@@ -14,6 +14,24 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 | `piper_kernels.convrot` | Rotated INT8 W8A8 tensor and linear operator |
 | `piper_kernels.attention` | Attention operators, including a future SageAttention backend |
 
+## ConvRot
+
+Wrap checkpoint storage without dequantizing it, then use the resulting tensor as a
+normal linear weight:
+
+```python
+import torch
+
+from piper_kernels.convrot import to_convrot_int8_tensor
+
+weight = to_convrot_int8_tensor(qdata, scale, group_size=64)
+output = torch.nn.functional.linear(activation, weight, bias)
+```
+
+The operator selects its Triton implementation on supported CUDA devices and otherwise
+uses the portable PyTorch reference. Install the optional backend explicitly with
+`piper-kernels[triton]`; importing the package does not require Triton.
+
 ## Dependency direction
 
 Applications such as Piper consume this package. Integrations such as torch-offload may
