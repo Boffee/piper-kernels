@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from piper_kernels.convrot import ConvRotInt8Tensor
-from piper_kernels.convrot._reference import rotate_groups
+from piper_kernels.convrot._rotation import rotate_groups
 
 
 def test_dequantize_unrotates_the_stored_weight() -> None:

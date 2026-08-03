@@ -1,5 +1,5 @@
-"""Rotated INT8 W8A8 weights with transparent PyTorch linear dispatch."""
+"""Rotated quantized weights with transparent PyTorch linear dispatch."""
 
-from .tensor import ConvRotInt8Tensor
+from ._int8.tensor import ConvRotInt8Tensor
 
 __all__ = ["ConvRotInt8Tensor"]

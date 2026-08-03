@@ -1,11 +1,11 @@
-"""Internal backend selection for ConvRot operators."""
+"""Internal backend selection for INT8 ConvRot operators."""
 
 import torch
 
-from ._reference import reference_linear, validate_storage
+from .reference import reference_linear, validate_storage
 
 try:
-    from .backends.triton import triton_int8_convrot_linear as _triton_linear
+    from .backends.triton import triton_convrot_int8_linear as _triton_linear
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise

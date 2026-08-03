@@ -6,8 +6,9 @@ from typing import Any, ClassVar
 import torch
 from torchao.utils import TorchAOBaseTensor
 
-from ._dispatch import _linear
-from ._reference import rotate_groups, validate_storage
+from .._rotation import rotate_groups
+from .dispatch import _linear
+from .reference import validate_storage
 
 
 class ConvRotInt8Tensor(TorchAOBaseTensor):
@@ -55,7 +56,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         group_size: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> "ConvRotInt8Tensor":
-        """Reconstruct a ConvRot weight from its stored tensors and metadata."""
+        """Reconstruct an INT8 ConvRot weight from its stored tensors and metadata."""
         return cls(
             qdata.contiguous(),
             scale.reshape(-1, 1).contiguous(),

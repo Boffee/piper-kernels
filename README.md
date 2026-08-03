@@ -11,10 +11,10 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
 | Package | Role |
 |---|---|
-| `piper_kernels.convrot` | Rotated INT8 W8A8 tensor and linear operator |
+| `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
 | `piper_kernels.attention` | Attention operators, including a future SageAttention backend |
 
-## ConvRot
+## ConvRot INT8
 
 Wrap checkpoint storage without dequantizing it, then use the resulting tensor as a
 normal linear weight:

@@ -145,8 +145,8 @@ def _int8_matmul_kernel(
     )
 
 
-@torch.library.custom_op("piper_kernels::int8_convrot_linear", mutates_args=())
-def triton_int8_convrot_linear(
+@torch.library.custom_op("piper_kernels::convrot_int8_linear", mutates_args=())
+def triton_convrot_int8_linear(
     activation: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -224,8 +224,8 @@ def triton_int8_convrot_linear(
     return output.reshape(*original_shape[:-1], n)
 
 
-@triton_int8_convrot_linear.register_fake
-def _triton_int8_convrot_linear_fake(
+@triton_convrot_int8_linear.register_fake
+def _triton_convrot_int8_linear_fake(
     activation: torch.Tensor,
     weight: torch.Tensor,
     _weight_scale: torch.Tensor,
