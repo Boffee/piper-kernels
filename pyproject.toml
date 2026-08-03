@@ -1,0 +1,82 @@
+[project]
+name = "piper-kernels"
+version = "0.1.0"
+description = "Reusable PyTorch inference operators and Triton kernels."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # PyTorch 2.13's CUDA 13.0 index metadata currently carries mismatched hashes.
+    # Keep the package on the known-good 2.12 line until that release is consumable.
+    "torch>=2.12,<2.13",
+    "torchao>=0.17",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=3.7; sys_platform == 'linux'"]
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "piper-kernels[triton]",
+    "pre-commit>=4.0",
+    "pyright>=1.1.409",
+    "pytest~=9.0",
+    "ruff>=0.14.3",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a CUDA-capable GPU",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "N", "ANN", "B", "A", "COM", "C4",
+    "DTZ", "EXE", "PIE", "T20", "PT", "SIM", "ARG", "PTH",
+    "ERA", "RUF", "PL",
+]
+ignore = [
+    "ANN002",
+    "ANN003",
+    "ANN204",
+    "COM812",
+    "PTH123",
+    "PLR2004",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "ARG", "PLR2004", "S101"]
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+[tool.ruff.lint.isort]
+known-first-party = ["piper_kernels"]
+
+[tool.pyright]
+include = ["src/piper_kernels"]
+exclude = ["tests", "benchmarks"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+reportMissingImports = "none"
+reportPrivateImportUsage = "none"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchao = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

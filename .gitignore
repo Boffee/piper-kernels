@@ -1,0 +1,15 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.python-version
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.idea/
+.vscode/
+uv.lock
+.DS_Store

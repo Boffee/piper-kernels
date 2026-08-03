@@ -1,0 +1,26 @@
+# Hooks use the versions resolved by uv's dev dependency group.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: pyright
+        name: pyright
+        entry: uv run --frozen pyright
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+
+      - id: tests
+        name: tests (cpu-only)
+        entry: env CUDA_VISIBLE_DEVICES= uv run --frozen pytest -q
+        language: system
+        files: ^(src/|tests/|pyproject\.toml)
+        pass_filenames: false
+        require_serial: true
