@@ -3,6 +3,8 @@ name = "piper-kernels"
 version = "0.1.0"
 description = "Reusable PyTorch inference operators and Triton kernels."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
     # PyTorch 2.13's CUDA 13.0 index metadata currently carries mismatched hashes.
