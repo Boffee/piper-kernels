@@ -16,15 +16,16 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
 ## ConvRot INT8
 
-Wrap checkpoint storage without dequantizing it, then use the resulting tensor as a
-normal linear weight:
+Quantize a dense weight, or wrap existing checkpoint storage without dequantizing it,
+then use the resulting tensor as a normal linear weight:
 
 ```python
 import torch
 
 from piper_kernels.convrot import ConvRotInt8Tensor
 
-weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
+weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=64)
+checkpoint_weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
 output = torch.nn.functional.linear(activation, weight, bias)
 ```
 

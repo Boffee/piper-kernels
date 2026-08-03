@@ -8,7 +8,7 @@ from torchao.utils import TorchAOBaseTensor
 
 from .._rotation import rotate_groups
 from .dispatch import _linear
-from .reference import validate_storage
+from .reference import quantize_weight, validate_storage
 
 
 class ConvRotInt8Tensor(TorchAOBaseTensor):
@@ -63,6 +63,18 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             group_size,
             dtype,
         )
+
+    @classmethod
+    def from_hp(
+        cls,
+        hp_tensor: torch.Tensor,
+        *,
+        group_size: int,
+    ) -> "ConvRotInt8Tensor":
+        """Rotate and quantize a high-precision weight into ConvRot INT8 storage."""
+        source = hp_tensor.detach()
+        qdata, scale = quantize_weight(source, group_size)
+        return cls(qdata.contiguous(), scale.contiguous(), group_size, source.dtype)
 
     def dequantize(self) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis."""

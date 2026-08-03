@@ -4,6 +4,32 @@ import torch
 
 from .._rotation import rotate_groups, validate_group_size
 
+_SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def quantize_weight(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate and quantize a dense two-dimensional weight per output row."""
+    validate_group_size(group_size)
+    if weight.ndim != 2:
+        raise ValueError(
+            f"ConvRot INT8 high-precision weight must be 2-D, got shape {tuple(weight.shape)}"
+        )
+    if weight.dtype not in _SUPPORTED_LOGICAL_DTYPES:
+        raise ValueError(
+            "ConvRot INT8 high-precision weight must use float16, bfloat16, or float32, "
+            f"got {weight.dtype}"
+        )
+    if weight.device.type == "meta":
+        raise ValueError("ConvRot INT8 cannot quantize a meta tensor without values")
+    if weight.shape[1] % group_size:
+        raise ValueError(
+            f"ConvRot in_features {weight.shape[1]} is not divisible by group size {group_size}"
+        )
+    return dynamic_quantize_rows(rotate_groups(weight, group_size))
+
 
 def validate_storage(
     qdata: torch.Tensor,
@@ -32,8 +58,10 @@ def validate_storage(
             "ConvRot INT8 qdata and scale must share a device, "
             f"got {qdata.device}/{scale.device}"
         )
-    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError(f"ConvRot logical dtype must be floating point, got {dtype}")
+    if dtype not in _SUPPORTED_LOGICAL_DTYPES:
+        raise ValueError(
+            f"ConvRot logical dtype must be float16, bfloat16, or float32, got {dtype}"
+        )
 
 
 def dynamic_quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

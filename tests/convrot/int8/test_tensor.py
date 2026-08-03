@@ -46,6 +46,69 @@ def test_from_packed_normalizes_flat_scale_to_column() -> None:
     assert torch.equal(wrapped.scale[:, 0], scale)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_from_hp_rotates_and_quantizes_each_weight_row(dtype: torch.dtype) -> None:
+    torch.manual_seed(12)
+    weight = torch.randn(7, 32, dtype=dtype)
+    rotated = rotate_groups(weight, 16)
+    expected_scale = (rotated.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(
+        min=1e-30
+    )
+    expected_qdata = (
+        (rotated / expected_scale.to(dtype)).round().clamp(-128, 127).to(torch.int8)
+    )
+
+    wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
+
+    assert wrapped.dtype is dtype
+    assert wrapped.group_size == 16
+    assert wrapped.qdata.dtype is torch.int8
+    assert wrapped.scale.dtype is torch.float32
+    assert wrapped.scale.shape == (7, 1)
+    assert torch.equal(wrapped.qdata, expected_qdata)
+    assert torch.equal(wrapped.scale, expected_scale)
+
+
+def test_from_hp_detaches_quantized_storage_from_autograd() -> None:
+    weight = torch.randn(3, 16, requires_grad=True)
+
+    wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
+
+    assert not wrapped.qdata.requires_grad
+    assert not wrapped.scale.requires_grad
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_from_hp_quantizes_cuda_weight() -> None:
+    weight = torch.randn(9, 64, dtype=torch.bfloat16, device="cuda")
+
+    wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=64)
+
+    assert wrapped.device.type == "cuda"
+    assert wrapped.qdata.device.type == "cuda"
+    assert wrapped.scale.device.type == "cuda"
+    assert wrapped.qdata.shape == weight.shape
+    assert wrapped.scale.shape == (weight.shape[0], 1)
+
+
+@pytest.mark.parametrize(
+    ("weight", "message"),
+    [
+        (torch.empty(2, 3, 16), "must be 2-D"),
+        (torch.empty(2, 16, dtype=torch.int32), "must use float16, bfloat16, or float32"),
+        (torch.empty(2, 16, device="meta"), "cannot quantize a meta tensor"),
+        (torch.empty(2, 24), "is not divisible by group size"),
+    ],
+)
+def test_from_hp_rejects_unsupported_dense_weight(
+    weight: torch.Tensor,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ConvRotInt8Tensor.from_hp(weight, group_size=16)
+
+
 @pytest.mark.parametrize("scale_shape", [(8,), (1, 8), (2, 4), (7, 1)])
 def test_constructor_rejects_noncanonical_scale_shape(
     scale_shape: tuple[int, ...],
