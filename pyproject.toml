@@ -7,13 +7,11 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
-    # PyTorch 2.13's CUDA 13.0 index metadata currently carries mismatched hashes.
-    # Keep the package on the known-good 2.12 line until that release is consumable.
-    "torch>=2.12,<2.13",
-    "torchao>=0.17",
+    "torch>=2.12",
 ]
 
 [project.optional-dependencies]
+convrot = ["torchao>=0.17"]
 triton = ["triton>=3.7; sys_platform == 'linux'"]
 
 [build-system]
@@ -22,7 +20,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "piper-kernels[triton]",
+    "piper-kernels[convrot,triton]",
     "pre-commit>=4.0",
     "pyright>=1.1.409",
     "pytest~=9.0",
@@ -54,7 +52,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/piper_kernels/convrot/_triton.py" = ["ANN", "PLR0913", "PLR0917"]
+"benchmarks/*.py" = ["T201"]
+"src/piper_kernels/**/backends/triton.py" = ["ANN", "PLR0913", "PLR0917"]
 "tests/**/*.py" = ["ANN", "ARG", "PLR2004", "S101"]
 
 [tool.ruff.lint.pylint]
@@ -70,6 +69,11 @@ pythonVersion = "3.10"
 typeCheckingMode = "standard"
 reportMissingImports = "none"
 reportPrivateImportUsage = "none"
+
+[tool.uv]
+# PyTorch 2.13's CUDA 13.0 index metadata currently carries mismatched hashes.
+# Keep local development on 2.12 without constraining published consumers.
+constraint-dependencies = ["torch<2.13"]
 
 [tool.uv.sources]
 torch = [

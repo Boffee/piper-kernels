@@ -1,10 +1,5 @@
-"""Rotated INT8 W8A8 tensor and linear operators."""
+"""Rotated INT8 W8A8 weights with transparent PyTorch linear dispatch."""
 
-from .functional import int8_convrot_linear
-from .tensor import ConvRotInt8Tensor, to_convrot_int8_tensor
+from .tensor import ConvRotInt8Tensor
 
-__all__ = [
-    "ConvRotInt8Tensor",
-    "int8_convrot_linear",
-    "to_convrot_int8_tensor",
-]
+__all__ = ["ConvRotInt8Tensor"]

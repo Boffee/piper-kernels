@@ -6,8 +6,8 @@ from typing import Any, ClassVar
 import torch
 from torchao.utils import TorchAOBaseTensor
 
+from ._dispatch import _linear
 from ._reference import rotate_groups, validate_storage
-from .functional import int8_convrot_linear
 
 
 class ConvRotInt8Tensor(TorchAOBaseTensor):
@@ -46,6 +46,23 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         self.scale = scale
         self.group_size = group_size
 
+    @classmethod
+    def from_packed(
+        cls,
+        qdata: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        group_size: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> "ConvRotInt8Tensor":
+        """Reconstruct a ConvRot weight from its stored tensors and metadata."""
+        return cls(
+            qdata.contiguous(),
+            scale.reshape(-1, 1).contiguous(),
+            group_size,
+            dtype,
+        )
+
     def dequantize(self) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis."""
         rotated = self.qdata.to(self.dtype) * self.scale.to(self.dtype)
@@ -69,22 +86,6 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
 
 
-def to_convrot_int8_tensor(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    group_size: int,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-) -> ConvRotInt8Tensor:
-    """Wrap stored ConvRot tensors without dequantizing or requantizing them."""
-    return ConvRotInt8Tensor(
-        qdata.contiguous(),
-        scale.reshape(qdata.shape[0], 1).contiguous(),
-        group_size,
-        dtype,
-    )
-
-
 @ConvRotInt8Tensor.implements(torch.ops.aten.linear.default)
 @ConvRotInt8Tensor.implements_torch_function(torch.nn.functional.linear)
 def _convrot_linear_dispatch(
@@ -102,7 +103,7 @@ def _convrot_linear_dispatch(
         )
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
-    return int8_convrot_linear(
+    return _linear(
         activation,
         weight.qdata,
         weight.scale,

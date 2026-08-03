@@ -1,11 +1,11 @@
-"""Backend-independent functional API for ConvRot operators."""
+"""Internal backend selection for ConvRot operators."""
 
 import torch
 
 from ._reference import reference_linear, validate_storage
 
 try:
-    from ._triton import triton_int8_convrot_linear as _triton_linear
+    from .backends.triton import triton_int8_convrot_linear as _triton_linear
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
@@ -22,19 +22,19 @@ def _can_use_triton(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
     )
 
 
-def int8_convrot_linear(
+def _linear(
     activation: torch.Tensor,
     qdata: torch.Tensor,
     scale: torch.Tensor,
     group_size: int,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply a ConvRot INT8 weight to a floating-point activation.
+    """Apply raw ConvRot INT8 storage to a floating-point activation.
 
-    ``qdata`` stores the two-dimensional INT8 weight in its rotated basis.
-    ``scale`` contains one float32 value per output channel. The function
-    automatically selects the Triton backend when supported and otherwise
-    executes the portable PyTorch reference implementation.
+    ``qdata`` stores the two-dimensional INT8 weight in its rotated basis,
+    and ``scale`` contains one float32 value per output channel. This is the
+    internal storage-level ABI. Consumers should call
+    :func:`torch.nn.functional.linear` with a ``ConvRotInt8Tensor`` weight.
     """
     validate_storage(qdata, scale, group_size, activation.dtype)
     if activation.ndim == 0 or activation.shape[-1] != qdata.shape[1]:

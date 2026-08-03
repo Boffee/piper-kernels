@@ -22,15 +22,16 @@ normal linear weight:
 ```python
 import torch
 
-from piper_kernels.convrot import to_convrot_int8_tensor
+from piper_kernels.convrot import ConvRotInt8Tensor
 
-weight = to_convrot_int8_tensor(qdata, scale, group_size=64)
+weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
 output = torch.nn.functional.linear(activation, weight, bias)
 ```
 
 The operator selects its Triton implementation on supported CUDA devices and otherwise
-uses the portable PyTorch reference. Install the optional backend explicitly with
-`piper-kernels[triton]`; importing the package does not require Triton.
+uses the portable PyTorch reference. Install the tensor format and optimized backend with
+`piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, so
+future attention-only consumers do not inherit quantization-specific dependencies.
 
 ## Dependency direction
 
