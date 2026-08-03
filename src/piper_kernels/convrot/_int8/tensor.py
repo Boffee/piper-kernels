@@ -56,7 +56,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         group_size: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> "ConvRotInt8Tensor":
-        """Reconstruct an INT8 ConvRot weight from its stored tensors and metadata."""
+        """Normalize serialized INT8 ConvRot storage into its canonical representation."""
         return cls(
             qdata.contiguous(),
             scale.reshape(-1, 1).contiguous(),

@@ -21,9 +21,10 @@ def validate_storage(
         raise ValueError(
             f"ConvRot in_features {qdata.shape[1]} is not divisible by group size {group_size}"
         )
-    if scale.dtype is not torch.float32 or scale.numel() != qdata.shape[0]:
+    expected_scale_shape = (qdata.shape[0], 1)
+    if scale.dtype is not torch.float32 or tuple(scale.shape) != expected_scale_shape:
         raise ValueError(
-            "ConvRot INT8 scale must be float32 with one element per output channel, "
+            f"ConvRot INT8 scale must be float32 with shape {expected_scale_shape}, "
             f"got {scale.dtype} {tuple(scale.shape)} for qdata {tuple(qdata.shape)}"
         )
     if scale.device != qdata.device:

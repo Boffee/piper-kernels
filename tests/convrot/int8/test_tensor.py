@@ -34,6 +34,30 @@ def test_meta_tensor_preserves_storage_and_rotation_metadata() -> None:
     assert wrapped.scale.shape == (8, 1)
 
 
+def test_from_packed_normalizes_flat_scale_to_column() -> None:
+    scale = torch.arange(1, 9, dtype=torch.float32)
+    wrapped = ConvRotInt8Tensor.from_packed(
+        torch.empty(8, 64, dtype=torch.int8),
+        scale,
+        group_size=64,
+    )
+
+    assert wrapped.scale.shape == (8, 1)
+    assert torch.equal(wrapped.scale[:, 0], scale)
+
+
+@pytest.mark.parametrize("scale_shape", [(8,), (1, 8), (2, 4), (7, 1)])
+def test_constructor_rejects_noncanonical_scale_shape(
+    scale_shape: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match=r"scale must be float32 with shape \(8, 1\)"):
+        ConvRotInt8Tensor(
+            torch.empty(8, 64, dtype=torch.int8),
+            torch.empty(scale_shape, dtype=torch.float32),
+            64,
+        )
+
+
 @pytest.mark.parametrize("group_size", [15, 32, 128])
 def test_rejects_unsupported_group_size(group_size: int) -> None:
     with pytest.raises(ValueError, match="group size must be one of"):
