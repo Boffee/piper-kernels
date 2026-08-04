@@ -44,6 +44,9 @@ def test_triton_matches_quantized_reference(
             value,
             head_dim**-0.5,
             is_causal,
+            qk_quantization=(
+                "per_warp" if torch.cuda.get_device_capability()[0] == 12 else "per_thread"
+            ),
         )
     error = (actual.float() - expected.float()).abs()
 

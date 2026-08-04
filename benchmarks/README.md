@@ -18,8 +18,9 @@ Run the end-to-end SageAttention2++ comparison with:
 uv run python benchmarks/benchmark_sage_attention.py
 ```
 
-The Sage timing includes K smoothing and Q/K/V quantization. Use `--help` to select sequence
-lengths, dtype, head dimension, and causal mode. The comparison reports warmed PyTorch SDPA
+The Sage timing includes K smoothing and Q/K/V quantization. Use `--help` to select query
+sequence lengths, a fixed `--kv-sequence` for cross-attention, dtype, head dimension, and
+causal mode. The comparison reports warmed PyTorch SDPA
 latency and error relative to SDPA as well as cold Triton compilation time. Warmed latency is
 reported as the median with p20/p80 bounds; increase `--repeat-ms` for a larger timing sample.
 

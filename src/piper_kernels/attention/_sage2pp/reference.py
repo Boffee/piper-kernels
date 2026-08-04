@@ -1,5 +1,7 @@
 """Portable reference for the SageAttention2++ 8+8 forward path."""
 
+from typing import Literal
+
 import torch
 
 _Q_BLOCK = 32
@@ -48,6 +50,19 @@ def _quantize_key_per_thread(key: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     )
 
 
+def _quantize_per_group(
+    value: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize consecutive rows with one scale per group."""
+    padded, length = _pad_sequence(value, group_size)
+    batch, heads, _, width = padded.shape
+    grouped = padded.float().reshape(batch, heads, -1, group_size, width)
+    scale = grouped.abs().amax(dim=(3, 4)) / 127.0 + _SCALE_EPSILON
+    quantized = (grouped / scale[..., None, None]).round().clamp(-128, 127).to(torch.int8)
+    return quantized.reshape_as(padded)[:, :, :length], scale
+
+
 def _quantize_value_per_channel(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = value.float().abs().amax(dim=2) / _V_FP8_RANGE + _SCALE_EPSILON
     quantized = (value.float() / scale[:, :, None, :]).to(torch.float8_e4m3fn)
@@ -60,6 +75,8 @@ def reference_sage_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
+    *,
+    qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
 ) -> torch.Tensor:
     """Evaluate the quantized 8+8 algorithm using ordinary PyTorch operations.
 
@@ -69,8 +86,16 @@ def reference_sage_attention(
     """
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
-    query_int8, query_scale = _quantize_query_per_thread(query)
-    key_int8, key_scale = _quantize_key_per_thread(key_centered)
+    if qk_quantization == "per_warp":
+        query_int8, query_scale = _quantize_per_group(query, _Q_BLOCK)
+        key_int8, key_scale = _quantize_per_group(key_centered, _K_BLOCK)
+        query_scale = query_scale.repeat_interleave(_Q_BLOCK, dim=2)[:, :, : query.shape[2]]
+        key_scale = key_scale.repeat_interleave(_K_BLOCK, dim=2)[:, :, : key.shape[2]]
+    elif qk_quantization == "per_thread":
+        query_int8, query_scale = _quantize_query_per_thread(query)
+        key_int8, key_scale = _quantize_key_per_thread(key_centered)
+    else:
+        raise ValueError(f"unknown Q/K quantization granularity: {qk_quantization}")
     value_fp8, value_scale = _quantize_value_per_channel(value)
 
     batch, heads, query_length, width = query.shape
@@ -96,10 +121,7 @@ def reference_sage_attention(
             key_block.transpose(-1, -2).float(),
         )
         scores = (
-            integer_scores
-            * query_scale[:, :, :, None]
-            * key_scale[:, :, None, start:stop]
-            * scale
+            integer_scores * query_scale[:, :, :, None] * key_scale[:, :, None, start:stop] * scale
         )
         if is_causal:
             key_positions = torch.arange(start, stop, device=query.device)

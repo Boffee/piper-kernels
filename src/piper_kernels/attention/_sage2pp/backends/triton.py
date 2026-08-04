@@ -169,6 +169,56 @@ def _quantize_query_kernel(
 
 
 @triton.jit
+def _quantize_query_per_warp_kernel(
+    query_ptr,
+    output_ptr,
+    scale_ptr,
+    query_length,
+    softmax_scale,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    head_dim: tl.constexpr,
+):
+    scale_group = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    offsets_n = scale_group * 32 + tl.arange(0, 32)
+    offsets_d = tl.arange(0, head_dim)
+    mask = offsets_n[:, None] < query_length
+    values = tl.load(
+        query_ptr
+        + batch * stride_qb
+        + head * stride_qh
+        + offsets_n[:, None] * stride_qn
+        + offsets_d[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    scale = maximum / 127.0 + _SCALE_EPSILON
+    quantized = _round_to_int8(values / scale)
+    tl.store(
+        output_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + offsets_n[:, None] * stride_on
+        + offsets_d[None, :],
+        quantized,
+        mask=mask,
+    )
+    tl.store(
+        scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
+        scale * (softmax_scale * _LOG2_E),
+    )
+
+
+@triton.jit
 def _quantize_key_kernel(
     key_ptr,
     mean_ptr,
@@ -222,6 +272,60 @@ def _quantize_key_kernel(
         scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
         scale,
         mask=offsets_n < key_length,
+    )
+
+
+@triton.jit
+def _quantize_key_per_block_kernel(
+    key_ptr,
+    mean_ptr,
+    output_ptr,
+    scale_ptr,
+    key_length,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    scale_group = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    offsets_n = scale_group * block_n + tl.arange(0, block_n)
+    offsets_d = tl.arange(0, head_dim)
+    mask = offsets_n[:, None] < key_length
+    mean = tl.load(mean_ptr + (batch * heads + head) * head_dim + offsets_d)
+    values = tl.load(
+        key_ptr
+        + batch * stride_kb
+        + head * stride_kh
+        + offsets_n[:, None] * stride_kn
+        + offsets_d[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    values -= mean[None, :]
+    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    scale = maximum / 127.0 + _SCALE_EPSILON
+    quantized = _round_to_int8(values / scale)
+    tl.store(
+        output_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + offsets_n[:, None] * stride_on
+        + offsets_d[None, :],
+        quantized,
+        mask=mask,
+    )
+    tl.store(
+        scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
+        scale,
     )
 
 
@@ -281,6 +385,7 @@ def _sage_attention_kernel(
     query_length,
     key_length,
     is_causal: tl.constexpr,
+    grouped_qk: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -300,13 +405,18 @@ def _sage_attention_kernel(
         mask=offsets_m[:, None] < query_length,
         other=0,
     )
-    query_scale = tl.load(
-        query_scale_ptr + (batch * heads + head) * query_length + offsets_m,
-        mask=offsets_m < query_length,
-        other=0.0,
-    )
-    value_scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
-
+    if grouped_qk:
+        query_scale = tl.load(
+            query_scale_ptr + (batch * heads + head) * tl.cdiv(query_length, 32) + offsets_m // 32,
+            mask=offsets_m < query_length,
+            other=0.0,
+        )
+    else:
+        query_scale = tl.load(
+            query_scale_ptr + (batch * heads + head) * query_length + offsets_m,
+            mask=offsets_m < query_length,
+            other=0.0,
+        )
     accumulator = tl.zeros((block_m, head_dim), dtype=tl.float32)
     denominator = tl.zeros((block_m,), dtype=tl.float32)
     running_max = tl.full((block_m,), -float("inf"), dtype=tl.float32)
@@ -324,12 +434,21 @@ def _sage_attention_kernel(
             other=0,
         )
         integer_scores = tl.dot(query, key)
-        key_scale = tl.load(
-            key_scale_ptr + (batch * heads + head) * key_length + current_n,
-            mask=current_n < key_length,
-            other=0.0,
-        )
-        scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+        if grouped_qk:
+            key_scale = tl.load(
+                key_scale_ptr
+                + (batch * heads + head) * tl.cdiv(key_length, block_n)
+                + start_n // block_n
+            )
+            score_scale = query_scale * key_scale
+            scores = integer_scores.to(tl.float32) * score_scale[:, None]
+        else:
+            key_scale = tl.load(
+                key_scale_ptr + (batch * heads + head) * key_length + current_n,
+                mask=current_n < key_length,
+                other=0.0,
+            )
+            scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
         valid_keys = current_n[None, :] < key_length
         if is_causal:
             valid_keys &= current_n[None, :] <= offsets_m[:, None]
@@ -356,10 +475,12 @@ def _sage_attention_kernel(
             acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
             out_dtype=tl.float16,
         )
-        accumulator += partial_fp16.to(tl.float32) * value_scale[None, :]
+        accumulator += partial_fp16.to(tl.float32)
         running_max = next_max
 
     output = accumulator / denominator[:, None]
+    value_scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
+    output *= value_scale[None, :]
     tl.store(
         output_ptr
         + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
@@ -417,7 +538,7 @@ def triton_sage_attention(
         heads=heads,
         head_dim=head_dim,
         block_n=statistics_block,
-        num_warps=8,
+        num_warps=4,
     )
 
     key_mean = torch.empty((batch, heads, head_dim), device=query.device, dtype=torch.float32)
@@ -446,46 +567,98 @@ def triton_sage_attention(
         device=query.device,
         dtype=torch.float8_e4m3fn,
     )
-    query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
-    key_scale = torch.empty(key.shape[:3], device=query.device, dtype=torch.float32)
-
-    query_grid = (triton.cdiv(query_length, 32) * 8, heads, batch)
-    _quantize_query_kernel[query_grid](
-        query,
-        query_int8,
-        query_scale,
-        query_length,
-        scale,
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        query_int8.stride(0),
-        query_int8.stride(1),
-        query_int8.stride(2),
-        query_scale.stride(0),
-        query_scale.stride(1),
-        head_dim=head_dim,
-        num_warps=4,
-    )
-    key_grid = (triton.cdiv(key_length, 64) * 4, heads, batch)
-    _quantize_key_kernel[key_grid](
-        key,
-        key_mean,
-        key_int8,
-        key_scale,
-        key_length,
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        key_int8.stride(0),
-        key_int8.stride(1),
-        key_int8.stride(2),
-        key_scale.stride(0),
-        key_scale.stride(1),
-        heads=heads,
-        head_dim=head_dim,
-        num_warps=4,
-    )
+    grouped_qk = torch.cuda.get_device_capability(query.device)[0] == 12
+    if grouped_qk:
+        query_scale_groups = (query_length + 31) // 32
+        key_scale_groups = (key_length + 63) // 64
+        query_scale = torch.empty(
+            (batch, heads, query_scale_groups),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        key_scale = torch.empty(
+            (batch, heads, key_scale_groups),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        query_grid = (query_scale_groups, heads, batch)
+        _quantize_query_per_warp_kernel[query_grid](
+            query,
+            query_int8,
+            query_scale,
+            query_length,
+            scale,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query_int8.stride(0),
+            query_int8.stride(1),
+            query_int8.stride(2),
+            query_scale.stride(0),
+            query_scale.stride(1),
+            head_dim=head_dim,
+            num_warps=4,
+        )
+        key_grid = (key_scale_groups, heads, batch)
+        _quantize_key_per_block_kernel[key_grid](
+            key,
+            key_mean,
+            key_int8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=64,
+            num_warps=4,
+        )
+    else:
+        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+        key_scale = torch.empty(key.shape[:3], device=query.device, dtype=torch.float32)
+        query_grid = (triton.cdiv(query_length, 32) * 8, heads, batch)
+        _quantize_query_kernel[query_grid](
+            query,
+            query_int8,
+            query_scale,
+            query_length,
+            scale,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query_int8.stride(0),
+            query_int8.stride(1),
+            query_int8.stride(2),
+            query_scale.stride(0),
+            query_scale.stride(1),
+            head_dim=head_dim,
+            num_warps=4,
+        )
+        key_grid = (triton.cdiv(key_length, 64) * 4, heads, batch)
+        _quantize_key_kernel[key_grid](
+            key,
+            key_mean,
+            key_int8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
+            head_dim=head_dim,
+            num_warps=4,
+        )
     value_grid = (triton.cdiv(key_length, 64), heads, batch)
     _quantize_value_kernel[value_grid](
         value,
@@ -520,6 +693,7 @@ def triton_sage_attention(
         query_length,
         key_length,
         is_causal=is_causal,
+        grouped_qk=grouped_qk,
         heads=heads,
         head_dim=head_dim,
         block_m=block_m,

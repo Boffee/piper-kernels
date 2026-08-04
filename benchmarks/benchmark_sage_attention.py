@@ -33,7 +33,8 @@ class Timing:
 class Result:
     """Timing and numerical result for one sequence length."""
 
-    sequence: int
+    query_sequence: int
+    key_sequence: int
     cold_ms: float
     sage: Timing
     sdpa: Timing
@@ -84,7 +85,7 @@ def _load_canonical(capability: tuple[int, int]) -> CanonicalSage:
 
 @torch.inference_mode()
 def _run_shape(
-    sequence: int,
+    sequences: tuple[int, int],
     batch: int,
     heads: int,
     head_dim: int,
@@ -95,9 +96,10 @@ def _run_shape(
     canonical_sage: CanonicalSage | None,
     canonical_qk_gran: str,
 ) -> Result:
-    query = torch.randn(batch, heads, sequence, head_dim, device="cuda", dtype=dtype)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
+    query_sequence, key_sequence = sequences
+    query = torch.randn(batch, heads, query_sequence, head_dim, device="cuda", dtype=dtype)
+    key = torch.randn(batch, heads, key_sequence, head_dim, device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
 
     def optimized() -> torch.Tensor:
         return sage_attention(query, key, value, is_causal=is_causal)
@@ -143,7 +145,8 @@ def _run_shape(
         canonical_max_error = canonical_error.max().item()
 
     return Result(
-        sequence=sequence,
+        query_sequence=query_sequence,
+        key_sequence=key_sequence,
         cold_ms=cold_ms,
         sage=_do_bench(optimized, warmup_ms, repeat_ms),
         sdpa=_do_bench(sdpa, warmup_ms, repeat_ms),
@@ -158,6 +161,11 @@ def _run_shape(
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", type=int, nargs="+", default=[512, 1024, 2048, 4096])
+    parser.add_argument(
+        "--kv-sequence",
+        type=int,
+        help="fixed key/value sequence length (defaults to each query sequence length)",
+    )
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, choices=[64, 128], default=128)
@@ -181,6 +189,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     capability = torch.cuda.get_device_capability()
     if capability != (8, 9) and capability[0] != 12:
         raise SystemExit("The optimized SageAttention backend requires SM89 or SM12x")
+    if (
+        args.causal
+        and args.kv_sequence is not None
+        and any(sequence != args.kv_sequence for sequence in args.sequence)
+    ):
+        raise SystemExit("causal attention requires equal query and key/value lengths")
 
     canonical_sage = _load_canonical(capability) if args.canonical else None
     canonical_qk_gran = "per_warp" if capability[0] == 12 else "per_thread"
@@ -199,22 +213,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     print()
     if canonical_sage is None:
         print(
-            "| sequence | cold Piper (ms) | Piper p50 [p20, p80] (ms) | "
+            "| query | key/value | cold Piper (ms) | Piper p50 [p20, p80] (ms) | "
             "SDPA p50 [p20, p80] (ms) | SDPA / Piper | "
             "Piper mean error | Piper max error |"
         )
-        print("|---:|---:|---:|---:|---:|---:|---:|")
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|")
     else:
         print(
-            "| sequence | cold Piper (ms) | Piper p50 [p20, p80] (ms) | "
+            "| query | key/value | cold Piper (ms) | Piper p50 [p20, p80] (ms) | "
             "canonical p50 [p20, p80] (ms) | SDPA p50 [p20, p80] (ms) | "
             "canonical / Piper | SDPA / Piper | Piper mean/max error | "
             "canonical mean/max error |"
         )
-        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for sequence in args.sequence:
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for query_sequence in args.sequence:
+        key_sequence = args.kv_sequence or query_sequence
         result = _run_shape(
-            sequence,
+            (query_sequence, key_sequence),
             args.batch,
             args.heads,
             args.head_dim,
@@ -227,7 +242,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if result.canonical is None:
             print(
-                f"| {result.sequence} | {result.cold_ms:.3f} | {result.sage.display()} "
+                f"| {result.query_sequence} | {result.key_sequence} | {result.cold_ms:.3f} "
+                f"| {result.sage.display()} "
                 f"| {result.sdpa.display()} | {result.speedup:.2f}x "
                 f"| {result.mean_error:.6f} | {result.max_error:.6f} |"
             )
@@ -236,7 +252,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             assert result.canonical_mean_error is not None
             assert result.canonical_max_error is not None
             print(
-                f"| {result.sequence} | {result.cold_ms:.3f} | {result.sage.display()} "
+                f"| {result.query_sequence} | {result.key_sequence} | {result.cold_ms:.3f} "
+                f"| {result.sage.display()} "
                 f"| {result.canonical.display()} | {result.sdpa.display()} "
                 f"| {result.canonical_speedup:.2f}x | {result.speedup:.2f}x "
                 f"| {result.mean_error:.6f}/{result.max_error:.6f} "
