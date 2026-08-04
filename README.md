@@ -3,6 +3,8 @@
 Reusable PyTorch inference operators and optimized kernels for the Piper ecosystem and
 other consumers.
 
+Piper Kernels requires Python 3.14 or newer.
+
 The package owns operator semantics, portable PyTorch references, tensor subclasses,
 and optimized backends. It deliberately does not know about model repositories,
 checkpoint metadata, pipeline frameworks, or device-offloading policy.
@@ -61,3 +63,9 @@ uv build
 
 GPU tests use the `gpu` pytest marker. The pre-commit test hook hides CUDA so commits run
 the portable suite; run `uv run pytest` directly to exercise installed GPU backends.
+
+## Releases
+
+Releases follow the compatibility and release policy in [VERSIONING.md](VERSIONING.md).
+Distribution artifacts are built from version tags and published to PyPI by GitHub Actions
+using Trusted Publishing; maintainers do not upload releases from local environments.

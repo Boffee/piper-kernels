@@ -6,9 +6,23 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.14"
+keywords = ["inference", "pytorch", "quantization", "triton"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.12",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Boffee/piper-kernels"
+Repository = "https://github.com/Boffee/piper-kernels.git"
+Issues = "https://github.com/Boffee/piper-kernels/issues"
+Changelog = "https://github.com/Boffee/piper-kernels/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 convrot = ["torchao>=0.17"]

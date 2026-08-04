@@ -11,5 +11,4 @@ wheels/
 .pyright/
 .idea/
 .vscode/
-uv.lock
 .DS_Store
