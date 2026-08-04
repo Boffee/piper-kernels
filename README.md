@@ -62,10 +62,12 @@ dimensions 64 and 128, equal query/KV head counts, causal or non-causal attentio
 not support autograd.
 
 The implementation follows SageAttention2++ rather than merely storing FP8 tensors: it
-smooths K, applies Sage's per-thread INT8 Q/K quantization, quantizes V per channel to E4M3,
+smooths K, applies architecture-tuned INT8 Q/K quantization, quantizes V per channel to E4M3,
 quantizes online-softmax probabilities to E4M3, accumulates each 64-key PV tile in FP16, and
-buffers the tile result in FP32. All device kernels are written in Triton; no CUDA extension
-or inline PTX is used. Unsupported devices use a slow portable quantized reference.
+buffers the tile result in FP32. Quantized V is stored feature-major to avoid an expensive
+RHS layout conversion; the SM120 D128 non-causal schedule additionally uses Triton tensor
+descriptors. All device kernels are written in Triton; no CUDA extension or inline PTX is used.
+Unsupported devices use a slow portable quantized reference.
 
 Install the optimized backend with `piper-kernels[triton]`.
 See [benchmarks/README.md](benchmarks/README.md) for the revision-pinned official CUDA

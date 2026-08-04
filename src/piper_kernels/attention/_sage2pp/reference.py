@@ -4,6 +4,8 @@ from typing import Literal
 
 import torch
 
+from piper_kernels.attention._convrot_reference import rotate_attention_groups
+
 _Q_BLOCK = 32
 _K_BLOCK = 64
 _PV_BLOCK = 64
@@ -22,28 +24,38 @@ def _pad_sequence(value: torch.Tensor, multiple: int) -> tuple[torch.Tensor, int
     return padded, length
 
 
-def _quantize_query_per_thread(query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_query_per_thread(
+    query: torch.Tensor,
+    quantization_range: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Match SageAttention's four interleaved query rows per scale."""
     padded, length = _pad_sequence(query, _Q_BLOCK)
     batch, heads, _, width = padded.shape
     grouped = padded.float().reshape(batch, heads, -1, 4, 8, width)
-    scale_group = grouped.abs().amax(dim=(3, 5)) / 127.0 + _SCALE_EPSILON
+    scale_group = grouped.abs().amax(dim=(3, 5)) / quantization_range + _SCALE_EPSILON
     scale = scale_group[:, :, :, None, :, None].expand_as(grouped)
-    quantized = (grouped / scale).round().clamp(-128, 127).to(torch.int8)
+    quantized = (
+        (grouped / scale).round().clamp(-quantization_range, quantization_range).to(torch.int8)
+    )
     return (
         quantized.reshape_as(padded)[:, :, :length],
         scale[..., 0].reshape(*padded.shape[:3])[:, :, :length],
     )
 
 
-def _quantize_key_per_thread(key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_key_per_thread(
+    key: torch.Tensor,
+    quantization_range: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Match SageAttention's sixteen interleaved key rows per scale."""
     padded, length = _pad_sequence(key, _K_BLOCK)
     batch, heads, _, width = padded.shape
     grouped = padded.float().reshape(batch, heads, -1, 8, 4, 2, width)
-    scale_group = grouped.abs().amax(dim=(3, 5, 6)) / 127.0 + _SCALE_EPSILON
+    scale_group = grouped.abs().amax(dim=(3, 5, 6)) / quantization_range + _SCALE_EPSILON
     scale = scale_group[:, :, :, None, :, None, None].expand_as(grouped)
-    quantized = (grouped / scale).round().clamp(-128, 127).to(torch.int8)
+    quantized = (
+        (grouped / scale).round().clamp(-quantization_range, quantization_range).to(torch.int8)
+    )
     return (
         quantized.reshape_as(padded)[:, :, :length],
         scale[..., 0].reshape(*padded.shape[:3])[:, :, :length],
@@ -53,13 +65,19 @@ def _quantize_key_per_thread(key: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 def _quantize_per_group(
     value: torch.Tensor,
     group_size: int,
+    quantization_range: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize consecutive rows with one scale per group."""
     padded, length = _pad_sequence(value, group_size)
     batch, heads, _, width = padded.shape
     grouped = padded.float().reshape(batch, heads, -1, group_size, width)
-    scale = grouped.abs().amax(dim=(3, 4)) / 127.0 + _SCALE_EPSILON
-    quantized = (grouped / scale[..., None, None]).round().clamp(-128, 127).to(torch.int8)
+    scale = grouped.abs().amax(dim=(3, 4)) / quantization_range + _SCALE_EPSILON
+    quantized = (
+        (grouped / scale[..., None, None])
+        .round()
+        .clamp(-quantization_range, quantization_range)
+        .to(torch.int8)
+    )
     return quantized.reshape_as(padded)[:, :, :length], scale
 
 
@@ -77,23 +95,38 @@ def reference_sage_attention(
     is_causal: bool,
     *,
     qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
+    qk_bits: Literal[4, 8] = 8,
+    rotation_group: int | None = None,
 ) -> torch.Tensor:
-    """Evaluate the quantized 8+8 algorithm using ordinary PyTorch operations.
+    """Evaluate a quantized Sage2++ algorithm using ordinary PyTorch operations.
 
     This intentionally follows the 64-key online-softmax loop. Probability FP8
     quantization depends on the running maximum, so quantizing a fully materialized
     softmax matrix would not be an equivalent reference.
     """
+    output_dtype = query.dtype
+    quantization_range = 7 if qk_bits == 4 else 127
+    if rotation_group is not None:
+        query = rotate_attention_groups(query.float(), rotation_group)
+        key = rotate_attention_groups(key.float(), rotation_group)
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
     if qk_quantization == "per_warp":
-        query_int8, query_scale = _quantize_per_group(query, _Q_BLOCK)
-        key_int8, key_scale = _quantize_per_group(key_centered, _K_BLOCK)
+        query_int8, query_scale = _quantize_per_group(
+            query,
+            _Q_BLOCK,
+            quantization_range,
+        )
+        key_int8, key_scale = _quantize_per_group(
+            key_centered,
+            _K_BLOCK,
+            quantization_range,
+        )
         query_scale = query_scale.repeat_interleave(_Q_BLOCK, dim=2)[:, :, : query.shape[2]]
         key_scale = key_scale.repeat_interleave(_K_BLOCK, dim=2)[:, :, : key.shape[2]]
     elif qk_quantization == "per_thread":
-        query_int8, query_scale = _quantize_query_per_thread(query)
-        key_int8, key_scale = _quantize_key_per_thread(key_centered)
+        query_int8, query_scale = _quantize_query_per_thread(query, quantization_range)
+        key_int8, key_scale = _quantize_key_per_thread(key_centered, quantization_range)
     else:
         raise ValueError(f"unknown Q/K quantization granularity: {qk_quantization}")
     value_fp8, value_scale = _quantize_value_per_channel(value)
@@ -149,4 +182,4 @@ def reference_sage_attention(
         running_max = next_max
 
     output = accumulator / denominator.clamp_min(1e-30)[..., None]
-    return output.to(query.dtype)
+    return output.to(output_dtype)

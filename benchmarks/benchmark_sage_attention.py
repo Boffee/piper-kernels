@@ -40,9 +40,12 @@ class Result:
     sdpa: Timing
     mean_error: float
     max_error: float
-    canonical: Timing | None = None
-    canonical_mean_error: float | None = None
-    canonical_max_error: float | None = None
+    canonical_sage2pp: Timing | None = None
+    canonical_sage2: Timing | None = None
+    canonical_sage2pp_mean_error: float | None = None
+    canonical_sage2pp_max_error: float | None = None
+    canonical_sage2_mean_error: float | None = None
+    canonical_sage2_max_error: float | None = None
 
     @property
     def speedup(self) -> float:
@@ -50,11 +53,18 @@ class Result:
         return self.sdpa.median_ms / self.sage.median_ms
 
     @property
-    def canonical_speedup(self) -> float | None:
-        """Return median canonical Sage latency divided by Piper Sage latency."""
-        if self.canonical is None:
+    def canonical_sage2pp_speedup(self) -> float | None:
+        """Return median canonical Sage2++ latency divided by Piper latency."""
+        if self.canonical_sage2pp is None:
             return None
-        return self.canonical.median_ms / self.sage.median_ms
+        return self.canonical_sage2pp.median_ms / self.sage.median_ms
+
+    @property
+    def canonical_accumulator_speedup(self) -> float | None:
+        """Return canonical Sage2 latency divided by canonical Sage2++ latency."""
+        if self.canonical_sage2 is None or self.canonical_sage2pp is None:
+            return None
+        return self.canonical_sage2.median_ms / self.canonical_sage2pp.median_ms
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -112,7 +122,7 @@ def _run_shape(
             is_causal=is_causal,
         )
 
-    def canonical() -> torch.Tensor:
+    def canonical(pv_accum_dtype: str) -> torch.Tensor:
         assert canonical_sage is not None
         return canonical_sage(
             query,
@@ -122,7 +132,7 @@ def _run_shape(
             is_causal=is_causal,
             qk_quant_gran=canonical_qk_gran,
             sm_scale=head_dim**-0.5,
-            pv_accum_dtype="fp32+fp16",
+            pv_accum_dtype=pv_accum_dtype,
             smooth_k=True,
             smooth_v=False,
             return_lse=False,
@@ -135,14 +145,28 @@ def _run_shape(
     torch.cuda.synchronize()
     cold_ms = (time.perf_counter() - started) * 1_000
     error = (actual.float() - expected.float()).abs()
-    canonical_timing = None
-    canonical_mean_error = None
-    canonical_max_error = None
+    canonical_sage2pp_timing = None
+    canonical_sage2_timing = None
+    canonical_sage2pp_mean_error = None
+    canonical_sage2pp_max_error = None
+    canonical_sage2_mean_error = None
+    canonical_sage2_max_error = None
     if canonical_sage is not None:
-        canonical_error = (canonical().float() - expected.float()).abs()
-        canonical_timing = _do_bench(canonical, warmup_ms, repeat_ms)
-        canonical_mean_error = canonical_error.mean().item()
-        canonical_max_error = canonical_error.max().item()
+
+        def canonical_sage2pp() -> torch.Tensor:
+            return canonical("fp32+fp16")
+
+        def canonical_sage2() -> torch.Tensor:
+            return canonical("fp32+fp32")
+
+        canonical_sage2pp_error = (canonical_sage2pp().float() - expected.float()).abs()
+        canonical_sage2_error = (canonical_sage2().float() - expected.float()).abs()
+        canonical_sage2pp_timing = _do_bench(canonical_sage2pp, warmup_ms, repeat_ms)
+        canonical_sage2_timing = _do_bench(canonical_sage2, warmup_ms, repeat_ms)
+        canonical_sage2pp_mean_error = canonical_sage2pp_error.mean().item()
+        canonical_sage2pp_max_error = canonical_sage2pp_error.max().item()
+        canonical_sage2_mean_error = canonical_sage2_error.mean().item()
+        canonical_sage2_max_error = canonical_sage2_error.max().item()
 
     return Result(
         query_sequence=query_sequence,
@@ -152,9 +176,12 @@ def _run_shape(
         sdpa=_do_bench(sdpa, warmup_ms, repeat_ms),
         mean_error=error.mean().item(),
         max_error=error.max().item(),
-        canonical=canonical_timing,
-        canonical_mean_error=canonical_mean_error,
-        canonical_max_error=canonical_max_error,
+        canonical_sage2pp=canonical_sage2pp_timing,
+        canonical_sage2=canonical_sage2_timing,
+        canonical_sage2pp_mean_error=canonical_sage2pp_mean_error,
+        canonical_sage2pp_max_error=canonical_sage2pp_max_error,
+        canonical_sage2_mean_error=canonical_sage2_mean_error,
+        canonical_sage2_max_error=canonical_sage2_max_error,
     )
 
 
@@ -208,7 +235,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if canonical_sage is not None:
         print(
             f"Canonical SageAttention: 2.2.0 @ {_CANONICAL_REVISION[:12]}; "
-            f"Q/K granularity: {canonical_qk_gran}; PV accumulation: fp32+fp16"
+            f"Q/K granularity: {canonical_qk_gran}; "
+            "PV accumulation: Sage2++ fp32+fp16, Sage2 fp32+fp32"
         )
     print()
     if canonical_sage is None:
@@ -221,11 +249,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         print(
             "| query | key/value | cold Piper (ms) | Piper p50 [p20, p80] (ms) | "
-            "canonical p50 [p20, p80] (ms) | SDPA p50 [p20, p80] (ms) | "
-            "canonical / Piper | SDPA / Piper | Piper mean/max error | "
-            "canonical mean/max error |"
+            "canonical Sage2++ p50 [p20, p80] (ms) | "
+            "canonical Sage2 p50 [p20, p80] (ms) | SDPA p50 [p20, p80] (ms) | "
+            "Sage2 / Sage2++ | Sage2++ / Piper | SDPA / Piper | Piper mean/max error | "
+            "Sage2++ mean/max error | Sage2 mean/max error |"
         )
-        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for query_sequence in args.sequence:
         key_sequence = args.kv_sequence or query_sequence
         result = _run_shape(
@@ -240,7 +269,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             canonical_sage,
             canonical_qk_gran,
         )
-        if result.canonical is None:
+        if result.canonical_sage2pp is None:
             print(
                 f"| {result.query_sequence} | {result.key_sequence} | {result.cold_ms:.3f} "
                 f"| {result.sage.display()} "
@@ -248,16 +277,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"| {result.mean_error:.6f} | {result.max_error:.6f} |"
             )
         else:
-            assert result.canonical_speedup is not None
-            assert result.canonical_mean_error is not None
-            assert result.canonical_max_error is not None
+            assert result.canonical_sage2 is not None
+            assert result.canonical_sage2pp_speedup is not None
+            assert result.canonical_accumulator_speedup is not None
+            assert result.canonical_sage2pp_mean_error is not None
+            assert result.canonical_sage2pp_max_error is not None
+            assert result.canonical_sage2_mean_error is not None
+            assert result.canonical_sage2_max_error is not None
             print(
                 f"| {result.query_sequence} | {result.key_sequence} | {result.cold_ms:.3f} "
                 f"| {result.sage.display()} "
-                f"| {result.canonical.display()} | {result.sdpa.display()} "
-                f"| {result.canonical_speedup:.2f}x | {result.speedup:.2f}x "
+                f"| {result.canonical_sage2pp.display()} | {result.canonical_sage2.display()} "
+                f"| {result.sdpa.display()} | {result.canonical_accumulator_speedup:.2f}x "
+                f"| {result.canonical_sage2pp_speedup:.2f}x | {result.speedup:.2f}x "
                 f"| {result.mean_error:.6f}/{result.max_error:.6f} "
-                f"| {result.canonical_mean_error:.6f}/{result.canonical_max_error:.6f} |"
+                f"| {result.canonical_sage2pp_mean_error:.6f}/"
+                f"{result.canonical_sage2pp_max_error:.6f} "
+                f"| {result.canonical_sage2_mean_error:.6f}/"
+                f"{result.canonical_sage2_max_error:.6f} |"
             )
 
 
