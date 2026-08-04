@@ -5,7 +5,7 @@ description = "Reusable PyTorch inference operators and Triton kernels."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
     "torch>=2.12",
 ]
@@ -33,7 +33,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
@@ -65,7 +65,7 @@ known-first-party = ["piper_kernels"]
 [tool.pyright]
 include = ["src/piper_kernels"]
 exclude = ["tests", "benchmarks"]
-pythonVersion = "3.10"
+pythonVersion = "3.14"
 typeCheckingMode = "standard"
 reportMissingImports = "none"
 reportPrivateImportUsage = "none"
