@@ -107,9 +107,10 @@ def _finish_kv_statistics_kernel(
         mask=offsets_d < head_dim,
     )
     value_scale = tl.max(value_maxima, axis=0) / _V_FP8_RANGE + _SCALE_EPSILON
+    # Fold the probability range into the scale consumed by the attention loop.
     tl.store(
         value_scale_ptr + output_offsets,
-        value_scale,
+        value_scale / _P_FP8_RANGE,
         mask=offsets_d < head_dim,
     )
 
@@ -120,6 +121,7 @@ def _quantize_query_kernel(
     output_ptr,
     scale_ptr,
     query_length,
+    softmax_scale,
     stride_qb,
     stride_qh,
     stride_qn,
@@ -161,7 +163,7 @@ def _quantize_query_kernel(
     )
     tl.store(
         scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
-        scale,
+        scale * (softmax_scale * _LOG2_E),
         mask=offsets_n < query_length,
     )
 
@@ -190,12 +192,7 @@ def _quantize_key_kernel(
     key_block = scale_group // 4
     thread = scale_group % 4
     group_offsets = tl.arange(0, 16)
-    offsets_n = (
-        key_block * 64
-        + (group_offsets // 2) * 8
-        + (group_offsets % 2)
-        + thread * 2
-    )
+    offsets_n = key_block * 64 + (group_offsets // 2) * 8 + (group_offsets % 2) + thread * 2
     offsets_d = tl.arange(0, head_dim)
     mask = offsets_n[:, None] < key_length
     mean = tl.load(mean_ptr + (batch * heads + head) * head_dim + offsets_d)
@@ -259,7 +256,7 @@ def _quantize_value_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
+    scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d) * _P_FP8_RANGE
     quantized = (value / scale[None, :]).to(tl.float8e4nv)
     tl.store(
         output_ptr
@@ -283,23 +280,6 @@ def _sage_attention_kernel(
     output_ptr,
     query_length,
     key_length,
-    softmax_scale,
-    stride_qb,
-    stride_qh,
-    stride_qn,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_qsb,
-    stride_qsh,
-    stride_ksb,
-    stride_ksh,
-    stride_ob,
-    stride_oh,
-    stride_on,
     is_causal: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -315,15 +295,13 @@ def _sage_attention_kernel(
 
     query = tl.load(
         query_ptr
-        + batch * stride_qb
-        + head * stride_qh
-        + offsets_m[:, None] * stride_qn
+        + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
         + offsets_d[None, :],
         mask=offsets_m[:, None] < query_length,
         other=0,
     )
     query_scale = tl.load(
-        query_scale_ptr + batch * stride_qsb + head * stride_qsh + offsets_m,
+        query_scale_ptr + (batch * heads + head) * query_length + offsets_m,
         mask=offsets_m < query_length,
         other=0.0,
     )
@@ -336,29 +314,22 @@ def _sage_attention_kernel(
     if is_causal:
         end_n = tl.minimum(key_length, (query_block + 1) * block_m)
 
-    for start_n in range(0, end_n, block_n):
+    for start_n in tl.range(0, end_n, block_n, disable_licm=True):
         current_n = start_n + offsets_n
         key = tl.load(
             key_ptr
-            + batch * stride_kb
-            + head * stride_kh
-            + current_n[None, :] * stride_kn
+            + ((batch * heads + head) * key_length + current_n[None, :]) * head_dim
             + offsets_d[:, None],
             mask=current_n[None, :] < key_length,
             other=0,
         )
         integer_scores = tl.dot(query, key)
         key_scale = tl.load(
-            key_scale_ptr + batch * stride_ksb + head * stride_ksh + current_n,
+            key_scale_ptr + (batch * heads + head) * key_length + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
-        scores = (
-            integer_scores.to(tl.float32)
-            * query_scale[:, None]
-            * key_scale[None, :]
-            * (softmax_scale * _LOG2_E)
-        )
+        scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
         valid_keys = current_n[None, :] < key_length
         if is_causal:
             valid_keys &= current_n[None, :] <= offsets_m[:, None]
@@ -374,9 +345,7 @@ def _sage_attention_kernel(
         probability_fp8 = (probabilities * _P_FP8_RANGE).to(tl.float8e4nv)
         value = tl.load(
             value_ptr
-            + batch * stride_vb
-            + head * stride_vh
-            + current_n[:, None] * stride_vn
+            + ((batch * heads + head) * key_length + current_n[:, None]) * head_dim
             + offsets_d[None, :],
             mask=current_n[:, None] < key_length,
             other=0.0,
@@ -387,21 +356,32 @@ def _sage_attention_kernel(
             acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
             out_dtype=tl.float16,
         )
-        accumulator += partial_fp16.to(tl.float32) * (
-            value_scale[None, :] / _P_FP8_RANGE
-        )
+        accumulator += partial_fp16.to(tl.float32) * value_scale[None, :]
         running_max = next_max
 
     output = accumulator / denominator[:, None]
     tl.store(
         output_ptr
-        + batch * stride_ob
-        + head * stride_oh
-        + offsets_m[:, None] * stride_on
+        + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
         + offsets_d[None, :],
         output,
         mask=offsets_m[:, None] < query_length,
     )
+
+
+def _select_query_block(
+    query: torch.Tensor,
+    batch: int,
+    heads: int,
+    query_length: int,
+) -> int:
+    """Choose the largest tile that launches at least one CTA per SM."""
+    num_sms = torch.cuda.get_device_properties(query.device).multi_processor_count
+    parallelism = batch * heads
+    for block_m in (128, 64):
+        if triton.cdiv(query_length, block_m) * parallelism >= num_sms:
+            return block_m
+    return 32
 
 
 @torch.library.custom_op("piper_kernels::sage_attention_2pp", mutates_args=())
@@ -457,9 +437,15 @@ def triton_sage_attention(
         num_warps=4,
     )
 
-    query_int8 = torch.empty_like(query, dtype=torch.int8)
-    key_int8 = torch.empty_like(key, dtype=torch.int8)
-    value_fp8 = torch.empty_like(value, dtype=torch.float8_e4m3fn)
+    # Contiguous intermediates let the hot kernel specialize its indexing while
+    # these preprocessing kernels continue to accept arbitrary input strides.
+    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+    key_int8 = torch.empty(key.shape, device=query.device, dtype=torch.int8)
+    value_fp8 = torch.empty(
+        value.shape,
+        device=query.device,
+        dtype=torch.float8_e4m3fn,
+    )
     query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
     key_scale = torch.empty(key.shape[:3], device=query.device, dtype=torch.float32)
 
@@ -469,6 +455,7 @@ def triton_sage_attention(
         query_int8,
         query_scale,
         query_length,
+        scale,
         query.stride(0),
         query.stride(1),
         query.stride(2),
@@ -517,8 +504,11 @@ def triton_sage_attention(
         num_warps=4,
     )
 
-    output = torch.empty_like(query)
-    attention_grid = (triton.cdiv(query_length, 128), heads, batch)
+    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+    # The 128-row causal variant creates severe accumulator spills in the
+    # current NVIDIA lowering; 64 rows avoids that spill-heavy code shape.
+    block_m = 64 if is_causal else _select_query_block(query, batch, heads, query_length)
+    attention_grid = (triton.cdiv(query_length, block_m), heads, batch)
     _sage_attention_kernel[attention_grid](
         query_int8,
         key_int8,
@@ -529,27 +519,10 @@ def triton_sage_attention(
         output,
         query_length,
         key_length,
-        scale,
-        query_int8.stride(0),
-        query_int8.stride(1),
-        query_int8.stride(2),
-        key_int8.stride(0),
-        key_int8.stride(1),
-        key_int8.stride(2),
-        value_fp8.stride(0),
-        value_fp8.stride(1),
-        value_fp8.stride(2),
-        query_scale.stride(0),
-        query_scale.stride(1),
-        key_scale.stride(0),
-        key_scale.stride(1),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
         is_causal=is_causal,
         heads=heads,
         head_dim=head_dim,
-        block_m=128,
+        block_m=block_m,
         block_n=64,
         num_stages=3,
         num_warps=4,
