@@ -14,7 +14,7 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 | Package | Role |
 |---|---|
 | `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
-| `piper_kernels.attention` | Attention operators, including a future SageAttention backend |
+| `piper_kernels.attention` | SageAttention2++ 8+8 inference for consumer Ada and Blackwell GPUs |
 
 ## ConvRot INT8
 
@@ -44,6 +44,32 @@ The operator selects its Triton implementation on supported CUDA devices and oth
 uses the portable PyTorch reference. Install the tensor format and optimized backend with
 `piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, so
 future attention-only consumers do not inherit quantization-specific dependencies.
+
+## SageAttention2++
+
+The attention package provides a pure-Triton implementation of the canonical 8+8
+SageAttention2++ forward path:
+
+```python
+from piper_kernels.attention import sage_attention
+
+output = sage_attention(query, key, value, is_causal=False)
+```
+
+Inputs use `[batch, heads, sequence, head_dim]` layout and may be FP16 or BF16. The initial
+optimized backend targets RTX 40-series SM89 and RTX 50-series SM12x GPUs, supports head
+dimensions 64 and 128, equal query/KV head counts, causal or non-causal attention, and does
+not support autograd.
+
+The implementation follows SageAttention2++ rather than merely storing FP8 tensors: it
+smooths K, applies Sage's per-thread INT8 Q/K quantization, quantizes V per channel to E4M3,
+quantizes online-softmax probabilities to E4M3, accumulates each 64-key PV tile in FP16, and
+buffers the tile result in FP32. All device kernels are written in Triton; no CUDA extension
+or inline PTX is used. Unsupported devices use a slow portable quantized reference.
+
+Install the optimized backend with `piper-kernels[triton]`.
+See [benchmarks/README.md](benchmarks/README.md) for the revision-pinned official CUDA
+baseline and reproducible three-way comparison against Piper and PyTorch SDPA.
 
 ## Dependency direction
 

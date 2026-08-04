@@ -33,6 +33,12 @@ requires = ["uv_build>=0.9.8,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+benchmark = [
+    "ninja>=1.13",
+    "packaging>=26.0",
+    "sageattention==2.2.0; sys_platform == 'linux'",
+    "setuptools>=81.0",
+]
 dev = [
     "piper-kernels[convrot,triton]",
     "pre-commit>=4.0",
@@ -88,8 +94,16 @@ reportPrivateImportUsage = "none"
 # PyTorch 2.13's CUDA 13.0 index metadata currently carries mismatched hashes.
 # Keep local development on 2.12 without constraining published consumers.
 constraint-dependencies = ["torch<2.13"]
+# Canonical SageAttention imports the active PyTorch installation from setup.py
+# while compiling its CUDA extension.
+no-build-isolation-package = ["sageattention"]
+
+[[tool.uv.dependency-metadata]]
+name = "sageattention"
+version = "2.2.0"
 
 [tool.uv.sources]
+sageattention = { git = "https://github.com/thu-ml/SageAttention.git", rev = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5" }
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
