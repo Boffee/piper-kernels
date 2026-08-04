@@ -7,7 +7,7 @@ import torch
 from torchao.utils import TorchAOBaseTensor
 
 from .._rotation import rotate_groups
-from .dispatch import _linear
+from .dispatch import _addmm_, _linear
 from .reference import quantize_weight, validate_storage
 
 
@@ -123,3 +123,28 @@ def _convrot_linear_dispatch(
         weight.group_size,
         bias,
     )
+
+
+@ConvRotInt8Tensor.implements(torch.ops.aten.addmm_.default)
+def _convrot_addmm_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> ConvRotInt8Tensor:
+    weight, mat1, mat2 = args
+    if not isinstance(weight, ConvRotInt8Tensor):
+        raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
+    if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
+        raise TypeError("ConvRot addmm_ matrices must be tensors")
+    _addmm_(
+        weight.qdata,
+        weight.scale,
+        weight.dtype,
+        weight.group_size,
+        mat1,
+        mat2,
+        beta=kwargs.get("beta", 1),
+        alpha=kwargs.get("alpha", 1),
+    )
+    return weight

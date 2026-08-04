@@ -55,8 +55,7 @@ def validate_storage(
         )
     if scale.device != qdata.device:
         raise ValueError(
-            "ConvRot INT8 qdata and scale must share a device, "
-            f"got {qdata.device}/{scale.device}"
+            f"ConvRot INT8 qdata and scale must share a device, got {qdata.device}/{scale.device}"
         )
     if dtype not in _SUPPORTED_LOGICAL_DTYPES:
         raise ValueError(
@@ -67,8 +66,42 @@ def validate_storage(
 def dynamic_quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamically quantize each row to signed INT8 with a float32 scale."""
     scale = (value.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
-    qdata = (value / scale.to(value.dtype)).round().clamp(-128, 127).to(torch.int8)
+    logical_scale = scale.to(value.dtype)
+    if value.dtype is torch.float16:
+        scale_underflowed = logical_scale == 0
+        safe_logical_scale = torch.where(
+            scale_underflowed,
+            torch.ones_like(logical_scale),
+            logical_scale,
+        )
+        scaled = value / safe_logical_scale
+        scaled = torch.where(scale_underflowed, value.float() / scale, scaled.float())
+    else:
+        # The minimum scale remains representable in bfloat16 and float32.
+        scaled = value / logical_scale
+    qdata = scaled.round().clamp(-128, 127).to(torch.int8)
     return qdata, scale
+
+
+def reference_addmm_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    group_size: int,
+    beta: float,
+    alpha: float,
+) -> None:
+    """Add a matrix product to a logical ConvRot weight and requantize it in place."""
+    if beta == 0:
+        rotated_weight = torch.zeros(qdata.shape, device=qdata.device, dtype=mat1.dtype)
+    else:
+        rotated_weight = qdata.to(mat1.dtype) * scale.to(mat1.dtype)
+    rotated_mat2 = rotate_groups(mat2, group_size)
+    merged = torch.addmm(rotated_weight, mat1, rotated_mat2, beta=beta, alpha=alpha)
+    merged_qdata, merged_scale = dynamic_quantize_rows(merged)
+    qdata.copy_(merged_qdata)
+    scale.copy_(merged_scale)
 
 
 def reference_linear(

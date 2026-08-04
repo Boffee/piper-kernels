@@ -31,6 +31,24 @@ def _hadamard_stage(values, offsets, stride: tl.constexpr):
 
 
 @triton.jit
+def _normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
+    """Normalize values without dividing by an underflowed logical scale."""
+    if logical_dtype_code == 1:
+        logical_scale = scale.to(tl.float16)
+        safe_logical_scale = tl.where(logical_scale == 0, 1.0, logical_scale).to(tl.float16)
+        scaled = (values / safe_logical_scale).to(tl.float16)
+        return tl.where(
+            logical_scale == 0,
+            values.to(tl.float32) / scale,
+            scaled.to(tl.float32),
+        )
+    elif logical_dtype_code == 2:
+        return (values / scale.to(tl.bfloat16)).to(tl.bfloat16)
+    else:
+        return values / scale
+
+
+@triton.jit
 def _rotate_groups_kernel(
     x_ptr,
     out_ptr,
@@ -70,15 +88,63 @@ def _quantize_rows_kernel(
     mask = offsets < row_width
     values = tl.load(x_ptr + row * row_width + offsets, mask=mask, other=0.0)
     scale = tl.maximum(tl.max(tl.abs(values), axis=0) / 127.0, 1e-30)
-    if input_dtype_code == 1:
-        scaled = (values / scale.to(tl.float16)).to(tl.float16)
-    elif input_dtype_code == 2:
-        scaled = (values / scale.to(tl.bfloat16)).to(tl.bfloat16)
-    else:
-        scaled = values / scale
+    scaled = _normalize_for_int8(values, scale, input_dtype_code)
     quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
     tl.store(q_ptr + row * row_width + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row, scale)
+
+
+@triton.jit
+def _requantize_addmm_rows_kernel(
+    q_ptr,
+    scale_ptr,
+    update_ptr,
+    row_width,
+    stride_q_row,
+    stride_q_col,
+    stride_scale_row,
+    stride_update_row,
+    stride_update_col,
+    beta,
+    alpha,
+    block_size: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    has_base: tl.constexpr,
+    has_update: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < row_width
+    if has_base:
+        quantized = tl.load(
+            q_ptr + row * stride_q_row + offsets * stride_q_col,
+            mask=mask,
+            other=0,
+        )
+        old_scale = tl.load(scale_ptr + row * stride_scale_row)
+        values = beta * quantized.to(tl.float32) * old_scale
+    else:
+        values = tl.zeros((block_size,), dtype=tl.float32)
+    if has_update:
+        update = tl.load(
+            update_ptr + row * stride_update_row + offsets * stride_update_col,
+            mask=mask,
+            other=0.0,
+        )
+        values += alpha * update.to(tl.float32)
+    if logical_dtype_code == 1:
+        values = values.to(tl.float16)
+    elif logical_dtype_code == 2:
+        values = values.to(tl.bfloat16)
+    scale = tl.maximum(tl.max(tl.abs(values).to(tl.float32), axis=0) / 127.0, 1e-30)
+    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
+    quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+    tl.store(
+        q_ptr + row * stride_q_row + offsets * stride_q_col,
+        quantized,
+        mask=mask,
+    )
+    tl.store(scale_ptr + row * stride_scale_row, scale)
 
 
 @triton.jit
@@ -222,6 +288,62 @@ def triton_convrot_int8_linear(
         num_warps=4,
     )
     return output.reshape(*original_shape[:-1], n)
+
+
+def triton_convrot_int8_addmm_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    group_size: int,
+    beta: float,
+    alpha: float,
+) -> None:
+    """Apply an addmm update in the rotated basis and requantize the weight in place."""
+    out_features, in_features = qdata.shape
+    has_update = alpha != 0 and mat1.shape[1] != 0
+    if has_update:
+        mat2_contiguous = mat2.contiguous()
+        rotated_mat2 = torch.empty_like(mat2_contiguous)
+        groups_per_row = in_features // group_size
+        _rotate_groups_kernel[(mat2.shape[0] * groups_per_row,)](
+            mat2_contiguous,
+            rotated_mat2,
+            in_features,
+            groups_per_row,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            num_warps=4,
+        )
+        update = torch.mm(mat1, rotated_mat2)
+    else:
+        update = qdata
+
+    if mat1.dtype is torch.float16:
+        logical_dtype_code = 1
+    elif mat1.dtype is torch.bfloat16:
+        logical_dtype_code = 2
+    else:
+        logical_dtype_code = 0
+    requant_block = max(128, triton.next_power_of_2(in_features))
+    _requantize_addmm_rows_kernel[(out_features,)](
+        qdata,
+        scale,
+        update,
+        in_features,
+        qdata.stride(0),
+        qdata.stride(1),
+        scale.stride(0),
+        update.stride(0),
+        update.stride(1),
+        beta,
+        alpha,
+        block_size=requant_block,
+        logical_dtype_code=logical_dtype_code,
+        has_base=beta != 0,
+        has_update=has_update,
+        num_warps=8,
+    )
 
 
 @triton_convrot_int8_linear.register_fake

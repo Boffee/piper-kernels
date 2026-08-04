@@ -51,12 +51,8 @@ def test_from_hp_rotates_and_quantizes_each_weight_row(dtype: torch.dtype) -> No
     torch.manual_seed(12)
     weight = torch.randn(7, 32, dtype=dtype)
     rotated = rotate_groups(weight, 16)
-    expected_scale = (rotated.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(
-        min=1e-30
-    )
-    expected_qdata = (
-        (rotated / expected_scale.to(dtype)).round().clamp(-128, 127).to(torch.int8)
-    )
+    expected_scale = (rotated.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
+    expected_qdata = (rotated / expected_scale.to(dtype)).round().clamp(-128, 127).to(torch.int8)
 
     wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
 
@@ -76,6 +72,83 @@ def test_from_hp_detaches_quantized_storage_from_autograd() -> None:
 
     assert not wrapped.qdata.requires_grad
     assert not wrapped.scale.requires_grad
+
+
+@pytest.mark.parametrize(("beta", "alpha"), [(1, 1), (0.25, 1.75), (0, -0.5)])
+def test_addmm_updates_logical_weight_and_requantizes_in_place(
+    beta: float,
+    alpha: float,
+) -> None:
+    torch.manual_seed(21)
+    weight = torch.randn(7, 32)
+    mat1 = torch.randn(7, 5)
+    mat2 = torch.randn(5, 32)
+    wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
+    qdata = wrapped.qdata
+    scale = wrapped.scale
+    logical_before = wrapped.dequantize()
+    expected = ConvRotInt8Tensor.from_hp(
+        torch.addmm(logical_before, mat1, mat2, beta=beta, alpha=alpha),
+        group_size=16,
+    )
+
+    result = wrapped.addmm_(mat1, mat2, beta=beta, alpha=alpha)
+
+    assert result is wrapped
+    assert wrapped.qdata is qdata
+    assert wrapped.scale is scale
+    assert torch.equal(wrapped.qdata, expected.qdata)
+    assert torch.allclose(wrapped.scale, expected.scale, rtol=1e-6, atol=1e-7)
+
+
+def test_addmm_no_op_does_not_requantize_storage() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    mat1 = torch.randn(7, 5)
+    mat2 = torch.randn(5, 32)
+    qdata_before = wrapped.qdata.clone()
+    scale_before = wrapped.scale.clone()
+    qdata_version = wrapped.qdata._version
+    scale_version = wrapped.scale._version
+
+    wrapped.addmm_(mat1, mat2, alpha=0)
+
+    assert torch.equal(wrapped.qdata, qdata_before)
+    assert torch.equal(wrapped.scale, scale_before)
+    assert wrapped.qdata._version == qdata_version
+    assert wrapped.scale._version == scale_version
+
+
+@pytest.mark.parametrize(
+    ("mat1", "mat2", "message"),
+    [
+        (torch.empty(7, 5, 1), torch.empty(5, 32), "matrices must be 2-D"),
+        (torch.empty(8, 5), torch.empty(5, 32), "shape mismatch"),
+        (torch.empty(7, 5), torch.empty(6, 32), "shape mismatch"),
+        (torch.empty(7, 5), torch.empty(5, 48), "shape mismatch"),
+        (torch.empty(7, 5, dtype=torch.float16), torch.empty(5, 32), "logical dtype"),
+    ],
+)
+def test_addmm_rejects_invalid_matrices(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    message: str,
+) -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+
+    with pytest.raises(ValueError, match=message):
+        wrapped.addmm_(mat1, mat2)
+
+
+def test_addmm_rejects_autograd_inputs() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    mat1 = torch.randn(7, 5, requires_grad=True)
+    mat2 = torch.randn(5, 32)
+
+    with pytest.raises(RuntimeError, match="does not support autograd"):
+        wrapped.addmm_(mat1, mat2)
+
+    with torch.no_grad():
+        assert wrapped.addmm_(mat1, mat2) is wrapped
 
 
 @pytest.mark.gpu

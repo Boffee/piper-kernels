@@ -27,7 +27,16 @@ from piper_kernels.convrot import ConvRotInt8Tensor
 weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=64)
 checkpoint_weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
 output = torch.nn.functional.linear(activation, weight, bias)
+
+# In-place low-rank update with the standard Tensor.addmm_ contract.
+weight.addmm_(lora_b, lora_a, alpha=lora_strength)
 ```
+
+`addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
+the result. It preserves the ConvRot tensor and packed storage identities, allowing
+offload integrations to keep their existing buffers. Repeated updates are lossy, so
+reload a pristine base weight before changing or removing a previously merged adapter.
+This is an inference operation and does not support autograd.
 
 The operator selects its Triton implementation on supported CUDA devices and otherwise
 uses the portable PyTorch reference. Install the tensor format and optimized backend with
