@@ -358,6 +358,7 @@ def _uint8_pv_feature_convrot_attention_kernel(
     tile_probability_scale: tl.constexpr,
     log_probability_scale: tl.constexpr,
     shift_log_scores: tl.constexpr,
+    omit_log_scale_shift: tl.constexpr,
     weighted_log_denominator: tl.constexpr,
     scale_forward_log_recurrence: tl.constexpr,
     running_max_probability_recurrence: tl.constexpr,
@@ -516,7 +517,7 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 # = sum(exp(y) Vq) / sum(exp(y) / s_v).
                 # This gives fixed-range UINT8 probabilities without the
                 # separate max(P * s_v) reduction used by dynamic mode.
-                if shift_log_scores:
+                if shift_log_scores and not omit_log_scale_shift:
                     if unmasked_self_attention:
                         key_value_log_scale = tl.load(
                             value_log_scale_ptr
@@ -542,7 +543,7 @@ def _uint8_pv_feature_convrot_attention_kernel(
                     other=0.0,
                 )
 
-        if scale_forward_log_recurrence:
+        if scale_forward_log_recurrence and not omit_log_scale_shift:
             block_max = tl.max(shifted_scores, axis=1)
         else:
             block_max = tl.max(scores, axis=1)
@@ -1996,6 +1997,7 @@ def _launch_uint8_pv_feature_convrot_attention(
     num_stages: int,
     value_transposed: bool = True,
     shift_log_scores: bool = True,
+    omit_log_scale_shift: bool = False,
     weighted_log_denominator: bool = True,
     scale_forward_log_recurrence: bool = False,
     running_max_probability_recurrence: bool = False,
@@ -2095,6 +2097,12 @@ def _launch_uint8_pv_feature_convrot_attention(
         raise ValueError(
             "scale-forward recurrence requires compatible per-key log recurrence"
         )
+    if omit_log_scale_shift and (
+        not scale_forward_log_recurrence
+        or value_scale_axis != "key"
+        or probability_scale_mode != "log"
+    ):
+        raise ValueError("omitting the log-scale shift requires per-key scale-forward recurrence")
     if fp16_pv_scaling and (
         not scale_forward_log_recurrence
         or not affine_probability
@@ -2259,7 +2267,10 @@ def _launch_uint8_pv_feature_convrot_attention(
             "normalized FP16 recurrence requires per-key log scaling without an INT32 recurrence"
         )
     if scaled_fp16_numerator and (
-        not scale_forward_log_recurrence
+        value_scale_axis != "key"
+        or probability_scale_mode != "log"
+        or not shift_log_scores
+        or not weighted_log_denominator
         or not affine_probability
         or not native_uint8_mma
         or head_dim != 128
@@ -2272,11 +2283,12 @@ def _launch_uint8_pv_feature_convrot_attention(
         or probability_fp16
         or running_max_probability_recurrence
         or immediate_k32_pv_conversion
+        or tile_common_log_denominator
         or key_length > 131072
     ):
         raise ValueError(
-            "scaled FP16 numerator requires native-UINT8 D128 scale-forward "
-            "recurrence with K <= 131072"
+            "scaled FP16 numerator requires a compatible native-UINT8 D128 "
+            "per-key log recurrence with K <= 131072"
         )
     if scaled_fp16_denominator and not scaled_fp16_numerator:
         raise ValueError("scaled FP16 denominator requires the scaled FP16 numerator")
@@ -2347,6 +2359,7 @@ def _launch_uint8_pv_feature_convrot_attention(
             tile_probability_scale=probability_scale_mode == "tile",
             log_probability_scale=probability_scale_mode == "log",
             shift_log_scores=shift_log_scores,
+            omit_log_scale_shift=omit_log_scale_shift,
             weighted_log_denominator=weighted_log_denominator,
             scale_forward_log_recurrence=scale_forward_log_recurrence,
             running_max_probability_recurrence=running_max_probability_recurrence,

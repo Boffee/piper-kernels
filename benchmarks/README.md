@@ -843,6 +843,40 @@ both measured 41.62 dB mean / 37.99 dB worst output SQNR and 0.0072 relative L1.
 numerator therefore selects FP16 multiplier metadata by default, while
 `fp32_pv_scale_metadata=True` retains the old control.
 
+The final M128 schedule was then profiled specifically to separate key-scale arithmetic from
+the recurrence and compiler schedule. Removing the `log2(s_v[k])` score shift while retaining
+the per-key `255*s_v[k]` PV multiplier is an intentionally low-quality ceiling. Three repeated
+profiles measured:
+
+| N | exact key-scaled ms | no-log-shift ceiling ms | log-shift cost |
+|---:|---:|---:|---:|
+| 8192 | 1.6745 | 1.6517 | 1.38% |
+| 32768 | 25.6858 | 25.2731 | 1.63% |
+| 131072 | 405.9269 | 400.5775 | 1.34% |
+
+The PV multiplier is not the bottleneck in this schedule. Forming `255*s_v[k]` inside the loop
+was tied with loading the prepared multiplier at 32K, while omitting the multiplication or using
+a separate scale descriptor was slower. The original weighted-denominator recurrence and an
+INT8-denominator control were also 1.4% and 2.8% slower at 8K. Therefore the remaining useful
+key-specific ceiling is only the roughly 1.5% log-coordinate shift; the earlier M64 result that
+attributed another 1-2% to the PV multiplier does not transfer to M128.
+
+Several ways of approximating or rescheduling the log maximum were rejected. A separable
+`max(score)+max(log_scale)` bound introduced a reduction barrier; preparing its K64 scalar and
+issuing the load before QK still measured 1.696 ms. Computing the maximum in FP16 measured
+1.688 ms, deriving the log from `255*s_v` measured 1.855 ms, and prefetching the exact log vector
+before QK measured 1.736 ms. These either add conversion/reduction work or lengthen metadata
+live ranges, so none was retained in the attention kernel.
+
+A matched 32K generated-code comparison measured 24.710 ms for fixed UINT8, 25.277 ms for the
+no-log ceiling, and 25.753 ms for exact key scaling. The residual after removing the log shift
+comes primarily from maintaining the rescalable online numerator, not from loading key-scale
+metadata. FP32 M128 recurrence spilled 54 slots and took 34.67 ms; an unscaled BF16 prototype
+spilled 66 slots and took 37.18 ms. Register caps from R248 through R176 retained two-CTA
+residency and slowed the kernel, while R168 reached three CTAs only by spilling 54 slots and took
+2.06 ms at 8K. The selected uncapped scaled-FP16 numerator is consequently the best measured
+quality-preserving key-scaled formulation on SM120.
+
 The K512 run kernel likewise benefits from specializing complete noncausal self-attention tiles:
 same-process A/B measurements improved hot latency by 0.4-1.8% at N=8192, 2.2% at N=32768, and
 1.8-2.6% at N=131072, with only BF16-rounding-level output differences. This is selected for the
