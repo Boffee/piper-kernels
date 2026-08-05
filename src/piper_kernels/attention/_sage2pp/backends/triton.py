@@ -514,6 +514,43 @@ def _load_attention_value_tile(
 
 
 @triton.jit
+def _load_attention_value_subtile(
+    value_ptr,
+    batch,
+    head,
+    batch_head,
+    start_n,
+    current_n,
+    offsets_d,
+    key_length,
+    feature_start: tl.constexpr,
+    feature_block: tl.constexpr,
+    value_transposed: tl.constexpr,
+    use_tensor_descriptors: tl.constexpr,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """Load one output-feature slice of a V tile."""
+    if use_tensor_descriptors:
+        return (
+            value_ptr.load([batch_head, feature_start, start_n]).reshape((feature_block, block_n)).T
+        )
+    else:
+        return _load_value_tile(
+            value_ptr,
+            batch,
+            head,
+            current_n,
+            offsets_d + feature_start,
+            key_length,
+            value_transposed,
+            heads,
+            head_dim,
+        )
+
+
+@triton.jit
 def _sage_attention_kernel(
     query_ptr,
     key_ptr,
@@ -675,19 +712,21 @@ def _make_attention_tensor_descriptors(
     heads: int,
     key_length: int,
     head_dim: int,
+    value_block_d: int | None = None,
+    block_n: int = 64,
 ) -> tuple[TensorDescriptor, TensorDescriptor]:
     """Describe flattened-BH K and feature-major V for descriptor loads."""
     key_descriptor = TensorDescriptor(
         base=key,
         shape=[batch * heads, key_length, head_dim],
         strides=[key_length * head_dim, head_dim, 1],
-        block_shape=[1, 64, head_dim],
+        block_shape=[1, block_n, head_dim],
     )
     value_descriptor = TensorDescriptor(
         base=value,
         shape=[batch * heads, head_dim, key_length],
         strides=[head_dim * key_length, key_length, 1],
-        block_shape=[1, head_dim, 64],
+        block_shape=[1, head_dim if value_block_d is None else value_block_d, block_n],
     )
     return key_descriptor, value_descriptor
 
@@ -710,6 +749,24 @@ def _should_use_attention_tensor_descriptors(
     )
 
 
+def _should_use_split_pv_tensor_descriptors(
+    query: torch.Tensor,
+    block_m: int,
+    head_dim: int,
+    key_length: int,
+    value_transposed: bool,
+) -> bool:
+    """Use D64 V descriptors for the measured split-PV SM120 schedule."""
+    device_major = torch.cuda.get_device_capability(query.device)[0]
+    return (
+        device_major == 12
+        and block_m == 64
+        and head_dim == 128
+        and key_length % 16 == 0
+        and value_transposed
+    )
+
+
 def _make_attention_arguments(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -719,6 +776,8 @@ def _make_attention_arguments(
     head_dim: int,
     value_transposed: bool,
     use_tensor_descriptors: bool,
+    value_block_d: int | None = None,
+    block_n: int = 64,
 ) -> tuple[torch.Tensor | TensorDescriptor, torch.Tensor | TensorDescriptor]:
     if not use_tensor_descriptors:
         return key, value
@@ -731,6 +790,8 @@ def _make_attention_arguments(
         heads,
         key_length,
         head_dim,
+        value_block_d,
+        block_n,
     )
 
 
@@ -776,6 +837,23 @@ def _run_sage_attention(
     batch, heads, query_length, head_dim = query.shape
     compiled_rotation_group = 0 if rotation_group is None else rotation_group
     key_length = key.shape[2]
+    # The 128-row causal variant creates severe accumulator spills in the
+    # current NVIDIA lowering; 64 rows avoids that spill-heavy code shape.
+    block_m = 64 if is_causal else _select_query_block(query, batch, heads, query_length)
+    padded_key_length = int(triton.cdiv(key_length, 64)) * 64
+    if use_tensor_descriptors is None:
+        use_tensor_descriptors = _should_use_attention_tensor_descriptors(
+            query,
+            block_m,
+            head_dim,
+            padded_key_length,
+            value_transposed,
+        )
+    storage_key_length = (
+        padded_key_length
+        if use_tensor_descriptors and key_length % 16 != 0
+        else key_length
+    )
     statistics_block = 256
     num_partials = (key_length + statistics_block - 1) // statistics_block
     partial_shape = (batch, heads, num_partials, head_dim)
@@ -821,14 +899,25 @@ def _run_sage_attention(
     # Contiguous intermediates let the hot kernel specialize its indexing while
     # these preprocessing kernels continue to accept arbitrary input strides.
     query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
-    key_int8 = torch.empty(key.shape, device=query.device, dtype=torch.int8)
-    value_fp8_shape = (
-        (batch, heads, head_dim, key_length) if value_transposed else value.shape
+    key_int8_shape = (batch, heads, storage_key_length, head_dim)
+    key_int8 = (
+        torch.zeros(key_int8_shape, device=query.device, dtype=torch.int8)
+        if storage_key_length != key_length
+        else torch.empty(key_int8_shape, device=query.device, dtype=torch.int8)
     )
-    value_fp8 = torch.empty(
-        value_fp8_shape,
-        device=query.device,
-        dtype=torch.float8_e4m3fn,
+    value_fp8_shape = (
+        (batch, heads, head_dim, storage_key_length)
+        if value_transposed
+        else (batch, heads, storage_key_length, head_dim)
+    )
+    value_fp8 = (
+        torch.zeros(value_fp8_shape, device=query.device, dtype=torch.float8_e4m3fn)
+        if storage_key_length != key_length
+        else torch.empty(
+            value_fp8_shape,
+            device=query.device,
+            dtype=torch.float8_e4m3fn,
+        )
     )
     if grouped_qk is None:
         grouped_qk = torch.cuda.get_device_capability(query.device)[0] == 12
@@ -951,29 +1040,17 @@ def _run_sage_attention(
     )
 
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-    # The 128-row causal variant creates severe accumulator spills in the
-    # current NVIDIA lowering; 64 rows avoids that spill-heavy code shape.
-    block_m = 64 if is_causal else _select_query_block(query, batch, heads, query_length)
-    if use_tensor_descriptors is None:
-        use_tensor_descriptors = _should_use_attention_tensor_descriptors(
-            query,
-            block_m,
-            head_dim,
-            key_length,
-            value_transposed,
-        )
-    attention_grid = (triton.cdiv(query_length, block_m), heads, batch)
     key_argument, value_argument = _make_attention_arguments(
         key_int8,
         value_fp8,
         batch,
         heads,
-        key_length,
+        storage_key_length,
         head_dim,
         value_transposed,
         use_tensor_descriptors,
     )
-    _sage_attention_kernel[attention_grid](
+    _sage_attention_kernel[(triton.cdiv(query_length, block_m), heads, batch)](
         query_int8,
         key_argument,
         value_argument,

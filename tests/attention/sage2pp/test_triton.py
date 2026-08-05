@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from piper_kernels.attention import sage_attention
+from piper_kernels.attention._sage2pp.backends.triton import _run_sage_attention
 from piper_kernels.attention._sage2pp.reference import reference_sage_attention
+
+
+def _sm120_available() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
 
 
 def _consumer_fp8_available() -> bool:
@@ -75,6 +80,31 @@ def test_triton_supports_rectangular_and_strided_inputs() -> None:
     assert torch.isfinite(actual).all()
     assert error.mean().item() < 0.01
     assert error.max().item() < 0.2
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="tensor-descriptor padding is currently selected on SM12x",
+)
+def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
+    torch.manual_seed(441)
+    query = torch.randn(1, 24, 1025, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    with torch.no_grad():
+        actual = sage_attention(query, key, value)
+        expected = _run_sage_attention(
+            query,
+            key,
+            value,
+            128**-0.5,
+            False,
+            qk_quantization_range=127,
+            use_tensor_descriptors=False,
+        )
+
+    assert torch.equal(actual, expected)
 
 
 def test_triton_runs_under_torch_compile() -> None:

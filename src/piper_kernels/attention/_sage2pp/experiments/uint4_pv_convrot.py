@@ -334,9 +334,14 @@ def _prepare_qk(
     key: torch.Tensor,
     scale: float,
     grouped_qk: bool,
+    storage_key_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
+    if storage_key_length is None:
+        storage_key_length = key_length
+    if storage_key_length < key_length:
+        raise ValueError("storage key length must cover the semantic key length")
     statistics_block = 256
     num_partials = (key_length + statistics_block - 1) // statistics_block
     partial_shape = (batch, heads, num_partials, head_dim)
@@ -368,7 +373,12 @@ def _prepare_qk(
     )
 
     query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
-    key_int8 = torch.empty(key.shape, device=query.device, dtype=torch.int8)
+    key_int8_shape = (batch, heads, storage_key_length, head_dim)
+    key_int8 = (
+        torch.zeros(key_int8_shape, device=query.device, dtype=torch.int8)
+        if storage_key_length != key_length
+        else torch.empty(key_int8_shape, device=query.device, dtype=torch.int8)
+    )
     if grouped_qk:
         query_scale_groups = (query_length + _Q_BLOCK - 1) // _Q_BLOCK
         key_scale_groups = (key_length + _K_BLOCK - 1) // _K_BLOCK

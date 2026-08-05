@@ -187,7 +187,12 @@ def _run_shape(
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequence", type=int, nargs="+", default=[512, 1024, 2048, 4096])
+    parser.add_argument(
+        "--sequence",
+        type=int,
+        nargs="+",
+        default=[512, 1024, 2048, 4096, 8192],
+    )
     parser.add_argument(
         "--kv-sequence",
         type=int,

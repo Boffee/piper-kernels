@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 from piper_kernels.attention._convrot_reference import rotate_attention_groups
 from piper_kernels.attention._sage2pp.backends.triton import _run_sage_attention
 from piper_kernels.attention._sage2pp.experiments import (
+    triton_sage_attention_uint8_pv_bucketed_grouped,
     triton_sage_attention_uint8_pv_feature_convrot,
 )
 from piper_kernels.attention._sage2pp.reference import (
@@ -24,6 +25,9 @@ from piper_kernels.attention._sage2pp.reference import (
 )
 
 _TILE_K = 64
+_GROUPED_TILE_K = 128
+_GROUPED_SCALE_RUN_K = 512
+_RANGE_BUCKET_LOG2_SCALE = 2
 _P_RANGE = 255
 _V_RANGE = 127
 
@@ -245,6 +249,86 @@ def _quantized_attention(
     return output, value_sqnr
 
 
+def _sort_transformed_value(
+    scores: torch.Tensor,
+    value: torch.Tensor,
+    transform: Transform,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a feature basis and stably sort paired score/V rows by range."""
+    transformed = _apply_transform(value.float(), transform.forward)
+    row_range = transformed.abs().amax(dim=-1).clamp_min(1e-30)
+    bucket = torch.floor(torch.log2(row_range) * _RANGE_BUCKET_LOG2_SCALE)
+    order = torch.argsort(bucket, dim=-1, stable=True)
+    sorted_value = torch.gather(
+        transformed,
+        2,
+        order[..., None].expand_as(transformed),
+    )
+    sorted_scores = torch.gather(
+        scores,
+        -1,
+        order[:, :, None, :].expand_as(scores),
+    )
+    return sorted_scores, sorted_value
+
+
+def _grouped_scale_run_attention(
+    scores: torch.Tensor,
+    value: torch.Tensor,
+    transform: Transform,
+    feature_group: int,
+) -> torch.Tensor:
+    """Reference K128 UINT8-P attention with K512 grouped INT8-V scales."""
+    feature_groups = value.shape[-1] // feature_group
+    value_int = torch.empty_like(value)
+    scale_vectors: list[torch.Tensor] = []
+    for run_start in range(0, value.shape[2], _GROUPED_SCALE_RUN_K):
+        run_stop = min(run_start + _GROUPED_SCALE_RUN_K, value.shape[2])
+        value_run = value[:, :, run_start:run_stop]
+        grouped = value_run.reshape(
+            *value_run.shape[:-1],
+            feature_groups,
+            feature_group,
+        )
+        value_scale = grouped.abs().amax(dim=(2, 4)) / _V_RANGE + 1e-7
+        scale_vectors.append(value_scale.repeat_interleave(feature_group, dim=-1))
+        value_int[:, :, run_start:run_stop] = (
+            (grouped / value_scale[:, :, None, :, None])
+            .round()
+            .clamp(-_V_RANGE, _V_RANGE)
+            .reshape_as(value_run)
+        )
+
+    accumulator = torch.zeros(
+        (*scores.shape[:-1], value.shape[-1]),
+        device=value.device,
+        dtype=torch.float32,
+    )
+    denominator = torch.zeros(scores.shape[:-1], device=value.device, dtype=torch.float32)
+    running_max = torch.full_like(denominator, -float("inf"))
+    for start in range(0, value.shape[2], _GROUPED_TILE_K):
+        stop = min(start + _GROUPED_TILE_K, value.shape[2])
+        block_scores = scores[..., start:stop]
+        block_max = block_scores.amax(dim=-1)
+        next_max = torch.maximum(running_max, block_max)
+        old_weight = torch.exp(running_max - next_max)
+        current_weight = torch.exp(block_max - next_max)
+        probability = torch.exp(block_scores - block_max[..., None])
+        probability_codes = (probability * _P_RANGE).round().clamp(0, _P_RANGE)
+        scale_vector = scale_vectors[start // _GROUPED_SCALE_RUN_K]
+        partial = torch.matmul(probability_codes, value_int[:, :, start:stop])
+        accumulator = (
+            accumulator * old_weight[..., None]
+            + partial
+            * scale_vector[:, :, None, :]
+            * (current_weight / _P_RANGE)[..., None]
+        )
+        denominator = denominator * old_weight + probability.sum(dim=-1) * current_weight
+        running_max = next_max
+    transformed_output = accumulator / denominator.clamp_min(1e-30)[..., None]
+    return _apply_transform(transformed_output, transform.inverse)
+
+
 def _sqnr(actual: torch.Tensor, expected: torch.Tensor) -> float:
     signal = expected.float().square().mean().clamp_min(1e-30)
     noise = (actual.float() - expected.float()).square().mean().clamp_min(1e-30)
@@ -252,7 +336,7 @@ def _sqnr(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 @torch.inference_mode()
-def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0915
+def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
     """Calibrate on the first prompt and evaluate transforms on held-out prompts."""
     args = _parse_args(argv)
     if not torch.cuda.is_available():
@@ -337,6 +421,17 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0915
     layer_measurements: dict[tuple[str, int], list[float]] = {}
     per_key_measurements: list[float] = []
     fp8_measurements: list[float] = []
+    grouped_transform_names = ("identity", "H64", "ZCA cond4", "ZCA cond8")
+    grouped_feature_groups = (4, 8, 16, 32, 64)
+    grouped_measurements: dict[tuple[str, int], list[float]] = {
+        (name, feature_group): []
+        for name in grouped_transform_names
+        for feature_group in grouped_feature_groups
+    }
+    grouped_zca_triton_groups = (16, 32, 64)
+    grouped_zca_triton_measurements: dict[int, list[float]] = {
+        feature_group: [] for feature_group in grouped_zca_triton_groups
+    }
 
     for capture in evaluation:
         query = capture.query.to("cuda")
@@ -368,15 +463,54 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0915
         )
         per_key_measurements.append(_sqnr(per_key_output, expected))
         for name, by_layer in transforms.items():
+            transform = by_layer[capture.layer]
             output, value_sqnr = _quantized_attention(
                 scores,
                 value,
-                by_layer[capture.layer],
+                transform,
             )
             output_sqnr = _sqnr(output, expected)
             value_measurements[name].append(value_sqnr)
             output_measurements[name].append(output_sqnr)
             layer_measurements.setdefault((name, capture.layer), []).append(output_sqnr)
+            if name in grouped_transform_names:
+                sorted_scores, sorted_value = _sort_transformed_value(
+                    scores,
+                    value,
+                    transform,
+                )
+                for feature_group in grouped_feature_groups:
+                    grouped_output = _grouped_scale_run_attention(
+                        sorted_scores,
+                        sorted_value,
+                        transform,
+                        feature_group,
+                    )
+                    grouped_measurements[(name, feature_group)].append(
+                        _sqnr(grouped_output, expected)
+                    )
+        zca_transform = transforms["ZCA cond8"][capture.layer]
+        transformed_value = _apply_transform(
+            value.float(),
+            zca_transform.forward,
+        ).to(value.dtype)
+        for feature_group in grouped_zca_triton_groups:
+            transformed_output = triton_sage_attention_uint8_pv_bucketed_grouped(
+                query,
+                key,
+                transformed_value,
+                query.shape[-1] ** -0.5,
+                False,
+                feature_group=feature_group,
+                scale_run_n=_GROUPED_SCALE_RUN_K,
+                maxnreg=224,
+            )
+            grouped_zca_triton_measurements[feature_group].append(
+                _sqnr(
+                    _apply_transform(transformed_output.float(), zca_transform.inverse),
+                    expected,
+                )
+            )
 
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"Model: {args.model}")
@@ -414,6 +548,24 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0915
             values = layer_measurements[(name, layer)]
             cells.append(f"{sum(values) / len(values):.2f}")
         print(f"| {layer} | " + " | ".join(cells) + " |")
+
+    print()
+    print("Sorted K512 scale runs with K128 UINT8-P tiles:")
+    print("| transform | V group | mean output SQNR | worst output SQNR |")
+    print("|:---|---:|---:|---:|")
+    for name in grouped_transform_names:
+        for feature_group in grouped_feature_groups:
+            outputs = grouped_measurements[(name, feature_group)]
+            print(
+                f"| {name} | {feature_group} | {sum(outputs) / len(outputs):.2f} dB "
+                f"| {min(outputs):.2f} dB |"
+            )
+    for feature_group in grouped_zca_triton_groups:
+        outputs = grouped_zca_triton_measurements[feature_group]
+        print(
+            f"| ZCA cond8 actual Triton | {feature_group} "
+            f"| {sum(outputs) / len(outputs):.2f} dB | {min(outputs):.2f} dB |"
+        )
 
 
 if __name__ == "__main__":

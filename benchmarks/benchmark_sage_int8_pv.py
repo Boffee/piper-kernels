@@ -1,4 +1,4 @@
-"""Benchmark direct signed-INT8 PV against Triton Sage2++ FP8 PV."""
+"""Benchmark fixed/block INT8 PV and optional native-UINT8 P against FP8 PV."""
 
 import argparse
 from collections.abc import Callable, Sequence
@@ -13,6 +13,7 @@ from piper_kernels.attention._sage2pp.experiments.int8_pv import (
     _launch_int8_pv_attention,
     _prepare_block_int8_pv_inputs,
     _prepare_int8_pv_inputs,
+    triton_sage_attention_int8_pv,
 )
 
 
@@ -60,7 +61,7 @@ def _select_fastest(
 
 
 @torch.inference_mode()
-def _run_shape(
+def _run_shape(  # noqa: PLR0915
     sequence: int,
     batch: int,
     heads: int,
@@ -70,6 +71,7 @@ def _run_shape(
     warmup_ms: int,
     repeat_ms: int,
     tune_ms: int,
+    native_uint8_mma: bool,
 ) -> None:
     query = torch.randn(batch, heads, sequence, head_dim, device="cuda", dtype=dtype)
     key = torch.randn_like(query)
@@ -105,6 +107,8 @@ def _run_shape(
     fp8_output = torch.empty_like(query)
     fp8_fp32_output = torch.empty_like(query)
     fixed_output = torch.empty_like(query)
+    fixed_split_output = torch.empty_like(query)
+    native_uint8_output = torch.empty_like(query) if native_uint8_mma else None
     block_output = torch.empty_like(query)
 
     block_ms = (32, 64) if sequence <= 512 else (32, 64, 128)
@@ -171,15 +175,33 @@ def _run_shape(
         output: torch.Tensor,
         *,
         block_scaled: bool,
+        split_pv_head_dim: bool = False,
+        native_unsigned_probability: bool = False,
+        unmasked_self_attention: bool = False,
     ) -> Callable[[Config], Callable[[], torch.Tensor]]:
         def make(config: Config) -> Callable[[], torch.Tensor]:
-            use_tensor_descriptors = _sage_backend._should_use_attention_tensor_descriptors(
-                query,
-                config.block_m,
-                head_dim,
-                sequence,
-                True,
-            )
+            if split_pv_head_dim:
+                use_tensor_descriptors = (
+                    unmasked_self_attention
+                    and torch.cuda.get_device_capability(query.device)[0] == 12
+                    and config.block_m == 128
+                    and head_dim == 128
+                    and sequence >= 8192
+                    and sequence % 16 == 0
+                ) or _sage_backend._should_use_split_pv_tensor_descriptors(
+                    query, config.block_m, head_dim, sequence, True
+                )
+            else:
+                use_tensor_descriptors = (
+                    _sage_backend._should_use_attention_tensor_descriptors(
+                        query,
+                        config.block_m,
+                        head_dim,
+                        sequence,
+                        True,
+                    )
+                    and config.block_n == 64
+                )
 
             def run() -> torch.Tensor:
                 return _launch_int8_pv_attention(
@@ -194,6 +216,9 @@ def _run_shape(
                     num_warps=4,
                     num_stages=config.num_stages,
                     block_scaled_pv=block_scaled,
+                    split_pv_head_dim=split_pv_head_dim,
+                    native_unsigned_probability=native_unsigned_probability,
+                    unmasked_self_attention=unmasked_self_attention,
                     use_tensor_descriptors=use_tensor_descriptors,
                 )
 
@@ -216,6 +241,41 @@ def _run_shape(
         make_int8(fixed_prepared, fixed_output, block_scaled=False),
         tune_ms,
     )
+    if head_dim == 128:
+        fixed_split_config, fixed_split_hot = _select_fastest(
+            fixed_configs,
+            make_int8(
+                fixed_prepared,
+                fixed_split_output,
+                block_scaled=False,
+                split_pv_head_dim=True,
+                unmasked_self_attention=sequence % 128 == 0,
+            ),
+            tune_ms,
+        )
+    else:
+        fixed_split_config, fixed_split_hot = fixed_config, fixed_hot
+    if native_uint8_output is not None:
+        native_uint8_config = (
+            Config(128, 64, 3)
+            if sequence >= 8192
+            else Config(64, 128, 2)
+            if sequence <= 512
+            else Config(64, 64, 3)
+        )
+        native_uint8_hot = make_int8(
+            fixed_prepared,
+            native_uint8_output,
+            block_scaled=False,
+            split_pv_head_dim=True,
+            native_unsigned_probability=True,
+            unmasked_self_attention=True,
+        )(
+            native_uint8_config
+        )
+    else:
+        native_uint8_config = None
+        native_uint8_hot = None
     block_config, block_hot = _select_fastest(
         common_configs,
         make_int8(block_prepared, block_output, block_scaled=True),
@@ -225,23 +285,94 @@ def _run_shape(
     fp8_hot_ms = _bench(fp8_hot, warmup_ms, repeat_ms)
     fp8_fp32_hot_ms = _bench(fp8_fp32_hot, warmup_ms, repeat_ms)
     fixed_hot_ms = _bench(fixed_hot, warmup_ms, repeat_ms)
+    fixed_split_hot_ms = _bench(fixed_split_hot, warmup_ms, repeat_ms)
+    native_uint8_hot_ms = (
+        _bench(native_uint8_hot, warmup_ms, repeat_ms)
+        if native_uint8_hot is not None
+        else None
+    )
     block_hot_ms = _bench(block_hot, warmup_ms, repeat_ms)
+    fp8_e2e_ms = _bench(
+        lambda: _sage_backend.triton_sage_attention(
+            query,
+            key,
+            value,
+            scale,
+            False,
+        ),
+        warmup_ms,
+        repeat_ms,
+    )
+    fixed_e2e_ms = _bench(
+        lambda: triton_sage_attention_int8_pv(
+            query,
+            key,
+            value,
+            scale,
+            False,
+            grouped_qk=grouped_qk,
+        ),
+        warmup_ms,
+        repeat_ms,
+    )
+    native_uint8_e2e_ms = (
+        _bench(
+            lambda: triton_sage_attention_int8_pv(
+                query,
+                key,
+                value,
+                scale,
+                False,
+                grouped_qk=grouped_qk,
+                native_unsigned_probability=True,
+            ),
+            warmup_ms,
+            repeat_ms,
+        )
+        if native_uint8_mma
+        else None
+    )
     fp8_quality = _quality(fp8_hot(), expected)
     fp8_fp32_quality = _quality(fp8_fp32_hot(), expected)
     fixed_quality = _quality(fixed_hot(), expected)
+    fixed_split_quality = _quality(fixed_split_hot(), expected)
     block_quality = _quality(block_hot(), expected)
+    native_uint8_quality = (
+        _quality(native_uint8_hot(), expected)
+        if native_uint8_hot is not None
+        else None
+    )
 
     print(
-        f"| {sequence} | {fp8_hot_ms:.5f} | {fp8_fp32_hot_ms:.5f} "
-        f"| {fixed_hot_ms:.5f} | {block_hot_ms:.5f} "
+        f"| {sequence} | {fp8_hot_ms:.5f} | {fp8_e2e_ms:.5f} "
+        f"| {fp8_fp32_hot_ms:.5f} "
+        f"| {fixed_hot_ms:.5f} | {fixed_split_hot_ms:.5f} | {block_hot_ms:.5f} "
+        f"| {fixed_e2e_ms:.5f} | {fixed_e2e_ms / fp8_e2e_ms:.2f}x "
         f"| {fp8_fp32_hot_ms / fp8_hot_ms:.2f}x | {fixed_hot_ms / fp8_hot_ms:.2f}x "
+        f"| {fixed_split_hot_ms / fp8_hot_ms:.2f}x "
         f"| {block_hot_ms / fp8_hot_ms:.2f}x | {fp8_quality[0]:.2f}/{fp8_quality[1]:.4f} "
         f"| {fp8_fp32_quality[0]:.2f}/{fp8_fp32_quality[1]:.4f} "
         f"| {fixed_quality[0]:.2f}/{fixed_quality[1]:.4f} "
+        f"| {fixed_split_quality[0]:.2f}/{fixed_split_quality[1]:.4f} "
         f"| {block_quality[0]:.2f}/{block_quality[1]:.4f} "
         f"| {fp8_config.display()} | {fp8_fp32_config.display()} "
-        f"| {fixed_config.display()} | {block_config.display()} |"
+        f"| {fixed_config.display()} | {fixed_split_config.display()} "
+        f"| {block_config.display()} |"
     )
+    if (
+        native_uint8_config is not None
+        and native_uint8_hot_ms is not None
+        and native_uint8_e2e_ms is not None
+        and native_uint8_quality is not None
+    ):
+        print(
+            f"  native UINT8 P: hot {native_uint8_hot_ms:.5f} ms "
+            f"({native_uint8_hot_ms / fp8_hot_ms:.3f}x FP8), "
+            f"E2E {native_uint8_e2e_ms:.5f} ms "
+            f"({native_uint8_e2e_ms / fp8_e2e_ms:.3f}x FP8), "
+            f"SQNR/L1 {native_uint8_quality[0]:.2f}/{native_uint8_quality[1]:.4f}, "
+            f"{native_uint8_config.display()}"
+        )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -255,17 +386,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tune-ms", type=int, default=50)
     parser.add_argument("--warmup-ms", type=int, default=200)
     parser.add_argument("--repeat-ms", type=int, default=1000)
+    parser.add_argument(
+        "--native-uint8-mma",
+        action="store_true",
+        help="also benchmark fixed native UINT8-P x INT8-V; requires the mixed-sign Triton patch",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Run prequantized FP8 and direct signed-INT8 PV comparisons."""
+    """Run prequantized FP8 and fixed/block integer-PV comparisons."""
     args = _parse_args(argv)
     if not torch.cuda.is_available():
         raise SystemExit("INT8 PV benchmarking requires a CUDA GPU")
     capability = torch.cuda.get_device_capability()
     if capability != (8, 9) and capability[0] != 12:
         raise SystemExit("The benchmark requires consumer Ada SM89 or Blackwell SM12x")
+    if args.native_uint8_mma and (capability[0] != 12 or args.head_dim != 128):
+        raise SystemExit("the tuned native UINT8 comparison requires SM12x and D128")
+    if args.native_uint8_mma and any(sequence % 128 for sequence in args.sequence):
+        raise SystemExit("the predicate-free native UINT8 comparison requires N divisible by 128")
     grouped_qk = capability[0] == 12 if args.grouped_qk is None else args.grouped_qk
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
 
@@ -273,12 +413,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("Hot-loop timings use prequantized Q/K/V and select the fastest listed configuration.")
     print()
     print(
-        "| N | FP8-FP16 ms | FP8-FP32 ms | fixed INT8 ms | block INT8 ms "
-        "| FP32/FP16 | fixed/FP16 | block/FP16 | FP8-FP16 SQNR/L1 "
-        "| FP8-FP32 SQNR/L1 | fixed SQNR/L1 | block SQNR/L1 "
-        "| FP16 config | FP32 config | fixed config | block config |"
+        "| N | FP8-FP16 hot | FP8 E2E | FP8-FP32 hot | fixed INT8 hot "
+        "| fixed D64 hot | block INT8 hot "
+        "| fixed INT8 E2E | fixed/FP8 E2E "
+        "| FP32/FP16 | fixed/FP16 | D64/FP16 | block/FP16 | FP8-FP16 SQNR/L1 "
+        "| FP8-FP32 SQNR/L1 | fixed SQNR/L1 | D64 SQNR/L1 | block SQNR/L1 "
+        "| FP16 config | FP32 config | fixed config | D64 config | block config |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|:---|:---|")
+    print(
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "---:|---:|---:|:---|:---|:---|:---|:---|"
+    )
     for sequence in args.sequence:
         _run_shape(
             sequence,
@@ -290,6 +435,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.warmup_ms,
             args.repeat_ms,
             args.tune_ms,
+            args.native_uint8_mma,
         )
 
 
