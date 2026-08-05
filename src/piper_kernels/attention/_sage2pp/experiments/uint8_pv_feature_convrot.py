@@ -238,6 +238,7 @@ def _uint8_pv_feature_convrot_attention_kernel(
     log_probability_scale: tl.constexpr,
     weighted_log_denominator: tl.constexpr,
     affine_probability: tl.constexpr,
+    native_uint8_mma: tl.constexpr,
     output_rotation_group: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -368,7 +369,8 @@ def _uint8_pv_feature_convrot_attention_kernel(
         metadata_offsets = metadata_block * head_dim + offsets_d
         if affine_probability:
             probability_range: tl.constexpr = _P_UINT8_RANGE
-            value_correction = tl.load(value_correction_ptr + metadata_offsets)
+            if not native_uint8_mma:
+                value_correction = tl.load(value_correction_ptr + metadata_offsets)
         else:
             probability_range: tl.constexpr = _V_INT8_RANGE
         if value_scale_per_key:
@@ -421,7 +423,9 @@ def _uint8_pv_feature_convrot_attention_kernel(
             probability_range,
             probability_for_dot / probability_quant_scale[:, None] + 0.5,
         ).to(tl.int32)
-        if affine_probability:
+        if native_uint8_mma:
+            probability_operand = probability_codes.to(tl.uint8)
+        elif affine_probability:
             probability_int8 = (probability_codes - _P_ZERO_POINT).to(tl.int8)
         else:
             probability_int8 = probability_codes.to(tl.int8)
@@ -440,7 +444,13 @@ def _uint8_pv_feature_convrot_attention_kernel(
             head_dim,
             block_n,
         )
-        if affine_probability:
+        if native_uint8_mma:
+            corrected_int32 = tl.dot(
+                probability_operand,
+                value,
+                out_dtype=tl.int32,
+            )
+        elif affine_probability:
             correction_accumulator = (
                 tl.zeros(
                     (block_m, head_dim),
@@ -505,6 +515,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
     probability_scale_mode: Literal["dynamic", "tile", "log"],
     value_transposed: bool = True,
     affine_probability: bool = True,
+    native_uint8_mma: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Quantize canonical Q/K and feature-rotated block-scaled INT8 V."""
     if rotation_group not in (0, 16, 64):
@@ -539,7 +550,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         value_log_scale = value_scale
         value_inverse_scale = value_scale
     value_correction = torch.empty(
-        correction_shape if affine_probability else (1,),
+        correction_shape if affine_probability and not native_uint8_mma else (1,),
         device=value.device,
         dtype=torch.int32,
     )
@@ -573,7 +584,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         value_scale_floor=value_scale_floor,
         store_log_scale=probability_scale_mode == "log",
         store_value_scale=probability_scale_mode != "log" or value_scale_axis == "feature",
-        store_value_correction=affine_probability,
+        store_value_correction=affine_probability and not native_uint8_mma,
         output_transposed=value_transposed,
         num_warps=4,
     )
@@ -609,6 +620,7 @@ def _launch_uint8_pv_feature_convrot_attention(
     value_transposed: bool = True,
     weighted_log_denominator: bool = True,
     affine_probability: bool = True,
+    native_uint8_mma: bool = False,
     use_tensor_descriptors: bool = False,
 ) -> torch.Tensor:
     """Launch prequantized attention followed by its feature inverse rotation."""
@@ -663,6 +675,7 @@ def _launch_uint8_pv_feature_convrot_attention(
         log_probability_scale=probability_scale_mode == "log",
         weighted_log_denominator=weighted_log_denominator,
         affine_probability=affine_probability,
+        native_uint8_mma=native_uint8_mma,
         output_rotation_group=rotation_group if fuse_output_rotation else 0,
         heads=heads,
         head_dim=head_dim,
@@ -700,6 +713,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     fuse_output_rotation: bool = True,
     grouped_qk: bool | None = None,
     affine_probability: bool = True,
+    native_uint8_mma: bool = False,
 ) -> torch.Tensor:
     """Run per-key-scaled feature-ConvRot V with affine UINT8 P attention.
 
@@ -722,6 +736,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         value_scale_floor=value_scale_floor,
         probability_scale_mode=probability_scale_mode,
         affine_probability=affine_probability,
+        native_uint8_mma=native_uint8_mma,
     )
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
@@ -739,7 +754,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         if rotation_group:
             block_m = 32 if query_length <= 1152 else 64
             num_stages = 2 if block_m == 32 else 3
-        elif not affine_probability:
+        elif not affine_probability or native_uint8_mma:
             candidate_block_m = _sage_backend._select_query_block(
                 query,
                 batch,
@@ -782,6 +797,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         num_warps=4,
         num_stages=num_stages,
         affine_probability=affine_probability,
+        native_uint8_mma=native_uint8_mma,
         use_tensor_descriptors=use_tensor_descriptors,
     )
 

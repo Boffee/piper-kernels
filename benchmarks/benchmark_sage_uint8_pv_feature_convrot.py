@@ -78,6 +78,7 @@ def _run_shape(
     probability_scale_modes: Sequence[str],
     value_scale_floors: Sequence[float],
     affine_probability: bool,
+    native_uint8_mma: bool,
     warmup_ms: int,
     repeat_ms: int,
     tune_ms: int,
@@ -150,6 +151,7 @@ def _run_shape(
             value_scale_floor=variant[3],
             probability_scale_mode=variant[2],
             affine_probability=affine_probability,
+            native_uint8_mma=native_uint8_mma,
         )
         for variant in variants
     }
@@ -243,7 +245,7 @@ def _run_shape(
     ) -> Callable[[Config], Callable[[], torch.Tensor]]:
         def make(config: Config) -> Callable[[], torch.Tensor]:
             use_tensor_descriptors = (
-                not affine_probability
+                (not affine_probability or native_uint8_mma)
                 and variant[1] == 0
                 and _sage_backend._should_use_attention_tensor_descriptors(
                     query,
@@ -271,6 +273,7 @@ def _run_shape(
                     num_warps=4,
                     num_stages=config.num_stages,
                     affine_probability=affine_probability,
+                    native_uint8_mma=native_uint8_mma,
                     use_tensor_descriptors=use_tensor_descriptors,
                 )
 
@@ -303,6 +306,7 @@ def _run_shape(
                 value_scale_floor=variant[3],
                 grouped_qk=grouped_qk,
                 affine_probability=affine_probability,
+                native_uint8_mma=native_uint8_mma,
             ),
             warmup_ms,
             repeat_ms,
@@ -327,7 +331,11 @@ def _run_shape(
     for variant in variants:
         scale_axis, rotation, probability_scale_mode, value_scale_floor = variant
         config, _ = feature_selected[variant]
-        probability_encoding = "UINT8" if affine_probability else "signed INT8"
+        probability_encoding = (
+            "native UINT8"
+            if native_uint8_mma
+            else "UINT8" if affine_probability else "signed INT8"
+        )
         print(
             f"| {sequence} | {probability_encoding} {scale_axis}-scale H{rotation} "
             f"P-{probability_scale_mode} V-floor-{value_scale_floor:g} | "
@@ -350,6 +358,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="use affine UINT8-equivalent P; disable for nonnegative signed INT8 P",
+    )
+    parser.add_argument(
+        "--native-uint8-mma",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use native UINT8 x INT8 MMA; requires a mixed-sign Triton compiler",
     )
     parser.add_argument(
         "--rotations", type=int, nargs="+", choices=[0, 16, 64], default=[0, 16, 64]
@@ -391,7 +405,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     grouped_qk = capability[0] == 12 if args.grouped_qk is None else args.grouped_qk
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
     print(f"GPU: {torch.cuda.get_device_name()}; capability: SM{capability[0]}{capability[1]}")
-    probability_encoding = "UINT8" if args.affine_probability else "signed INT8"
+    probability_encoding = (
+        "native UINT8"
+        if args.native_uint8_mma
+        else "UINT8" if args.affine_probability else "signed INT8"
+    )
     print(
         f"Hot {probability_encoding} timings include the inverse when enabled but exclude "
         "Q/K/V preparation."
@@ -416,6 +434,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.probability_scale_modes,
             args.value_scale_floors,
             args.affine_probability,
+            args.native_uint8_mma,
             args.warmup_ms,
             args.repeat_ms,
             args.tune_ms,

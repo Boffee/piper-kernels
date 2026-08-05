@@ -200,6 +200,36 @@ The signed-probability option uses codes `[0, 127]`, removes the affine correcti
 metadata, and keeps the same per-key log recurrence. On SM120 D128 it enables the lower-spill
 M128 tensor-descriptor schedule; the tradeoff is one fewer bit of probability precision.
 
+Test native mixed-sign integer MMA with the pinned Triton 3.7.1 compiler patch:
+
+```shell
+git clone --depth 1 --branch v3.7.1 \
+  https://github.com/triton-lang/triton.git /tmp/piper-triton-src
+git -C /tmp/piper-triton-src apply \
+  "$PWD/benchmarks/patches/triton-3.7.1-mixed-int8-dot.patch"
+
+TRITON_HOME=/tmp/piper-triton-build-cache MAX_JOBS=24 \
+  uv build --python "$PWD/.venv/bin/python" --wheel \
+  --out-dir /tmp/piper-triton-dist /tmp/piper-triton-src
+uv pip install --python "$PWD/.venv/bin/python" --no-deps \
+  --target /tmp/piper-triton-mixed /tmp/piper-triton-dist/*.whl
+
+PYTHONPATH=/tmp/piper-triton-mixed uv run python \
+  benchmarks/benchmark_mixed_int8_dot.py native
+PYTHONPATH=/tmp/piper-triton-mixed uv run python \
+  benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
+  --sequence 4096 --scale-axes key --rotations 0 \
+  --probability-scale-modes log --value-scale-floors 0 \
+  --native-uint8-mma
+```
+
+The patch carries each integer dot operand's signedness through Triton IR and the
+`AccelerateMatmul` rewrite, then selects the corresponding MMAv2 PTX opcode. It is intentionally
+limited to the MMA path used by consumer Ada and Blackwell; it does not add mixed-sign WGMMA for
+Hopper. The direct benchmark checks exact output and reports the emitted SASS. The attention
+benchmark keeps signed INT8 QK while using native UINT8-by-INT8 PV, so a correct SM120 build
+reports both `IMMA.16832.S8.S8.SAT` and `IMMA.16832.U8.S8.SAT` in the fixed-schedule profiler.
+
 Inspect whether feature Hadamard rotations improve the lower tail of tile-normalized per-key V
 scales on real FLUX activations with:
 

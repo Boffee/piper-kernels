@@ -1,0 +1,178 @@
+diff --git a/include/triton/Dialect/Triton/IR/TritonOps.td b/include/triton/Dialect/Triton/IR/TritonOps.td
+index 91f8aff..695c2f0 100644
+--- a/include/triton/Dialect/Triton/IR/TritonOps.td
++++ b/include/triton/Dialect/Triton/IR/TritonOps.td
+@@ -679,7 +679,9 @@ def TT_DotOp : TT_Op<"dot", [Pure,
+       TT_FpIntTensor:$b,
+       TT_FpIntTensor:$c,
+       DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
+-      DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc
++      DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc,
++      DefaultValuedAttr<BoolAttr, "false">:$aIsUnsigned,
++      DefaultValuedAttr<BoolAttr, "false">:$bIsUnsigned
+     );
+ 
+     let results = (outs TT_FpIntTensor:$d);
+diff --git a/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp b/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp
+index 780d0fd..8c57d39 100644
+--- a/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp
++++ b/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp
+@@ -271,9 +271,12 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
+     }
+     c = triton::gpu::ConvertLayoutOp::create(rewriter, c.getLoc(), retType, c);
+ 
++    bool aIsUnsigned = op.getAIsUnsigned();
++    bool bIsUnsigned = op.getBIsUnsigned();
+     addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
+                       op, retType, a, b, c, adaptor.getInputPrecision(),
+-                      adaptor.getMaxNumImpreciseAcc()),
++                      adaptor.getMaxNumImpreciseAcc(), aIsUnsigned,
++                      bIsUnsigned),
+                   adaptor.getAttributes());
+     return success();
+   }
+diff --git a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+index ebc995f..4372373 100644
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -437,7 +437,8 @@ public:
+                                   rewriter);
+       newDot = DotOp::create(rewriter, dotOp.getLoc(), mmaResult.newRetType, a,
+                              b, mmaResult.newAcc, dotOp.getInputPrecision(),
+-                             dotOp.getMaxNumImpreciseAcc());
++                             dotOp.getMaxNumImpreciseAcc(),
++                             dotOp.getAIsUnsigned(), dotOp.getBIsUnsigned());
+     }
+ 
+     rewriter.replaceOpWithNewOp<ConvertLayoutOp>(dotOp, dotOp.getType(),
+diff --git a/python/src/ir.cc b/python/src/ir.cc
+index 4024b91..9d25451 100644
+--- a/python/src/ir.cc
++++ b/python/src/ir.cc
+@@ -1669,9 +1669,11 @@ void init_triton_ir(py::module &&m) {
+       .def("create_dot",
+            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
+               mlir::Value &c, InputPrecision inputPrecision,
+-              int maxNumImpreciseAcc) -> mlir::Value {
++              int maxNumImpreciseAcc, bool aIsUnsigned,
++              bool bIsUnsigned) -> mlir::Value {
+              return self.create<DotOp>(c.getType(), a, b, c, inputPrecision,
+-                                       maxNumImpreciseAcc);
++                                       maxNumImpreciseAcc, aIsUnsigned,
++                                       bIsUnsigned);
+            })
+       .def("create_dot_scaled",
+            [](TritonOpBuilder &self, mlir::Value &lhs,
+diff --git a/python/triton/language/semantic.py b/python/triton/language/semantic.py
+index 691c471..ad5cb81 100644
+--- a/python/triton/language/semantic.py
++++ b/python/triton/language/semantic.py
+@@ -1499,7 +1499,9 @@ class TritonSemantic(Generic[TensorTy]):
+                                  tl.float64), f"Unsupported lhs dtype {lhs.dtype}"
+             assert rhs.dtype in (tl.int8, tl.uint8, tl.float16, tl.bfloat16, tl.float32,
+                                  tl.float64), f"Unsupported rhs dtype {rhs.dtype}"
+-            assert lhs.dtype == rhs.dtype, f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
++            integer_dot = lhs.dtype in (tl.int8, tl.uint8) and rhs.dtype in (tl.int8, tl.uint8)
++            assert integer_dot or lhs.dtype == rhs.dtype, \
++                f"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}"
+ 
+         if lhs.dtype.is_fp8e4b15() or rhs.dtype.is_fp8e4b15():
+             if "fp8e4b15" in self.builder.options.deprecated_fp8_dot_operand_dtypes:
+@@ -1539,7 +1541,8 @@ class TritonSemantic(Generic[TensorTy]):
+             and rhs.shape[-1].value >= min_dot_size[1], \
+                 f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
+         if lhs.type.scalar.is_int():
+-            assert lhs.type.scalar == tl.int8, "only int8 supported!"
++            assert lhs.type.scalar in (tl.int8, tl.uint8), "only 8-bit integer dot inputs supported!"
++            assert rhs.type.scalar in (tl.int8, tl.uint8), "only 8-bit integer dot inputs supported!"
+             _0 = self.builder.get_int32(0)
+             ret_scalar_ty = tl.int32
+         elif out_dtype.is_bf16():
+@@ -1578,7 +1581,15 @@ class TritonSemantic(Generic[TensorTy]):
+                 raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
+ 
+         return self.tensor(
+-            self.builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc), ret_ty)
++            self.builder.create_dot(
++                lhs.handle,
++                rhs.handle,
++                acc_handle,
++                input_precision,
++                max_num_imprecise_acc,
++                lhs.dtype.is_int_unsigned(),
++                rhs.dtype.is_int_unsigned(),
++            ), ret_ty)
+ 
+     def _str_to_fp_type(self, float_format: str):
+         ty_enum = getattr(ir.ScaleDotElemTypeTY, float_format.upper(), None)
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp
+index 1e7ca58..8ad6f18 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp
+@@ -288,6 +288,9 @@ enum class TensorCoreType : uint8_t {
+   INT32_INT1_INT1_INT32, // Not implemented
+   INT32_INT4_INT4_INT32, // Not implemented
+   INT32_INT8_INT8_INT32, // Not implemented
++  INT32_UINT8_INT8_INT32,
++  INT32_INT8_UINT8_INT32,
++  INT32_UINT8_UINT8_INT32,
+   // double precision tensor core instr
+   FP64_FP64_FP64_FP64,
+   // scaled mxfp8 x mxfp8 matmul
+@@ -335,6 +338,9 @@ static Type getMmaRetType(TensorCoreType mmaType, MLIRContext *ctx) {
+   case TensorCoreType::FP16_FP8E4M3FN_FP8E4M3FN_FP16:
+     return fp16x2Pack2Ty;
+   case TensorCoreType::INT32_INT8_INT8_INT32:
++  case TensorCoreType::INT32_UINT8_INT8_INT32:
++  case TensorCoreType::INT32_INT8_UINT8_INT32:
++  case TensorCoreType::INT32_UINT8_UINT8_INT32:
+     return i32x4Ty;
+   case TensorCoreType::FP64_FP64_FP64_FP64:
+     return fp64x4Ty;
+@@ -409,8 +415,19 @@ static TensorCoreType getMmaTypeDot(DotOp op, RankedTensorType aTy,
+         op.getInputPrecision() == InputPrecision::TF32)
+       return TensorCoreType::FP32_TF32_TF32_FP32;
+   } else if (dTy.getElementType().isInteger(32)) {
+-    if (aTy.getElementType().isInteger(8) && bTy.getElementType().isInteger(8))
++    auto aIntTy = dyn_cast<IntegerType>(aTy.getElementType());
++    auto bIntTy = dyn_cast<IntegerType>(bTy.getElementType());
++    if (aIntTy && bIntTy && aIntTy.getWidth() == 8 && bIntTy.getWidth() == 8) {
++      bool aIsUnsigned = op.getAIsUnsigned();
++      bool bIsUnsigned = op.getBIsUnsigned();
++      if (aIsUnsigned && bIsUnsigned)
++        return TensorCoreType::INT32_UINT8_UINT8_INT32;
++      if (aIsUnsigned)
++        return TensorCoreType::INT32_UINT8_INT8_INT32;
++      if (bIsUnsigned)
++        return TensorCoreType::INT32_INT8_UINT8_INT32;
+       return TensorCoreType::INT32_INT8_INT8_INT32;
++    }
+   } else if (dTy.getElementType().isF16()) {
+     if (aTy.getElementType().isF16() && bTy.getElementType().isF16())
+       return TensorCoreType::FP16_FP16_FP16_FP16;
+@@ -440,6 +457,12 @@ inline static const std::map<TensorCoreType, std::string> mmaInstrPtxTuring = {
+ 
+     {TensorCoreType::INT32_INT8_INT8_INT32,
+      "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32"},
++    {TensorCoreType::INT32_UINT8_INT8_INT32,
++     "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.u8.s8.s32"},
++    {TensorCoreType::INT32_INT8_UINT8_INT32,
++     "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.u8.s32"},
++    {TensorCoreType::INT32_UINT8_UINT8_INT32,
++     "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.u8.u8.s32"},
+ 
+     {TensorCoreType::FP16_FP16_FP16_FP16,
+      "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16"},
+@@ -459,6 +482,12 @@ inline static const std::map<TensorCoreType, std::string> mmaInstrPtxAmpere = {
+      "mma.sync.aligned.m16n8k64.row.col.satfinite.s32.s4.s4.s32"},
+     {TensorCoreType::INT32_INT8_INT8_INT32,
+      "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"},
++    {TensorCoreType::INT32_UINT8_INT8_INT32,
++     "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32"},
++    {TensorCoreType::INT32_INT8_UINT8_INT32,
++     "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.u8.s32"},
++    {TensorCoreType::INT32_UINT8_UINT8_INT32,
++     "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.u8.s32"},
+ 
+     {TensorCoreType::FP16_FP16_FP16_FP16,
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16"},

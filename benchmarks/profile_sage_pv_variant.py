@@ -55,6 +55,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "int8-log-unweighted-transposed",
             "int8-log-signed-transposed",
             "int8-log-signed-descriptor",
+            "int8-log-native-descriptor",
             "int8-affine-block-transposed",
             "int8-per-key-dynamic-transposed",
             "int8-per-key-tile-transposed",
@@ -324,6 +325,7 @@ def _log_int8_launcher(
     value_scale_axis: Literal["feature", "key"],
     probability_scale_mode: Literal["dynamic", "tile", "log"],
     affine_probability: bool,
+    native_uint8_mma: bool,
     use_tensor_descriptors: bool,
 ) -> Callable[[], torch.Tensor]:
     sequence = query.shape[2]
@@ -339,6 +341,7 @@ def _log_int8_launcher(
         probability_scale_mode=probability_scale_mode,
         value_transposed=value_transposed,
         affine_probability=affine_probability,
+        native_uint8_mma=native_uint8_mma,
     )
 
     def launch() -> torch.Tensor:
@@ -360,6 +363,7 @@ def _log_int8_launcher(
             value_transposed=value_transposed,
             weighted_log_denominator=weighted_log_denominator,
             affine_probability=affine_probability,
+            native_uint8_mma=native_uint8_mma,
             use_tensor_descriptors=use_tensor_descriptors,
         )
 
@@ -426,6 +430,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_scale_axis=value_scale_axis,
             probability_scale_mode=probability_scale_mode,
             affine_probability="signed" not in args.variant,
+            native_uint8_mma="native" in args.variant,
             use_tensor_descriptors=args.variant.endswith("descriptor"),
         )
         jit_kernel = _uint8_pv_feature_convrot_attention_kernel
