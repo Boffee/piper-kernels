@@ -861,12 +861,88 @@ INT8-denominator control were also 1.4% and 2.8% slower at 8K. Therefore the rem
 key-specific ceiling is only the roughly 1.5% log-coordinate shift; the earlier M64 result that
 attributed another 1-2% to the PV multiplier does not transfer to M128.
 
+That ceiling is not quality-viable even under the relaxed canonical-quality target. On twenty
+captured FLUX.2 Klein calls, omitting only the log shift reduced mean/worst output SQNR to
+20.38/3.84 dB with 0.1672 relative L1, versus 36.49/32.64 dB and 0.0133 for canonical
+SageAttention2++. The shift is therefore structurally required; the key-scaled path's otherwise
+large quality margin cannot absorb normalizing P in the wrong V-scale coordinate.
+
 Several ways of approximating or rescheduling the log maximum were rejected. A separable
 `max(score)+max(log_scale)` bound introduced a reduction barrier; preparing its K64 scalar and
 issuing the load before QK still measured 1.696 ms. Computing the maximum in FP16 measured
 1.688 ms, deriving the log from `255*s_v` measured 1.855 ms, and prefetching the exact log vector
 before QK measured 1.736 ms. These either add conversion/reduction work or lengthen metadata
 live ranges, so none was retained in the attention kernel.
+
+The recurrence boundary can be isolated from input preparation and unrelated attention policy
+with:
+
+```shell
+PYTHONPATH=/tmp/piper-triton-mixed:$PYTHONPATH uv run python \
+  benchmarks/profile_int8_pv_recurrence.py attention-local \
+  --sequence 32768 --probability-dtype int8
+```
+
+This M128/K64/D128 control runs the real INT8 QK reduction, forms quantized P, completes two D64
+INT8 PV dots, and varies only the persistent numerator merge. Stable RTX 5090 measurements were:
+
+| N | running-coordinate P ms | local-coordinate P ms | exact local penalty |
+|---:|---:|---:|---:|
+| 8192 | 2.4608 | 2.5595 | 4.01% |
+| 32768 | 37.2316 | 38.8336 | 4.30% |
+
+Both variants issue the same three MMA operations per K64 tile and have the same two-CTA
+residency ceiling. Local normalization adds 64 FP16 multiply instructions and four row-level
+exponent/conversion operations to merge each completed PV partial into the running softmax
+coordinate. The full production-shaped M128/S2 kernel showed the same boundary at N=32768:
+25.8688 ms for exact key scaling versus 24.8953 ms for fixed UINT8, a 3.91% gap.
+
+Because `next_max = max(running_max, block_max)`, one recurrence weight is exactly one. An exact
+control selected the weighted operand per row and used one shared weight plus one FMA. It was
+slower: 2.7440 ms at N=8192 and 41.6767 ms at N=32768. Triton materialized the row-wise choice
+across both D64 accumulator fragments, increasing static permutation instructions from 448 to
+740 and static SASS from 3426 to 3903. The ordinary two-weight expression is therefore the
+better lowering despite doing one apparently redundant multiply.
+
+A narrower shared-weight control retained the ordinary MxD multiply/FMA merge and changed only
+the two row-vector exponentials into `exp2(-abs(block_max-running_max))` plus row-vector selects.
+It successfully reduced static `MUFU` instructions from 76 to 72 with unchanged registers,
+spills, MMAs, and layout conversions. The absolute-value/compare/select sequence added twelve
+other instructions, however. Alternating profiles measured 2.5715/2.5830 ms for the ordinary
+form versus 2.5816/2.5870 ms for the shared form at N=8192, and 38.8016/38.8267 versus
+38.8789/38.9002 ms at N=32768. The shared exponential is therefore a small regression even
+without the expensive accumulator-fragment selection and remains a profiler-only negative
+control.
+
+The compiler boundary is not specific to the pinned Triton 3.7.1 build. Triton main at commit
+`707fc2ca` (reported as 3.8.0) measured 37.3755/38.6573 ms for running/local coordinates at 32K,
+still a 3.43% penalty. It changed register allocation slightly but did not introduce an
+output-scaled INT8 MMA or a cheaper row-wise merge.
+
+Quantizing P directly in the running-max coordinate removes the local merge but is not a usable
+quality trade. On the twenty-call FLUX.2 Klein sample it measured 31.73 dB mean / 24.90 dB worst
+output SQNR and 0.0197 relative L1, versus 41.55/37.58 dB and 0.0074 for the selected local
+scale-forward recurrence. The canonical SageAttention2++ target on the same sample was
+36.49/32.64 dB and 0.0133. Revisiting the quality-viable dithered pre-dot INT32 alignment under
+M128 was also negative: its 74 spill slots and extra conversion/shift chain measured 40.2750 and
+634.5155 ms at N=32768/131072, versus 25.8181 and 405.5987 ms for the selected exact path.
+
+Together these controls localize the remaining key-scaled cost to the required per-query
+coordinate merge. It is no longer primarily a metadata-load, V-scale multiplication, occupancy,
+or MMA-selection problem. Closing it without losing canonical quality would require either a
+different P representation that preserves local UINT8 resolution or hardware/compiler support
+for scaling an INT32 MMA result as it enters the persistent accumulator.
+
+The explicit UINT8 probability clamp is not another hidden hot-loop cost. A guarded control
+derived the FP16 `255*s_v` multiplier from the same rounded FP16 `log2(s_v)`, biased the
+multiplier downward by `2^-10`, compensated that common factor in the epilogue, and removed
+`min(255, code + 0.5)`. The metadata bound and output agreement passed, but the clamped and
+clamp-free specializations both compiled to 253 registers, 14 spills, 2612 static instructions,
+and 140 `FMNMX` instructions. Alternating measurements were tied at roughly 1.70 ms for N=8192
+and 25.90 ms for N=32768. Triton already folds the clamp into the UINT8 conversion/lowering; the
+remaining `FMNMX` instructions implement required score and running-maximum reductions. The
+guarded metadata path was therefore reverted rather than retaining numerical complexity without
+a generated-code change.
 
 A matched 32K generated-code comparison measured 24.710 ms for fixed UINT8, 25.277 ms for the
 no-log ceiling, and 25.753 ms for exact key scaling. The residual after removing the log shift
@@ -973,3 +1049,124 @@ benefit does not justify a runtime dense transform. For model integration, fold 
 per-layer/per-head `Z` into `W_V` as `W_V @ Z` and fold `Z^-1` into the output projection as
 `Z^-1 @ W_O`. Group16/R224 is the selected calibrated experiment; group4 remains the portable
 uncalibrated path.
+
+### Stock-Triton affine UINT8 execution
+
+The signed-MMA affine proxy now stores each exact K64 `sum(Vq)` correction as INT16 rather than
+`128*sum(Vq)` as INT32. The sum is bounded by 8128, so reconstructing the INT32 MMA accumulator
+with a seven-bit shift is exact while halving metadata storage. For the selected scaled-FP16
+numerator, `scaled_fp16_correction=True` goes further: preparation stores
+`sum(Vq)/512` directly in the numerator's 2^-16 FP16 coordinate, and the attention kernel adds it
+after converting the signed MMA partial. This changes only FP16 reassociation. A direct test
+matches the exact INT32-correction output within 0.002 absolute/0.004 relative tolerance, and the
+N=2048 synthetic attention benchmark retained 36.00 dB SQNR versus 28.27 dB for its FP8 control.
+
+Profile the selected stock-Triton path with:
+
+```shell
+uv run python benchmarks/profile_sage_pv_variant.py \
+  int8-log-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-fp16-correction-unmasked-descriptor \
+  --sequence 32768 --block-m 128 --num-stages 2 --maxnreg 240
+```
+
+Matched RTX 5090 hot results were:
+
+| N | original INT32 metadata ms | FP16-coordinate correction ms | native U8xS8 ms |
+|---:|---:|---:|---:|
+| 4096 | 0.57191 | 0.50590 | 0.46115 |
+| 8192 | - | 1.87228 | 1.70435 |
+| 32768 | - | 28.43666 | 25.92803 |
+| 131072 | - | 448.99 | 408.45 |
+
+The remaining stock-Triton penalty is about 10%. Generated code attributes it to the affine
+correction path: 16 additional global-load instructions and 64 packed FP16 additions per loop
+body. It is not an INT8 tensor-core throughput difference. Three exact alternatives were negative
+controls: reconstructing `sum(Vq)` from the loaded V tile took 0.625 ms at N=4096, moving the
+correction through a separate tensor descriptor took 0.595 ms, and spelling the correction as a
+post-dot add generated the same SASS as supplying it as MMA C. Loading the correction earlier also
+caused spills. Stock Triton 3.7.1 and current upstream both reject U8xU8 `tl.dot`, so moving the
+zero point to V and using a row-wise `sum(P)` correction is not currently expressible without a
+compiler change.
+
+The matched N=8192 end-to-end benchmark, including Q/K/V preparation, measured 2.04952 ms for
+stock Triton versus 1.85847 ms for patched native U8xS8. Hot attention was 1.89832 versus
+1.71106 ms, and both paths measured 36.06-36.07 dB SQNR.
+
+The exact affine correction can also be delayed across eight K64 tiles with
+`delayed_fp16_correction_group=8` (benchmark CLI:
+`--delayed-fp16-correction-group 8`). The kernel retains each tile's block maximum, reconstructs
+the eight query-dependent recurrence weights at the group boundary, and contracts them with the
+eight precomputed correction vectors. This does not approximate the attention math; only the
+placement and FP16 association of the correction changes. A direct test covers both G8 and G16,
+and the N=2048 synthetic benchmark measured 35.98 dB for G8 versus 36.00 dB for per-tile
+correction.
+
+On RTX 5090, G8 removes most per-tile correction loads and packed additions while adding one
+group-boundary barrier and eight static `exp2` instructions. Registers/spills remain 254/10.
+Matched hot profiles were:
+
+| N | per-tile correction ms | delayed G8 ms | patched native U8xS8 ms |
+|---:|---:|---:|---:|
+| 4096 | 0.50564 | 0.46913 | 0.46115 |
+| 8192 | 1.87228 | 1.77645 | 1.70435 |
+| 32768 | 28.40416 | 26.95103 | 25.92803 |
+| 131072 | 448.99 | 425.82 | 408.45 |
+
+Thus delayed correction recovers over half of the stock-Triton affine penalty and leaves roughly
+a 4% long-context gap to native mixed-sign MMA. In the public N=8192 H24 benchmark, hot/E2E
+latency improved from 1.90408/2.04939 ms to 1.80354/1.96090 ms. G16 was slower at 0.48362 ms
+for N=4096 because it reached 255 registers and 16 spills. Two exact log-metadata controls were
+also negative: storing block maxima in FP16 took 0.47936 ms, and incrementally reusing the online
+softmax weights took 0.48196 ms because its packed multiplies execute on every tile. The selected
+G8 path therefore retains FP32 block maxima and reconstructs weights once per group.
+
+A hierarchical G16 control treated correction alignment as a second mini-recurrence: it retained
+the first G8's FP16 weights and maximum while collecting the second G8's maxima, then rescaled the
+first weights for one final K16 contraction. The extra Mx8 state remained live beside both D64
+attention accumulators, producing 255 registers, 16 spills, and 0.49368 ms at N=4096. M64 avoided
+spills but its best 0.51650 ms remained slower than M64 G8 at 0.50769 ms and much slower than the
+M128 G8 schedule. Combining the two D64 correction contractions into one interleaved D128 dot was
+also counterproductive: join/split layout conversions increased static permutations to 387,
+barriers to 49, spills to 22, and latency to 0.56355 ms. Both controls were removed after
+measurement. Factoring the selected G8 correction into one helper and removing its redundant
+maxima reset reduced static SASS by eight instructions without changing its measured latency.
+
+### Optimized nonnegative signed-INT8 probability path
+
+When one probability bit can be traded for speed, `affine_probability=False` encodes P directly
+as signed INT8 codes in `[0, 127]` and removes affine correction entirely. The scale-forward
+preparation now precomputes `127 * s_v[k]` just as the UINT8 path precomputes `255 * s_v[k]`, and
+the fixed 2^-16 FP16 numerator epilogue uses the selected probability range rather than assuming
+255. On SM120, `triton_sage_attention_int8_pv_per_key_log` selects this optimized split-D64 path
+for noncausal D128 attention through N=131072.
+
+Profile it with:
+
+```shell
+uv run python benchmarks/profile_sage_pv_variant.py \
+  int8-log-signed-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-unmasked-descriptor \
+  --sequence 32768 --block-m 128 --num-stages 2
+```
+
+Matched prequantized RTX 5090 profiles show that removing correction brings stock signed INT8 to
+the same performance class as the compiler-patched native U8xS8 path:
+
+| N | signed INT8 ms | delayed affine G8 ms | patched native U8xS8 ms |
+|---:|---:|---:|---:|
+| 4096 | 0.46063 | 0.47047 | 0.46115 |
+| 8192 | 1.68076 | 1.77645 | 1.70435 |
+| 32768 | 25.71550 | 26.95103 | 25.92803 |
+| 131072 | 404.89 | 425.82 | 408.45 |
+
+The generated N=4096 kernel uses 253 registers, 14 spills, 128 signed IMMA instructions, and no
+correction HMMA. At the FLUX.2 Klein model's N=1152 shape, signed INT8 measured 0.04852 ms hot and
+0.07252 ms E2E, versus 0.05180/0.07580 ms for per-tile affine UINT8 and 0.088 ms E2E for canonical
+SageAttention2++. At longer context it retains the exact key-scale recurrence cost: N=8192 E2E
+was 1.86577 ms versus 1.752 ms for pure-Triton SageAttention2++ and 1.647 ms for canonical CUDA;
+N=32768 was 26.50122 versus 24.629 and 22.904 ms, respectively.
+
+Quality remains above the chosen canonical target. On the established two-prompt, twenty-call
+FLUX.2 Klein sample, signed key-scaled INT8 measured 39.81 dB mean / 36.62 dB worst output SQNR
+and 0.0089 relative L1. Canonical SageAttention2++ measured 36.49/32.64 dB and 0.0133. Thus the
+seventh probability bit costs roughly 1.5-2 dB versus affine UINT8 but retains a 3-4 dB margin
+over canonical SageAttention2++ on this sample.

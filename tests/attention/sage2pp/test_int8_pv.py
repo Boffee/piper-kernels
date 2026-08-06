@@ -814,6 +814,147 @@ def test_key_scaled_fp16_numerator_is_close_to_fp32(
 
 @pytest.mark.skipif(
     not _sm120_available(),
+    reason="affine scaled-FP16 correction path is currently tuned for SM12x",
+)
+def test_affine_fp16_correction_is_close_to_int32_correction() -> None:
+    torch.manual_seed(893)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    arguments = (query, key, value, 128**-0.5, False)
+    common_options = {
+        "grouped_qk": False,
+        "native_uint8_mma": False,
+        "split_pv_head_dim": True,
+        "scale_forward_log_recurrence": True,
+        "optimize_pv_scaling": True,
+        "scaled_fp16_numerator": True,
+    }
+
+    with torch.no_grad():
+        exact = triton_sage_attention_uint8_pv_feature_convrot(
+            *arguments,
+            **common_options,
+        )
+        reduced = triton_sage_attention_uint8_pv_feature_convrot(
+            *arguments,
+            scaled_fp16_correction=True,
+            **common_options,
+        )
+
+    torch.testing.assert_close(reduced, exact, atol=0.002, rtol=0.004)
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="signed scaled-FP16 numerator path is currently tuned for SM12x",
+)
+def test_signed_key_scaled_fp16_numerator_is_close_to_fp32() -> None:
+    torch.manual_seed(895)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    arguments = (query, key, value, 128**-0.5, False)
+    common_options = {
+        "grouped_qk": False,
+        "affine_probability": False,
+        "split_pv_head_dim": True,
+        "scale_forward_log_recurrence": True,
+        "optimize_pv_scaling": True,
+    }
+
+    with torch.no_grad():
+        fp32 = triton_sage_attention_uint8_pv_feature_convrot(
+            *arguments,
+            **common_options,
+        )
+        reduced = triton_sage_attention_uint8_pv_feature_convrot(
+            *arguments,
+            scaled_fp16_numerator=True,
+            **common_options,
+        )
+
+    torch.testing.assert_close(reduced, fp32, atol=0.004, rtol=0.008)
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="delayed affine correction path is currently tuned for SM12x",
+)
+@pytest.mark.parametrize("correction_group", [8, 16])
+def test_delayed_correction_is_close_to_per_tile_correction(
+    correction_group: int,
+) -> None:
+    torch.manual_seed(894)
+    sequence = 1024
+    query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    prepared = _prepare_uint8_pv_feature_convrot_inputs(
+        query,
+        key,
+        value,
+        128**-0.5,
+        grouped_qk=True,
+        rotation_group=0,
+        value_scale_axis="key",
+        value_scale_floor=0.0,
+        probability_scale_mode="log",
+        affine_probability=True,
+        native_uint8_mma=False,
+        scaled_fp16_correction=True,
+        scale_forward_log_recurrence=True,
+        precompute_pv_multiplier=True,
+    )
+    common_options = {
+        "grouped_qk": True,
+        "rotation_group": 0,
+        "value_scale_axis": "key",
+        "probability_scale_mode": "log",
+        "fuse_output_rotation": True,
+        "block_m": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "affine_probability": True,
+        "native_uint8_mma": False,
+        "factored_pv_scaling": True,
+        "precomputed_pv_multiplier": True,
+        "scaled_fp16_numerator": True,
+        "scaled_fp16_correction": True,
+        "split_pv_head_dim": True,
+        "scale_forward_log_recurrence": True,
+        "unmasked_self_attention": True,
+        "use_tensor_descriptors": True,
+    }
+
+    with torch.no_grad():
+        per_tile_output = torch.empty_like(query)
+        per_tile = _launch_uint8_pv_feature_convrot_attention(
+            prepared,
+            per_tile_output,
+            per_tile_output,
+            sequence,
+            sequence,
+            False,
+            **common_options,
+        )
+        delayed_output = torch.empty_like(query)
+        delayed = _launch_uint8_pv_feature_convrot_attention(
+            prepared,
+            delayed_output,
+            delayed_output,
+            sequence,
+            sequence,
+            False,
+            delayed_fp16_correction_group=correction_group,
+            **common_options,
+        )
+
+    torch.testing.assert_close(delayed, per_tile, atol=0.003, rtol=0.006)
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
     reason="M128 split-PV descriptors are currently selected on SM12x",
 )
 def test_key_scaled_m128_descriptor_matches_pointer_path() -> None:

@@ -90,6 +90,8 @@ def _run_shape(
     optimize_pv_scaling: bool,
     fp32_pv_scale_metadata: bool | None,
     scaled_fp16_numerator: bool,
+    scaled_fp16_correction: bool,
+    delayed_fp16_correction_group: int,
     scaled_fp16_denominator: bool,
     warmup_ms: int,
     repeat_ms: int,
@@ -165,6 +167,7 @@ def _run_shape(
             probability_scale_mode=variant[2],
             affine_probability=affine_probability,
             native_uint8_mma=native_uint8_mma,
+            scaled_fp16_correction=scaled_fp16_correction,
             tile_common_log_denominator=tile_common_log_denominator,
             narrow_int8_log_denominator=narrow_int8_log_denominator,
             scale_forward_log_recurrence=scale_forward_log_recurrence,
@@ -363,12 +366,13 @@ def _run_shape(
                     factored_pv_scaling=optimize_pv_scaling,
                     precomputed_pv_multiplier=optimize_pv_scaling,
                     scaled_fp16_numerator=scaled_fp16_numerator,
+                    scaled_fp16_correction=scaled_fp16_correction,
+                    delayed_fp16_correction_group=delayed_fp16_correction_group,
                     scaled_fp16_denominator=scaled_fp16_denominator,
                     unmasked_self_attention=(
                         sequence % config.block_m == 0
                         and sequence % 64 == 0
                         and scale_forward_log_recurrence
-                        and native_uint8_mma
                         and split_pv_head_dim
                         and optimize_pv_scaling
                     ),
@@ -427,6 +431,8 @@ def _run_shape(
                 optimize_pv_scaling=optimize_pv_scaling,
                 fp32_pv_scale_metadata=fp32_pv_scale_metadata,
                 scaled_fp16_numerator=scaled_fp16_numerator,
+                scaled_fp16_correction=scaled_fp16_correction,
+                delayed_fp16_correction_group=delayed_fp16_correction_group,
                 scaled_fp16_denominator=scaled_fp16_denominator,
             ),
             warmup_ms,
@@ -476,6 +482,9 @@ def _run_shape(
         recurrence += " scale-forward" if scale_forward_log_recurrence else ""
         recurrence += " optimized-PV-scale" if optimize_pv_scaling else ""
         recurrence += " scaled-FP16-numerator" if scaled_fp16_numerator else ""
+        recurrence += " FP16-correction" if scaled_fp16_correction else ""
+        if delayed_fp16_correction_group:
+            recurrence += f" G{delayed_fp16_correction_group}-correction"
         recurrence += " scaled-FP16-denominator" if scaled_fp16_denominator else ""
         recurrence += (
             " R168"
@@ -573,13 +582,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--optimize-pv-scaling",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="precompute the FP32 UINT8 probability multiplier during V quantization",
+        help="precompute the integer-P probability multiplier during V quantization",
     )
     parser.add_argument(
         "--scaled-fp16-numerator",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="keep the unnormalized key-scaled PV numerator in a fixed 2^-16 FP16 coordinate",
+    )
+    parser.add_argument(
+        "--scaled-fp16-correction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="store and apply the affine correction in the numerator's FP16 coordinate",
+    )
+    parser.add_argument(
+        "--delayed-fp16-correction-group",
+        type=int,
+        choices=[0, 8, 16],
+        default=0,
+        help="apply 8 or 16 affine corrections together with one FP16 contraction",
     )
     parser.add_argument(
         "--fp32-pv-scale-metadata",
@@ -699,24 +721,43 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912
         )
     if args.optimize_pv_scaling and (
         not args.scale_forward_log_recurrence
-        or not args.native_uint8_mma
         or not args.split_pv_head_dim
     ):
         raise SystemExit(
-            "--optimize-pv-scaling requires native UINT8 split-D128 scale-forward recurrence"
+            "--optimize-pv-scaling requires integer-P split-D128 scale-forward recurrence"
         )
     if args.fp32_pv_scale_metadata is not None and not args.optimize_pv_scaling:
         raise SystemExit("PV scale metadata override requires --optimize-pv-scaling")
     if args.scaled_fp16_numerator and (
         not args.scale_forward_log_recurrence
-        or not args.native_uint8_mma
         or not args.split_pv_head_dim
-        or not args.affine_probability
         or max(args.sequence) > 131072
     ):
         raise SystemExit(
-            "--scaled-fp16-numerator requires affine native UINT8 split-D128 "
+            "--scaled-fp16-numerator requires integer-P split-D128 "
             "scale-forward recurrence with N <= 131072"
+        )
+    if args.scaled_fp16_correction and (
+        args.native_uint8_mma
+        or not args.affine_probability
+        or not args.scaled_fp16_numerator
+        or not args.split_pv_head_dim
+    ):
+        raise SystemExit(
+            "--scaled-fp16-correction requires signed-MMA affine UINT8 with "
+            "a split scaled-FP16 numerator"
+        )
+    if args.delayed_fp16_correction_group and (
+        not args.scaled_fp16_correction
+        or not args.optimize_pv_scaling
+        or any(
+            sequence % (args.delayed_fp16_correction_group * 64)
+            for sequence in args.sequence
+        )
+    ):
+        raise SystemExit(
+            "--delayed-fp16-correction-group requires optimized scaled-FP16 correction "
+            "and complete groups"
         )
     if args.scaled_fp16_denominator and not args.scaled_fp16_numerator:
         raise SystemExit("--scaled-fp16-denominator requires --scaled-fp16-numerator")
@@ -770,6 +811,8 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912
             args.optimize_pv_scaling,
             args.fp32_pv_scale_metadata,
             args.scaled_fp16_numerator,
+            args.scaled_fp16_correction,
+            args.delayed_fp16_correction_group,
             args.scaled_fp16_denominator,
             args.warmup_ms,
             args.repeat_ms,

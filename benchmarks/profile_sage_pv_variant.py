@@ -119,6 +119,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "int8-log-unweighted-transposed",
             "int8-log-signed-transposed",
             "int8-log-signed-descriptor",
+            "int8-log-signed-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-unmasked-descriptor",
             "int8-log-native-descriptor",
             "int8-log-scale-forward-descriptor",
             "int8-log-scale-forward-native-descriptor",
@@ -143,6 +144,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "int8-log-split-scale-forward-factored-pv-scale-scaled-fp16-numerator-unmasked-native-descriptor",
             "int8-log-split-scale-forward-factored-pv-scale-fp32-metadata-native-descriptor",
             "int8-log-split-scale-forward-precomputed-pv-scale-native-descriptor",
+            "int8-log-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-unmasked-descriptor",
+            "int8-log-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-fp16-correction-unmasked-descriptor",
+            "int8-log-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-fp16-correction-g8-unmasked-descriptor",
+            "int8-log-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-fp16-correction-g16-unmasked-descriptor",
             "int8-log-split-scale-forward-precomputed-pv-scale-scaled-fp16-numerator-unmasked-native-descriptor",
             "int8-log-split-scale-forward-precomputed-pv-scale-scale-descriptor-scaled-fp16-numerator-unmasked-native-descriptor",
             "int8-log-split-scale-forward-precomputed-pv-scale-fp32-metadata-native-descriptor",
@@ -246,6 +251,7 @@ def _sass_counts(cubin: bytes) -> tuple[int, dict[str, int], dict[str, int]]:
         family: families[family]
         for family in (
             "IMMA",
+            "HMMA",
             "QMMA",
             "I2FP",
             "IADD3",
@@ -260,6 +266,7 @@ def _sass_counts(cubin: bytes) -> tuple[int, dict[str, int], dict[str, int]]:
             "FFMA",
             "FADD",
             "FMUL",
+            "FMNMX",
             "MUFU",
             "PRMT",
             "LDSM",
@@ -277,7 +284,7 @@ def _sass_counts(cubin: bytes) -> tuple[int, dict[str, int], dict[str, int]]:
     selected_mma = {
         opcode: count
         for opcode, count in sorted(full.items())
-        if opcode.startswith(("IMMA", "QMMA"))
+        if opcode.startswith(("IMMA", "HMMA", "QMMA"))
     }
     return sum(full.values()), selected_families, selected_mma
 
@@ -1368,6 +1375,8 @@ def _log_int8_launcher(
     scaled_fp16_numerator: bool,
     scaled_fp16_denominator: bool,
     split_pv_head_dim: bool,
+    scaled_fp16_correction: bool,
+    delayed_fp16_correction_group: int,
     tile_common_log_denominator: bool,
     narrow_int8_log_denominator: bool,
     running_max_probability_recurrence: bool,
@@ -1390,6 +1399,7 @@ def _log_int8_launcher(
         value_transposed=value_transposed,
         affine_probability=affine_probability,
         native_uint8_mma=native_uint8_mma,
+        scaled_fp16_correction=scaled_fp16_correction,
         tile_common_log_denominator=tile_common_log_denominator,
         narrow_int8_log_denominator=narrow_int8_log_denominator,
         scale_forward_log_recurrence=scale_forward_log_recurrence,
@@ -1438,6 +1448,8 @@ def _log_int8_launcher(
             scaled_fp16_numerator=scaled_fp16_numerator,
             scaled_fp16_denominator=scaled_fp16_denominator,
             split_pv_head_dim=split_pv_head_dim,
+            scaled_fp16_correction=scaled_fp16_correction,
+            delayed_fp16_correction_group=delayed_fp16_correction_group,
             tile_common_log_denominator=tile_common_log_denominator,
             narrow_int8_log_denominator=narrow_int8_log_denominator,
             running_max_probability_recurrence=running_max_probability_recurrence,
@@ -1673,6 +1685,14 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0915
             scaled_fp16_numerator="scaled-fp16-numerator" in args.variant,
             scaled_fp16_denominator="scaled-fp16-denominator" in args.variant,
             split_pv_head_dim="split" in args.variant,
+            scaled_fp16_correction="fp16-correction" in args.variant,
+            delayed_fp16_correction_group=(
+                16
+                if "fp16-correction-g16" in args.variant
+                else 8
+                if "fp16-correction-g8" in args.variant
+                else 0
+            ),
             tile_common_log_denominator="tile-common" in args.variant,
             narrow_int8_log_denominator="narrow-denom" in args.variant,
             running_max_probability_recurrence="running-max" in args.variant,

@@ -30,9 +30,11 @@ affine identity
     u @ v = (u - 128) @ v + 128 * sum(v),
 
 where ``u`` is an integer in ``[0, 255]`` and ``u - 128`` is representable as
-signed INT8.  The complete ``128 * sum(v)`` term is produced during V
-quantization and supplied as the integer MMA accumulator, so the attention loop
-only loads one INT32 correction vector per K=64 tile.
+signed INT8.  The K=64 ``sum(v)`` term is produced during V quantization and
+stored in INT16 (its exact range is only ``[-8128, 8128]``). Attention
+reconstructs ``128 * sum(v)`` with a left shift and supplies it as the integer
+MMA accumulator. This halves correction metadata traffic without changing the
+represented product.
 """
 
 # ruff: noqa: ANN001, ANN202, ARG001, PLR0912, PLR0913, PLR0915, PLR0917
@@ -142,6 +144,50 @@ def _rescale_int32_pair(values, weight):
 
 
 @triton.jit
+def _apply_delayed_fp16_correction(
+    value_correction_ptr,
+    correction_group_weights,
+    correction_group_blocks,
+    offsets_vd,
+    accumulator_low,
+    accumulator_high,
+    active_corrections: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Merge one padded K16 correction group into both D64 accumulators."""
+    correction_group_slots = tl.arange(0, 16)
+    half_head_dim: tl.constexpr = head_dim // 2
+    correction_group_low = tl.load(
+        value_correction_ptr
+        + correction_group_blocks[:, None] * head_dim
+        + offsets_vd[None, :],
+        mask=correction_group_slots[:, None] < active_corrections,
+        other=0.0,
+    )
+    correction_group_high = tl.load(
+        value_correction_ptr
+        + correction_group_blocks[:, None] * head_dim
+        + half_head_dim
+        + offsets_vd[None, :],
+        mask=correction_group_slots[:, None] < active_corrections,
+        other=0.0,
+    )
+    accumulator_low = tl.dot(
+        correction_group_weights,
+        correction_group_low,
+        accumulator_low,
+        out_dtype=tl.float16,
+    )
+    accumulator_high = tl.dot(
+        correction_group_weights,
+        correction_group_high,
+        accumulator_high,
+        out_dtype=tl.float16,
+    )
+    return accumulator_low, accumulator_high
+
+
+@triton.jit
 def _quantize_value_feature_convrot_int8_kernel(
     value_ptr,
     scale_ptr,
@@ -165,6 +211,8 @@ def _quantize_value_feature_convrot_int8_kernel(
     store_value_scale: tl.constexpr,
     store_probability_multiplier: tl.constexpr,
     store_value_correction: tl.constexpr,
+    store_scaled_fp16_correction: tl.constexpr,
+    probability_range: tl.constexpr,
     tile_common_log_denominator: tl.constexpr,
     narrow_int8_log_denominator: tl.constexpr,
     scale_forward_log_recurrence: tl.constexpr,
@@ -194,11 +242,14 @@ def _quantize_value_feature_convrot_int8_kernel(
     scale_block = (batch * heads + head) * tl.cdiv(key_length, block_n) + key_block
     metadata_offsets = scale_block * head_dim + offsets_d
     if store_value_scale:
-        stored_scale = tl.where(store_probability_multiplier, scale * _P_UINT8_RANGE, scale)
+        stored_scale = tl.where(store_probability_multiplier, scale * probability_range, scale)
         tl.store(scale_ptr + metadata_offsets, stored_scale)
     if store_value_correction:
-        value_correction = _P_ZERO_POINT * tl.sum(quantized.to(tl.int32), axis=0)
-        tl.store(correction_ptr + metadata_offsets, value_correction)
+        value_sum = tl.sum(quantized.to(tl.int32), axis=0)
+        if store_scaled_fp16_correction:
+            tl.store(correction_ptr + metadata_offsets, value_sum.to(tl.float32) * (1.0 / 512.0))
+        else:
+            tl.store(correction_ptr + metadata_offsets, value_sum)
     _sage_backend._store_value_tile(
         output_ptr,
         quantized,
@@ -238,6 +289,8 @@ def _quantize_value_feature_convrot_per_key_int8_kernel(
     store_value_scale: tl.constexpr,
     store_probability_multiplier: tl.constexpr,
     store_value_correction: tl.constexpr,
+    store_scaled_fp16_correction: tl.constexpr,
+    probability_range: tl.constexpr,
     tile_common_log_denominator: tl.constexpr,
     narrow_int8_log_denominator: tl.constexpr,
     scale_forward_log_recurrence: tl.constexpr,
@@ -269,7 +322,7 @@ def _quantize_value_feature_convrot_per_key_int8_kernel(
     )
     batch_head = batch * heads + head
     if store_value_scale:
-        stored_scale = tl.where(store_probability_multiplier, scale * _P_UINT8_RANGE, scale)
+        stored_scale = tl.where(store_probability_multiplier, scale * probability_range, scale)
         tl.store(
             scale_ptr + batch_head * key_length + offsets_n,
             stored_scale,
@@ -317,11 +370,14 @@ def _quantize_value_feature_convrot_per_key_int8_kernel(
                 mask=valid_keys,
             )
     if store_value_correction:
-        value_correction = _P_ZERO_POINT * tl.sum(quantized.to(tl.int32), axis=0)
+        value_sum = tl.sum(quantized.to(tl.int32), axis=0)
         correction_offsets = (
             batch_head * tl.cdiv(key_length, block_n) + key_block
         ) * head_dim + offsets_d
-        tl.store(correction_ptr + correction_offsets, value_correction)
+        if store_scaled_fp16_correction:
+            tl.store(correction_ptr + correction_offsets, value_sum.to(tl.float32) * (1.0 / 512.0))
+        else:
+            tl.store(correction_ptr + correction_offsets, value_sum)
     _sage_backend._store_value_tile(
         output_ptr,
         quantized,
@@ -385,6 +441,8 @@ def _uint8_pv_feature_convrot_attention_kernel(
     scaled_fp16_numerator: tl.constexpr,
     scaled_fp16_denominator: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
+    scaled_fp16_correction: tl.constexpr,
+    delayed_fp16_correction_group: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     unmasked_self_attention: tl.constexpr,
     output_rotation_group: tl.constexpr,
@@ -402,6 +460,10 @@ def _uint8_pv_feature_convrot_attention_kernel(
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
     half_head_dim: tl.constexpr = head_dim // 2
+    if affine_probability:
+        base_probability_range: tl.constexpr = _P_UINT8_RANGE
+    else:
+        base_probability_range: tl.constexpr = _V_INT8_RANGE
     if split_pv_head_dim:
         offsets_vd = tl.arange(0, half_head_dim)
     if unmasked_query_tiles:
@@ -460,6 +522,13 @@ def _uint8_pv_feature_convrot_attention_kernel(
     else:
         denominator = tl.zeros((block_m,), dtype=tl.float32)
     running_max = tl.full((block_m,), -float("inf"), dtype=tl.float32)
+    if delayed_fp16_correction_group:
+        correction_group_slots = tl.arange(0, 16)
+        correction_group_maxima = tl.full(
+            (block_m, 16),
+            -float("inf"),
+            dtype=tl.float32,
+        )
     if integer_tile_exponent_recurrence or lazy_int32_exponent_recurrence:
         running_exponent = tl.full((block_m,), -(1 << 30), dtype=tl.int32)
     if paired_int32_tiles:
@@ -730,7 +799,9 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 probability_range: tl.constexpr = _P_UINT8_RANGE
                 probability_code_limit: tl.constexpr = probability_range
             if not native_uint8_mma and not split_pv_head_dim:
-                value_correction = tl.load(value_correction_ptr + metadata_offsets)
+                value_correction = (
+                    tl.load(value_correction_ptr + metadata_offsets).to(tl.int32) << 7
+                )
         else:
             probability_range: tl.constexpr = _V_INT8_RANGE
             probability_code_limit: tl.constexpr = probability_range
@@ -1019,18 +1090,30 @@ def _uint8_pv_feature_convrot_attention_kernel(
                         out_dtype=tl.int32,
                     )
             elif affine_probability:
-                correction_low = tl.load(
-                    value_correction_ptr + metadata_block * head_dim + offsets_vd
-                )
-                correction_accumulator_low = (
-                    tl.zeros((block_m, half_head_dim), dtype=tl.int32) + correction_low[None, :]
-                )
-                partial_low = tl.dot(
-                    probability_int8,
-                    value_low,
-                    correction_accumulator_low,
-                    out_dtype=tl.int32,
-                )
+                if scaled_fp16_correction:
+                    if not delayed_fp16_correction_group:
+                        correction_low_scaled = tl.load(
+                            value_correction_ptr + metadata_block * head_dim + offsets_vd
+                        )
+                    partial_low = tl.dot(
+                        probability_int8,
+                        value_low,
+                        out_dtype=tl.int32,
+                    )
+                else:
+                    correction_low = tl.load(
+                        value_correction_ptr + metadata_block * head_dim + offsets_vd
+                    ).to(tl.int32) << 7
+                    correction_accumulator_low = (
+                        tl.zeros((block_m, half_head_dim), dtype=tl.int32)
+                        + correction_low[None, :]
+                    )
+                    partial_low = tl.dot(
+                        probability_int8,
+                        value_low,
+                        correction_accumulator_low,
+                        out_dtype=tl.int32,
+                    )
             else:
                 partial_low = tl.dot(
                     probability_int8,
@@ -1088,6 +1171,8 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 partial_low_scaled = (
                     partial_low.to(tl.float32) * (1.0 / 65536.0)
                 ).to(tl.float16)
+                if scaled_fp16_correction and not delayed_fp16_correction_group:
+                    partial_low_scaled += correction_low_scaled[None, :]
                 accumulator_low = (
                     accumulator_low * old_weight[:, None].to(tl.float16)
                     + partial_low_scaled
@@ -1191,18 +1276,36 @@ def _uint8_pv_feature_convrot_attention_kernel(
                         out_dtype=tl.int32,
                     )
             elif affine_probability:
-                correction_high = tl.load(
-                    value_correction_ptr + metadata_block * head_dim + half_head_dim + offsets_vd
-                )
-                correction_accumulator_high = (
-                    tl.zeros((block_m, half_head_dim), dtype=tl.int32) + correction_high[None, :]
-                )
-                partial_high = tl.dot(
-                    probability_int8,
-                    value_high,
-                    correction_accumulator_high,
-                    out_dtype=tl.int32,
-                )
+                if scaled_fp16_correction:
+                    if not delayed_fp16_correction_group:
+                        correction_high_scaled = tl.load(
+                            value_correction_ptr
+                            + metadata_block * head_dim
+                            + half_head_dim
+                            + offsets_vd
+                        )
+                    partial_high = tl.dot(
+                        probability_int8,
+                        value_high,
+                        out_dtype=tl.int32,
+                    )
+                else:
+                    correction_high = tl.load(
+                        value_correction_ptr
+                        + metadata_block * head_dim
+                        + half_head_dim
+                        + offsets_vd
+                    ).to(tl.int32) << 7
+                    correction_accumulator_high = (
+                        tl.zeros((block_m, half_head_dim), dtype=tl.int32)
+                        + correction_high[None, :]
+                    )
+                    partial_high = tl.dot(
+                        probability_int8,
+                        value_high,
+                        correction_accumulator_high,
+                        out_dtype=tl.int32,
+                    )
             else:
                 partial_high = tl.dot(
                     probability_int8,
@@ -1257,6 +1360,8 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 partial_high_scaled = (
                     partial_high.to(tl.float32) * (1.0 / 65536.0)
                 ).to(tl.float16)
+                if scaled_fp16_correction and not delayed_fp16_correction_group:
+                    partial_high_scaled += correction_high_scaled[None, :]
                 accumulator_high = (
                     accumulator_high * old_weight[:, None].to(tl.float16)
                     + partial_high_scaled
@@ -1411,6 +1516,37 @@ def _uint8_pv_feature_convrot_attention_kernel(
                     * value_scale[None, :]
                     * current_weight[:, None]
                 )
+        if delayed_fp16_correction_group:
+            correction_group_slot = (start_n // block_n) % delayed_fp16_correction_group
+            correction_group_maxima = tl.where(
+                correction_group_slots[None, :] == correction_group_slot,
+                block_max[:, None],
+                correction_group_maxima,
+            )
+            if correction_group_slot == delayed_fp16_correction_group - 1:
+                correction_group_weights = tl.where(
+                    correction_group_slots[None, :] < delayed_fp16_correction_group,
+                    tl.exp2(correction_group_maxima - next_max[:, None]),
+                    0.0,
+                ).to(tl.float16)
+                correction_group_first_block = (
+                    start_n // block_n - (delayed_fp16_correction_group - 1)
+                )
+                correction_group_blocks = (
+                    (batch * heads + head) * tl.cdiv(key_length, block_n)
+                    + correction_group_first_block
+                    + correction_group_slots
+                )
+                accumulator_low, accumulator_high = _apply_delayed_fp16_correction(
+                    value_correction_ptr,
+                    correction_group_weights,
+                    correction_group_blocks,
+                    offsets_vd,
+                    accumulator_low,
+                    accumulator_high,
+                    active_corrections=delayed_fp16_correction_group,
+                    head_dim=head_dim,
+                )
         if paired_int32_tiles:
             pending_block_max = tl.where(first_in_pair, block_max, pending_block_max)
         if lazy_int32_exponent_recurrence:
@@ -1466,14 +1602,14 @@ def _uint8_pv_feature_convrot_attention_kernel(
             )[:, None]
             if scaled_fp16_denominator:
                 output_low = accumulator_low.to(tl.float32) / (
-                    denominator_safe * (_P_UINT8_RANGE / 4096.0)
+                    denominator_safe * (base_probability_range / 4096.0)
                 )
                 output_high = accumulator_high.to(tl.float32) / (
-                    denominator_safe * (_P_UINT8_RANGE / 4096.0)
+                    denominator_safe * (base_probability_range / 4096.0)
                 )
             else:
                 denominator_code_scale: tl.constexpr = (
-                    _P_UINT8_RANGE / 65536.0
+                    base_probability_range / 65536.0
                 )
                 output_low = accumulator_low.to(tl.float32) / (
                     denominator_safe * denominator_code_scale
@@ -1840,6 +1976,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
     value_transposed: bool = True,
     affine_probability: bool = True,
     native_uint8_mma: bool = False,
+    scaled_fp16_correction: bool = False,
     tile_common_log_denominator: bool = False,
     narrow_int8_log_denominator: bool = False,
     scale_forward_log_recurrence: bool = False,
@@ -1916,7 +2053,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
     value_correction = torch.empty(
         correction_shape if affine_probability and not native_uint8_mma else (1,),
         device=value.device,
-        dtype=torch.int32,
+        dtype=torch.float16 if scaled_fp16_correction else torch.int16,
     )
     value_int8_shape = (
         (batch, heads, head_dim, storage_key_length)
@@ -1960,6 +2097,10 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         ),
         store_probability_multiplier=precompute_pv_multiplier,
         store_value_correction=affine_probability and not native_uint8_mma,
+        store_scaled_fp16_correction=scaled_fp16_correction,
+        probability_range=(
+            255.0 if affine_probability or native_uint8_mma else 127.0
+        ),
         tile_common_log_denominator=tile_common_log_denominator,
         narrow_int8_log_denominator=narrow_int8_log_denominator,
         scale_forward_log_recurrence=scale_forward_log_recurrence,
@@ -2022,6 +2163,8 @@ def _launch_uint8_pv_feature_convrot_attention(
     omit_pv_scaling: bool = False,
     normalized_fp16_recurrence: bool = False,
     scaled_fp16_numerator: bool = False,
+    scaled_fp16_correction: bool = False,
+    delayed_fp16_correction_group: int = 0,
     scaled_fp16_denominator: bool = False,
     split_pv_head_dim: bool = False,
     unmasked_self_attention: bool = False,
@@ -2115,12 +2258,10 @@ def _launch_uint8_pv_feature_convrot_attention(
         )
     if factored_pv_scaling and (
         not scale_forward_log_recurrence
-        or not affine_probability
-        or not native_uint8_mma
         or fp16_pv_scaling
     ):
         raise ValueError(
-            "factored PV scaling requires native UINT8 scale-forward recurrence"
+            "factored PV scaling requires integer-P scale-forward recurrence"
         )
     if precomputed_pv_multiplier and not factored_pv_scaling:
         raise ValueError("precomputed PV multiplier requires factored PV scaling")
@@ -2271,8 +2412,6 @@ def _launch_uint8_pv_feature_convrot_attention(
         or probability_scale_mode != "log"
         or not shift_log_scores
         or not weighted_log_denominator
-        or not affine_probability
-        or not native_uint8_mma
         or head_dim != 128
         or rotation_group != 0
         or normalized_fp16_recurrence
@@ -2287,7 +2426,7 @@ def _launch_uint8_pv_feature_convrot_attention(
         or key_length > 131072
     ):
         raise ValueError(
-            "scaled FP16 numerator requires a compatible native-UINT8 D128 "
+            "scaled FP16 numerator requires a compatible integer-P D128 "
             "per-key log recurrence with K <= 131072"
         )
     if scaled_fp16_denominator and not scaled_fp16_numerator:
@@ -2301,6 +2440,27 @@ def _launch_uint8_pv_feature_convrot_attention(
     ):
         raise ValueError(
             "split PV requires D128, rotation-free per-key log scaling, and compatible recurrence"
+        )
+    if scaled_fp16_correction and (
+        native_uint8_mma
+        or not affine_probability
+        or not split_pv_head_dim
+        or not scaled_fp16_numerator
+    ):
+        raise ValueError(
+            "scaled FP16 correction requires affine signed-MMA emulation "
+            "with a split scaled-FP16 numerator"
+        )
+    if delayed_fp16_correction_group not in (0, 8, 16):
+        raise ValueError("delayed FP16 correction group must be 0, 8, or 16")
+    if delayed_fp16_correction_group and (
+        not scaled_fp16_correction
+        or not unmasked_self_attention
+        or key_length % (delayed_fp16_correction_group * _PV_BLOCK)
+    ):
+        raise ValueError(
+            "delayed correction requires complete noncausal self-attention groups "
+            "with the scaled FP16 correction path"
         )
     key_argument, value_argument = _sage_backend._make_attention_arguments(
         key,
@@ -2386,6 +2546,8 @@ def _launch_uint8_pv_feature_convrot_attention(
             scaled_fp16_numerator=scaled_fp16_numerator,
             scaled_fp16_denominator=scaled_fp16_denominator,
             split_pv_head_dim=split_pv_head_dim,
+            scaled_fp16_correction=scaled_fp16_correction,
+            delayed_fp16_correction_group=delayed_fp16_correction_group,
             unmasked_query_tiles=unmasked_query_tiles,
             unmasked_self_attention=unmasked_self_attention,
             output_rotation_group=rotation_group if fuse_output_rotation else 0,
@@ -2448,6 +2610,8 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     probability_fp16: bool = False,
     normalized_fp16_recurrence: bool = False,
     scaled_fp16_numerator: bool = False,
+    scaled_fp16_correction: bool = False,
+    delayed_fp16_correction_group: int = 0,
     scaled_fp16_denominator: bool = False,
     split_pv_head_dim: bool = False,
     tile_common_log_denominator: bool = False,
@@ -2457,16 +2621,16 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     optimize_pv_scaling: bool | None = None,
     fp32_pv_scale_metadata: bool | None = None,
 ) -> torch.Tensor:
-    """Run per-key-scaled feature-ConvRot V with affine UINT8 P attention.
+    """Run per-key-scaled feature-ConvRot V with integer P attention.
 
     Log-domain scaling is algebraically equivalent to dynamic ``P * scale_v`` normalization
     while avoiding its second per-query reduction. ``probability_scale_mode="tile"`` and
     ``value_scale_floor`` remain quality/performance ablations.  The algebraically equivalent
     scale-forward recurrence is selected for measured noncausal SM120 D128 exact-log shapes
     from N=1024; an explicit boolean controls the experiment. ``optimize_pv_scaling`` stores
-    the final ``255 * scale_v`` multiplier during V preparation, removing its formation from
-    the attention loop. The scaled-FP16 numerator uses FP16 multiplier metadata by default;
-    ``fp32_pv_scale_metadata`` retains the older FP32 control.
+    the final ``probability_range * scale_v`` multiplier during V preparation, removing its
+    formation from the attention loop. The scaled-FP16 numerator uses FP16 multiplier metadata
+    by default; ``fp32_pv_scale_metadata`` retains the older FP32 control.
     """
     if grouped_qk is None:
         grouped_qk = torch.cuda.get_device_capability(query.device)[0] == 12
@@ -2477,7 +2641,6 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     if scale_forward_log_recurrence is None:
         scale_forward_log_recurrence = (
             torch.cuda.get_device_capability(query.device)[0] == 12
-            and affine_probability
             and not is_causal
             and value_scale_axis == "key"
             and probability_scale_mode == "log"
@@ -2498,19 +2661,41 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         optimize_pv_scaling = (
             torch.cuda.get_device_capability(query.device)[0] == 12
             and scale_forward_log_recurrence
-            and native_uint8_mma
+            and (native_uint8_mma or not affine_probability)
             and split_pv_head_dim
             and not is_causal
         )
     if optimize_pv_scaling and (
         not scale_forward_log_recurrence
-        or not native_uint8_mma
         or not split_pv_head_dim
         or is_causal
     ):
         raise ValueError(
-            "optimized PV scaling requires noncausal native UINT8 split-D128 "
+            "optimized PV scaling requires noncausal integer-P split-D128 "
             "scale-forward recurrence"
+        )
+    if scaled_fp16_correction and (
+        native_uint8_mma
+        or not affine_probability
+        or not split_pv_head_dim
+        or not scaled_fp16_numerator
+    ):
+        raise ValueError(
+            "scaled FP16 correction requires affine signed-MMA emulation "
+            "with a split scaled-FP16 numerator"
+        )
+    if delayed_fp16_correction_group not in (0, 8, 16):
+        raise ValueError("delayed FP16 correction group must be 0, 8, or 16")
+    if delayed_fp16_correction_group and (
+        not scaled_fp16_correction
+        or is_causal
+        or query_length != key_length
+        or query_length % (delayed_fp16_correction_group * _PV_BLOCK)
+        or not optimize_pv_scaling
+    ):
+        raise ValueError(
+            "delayed correction requires complete noncausal self-attention groups "
+            "with optimized scaled-FP16 affine correction"
         )
     if fp32_pv_scale_metadata is None:
         fp32_pv_scale_metadata = optimize_pv_scaling and not scaled_fp16_numerator
@@ -2523,7 +2708,6 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         and key_length >= 1024
         and key_length % 16 != 0
         and scale_forward_log_recurrence
-        and native_uint8_mma
         and split_pv_head_dim
         and optimize_pv_scaling
     )
@@ -2544,6 +2728,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         probability_scale_mode=probability_scale_mode,
         affine_probability=affine_probability,
         native_uint8_mma=native_uint8_mma,
+        scaled_fp16_correction=scaled_fp16_correction,
         tile_common_log_denominator=tile_common_log_denominator,
         narrow_int8_log_denominator=narrow_int8_log_denominator,
         scale_forward_log_recurrence=scale_forward_log_recurrence,
@@ -2579,7 +2764,14 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         num_stages = 2 if use_three_cta_schedule else 3
         maxnreg = 168 if use_three_cta_schedule else None
         if scaled_fp16_numerator:
-            maxnreg = None
+            maxnreg = (
+                240
+                if scaled_fp16_correction
+                and not delayed_fp16_correction_group
+                and query_length >= 8192
+                and key_length >= 8192
+                else None
+            )
         use_tensor_descriptors = (
             torch.cuda.get_device_capability(query.device)[0] == 12
             and scaled_fp16_numerator
@@ -2631,7 +2823,6 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         and query_length % block_m == 0
         and key_length % _PV_BLOCK == 0
         and scale_forward_log_recurrence
-        and native_uint8_mma
         and split_pv_head_dim
         and optimize_pv_scaling
     )
@@ -2641,7 +2832,6 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         and query_length >= 16384
         and use_tensor_descriptors
         and scale_forward_log_recurrence
-        and native_uint8_mma
         and split_pv_head_dim
         and optimize_pv_scaling
         and not unmasked_self_attention
@@ -2679,6 +2869,8 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         scaled_fp16_numerator=scaled_fp16_numerator,
         scaled_fp16_denominator=scaled_fp16_denominator,
         split_pv_head_dim=split_pv_head_dim,
+        scaled_fp16_correction=scaled_fp16_correction,
+        delayed_fp16_correction_group=delayed_fp16_correction_group,
         unmasked_self_attention=unmasked_self_attention,
         split_query_tail=split_query_tail,
         use_tensor_descriptors=use_tensor_descriptors,
@@ -2727,6 +2919,12 @@ def triton_sage_attention_int8_pv_per_key_log(
     grouped_qk: bool | None = None,
 ) -> torch.Tensor:
     """Run exact per-key-scaled V with nonnegative signed-INT8 P."""
+    use_sm120_scaled_path = (
+        torch.cuda.get_device_capability(query.device)[0] == 12
+        and not is_causal
+        and query.shape[-1] == 128
+        and key.shape[2] <= 131072
+    )
     return triton_sage_attention_uint8_pv_feature_convrot(
         query,
         key,
@@ -2738,4 +2936,8 @@ def triton_sage_attention_int8_pv_per_key_log(
         probability_scale_mode="log",
         grouped_qk=grouped_qk,
         affine_probability=False,
+        split_pv_head_dim=use_sm120_scaled_path,
+        scale_forward_log_recurrence=use_sm120_scaled_path,
+        optimize_pv_scaling=use_sm120_scaled_path,
+        scaled_fp16_numerator=use_sm120_scaled_path,
     )
