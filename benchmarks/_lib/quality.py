@@ -91,6 +91,17 @@ def _zero_safe_cosine(actual: torch.Tensor, reference: torch.Tensor) -> float:
     return float(cosine.clamp(-1, 1))
 
 
+def _comparison_dtype(actual: torch.Tensor, reference: torch.Tensor) -> torch.dtype:
+    """Choose a floating dtype that preserves the supported input precision."""
+    if (
+        torch.float64 in (actual.dtype, reference.dtype)
+        or not actual.is_floating_point()
+        or not reference.is_floating_point()
+    ):
+        return torch.float64
+    return torch.float32
+
+
 def measure_quality(
     actual: torch.Tensor,
     reference: torch.Tensor,
@@ -101,8 +112,9 @@ def measure_quality(
     if actual.shape != reference.shape:
         raise ValueError(f"shape mismatch: actual {actual.shape}, reference {reference.shape}")
 
-    actual_float = actual.detach().to(torch.float32)
-    reference_float = reference.detach().to(torch.float32)
+    comparison_dtype = _comparison_dtype(actual, reference)
+    actual_float = actual.detach().to(comparison_dtype)
+    reference_float = reference.detach().to(comparison_dtype)
     actual_finite = torch.isfinite(actual_float)
     reference_finite = torch.isfinite(reference_float)
     finite_pairs = actual_finite & reference_finite
@@ -136,7 +148,7 @@ def measure_quality(
     reference_values = reference_float[finite_pairs]
     error = actual_values - reference_values
     absolute_error = error.abs()
-    epsilon = torch.finfo(torch.float32).tiny
+    epsilon = torch.finfo(comparison_dtype).tiny
     reference_l1 = reference_values.abs().sum()
     reference_l2_squared = reference_values.square().sum()
     error_l2_squared = error.square().sum()

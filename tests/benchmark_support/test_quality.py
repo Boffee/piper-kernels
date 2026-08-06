@@ -30,6 +30,28 @@ def test_quality_clamps_cosine_roundoff_to_its_mathematical_range() -> None:
     assert quality.cosine_similarity == 1.0
 
 
+def test_quality_preserves_integer_precision_beyond_float32() -> None:
+    reference = torch.tensor([16_777_216], dtype=torch.int32)
+    actual = torch.tensor([16_777_217], dtype=torch.int32)
+
+    quality = measure_quality(actual, reference)
+
+    assert quality.mean_absolute_error == 1.0
+    assert quality.max_absolute_error == 1.0
+    assert math.isfinite(quality.sqnr_db)
+
+
+def test_quality_preserves_float64_precision() -> None:
+    reference = torch.tensor([1.0], dtype=torch.float64)
+    actual = torch.nextafter(reference, torch.tensor([2.0], dtype=torch.float64))
+
+    quality = measure_quality(actual, reference)
+
+    assert quality.mean_absolute_error == 2**-52
+    assert quality.max_absolute_error == 2**-52
+    assert math.isfinite(quality.sqnr_db)
+
+
 def test_quality_counts_nonfinite_values_and_uses_finite_pairs() -> None:
     reference = torch.tensor([torch.nan, 2.0, 1.0])
     actual = torch.tensor([torch.nan, torch.inf, 1.0])
