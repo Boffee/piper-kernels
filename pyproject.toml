@@ -45,6 +45,7 @@ dev = [
 markers = [
     "gpu: requires a CUDA-capable GPU",
 ]
+pythonpath = ["benchmarks"]
 
 [tool.ruff]
 target-version = "py314"
