@@ -12,7 +12,7 @@ from .reporting import (
     output_target,
     write_records,
 )
-from .timing import PhaseTimings, Timing, measure_first_call, triton_benchmark
+from .timing import PhaseTimings, Timing, time_first_call, triton_benchmark
 
 __all__ = [
     "AttentionConfig",
@@ -29,11 +29,11 @@ __all__ = [
     "Timing",
     "add_output_arguments",
     "capture_environment",
-    "measure_first_call",
     "measure_provider",
     "measure_quality",
     "measure_saturation",
     "output_target",
+    "time_first_call",
     "triton_benchmark",
     "write_records",
 ]

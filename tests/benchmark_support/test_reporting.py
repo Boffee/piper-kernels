@@ -38,8 +38,8 @@ def _record() -> BenchmarkRecord:
     quality = QualityMetrics(
         mean_absolute_error=0.0,
         max_absolute_error=0.0,
-        relative_l1=0.0,
-        relative_l2=0.0,
+        relative_l1_error=0.0,
+        relative_l2_error=0.0,
         sqnr_db=float("inf"),
         cosine_similarity=1.0,
         actual_nonfinite_count=0,
@@ -53,11 +53,11 @@ def _record() -> BenchmarkRecord:
         configuration={"dtype": "float16"},
         timings=PhaseTimings(
             warmup_ms=100,
-            repeat_ms=500,
-            compilation_ms=12.0,
+            measurement_time_ms=500,
+            first_call_ms=12.0,
             preparation=timing,
-            kernel=timing,
-            complete=timing,
+            prepared_execution=timing,
+            operator_end_to_end=timing,
         ),
         quality=quality,
         environment=_environment(),
@@ -72,8 +72,8 @@ def test_json_output_is_versioned_and_strict(tmp_path: Path) -> None:
     values = json.loads(path.read_text())
     assert values[0]["schema_version"] == 1
     assert values[0]["timings"]["warmup_ms"] == 100
-    assert values[0]["timings"]["repeat_ms"] == 500
-    assert values[0]["timings"]["kernel"]["median_ms"] == 1.0
+    assert values[0]["timings"]["measurement_time_ms"] == 500
+    assert values[0]["timings"]["prepared_execution"]["median_ms"] == 1.0
     assert values[0]["quality"]["sqnr_db"] is None
     assert values[0]["environment"]["gpu_architecture"] == "SM120"
 

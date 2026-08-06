@@ -1,6 +1,6 @@
 import pytest
 import torch
-from benchmark_mixed_int8_dot import _reference_output
+from benchmark_integer_pv_dot import _reference_output
 
 
 def test_reference_output_validates_every_tile() -> None:

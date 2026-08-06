@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
 
-from .timing import PhaseTimings, Timing, measure_first_call, triton_benchmark
+from .timing import PhaseTimings, Timing, time_first_call, triton_benchmark
 
 PreparedT = TypeVar("PreparedT")
 OutputT = TypeVar("OutputT")
@@ -19,7 +19,7 @@ class DistributionTimer(Protocol):
         self,
         function: Callable[[], Any],
         warmup_ms: int,
-        repeat_ms: int,
+        measurement_time_ms: int,
     ) -> Timing: ...
 
 
@@ -28,7 +28,7 @@ class BenchmarkProvider(Generic[PreparedT, OutputT]):
     """One implementation of an operation under benchmark.
 
     Preparation may quantize, pack, or transform inputs. Run receives the
-    prepared value and should contain only the hot kernel path.
+    prepared value and should contain only the prepared execution path.
     """
 
     name: str
@@ -37,8 +37,8 @@ class BenchmarkProvider(Generic[PreparedT, OutputT]):
     synchronize: Callable[[], None] = lambda: None
     configuration: Mapping[str, Any] = field(default_factory=dict)
 
-    def complete(self) -> OutputT:
-        """Run preparation and the kernel as one complete operator call."""
+    def run_operator(self) -> OutputT:
+        """Run preparation and execution as one end-to-end operator call."""
         return self.run(self.prepare())
 
 
@@ -56,28 +56,36 @@ def measure_provider(
     provider: BenchmarkProvider[PreparedT, OutputT],
     *,
     warmup_ms: int,
-    repeat_ms: int,
+    measurement_time_ms: int,
     timer: DistributionTimer = triton_benchmark,
-    measure_compilation: bool = True,
+    measure_first_call: bool = True,
     measure_preparation: bool = True,
-    measure_complete: bool = True,
+    measure_operator_end_to_end: bool = True,
 ) -> ProviderMeasurement[OutputT]:
     """Measure all requested phases of one provider.
 
-    The cold call is intentionally performed before any warmed phase. The
+    The first call is intentionally performed before any warmed phase. The
     returned output is produced from the same prepared inputs used by the
-    kernel-only measurement so callers can compute quality afterward.
+    prepared-execution measurement so callers can compute quality afterward.
     """
-    compilation_ms = None
-    if measure_compilation:
-        _, compilation_ms = measure_first_call(provider.complete, provider.synchronize)
+    first_call_ms = None
+    if measure_first_call:
+        _, first_call_ms = time_first_call(provider.run_operator, provider.synchronize)
 
     prepared = provider.prepare()
     preparation = (
-        timer(provider.prepare, warmup_ms, repeat_ms) if measure_preparation else None
+        timer(provider.prepare, warmup_ms, measurement_time_ms)
+        if measure_preparation
+        else None
     )
-    kernel = timer(lambda: provider.run(prepared), warmup_ms, repeat_ms)
-    complete = timer(provider.complete, warmup_ms, repeat_ms) if measure_complete else None
+    prepared_execution = timer(
+        lambda: provider.run(prepared), warmup_ms, measurement_time_ms
+    )
+    operator_end_to_end = (
+        timer(provider.run_operator, warmup_ms, measurement_time_ms)
+        if measure_operator_end_to_end
+        else None
+    )
     output = provider.run(prepared)
     provider.synchronize()
 
@@ -86,11 +94,11 @@ def measure_provider(
         output=output,
         timings=PhaseTimings(
             warmup_ms=warmup_ms,
-            repeat_ms=repeat_ms,
-            compilation_ms=compilation_ms,
+            measurement_time_ms=measurement_time_ms,
+            first_call_ms=first_call_ms,
             preparation=preparation,
-            kernel=kernel,
-            complete=complete,
+            prepared_execution=prepared_execution,
+            operator_end_to_end=operator_end_to_end,
         ),
         configuration=dict(provider.configuration),
     )

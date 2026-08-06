@@ -44,8 +44,8 @@ class QualityMetrics:
 
     mean_absolute_error: float
     max_absolute_error: float
-    relative_l1: float
-    relative_l2: float
+    relative_l1_error: float
+    relative_l2_error: float
     sqnr_db: float
     cosine_similarity: float
     actual_nonfinite_count: int
@@ -58,8 +58,8 @@ class QualityMetrics:
         return {
             "mean_absolute_error": self.mean_absolute_error,
             "max_absolute_error": self.max_absolute_error,
-            "relative_l1": self.relative_l1,
-            "relative_l2": self.relative_l2,
+            "relative_l1_error": self.relative_l1_error,
+            "relative_l2_error": self.relative_l2_error,
             "sqnr_db": self.sqnr_db,
             "cosine_similarity": self.cosine_similarity,
             "actual_nonfinite_count": self.actual_nonfinite_count,
@@ -122,8 +122,8 @@ def measure_quality(
         return QualityMetrics(
             mean_absolute_error=nan,
             max_absolute_error=nan,
-            relative_l1=nan,
-            relative_l2=nan,
+            relative_l1_error=nan,
+            relative_l2_error=nan,
             sqnr_db=nan,
             cosine_similarity=nan,
             actual_nonfinite_count=actual_nonfinite,
@@ -145,8 +145,8 @@ def measure_quality(
     return QualityMetrics(
         mean_absolute_error=float(absolute_error.mean()),
         max_absolute_error=float(absolute_error.max()),
-        relative_l1=float(absolute_error.sum() / reference_l1.clamp_min(epsilon)),
-        relative_l2=float(
+        relative_l1_error=float(absolute_error.sum() / reference_l1.clamp_min(epsilon)),
+        relative_l2_error=float(
             torch.sqrt(error_l2_squared) / torch.sqrt(reference_l2_squared).clamp_min(epsilon)
         ),
         sqnr_db=float(sqnr),

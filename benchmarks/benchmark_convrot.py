@@ -38,7 +38,8 @@ class Result:
     def speedup(self) -> float:
         """Return the warmed reference-to-Triton speed ratio."""
         return (
-            self.reference.timings.kernel.median_ms / self.triton.timings.kernel.median_ms
+            self.reference.timings.prepared_execution.median_ms
+            / self.triton.timings.prepared_execution.median_ms
         )
 
 
@@ -59,7 +60,7 @@ def _run_shape(
     dtype: torch.dtype,
     seed: int,
     warmup_ms: int,
-    repeat_ms: int,
+    measurement_time_ms: int,
 ) -> Result:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     qdata = torch.randint(
@@ -102,7 +103,7 @@ def _run_shape(
         return torch.nn.functional.linear(activation, weight, bias)
 
     provider_config = {
-        "dtype": str(dtype),
+        "dtype": str(dtype).removeprefix("torch."),
         "group_size": group_size,
         "seed": seed,
     }
@@ -115,7 +116,7 @@ def _run_shape(
             configuration=provider_config,
         ),
         warmup_ms=warmup_ms,
-        repeat_ms=repeat_ms,
+        measurement_time_ms=measurement_time_ms,
         measure_preparation=False,
     )
     reference_measurement = measure_provider(
@@ -127,8 +128,8 @@ def _run_shape(
             configuration=provider_config,
         ),
         warmup_ms=warmup_ms,
-        repeat_ms=repeat_ms,
-        measure_compilation=False,
+        measurement_time_ms=measurement_time_ms,
+        measure_first_call=False,
         measure_preparation=False,
     )
     torch.testing.assert_close(
@@ -160,7 +161,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="bfloat16",
     )
     parser.add_argument("--warmup-ms", type=int, default=100)
-    parser.add_argument("--repeat-ms", type=int, default=500)
+    parser.add_argument("--measurement-time-ms", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     add_output_arguments(parser)
     return parser.parse_args(argv)
@@ -183,8 +184,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"Torch: {torch.__version__}; dtype: {dtype}; group size: {args.group_size}")
     print()
     print(
-        "| M | N | K | compile/first Triton (ms) | Triton kernel p50 [p20, p80] (ms) "
-        "| reference kernel p50 [p20, p80] (ms) | reference / Triton |"
+        "| M | N | K | first Triton call (ms) "
+        "| Triton prepared execution p50 [p20, p80] (ms) "
+        "| reference prepared execution p50 [p20, p80] (ms) | reference / Triton |"
     )
     print("|---:|---:|---:|---:|---:|---:|---:|")
     records: list[BenchmarkRecord] = []
@@ -197,14 +199,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             dtype,
             args.seed,
             args.warmup_ms,
-            args.repeat_ms,
+            args.measurement_time_ms,
         )
-        compilation_ms = result.triton.timings.compilation_ms
-        assert compilation_ms is not None
+        first_call_ms = result.triton.timings.first_call_ms
+        assert first_call_ms is not None
         print(
             f"| {result.rows} | {result.out_features} | {result.in_features} "
-            f"| {compilation_ms:.3f} | {result.triton.timings.kernel.display()} "
-            f"| {result.reference.timings.kernel.display()} | {result.speedup:.2f}x |"
+            f"| {first_call_ms:.3f} "
+            f"| {result.triton.timings.prepared_execution.display()} "
+            f"| {result.reference.timings.prepared_execution.display()} "
+            f"| {result.speedup:.2f}x |"
         )
         shape = {
             "rows": result.rows,

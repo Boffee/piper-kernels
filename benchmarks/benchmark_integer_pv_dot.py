@@ -1,10 +1,10 @@
-"""Benchmark native U8 x S8 P@V against signed and affine S8 baselines.
+"""Benchmark native and affine-proxy integer P@V dot products.
 
-The ``native`` mode requires a Triton compiler with mixed-sign integer-dot
-support. Stock Triton can run ``signed`` and ``affine``. The affine kernel
-models the exact UINT8 identity used by the attention experiment: its
-precomputed ``128 * sum(V)`` correction is loaded as the integer MMA
-accumulator.
+The ``s8-s8`` and ``u8-s8-affine-proxy`` variants run with stock Triton. The
+``u8-s8-native`` variant requires compiler and target support for a mixed-sign
+integer dot. The affine proxy models the exact UINT8 identity used by the
+attention experiment: its precomputed ``128 * sum(V)`` correction is loaded as
+the integer MMA accumulator.
 """
 
 # Triton's JIT pointer arguments intentionally omit Python annotations.
@@ -37,7 +37,7 @@ def _dot_kernel(
     b_ptr,
     correction_ptr,
     output_ptr,
-    mode: tl.constexpr,
+    use_affine_proxy: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -58,7 +58,7 @@ def _dot_kernel(
         + offsets_k[:, None] * block_n
         + offsets_n[None, :]
     )
-    if mode == "affine":
+    if use_affine_proxy:
         a = (a.to(tl.int32) - 128).to(tl.int8)
         correction = tl.load(correction_ptr + tile * block_n + offsets_n)
         accumulator = tl.zeros((block_m, block_n), tl.int32) + correction[None, :]
@@ -76,7 +76,7 @@ def _dot_kernel(
 
 @dataclass(frozen=True, slots=True)
 class PreparedDot:
-    """Per-invocation affine metadata and output storage."""
+    """Per-invocation metadata and output storage."""
 
     correction: torch.Tensor
     output: torch.Tensor
@@ -111,14 +111,17 @@ def _reference_output(
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("native", "signed", "affine"))
+    parser.add_argument(
+        "variant",
+        choices=("s8-s8", "u8-s8-native", "u8-s8-affine-proxy"),
+    )
     parser.add_argument("--tiles", type=int, default=2048)
     parser.add_argument("--block-m", type=int, choices=(32, 64, 128), default=64)
     parser.add_argument("--block-n", type=int, choices=(64, 128), default=128)
     parser.add_argument("--block-k", type=int, choices=(32, 64, 128), default=64)
     parser.add_argument("--num-warps", type=int, choices=(4, 8), default=4)
     parser.add_argument("--warmup-ms", type=int, default=500)
-    parser.add_argument("--repeat-ms", type=int, default=2000)
+    parser.add_argument("--measurement-time-ms", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     add_output_arguments(parser)
     return parser.parse_args(argv)
@@ -134,7 +137,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     generator = torch.Generator(device=device).manual_seed(args.seed)
     shape_a = (args.tiles, args.block_m, args.block_k)
     shape_b = (args.tiles, args.block_k, args.block_n)
-    if args.mode == "signed":
+    if args.variant == "s8-s8":
         a = torch.randint(
             -128,
             128,
@@ -162,7 +165,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
 
     def prepare() -> PreparedDot:
-        if args.mode == "affine":
+        if args.variant == "u8-s8-affine-proxy":
             correction = (128 * b.to(torch.int32).sum(dim=1)).to(torch.int32)
         else:
             correction = torch.empty(1, device=device, dtype=torch.int32)
@@ -179,7 +182,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             b,
             prepared.correction,
             prepared.output,
-            mode=args.mode,
+            use_affine_proxy=args.variant == "u8-s8-affine-proxy",
             block_m=args.block_m,
             block_n=args.block_n,
             block_k=args.block_k,
@@ -187,8 +190,15 @@ def _main(argv: Sequence[str] | None = None) -> None:
         )
         return prepared.output
 
+    lhs_dtype = "int8" if args.variant == "s8-s8" else "uint8"
+    implementation = (
+        "affine-proxy" if args.variant == "u8-s8-affine-proxy" else "native"
+    )
     configuration = {
-        "mode": args.mode,
+        "lhs_dtype": lhs_dtype,
+        "rhs_dtype": "int8",
+        "accumulator_dtype": "int32",
+        "implementation": implementation,
         "block_m": args.block_m,
         "block_n": args.block_n,
         "block_k": args.block_k,
@@ -197,21 +207,23 @@ def _main(argv: Sequence[str] | None = None) -> None:
     }
     measurement = measure_provider(
         BenchmarkProvider(
-            name=args.mode,
+            name=f"triton-{implementation}",
             prepare=prepare,
             run=launch,
             synchronize=torch.cuda.synchronize,
             configuration=configuration,
         ),
         warmup_ms=args.warmup_ms,
-        repeat_ms=args.repeat_ms,
+        measurement_time_ms=args.measurement_time_ms,
     )
 
     expected = _reference_output(a, b)
     actual = measurement.output.cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     operations = 2 * args.tiles * args.block_m * args.block_n * args.block_k
-    tops = operations / (measurement.timings.kernel.median_ms * 1e-3) / 1e12
+    tops = (
+        operations / (measurement.timings.prepared_execution.median_ms * 1e-3) / 1e12
+    )
     environment = capture_environment(Path(__file__).resolve().parents[1])
 
     print(
@@ -220,20 +232,24 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     print(f"triton: {environment.triton_version}")
     print(
-        f"mode={args.mode} tiles={args.tiles} "
+        f"variant={args.variant} operation={lhs_dtype}xint8->int32 tiles={args.tiles} "
         f"tile={args.block_m}x{args.block_n}x{args.block_k} warps={args.num_warps}"
     )
-    assert measurement.timings.compilation_ms is not None
+    assert measurement.timings.first_call_ms is not None
     assert measurement.timings.preparation is not None
-    assert measurement.timings.complete is not None
-    print(f"compile_first_ms={measurement.timings.compilation_ms:.6f}")
+    assert measurement.timings.operator_end_to_end is not None
+    print(f"first_call_ms={measurement.timings.first_call_ms:.6f}")
     print(f"preparation_p50_p20_p80_ms={measurement.timings.preparation.display(6)}")
     print(
-        f"kernel_p50_p20_p80_ms={measurement.timings.kernel.display(6)} "
+        "prepared_execution_p50_p20_p80_ms="
+        f"{measurement.timings.prepared_execution.display(6)} "
         f"effective_tops={tops:.2f}"
     )
-    print(f"complete_p50_p20_p80_ms={measurement.timings.complete.display(6)}")
-    probability_limits = (-128, 127) if args.mode == "signed" else (0, 255)
+    print(
+        "operator_end_to_end_p50_p20_p80_ms="
+        f"{measurement.timings.operator_end_to_end.display(6)}"
+    )
+    probability_limits = (-128, 127) if args.variant == "s8-s8" else (0, 255)
     saturation = {
         "probability": measure_saturation(a, *probability_limits),
         "value": measure_saturation(b, -128, 127),

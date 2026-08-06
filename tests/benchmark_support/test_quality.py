@@ -13,8 +13,8 @@ def test_quality_metrics_have_expected_definitions() -> None:
 
     assert quality.mean_absolute_error == pytest.approx(1 / 3)
     assert quality.max_absolute_error == 1.0
-    assert quality.relative_l1 == pytest.approx(1 / 3)
-    assert quality.relative_l2 == pytest.approx(1 / math.sqrt(5))
+    assert quality.relative_l1_error == pytest.approx(1 / 3)
+    assert quality.relative_l2_error == pytest.approx(1 / math.sqrt(5))
     assert quality.sqnr_db == pytest.approx(10 * math.log10(5))
     assert quality.cosine_similarity == pytest.approx(3 / math.sqrt(10))
     assert quality.actual_nonfinite_count == 0
