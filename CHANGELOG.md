@@ -5,6 +5,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Reusable Triton specialization, resource, PTX/SASS, and profiler-capture tooling for
+  development benchmarks, with versioned compiler-report JSON and JSONL output.
+
 ## [0.1.0] - 2026-08-03
 
 ### Added

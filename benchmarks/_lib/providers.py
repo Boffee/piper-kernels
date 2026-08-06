@@ -35,6 +35,8 @@ class BenchmarkProvider(Generic[PreparedT, OutputT]):
 
     Preparation may quantize, pack, or transform inputs. Run receives the
     prepared value and should contain only the prepared execution path.
+    ``triton_jit_functions`` maps stable report names to JIT functions launched by
+    the provider so compiler inspection remains independent of the operation.
     """
 
     name: str
@@ -42,6 +44,7 @@ class BenchmarkProvider(Generic[PreparedT, OutputT]):
     run: Callable[[PreparedT], OutputT]
     synchronize: Callable[[], None] = lambda: None
     configuration: Mapping[str, Any] = field(default_factory=dict)
+    triton_jit_functions: Mapping[str, object] = field(default_factory=dict)
 
     def run_operator(self) -> OutputT:
         """Run preparation and execution as one end-to-end operator call."""

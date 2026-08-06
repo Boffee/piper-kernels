@@ -138,3 +138,78 @@ mixed-sign UINT8 x INT8 dot support. The benchmark records the LHS, RHS, and acc
 dtypes explicitly, checks exact INT32 output, and records operand saturation.
 Backend-specific PTX, SASS, and AMDGCN inspection belongs to compiler/profiling tooling
 rather than this portable benchmark runner.
+
+## Triton compiler inspection
+
+Providers register the Triton JIT functions they launch through
+`triton_jit_functions`. After the provider has run at least once, the shared inspector
+discovers its compiled specialization and reports:
+
+- registers per thread, compiler-reported spills, shared memory per Triton program,
+  warps, stages, and CUDA CTAs per cluster;
+- a resource-only program and warp residency ceiling per compute unit from the device
+  limits exposed by PyTorch, including the limiting resource;
+- static PTX instruction-family and MMA-opcode counts when PTX is available;
+- static SASS instruction-family and MMA-opcode counts for NVIDIA CUDA kernels.
+
+The residency value is a ceiling, not achieved occupancy. It does not model every
+architecture's allocation granularity or replace hardware profiling. Static instruction
+counts describe one compiled program, not dynamic execution counts.
+
+The integer P x V benchmark is the executable reference integration:
+
+```shell
+uv run python benchmarks/benchmark_integer_pv_dot.py s8-s8 \
+  --compiler-report \
+  --compiler-json artifacts/s8-s8-compiler.json
+```
+
+SASS inspection invokes `nvdisasm` from the NVIDIA CUDA Toolkit. It is enabled
+automatically for CUDA compiler reports and disabled for other Triton backends. If the
+tool is absent, the inspector gives an actionable error; use `--no-sass` when only the
+portable resource report and available compiler IR are needed, or use
+`--nvdisasm /path/to/nvdisasm` when the toolkit binary is not on `PATH`. ROCm resource
+reporting uses the same provider and specialization model, while AMDGCN disassembly
+remains a separate future backend adapter.
+
+All Triton-cache and compiled-metadata access lives in `_lib/triton_inspection.py`.
+Specialized diagnostics can read an artifact without depending on Triton internals:
+
+```python
+from _lib.triton_inspection import compiled_artifact
+
+ttgir = compiled_artifact(jit_kernel, "ttgir")
+```
+
+Compiler JSON has its own versioned `triton_compiler` record type and includes provider
+configuration, environment and Git metadata, specialization fingerprints, resources,
+and instruction summaries for comparison across commits. `--compiler-json` writes an
+array and `--compiler-jsonl` writes one compiler record per line through the same output
+machinery as benchmark records.
+
+Compiler reporting requires each registered JIT function to have one specialization in
+the current process by default. This prevents one provider from silently claiming
+specializations compiled earlier by another provider. Run compiler comparisons as one
+provider/configuration per process; advanced diagnostics that intentionally inspect an
+entire process-wide cache must opt out explicitly.
+
+## External profiler captures
+
+`profile_provider()` launches either `prepared_execution` or `operator_end_to_end` for
+any `BenchmarkProvider`. By default, its initial compilation call and warmup iterations
+finish and synchronize before the CUDA profiler starts. Passing
+`--profile-include-setup` explicitly includes them in a separate `profile/setup` NVTX
+range.
+
+For example, capture the integer P x V provider with Nsight Systems:
+
+```shell
+nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
+  uv run python benchmarks/benchmark_integer_pv_dot.py s8-s8 \
+  --profile --profile-phase prepared_execution
+```
+
+The launch loop accepts an injected capture controller so a future ROCTracer/ROCTx
+adapter can reuse its provider-phase and setup-exclusion behavior. The built-in
+controller intentionally reports a clear unsupported-backend error on ROCm rather than
+presenting CUDA profiler APIs as portable.

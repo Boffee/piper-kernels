@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .environment import EnvironmentInfo
 from .quality import QualityMetrics
@@ -17,6 +17,12 @@ from .timing import PhaseTimings
 
 SCHEMA_VERSION = 1
 type JSONValue = str | int | float | bool | list[JSONValue] | dict[str, JSONValue] | None
+
+
+class SerializableRecord(Protocol):
+    """A versioned development record accepted by the common output writer."""
+
+    def as_dict(self) -> Mapping[str, object]: ...
 
 
 class OutputFormat(Enum):
@@ -64,6 +70,7 @@ class BenchmarkRecord:
 
 
 def _json_safe(value: object) -> JSONValue:
+    """Convert nested benchmark values to strict JSON-compatible values."""
     if isinstance(value, float) and not math.isfinite(value):
         result: JSONValue = None
     elif isinstance(value, Path):
@@ -81,27 +88,41 @@ def _json_safe(value: object) -> JSONValue:
     return result
 
 
-def add_output_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add mutually exclusive optional JSON and JSONL output arguments."""
+def add_output_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    option_prefix: str | None = None,
+    record_name: str = "result",
+) -> None:
+    """Add optional JSON and JSONL output arguments, with an optional prefix."""
+    option_stem = "" if option_prefix is None else f"{option_prefix}-"
+    destination_stem = "" if option_prefix is None else f"{option_prefix}_"
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
-        "--json",
+        f"--{option_stem}json",
+        dest=f"{destination_stem}json",
         type=Path,
         metavar="PATH",
-        help="write the complete result set as a JSON array",
+        help=f"write all {record_name} records as a JSON array",
     )
     group.add_argument(
-        "--jsonl",
+        f"--{option_stem}jsonl",
+        dest=f"{destination_stem}jsonl",
         type=Path,
         metavar="PATH",
-        help="write one JSON result object per line",
+        help=f"write one {record_name} record per JSON line",
     )
 
 
-def output_target(arguments: argparse.Namespace) -> OutputTarget | None:
+def output_target(
+    arguments: argparse.Namespace,
+    *,
+    option_prefix: str | None = None,
+) -> OutputTarget | None:
     """Resolve arguments populated by :func:`add_output_arguments`."""
-    json_path = getattr(arguments, "json", None)
-    jsonl_path = getattr(arguments, "jsonl", None)
+    destination_stem = "" if option_prefix is None else f"{option_prefix}_"
+    json_path = getattr(arguments, f"{destination_stem}json", None)
+    jsonl_path = getattr(arguments, f"{destination_stem}jsonl", None)
     if json_path is not None:
         return OutputTarget(json_path, OutputFormat.JSON)
     if jsonl_path is not None:
@@ -109,7 +130,7 @@ def output_target(arguments: argparse.Namespace) -> OutputTarget | None:
     return None
 
 
-def write_records(records: Iterable[BenchmarkRecord], target: OutputTarget | None) -> None:
+def write_records(records: Iterable[SerializableRecord], target: OutputTarget | None) -> None:
     """Write records when a machine-readable output target was requested."""
     if target is None:
         return

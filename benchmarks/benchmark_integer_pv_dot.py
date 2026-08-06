@@ -21,12 +21,20 @@ import triton.language as tl
 from _lib import (
     BenchmarkProvider,
     BenchmarkRecord,
+    EnvironmentInfo,
+    OutputTarget,
+    TritonCompilerRecord,
+    add_compiler_inspection_arguments,
     add_output_arguments,
+    add_profile_arguments,
     capture_environment,
+    format_compiler_report,
+    inspect_provider,
     measure_provider,
     measure_quality,
     measure_saturation,
     output_target,
+    profile_provider,
     write_records,
 )
 
@@ -123,8 +131,73 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-ms", type=int, default=500)
     parser.add_argument("--measurement-time-ms", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
+    add_compiler_inspection_arguments(parser)
+    add_profile_arguments(parser)
     add_output_arguments(parser)
     return parser.parse_args(argv)
+
+
+def _run_profile_if_requested(
+    args: argparse.Namespace,
+    provider: BenchmarkProvider[PreparedDot, torch.Tensor],
+    repository: Path,
+) -> bool:
+    if not args.profile:
+        return False
+    profile = profile_provider(
+        provider,
+        iterations=args.profile_iterations,
+        warmup_iterations=args.profile_warmup_iterations,
+        phase=args.profile_phase,
+        range_name=args.profile_range_name,
+        include_setup=args.profile_include_setup,
+    )
+    print(
+        f"profiled provider={profile.provider} phase={profile.phase.value} "
+        f"iterations={profile.iterations} range={profile.range_name!r} "
+        f"include_setup={profile.include_setup}"
+    )
+    compiler_report = _compiler_report_if_requested(
+        args,
+        provider,
+        capture_environment(repository),
+    )
+    _print_compiler_report_if_requested(args, compiler_report)
+    return True
+
+
+def _compiler_report_if_requested(
+    args: argparse.Namespace,
+    provider: BenchmarkProvider[PreparedDot, torch.Tensor],
+    environment: EnvironmentInfo,
+) -> TritonCompilerRecord | None:
+    compiler_output = output_target(args, option_prefix="compiler")
+    if not args.compiler_report and compiler_output is None:
+        return None
+    report = inspect_provider(
+        provider,
+        environment,
+        include_sass=args.sass,
+        nvdisasm=args.nvdisasm,
+    )
+    write_records([report], compiler_output)
+    return report
+
+
+def _print_compiler_report_if_requested(
+    args: argparse.Namespace,
+    report: TritonCompilerRecord | None,
+) -> None:
+    if args.compiler_report:
+        assert report is not None
+        print(format_compiler_report(report))
+
+
+def _benchmark_output(args: argparse.Namespace) -> OutputTarget | None:
+    target = output_target(args)
+    if args.profile and target is not None:
+        raise SystemExit("--profile cannot produce benchmark --json/--jsonl records")
+    return target
 
 
 @torch.inference_mode()
@@ -132,6 +205,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     if not torch.cuda.is_available():
         raise SystemExit("integer P@V benchmarking requires a Triton-supported GPU")
+    benchmark_output = _benchmark_output(args)
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -205,14 +279,20 @@ def _main(argv: Sequence[str] | None = None) -> None:
         "num_warps": args.num_warps,
         "seed": args.seed,
     }
+    provider = BenchmarkProvider(
+        name=f"triton-{implementation}",
+        prepare=prepare,
+        run=launch,
+        synchronize=torch.cuda.synchronize,
+        configuration=configuration,
+        triton_jit_functions={"integer-pv-dot": _dot_kernel},
+    )
+    repository = Path(__file__).resolve().parents[1]
+    if _run_profile_if_requested(args, provider, repository):
+        return
+
     measurement = measure_provider(
-        BenchmarkProvider(
-            name=f"triton-{implementation}",
-            prepare=prepare,
-            run=launch,
-            synchronize=torch.cuda.synchronize,
-            configuration=configuration,
-        ),
+        provider,
         warmup_ms=args.warmup_ms,
         measurement_time_ms=args.measurement_time_ms,
     )
@@ -224,7 +304,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
     tops = (
         operations / (measurement.timings.prepared_execution.median_ms * 1e-3) / 1e12
     )
-    environment = capture_environment(Path(__file__).resolve().parents[1])
+    environment = capture_environment(repository)
+    compiler_report = _compiler_report_if_requested(args, provider, environment)
 
     print(
         f"device: {environment.gpu_name}; backend: {environment.accelerator_backend}; "
@@ -252,6 +333,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         "operator_end_to_end_synchronized_wall_p50_p20_p80_ms="
         f"{measurement.timings.operator_end_to_end.display(6)}"
     )
+    _print_compiler_report_if_requested(args, compiler_report)
     probability_limits = (-128, 127) if args.variant == "s8-s8" else (0, 255)
     saturation = {
         "probability": measure_saturation(a, *probability_limits),
@@ -272,7 +354,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         environment=environment,
         extra={"effective_tops": tops},
     )
-    write_records([record], output_target(args))
+    write_records([record], benchmark_output)
 
 
 if __name__ == "__main__":
