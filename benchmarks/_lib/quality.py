@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+_FULL_WIDTH_INTEGER_DTYPES = (torch.int64, torch.uint64)
+
 
 @dataclass(frozen=True, slots=True)
 class QuantizerSaturation:
@@ -111,6 +113,14 @@ def measure_quality(
     """Compare tensors using finite pairs and report non-finite values separately."""
     if actual.shape != reference.shape:
         raise ValueError(f"shape mismatch: actual {actual.shape}, reference {reference.shape}")
+    if (
+        actual.dtype in _FULL_WIDTH_INTEGER_DTYPES
+        or reference.dtype in _FULL_WIDTH_INTEGER_DTYPES
+    ):
+        raise ValueError(
+            "int64 and uint64 quality inputs are unsupported because float64 cannot "
+            "preserve every full-width integer value"
+        )
 
     comparison_dtype = _comparison_dtype(actual, reference)
     actual_float = actual.detach().to(comparison_dtype)

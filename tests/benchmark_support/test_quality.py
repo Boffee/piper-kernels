@@ -52,6 +52,15 @@ def test_quality_preserves_float64_precision() -> None:
     assert math.isfinite(quality.sqnr_db)
 
 
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+def test_quality_rejects_full_width_integer_inputs(dtype: torch.dtype) -> None:
+    actual = torch.tensor([9_007_199_254_740_993], dtype=dtype)
+    reference = torch.tensor([9_007_199_254_740_992], dtype=dtype)
+
+    with pytest.raises(ValueError, match="int64 and uint64 quality inputs are unsupported"):
+        measure_quality(actual, reference)
+
+
 def test_quality_counts_nonfinite_values_and_uses_finite_pairs() -> None:
     reference = torch.tensor([torch.nan, 2.0, 1.0])
     actual = torch.tensor([torch.nan, torch.inf, 1.0])

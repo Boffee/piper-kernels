@@ -52,6 +52,9 @@ causality, scale, and an explicit QKV layout such as `BHSD`.
 `measure_quality()` centralizes mean/max absolute error, relative L1 and L2 error,
 SQNR, cosine similarity, and actual/reference non-finite counts. Providers can attach
 endpoint saturation counts for quantized tensors with `measure_saturation()`.
+Integer quality inputs through 32 bits are promoted to FP64. Full-width INT64 and UINT64
+inputs are rejected because no floating comparison dtype preserves every possible value;
+providers needing them should use a domain-specific exact comparison.
 
 Every `BenchmarkRecord` includes:
 
