@@ -87,7 +87,8 @@ def _zero_safe_cosine(actual: torch.Tensor, reference: torch.Tensor) -> float:
     reference_norm = torch.linalg.vector_norm(reference)
     if actual_norm == 0 or reference_norm == 0:
         return 1.0 if actual_norm == 0 and reference_norm == 0 else 0.0
-    return float(torch.dot(actual.flatten(), reference.flatten()) / (actual_norm * reference_norm))
+    cosine = torch.dot(actual.flatten(), reference.flatten()) / (actual_norm * reference_norm)
+    return float(cosine.clamp(-1, 1))
 
 
 def measure_quality(
@@ -107,7 +108,14 @@ def measure_quality(
     finite_pairs = actual_finite & reference_finite
     actual_nonfinite = int(torch.count_nonzero(~actual_finite).item())
     reference_nonfinite = int(torch.count_nonzero(~reference_finite).item())
-    nonfinite_mismatch = int(torch.count_nonzero(actual_finite ^ reference_finite).item())
+    nonfinite_positions = ~actual_finite | ~reference_finite
+    matching_nonfinite = (
+        (torch.isnan(actual_float) & torch.isnan(reference_float))
+        | (actual_float == reference_float)
+    )
+    nonfinite_mismatch = int(
+        torch.count_nonzero(nonfinite_positions & ~matching_nonfinite).item()
+    )
 
     if not torch.any(finite_pairs):
         nan = math.nan

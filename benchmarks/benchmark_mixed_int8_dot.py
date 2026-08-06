@@ -82,6 +82,33 @@ class PreparedDot:
     output: torch.Tensor
 
 
+def _reference_output(
+    probability: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    tile_batch: int = 32,
+) -> torch.Tensor:
+    """Compute every integer P@V tile on CPU with bounded temporary memory."""
+    if probability.ndim != 3 or value.ndim != 3:
+        raise ValueError("probability and value must be rank-three batched matrices")
+    if probability.shape[0] != value.shape[0] or probability.shape[2] != value.shape[1]:
+        raise ValueError("probability and value batch or reduction dimensions do not match")
+    if tile_batch <= 0:
+        raise ValueError("tile batch must be positive")
+
+    expected = torch.empty(
+        (probability.shape[0], probability.shape[1], value.shape[2]),
+        device="cpu",
+        dtype=torch.int32,
+    )
+    for start in range(0, probability.shape[0], tile_batch):
+        stop = min(start + tile_batch, probability.shape[0])
+        probability_batch = probability[start:stop].cpu().to(torch.int32)
+        value_batch = value[start:stop].cpu().to(torch.int32)
+        expected[start:stop] = probability_batch @ value_batch
+    return expected
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("native", "signed", "affine"))
@@ -180,8 +207,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
         repeat_ms=args.repeat_ms,
     )
 
-    expected = a[0].cpu().to(torch.int32) @ b[0].cpu().to(torch.int32)
-    actual = measurement.output[0].cpu()
+    expected = _reference_output(a, b)
+    actual = measurement.output.cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     operations = 2 * args.tiles * args.block_m * args.block_n * args.block_k
     tops = operations / (measurement.timings.kernel.median_ms * 1e-3) / 1e12

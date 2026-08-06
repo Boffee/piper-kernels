@@ -22,6 +22,14 @@ def test_quality_metrics_have_expected_definitions() -> None:
     assert quality.nonfinite_mismatch_count == 0
 
 
+def test_quality_clamps_cosine_roundoff_to_its_mathematical_range() -> None:
+    values = torch.arange(1000, dtype=torch.int32) * 1000
+
+    quality = measure_quality(values, values)
+
+    assert quality.cosine_similarity == 1.0
+
+
 def test_quality_counts_nonfinite_values_and_uses_finite_pairs() -> None:
     reference = torch.tensor([torch.nan, 2.0, 1.0])
     actual = torch.tensor([torch.nan, torch.inf, 1.0])
@@ -33,6 +41,17 @@ def test_quality_counts_nonfinite_values_and_uses_finite_pairs() -> None:
     assert quality.actual_nonfinite_count == 2
     assert quality.reference_nonfinite_count == 1
     assert quality.nonfinite_mismatch_count == 1
+
+
+def test_quality_distinguishes_nonfinite_values() -> None:
+    reference = torch.tensor([torch.nan, torch.inf, -torch.inf, torch.nan, torch.inf, -torch.inf])
+    actual = torch.tensor([torch.nan, torch.inf, -torch.inf, torch.inf, torch.nan, torch.inf])
+
+    quality = measure_quality(actual, reference)
+
+    assert quality.actual_nonfinite_count == 6
+    assert quality.reference_nonfinite_count == 6
+    assert quality.nonfinite_mismatch_count == 3
 
 
 def test_saturation_counts_both_quantizer_endpoints() -> None:
