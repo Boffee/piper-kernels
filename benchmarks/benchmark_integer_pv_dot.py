@@ -238,15 +238,18 @@ def _main(argv: Sequence[str] | None = None) -> None:
     assert measurement.timings.first_call_ms is not None
     assert measurement.timings.preparation is not None
     assert measurement.timings.operator_end_to_end is not None
-    print(f"first_call_ms={measurement.timings.first_call_ms:.6f}")
-    print(f"preparation_p50_p20_p80_ms={measurement.timings.preparation.display(6)}")
+    print(f"first_call_synchronized_wall_ms={measurement.timings.first_call_ms:.6f}")
     print(
-        "prepared_execution_p50_p20_p80_ms="
+        "preparation_synchronized_wall_p50_p20_p80_ms="
+        f"{measurement.timings.preparation.display(6)}"
+    )
+    print(
+        "prepared_execution_device_event_p50_p20_p80_ms="
         f"{measurement.timings.prepared_execution.display(6)} "
         f"effective_tops={tops:.2f}"
     )
     print(
-        "operator_end_to_end_p50_p20_p80_ms="
+        "operator_end_to_end_synchronized_wall_p50_p20_p80_ms="
         f"{measurement.timings.operator_end_to_end.display(6)}"
     )
     probability_limits = (-128, 127) if args.variant == "s8-s8" else (0, 255)

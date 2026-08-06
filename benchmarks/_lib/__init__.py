@@ -12,13 +12,21 @@ from .reporting import (
     output_target,
     write_records,
 )
-from .timing import PhaseTimings, Timing, time_first_call, triton_benchmark
+from .timing import (
+    ClockDomain,
+    PhaseTimings,
+    Timing,
+    synchronized_wall_benchmark,
+    time_first_call,
+    triton_benchmark,
+)
 
 __all__ = [
     "AttentionConfig",
     "AttentionShape",
     "BenchmarkProvider",
     "BenchmarkRecord",
+    "ClockDomain",
     "EnvironmentInfo",
     "OutputFormat",
     "OutputTarget",
@@ -33,6 +41,7 @@ __all__ = [
     "measure_quality",
     "measure_saturation",
     "output_target",
+    "synchronized_wall_benchmark",
     "time_first_call",
     "triton_benchmark",
     "write_records",

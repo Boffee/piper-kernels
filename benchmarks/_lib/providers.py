@@ -6,14 +6,20 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
 
-from .timing import PhaseTimings, Timing, time_first_call, triton_benchmark
+from .timing import (
+    PhaseTimings,
+    Timing,
+    synchronized_wall_benchmark,
+    time_first_call,
+    triton_benchmark,
+)
 
 PreparedT = TypeVar("PreparedT")
 OutputT = TypeVar("OutputT")
 
 
 class DistributionTimer(Protocol):
-    """A timing adapter compatible with :func:`triton_benchmark`."""
+    """A timing adapter for one benchmark phase."""
 
     def __call__(
         self,
@@ -57,7 +63,8 @@ def measure_provider(
     *,
     warmup_ms: int,
     measurement_time_ms: int,
-    timer: DistributionTimer = triton_benchmark,
+    device_timer: DistributionTimer = triton_benchmark,
+    wall_timer: DistributionTimer | None = None,
     measure_first_call: bool = True,
     measure_preparation: bool = True,
     measure_operator_end_to_end: bool = True,
@@ -72,17 +79,30 @@ def measure_provider(
     if measure_first_call:
         _, first_call_ms = time_first_call(provider.run_operator, provider.synchronize)
 
+    def default_wall_timer(
+        function: Callable[[], Any],
+        phase_warmup_ms: int,
+        phase_measurement_time_ms: int,
+    ) -> Timing:
+        return synchronized_wall_benchmark(
+            function,
+            phase_warmup_ms,
+            phase_measurement_time_ms,
+            synchronize=provider.synchronize,
+        )
+
+    resolved_wall_timer = wall_timer or default_wall_timer
     prepared = provider.prepare()
     preparation = (
-        timer(provider.prepare, warmup_ms, measurement_time_ms)
+        resolved_wall_timer(provider.prepare, warmup_ms, measurement_time_ms)
         if measure_preparation
         else None
     )
-    prepared_execution = timer(
+    prepared_execution = device_timer(
         lambda: provider.run(prepared), warmup_ms, measurement_time_ms
     )
     operator_end_to_end = (
-        timer(provider.run_operator, warmup_ms, measurement_time_ms)
+        resolved_wall_timer(provider.run_operator, warmup_ms, measurement_time_ms)
         if measure_operator_end_to_end
         else None
     )

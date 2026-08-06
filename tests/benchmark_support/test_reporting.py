@@ -12,7 +12,7 @@ from _lib.reporting import (
     output_target,
     write_records,
 )
-from _lib.timing import PhaseTimings, Timing
+from _lib.timing import ClockDomain, PhaseTimings, Timing
 
 
 def _environment() -> EnvironmentInfo:
@@ -34,7 +34,8 @@ def _environment() -> EnvironmentInfo:
 
 
 def _record() -> BenchmarkRecord:
-    timing = Timing(1.0, 0.8, 1.2)
+    wall_timing = Timing(1.0, 0.8, 1.2, ClockDomain.SYNCHRONIZED_WALL)
+    device_timing = Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT)
     quality = QualityMetrics(
         mean_absolute_error=0.0,
         max_absolute_error=0.0,
@@ -55,9 +56,9 @@ def _record() -> BenchmarkRecord:
             warmup_ms=100,
             measurement_time_ms=500,
             first_call_ms=12.0,
-            preparation=timing,
-            prepared_execution=timing,
-            operator_end_to_end=timing,
+            preparation=wall_timing,
+            prepared_execution=device_timing,
+            operator_end_to_end=wall_timing,
         ),
         quality=quality,
         environment=_environment(),
@@ -73,7 +74,10 @@ def test_json_output_is_versioned_and_strict(tmp_path: Path) -> None:
     assert values[0]["schema_version"] == 1
     assert values[0]["timings"]["warmup_ms"] == 100
     assert values[0]["timings"]["measurement_time_ms"] == 500
+    assert values[0]["timings"]["first_call_clock"] == "synchronized_wall"
     assert values[0]["timings"]["prepared_execution"]["median_ms"] == 1.0
+    assert values[0]["timings"]["prepared_execution"]["clock"] == "device_event"
+    assert values[0]["timings"]["operator_end_to_end"]["clock"] == "synchronized_wall"
     assert values[0]["quality"]["sqnr_db"] is None
     assert values[0]["environment"]["gpu_architecture"] == "SM120"
 

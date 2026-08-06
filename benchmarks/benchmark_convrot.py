@@ -184,9 +184,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"Torch: {torch.__version__}; dtype: {dtype}; group size: {args.group_size}")
     print()
     print(
-        "| M | N | K | first Triton call (ms) "
-        "| Triton prepared execution p50 [p20, p80] (ms) "
-        "| reference prepared execution p50 [p20, p80] (ms) | reference / Triton |"
+        "| M | N | K | first Triton call, wall (ms) "
+        "| Triton prepared execution, device p50 [p20, p80] (ms) "
+        "| reference prepared execution, device p50 [p20, p80] (ms) "
+        "| reference / Triton |"
     )
     print("|---:|---:|---:|---:|---:|---:|---:|")
     records: list[BenchmarkRecord] = []

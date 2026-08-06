@@ -19,9 +19,14 @@ The common runner reports these phases:
 - `first_call_ms`: synchronized wall time for the first operator invocation, including
   any lazy compilation. It is not compiler CPU time in isolation and does not claim
   that compiler caches were initially empty.
-- `preparation`: warmed preparation-only latency.
-- `prepared_execution`: warmed latency of `run(prepared)` on fixed prepared inputs.
-- `operator_end_to_end`: warmed latency of `run(prepare())`.
+- `preparation`: warmed, synchronized wall latency of preparation-only work.
+- `prepared_execution`: warmed device-event latency of `run(prepared)` on fixed
+  prepared inputs.
+- `operator_end_to_end`: warmed, synchronized wall latency of `run(prepare())`.
+
+Synchronized wall timing captures host dispatch, allocation, packing, and device work.
+Device-event timing isolates elapsed work on the accelerator stream. Every latency
+distribution serializes its `clock`, and `first_call_clock` describes the scalar first call.
 
 Warmed latencies are displayed as `p50 [p20, p80]`. A phase is `null` in machine output
 when it does not apply to a provider. The configured warmup and measurement-time windows
@@ -83,9 +88,25 @@ on field names. A shortened record looks like:
     "warmup_ms": 500,
     "measurement_time_ms": 2000,
     "first_call_ms": 310.2,
-    "preparation": {"median_ms": 0.004, "p20_ms": 0.004, "p80_ms": 0.005},
-    "prepared_execution": {"median_ms": 0.031, "p20_ms": 0.030, "p80_ms": 0.032},
-    "operator_end_to_end": {"median_ms": 0.036, "p20_ms": 0.035, "p80_ms": 0.037}
+    "first_call_clock": "synchronized_wall",
+    "preparation": {
+      "median_ms": 0.004,
+      "p20_ms": 0.004,
+      "p80_ms": 0.005,
+      "clock": "synchronized_wall"
+    },
+    "prepared_execution": {
+      "median_ms": 0.031,
+      "p20_ms": 0.030,
+      "p80_ms": 0.032,
+      "clock": "device_event"
+    },
+    "operator_end_to_end": {
+      "median_ms": 0.036,
+      "p20_ms": 0.035,
+      "p80_ms": 0.037,
+      "clock": "synchronized_wall"
+    }
   }
 }
 ```
