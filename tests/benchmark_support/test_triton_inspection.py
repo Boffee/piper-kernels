@@ -41,7 +41,7 @@ def _environment() -> EnvironmentInfo:
     )
 
 
-def _jit_kernel(*, backend: str = "cuda") -> SimpleNamespace:
+def _jit_kernel(*, backend: str = "cuda", num_ctas: int = 1) -> SimpleNamespace:
     assembly: dict[str, object] = {
         "ptx": """
             mov.u32 %r1, %tid.x;
@@ -57,7 +57,7 @@ def _jit_kernel(*, backend: str = "cuda") -> SimpleNamespace:
         shared=16_384,
         num_warps=4,
         num_stages=3,
-        num_ctas=1,
+        num_ctas=num_ctas,
     )
     compiled = SimpleNamespace(
         metadata=metadata,
@@ -115,13 +115,13 @@ def test_instruction_summaries_detect_mma_and_families() -> None:
 def test_resource_ceiling_reports_each_constraint_and_limiter() -> None:
     ceiling = resource_residency_ceiling(
         registers_per_thread=64,
-        shared_memory_bytes_per_program=16_384,
-        warps_per_program=4,
+        shared_memory_bytes_per_workgroup=16_384,
+        warps_per_workgroup=4,
         limits=_limits(),
     )
 
-    assert ceiling.program_limits == {"registers": 8, "shared_memory": 6, "threads": 12}
-    assert ceiling.resident_programs_per_compute_unit == 6
+    assert ceiling.workgroup_limits == {"registers": 8, "shared_memory": 6, "threads": 12}
+    assert ceiling.resident_workgroups_per_compute_unit == 6
     assert ceiling.resident_warps_per_compute_unit == 24
     assert ceiling.limiting_resources == ("shared_memory",)
 
@@ -160,8 +160,24 @@ def test_provider_report_covers_resources_ptx_sass_and_json(tmp_path: Path) -> N
     assert value["configuration"] == {"block_m": 64}
     assert value["environment"]["git_revision"] == "a" * 40
     assert value["specializations"][0]["residency_ceiling"][
-        "resident_programs_per_compute_unit"
+        "resident_workgroups_per_compute_unit"
     ] == 6
+
+
+def test_clustered_cuda_report_keeps_resources_and_residency_workgroup_scoped() -> None:
+    report = inspect_provider(
+        _provider(_jit_kernel(num_ctas=2)),
+        _environment(),
+        include_sass=False,
+        limits=_limits(),
+    )
+
+    specialization = report.specializations[0]
+    assert specialization.ctas_per_cluster == 2
+    assert specialization.shared_memory_bytes_per_workgroup == 16_384
+    assert specialization.warps_per_workgroup == 4
+    assert specialization.residency_ceiling.resident_workgroups_per_compute_unit == 6
+    assert specialization.residency_ceiling.resident_warps_per_compute_unit == 24
 
 
 def test_compiler_json_normalizes_provider_configuration(tmp_path: Path) -> None:

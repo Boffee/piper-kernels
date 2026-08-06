@@ -145,16 +145,18 @@ Providers register the Triton JIT functions they launch through
 `triton_jit_functions`. After the provider has run at least once, the shared inspector
 discovers its compiled specialization and reports:
 
-- registers per thread, compiler-reported spills, shared memory per Triton program,
-  warps, stages, and CUDA CTAs per cluster;
-- a resource-only program and warp residency ceiling per compute unit from the device
+- registers per thread, compiler-reported spills, shared memory and warps per workgroup,
+  stages, and CUDA CTAs per cluster;
+- a resource-only workgroup and warp residency ceiling per compute unit from the device
   limits exposed by PyTorch, including the limiting resource;
 - static PTX instruction-family and MMA-opcode counts when PTX is available;
 - static SASS instruction-family and MMA-opcode counts for NVIDIA CUDA kernels.
 
 The residency value is a ceiling, not achieved occupancy. It does not model every
-architecture's allocation granularity or replace hardware profiling. Static instruction
-counts describe one compiled program, not dynamic execution counts.
+architecture's allocation granularity or replace hardware profiling. For CUDA
+specializations with more than one CTA per cluster, resources and residency remain
+workgroup/CTA-level values; they do not claim to predict active cluster residency.
+Static instruction counts describe one compiled program, not dynamic execution counts.
 
 The integer P x V benchmark is the executable reference integration:
 

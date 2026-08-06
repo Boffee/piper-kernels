@@ -66,25 +66,26 @@ class DeviceResourceLimits:
 
 @dataclass(frozen=True, slots=True)
 class ResidencyCeiling:
-    """Triton-program residency ceiling from resources and exposed device limits.
+    """Workgroup residency ceiling from resources and exposed device limits.
 
     This is not an achieved-occupancy prediction.  It intentionally omits
     allocation granularities and architectural limits that PyTorch does not
-    expose consistently across CUDA and ROCm.
+    expose consistently across CUDA and ROCm.  For a clustered CUDA launch,
+    this remains a per-CTA ceiling and is not a cluster-occupancy estimate.
     """
 
-    resident_programs_per_compute_unit: int | None
+    resident_workgroups_per_compute_unit: int | None
     resident_warps_per_compute_unit: int | None
     limiting_resources: tuple[str, ...]
-    program_limits: Mapping[str, int]
+    workgroup_limits: Mapping[str, int]
 
     def as_dict(self) -> dict[str, object]:
         """Return stable machine-readable fields."""
         return {
-            "resident_programs_per_compute_unit": self.resident_programs_per_compute_unit,
+            "resident_workgroups_per_compute_unit": self.resident_workgroups_per_compute_unit,
             "resident_warps_per_compute_unit": self.resident_warps_per_compute_unit,
             "limiting_resources": list(self.limiting_resources),
-            "program_limits": dict(self.program_limits),
+            "workgroup_limits": dict(self.workgroup_limits),
         }
 
 
@@ -118,8 +119,8 @@ class TritonSpecializationReport:
     target_architecture: str
     registers_per_thread: int
     spills: int
-    shared_memory_bytes_per_program: int
-    warps_per_program: int
+    shared_memory_bytes_per_workgroup: int
+    warps_per_workgroup: int
     stages: int | None
     ctas_per_cluster: int | None
     residency_ceiling: ResidencyCeiling
@@ -138,8 +139,8 @@ class TritonSpecializationReport:
             "target_architecture": self.target_architecture,
             "registers_per_thread": self.registers_per_thread,
             "spills": self.spills,
-            "shared_memory_bytes_per_program": self.shared_memory_bytes_per_program,
-            "warps_per_program": self.warps_per_program,
+            "shared_memory_bytes_per_workgroup": self.shared_memory_bytes_per_workgroup,
+            "warps_per_workgroup": self.warps_per_workgroup,
             "stages": self.stages,
             "ctas_per_cluster": self.ctas_per_cluster,
             "residency_ceiling": self.residency_ceiling.as_dict(),
@@ -296,50 +297,54 @@ def current_device_resource_limits(device_index: int | None = None) -> DeviceRes
 def resource_residency_ceiling(
     *,
     registers_per_thread: int,
-    shared_memory_bytes_per_program: int,
-    warps_per_program: int,
+    shared_memory_bytes_per_workgroup: int,
+    warps_per_workgroup: int,
     limits: DeviceResourceLimits,
 ) -> ResidencyCeiling:
-    """Estimate a program ceiling from registers, shared memory, and threads."""
+    """Estimate a workgroup ceiling from registers, shared memory, and threads."""
     if (
         registers_per_thread < 0
-        or shared_memory_bytes_per_program < 0
-        or warps_per_program <= 0
+        or shared_memory_bytes_per_workgroup < 0
+        or warps_per_workgroup <= 0
     ):
         raise ValueError("compiler resource values must be non-negative and warps positive")
-    threads_per_program = warps_per_program * limits.warp_size
-    program_limits: dict[str, int] = {}
+    threads_per_workgroup = warps_per_workgroup * limits.warp_size
+    workgroup_limits: dict[str, int] = {}
     if limits.registers_per_compute_unit is not None and registers_per_thread:
-        program_limits["registers"] = limits.registers_per_compute_unit // (
-            registers_per_thread * threads_per_program
+        workgroup_limits["registers"] = limits.registers_per_compute_unit // (
+            registers_per_thread * threads_per_workgroup
         )
     if (
         limits.shared_memory_bytes_per_compute_unit is not None
-        and shared_memory_bytes_per_program
+        and shared_memory_bytes_per_workgroup
     ):
-        program_limits["shared_memory"] = (
-            limits.shared_memory_bytes_per_compute_unit // shared_memory_bytes_per_program
+        workgroup_limits["shared_memory"] = (
+            limits.shared_memory_bytes_per_compute_unit // shared_memory_bytes_per_workgroup
         )
     if limits.max_threads_per_compute_unit is not None:
-        program_limits["threads"] = (
-            limits.max_threads_per_compute_unit // threads_per_program
+        workgroup_limits["threads"] = (
+            limits.max_threads_per_compute_unit // threads_per_workgroup
         )
 
-    resident_programs = min(program_limits.values()) if program_limits else None
+    resident_workgroups = min(workgroup_limits.values()) if workgroup_limits else None
     limiting_resources = (
         tuple(
-            sorted(name for name, value in program_limits.items() if value == resident_programs)
+            sorted(
+                name for name, value in workgroup_limits.items() if value == resident_workgroups
+            )
         )
-        if resident_programs is not None
+        if resident_workgroups is not None
         else ()
     )
     return ResidencyCeiling(
-        resident_programs_per_compute_unit=resident_programs,
+        resident_workgroups_per_compute_unit=resident_workgroups,
         resident_warps_per_compute_unit=(
-            None if resident_programs is None else resident_programs * warps_per_program
+            None
+            if resident_workgroups is None
+            else resident_workgroups * warps_per_workgroup
         ),
         limiting_resources=limiting_resources,
-        program_limits=program_limits,
+        workgroup_limits=workgroup_limits,
     )
 
 
@@ -478,8 +483,8 @@ def _inspect_specialization(
     resolved_limits = limits or current_device_resource_limits(specialization.device_index)
     residency = resource_residency_ceiling(
         registers_per_thread=registers,
-        shared_memory_bytes_per_program=shared_memory,
-        warps_per_program=warps,
+        shared_memory_bytes_per_workgroup=shared_memory,
+        warps_per_workgroup=warps,
         limits=resolved_limits,
     )
 
@@ -523,8 +528,8 @@ def _inspect_specialization(
         target_architecture=architecture,
         registers_per_thread=registers,
         spills=spills,
-        shared_memory_bytes_per_program=shared_memory,
-        warps_per_program=warps,
+        shared_memory_bytes_per_workgroup=shared_memory,
+        warps_per_workgroup=warps,
         stages=_optional_integer(metadata, "num_stages"),
         ctas_per_cluster=(
             _optional_integer(metadata, "num_ctas") if backend == "cuda" else None
@@ -593,7 +598,7 @@ def format_compiler_report(report: TritonCompilerRecord) -> str:
     lines: list[str] = []
     for specialization in report.specializations:
         residency = specialization.residency_ceiling
-        programs = residency.resident_programs_per_compute_unit
+        workgroups = residency.resident_workgroups_per_compute_unit
         warps = residency.resident_warps_per_compute_unit
         limiting = ",".join(residency.limiting_resources) or "unknown"
         lines.append(
@@ -604,8 +609,10 @@ def format_compiler_report(report: TritonCompilerRecord) -> str:
             f"target_architecture={specialization.target_architecture} "
             f"registers/thread={specialization.registers_per_thread} "
             f"spills={specialization.spills} "
-            f"shared_bytes/program={specialization.shared_memory_bytes_per_program} "
-            f"resource_programs/cu={programs} resource_warps/cu={warps} "
+            f"shared_bytes/workgroup={specialization.shared_memory_bytes_per_workgroup} "
+            f"warps/workgroup={specialization.warps_per_workgroup} "
+            f"ctas/cluster={specialization.ctas_per_cluster} "
+            f"resource_workgroups/cu={workgroups} resource_warps/cu={warps} "
             f"limiting={limiting}"
         )
         if specialization.ptx is not None and specialization.ptx.mma_opcodes:

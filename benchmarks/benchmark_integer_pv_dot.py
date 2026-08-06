@@ -197,6 +197,13 @@ def _benchmark_output(args: argparse.Namespace) -> OutputTarget | None:
     target = output_target(args)
     if args.profile and target is not None:
         raise SystemExit("--profile cannot produce benchmark --json/--jsonl records")
+    compiler_target = output_target(args, option_prefix="compiler")
+    if (
+        target is not None
+        and compiler_target is not None
+        and target.path.resolve() == compiler_target.path.resolve()
+    ):
+        raise SystemExit("benchmark and compiler output paths must be different")
     return target
 
 

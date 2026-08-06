@@ -31,6 +31,21 @@ def test_cuda_capture_rejects_unavailable_and_rocm_backends(monkeypatch) -> None
         CudaProfilerController()
 
 
+def test_cuda_capture_uses_checked_public_profiler_api(monkeypatch) -> None:
+    events: list[str] = []
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torch.version.hip", None)
+    monkeypatch.setattr("torch.version.cuda", "13.0")
+    monkeypatch.setattr("torch.cuda.profiler.start", lambda: events.append("start"))
+    monkeypatch.setattr("torch.cuda.profiler.stop", lambda: events.append("stop"))
+
+    controller = CudaProfilerController()
+    controller.start()
+    controller.stop()
+
+    assert events == ["start", "stop"]
+
+
 def _provider(events: list[str]) -> BenchmarkProvider[int, int]:
     def prepare() -> int:
         events.append("prepare")

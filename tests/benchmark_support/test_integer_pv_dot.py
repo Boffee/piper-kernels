@@ -76,3 +76,24 @@ def test_profile_mode_rejects_benchmark_result_output(tmp_path) -> None:
 
     with pytest.raises(SystemExit, match="cannot produce benchmark"):
         _benchmark_output(arguments)
+
+
+@pytest.mark.parametrize(
+    ("benchmark_option", "compiler_option"),
+    [
+        ("--json", "--compiler-json"),
+        ("--json", "--compiler-jsonl"),
+        ("--jsonl", "--compiler-json"),
+        ("--jsonl", "--compiler-jsonl"),
+    ],
+)
+def test_benchmark_and_compiler_outputs_must_not_collide(
+    tmp_path, benchmark_option: str, compiler_option: str
+) -> None:
+    path = tmp_path / "records.json"
+    arguments = _parse_args(
+        ["s8-s8", benchmark_option, str(path), compiler_option, str(path)]
+    )
+
+    with pytest.raises(SystemExit, match="must be different"):
+        _benchmark_output(arguments)

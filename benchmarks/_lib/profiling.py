@@ -51,11 +51,11 @@ class CudaProfilerController:
 
     def start(self) -> None:
         """Start a CUDA profiler API capture."""
-        torch.cuda.cudart().cudaProfilerStart()
+        torch.cuda.profiler.start()
 
     def stop(self) -> None:
         """Stop a CUDA profiler API capture."""
-        torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.profiler.stop()
 
     def push_range(self, name: str) -> None:
         """Push an NVTX range."""
