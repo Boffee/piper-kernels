@@ -1050,6 +1050,65 @@ per-layer/per-head `Z` into `W_V` as `W_V @ Z` and fold `Z^-1` into the output p
 `Z^-1 @ W_O`. Group16/R224 is the selected calibrated experiment; group4 remains the portable
 uncalibrated path.
 
+Measure hardware-granular PV skipping on the same real FLUX.2 Klein activations with:
+
+```shell
+uv run \
+  --with 'diffusers>=0.39' \
+  --with transformers \
+  --with accelerate \
+  --with safetensors \
+  --with sentencepiece \
+  python benchmarks/analyze_sage_pv_skipping.py \
+  --local-files-only
+```
+
+The first prompt calibrates per-layer/per-head skip thresholds and three held-out prompts measure
+the resulting skip rate and combined quantization-plus-sparsity error. The analyzer compares the
+original key order, range sorting within local K512 regions, and global range sorting. Its score
+gap is the inexpensive SpargeAttention-style online gate; the value gate additionally incorporates
+the transformed per-key V range. The online-mass gate uses the tile row sum and running denominator
+that online softmax already computes. Final softmax mass and the actual tile-output norm are
+included as offline oracles rather than proposed hot-loop implementations. Decisions are
+aggregated over hardware-shaped query groups and K128 PV tiles, and the softmax denominator always
+includes every key even when a numerator contribution is omitted.
+
+On FLUX.2 Klein at N=1152, thresholds were calibrated from ten prompt-0 captures and evaluated on
+30 captures from three held-out prompts. Global range sorting was necessary for the ZCA-cond8,
+group16 dense control: it measured 39.77/35.62 dB mean/worst SQNR, versus 36.57/32.64 dB for
+canonical SageAttention2++. The finer K64/Q16 analysis found only a very small safe PV-skip region:
+
+| gate | calibration target | held-out skip | mean/worst SQNR | relative L1 |
+|:---|---:|---:|---:|---:|
+| online mass | 1% | 1.5% | 39.43/32.80 dB | 0.0093 |
+| online mass | 2% | 2.6% | 38.10/30.03 dB | 0.0101 |
+| final-mass oracle | 1% | 1.3% | 39.72/34.18 dB | 0.0089 |
+| final-mass oracle | 2% | 2.3% | 39.07/31.93 dB | 0.0092 |
+| contribution oracle | 5% | 5.0% | 39.06/27.69 dB | 0.0103 |
+
+The online-mass gate is therefore mathematically useful but not a worthwhile kernel optimization
+for this model and sequence length: the roughly 1.5% safe PV sparsity cannot repay Q16 scheduling,
+runtime control flow, or additional state. The analyzer remains useful for long-video captures,
+where sparsity may change materially with sequence length and spatial-temporal structure.
+
+Pure V-magnitude pruning was also tested after global sorting. For every K tile, `v_only` takes
+the maximum transformed row range in that tile and removes the lowest calibrated tiles for every
+query, without consulting QK scores or probabilities. It failed even at very low aggregate skip
+rates:
+
+| resolution / N | K tile | calibration target | held-out skip | mean/worst SQNR |
+|:---|---:|---:|---:|---:|
+| 512px / 1152 | 64 | 5% | 1.8% | 31.78/10.62 dB |
+| 512px / 1152 | 128 | 5% | 1.5% | 31.74/10.83 dB |
+| 768px / 2432 | 64 | 1% | 0.4% | 36.10/16.86 dB |
+| 768px / 2432 | 64 | 5% | 1.9% | 29.95/11.27 dB |
+
+Resolution does change block-selection granularity: one K64 block is 5.6% of an N=1152 head and
+2.6% of an N=2432 head. The higher-resolution run shows that finer granularity does not repair the
+underlying selector. Some low-range V blocks receive decisive attention, so V magnitude alone is
+not a safe proxy for PV contribution. Global sorting remains useful for grouped quantization, but
+it does not justify unconditional removal of the low end of the sorted sequence.
+
 ### Stock-Triton affine UINT8 execution
 
 The signed-MMA affine proxy now stores each exact K64 `sum(Vq)` correction as INT16 rather than
