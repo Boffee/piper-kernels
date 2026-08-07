@@ -1,10 +1,9 @@
 """Benchmark native and affine-proxy integer P@V dot products.
 
-The ``s8-s8`` and ``u8-s8-affine-proxy`` variants run with stock Triton. The
-``u8-s8-native`` variant requires compiler and target support for a mixed-sign
-integer dot. The affine proxy models the exact UINT8 identity used by the
-attention experiment: its precomputed ``128 * sum(V)`` correction is loaded as
-the integer MMA accumulator.
+All variants run with stock Triton. The ``u8-s8-native`` variant uses Piper's
+compiler extension to select NVIDIA's native mixed-sign integer MMA. The affine
+proxy models the exact UINT8 identity used by the attention experiment: its
+precomputed ``128 * sum(V)`` correction is loaded as the integer MMA accumulator.
 """
 
 # Triton's JIT pointer arguments intentionally omit Python annotations.
@@ -38,6 +37,8 @@ from _lib import (
     write_records,
 )
 
+from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook, uint8_int8_dot
+
 
 @triton.jit
 def _dot_kernel(
@@ -46,6 +47,7 @@ def _dot_kernel(
     correction_ptr,
     output_ptr,
     use_affine_proxy: tl.constexpr,
+    use_native_uint8: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -71,6 +73,8 @@ def _dot_kernel(
         correction = tl.load(correction_ptr + tile * block_n + offsets_n)
         accumulator = tl.zeros((block_m, block_n), tl.int32) + correction[None, :]
         result = tl.dot(a, b, accumulator, out_dtype=tl.int32)
+    elif use_native_uint8:
+        result = uint8_int8_dot(a, b)
     else:
         result = tl.dot(a, b, out_dtype=tl.int32)
     tl.store(
@@ -207,11 +211,17 @@ def _benchmark_output(args: argparse.Namespace) -> OutputTarget | None:
     return target
 
 
+def _configure_variant_runtime(variant: str) -> None:
+    if not torch.cuda.is_available():
+        raise SystemExit("integer P@V benchmarking requires a Triton-supported GPU")
+    if variant == "u8-s8-native":
+        install_uint8_int8_dot_hook()
+
+
 @torch.inference_mode()
 def _main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    if not torch.cuda.is_available():
-        raise SystemExit("integer P@V benchmarking requires a Triton-supported GPU")
+    _configure_variant_runtime(args.variant)
     benchmark_output = _benchmark_output(args)
 
     device = torch.device("cuda")
@@ -264,6 +274,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             prepared.correction,
             prepared.output,
             use_affine_proxy=args.variant == "u8-s8-affine-proxy",
+            use_native_uint8=args.variant == "u8-s8-native",
             block_m=args.block_m,
             block_n=args.block_n,
             block_k=args.block_k,

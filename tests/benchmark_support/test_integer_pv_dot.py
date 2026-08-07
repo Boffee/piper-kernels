@@ -1,7 +1,12 @@
 import pytest
 import torch
 from _lib.profiling import ProfilePhase
-from benchmark_integer_pv_dot import _benchmark_output, _parse_args, _reference_output
+from benchmark_integer_pv_dot import (
+    _benchmark_output,
+    _configure_variant_runtime,
+    _parse_args,
+    _reference_output,
+)
 
 
 def test_reference_output_validates_every_tile() -> None:
@@ -76,6 +81,34 @@ def test_profile_mode_rejects_benchmark_result_output(tmp_path) -> None:
 
     with pytest.raises(SystemExit, match="cannot produce benchmark"):
         _benchmark_output(arguments)
+
+
+def test_native_uint8_selection_installs_the_compiler_extension(monkeypatch) -> None:
+    enabled = False
+
+    def enable() -> None:
+        nonlocal enabled
+        enabled = True
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr("benchmark_integer_pv_dot.install_uint8_int8_dot_hook", enable)
+
+    _configure_variant_runtime("u8-s8-native")
+
+    assert enabled
+
+
+def test_signed_selection_does_not_install_the_compiler_extension(monkeypatch) -> None:
+    def unexpected_enable() -> None:
+        pytest.fail("signed dot should not install the mixed-sign compiler extension")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        "benchmark_integer_pv_dot.install_uint8_int8_dot_hook",
+        unexpected_enable,
+    )
+
+    _configure_variant_runtime("s8-s8")
 
 
 @pytest.mark.parametrize(
