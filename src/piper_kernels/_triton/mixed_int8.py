@@ -58,19 +58,17 @@ def _mark_uint8_int8_dot(value):
 
 
 @triton.jit
-def uint8_int8_dot(lhs, rhs, accumulator=None):
-    """Emit a marked UINT8-by-INT8 dot with an INT32 accumulator."""
+def uint8_int8_dot(lhs, rhs):
+    """Emit a marked UINT8-by-INT8 dot with INT32 accumulation.
+
+    External accumulators are intentionally unsupported: the LLVM marker traces
+    Triton's tied MMA accumulator chain backward, so accepting an independent dot
+    result could incorrectly rewrite that producer as mixed-sign arithmetic.
+    """
     tl.static_assert(lhs.dtype == tl.uint8, "uint8_int8_dot requires a UINT8 lhs")
     tl.static_assert(rhs.dtype == tl.int8, "uint8_int8_dot requires an INT8 rhs")
     lhs_bits = lhs.to(tl.int8)
-    if accumulator is None:
-        result = tl.dot(lhs_bits, rhs, out_dtype=tl.int32)
-    else:
-        tl.static_assert(
-            accumulator.dtype == tl.int32,
-            "uint8_int8_dot requires an INT32 accumulator",
-        )
-        result = tl.dot(lhs_bits, rhs, accumulator, out_dtype=tl.int32)
+    result = tl.dot(lhs_bits, rhs, out_dtype=tl.int32)
     return _mark_uint8_int8_dot(result)
 
 

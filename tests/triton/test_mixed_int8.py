@@ -1,5 +1,6 @@
 """Tests for stock-Triton mixed-sign integer-dot lowering."""
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -80,6 +81,12 @@ def test_rewrite_leaves_unmarked_llvm_unchanged() -> None:
     llvm_ir = "define void @unmarked() {\n  ret void\n}\n"
 
     assert rewrite_uint8_int8_dot_llvm(llvm_ir) is llvm_ir
+
+
+def test_mixed_dot_api_excludes_external_accumulators() -> None:
+    parameters = inspect.signature(uint8_int8_dot.fn).parameters
+
+    assert tuple(parameters) == ("lhs", "rhs")
 
 
 def test_rewrite_marks_only_the_dot_accumulator_chain() -> None:
