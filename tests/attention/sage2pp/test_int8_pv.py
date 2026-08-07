@@ -108,6 +108,50 @@ def test_centered_value_fusion_restores_constant_value() -> None:
     torch.testing.assert_close(actual, value_row.expand_as(actual), atol=0.0, rtol=0.0)
 
 
+def test_exact_direct_value_sort_matches_materialized_bf16_order() -> None:
+    torch.manual_seed(840)
+    query = torch.randn(1, 2, 257, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    centered_value = value.float() - value.float().mean(dim=2, keepdim=True)
+    value_range = centered_value.abs().amax(dim=-1)
+    order = torch.argsort(value_range, dim=-1, stable=True)
+    expanded_order = order[..., None].expand_as(key)
+    sorted_key = torch.gather(key, 2, expanded_order)
+    sorted_value = torch.gather(value, 2, expanded_order)
+    options = {
+        "grouped_qk": True,
+        "probability_scale_mode": "log",
+        "native_uint8_mma": True,
+        "scale_forward_log_recurrence": True,
+        "optimize_pv_scaling": True,
+        "split_pv_head_dim": True,
+        "scaled_fp16_numerator": True,
+        "center_value": True,
+    }
+
+    with torch.no_grad():
+        materialized = triton_sage_attention_uint8_pv_feature_convrot(
+            query,
+            sorted_key,
+            sorted_value,
+            128**-0.5,
+            False,
+            **options,
+        )
+        direct = triton_sage_attention_uint8_pv_feature_convrot(
+            query,
+            key,
+            value,
+            128**-0.5,
+            False,
+            sort_value_rows=True,
+            **options,
+        )
+
+    torch.testing.assert_close(direct, materialized, atol=1e-5, rtol=0.0)
+
+
 @pytest.mark.skipif(
     not _sm120_available(),
     reason="optimized centered key-scaled path is currently tuned for SM12x",

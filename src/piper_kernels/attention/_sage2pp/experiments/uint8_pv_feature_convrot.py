@@ -269,6 +269,142 @@ def _value_mean_finalize_kernel(
 
 
 @triton.jit
+def _key_value_mean_partial_kernel(
+    key_ptr,
+    value_ptr,
+    key_partial_ptr,
+    value_partial_ptr,
+    key_length,
+    num_chunks,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    chunk_n: tl.constexpr,
+    block_n: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """Reduce one raw K/V sequence chunk into compact FP32 partials."""
+    chunk = tl.program_id(0)
+    feature_block = tl.program_id(1)
+    batch_head = tl.program_id(2)
+    batch = batch_head // heads
+    head = batch_head % heads
+    offsets_d = feature_block * block_d + tl.arange(0, block_d)
+    offsets_n = tl.arange(0, block_n)
+    key_accumulator = tl.zeros((block_d,), dtype=tl.float32)
+    value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
+    chunk_start = chunk * chunk_n
+    for offset in tl.range(0, chunk_n, block_n, disable_licm=True):
+        current_n = chunk_start + offset + offsets_n
+        mask = (current_n[:, None] < key_length) & (offsets_d[None, :] < head_dim)
+        key = tl.load(
+            key_ptr
+            + batch * stride_kb
+            + head * stride_kh
+            + current_n[:, None] * stride_kn
+            + offsets_d[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        value = tl.load(
+            value_ptr
+            + batch * stride_vb
+            + head * stride_vh
+            + current_n[:, None] * stride_vn
+            + offsets_d[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        key_accumulator += tl.sum(key, axis=0)
+        value_accumulator += tl.sum(value, axis=0)
+    output_offsets = (batch_head * num_chunks + chunk) * head_dim + offsets_d
+    tl.store(key_partial_ptr + output_offsets, key_accumulator, mask=offsets_d < head_dim)
+    tl.store(value_partial_ptr + output_offsets, value_accumulator, mask=offsets_d < head_dim)
+
+
+@triton.jit
+def _key_value_mean_finalize_kernel(
+    key_partial_ptr,
+    value_partial_ptr,
+    key_mean_ptr,
+    value_mean_ptr,
+    key_length,
+    num_chunks,
+    head_dim: tl.constexpr,
+    block_chunks: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """Merge K/V chunk partials into two compact FP32 means."""
+    batch_head = tl.program_id(0)
+    feature_block = tl.program_id(1)
+    offsets_c = tl.arange(0, block_chunks)
+    offsets_d = feature_block * block_d + tl.arange(0, block_d)
+    mask = (offsets_c[:, None] < num_chunks) & (offsets_d[None, :] < head_dim)
+    partial_offsets = (
+        (batch_head * num_chunks + offsets_c[:, None]) * head_dim
+        + offsets_d[None, :]
+    )
+    key_partials = tl.load(key_partial_ptr + partial_offsets, mask=mask, other=0.0)
+    value_partials = tl.load(value_partial_ptr + partial_offsets, mask=mask, other=0.0)
+    output_offsets = batch_head * head_dim + offsets_d
+    output_mask = offsets_d < head_dim
+    tl.store(
+        key_mean_ptr + output_offsets,
+        tl.sum(key_partials, axis=0) / key_length,
+        mask=output_mask,
+    )
+    tl.store(
+        value_mean_ptr + output_offsets,
+        tl.sum(value_partials, axis=0) / key_length,
+        mask=output_mask,
+    )
+
+
+@triton.jit
+def _centered_value_row_range_kernel(
+    value_ptr,
+    value_mean_ptr,
+    range_ptr,
+    key_length,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """Compute centered per-row V ranges without materializing centered V."""
+    key_block = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    offsets_n = key_block * block_n + tl.arange(0, block_n)
+    offsets_d = tl.arange(0, head_dim)
+    valid = offsets_n < key_length
+    value = tl.load(
+        value_ptr
+        + batch * stride_vb
+        + head * stride_vh
+        + offsets_n[:, None] * stride_vn
+        + offsets_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    value_mean = tl.load(value_mean_ptr + (batch * heads + head) * head_dim + offsets_d)
+    value = tl.where(valid[:, None], value - value_mean[None, :], 0.0)
+    value_range = tl.max(tl.abs(value), axis=1)
+    tl.store(
+        range_ptr + (batch * heads + head) * key_length + offsets_n,
+        value_range,
+        mask=valid,
+    )
+
+
+@triton.jit
 def _quantize_value_feature_convrot_int8_kernel(
     value_ptr,
     value_mean_ptr,
@@ -416,6 +552,204 @@ def _quantize_value_feature_convrot_per_key_int8_kernel(
         _V_INT8_RANGE,
     )
     batch_head = batch * heads + head
+    if store_value_scale:
+        stored_scale = tl.where(store_probability_multiplier, scale * probability_range, scale)
+        tl.store(
+            scale_ptr + batch_head * key_length + offsets_n,
+            stored_scale,
+            mask=valid_keys,
+        )
+    if store_log_scale:
+        log_scale = tl.log2(scale)
+        tl.store(
+            log_scale_ptr + batch_head * key_length + offsets_n,
+            log_scale,
+            mask=valid_keys,
+        )
+        if scale_forward_log_recurrence:
+            pass
+        elif narrow_int8_log_denominator:
+            inverse_scale = tl.where(valid_keys, 1.0 / scale, 0.0)
+            inverse_quant_scale = tl.max(inverse_scale, axis=0) / _V_INT8_RANGE + _SCALE_EPSILON
+            inverse_int8 = _sage_backend._round_to_int8(
+                inverse_scale / inverse_quant_scale,
+                _V_INT8_RANGE,
+            )
+            tl.store(
+                inverse_scale_ptr + batch_head * key_length + offsets_n,
+                inverse_int8,
+                mask=valid_keys,
+            )
+            tl.store(
+                scale_ptr + batch_head * tl.cdiv(key_length, block_n) + key_block,
+                inverse_quant_scale,
+            )
+        elif tile_common_log_denominator:
+            valid_count = tl.sum(valid_keys.to(tl.float32), axis=0)
+            tile_log_center = tl.sum(
+                tl.where(valid_keys, log_scale, 0.0),
+                axis=0,
+            ) / tl.maximum(valid_count, 1.0)
+            tl.store(
+                inverse_scale_ptr + batch_head * key_length + key_block * block_n,
+                tl.exp2(-tile_log_center),
+            )
+        else:
+            tl.store(
+                inverse_scale_ptr + batch_head * key_length + offsets_n,
+                1.0 / scale,
+                mask=valid_keys,
+            )
+    if store_value_correction:
+        value_sum = tl.sum(quantized.to(tl.int32), axis=0)
+        correction_offsets = (
+            batch_head * tl.cdiv(key_length, block_n) + key_block
+        ) * head_dim + offsets_d
+        if store_scaled_fp16_correction:
+            tl.store(correction_ptr + correction_offsets, value_sum.to(tl.float32) * (1.0 / 512.0))
+        else:
+            tl.store(correction_ptr + correction_offsets, value_sum)
+    _sage_backend._store_value_tile(
+        output_ptr,
+        quantized,
+        batch,
+        head,
+        offsets_n,
+        offsets_d,
+        valid_keys[:, None],
+        stride_ob,
+        stride_oh,
+        stride_on,
+        output_transposed,
+    )
+
+
+@triton.jit
+def _quantize_ordered_key_per_block_kernel(
+    key_ptr,
+    key_mean_ptr,
+    order_ptr,
+    output_ptr,
+    scale_ptr,
+    key_length,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+    quantization_range: tl.constexpr,
+):
+    """Gather ordered raw K rows directly into grouped INT8 K storage."""
+    scale_group = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    offsets_n = scale_group * block_n + tl.arange(0, block_n)
+    offsets_d = tl.arange(0, head_dim)
+    valid = offsets_n < key_length
+    batch_head = batch * heads + head
+    source_n = tl.load(
+        order_ptr + batch_head * key_length + offsets_n,
+        mask=valid,
+        other=0,
+    )
+    mean = tl.load(key_mean_ptr + batch_head * head_dim + offsets_d)
+    values = tl.load(
+        key_ptr
+        + batch * stride_kb
+        + head * stride_kh
+        + source_n[:, None] * stride_kn
+        + offsets_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    values -= mean[None, :]
+    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    scale = maximum / quantization_range + _SCALE_EPSILON
+    quantized = _sage_backend._round_to_int8(values / scale, quantization_range)
+    tl.store(
+        output_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + offsets_n[:, None] * stride_on
+        + offsets_d[None, :],
+        quantized,
+        mask=valid[:, None],
+    )
+    tl.store(
+        scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
+        scale,
+    )
+
+
+@triton.jit
+def _quantize_ordered_value_per_key_int8_kernel(
+    value_ptr,
+    value_mean_ptr,
+    order_ptr,
+    scale_ptr,
+    log_scale_ptr,
+    inverse_scale_ptr,
+    correction_ptr,
+    output_ptr,
+    key_length,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+    value_scale_floor: tl.constexpr,
+    store_log_scale: tl.constexpr,
+    store_value_scale: tl.constexpr,
+    store_probability_multiplier: tl.constexpr,
+    store_value_correction: tl.constexpr,
+    store_scaled_fp16_correction: tl.constexpr,
+    probability_range: tl.constexpr,
+    tile_common_log_denominator: tl.constexpr,
+    narrow_int8_log_denominator: tl.constexpr,
+    scale_forward_log_recurrence: tl.constexpr,
+    output_transposed: tl.constexpr,
+):
+    """Gather centered raw V rows directly into final per-key INT8 storage."""
+    key_block = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    offsets_n = key_block * block_n + tl.arange(0, block_n)
+    offsets_d = tl.arange(0, head_dim)
+    valid_keys = offsets_n < key_length
+    batch_head = batch * heads + head
+    source_n = tl.load(
+        order_ptr + batch_head * key_length + offsets_n,
+        mask=valid_keys,
+        other=0,
+    )
+    value = tl.load(
+        value_ptr
+        + batch * stride_vb
+        + head * stride_vh
+        + source_n[:, None] * stride_vn
+        + offsets_d[None, :],
+        mask=valid_keys[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
+    value = tl.where(valid_keys[:, None], value - value_mean[None, :], 0.0)
+    scale = tl.max(tl.abs(value), axis=1) / _V_INT8_RANGE + _SCALE_EPSILON
+    if value_scale_floor > 0.0:
+        scale = tl.maximum(scale, tl.max(scale, axis=0) * value_scale_floor)
+    quantized = _sage_backend._round_to_int8(
+        value / scale[:, None],
+        _V_INT8_RANGE,
+    )
     if store_value_scale:
         stored_scale = tl.where(store_probability_multiplier, scale * probability_range, scale)
         tl.store(
@@ -2057,6 +2391,160 @@ def _launch_uint8_pv_scale_forward_bulk_tail_attention(
     return output
 
 
+def _compute_key_value_means(
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute compact FP32 K/V means together from their original BF16 storage."""
+    batch, heads, key_length, head_dim = key.shape
+    mean_chunks = int(triton.cdiv(key_length, _VALUE_MEAN_CHUNK))
+    partial_shape = (batch, heads, mean_chunks, head_dim)
+    key_partials = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
+    value_partials = torch.empty_like(key_partials)
+    key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
+    value_mean = torch.empty_like(key_mean)
+    _key_value_mean_partial_kernel[
+        (
+            mean_chunks,
+            int(triton.cdiv(head_dim, _VALUE_MEAN_BLOCK_D)),
+            batch * heads,
+        )
+    ](
+        key,
+        value,
+        key_partials,
+        value_partials,
+        key_length,
+        mean_chunks,
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        heads=heads,
+        head_dim=head_dim,
+        chunk_n=_VALUE_MEAN_CHUNK,
+        block_n=_VALUE_MEAN_BLOCK_N,
+        block_d=_VALUE_MEAN_BLOCK_D,
+        num_warps=4,
+    )
+    _key_value_mean_finalize_kernel[
+        (batch * heads, int(triton.cdiv(head_dim, _VALUE_MEAN_BLOCK_D)))
+    ](
+        key_partials,
+        value_partials,
+        key_mean,
+        value_mean,
+        key_length,
+        mean_chunks,
+        head_dim=head_dim,
+        block_chunks=triton.next_power_of_2(mean_chunks),
+        block_d=_VALUE_MEAN_BLOCK_D,
+        num_warps=4,
+    )
+    return key_mean, value_mean
+
+
+def _build_centered_value_order(
+    value: torch.Tensor,
+    value_mean: torch.Tensor,
+) -> torch.Tensor:
+    """Build a stable low-to-high order from each centered V row's FP32 range."""
+    batch, heads, key_length, head_dim = value.shape
+    value_range = torch.empty(
+        (batch, heads, key_length),
+        device=value.device,
+        dtype=torch.float32,
+    )
+    block_n = 32
+    _centered_value_row_range_kernel[
+        (triton.cdiv(key_length, block_n), heads, batch)
+    ](
+        value,
+        value_mean,
+        value_range,
+        key_length,
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        heads=heads,
+        head_dim=head_dim,
+        block_n=block_n,
+        num_warps=4,
+    )
+    return torch.argsort(value_range, dim=-1, stable=True).to(torch.int32)
+
+
+def _prepare_ordered_grouped_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    key_mean: torch.Tensor,
+    order: torch.Tensor,
+    scale: float,
+    storage_key_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize Q and ordered raw K directly for the grouped-QK path."""
+    batch, heads, query_length, head_dim = query.shape
+    key_length = key.shape[2]
+    query_scale_groups = int(triton.cdiv(query_length, 32))
+    key_scale_groups = int(triton.cdiv(key_length, _PV_BLOCK))
+    query_int8 = torch.empty_like(query, dtype=torch.int8)
+    key_int8_shape = (batch, heads, storage_key_length, head_dim)
+    key_int8 = (
+        torch.zeros(key_int8_shape, device=key.device, dtype=torch.int8)
+        if storage_key_length != key_length
+        else torch.empty(key_int8_shape, device=key.device, dtype=torch.int8)
+    )
+    query_scale = torch.empty(
+        (batch, heads, query_scale_groups), device=query.device, dtype=torch.float32
+    )
+    key_scale = torch.empty(
+        (batch, heads, key_scale_groups), device=key.device, dtype=torch.float32
+    )
+    _sage_backend._quantize_query_per_warp_kernel[(query_scale_groups, heads, batch)](
+        query,
+        query_int8,
+        query_scale,
+        query_length,
+        scale,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query_int8.stride(0),
+        query_int8.stride(1),
+        query_int8.stride(2),
+        query_scale.stride(0),
+        query_scale.stride(1),
+        head_dim=head_dim,
+        quantization_range=127,
+        rotation_group=0,
+        num_warps=4,
+    )
+    _quantize_ordered_key_per_block_kernel[(key_scale_groups, heads, batch)](
+        key,
+        key_mean,
+        order,
+        key_int8,
+        key_scale,
+        key_length,
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key_int8.stride(0),
+        key_int8.stride(1),
+        key_int8.stride(2),
+        key_scale.stride(0),
+        key_scale.stride(1),
+        heads=heads,
+        head_dim=head_dim,
+        block_n=_PV_BLOCK,
+        quantization_range=127,
+        num_warps=4,
+    )
+    return query_int8, key_int8, query_scale, key_scale
+
+
 def _prepare_uint8_pv_feature_convrot_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2079,6 +2567,9 @@ def _prepare_uint8_pv_feature_convrot_inputs(
     precompute_pv_multiplier: bool = False,
     storage_key_length: int | None = None,
     center_value: bool = False,
+    key_order: torch.Tensor | None = None,
+    ordered_key_mean: torch.Tensor | None = None,
+    ordered_value_mean: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Quantize canonical Q/K and feature-rotated block-scaled INT8 V."""
     if rotation_group not in (0, 16, 64):
@@ -2114,15 +2605,39 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         storage_key_length = key_length
     if storage_key_length < key_length:
         raise ValueError("storage key length must cover the semantic key length")
-    query_int8, key_int8, query_scale, key_scale = _prepare_qk(
-        query,
-        key,
-        scale,
-        grouped_qk,
-        storage_key_length,
-    )
+    if key_order is not None:
+        if not grouped_qk:
+            raise ValueError("direct ordered INT8 preparation requires grouped QK")
+        if value_scale_axis != "key" or not center_value or rotation_group:
+            raise ValueError(
+                "direct ordered INT8 preparation requires centered, unrotated per-key V"
+            )
+        if ordered_key_mean is None or ordered_value_mean is None:
+            raise ValueError("direct ordered INT8 preparation requires compact K/V means")
+        if key_order.shape != key.shape[:3] or key_order.dtype != torch.int32:
+            raise ValueError("direct ordered INT8 preparation requires an INT32 [B, H, K] order")
+        query_int8, key_int8, query_scale, key_scale = _prepare_ordered_grouped_qk(
+            query,
+            key,
+            ordered_key_mean,
+            key_order,
+            scale,
+            storage_key_length,
+        )
+    else:
+        if ordered_key_mean is not None or ordered_value_mean is not None:
+            raise ValueError("ordered K/V means require an ordered key index")
+        query_int8, key_int8, query_scale, key_scale = _prepare_qk(
+            query,
+            key,
+            scale,
+            grouped_qk,
+            storage_key_length,
+        )
     batch, heads, _, _ = value.shape
-    if center_value:
+    if ordered_value_mean is not None:
+        value_mean = ordered_value_mean
+    elif center_value:
         mean_chunks = int(triton.cdiv(key_length, _VALUE_MEAN_CHUNK))
         value_mean_partials = torch.empty(
             (batch, heads, mean_chunks, head_dim),
@@ -2210,50 +2725,74 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         if storage_key_length != key_length
         else torch.empty(value_int8_shape, device=value.device, dtype=torch.int8)
     )
-    quantize_kernel = (
-        _quantize_value_feature_convrot_per_key_int8_kernel
-        if value_scale_axis == "key"
-        else _quantize_value_feature_convrot_int8_kernel
-    )
-    quantize_kernel[(value_blocks, heads, batch)](
-        value,
-        value_mean,
-        value_scale,
-        value_log_scale,
-        value_inverse_scale,
-        value_correction,
-        value_int8,
-        key_length,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        value_int8.stride(0),
-        value_int8.stride(1),
-        value_int8.stride(2),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=_PV_BLOCK,
-        rotation_group=rotation_group,
-        value_scale_floor=value_scale_floor,
-        store_log_scale=probability_scale_mode == "log",
-        store_value_scale=(
+    common_quantize_options = {
+        "heads": heads,
+        "head_dim": head_dim,
+        "block_n": _PV_BLOCK,
+        "value_scale_floor": value_scale_floor,
+        "store_log_scale": probability_scale_mode == "log",
+        "store_value_scale": (
             probability_scale_mode != "log"
             or value_scale_axis == "feature"
             or scale_forward_log_recurrence
         ),
-        store_probability_multiplier=precompute_pv_multiplier,
-        store_value_correction=affine_probability and not native_uint8_mma,
-        store_scaled_fp16_correction=scaled_fp16_correction,
-        probability_range=(
+        "store_probability_multiplier": precompute_pv_multiplier,
+        "store_value_correction": affine_probability and not native_uint8_mma,
+        "store_scaled_fp16_correction": scaled_fp16_correction,
+        "probability_range": (
             255.0 if affine_probability or native_uint8_mma else 127.0
         ),
-        tile_common_log_denominator=tile_common_log_denominator,
-        narrow_int8_log_denominator=narrow_int8_log_denominator,
-        scale_forward_log_recurrence=scale_forward_log_recurrence,
-        output_transposed=value_transposed,
-        center_value=center_value,
-        num_warps=4,
-    )
+        "tile_common_log_denominator": tile_common_log_denominator,
+        "narrow_int8_log_denominator": narrow_int8_log_denominator,
+        "scale_forward_log_recurrence": scale_forward_log_recurrence,
+        "output_transposed": value_transposed,
+        "num_warps": 4,
+    }
+    if key_order is not None:
+        _quantize_ordered_value_per_key_int8_kernel[(value_blocks, heads, batch)](
+            value,
+            value_mean,
+            key_order,
+            value_scale,
+            value_log_scale,
+            value_inverse_scale,
+            value_correction,
+            value_int8,
+            key_length,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value_int8.stride(0),
+            value_int8.stride(1),
+            value_int8.stride(2),
+            **common_quantize_options,
+        )
+    else:
+        quantize_kernel = cast(
+            Any,
+            _quantize_value_feature_convrot_per_key_int8_kernel
+            if value_scale_axis == "key"
+            else _quantize_value_feature_convrot_int8_kernel,
+        )
+        quantize_kernel[(value_blocks, heads, batch)](
+            value,
+            value_mean,
+            value_scale,
+            value_log_scale,
+            value_inverse_scale,
+            value_correction,
+            value_int8,
+            key_length,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value_int8.stride(0),
+            value_int8.stride(1),
+            value_int8.stride(2),
+            rotation_group=rotation_group,
+            center_value=center_value,
+            **common_quantize_options,
+        )
     return (
         query_int8,
         key_int8,
@@ -2775,6 +3314,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     optimize_pv_scaling: bool | None = None,
     fp32_pv_scale_metadata: bool | None = None,
     center_value: bool | None = None,
+    sort_value_rows: bool = False,
 ) -> torch.Tensor:
     """Run per-key-scaled feature-ConvRot V with integer P attention.
 
@@ -2789,7 +3329,8 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     computes a compact FP32 sequence mean, subtracts it inside V quantization, and restores it
     in the attention epilogue without materializing a centered V tensor. It is selected by
     default for long noncausal SM12x per-key log scaling; pass an explicit boolean to override
-    that policy.
+    that policy. ``sort_value_rows`` stably orders noncausal K/V rows by centered-V FP32 range,
+    gathering raw K/V directly into their final INT8 layouts.
     """
     if grouped_qk is None:
         grouped_qk = torch.cuda.get_device_capability(query.device)[0] == 12
@@ -2810,6 +3351,18 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         )
     if center_value and rotation_group:
         raise ValueError("centered V currently requires rotation_group=0")
+    if sort_value_rows and (
+        is_causal
+        or not grouped_qk
+        or not center_value
+        or rotation_group
+        or value_scale_axis != "key"
+        or probability_scale_mode != "log"
+        or head_dim != 128
+    ):
+        raise ValueError(
+            "direct V sorting requires noncausal grouped-QK centered per-key D128 attention"
+        )
     if scale_forward_log_recurrence is None:
         scale_forward_log_recurrence = (
             torch.cuda.get_device_capability(query.device)[0] == 12
@@ -2888,6 +3441,13 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         if use_padded_descriptor_storage
         else key_length
     )
+    if sort_value_rows:
+        ordered_key_mean, ordered_value_mean = _compute_key_value_means(key, value)
+        key_order = _build_centered_value_order(value, ordered_value_mean)
+    else:
+        key_order = None
+        ordered_key_mean = None
+        ordered_value_mean = None
     prepared = _prepare_uint8_pv_feature_convrot_inputs(
         query,
         key,
@@ -2908,6 +3468,9 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         precompute_pv_multiplier=optimize_pv_scaling,
         storage_key_length=storage_key_length,
         center_value=center_value,
+        key_order=key_order,
+        ordered_key_mean=ordered_key_mean,
+        ordered_value_mean=ordered_value_mean,
     )
     output = torch.empty_like(query)
     rotated_output = (

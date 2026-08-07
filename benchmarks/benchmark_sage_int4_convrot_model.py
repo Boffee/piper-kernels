@@ -237,6 +237,41 @@ def _permute_key_value_by_v_scale(
     return torch.gather(key, 2, key_order), torch.gather(value, 2, value_order)
 
 
+def _centered_key_scaled_uint8_sort_low_to_high(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    *,
+    grouped_qk: bool | None = None,
+) -> torch.Tensor:
+    """Run the quality-first exact centered-V ordering through direct INT8 preparation."""
+    if is_causal:
+        raise ValueError("V sorting is valid only for noncausal attention")
+    # Direct ordered preparation targets the grouped SM12x execution path.
+    grouped_qk = True
+    return triton_sage_attention_uint8_pv_feature_convrot(
+        query,
+        key,
+        value,
+        scale,
+        is_causal,
+        rotation_group=0,
+        value_scale_axis="key",
+        probability_scale_mode="log",
+        grouped_qk=grouped_qk,
+        affine_probability=True,
+        native_uint8_mma=True,
+        split_pv_head_dim=True,
+        scale_forward_log_recurrence=True,
+        optimize_pv_scaling=True,
+        scaled_fp16_numerator=True,
+        center_value=True,
+        sort_value_rows=True,
+    )
+
+
 def _int8_pv_output_scaled_reference(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
     scores: torch.Tensor,
     value: torch.Tensor,
@@ -1094,6 +1129,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "uint8_pv_key_log_scale_forward",
             "uint8_pv_key_log_scale_forward_optimized_pv",
             "uint8_pv_key_log_scale_forward_optimized_pv_scaled_fp16_numerator",
+            "uint8_pv_key_log_scale_forward_optimized_pv_scaled_fp16_numerator_sort_low_to_high",
             "uint8_pv_key_log_scale_forward_optimized_pv_scaled_fp16_numerator_fp32_metadata",
             "uint8_pv_key_log_scale_forward_optimized_pv_scaled_fp16_numerator_scaled_fp16_denominator",
             "uint8_pv_key_log_tile_common",
@@ -1181,6 +1217,10 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                 triton_sage_attention_uint8_pv_bucketed_grouped,
                 range_bucket_log2_scale=4,
             ),
+        ),
+        (
+            "uint8_pv_key_log_scale_forward_optimized_pv_scaled_fp16_numerator_sort_low_to_high",
+            _centered_key_scaled_uint8_sort_low_to_high,
         ),
         (
             "int8_pv_bucketed_group4_k128_global_p",

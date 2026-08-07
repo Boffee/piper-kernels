@@ -1222,3 +1222,28 @@ FLUX.2 Klein sample, signed key-scaled INT8 measured 39.81 dB mean / 36.62 dB wo
 and 0.0089 relative L1. Canonical SageAttention2++ measured 36.49/32.64 dB and 0.0133. Thus the
 seventh probability bit costs roughly 1.5-2 dB versus affine UINT8 but retains a 3-4 dB margin
 over canonical SageAttention2++ on this sample.
+
+### Exact centered-V ordering
+
+The quality-first centered, per-key-scaled affine-UINT8 control can stably sort noncausal K/V
+rows from low to high centered-V FP32 row range. Exact attention is invariant to the joint
+permutation, while the integer recurrence sees a different K64 grouping and accumulation order.
+On the exhaustive Diffusers BF16 LTX-2.3 sci-fi shadow trajectory, exact ordering improved global
+attention-output SQNR from 39.12 to 39.52 dB. The corresponding rollout measured 18.67 dB decoded
+PSNR and 9.60 dB latent SQNR against the exact render.
+
+The implementation computes compact joint FP32 K/V means, forms and stably sorts one FP32 range
+per V row, and gathers raw BF16 K/V directly into their final INT8 layouts. It does not materialize
+a full centered FP32 V tensor or sorted BF16 K/V tensors. Select it in the real-model benchmark as
+`uint8_pv_key_log_scale_forward_optimized_pv_scaled_fp16_numerator_sort_low_to_high`.
+
+Complete-call RTX 5090 timings include centering, ordering, direct INT8 preparation, and attention:
+
+| shape | Triton SA2++ ms | unsorted UINT8 ms | exact ordered UINT8 ms | ordering overhead |
+|---|---:|---:|---:|---:|
+| B1/H24/N1152/D128 | 0.07412 | 0.08845 | 0.10969 | 24.01% |
+| B1/H24/N131072/D128 | 392.60 | 414.69 | 415.24 | 0.13% |
+
+Thus exact ordering is relatively expensive at the short FLUX.2 Klein sequence but is effectively
+amortized at long context. The exact-direct formulation is retained because the alternative
+quantize-first formulation showed no repeatable performance benefit.
