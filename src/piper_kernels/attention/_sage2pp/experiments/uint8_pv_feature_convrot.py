@@ -69,6 +69,9 @@ _RECURRENCE_ACCUMULATOR_LIMIT = tl.constexpr(8388607)
 _PAIR_SCALE_BITS = tl.constexpr(10)
 _PAIR_SCALE = tl.constexpr(1024.0)
 _PAIR_ROUNDING = tl.constexpr(512)
+_VALUE_MEAN_CHUNK = 1024
+_VALUE_MEAN_BLOCK_N = 64
+_VALUE_MEAN_BLOCK_D = 64
 
 
 @triton.jit
@@ -188,8 +191,83 @@ def _apply_delayed_fp16_correction(
 
 
 @triton.jit
+def _value_mean_partial_kernel(
+    value_ptr,
+    partial_ptr,
+    key_length,
+    num_chunks,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    chunk_n: tl.constexpr,
+    block_n: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """Reduce one sequence chunk into a per-head/per-feature FP32 partial."""
+    chunk = tl.program_id(0)
+    feature_block = tl.program_id(1)
+    batch_head = tl.program_id(2)
+    batch = batch_head // heads
+    head = batch_head % heads
+    offsets_d = feature_block * block_d + tl.arange(0, block_d)
+    offsets_n = tl.arange(0, block_n)
+    accumulator = tl.zeros((block_d,), dtype=tl.float32)
+    chunk_start = chunk * chunk_n
+    for offset in tl.range(0, chunk_n, block_n, disable_licm=True):
+        current_n = chunk_start + offset + offsets_n
+        values = tl.load(
+            value_ptr
+            + batch * stride_vb
+            + head * stride_vh
+            + current_n[:, None] * stride_vn
+            + offsets_d[None, :],
+            mask=(current_n[:, None] < key_length) & (offsets_d[None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.sum(values, axis=0)
+    tl.store(
+        partial_ptr + (batch_head * num_chunks + chunk) * head_dim + offsets_d,
+        accumulator,
+        mask=offsets_d < head_dim,
+    )
+
+
+@triton.jit
+def _value_mean_finalize_kernel(
+    partial_ptr,
+    mean_ptr,
+    key_length,
+    num_chunks,
+    head_dim: tl.constexpr,
+    block_chunks: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """Merge chunk partials into the compact FP32 V mean."""
+    batch_head = tl.program_id(0)
+    feature_block = tl.program_id(1)
+    offsets_c = tl.arange(0, block_chunks)
+    offsets_d = feature_block * block_d + tl.arange(0, block_d)
+    partials = tl.load(
+        partial_ptr
+        + (batch_head * num_chunks + offsets_c[:, None]) * head_dim
+        + offsets_d[None, :],
+        mask=(offsets_c[:, None] < num_chunks) & (offsets_d[None, :] < head_dim),
+        other=0.0,
+    )
+    mean = tl.sum(partials, axis=0) / key_length
+    tl.store(
+        mean_ptr + batch_head * head_dim + offsets_d,
+        mean,
+        mask=offsets_d < head_dim,
+    )
+
+
+@triton.jit
 def _quantize_value_feature_convrot_int8_kernel(
     value_ptr,
+    value_mean_ptr,
     scale_ptr,
     log_scale_ptr,
     inverse_scale_ptr,
@@ -217,6 +295,7 @@ def _quantize_value_feature_convrot_int8_kernel(
     narrow_int8_log_denominator: tl.constexpr,
     scale_forward_log_recurrence: tl.constexpr,
     output_transposed: tl.constexpr,
+    center_value: tl.constexpr,
 ):
     key_block = tl.program_id(0)
     head = tl.program_id(1)
@@ -233,6 +312,9 @@ def _quantize_value_feature_convrot_int8_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
+    if center_value:
+        value_mean = tl.load(value_mean_ptr + (batch * heads + head) * head_dim + offsets_d)
+        value = tl.where(mask, value - value_mean[None, :], 0.0)
     value = rotate_rows_in_registers(value, offsets_d, block_n, rotation_group)
     scale = tl.max(tl.abs(value), axis=0) / _V_INT8_RANGE + _SCALE_EPSILON
     quantized = _sage_backend._round_to_int8(
@@ -268,6 +350,7 @@ def _quantize_value_feature_convrot_int8_kernel(
 @triton.jit
 def _quantize_value_feature_convrot_per_key_int8_kernel(
     value_ptr,
+    value_mean_ptr,
     scale_ptr,
     log_scale_ptr,
     inverse_scale_ptr,
@@ -295,6 +378,7 @@ def _quantize_value_feature_convrot_per_key_int8_kernel(
     narrow_int8_log_denominator: tl.constexpr,
     scale_forward_log_recurrence: tl.constexpr,
     output_transposed: tl.constexpr,
+    center_value: tl.constexpr,
 ):
     """Rotate features, then use one symmetric INT8 scale per key row."""
     key_block = tl.program_id(0)
@@ -312,6 +396,13 @@ def _quantize_value_feature_convrot_per_key_int8_kernel(
         mask=valid_keys[:, None],
         other=0.0,
     ).to(tl.float32)
+    if center_value:
+        value_mean = tl.load(value_mean_ptr + (batch * heads + head) * head_dim + offsets_d)
+        value = tl.where(
+            valid_keys[:, None],
+            value - value_mean[None, :],
+            0.0,
+        )
     value = rotate_rows_in_registers(value, offsets_d, block_n, rotation_group)
     scale = tl.max(tl.abs(value), axis=1) / _V_INT8_RANGE + _SCALE_EPSILON
     if value_scale_floor > 0.0:
@@ -404,6 +495,7 @@ def _uint8_pv_feature_convrot_attention_kernel(
     value_log_scale_ptr,
     value_inverse_scale_ptr,
     value_correction_ptr,
+    value_mean_ptr,
     rotated_output_ptr,
     query_length,
     key_length,
@@ -446,6 +538,7 @@ def _uint8_pv_feature_convrot_attention_kernel(
     unmasked_query_tiles: tl.constexpr,
     unmasked_self_attention: tl.constexpr,
     output_rotation_group: tl.constexpr,
+    center_value: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -1628,6 +1721,10 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 delayed_probability_scale: tl.constexpr = 1.0 / _V_INT8_RANGE
             output_low *= delayed_probability_scale
             output_high *= delayed_probability_scale
+        if center_value:
+            value_mean_base = value_mean_ptr + (batch * heads + head) * head_dim
+            output_low += tl.load(value_mean_base + offsets_vd)[None, :]
+            output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]
         output_base = (
             rotated_output_ptr
             + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
@@ -1701,6 +1798,10 @@ def _uint8_pv_feature_convrot_attention_kernel(
             block_m,
             output_rotation_group,
         )
+        if center_value:
+            rotated_output += tl.load(
+                value_mean_ptr + (batch * heads + head) * head_dim + offsets_d
+            )[None, :]
         tl.store(
             rotated_output_ptr
             + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
@@ -1983,6 +2084,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
     fp32_scale_forward_metadata: bool = False,
     precompute_pv_multiplier: bool = False,
     storage_key_length: int | None = None,
+    center_value: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Quantize canonical Q/K and feature-rotated block-scaled INT8 V."""
     if rotation_group not in (0, 16, 64):
@@ -1992,6 +2094,8 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         raise ValueError(
             f"head dimension {head_dim} must be divisible by rotation group {rotation_group}"
         )
+    if center_value and rotation_group:
+        raise ValueError("centered V currently requires rotation_group=0")
     if value_scale_axis not in ("feature", "key"):
         raise ValueError(f"value scale axis must be 'feature' or 'key', got {value_scale_axis!r}")
     if not 0.0 <= value_scale_floor <= 1.0:
@@ -2024,6 +2128,53 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         storage_key_length,
     )
     batch, heads, _, _ = value.shape
+    if center_value:
+        mean_chunks = int(triton.cdiv(key_length, _VALUE_MEAN_CHUNK))
+        value_mean_partials = torch.empty(
+            (batch, heads, mean_chunks, head_dim),
+            device=value.device,
+            dtype=torch.float32,
+        )
+        value_mean = torch.empty(
+            (batch, heads, head_dim),
+            device=value.device,
+            dtype=torch.float32,
+        )
+        _value_mean_partial_kernel[
+            (
+                mean_chunks,
+                int(triton.cdiv(head_dim, _VALUE_MEAN_BLOCK_D)),
+                batch * heads,
+            )
+        ](
+            value,
+            value_mean_partials,
+            key_length,
+            mean_chunks,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            heads=heads,
+            head_dim=head_dim,
+            chunk_n=_VALUE_MEAN_CHUNK,
+            block_n=_VALUE_MEAN_BLOCK_N,
+            block_d=_VALUE_MEAN_BLOCK_D,
+            num_warps=4,
+        )
+        _value_mean_finalize_kernel[
+            (batch * heads, int(triton.cdiv(head_dim, _VALUE_MEAN_BLOCK_D)))
+        ](
+            value_mean_partials,
+            value_mean,
+            key_length,
+            mean_chunks,
+            head_dim=head_dim,
+            block_chunks=triton.next_power_of_2(mean_chunks),
+            block_d=_VALUE_MEAN_BLOCK_D,
+            num_warps=4,
+        )
+    else:
+        value_mean = value
     value_blocks = (key_length + _PV_BLOCK - 1) // _PV_BLOCK
     correction_shape = (batch, heads, value_blocks, head_dim)
     scale_shape = (batch, heads, key_length) if value_scale_axis == "key" else correction_shape
@@ -2072,6 +2223,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
     )
     quantize_kernel[(value_blocks, heads, batch)](
         value,
+        value_mean,
         value_scale,
         value_log_scale,
         value_inverse_scale,
@@ -2105,6 +2257,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         narrow_int8_log_denominator=narrow_int8_log_denominator,
         scale_forward_log_recurrence=scale_forward_log_recurrence,
         output_transposed=value_transposed,
+        center_value=center_value,
         num_warps=4,
     )
     return (
@@ -2117,6 +2270,7 @@ def _prepare_uint8_pv_feature_convrot_inputs(
         value_log_scale,
         value_inverse_scale,
         value_correction,
+        value_mean,
     )
 
 
@@ -2173,6 +2327,7 @@ def _launch_uint8_pv_feature_convrot_attention(
     use_tensor_descriptors: bool = False,
     storage_key_length: int | None = None,
     maxnreg: int | None = None,
+    center_value: bool = False,
 ) -> torch.Tensor:
     """Launch prequantized attention followed by its feature inverse rotation."""
     (
@@ -2185,6 +2340,7 @@ def _launch_uint8_pv_feature_convrot_attention(
         value_log_scale,
         value_inverse_scale,
         value_correction,
+        value_mean,
     ) = prepared
     batch, heads, _, head_dim = query.shape
     if storage_key_length is None:
@@ -2509,6 +2665,7 @@ def _launch_uint8_pv_feature_convrot_attention(
             value_log_scale,
             value_inverse_scale,
             value_correction,
+            value_mean,
             attention_output,
             query_length,
             key_length,
@@ -2551,6 +2708,7 @@ def _launch_uint8_pv_feature_convrot_attention(
             unmasked_query_tiles=unmasked_query_tiles,
             unmasked_self_attention=unmasked_self_attention,
             output_rotation_group=rotation_group if fuse_output_rotation else 0,
+            center_value=center_value,
             heads=heads,
             head_dim=head_dim,
             block_m=block_m,
@@ -2620,6 +2778,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     scale_forward_log_recurrence: bool | None = None,
     optimize_pv_scaling: bool | None = None,
     fp32_pv_scale_metadata: bool | None = None,
+    center_value: bool | None = None,
 ) -> torch.Tensor:
     """Run per-key-scaled feature-ConvRot V with integer P attention.
 
@@ -2630,7 +2789,11 @@ def triton_sage_attention_uint8_pv_feature_convrot(
     from N=1024; an explicit boolean controls the experiment. ``optimize_pv_scaling`` stores
     the final ``probability_range * scale_v`` multiplier during V preparation, removing its
     formation from the attention loop. The scaled-FP16 numerator uses FP16 multiplier metadata
-    by default; ``fp32_pv_scale_metadata`` retains the older FP32 control.
+    by default; ``fp32_pv_scale_metadata`` retains the older FP32 control. ``center_value``
+    computes a compact FP32 sequence mean, subtracts it inside V quantization, and restores it
+    in the attention epilogue without materializing a centered V tensor. It is selected by
+    default for long noncausal SM12x per-key log scaling; pass an explicit boolean to override
+    that policy.
     """
     if grouped_qk is None:
         grouped_qk = torch.cuda.get_device_capability(query.device)[0] == 12
@@ -2638,6 +2801,19 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         probability_scale_mode = "log" if value_scale_axis == "key" else "dynamic"
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
+    if center_value is None:
+        center_value = (
+            torch.cuda.get_device_capability(query.device)[0] == 12
+            and not is_causal
+            and rotation_group == 0
+            and value_scale_axis == "key"
+            and probability_scale_mode == "log"
+            and head_dim == 128
+            and query_length >= 1024
+            and key_length >= 1024
+        )
+    if center_value and rotation_group:
+        raise ValueError("centered V currently requires rotation_group=0")
     if scale_forward_log_recurrence is None:
         scale_forward_log_recurrence = (
             torch.cuda.get_device_capability(query.device)[0] == 12
@@ -2735,6 +2911,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         fp32_scale_forward_metadata=fp32_pv_scale_metadata,
         precompute_pv_multiplier=optimize_pv_scaling,
         storage_key_length=storage_key_length,
+        center_value=center_value,
     )
     output = torch.empty_like(query)
     rotated_output = (
@@ -2876,6 +3053,7 @@ def triton_sage_attention_uint8_pv_feature_convrot(
         use_tensor_descriptors=use_tensor_descriptors,
         storage_key_length=storage_key_length,
         maxnreg=maxnreg,
+        center_value=center_value,
     )
 
 

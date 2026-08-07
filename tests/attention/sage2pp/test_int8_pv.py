@@ -86,6 +86,69 @@ def test_int8_pv_baseline_is_close_to_exact_attention(
     assert error.max().item() < 0.1
 
 
+def test_centered_value_fusion_restores_constant_value() -> None:
+    torch.manual_seed(831)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value_row = torch.randn(1, 2, 1, 128, device="cuda", dtype=torch.bfloat16)
+    value = value_row.expand_as(query).contiguous()
+
+    with torch.no_grad():
+        actual = triton_sage_attention_uint8_pv_feature_convrot(
+            query,
+            key,
+            value,
+            128**-0.5,
+            False,
+            grouped_qk=False,
+            probability_scale_mode="log",
+            center_value=True,
+        )
+
+    torch.testing.assert_close(actual, value_row.expand_as(actual), atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="optimized centered key-scaled path is currently tuned for SM12x",
+)
+def test_centered_value_improves_biased_value_quality() -> None:
+    torch.manual_seed(896)
+    sequence = 1024
+    query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    offset = torch.linspace(-8, 8, 128, device="cuda").reshape(1, 1, 1, 128)
+    value = (offset + torch.randn_like(query.float()) * 0.25).to(torch.bfloat16)
+    arguments = (query, key, value, 128**-0.5, False)
+    options = {
+        "grouped_qk": True,
+        "probability_scale_mode": "log",
+        "native_uint8_mma": False,
+        "scale_forward_log_recurrence": True,
+        "optimize_pv_scaling": True,
+        "split_pv_head_dim": True,
+        "scaled_fp16_numerator": True,
+        "scaled_fp16_correction": True,
+        "delayed_fp16_correction_group": 8,
+    }
+
+    with torch.no_grad():
+        uncentered = triton_sage_attention_uint8_pv_feature_convrot(
+            *arguments,
+            center_value=False,
+            **options,
+        )
+        centered = triton_sage_attention_uint8_pv_feature_convrot(
+            *arguments,
+            **options,
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    uncentered_mse = (uncentered.float() - expected.float()).square().mean()
+    centered_mse = (centered.float() - expected.float()).square().mean()
+    assert centered_mse < uncentered_mse * 0.2
+
+
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_fixed_int8_split_pv_is_close_to_exact_attention(is_causal: bool) -> None:
     torch.manual_seed(811)

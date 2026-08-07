@@ -38,6 +38,7 @@ class Measurement:
 
     prompt: int
     step: int
+    attention_pass: int
     layer: int
     sequence: int
     variant: str
@@ -126,12 +127,16 @@ def _int8_pv_key_log_reference(
     value: torch.Tensor,
     block_n: int,
     *,
+    center_value: bool = False,
     probability_dtype: torch.dtype | None = None,
     accumulator_dtype: torch.dtype | None = None,
     normalized_accumulator_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Evaluate per-key INT8 V with tile-local UINT8 P in FP32."""
     value_float = value.float()
+    value_mean = value_float.mean(dim=2, keepdim=True) if center_value else None
+    if value_mean is not None:
+        value_float = value_float - value_mean
     value_scale = value_float.abs().amax(dim=-1) / 127 + 1e-7
     value_int = (value_float / value_scale[..., None]).round().clamp(-127, 127)
     value_log_scale = torch.log(value_scale)
@@ -185,9 +190,12 @@ def _int8_pv_key_log_reference(
             )
         denominator = next_denominator
         running_max = next_max
-    if normalized_accumulator_dtype is not None:
-        return accumulator
-    return accumulator / denominator.clamp_min(1e-30)[..., None]
+    output = (
+        accumulator
+        if normalized_accumulator_dtype is not None
+        else accumulator / denominator.clamp_min(1e-30)[..., None]
+    )
+    return output if value_mean is None else output + value_mean
 
 
 def _permute_key_value_by_v_scale(
@@ -939,6 +947,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--max-sequence-length", type=int, default=128)
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 4, 5, 14, 24])
     parser.add_argument("--capture-steps", type=int, nargs="+", default=[0, 3])
@@ -975,6 +984,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "int8_pv_key_log_int32_tile",
             "int8_pv_key_log_int32_tile_predot_dithered",
             "int8_pv_key_log_ref64",
+            "int8_pv_key_log_ref64_v_centered",
             "int8_pv_key_log_ref128",
             "int8_pv_key_log_pair_q10",
             "int8_pv_key_log_ref64_fp16_p",
@@ -1210,11 +1220,12 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
         ),
     )
     int8_pv_reference_variants = (
-        ("int8_pv_key_log_ref64", 64, None, None, None, None),
-        ("int8_pv_key_log_ref128", 128, None, None, None, None),
-        ("int8_pv_key_log_pair_q10", 64, 10, None, None, None),
-        ("int8_pv_key_log_ref64_fp16_p", 64, None, torch.float16, None, None),
-        ("int8_pv_key_log_ref64_fp16_acc", 64, None, None, torch.float16, None),
+        ("int8_pv_key_log_ref64", 64, None, None, None, None, False),
+        ("int8_pv_key_log_ref64_v_centered", 64, None, None, None, None, True),
+        ("int8_pv_key_log_ref128", 128, None, None, None, None, False),
+        ("int8_pv_key_log_pair_q10", 64, 10, None, None, None, False),
+        ("int8_pv_key_log_ref64_fp16_p", 64, None, torch.float16, None, None, False),
+        ("int8_pv_key_log_ref64_fp16_acc", 64, None, None, torch.float16, None, False),
         (
             "int8_pv_key_log_ref64_fp16_p_acc",
             64,
@@ -1222,6 +1233,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
             torch.float16,
             torch.float16,
             None,
+            False,
         ),
         (
             "int8_pv_key_log_ref64_fp16_norm_acc",
@@ -1230,6 +1242,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
             None,
             None,
             torch.float16,
+            False,
         ),
     )
     output_scaled_reference_variants = (
@@ -1418,7 +1431,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
     all_variant_names = tuple(
         [name for name, _, _ in qk_variants]
         + [name for name, _ in int8_pv_variants]
-        + [name for name, _, _, _, _, _ in int8_pv_reference_variants]
+        + [name for name, _, _, _, _, _, _ in int8_pv_reference_variants]
         + [name for name, _, _, _, _ in output_scaled_reference_variants]
         + list(alignment_reference_variant_names)
         + [name for name, _ in sampled_pair_reference_variants]
@@ -1442,7 +1455,9 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
     measurements: list[Measurement] = []
     alignment_diagnostics: list[AlignmentDiagnostics] = []
     sampled_pair_diagnostics: list[tuple[str, float, float, float, float]] = []
-    calls_per_step = 25
+    attention_passes = 2 if args.guidance_scale > 1.0 else 1
+    layers_per_pass = 25
+    calls_per_step = attention_passes * layers_per_pass
     call_index = 0
     prompt_index = 0
 
@@ -1462,7 +1477,9 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
             **dispatch_kwargs,
         )
         step = call_index // calls_per_step
-        layer = call_index % calls_per_step
+        call_within_step = call_index % calls_per_step
+        attention_pass = call_within_step // layers_per_pass
+        layer = call_within_step % layers_per_pass
         call_index += 1
         if step not in args.capture_steps or layer not in args.layers:
             return exact_output
@@ -1497,6 +1514,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                 Measurement(
                     prompt=prompt_index,
                     step=step,
+                    attention_pass=attention_pass,
                     layer=layer,
                     sequence=query.shape[1],
                     variant=variant,
@@ -1523,6 +1541,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1532,7 +1551,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     )
                 )
         if selected_variant_names.intersection(
-            name for name, _, _, _, _, _ in int8_pv_reference_variants
+            name for name, _, _, _, _, _, _ in int8_pv_reference_variants
         ):
             int8_scores = _quantized_scores(query_h, key_h, 127, None)
             int8_score_sqnr = _sqnr(int8_scores, exact_scores)
@@ -1544,6 +1563,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                 probability_dtype,
                 accumulator_dtype,
                 normalized_accumulator_dtype,
+                center_value,
             ) in int8_pv_reference_variants:
                 if variant not in selected_variant_names:
                     continue
@@ -1552,6 +1572,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                         scaled_int8_scores,
                         value_h,
                         block_n,
+                        center_value=center_value,
                         probability_dtype=probability_dtype,
                         accumulator_dtype=accumulator_dtype,
                         normalized_accumulator_dtype=normalized_accumulator_dtype,
@@ -1567,6 +1588,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1682,6 +1704,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1707,6 +1730,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1746,6 +1770,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1778,6 +1803,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1829,6 +1855,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1887,6 +1914,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                     Measurement(
                         prompt=prompt_index,
                         step=step,
+                        attention_pass=attention_pass,
                         layer=layer,
                         sequence=query.shape[1],
                         variant=variant,
@@ -1908,7 +1936,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
                 height=args.height,
                 width=args.width,
                 num_inference_steps=args.steps,
-                guidance_scale=1.0,
+                guidance_scale=args.guidance_scale,
                 max_sequence_length=args.max_sequence_length,
                 generator=generator,
                 output_type="latent",
@@ -1924,16 +1952,19 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912, PLR0915
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(
         f"Model: {args.model}; prompts: {len(prompts)}; resolution: "
-        f"{args.width}x{args.height}; denoising steps: {args.steps}"
+        f"{args.width}x{args.height}; denoising steps: {args.steps}; "
+        f"guidance: {args.guidance_scale:g}"
     )
     print()
     print(
-        "| prompt | step | layer | sequence | variant | score SQNR | output SQNR | output rel-L1 |"
+        "| prompt | step | pass | layer | sequence | variant | score SQNR | output SQNR "
+        "| output rel-L1 |"
     )
-    print("|---:|---:|:---|---:|:---|---:|---:|---:|")
+    print("|---:|---:|---:|:---|---:|:---|---:|---:|---:|")
     for item in measurements:
         print(
-            f"| {item.prompt} | {item.step} | {_layer_name(item.layer)} | {item.sequence} "
+            f"| {item.prompt} | {item.step} | {item.attention_pass} "
+            f"| {_layer_name(item.layer)} | {item.sequence} "
             f"| {item.variant} | {item.score_sqnr:.2f} dB | {item.output_sqnr:.2f} dB "
             f"| {item.output_relative_l1:.4f} |"
         )

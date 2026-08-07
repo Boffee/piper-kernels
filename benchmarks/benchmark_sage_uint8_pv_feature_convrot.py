@@ -93,6 +93,7 @@ def _run_shape(
     scaled_fp16_correction: bool,
     delayed_fp16_correction_group: int,
     scaled_fp16_denominator: bool,
+    center_value: bool,
     warmup_ms: int,
     repeat_ms: int,
     tune_ms: int,
@@ -180,6 +181,7 @@ def _run_shape(
                 )
             ),
             precompute_pv_multiplier=optimize_pv_scaling,
+            center_value=center_value,
         )
         for variant in variants
     }
@@ -369,6 +371,7 @@ def _run_shape(
                     scaled_fp16_correction=scaled_fp16_correction,
                     delayed_fp16_correction_group=delayed_fp16_correction_group,
                     scaled_fp16_denominator=scaled_fp16_denominator,
+                    center_value=center_value,
                     unmasked_self_attention=(
                         sequence % config.block_m == 0
                         and sequence % 64 == 0
@@ -434,6 +437,7 @@ def _run_shape(
                 scaled_fp16_correction=scaled_fp16_correction,
                 delayed_fp16_correction_group=delayed_fp16_correction_group,
                 scaled_fp16_denominator=scaled_fp16_denominator,
+                center_value=center_value,
             ),
             warmup_ms,
             repeat_ms,
@@ -486,6 +490,7 @@ def _run_shape(
         if delayed_fp16_correction_group:
             recurrence += f" G{delayed_fp16_correction_group}-correction"
         recurrence += " scaled-FP16-denominator" if scaled_fp16_denominator else ""
+        recurrence += " centered-V" if center_value else ""
         recurrence += (
             " R168"
             if split_pv_head_dim
@@ -614,6 +619,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="keep the softmax denominator in a fixed 2^-4 FP16 coordinate",
+    )
+    parser.add_argument(
+        "--center-value",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="subtract each V feature mean before quantization and restore it in the epilogue",
     )
     parser.add_argument(
         "--rotations", type=int, nargs="+", choices=[0, 16, 64], default=[0, 16, 64]
@@ -761,6 +772,8 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912
         )
     if args.scaled_fp16_denominator and not args.scaled_fp16_numerator:
         raise SystemExit("--scaled-fp16-denominator requires --scaled-fp16-numerator")
+    if args.center_value and args.rotations != [0]:
+        raise SystemExit("--center-value currently requires --rotations 0")
     if (args.integer_output_recurrence or args.integer_tile_exponent_recurrence) and (
         args.scale_axes != ["key"] or args.probability_scale_modes != ["log"]
     ):
@@ -780,6 +793,8 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912
         "Q/K/V preparation."
     )
     print("Feature inverse rotations are fused into the attention epilogue.")
+    if args.center_value:
+        print("Per-feature V centering and mean restoration are fused into the kernels.")
     print(
         "End-to-end timings include Q/K preparation, V rotation/quantization, and output inverse."
     )
@@ -814,6 +829,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # noqa: PLR0912
             args.scaled_fp16_correction,
             args.delayed_fp16_correction_group,
             args.scaled_fp16_denominator,
+            args.center_value,
             args.warmup_ms,
             args.repeat_ms,
             args.tune_ms,
