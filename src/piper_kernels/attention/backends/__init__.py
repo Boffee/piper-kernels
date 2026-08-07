@@ -1,1 +1,1 @@
-"""Optional optimized backends for attention operators."""
+"""Compatibility namespace for optional attention backends."""

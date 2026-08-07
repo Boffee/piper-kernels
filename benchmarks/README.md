@@ -160,6 +160,63 @@ The PTX report contains `mma.sync.aligned.m16n8k32...s32.u8.s8.s32`. Add SASS in
 Backend-specific PTX, SASS, and AMDGCN inspection belongs to compiler/profiling tooling
 rather than this portable benchmark runner.
 
+Run the SageAttention2++ provider comparison with:
+
+```shell
+uv run python benchmarks/benchmark_sage_attention_2pp.py
+```
+
+The default providers are the production pure-Triton SageAttention2++ backend and
+PyTorch SDPA. Add the revision-pinned official CUDA SageAttention2++ and SageAttention2
+providers with:
+
+```shell
+TORCH_CUDA_ARCH_LIST=12.0 uv sync --group benchmark
+uv run python benchmarks/benchmark_sage_attention_2pp.py --canonical
+```
+
+Replace `12.0` with `8.9` on RTX 40-series GPUs. The benchmark dependency is
+SageAttention 2.2.0 at commit `d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5` and is never
+imported by package production code. SM89 comparisons use canonical per-thread Q/K
+quantization; SM12x comparisons use canonical per-warp Q/K quantization. Both canonical
+providers enable K smoothing and differ only in their P x V accumulator strategy.
+
+Each row uses the common provider lifecycle and records first-call synchronized wall
+time, warmed device-event execution, warmed synchronized-wall operator latency, quality
+against SDPA, and effective TFLOP/s. Use `--sequence`, `--kv-sequence`, `--head-dim`,
+`--dtype`, and `--causal` to build a shape matrix. JSON and JSONL output use the shared
+versioned benchmark schema.
+
+Compiler inspection and external profiling are available for one shape at a time:
+
+```shell
+uv run python benchmarks/benchmark_sage_attention_2pp.py \
+  --sequence 8192 --compiler-report --compiler-json artifacts/sage2pp-compiler.json
+
+nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
+  uv run python benchmarks/benchmark_sage_attention_2pp.py \
+  --sequence 8192 --profile --profile-provider pure-triton-sage2pp
+```
+
+### SageAttention2++ regression baseline
+
+The issue #8 productionization was validated on an RTX 5090 (SM120) with Torch
+2.12.1+cu130 and Triton 3.7.1. For FP16 B1/H8/D128 non-causal self-attention at
+N=8192, a one-second warmed sample measured:
+
+| provider | device p50 [p20, p80] (ms) | synchronized wall p50 [p20, p80] (ms) | mean absolute error vs SDPA |
+|:---|---:|---:|---:|
+| pure Triton SageAttention2++ | 0.637 [0.635, 0.641] | 0.666 [0.665, 0.668] | 0.000563 |
+| canonical CUDA SageAttention2++ | 0.610 [0.608, 0.611] | 0.618 [0.612, 0.620] | 0.000563 |
+| canonical CUDA SageAttention2 | 0.707 [0.705, 0.708] | 0.707 [0.706, 0.709] | 0.000561 |
+| PyTorch SDPA | 1.692 [1.689, 1.695] | 1.702 [1.699, 1.717] | 0 |
+
+The pure-Triton attention specialization used 255 registers per thread, 8 compiler-reported
+spills, 49,704 bytes of shared memory per workgroup, and four warps. Its SASS contained the
+expected 64 signed INT8 QK MMA instructions and 64 E4M3 x E4M3 to FP16 PV MMA instructions.
+The complete GPU suite passed 155 tests. These measurements are a regression reference for
+this hardware/software stack, not a portable performance guarantee.
+
 ## Triton compiler inspection
 
 Providers register the Triton JIT functions they launch through
