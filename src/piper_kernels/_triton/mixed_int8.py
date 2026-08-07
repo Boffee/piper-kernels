@@ -149,6 +149,11 @@ def enable_uint8_int8_dot() -> None:
         raise RuntimeError(
             f"native UINT8-by-INT8 dot requires NVIDIA MMAv2, got {target.backend!r}"
         )
+    if not isinstance(target.arch, int) or target.arch < 80:
+        raise RuntimeError(
+            "native UINT8-by-INT8 dot requires NVIDIA compute capability 8.0 or newer, "
+            f"got {target.arch!r}"
+        )
     runtime_knobs = cast(Any, knobs.runtime)
     if not hasattr(runtime_knobs, "add_stages_inspection_hook"):
         raise RuntimeError("native UINT8-by-INT8 dot requires Triton compiler-stage hooks")

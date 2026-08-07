@@ -310,10 +310,11 @@ The extension lets Triton perform its ordinary signed-INT8 layout, scheduling, a
 It marks only requested dots, changes their exact MMAv2 accumulator chains from S8-by-S8 to
 U8-by-S8 at the compiler's LLVM stage, and removes the markers before PTX generation. A missing
 hook therefore fails compilation instead of silently running signed arithmetic, and the marker
-adds no device instruction. This is intentionally limited to the MMAv2 path used by consumer Ada
-and Blackwell; it does not add mixed-sign WGMMA for Hopper. The direct benchmark checks exact
-output and reports the emitted SASS. The attention benchmark keeps signed INT8 QK while using
-native UINT8-by-INT8 PV, so a correct SM120 build reports both `IMMA.16832.S8.S8.SAT` and
+adds no device instruction. This is intentionally limited to the `m16n8k32` MMAv2 path on NVIDIA
+compute capability 8.0 or newer; current attention schedules are tuned for consumer Ada and
+Blackwell, and the extension does not add mixed-sign WGMMA for Hopper. The direct benchmark checks
+exact output and reports the emitted SASS. The attention benchmark keeps signed INT8 QK while
+using native UINT8-by-INT8 PV, so a correct SM120 build reports both `IMMA.16832.S8.S8.SAT` and
 `IMMA.16832.U8.S8.SAT` in the fixed-schedule profiler.
 
 The extension was also checked against the former full Triton compiler patch. On RTX 5090, the
