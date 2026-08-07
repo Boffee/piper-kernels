@@ -1,4 +1,4 @@
-"""Machine-readable benchmark result records and CLI output options."""
+"""Machine-readable benchmark records and CLI output options."""
 
 from __future__ import annotations
 

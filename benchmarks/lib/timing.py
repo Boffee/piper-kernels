@@ -1,4 +1,4 @@
-"""Consistent timing terminology and Triton timing integration."""
+"""Shared timing terminology and Triton timing integration."""
 
 from __future__ import annotations
 

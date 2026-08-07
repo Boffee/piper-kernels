@@ -1,4 +1,4 @@
-"""Portable reference implementation for INT8 ConvRot linear layers."""
+"""Portable INT8 ConvRot reference implementation."""
 
 import torch
 

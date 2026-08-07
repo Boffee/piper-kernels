@@ -1,4 +1,4 @@
-"""Tensor subclass representing rotated INT8 W8A8 weights."""
+"""Rotated INT8 W8A8 tensor subclass."""
 
 from collections.abc import Callable
 from typing import Any, ClassVar

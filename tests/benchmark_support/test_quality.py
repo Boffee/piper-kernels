@@ -2,7 +2,7 @@ import math
 
 import pytest
 import torch
-from _lib.quality import measure_quality, measure_saturation
+from lib.quality import measure_quality, measure_saturation
 
 
 def test_quality_metrics_have_expected_definitions() -> None:

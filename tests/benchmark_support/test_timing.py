@@ -1,7 +1,7 @@
 import time
 
 import pytest
-from _lib.timing import ClockDomain, synchronized_wall_benchmark
+from lib.timing import ClockDomain, synchronized_wall_benchmark
 
 
 def test_synchronized_wall_benchmark_captures_host_work() -> None:

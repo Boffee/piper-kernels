@@ -1,4 +1,4 @@
-"""Model-neutral attention benchmark records."""
+"""Model-neutral attention shapes and configuration."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Reproducibility metadata for benchmark result records."""
+"""Reproducibility environment metadata for benchmark records."""
 
 from __future__ import annotations
 

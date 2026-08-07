@@ -1,7 +1,7 @@
 from collections.abc import Callable
 
-from _lib.providers import BenchmarkProvider, measure_provider
-from _lib.timing import ClockDomain, Timing
+from lib.providers import BenchmarkProvider, measure_provider
+from lib.timing import ClockDomain, Timing
 
 
 def _fake_device_timer(

@@ -2,9 +2,9 @@ import argparse
 import json
 from pathlib import Path
 
-from _lib.environment import EnvironmentInfo, capture_environment
-from _lib.quality import QualityMetrics
-from _lib.reporting import (
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.quality import QualityMetrics
+from lib.reporting import (
     BenchmarkRecord,
     OutputFormat,
     OutputTarget,
@@ -12,7 +12,7 @@ from _lib.reporting import (
     output_target,
     write_records,
 )
-from _lib.timing import ClockDomain, PhaseTimings, Timing
+from lib.timing import ClockDomain, PhaseTimings, Timing
 
 
 def _environment() -> EnvironmentInfo:

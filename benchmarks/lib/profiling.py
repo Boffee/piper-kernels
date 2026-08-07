@@ -1,4 +1,4 @@
-"""Generic provider launch loops for external GPU profilers."""
+"""Provider launch loops for external GPU profilers."""
 
 from __future__ import annotations
 

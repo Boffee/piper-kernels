@@ -2,7 +2,7 @@
 
 Operator benchmarks live here rather than in the correctness test suite. Each benchmark
 reports hardware, software, Git state, shapes, kernel configuration, numerical quality,
-and consistently named timing phases. The support code in `_lib/` is development-only;
+and consistently named timing phases. The support code in `lib/` is development-only;
 it is not part of the installed `piper_kernels` API.
 
 ## Common provider and timing model
@@ -126,16 +126,37 @@ Use `--help` to select activation rows, weight dimensions, group size, dtype,
 deterministic input seed, and timing windows. The script verifies exact agreement before
 reporting Triton and reference timings.
 
-Run the stock-Triton signed or affine-proxy integer P x V microbenchmark with:
+Run the stock-Triton integer P x V microbenchmark with:
 
 ```shell
 uv run python benchmarks/benchmark_integer_pv_dot.py s8-s8
+uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-native
 uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-affine-proxy
 ```
 
-The optional `u8-s8-native` variant requires a Triton compiler and target with
-mixed-sign UINT8 x INT8 dot support. The benchmark records the LHS, RHS, and accumulator
-dtypes explicitly, checks exact INT32 output, and records operand saturation.
+The `u8-s8-native` variant uses Piper's stock-Triton compiler extension to emit native
+`UINT8 x INT8 -> INT32` MMAv2. The extension is packaged in the normal Python wheel and
+requires no patched Triton, CUDA extension, native build, or executable inline PTX. It is tested
+with Triton 3.7.1 and validates its compiler hook and generated MMA fail-closed, allowing newer
+Triton versions only while the same lowering remains compatible.
+
+Native mixed-sign lowering currently requires NVIDIA compute capability 8.0 or newer and the
+`m16n8k32` MMAv2 path. Turing, Hopper WGMMA, and ROCm mixed-sign lowering are not supported by
+this extension. The native benchmark installs the hook automatically before JIT compilation;
+production native-UINT8 launchers use the same selection-time installation. Unsupported targets
+should select the exact affine signed-INT8 proxy instead. The benchmark records the LHS, RHS, and
+accumulator dtypes explicitly, checks exact INT32 output including UINT8 values above 127, and
+records operand saturation.
+
+Inspect the generated mixed-sign MMA while verifying exact output with:
+
+```shell
+uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-native \
+  --compiler-report --no-sass
+```
+
+The PTX report contains `mma.sync.aligned.m16n8k32...s32.u8.s8.s32`. Add SASS inspection when
+`nvdisasm` is available to verify the corresponding native `U8.S8` machine instruction.
 Backend-specific PTX, SASS, and AMDGCN inspection belongs to compiler/profiling tooling
 rather than this portable benchmark runner.
 
@@ -174,11 +195,11 @@ portable resource report and available compiler IR are needed, or use
 reporting uses the same provider and specialization model, while AMDGCN disassembly
 remains a separate future backend adapter.
 
-All Triton-cache and compiled-metadata access lives in `_lib/triton_inspection.py`.
+All Triton-cache and compiled-metadata access lives in `lib/triton_inspection.py`.
 Specialized diagnostics can read an artifact without depending on Triton internals:
 
 ```python
-from _lib.triton_inspection import compiled_artifact
+from lib.triton_inspection import compiled_artifact
 
 ttgir = compiled_artifact(jit_kernel, "ttgir")
 ```
