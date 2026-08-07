@@ -453,13 +453,7 @@ def _optional_integer(value: object, name: str) -> int | None:
 
 
 def _assembly_mapping(compiled_kernel: object) -> Mapping[str, object]:
-    assembly = _required_attribute(compiled_kernel, "asm", Mapping)
-    if not isinstance(assembly, Mapping):
-        raise TritonCompatibilityError(
-            "the compiled Triton kernel asm field is not a mapping; "
-            "the inspection adapter may need updating"
-        )
-    return assembly
+    return _required_attribute(compiled_kernel, "asm", Mapping)
 
 
 def _inspect_specialization(
