@@ -103,6 +103,19 @@ def test_output_arguments_are_optional_and_mutually_exclusive(tmp_path: Path) ->
     )
 
 
+def test_output_arguments_support_namespaced_record_types(tmp_path: Path) -> None:
+    parser = argparse.ArgumentParser()
+    add_output_arguments(parser, option_prefix="compiler", record_name="compiler report")
+    path = tmp_path / "compiler.jsonl"
+
+    arguments = parser.parse_args(["--compiler-jsonl", str(path)])
+
+    assert output_target(arguments, option_prefix="compiler") == OutputTarget(
+        path,
+        OutputFormat.JSONL,
+    )
+
+
 def test_environment_capture_does_not_require_cuda(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
 
