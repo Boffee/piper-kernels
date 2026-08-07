@@ -1,8 +1,7 @@
 """Benchmark native U8 x S8 MMA against signed and affine S8 baselines.
 
-The ``native`` mode requires a Triton compiler with mixed-sign integer-dot
-support.  Stock Triton can run ``signed`` and ``affine``.  The affine kernel
-models the exact UINT8 identity used by the attention experiment: its
+The ``native`` mode uses Piper's stock-Triton compiler extension. The affine
+kernel models the exact UINT8 identity used by the attention experiment: its
 precomputed ``128 * sum(B)`` correction is loaded as the integer MMA
 accumulator.
 """
@@ -20,6 +19,11 @@ import torch
 import triton
 import triton.language as tl
 import triton.testing
+
+from piper_kernels._triton.mixed_int8 import (
+    enable_uint8_int8_dot,
+    uint8_int8_dot,
+)
 
 
 @triton.jit
@@ -54,6 +58,8 @@ def _dot_kernel(
         correction = tl.load(correction_ptr + tile * block_n + offsets_n)
         accumulator = tl.zeros((block_m, block_n), tl.int32) + correction[None, :]
         result = tl.dot(a, b, accumulator, out_dtype=tl.int32)
+    elif mode == "native":
+        result = uint8_int8_dot(a, b)
     else:
         result = tl.dot(a, b, out_dtype=tl.int32)
     tl.store(
@@ -110,6 +116,8 @@ def _mma_instructions() -> tuple[list[str], list[str]]:
 @torch.inference_mode()
 def _main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    if args.mode == "native":
+        enable_uint8_int8_dot()
     device = torch.device("cuda")
     shape_a = (args.tiles, args.block_m, args.block_k)
     shape_b = (args.tiles, args.block_k, args.block_n)

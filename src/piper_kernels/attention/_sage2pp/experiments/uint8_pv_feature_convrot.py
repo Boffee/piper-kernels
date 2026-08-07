@@ -50,6 +50,10 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from piper_kernels._triton.mixed_int8 import (
+    enable_uint8_int8_dot,
+    uint8_int8_dot,
+)
 from piper_kernels.attention._convrot_triton import rotate_rows_in_registers
 from piper_kernels.attention._sage2pp.backends import triton as _sage_backend
 from piper_kernels.attention._sage2pp.experiments.uint4_pv_convrot import (
@@ -1055,10 +1059,9 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 (block_n, 16),
             )
             if native_uint8_mma:
-                denominator_partial = tl.dot(
+                denominator_partial = uint8_int8_dot(
                     probability_operand,
                     inverse_scale_matrix,
-                    out_dtype=tl.int32,
                 )
             elif affine_probability:
                 denominator_correction = _P_ZERO_POINT * tl.sum(
@@ -1149,20 +1152,18 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 )
             if native_uint8_mma:
                 if immediate_k32_pv_conversion:
-                    partial_low0 = tl.dot(
+                    partial_low0 = uint8_int8_dot(
                         probability_operand0,
                         value_low0,
-                        out_dtype=tl.int32,
                     )
                     accumulator_low += (
                         partial_low0.to(tl.float32)
                         * probability_output_scale[:, None]
                         * current_weight[:, None]
                     )
-                    partial_low1 = tl.dot(
+                    partial_low1 = uint8_int8_dot(
                         probability_operand1,
                         value_low1,
-                        out_dtype=tl.int32,
                     )
                     accumulator_low += (
                         partial_low1.to(tl.float32)
@@ -1170,17 +1171,15 @@ def _uint8_pv_feature_convrot_attention_kernel(
                         * current_weight[:, None]
                     )
                 elif lazy_int32_exponent_recurrence or predot_exponent_alignment:
-                    accumulator_low = tl.dot(
+                    accumulator_low = uint8_int8_dot(
                         probability_operand,
                         value_low,
                         accumulator_low,
-                        out_dtype=tl.int32,
                     )
                 else:
-                    partial_low = tl.dot(
+                    partial_low = uint8_int8_dot(
                         probability_operand,
                         value_low,
-                        out_dtype=tl.int32,
                     )
             elif affine_probability:
                 if scaled_fp16_correction:
@@ -1335,20 +1334,18 @@ def _uint8_pv_feature_convrot_attention_kernel(
                 )
             if native_uint8_mma:
                 if immediate_k32_pv_conversion:
-                    partial_high0 = tl.dot(
+                    partial_high0 = uint8_int8_dot(
                         probability_operand0,
                         value_high0,
-                        out_dtype=tl.int32,
                     )
                     accumulator_high += (
                         partial_high0.to(tl.float32)
                         * probability_output_scale[:, None]
                         * current_weight[:, None]
                     )
-                    partial_high1 = tl.dot(
+                    partial_high1 = uint8_int8_dot(
                         probability_operand1,
                         value_high1,
-                        out_dtype=tl.int32,
                     )
                     accumulator_high += (
                         partial_high1.to(tl.float32)
@@ -1356,17 +1353,15 @@ def _uint8_pv_feature_convrot_attention_kernel(
                         * current_weight[:, None]
                     )
                 elif lazy_int32_exponent_recurrence or predot_exponent_alignment:
-                    accumulator_high = tl.dot(
+                    accumulator_high = uint8_int8_dot(
                         probability_operand,
                         value_high,
                         accumulator_high,
-                        out_dtype=tl.int32,
                     )
                 else:
-                    partial_high = tl.dot(
+                    partial_high = uint8_int8_dot(
                         probability_operand,
                         value_high,
-                        out_dtype=tl.int32,
                     )
             elif affine_probability:
                 if scaled_fp16_correction:
@@ -1490,17 +1485,15 @@ def _uint8_pv_feature_convrot_attention_kernel(
                     or lazy_int32_exponent_recurrence
                     or predot_exponent_alignment
                 ):
-                    corrected_int32 = tl.dot(
+                    corrected_int32 = uint8_int8_dot(
                         probability_operand,
                         value,
                         accumulator,
-                        out_dtype=tl.int32,
                     )
                 else:
-                    corrected_int32 = tl.dot(
+                    corrected_int32 = uint8_int8_dot(
                         probability_operand,
                         value,
-                        out_dtype=tl.int32,
                     )
             elif affine_probability:
                 correction_accumulator = (
@@ -1888,8 +1881,8 @@ def _uint8_pv_scale_forward_bulk_tail_tile(
     value_high = value_ptr.load([batch_head, head_dim // 2, start_n]).reshape(
         (head_dim // 2, block_n)
     ).T
-    partial_low = tl.dot(probability_codes, value_low, out_dtype=tl.int32)
-    partial_high = tl.dot(probability_codes, value_high, out_dtype=tl.int32)
+    partial_low = uint8_int8_dot(probability_codes, value_low)
+    partial_high = uint8_int8_dot(probability_codes, value_high)
     output_scale: tl.constexpr = 1.0 / _P_UINT8_RANGE
     accumulator_low += (
         partial_low.to(tl.float32)
@@ -2019,6 +2012,7 @@ def _launch_uint8_pv_scale_forward_bulk_tail_attention(
     maxnreg: int | None = 168,
 ) -> torch.Tensor:
     """Launch the profiler-only selected recurrence over complete query blocks."""
+    enable_uint8_int8_dot()
     query, key, value, query_scale, key_scale, value_scale, value_log_scale, *_ = prepared
     batch, heads, _, head_dim = query.shape
     if (
@@ -2330,6 +2324,8 @@ def _launch_uint8_pv_feature_convrot_attention(
     center_value: bool = False,
 ) -> torch.Tensor:
     """Launch prequantized attention followed by its feature inverse rotation."""
+    if native_uint8_mma:
+        enable_uint8_int8_dot()
     (
         query,
         key,

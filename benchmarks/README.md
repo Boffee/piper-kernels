@@ -122,12 +122,12 @@ comparison uses prequantized inputs; E2E includes smoothing and Q/K/V quantizati
 pure-Triton fixed-INT8 path is therefore within 2.4% of canonical SA2 hot and within 1.4% E2E on
 all three long contexts tested.
 
-The fixed-scale kernel also has an opt-in native-UINT8 probability specialization for the pinned
-mixed-sign Triton compiler patch described below. It maps nonnegative P to all 256 UINT8 codes and
-uses native U8-by-S8 PV MMA, while QK remains signed S8-by-S8. Compared with signed P, generated
-SM120 SASS drops 64 static `LOP3` instructions (118 to 54) without changing the 255-register,
-28-spill D64 schedule. A random BF16 B1/H24/N4096/D128 comparison against exact SDPA improved
-SQNR from 29.39 dB to 33.33 dB because P gains one bit of resolution.
+The fixed-scale kernel also has an opt-in native-UINT8 probability specialization through Piper's
+stock-Triton compiler extension. It maps nonnegative P to all 256 UINT8 codes and uses native
+U8-by-S8 PV MMA, while QK remains signed S8-by-S8. Compared with signed P, generated SM120 SASS
+drops 64 static `LOP3` instructions (118 to 54) without changing the 255-register, 28-spill D64
+schedule. A random BF16 B1/H24/N4096/D128 comparison against exact SDPA improved SQNR from 29.39
+dB to 33.33 dB because P gains one bit of resolution.
 
 Same-process reversed-order measurements against Triton Sage2++ show a long-context crossover:
 
@@ -138,14 +138,14 @@ Same-process reversed-order measurements against Triton Sage2++ show a long-cont
 | 131072 | 386.7416 | 384.0799 | -0.69% | 390.1706 | 386.0661 | -1.05% |
 
 Thus fixed integer PV can slightly beat pure-Triton Sage2++ in the 64K-128K video-generation
-regime, but not at 32K or below on this RTX 5090. This path remains experimental because released
-Triton 3.7.1 does not expose mixed-sign integer dot; the compiler patch is pure Triton/compiler
-work and adds no CUDA kernel or inline PTX. Reproduce the complete comparison after installing the
-patch with:
+regime, but not at 32K or below on this RTX 5090. Triton's public `tl.dot` API still does not
+expose mixed-sign integer dot, but Piper now supplies the missing lowering as a Python compiler
+extension. It adds no CUDA kernel or executable inline PTX and is enabled automatically by
+native-UINT8 attention launchers. Reproduce the complete comparison with the stock project
+environment:
 
 ```shell
-PYTHONPATH=/tmp/piper-triton-mixed uv run python \
-  benchmarks/benchmark_sage_int8_pv.py \
+uv run python benchmarks/benchmark_sage_int8_pv.py \
   --sequence 32768 65536 131072 --native-uint8-mma \
   --warmup-ms 300 --repeat-ms 1500
 ```
@@ -296,41 +296,36 @@ The signed-probability option uses codes `[0, 127]`, removes the affine correcti
 metadata, and keeps the same per-key log recurrence. On SM120 D128 it enables the lower-spill
 M128 tensor-descriptor schedule; the tradeoff is one fewer bit of probability precision.
 
-Test native mixed-sign integer MMA with the pinned Triton 3.7.1 compiler patch:
+Test native mixed-sign integer MMA with stock Triton 3.7 or newer:
 
 ```shell
-git clone --depth 1 --branch v3.7.1 \
-  https://github.com/triton-lang/triton.git /tmp/piper-triton-src
-git -C /tmp/piper-triton-src apply \
-  "$PWD/benchmarks/patches/triton-3.7.1-mixed-int8-dot.patch"
-
-TRITON_HOME=/tmp/piper-triton-build-cache MAX_JOBS=24 \
-  uv build --python "$PWD/.venv/bin/python" --wheel \
-  --out-dir /tmp/piper-triton-dist /tmp/piper-triton-src
-uv pip install --python "$PWD/.venv/bin/python" --no-deps \
-  --target /tmp/piper-triton-mixed /tmp/piper-triton-dist/*.whl
-
-PYTHONPATH=/tmp/piper-triton-mixed uv run python \
-  benchmarks/benchmark_mixed_int8_dot.py native
-PYTHONPATH=/tmp/piper-triton-mixed uv run python \
-  benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
+uv run python benchmarks/benchmark_mixed_int8_dot.py native
+uv run python benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
   --sequence 4096 --scale-axes key --rotations 0 \
   --probability-scale-modes log --value-scale-floors 0 \
   --native-uint8-mma
 ```
 
-The patch carries each integer dot operand's signedness through Triton IR and the
-`AccelerateMatmul` rewrite, then selects the corresponding MMAv2 PTX opcode. It is intentionally
-limited to the MMA path used by consumer Ada and Blackwell; it does not add mixed-sign WGMMA for
-Hopper. The direct benchmark checks exact output and reports the emitted SASS. The attention
-benchmark keeps signed INT8 QK while using native UINT8-by-INT8 PV, so a correct SM120 build
-reports both `IMMA.16832.S8.S8.SAT` and `IMMA.16832.U8.S8.SAT` in the fixed-schedule profiler.
+The extension lets Triton perform its ordinary signed-INT8 layout, scheduling, and LLVM lowering.
+It marks only requested dots, changes their exact MMAv2 accumulator chains from S8-by-S8 to
+U8-by-S8 at the compiler's LLVM stage, and removes the markers before PTX generation. A missing
+hook therefore fails compilation instead of silently running signed arithmetic, and the marker
+adds no device instruction. This is intentionally limited to the MMAv2 path used by consumer Ada
+and Blackwell; it does not add mixed-sign WGMMA for Hopper. The direct benchmark checks exact
+output and reports the emitted SASS. The attention benchmark keeps signed INT8 QK while using
+native UINT8-by-INT8 PV, so a correct SM120 build reports both `IMMA.16832.S8.S8.SAT` and
+`IMMA.16832.U8.S8.SAT` in the fixed-schedule profiler.
+
+The extension was also checked against the former full Triton compiler patch. On RTX 5090, the
+standalone 2048-tile M64/N128/K64 dot measured 0.06457 ms through the extension versus 0.06443 ms
+through the patch. The production-shaped key-scaled attention measured 1.7351 versus 1.7368 ms at
+N=8192 and 26.2157 versus 26.2758 ms at N=32768. These sub-0.3% differences are measurement noise:
+the lighter stock-Triton path retains the patched compiler's hot performance.
 
 Evaluate the exact D128 PV computation as two sequential D64 output-feature slices with:
 
 ```shell
-PYTHONPATH=/tmp/piper-triton-mixed uv run python \
-  benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
+uv run python benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
   --sequence 512 1024 2048 4096 8192 --scale-axes key --rotations 0 \
   --probability-scale-modes log --value-scale-floors 0 \
   --native-uint8-mma --split-pv-head-dim
@@ -551,8 +546,7 @@ not improve CTA residency. These remain research ablations rather than productio
 Keep the PV numerator in INT32 across the online-softmax loop with:
 
 ```shell
-PYTHONPATH=/tmp/piper-triton-mixed uv run python \
-  benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
+uv run python benchmarks/benchmark_sage_uint8_pv_feature_convrot.py \
   --sequence 4096 --scale-axes key --rotations 0 \
   --probability-scale-modes log --value-scale-floors 0 \
   --native-uint8-mma --integer-output-recurrence
@@ -568,8 +562,7 @@ but the separate partial increases register pressure and is currently slower tha
 The raw conversion overhead can be isolated without changing operands or MMA count using:
 
 ```shell
-PYTHONPATH=/tmp/piper-triton-mixed uv run python \
-  benchmarks/profile_int8_pv_conversion.py --sequence 4096 8192
+uv run python benchmarks/profile_int8_pv_conversion.py --sequence 4096 8192
 ```
 
 This bounded PV-only control compares converting every K64 INT32 partial into an FP32 accumulator
@@ -878,8 +871,7 @@ The recurrence boundary can be isolated from input preparation and unrelated att
 with:
 
 ```shell
-PYTHONPATH=/tmp/piper-triton-mixed:$PYTHONPATH uv run python \
-  benchmarks/profile_int8_pv_recurrence.py attention-local \
+uv run python benchmarks/profile_int8_pv_recurrence.py attention-local \
   --sequence 32768 --probability-dtype int8
 ```
 
@@ -914,7 +906,7 @@ form versus 2.5816/2.5870 ms for the shared form at N=8192, and 38.8016/38.8267 
 without the expensive accumulator-fragment selection and remains a profiler-only negative
 control.
 
-The compiler boundary is not specific to the pinned Triton 3.7.1 build. Triton main at commit
+The compiler boundary is not specific to the stock Triton 3.7.1 build. Triton main at commit
 `707fc2ca` (reported as 3.8.0) measured 37.3755/38.6573 ms for running/local coordinates at 32K,
 still a 3.43% penalty. It changed register allocation slightly but did not introduce an
 output-scaled INT8 MMA or a cheaper row-wise merge.

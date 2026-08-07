@@ -533,7 +533,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--native-uint8-mma",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="use native UINT8 x INT8 MMA; requires a mixed-sign Triton compiler",
+        help="use native UINT8 x INT8 MMA through Piper's stock-Triton extension",
     )
     parser.add_argument(
         "--integer-output-recurrence",

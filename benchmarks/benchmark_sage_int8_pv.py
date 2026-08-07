@@ -389,7 +389,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--native-uint8-mma",
         action="store_true",
-        help="also benchmark fixed native UINT8-P x INT8-V; requires the mixed-sign Triton patch",
+        help="also benchmark fixed native UINT8-P x INT8-V via Piper's stock-Triton extension",
     )
     return parser.parse_args(argv)
 

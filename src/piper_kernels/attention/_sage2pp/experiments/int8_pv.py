@@ -11,7 +11,7 @@ signed-INT8 V. Their tensor-core dot accumulates in INT32 before the FP32 online
 recurrence. The fixed-scale control factors all PV scales out of the loop; the
 block-scaled path pays one partial-output rescale per tile to retain quality.
 The fixed-scale path can optionally use native UINT8 ``P`` codes ``[0, 255]``
-with the benchmark compiler patch, retaining signed-INT8 V.
+through Piper's stock-Triton compiler extension, retaining signed-INT8 V.
 """
 
 # ruff: noqa: ANN001, ANN202, PLR0912, PLR0913, PLR0915, PLR0917
@@ -27,6 +27,10 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from piper_kernels._triton.mixed_int8 import (
+    enable_uint8_int8_dot,
+    uint8_int8_dot,
+)
 from piper_kernels.attention._convrot_triton import (
     rotate_attention_rows,
     rotate_rows_in_registers,
@@ -736,7 +740,10 @@ def _int8_pv_attention_kernel(
                 head_dim=head_dim,
                 block_n=block_n,
             )
-            partial_low = tl.dot(probability_integer, value_low, out_dtype=tl.int32)
+            if native_unsigned_probability:
+                partial_low = uint8_int8_dot(probability_integer, value_low)
+            else:
+                partial_low = tl.dot(probability_integer, value_low, out_dtype=tl.int32)
             if not block_scaled_pv:
                 accumulator_low += partial_low.to(tl.float32)
             value_high = _sage_backend._load_attention_value_subtile(
@@ -756,7 +763,10 @@ def _int8_pv_attention_kernel(
                 head_dim=head_dim,
                 block_n=block_n,
             )
-            partial_high = tl.dot(probability_integer, value_high, out_dtype=tl.int32)
+            if native_unsigned_probability:
+                partial_high = uint8_int8_dot(probability_integer, value_high)
+            else:
+                partial_high = tl.dot(probability_integer, value_high, out_dtype=tl.int32)
             if not block_scaled_pv:
                 accumulator_high += partial_high.to(tl.float32)
         else:
@@ -776,14 +786,27 @@ def _int8_pv_attention_kernel(
                 block_n,
             )
             if integer_pv_recurrence or raw_integer_pv_recurrence:
-                accumulator = tl.dot(
+                if native_unsigned_probability:
+                    accumulator = uint8_int8_dot(
+                        probability_integer,
+                        value,
+                        accumulator,
+                    )
+                else:
+                    accumulator = tl.dot(
+                        probability_integer,
+                        value,
+                        accumulator,
+                        out_dtype=tl.int32,
+                    )
+            elif native_unsigned_probability:
+                partial_int32 = uint8_int8_dot(probability_integer, value)
+            else:
+                partial_int32 = tl.dot(
                     probability_integer,
                     value,
-                    accumulator,
                     out_dtype=tl.int32,
                 )
-            else:
-                partial_int32 = tl.dot(probability_integer, value, out_dtype=tl.int32)
         if block_scaled_pv:
             value_scale_block = (batch * heads + head) * tl.cdiv(
                 key_length, block_n
@@ -1013,7 +1036,7 @@ def _uint8_k32_feature_pv_attention_kernel(
         value_low0 = value_ptr.load([batch_head, 0, start_n]).reshape(
             (half_head_dim, block_n // 2)
         ).T
-        partial_low0 = tl.dot(probability0, value_low0, out_dtype=tl.int32)
+        partial_low0 = uint8_int8_dot(probability0, value_low0)
         scale_low0 = tl.load(value_scale_ptr + scale_base0 + offsets_vd)
         accumulator_low += (
             partial_low0.to(tl.float32)
@@ -1023,7 +1046,7 @@ def _uint8_k32_feature_pv_attention_kernel(
         value_low1 = value_ptr.load(
             [batch_head, 0, start_n + block_n // 2]
         ).reshape((half_head_dim, block_n // 2)).T
-        partial_low1 = tl.dot(probability1, value_low1, out_dtype=tl.int32)
+        partial_low1 = uint8_int8_dot(probability1, value_low1)
         scale_low1 = tl.load(value_scale_ptr + scale_base1 + offsets_vd)
         accumulator_low += (
             partial_low1.to(tl.float32)
@@ -1034,7 +1057,7 @@ def _uint8_k32_feature_pv_attention_kernel(
         value_high0 = value_ptr.load(
             [batch_head, half_head_dim, start_n]
         ).reshape((half_head_dim, block_n // 2)).T
-        partial_high0 = tl.dot(probability0, value_high0, out_dtype=tl.int32)
+        partial_high0 = uint8_int8_dot(probability0, value_high0)
         scale_high0 = tl.load(
             value_scale_ptr + scale_base0 + half_head_dim + offsets_vd
         )
@@ -1046,7 +1069,7 @@ def _uint8_k32_feature_pv_attention_kernel(
         value_high1 = value_ptr.load(
             [batch_head, half_head_dim, start_n + block_n // 2]
         ).reshape((half_head_dim, block_n // 2)).T
-        partial_high1 = tl.dot(probability1, value_high1, out_dtype=tl.int32)
+        partial_high1 = uint8_int8_dot(probability1, value_high1)
         scale_high1 = tl.load(
             value_scale_ptr + scale_base1 + half_head_dim + offsets_vd
         )
@@ -1239,7 +1262,7 @@ def _uint8_grouped_output_pv_attention_kernel(
         value_low = value_ptr.load([batch_head, 0, start_n]).reshape(
             (half_head_dim, block_n)
         ).T
-        partial_low = tl.dot(probability_codes, value_low, out_dtype=tl.int32)
+        partial_low = uint8_int8_dot(probability_codes, value_low)
         if integer_output_recurrence:
             safe_block_max = tl.where(valid_queries, block_max, 0.0)
             coefficient_low = safe_block_max[:, None] + compact_scale_low[None, :]
@@ -1318,7 +1341,7 @@ def _uint8_grouped_output_pv_attention_kernel(
         value_high = value_ptr.load([batch_head, half_head_dim, start_n]).reshape(
             (half_head_dim, block_n)
         ).T
-        partial_high = tl.dot(probability_codes, value_high, out_dtype=tl.int32)
+        partial_high = uint8_int8_dot(probability_codes, value_high)
         if integer_output_recurrence:
             safe_block_max = tl.where(valid_queries, block_max, 0.0)
             coefficient_high = safe_block_max[:, None] + compact_scale_high[None, :]
@@ -1598,7 +1621,7 @@ def _uint8_run_scaled_output_pv_attention_kernel(
         value_low = value_ptr.load([batch_head, 0, start_n]).reshape(
             (half_head_dim, block_n)
         ).T
-        partial_low = tl.dot(probability_codes, value_low, out_dtype=tl.int32)
+        partial_low = uint8_int8_dot(probability_codes, value_low)
         if scaled_fp16_numerator:
             partial_low_scaled_fp16 = (
                 partial_low.to(tl.float32) * (1.0 / 65536.0)
@@ -1628,7 +1651,7 @@ def _uint8_run_scaled_output_pv_attention_kernel(
         value_high = value_ptr.load(
             [batch_head, half_head_dim, start_n]
         ).reshape((half_head_dim, block_n)).T
-        partial_high = tl.dot(probability_codes, value_high, out_dtype=tl.int32)
+        partial_high = uint8_int8_dot(probability_codes, value_high)
         if scaled_fp16_numerator:
             partial_high_scaled_fp16 = (
                 partial_high.to(tl.float32) * (1.0 / 65536.0)
@@ -1898,6 +1921,8 @@ def _launch_int8_pv_attention(
     maxnreg: int | None = None,
 ) -> torch.Tensor:
     query, key, value, query_scale, key_scale, value_scale = prepared
+    if native_unsigned_probability:
+        enable_uint8_int8_dot()
     batch, heads, _, head_dim = query.shape
     if unmasked_self_attention and (
         is_causal
@@ -1983,7 +2008,7 @@ def triton_sage_attention_int8_pv(
     Complete-tile D128 noncausal self-attention uses a predicate-free split-D64
     schedule on consumer Blackwell, including M128 from N=8192.
     Pass an explicit boolean to select the split or unsplit kernel directly.
-    Native UINT8 P requires Triton's mixed-sign integer-dot compiler patch.
+    Native UINT8 P uses Piper's stock-Triton compiler extension.
     """
     if grouped_qk is None:
         grouped_qk = torch.cuda.get_device_capability(query.device)[0] == 12
@@ -2184,6 +2209,7 @@ def _launch_uint8_k32_feature_pv_attention(
     maxnreg: int | None = None,
 ) -> torch.Tensor:
     """Launch the profiler-only native-UINT8 K32 output-scale kernel."""
+    enable_uint8_int8_dot()
     query, key, value, query_scale, key_scale, value_scale = prepared
     batch, heads, _, head_dim = query.shape
     if head_dim != 128 or key_length % 64:
@@ -2486,6 +2512,7 @@ def _launch_uint8_grouped_output_pv_attention(
     maxnreg: int | None = None,
 ) -> torch.Tensor:
     """Launch the profiler-only grouped-output-scale native-UINT8 kernel."""
+    enable_uint8_int8_dot()
     if integer_output_recurrence and not local_probability_codes:
         raise ValueError("INT32 output recurrence requires tile-local probability codes")
     if common_feature_exponent and not integer_output_recurrence:
@@ -2568,6 +2595,7 @@ def _launch_uint8_run_scaled_output_pv_attention(
     maxnreg: int | None = None,
 ) -> torch.Tensor:
     """Launch the sorted-run V-scale amortization kernel."""
+    enable_uint8_int8_dot()
     query, key, value, query_scale, key_scale, value_scale, value_scale_ratio = prepared
     batch, heads, _, head_dim = query.shape
     if unmasked_self_attention and (
