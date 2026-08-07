@@ -1,5 +1,7 @@
 """GPU tests for the pure-Triton SageAttention2++ backend."""
 
+from typing import Literal
+
 import pytest
 import torch
 
@@ -17,6 +19,10 @@ def _consumer_fp8_available() -> bool:
         return False
     capability = torch.cuda.get_device_capability()
     return capability == (8, 9) or capability[0] == 12
+
+
+def _qk_quantization() -> Literal["per_thread", "per_warp"]:
+    return "per_warp" if torch.cuda.get_device_capability()[0] == 12 else "per_thread"
 
 
 pytestmark = [
@@ -49,15 +55,35 @@ def test_triton_matches_quantized_reference(
             value,
             head_dim**-0.5,
             is_causal,
-            qk_quantization=(
-                "per_warp" if torch.cuda.get_device_capability()[0] == 12 else "per_thread"
-            ),
+            qk_quantization=_qk_quantization(),
         )
     error = (actual.float() - expected.float()).abs()
 
     assert actual.shape == query.shape
     assert actual.dtype is dtype
     assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
+
+
+def test_triton_ragged_offset_key_matches_quantized_reference() -> None:
+    torch.manual_seed(431)
+    query = torch.randn(1, 1, 32, 64, device="cuda", dtype=torch.float16)
+    key = 100.0 + torch.randn(1, 1, 17, 64, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+
+    with torch.no_grad():
+        actual = sage_attention_2pp(query, key, value)
+        expected = reference_sage_attention_2pp(
+            query,
+            key,
+            value,
+            64**-0.5,
+            False,
+            qk_quantization=_qk_quantization(),
+        )
+    error = (actual.float() - expected.float()).abs()
+
     assert error.mean().item() < 0.003
     assert error.max().item() < 0.12
 
@@ -121,5 +147,28 @@ def test_triton_runs_under_torch_compile(dtype: torch.dtype) -> None:
     with torch.no_grad():
         expected = sage_attention_2pp(query, key, value)
         actual = torch.compile(sage_attention_2pp, fullgraph=True)(query, key, value)
+
+    assert torch.equal(actual, expected)
+
+
+def test_triton_torch_compile_supports_permuted_batch_head_strides() -> None:
+    torch.manual_seed(451)
+    query_storage = torch.randn(3, 2, 32, 64, device="cuda", dtype=torch.float16)
+    key_storage = torch.randn_like(query_storage)
+    value_storage = torch.randn_like(query_storage)
+    query = query_storage.permute(1, 0, 2, 3)
+    key = key_storage.permute(1, 0, 2, 3)
+    value = value_storage.permute(1, 0, 2, 3)
+
+    def consumer(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return -sage_attention_2pp(query, key, value)
+
+    with torch.no_grad():
+        expected = consumer(query, key, value)
+        actual = torch.compile(consumer, fullgraph=True)(query, key, value)
 
     assert torch.equal(actual, expected)

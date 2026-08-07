@@ -261,7 +261,7 @@ def _quantize_key_per_thread_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    values -= mean[None, :]
+    values = tl.where(mask, values - mean[None, :], 0.0)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
     scale = maximum / 127.0 + _SCALE_EPSILON
     quantized = _round_to_int8(values / scale)
@@ -316,7 +316,7 @@ def _quantize_key_per_block_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    values -= mean[None, :]
+    values = tl.where(mask, values - mean[None, :], 0.0)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
     scale = maximum / 127.0 + _SCALE_EPSILON
     quantized = _round_to_int8(values / scale)
@@ -914,4 +914,4 @@ def _triton_sage_attention_2pp_fake(
     _scale: float,
     _is_causal: bool,
 ) -> torch.Tensor:
-    return torch.empty_like(query)
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
