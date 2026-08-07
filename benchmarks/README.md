@@ -2,7 +2,7 @@
 
 Operator benchmarks live here rather than in the correctness test suite. Each benchmark
 reports hardware, software, Git state, shapes, kernel configuration, numerical quality,
-and consistently named timing phases. The support code in `_lib/` is development-only;
+and consistently named timing phases. The support code in `lib/` is development-only;
 it is not part of the installed `piper_kernels` API.
 
 ## Common provider and timing model
@@ -195,11 +195,11 @@ portable resource report and available compiler IR are needed, or use
 reporting uses the same provider and specialization model, while AMDGCN disassembly
 remains a separate future backend adapter.
 
-All Triton-cache and compiled-metadata access lives in `_lib/triton_inspection.py`.
+All Triton-cache and compiled-metadata access lives in `lib/triton_inspection.py`.
 Specialized diagnostics can read an artifact without depending on Triton internals:
 
 ```python
-from _lib.triton_inspection import compiled_artifact
+from lib.triton_inspection import compiled_artifact
 
 ttgir = compiled_artifact(jit_kernel, "ttgir")
 ```

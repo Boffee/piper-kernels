@@ -1,4 +1,4 @@
-"""Internal backend selection for INT8 ConvRot operators."""
+"""Backend selection for INT8 ConvRot operators."""
 
 import math
 

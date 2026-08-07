@@ -1,6 +1,6 @@
 import pytest
-from _lib.profiling import CudaProfilerController, ProfilePhase, profile_provider
-from _lib.providers import BenchmarkProvider
+from lib.profiling import CudaProfilerController, ProfilePhase, profile_provider
+from lib.providers import BenchmarkProvider
 
 
 class FakeCapture:

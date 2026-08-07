@@ -4,10 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from _lib.environment import EnvironmentInfo
-from _lib.providers import BenchmarkProvider
-from _lib.reporting import OutputFormat, OutputTarget, write_records
-from _lib.triton_inspection import (
+from lib.environment import EnvironmentInfo
+from lib.providers import BenchmarkProvider
+from lib.reporting import OutputFormat, OutputTarget, write_records
+from lib.triton_inspection import (
     DeviceResourceLimits,
     NvdisasmUnavailableError,
     TritonArtifactUnavailableError,
@@ -276,7 +276,7 @@ def test_non_cuda_report_rejects_explicit_sass() -> None:
 
 
 def test_missing_nvdisasm_has_actionable_diagnostic(monkeypatch) -> None:
-    monkeypatch.setattr("_lib.triton_inspection.shutil.which", lambda _name: None)
+    monkeypatch.setattr("lib.triton_inspection.shutil.which", lambda _name: None)
 
     with pytest.raises(NvdisasmUnavailableError, match="disable SASS inspection"):
         find_nvdisasm()

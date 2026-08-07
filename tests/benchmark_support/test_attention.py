@@ -1,5 +1,5 @@
 import pytest
-from _lib.attention import AttentionConfig, AttentionShape
+from lib.attention import AttentionConfig, AttentionShape
 
 
 def test_attention_shape_expands_implicit_kv_heads() -> None:

@@ -1,4 +1,4 @@
-"""Numerical quality and quantizer saturation metrics."""
+"""Numerical quality and quantizer-saturation metrics."""
 
 from __future__ import annotations
 

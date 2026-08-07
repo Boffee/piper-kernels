@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 import triton
 import triton.language as tl
-from _lib import (
+from lib import (
     BenchmarkProvider,
     BenchmarkRecord,
     EnvironmentInfo,

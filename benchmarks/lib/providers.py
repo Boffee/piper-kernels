@@ -1,4 +1,4 @@
-"""Callable benchmark providers with explicit prepare and run phases."""
+"""Benchmark providers with explicit preparation and execution phases."""
 
 from __future__ import annotations
 

@@ -4,10 +4,10 @@ import pytest
 import torch
 
 from piper_kernels.convrot import ConvRotInt8Tensor
-from piper_kernels.convrot._int8.reference import (
+from piper_kernels.convrot._rotation import rotate_groups
+from piper_kernels.convrot.int8.reference import (
     dynamic_quantize_rows,
 )
-from piper_kernels.convrot._rotation import rotate_groups
 
 
 def test_cpu_linear_matches_explicit_w8a8_reference() -> None:

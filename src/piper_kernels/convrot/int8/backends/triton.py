@@ -1,4 +1,4 @@
-"""Triton backend for rotated INT8 W8A8 linear layers."""
+"""Triton implementation of rotated INT8 W8A8 linear layers."""
 
 # Triton's JIT launcher accepts compile-time options not represented in its
 # Python call signature.

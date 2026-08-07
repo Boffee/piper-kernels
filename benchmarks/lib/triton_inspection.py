@@ -1,4 +1,4 @@
-"""Triton compiler-resource and NVIDIA assembly inspection.
+"""Triton compiler-resource and accelerator assembly inspection.
 
 This module is the sole compatibility boundary around Triton's compiled-kernel
 caches and metadata.  Callers should register JIT functions on a

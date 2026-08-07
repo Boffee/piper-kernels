@@ -1,4 +1,4 @@
-"""Tests for Piper's stock-Triton mixed-sign integer-dot lowering."""
+"""Tests for stock-Triton mixed-sign integer-dot lowering."""
 
 from types import SimpleNamespace
 
@@ -6,7 +6,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from _lib.triton_inspection import compiled_artifact
+from lib.triton_inspection import compiled_artifact
 
 from piper_kernels._triton import mixed_int8
 from piper_kernels._triton.mixed_int8 import (

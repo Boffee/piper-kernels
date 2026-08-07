@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from _lib import (
+from lib import (
     BenchmarkProvider,
     BenchmarkRecord,
     ProviderMeasurement,
@@ -20,7 +20,7 @@ from _lib import (
 )
 
 from piper_kernels.convrot import ConvRotInt8Tensor
-from piper_kernels.convrot._int8.reference import reference_linear
+from piper_kernels.convrot.int8.reference import reference_linear
 
 
 @dataclass(slots=True, frozen=True)

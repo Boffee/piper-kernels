@@ -1,12 +1,12 @@
 import pytest
 import torch
-from _lib.profiling import ProfilePhase
 from benchmark_integer_pv_dot import (
     _benchmark_output,
     _configure_variant_runtime,
     _parse_args,
     _reference_output,
 )
+from lib.profiling import ProfilePhase
 
 
 def test_reference_output_validates_every_tile() -> None:

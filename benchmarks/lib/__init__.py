@@ -1,4 +1,4 @@
-"""Reusable support for piper-kernels development benchmarks."""
+"""Reusable library for piper-kernels development benchmarks."""
 
 from .attention import AttentionConfig, AttentionShape
 from .environment import EnvironmentInfo, capture_environment
