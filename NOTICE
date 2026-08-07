@@ -2,3 +2,12 @@ Piper Kernels
 Copyright 2026 Piper Kernels contributors
 
 This product includes software developed by Piper Kernels contributors.
+
+The SageAttention2++ algorithm and naming originate from the SageAttention project:
+Copyright (c) 2024 SageAttention team.
+Copyright 2024 Jintao Zhang, Haofeng Huang.
+Licensed under the Apache License, Version 2.0.
+https://github.com/thu-ml/SageAttention
+
+Piper Kernels provides an independently maintained pure-Triton backend and is not the
+official SageAttention distribution.

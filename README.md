@@ -9,12 +9,12 @@ The package owns operator semantics, portable PyTorch references, tensor subclas
 and optimized backends. It deliberately does not know about model repositories,
 checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
-## Planned operators
+## Operators
 
 | Package | Role |
 |---|---|
 | `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
-| `piper_kernels.attention` | Attention operators, including a future SageAttention backend |
+| `piper_kernels.attention` | Canonical SageAttention2++ 8+8 forward attention |
 
 ## ConvRot INT8
 
@@ -42,8 +42,37 @@ This is an inference operation and does not support autograd.
 
 The operator selects its Triton implementation on supported CUDA devices and otherwise
 uses the portable PyTorch reference. Install the tensor format and optimized backend with
-`piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, so
-future attention-only consumers do not inherit quantization-specific dependencies.
+`piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, and
+attention-only consumers do not inherit the TorchAO dependency.
+
+## SageAttention2++
+
+The attention package provides an independently written, pure-Triton backend for the
+canonical [SageAttention2++](https://github.com/thu-ml/SageAttention) 8+8 algorithm:
+
+```python
+from piper_kernels.attention import sage_attention_2pp
+
+output = sage_attention_2pp(query, key, value, is_causal=False)
+```
+
+Inputs use `[batch, heads, sequence, head_dim]` layout and may be FP16 or BF16. The
+optimized backend targets RTX 40-series SM89 and RTX 50-series SM12x GPUs. It supports
+head dimensions 64 and 128, equal query/KV head counts, arbitrary positive sequence
+lengths, rectangular non-causal attention, strided sequence dimensions, and
+`torch.compile`. It is inference-only and does not support autograd.
+
+This is SageAttention2++, not a Piper-specific attention algorithm: K is smoothed, Q/K
+are quantized to INT8 with the canonical architecture-specific granularity, V and the
+online-softmax probabilities are quantized to E4M3, each 64-key P x V tile accumulates
+in FP16, and tile results are buffered in FP32. All optimized device code is Triton;
+the package contains no CUDA extension or inline PTX. Unsupported devices use the slow
+portable quantized reference.
+
+Install the optimized backend with `piper-kernels[triton]`. The official CUDA
+SageAttention package is a revision-pinned, optional benchmark dependency only; it is
+not imported by production code. See [benchmarks/README.md](benchmarks/README.md) for
+the reproducible provider comparison.
 
 ## Dependency direction
 

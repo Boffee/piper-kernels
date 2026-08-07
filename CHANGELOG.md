@@ -7,6 +7,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Pure-Triton canonical SageAttention2++ 8+8 forward inference for SM89 and SM12x,
+  including a portable quantized reference, explicit `sage_attention_2pp` API,
+  `torch.compile` support, and revision-pinned canonical CUDA benchmarks.
 - Reusable Triton specialization, resource, PTX/SASS, and profiler-capture tooling for
   development benchmarks, with versioned compiler-report JSON and JSONL output.
 - Stock-Triton native `UINT8 x INT8 -> INT32` support on NVIDIA compute capability 8.0 and
