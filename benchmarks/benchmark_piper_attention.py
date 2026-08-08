@@ -1,8 +1,9 @@
-"""Benchmark canonical SageAttention2++ providers and PyTorch SDPA.
+"""Benchmark Piper Attention against SageAttention2++, SDPA, and controls.
 
-The pure-Triton provider is the production implementation in this package.
-Canonical CUDA SageAttention2 and SageAttention2++ are optional, revision-pinned
-benchmark dependencies; they are never imported by the installed package.
+Piper providers separate integer preprocessing from the fused attention launch,
+so ``prepared_execution`` is the hot recurrence while ``operator_end_to_end``
+includes K/V means, optional row ordering, quantization, and the mean-restoring
+epilogue. Sage and SDPA providers retain their ordinary operator boundary.
 """
 
 from __future__ import annotations
@@ -35,21 +36,41 @@ from lib import (
     write_records,
 )
 
-from piper_kernels._triton.targets import supports_fp8_fp16_mma
+from piper_kernels._triton.targets import (
+    supports_fp8_fp16_mma,
+    supports_uint8_int8_mma,
+)
 from piper_kernels.attention import sage_attention_2pp
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_backend
-from piper_kernels.attention.sage2pp import triton as triton_backend
+from piper_kernels.attention.piper import triton as piper_backend
+from piper_kernels.attention.piper.dispatch import _default_center_value
 
 _CANONICAL_VERSION = "2.2.0"
 _CANONICAL_REVISION = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
-_PURE_TRITON = "pure-triton-sage2pp"
+_PIPER = "piper"
+_PIPER_CENTERED = "piper-centered"
+_PIPER_UNCENTERED = "piper-uncentered"
+_PIPER_AFFINE = "piper-affine"
+_PURE_TRITON_SAGE2PP = "pure-triton-sage2pp"
 _SDPA = "pytorch-sdpa"
 _CANONICAL_SAGE2PP = "canonical-cuda-sage2pp"
 _CANONICAL_SAGE2 = "canonical-cuda-sage2"
-_PROVIDER_NAMES = (_PURE_TRITON, _SDPA, _CANONICAL_SAGE2PP, _CANONICAL_SAGE2)
+_PROVIDER_NAMES = (
+    _PIPER,
+    _PIPER_CENTERED,
+    _PIPER_UNCENTERED,
+    _PIPER_AFFINE,
+    _PURE_TRITON_SAGE2PP,
+    _SDPA,
+    _CANONICAL_SAGE2PP,
+    _CANONICAL_SAGE2,
+)
+_PIPER_PROVIDERS = (_PIPER, _PIPER_CENTERED, _PIPER_UNCENTERED, _PIPER_AFFINE)
+_FP8_SAGE_PROVIDERS = (_PURE_TRITON_SAGE2PP, _CANONICAL_SAGE2PP, _CANONICAL_SAGE2)
 
 type AttentionInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type CanonicalSage = Callable[..., torch.Tensor]
+type AttentionProvider = BenchmarkProvider[object, torch.Tensor]
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -89,11 +110,19 @@ def _sdpa(
     )
 
 
-def _triton_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
+def _piper_jit_functions(
+    capability: tuple[int, int],
+    *,
+    sort_value_rows: bool,
+) -> dict[str, object]:
     qk_kernels = (
         {
             "quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel,
-            "quantize-key-per-block": qk_backend.quantize_key_per_block_kernel,
+            "quantize-key-per-block": (
+                piper_backend._quantize_ordered_key_per_block_kernel
+                if sort_value_rows
+                else qk_backend.quantize_key_per_block_kernel
+            ),
         }
         if capability[0] == 12
         else {
@@ -101,13 +130,77 @@ def _triton_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
             "quantize-key-per-thread": qk_backend.quantize_key_per_thread_kernel,
         }
     )
-    return {
-        "kv-statistics-partial": triton_backend._kv_statistics_partial_kernel,
-        "kv-statistics-finish": triton_backend._finish_kv_statistics_kernel,
+    kernels = {
+        "kv-mean-partial": piper_backend._kv_mean_partial_kernel,
+        "kv-mean-finish": piper_backend._kv_mean_finalize_kernel,
         **qk_kernels,
-        "quantize-value-per-channel": triton_backend._quantize_value_kernel,
-        "attention": triton_backend._sage_attention_2pp_kernel,
+        "quantize-value-per-key": piper_backend._quantize_value_per_key_kernel,
+        "attention": piper_backend._piper_attention_kernel,
     }
+    if sort_value_rows:
+        kernels["centered-value-row-range"] = piper_backend._centered_value_row_range_kernel
+    return kernels
+
+
+def _make_piper_provider(
+    name: str,
+    inputs: AttentionInputs,
+    *,
+    config: AttentionConfig,
+    capability: tuple[int, int],
+    center_value: bool,
+    native_uint8: bool,
+) -> AttentionProvider:
+    query, key, value = inputs
+    scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
+    sort_value_rows = piper_backend._should_sort_value_rows(
+        center_value=center_value,
+        capability=capability,
+        nvidia_cuda=True,
+        is_causal=config.is_causal,
+        head_dim=query.shape[-1],
+        key_length=key.shape[2],
+    )
+
+    def prepare() -> object:
+        return piper_backend._prepare_piper_attention(
+            query,
+            key,
+            value,
+            scale,
+            config.is_causal,
+            center_value,
+            native_uint8=native_uint8,
+            sort_value_rows=sort_value_rows,
+        )
+
+    def run(prepared: object) -> torch.Tensor:
+        return piper_backend._launch_piper_attention(
+            cast(piper_backend._PreparedPiperAttention, prepared)
+        )
+
+    return BenchmarkProvider(
+        name=name,
+        prepare=prepare,
+        run=run,
+        synchronize=torch.cuda.synchronize,
+        configuration={
+            **config.as_dict(),
+            "implementation": "pure_triton",
+            "algorithm": "piper_attention",
+            "qk_quantization": _canonical_qk_granularity(capability),
+            "probability_dtype": "uint8",
+            "value_dtype": "int8",
+            "value_scale": "per_key",
+            "center_value": center_value,
+            "value_row_order": "centered_range_ascending" if sort_value_rows else "original",
+            "mixed_sign_mma": "native" if native_uint8 else "affine_proxy",
+        },
+        triton_jit_functions=_piper_jit_functions(
+            capability,
+            sort_value_rows=sort_value_rows,
+        ),
+    )
 
 
 def _make_providers(
@@ -116,88 +209,101 @@ def _make_providers(
     provider_names: Sequence[str],
     config: AttentionConfig,
     capability: tuple[int, int],
-) -> dict[str, BenchmarkProvider[AttentionInputs, torch.Tensor]]:
-    canonical = (
-        _load_canonical(capability)
-        if _CANONICAL_SAGE2PP in provider_names or _CANONICAL_SAGE2 in provider_names
-        else None
-    )
-
-    def prepare() -> AttentionInputs:
-        return inputs
-
-    def run_triton(prepared: AttentionInputs) -> torch.Tensor:
-        query, key, value = prepared
-        return sage_attention_2pp(
-            query,
-            key,
-            value,
-            scale=config.scale,
-            is_causal=config.is_causal,
-        )
-
-    def run_sdpa(prepared: AttentionInputs) -> torch.Tensor:
-        return _sdpa(prepared, scale=config.scale, is_causal=config.is_causal)
-
-    def canonical_run(pv_accum_dtype: str) -> Callable[[AttentionInputs], torch.Tensor]:
-        def run(prepared: AttentionInputs) -> torch.Tensor:
-            assert canonical is not None
-            query, key, value = prepared
-            return canonical(
-                query,
-                key,
-                value,
-                tensor_layout="HND",
-                is_causal=config.is_causal,
-                qk_quant_gran=_canonical_qk_granularity(capability),
-                sm_scale=config.scale,
-                pv_accum_dtype=pv_accum_dtype,
-                smooth_k=True,
-                smooth_v=False,
-                return_lse=False,
+) -> dict[str, AttentionProvider]:
+    query, _, _ = inputs
+    default_centering = _default_center_value(query, inputs[1], config.is_causal)
+    providers: dict[str, AttentionProvider] = {}
+    piper_settings = {
+        _PIPER: (default_centering, True),
+        _PIPER_CENTERED: (True, True),
+        _PIPER_UNCENTERED: (False, True),
+        _PIPER_AFFINE: (default_centering, False),
+    }
+    for name, (center_value, native_uint8) in piper_settings.items():
+        if name in provider_names:
+            providers[name] = _make_piper_provider(
+                name,
+                inputs,
+                config=config,
+                capability=capability,
+                center_value=center_value,
+                native_uint8=native_uint8,
             )
 
-        return run
+    def prepare_inputs() -> object:
+        return inputs
 
-    common_configuration = config.as_dict()
-    providers = {
-        _PURE_TRITON: BenchmarkProvider(
-            name=_PURE_TRITON,
-            prepare=prepare,
-            run=run_triton,
+    if _PURE_TRITON_SAGE2PP in provider_names:
+        providers[_PURE_TRITON_SAGE2PP] = BenchmarkProvider(
+            name=_PURE_TRITON_SAGE2PP,
+            prepare=prepare_inputs,
+            run=lambda prepared: sage_attention_2pp(
+                *cast(AttentionInputs, prepared),
+                scale=config.scale,
+                is_causal=config.is_causal,
+            ),
             synchronize=torch.cuda.synchronize,
             configuration={
-                **common_configuration,
+                **config.as_dict(),
                 "implementation": "pure_triton",
                 "algorithm": "sage_attention_2pp",
                 "qk_quantization": _canonical_qk_granularity(capability),
                 "pv_accumulation": "fp32+fp16",
             },
-            triton_jit_functions=_triton_jit_functions(capability),
-        ),
-        _SDPA: BenchmarkProvider(
+        )
+    if _SDPA in provider_names:
+        providers[_SDPA] = BenchmarkProvider(
             name=_SDPA,
-            prepare=prepare,
-            run=run_sdpa,
+            prepare=prepare_inputs,
+            run=lambda prepared: _sdpa(
+                cast(AttentionInputs, prepared),
+                scale=config.scale,
+                is_causal=config.is_causal,
+            ),
             synchronize=torch.cuda.synchronize,
             configuration={
-                **common_configuration,
+                **config.as_dict(),
                 "implementation": "pytorch",
                 "algorithm": "scaled_dot_product_attention",
             },
-        ),
-    }
+        )
+
+    canonical = (
+        _load_canonical(capability)
+        if _CANONICAL_SAGE2PP in provider_names or _CANONICAL_SAGE2 in provider_names
+        else None
+    )
     if canonical is not None:
         canonical_configuration = {
-            **common_configuration,
+            **config.as_dict(),
             "implementation": "canonical_cuda",
             "canonical_version": _CANONICAL_VERSION,
             "canonical_revision": _CANONICAL_REVISION,
             "qk_quantization": _canonical_qk_granularity(capability),
         }
+
+        def canonical_run(pv_accum_dtype: str) -> Callable[[object], torch.Tensor]:
+            def run(prepared: object) -> torch.Tensor:
+                query, key, value = cast(AttentionInputs, prepared)
+                return canonical(
+                    query,
+                    key,
+                    value,
+                    tensor_layout="HND",
+                    is_causal=config.is_causal,
+                    qk_quant_gran=_canonical_qk_granularity(capability),
+                    sm_scale=config.scale,
+                    pv_accum_dtype=pv_accum_dtype,
+                    smooth_k=True,
+                    smooth_v=False,
+                    return_lse=False,
+                )
+
+            return run
+
         providers[_CANONICAL_SAGE2PP] = BenchmarkProvider(
             name=_CANONICAL_SAGE2PP,
-            prepare=prepare,
+            prepare=prepare_inputs,
             run=canonical_run("fp32+fp16"),
             synchronize=torch.cuda.synchronize,
             configuration={
@@ -208,7 +314,7 @@ def _make_providers(
         )
         providers[_CANONICAL_SAGE2] = BenchmarkProvider(
             name=_CANONICAL_SAGE2,
-            prepare=prepare,
+            prepare=prepare_inputs,
             run=canonical_run("fp32+fp32"),
             synchronize=torch.cuda.synchronize,
             configuration={
@@ -226,7 +332,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--providers",
         choices=_PROVIDER_NAMES,
         nargs="+",
-        default=[_PURE_TRITON, _SDPA],
+        default=None,
     )
     parser.add_argument(
         "--canonical",
@@ -237,40 +343,65 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--sequence",
         type=int,
         nargs="+",
-        default=[512, 1024, 2048, 4096, 8192],
+        default=[1024, 2048, 4096, 8192, 16384],
     )
-    parser.add_argument(
-        "--kv-sequence",
-        type=int,
-        help="fixed key/value length; defaults to each query length",
-    )
+    parser.add_argument("--kv-sequence", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
-    parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="float16")
+    parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--scale", type=float)
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measurement-time-ms", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--profile-provider",
-        choices=_PROVIDER_NAMES,
-        default=_PURE_TRITON,
-    )
+    parser.add_argument("--profile-provider", choices=_PROVIDER_NAMES, default=_PIPER)
     add_compiler_inspection_arguments(parser)
     add_profile_arguments(parser)
     add_output_arguments(parser)
     return parser.parse_args(argv)
 
 
-def _resolved_provider_names(args: argparse.Namespace) -> tuple[str, ...]:
-    names = list(dict.fromkeys(args.providers))
+def _resolved_provider_names(
+    args: argparse.Namespace,
+    *,
+    fp8_supported: bool,
+) -> tuple[str, ...]:
+    requested = (
+        args.providers
+        if args.providers is not None
+        else [
+            _PIPER,
+            _PIPER_UNCENTERED,
+            *([_PURE_TRITON_SAGE2PP] if fp8_supported else []),
+            _SDPA,
+        ]
+    )
+    names = list(dict.fromkeys(requested))
     if args.canonical:
         for name in (_CANONICAL_SAGE2PP, _CANONICAL_SAGE2):
             if name not in names:
                 names.append(name)
     return tuple(names)
+
+
+def _validate_provider_support(
+    provider_names: Sequence[str],
+    device: torch.device,
+) -> None:
+    if any(name in _PIPER_PROVIDERS for name in provider_names) and not supports_uint8_int8_mma(
+        device
+    ):
+        raise SystemExit(
+            "Piper Attention providers require NVIDIA SM8x or consumer Blackwell SM12x"
+        )
+    if any(name in _FP8_SAGE_PROVIDERS for name in provider_names) and not supports_fp8_fp16_mma(
+        device
+    ):
+        raise SystemExit(
+            "Sage 8+8 providers require NVIDIA FP8 tensor cores; "
+            "the canonical RTX 30 fallback is a different FP16-PV algorithm"
+        )
 
 
 def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> None:
@@ -294,14 +425,9 @@ def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> N
     if (args.profile or compiler_requested) and len(args.sequence) != 1:
         raise SystemExit("profiling and compiler inspection require exactly one query length")
     if args.profile and args.profile_provider not in provider_names:
-        raise SystemExit("--profile-provider must also be selected by --providers or --canonical")
-    if compiler_requested and _PURE_TRITON not in provider_names:
-        raise SystemExit("compiler inspection requires the pure-Triton provider")
-    if args.profile and compiler_requested and args.profile_provider != _PURE_TRITON:
-        raise SystemExit(
-            "combined profiling and compiler inspection requires the pure-Triton "
-            "profile provider"
-        )
+        raise SystemExit("--profile-provider must be selected by --providers or --canonical")
+    if compiler_requested and tuple(provider_names) != (_PIPER,):
+        raise SystemExit("compiler inspection requires only the default Piper provider")
 
 
 def _output_targets(args: argparse.Namespace) -> tuple[OutputTarget | None, OutputTarget | None]:
@@ -325,12 +451,7 @@ def _make_inputs(
     generator: torch.Generator,
 ) -> AttentionInputs:
     query = torch.randn(
-        (
-            shape.batch_size,
-            shape.num_query_heads,
-            shape.query_length,
-            shape.head_dim,
-        ),
+        (shape.batch_size, shape.num_query_heads, shape.query_length, shape.head_dim),
         device="cuda",
         dtype=dtype,
         generator=generator,
@@ -346,18 +467,13 @@ def _make_inputs(
         dtype=dtype,
         generator=generator,
     )
-    value = torch.randn(
-        key.shape,
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
-    )
+    value = torch.randn(key.shape, device="cuda", dtype=dtype, generator=generator)
     return query, key, value
 
 
 def _compiler_report(
     args: argparse.Namespace,
-    provider: BenchmarkProvider[AttentionInputs, torch.Tensor],
+    provider: AttentionProvider,
     environment: EnvironmentInfo,
     target: OutputTarget | None,
 ) -> TritonCompilerRecord | None:
@@ -368,6 +484,7 @@ def _compiler_report(
         environment,
         include_sass=args.sass,
         nvdisasm=args.nvdisasm,
+        require_isolated_jit_cache=False,
     )
     write_records([report], target)
     if args.compiler_report:
@@ -384,6 +501,7 @@ def _print_measurement(record: BenchmarkRecord) -> None:
     print(
         f"| {record.shape['query_length']} | {record.shape['key_value_length']} "
         f"| {record.provider} | {timings.first_call_ms:.3f} "
+        f"| {timings.preparation.display(3)} "
         f"| {timings.prepared_execution.display(3)} "
         f"| {timings.operator_end_to_end.display(3)} "
         f"| {record.quality.mean_absolute_error:.6f} "
@@ -394,21 +512,19 @@ def _print_measurement(record: BenchmarkRecord) -> None:
 @torch.inference_mode()
 def _main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    provider_names = _resolved_provider_names(args)
-    _validate_args(args, provider_names)
-    benchmark_target, compiler_target = _output_targets(args)
     if not torch.cuda.is_available():
-        raise SystemExit("SageAttention2++ benchmarking requires an NVIDIA CUDA GPU")
-
+        raise SystemExit("Piper Attention benchmarking requires a CUDA-capable GPU")
     device = torch.device("cuda")
-    if _PURE_TRITON in provider_names and not supports_fp8_fp16_mma(device):
-        raise SystemExit(
-            "the pure-Triton SageAttention2++ provider requires NVIDIA FP8 tensor cores"
-        )
+    provider_names = _resolved_provider_names(
+        args,
+        fp8_supported=supports_fp8_fp16_mma(device),
+    )
+    _validate_args(args, provider_names)
+    _validate_provider_support(provider_names, device)
+    benchmark_target, compiler_target = _output_targets(args)
     capability = torch.cuda.get_device_capability(device)
 
-    repository = Path(__file__).resolve().parents[1]
-    environment = capture_environment(repository)
+    environment = capture_environment(Path(__file__).resolve().parents[1])
     config = AttentionConfig(
         dtype=args.dtype,
         is_causal=args.causal,
@@ -417,18 +533,18 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     records: list[BenchmarkRecord] = []
-    compiler_provider: BenchmarkProvider[AttentionInputs, torch.Tensor] | None = None
+    compiler_provider: AttentionProvider | None = None
 
     print(
         f"device: {environment.gpu_name}; architecture: {environment.gpu_architecture}; "
         f"torch: {environment.torch_version}; triton: {environment.triton_version}"
     )
     print(
-        "| query | key/value | provider | first call (ms) "
-        "| device p50 [p20, p80] (ms) | wall p50 [p20, p80] (ms) "
-        "| mean abs error | SQNR (dB) |"
+        "| query | key/value | provider | first call (ms) | preparation wall p50 "
+        "[p20, p80] (ms) | hot device p50 [p20, p80] (ms) | complete wall p50 "
+        "[p20, p80] (ms) | mean abs error | SQNR (dB) |"
     )
-    print("|---:|---:|:---|---:|---:|---:|---:|---:|")
+    print("|---:|---:|:---|---:|---:|---:|---:|---:|---:|")
 
     for query_length in args.sequence:
         key_value_length = args.kv_sequence or query_length
@@ -459,13 +575,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 f"profiled provider={profile.provider} phase={profile.phase.value} "
                 f"iterations={profile.iterations} range={profile.range_name!r}"
             )
-            if _PURE_TRITON in providers:
-                _compiler_report(
-                    args,
-                    providers[_PURE_TRITON],
-                    environment,
-                    compiler_target,
-                )
+            if _PIPER in providers:
+                _compiler_report(args, providers[_PIPER], environment, compiler_target)
             return
 
         measurements = [
@@ -479,34 +590,18 @@ def _main(argv: Sequence[str] | None = None) -> None:
         expected = _sdpa(inputs, scale=config.scale, is_causal=config.is_causal)
         torch.cuda.synchronize()
         for measurement in measurements:
-            attention_pairs = shape.query_length * shape.key_value_length
-            if config.is_causal:
-                attention_pairs = shape.query_length * (shape.query_length + 1) // 2
-            operations = (
-                4
-                * shape.batch_size
-                * shape.num_query_heads
-                * attention_pairs
-                * shape.head_dim
-            )
-            effective_tflops = (
-                operations
-                / (measurement.timings.prepared_execution.median_ms * 1e-3)
-                / 1e12
-            )
             record = BenchmarkRecord(
-                benchmark="sage-attention-2pp",
+                benchmark="piper-attention",
                 provider=measurement.provider,
                 shape=shape.as_dict(),
                 configuration=measurement.configuration,
                 timings=measurement.timings,
                 quality=measure_quality(measurement.output, expected),
                 environment=environment,
-                extra={"effective_tflops": effective_tflops},
             )
             records.append(record)
             _print_measurement(record)
-        compiler_provider = providers.get(_PURE_TRITON)
+        compiler_provider = providers.get(_PIPER)
 
     if compiler_provider is not None:
         _compiler_report(args, compiler_provider, environment, compiler_target)
@@ -514,7 +609,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
 
 
 def main() -> None:
-    """Run the SageAttention2++ benchmark CLI."""
+    """Run the Piper Attention benchmark CLI."""
     _main()
 
 

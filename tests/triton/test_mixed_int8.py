@@ -16,6 +16,7 @@ from piper_kernels._triton.mixed_int8 import (
     rewrite_uint8_int8_dot_llvm,
     uint8_int8_dot,
 )
+from piper_kernels._triton.targets import supports_uint8_int8_mma
 
 _NVIDIA_GPU_AVAILABLE = torch.cuda.is_available() and torch.version.cuda is not None
 
@@ -158,13 +159,19 @@ def test_rewrite_rejects_an_unsupported_integer_mma_shape() -> None:
     [
         (None, "active NVIDIA target"),
         (SimpleNamespace(backend="hip", arch="gfx1201"), "got backend 'hip'"),
-        (SimpleNamespace(backend="cuda", arch=75), "capability 8.0 or newer"),
-        (SimpleNamespace(backend="cuda", arch="sm80"), "capability 8.0 or newer"),
+        (SimpleNamespace(backend="cuda", arch=75), "SM8x or consumer Blackwell SM12x"),
+        (SimpleNamespace(backend="cuda", arch=90), "SM8x or consumer Blackwell SM12x"),
+        (SimpleNamespace(backend="cuda", arch="sm80"), "SM8x or consumer Blackwell SM12x"),
     ],
 )
 def test_target_validation_fails_clearly(target: object, message: str) -> None:
     with pytest.raises(MixedInt8DotCompatibilityError, match=message):
         mixed_int8._validate_target(target)
+
+
+@pytest.mark.parametrize("architecture", [80, 86, 89, 120, 121])
+def test_target_validation_accepts_supported_mmav2_families(architecture: int) -> None:
+    mixed_int8._validate_target(SimpleNamespace(backend="cuda", arch=architecture))
 
 
 def test_compiler_hook_composes_cache_identity_and_stage_order() -> None:
@@ -193,8 +200,8 @@ def test_compiler_hook_composes_cache_identity_and_stage_order() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
 def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
-    if torch.cuda.get_device_capability()[0] < 8:
-        pytest.skip("requires MMAv2 integer tensor cores")
+    if not supports_uint8_int8_mma(torch.device("cuda")):
+        pytest.skip("requires Piper's supported MMAv2 lowering")
     lhs = torch.arange(64 * 64, device="cuda", dtype=torch.int64)
     lhs = lhs.remainder(256).to(torch.uint8).reshape(64, 64)
     generator = torch.Generator(device="cuda").manual_seed(912)
@@ -219,8 +226,8 @@ def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
 def test_generated_ptx_changes_only_the_marked_dot() -> None:
-    if torch.cuda.get_device_capability()[0] < 8:
-        pytest.skip("requires MMAv2 integer tensor cores")
+    if not supports_uint8_int8_mma(torch.device("cuda")):
+        pytest.skip("requires Piper's supported MMAv2 lowering")
     unsigned_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.uint8)
     signed_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)
     rhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)

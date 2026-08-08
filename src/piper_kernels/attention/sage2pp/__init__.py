@@ -1,4 +1,4 @@
-"""Internal canonical SageAttention2++ implementation."""
+"""Canonical SageAttention2++ implementation."""
 
 from .dispatch import sage_attention_2pp
 

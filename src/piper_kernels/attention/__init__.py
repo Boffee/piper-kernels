@@ -1,5 +1,6 @@
 """Optimized attention operators."""
 
-from ._sage2pp import sage_attention_2pp
+from .piper import piper_attention
+from .sage2pp import sage_attention_2pp
 
-__all__ = ["sage_attention_2pp"]
+__all__ = ["piper_attention", "sage_attention_2pp"]

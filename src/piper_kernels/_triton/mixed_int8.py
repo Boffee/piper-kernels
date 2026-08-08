@@ -7,8 +7,8 @@ side equivalent. The marker is removed before PTX generation, so it adds no devi
 instruction.
 
 The extension is deliberately fail-closed and limited to NVIDIA's
-``m16n8k32`` MMAv2 integer MMA on compute capability 8.0 or newer. Other Triton
-backends remain usable, but they cannot request this operation.
+``m16n8k32`` MMAv2 integer MMA on SM8x and consumer Blackwell SM12x. Other
+Triton backends remain usable, but they cannot request this operation.
 """
 
 from __future__ import annotations
@@ -233,9 +233,9 @@ def _validate_target(target: object | None) -> None:
             f"native UINT8-by-INT8 dot requires NVIDIA MMAv2, got backend {backend!r}"
         )
     architecture = getattr(target, "arch", None)
-    if not isinstance(architecture, int) or architecture < 80:
+    if not isinstance(architecture, int) or architecture // 10 not in (8, 12):
         raise MixedInt8DotCompatibilityError(
-            "native UINT8-by-INT8 dot requires NVIDIA compute capability 8.0 or newer, "
+            "native UINT8-by-INT8 dot requires NVIDIA SM8x or consumer Blackwell SM12x, "
             f"got {architecture!r}"
         )
 
