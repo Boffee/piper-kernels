@@ -229,6 +229,16 @@ valuable for tracing, export, tensor-subclass dispatch, and making the internal
 launches visible to compiler tooling, but this Torch 2.12.1 test did not recover
 the cross-boundary bandwidth saving automatically.
 
+There are currently no production `triton_op` registrations in Piper. Ordinary
+ConvRot linear, input-SwiGLU linear, mutating ConvRot `addmm_`, and
+SageAttention2++ remain `custom_op` registrations. The proposed migration order,
+scope, and acceptance gates are recorded in the
+[`operator registration status`](convrot-adoption.md#operator-registration-status)
+section of the adoption roadmap. Private Triton kernels should remain
+unregistered, using `wrap_triton` only when invoked from a migrated composite;
+only stable PyTorch-style composite boundaries are registration migration
+candidates.
+
 ```shell
 uv run python benchmarks/benchmark_convrot_triton_op.py \
   --rows 37710 --warmup-ms 100 --measurement-time-ms 500

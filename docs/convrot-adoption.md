@@ -39,6 +39,51 @@ The prototype branches are independent. Adopting QKV fusion does not require
 paired FC1 SwiGLU or gated residual fusion, and none is required to adopt the
 core ConvRot operator.
 
+## Operator registration status
+
+No production kernel on this branch uses `torch.library.triton_op` or
+`torch.library.wrap_triton`. The only use is the benchmark-only
+[`piper_kernels_benchmarks::convrot_prepare`](../benchmarks/benchmark_convrot_triton_op.py),
+which establishes compiler traceability but does not remove an adjacent
+materialization boundary.
+
+| Production boundary | Current registration | Recommended treatment |
+|:---|:---|:---|
+| [Ordinary ConvRot linear](../src/piper_kernels/convrot/int8/backends/triton.py) | Functional `custom_op` around preparation and GEMM | Migrate to one composite `triton_op` after the simpler SwiGLU path |
+| [ConvRot input-SwiGLU linear](../src/piper_kernels/convrot/int8/backends/triton.py) | Functional `custom_op` around fused preparation and GEMM | First production `triton_op` candidate |
+| [Mutating ConvRot `addmm_`](../src/piper_kernels/convrot/int8/dispatch.py) | Cross-backend mutating `custom_op` | Keep opaque initially; revisit only after alias and version-counter tests |
+| [SageAttention2++](../src/piper_kernels/attention/_sage2pp/backends/triton.py) | Functional `custom_op` around a multi-kernel Triton implementation | Evaluate independently from ConvRot after its descriptor and dynamic-shape paths are covered |
+| Private rotation, quantization, GEMM, matvec, and requantization kernels | Direct Triton launches | Keep private and unregistered; use `wrap_triton` only when reached from a migrated composite |
+
+This migration is integration cleanup, not a kernel-speed optimization.
+`triton_op` makes a Triton-backed registered composite boundary visible to
+compiler and export tooling, but it does not rewrite separate producer and
+consumer kernels into a new fused kernel. The measured control below remained
+two launches and took `0.9357 ms`, versus `0.4793 ms` for the explicitly fused
+implementation.
+
+Migration is also more than changing a decorator: every Triton launch inside
+the composite must go through `wrap_triton`, while allocations, shape branches,
+mutation declarations, and fallbacks must remain traceable and correct. Use
+this order:
+
+1. migrate the functional input-SwiGLU linear;
+2. migrate the ordinary linear, including fused and split preparation paths;
+3. evaluate SageAttention separately; and
+4. leave the mutating `addmm_` opaque until its stateful contract is tested.
+
+Registration migration is optional cleanup after Stage 1 reaches correctness
+and performance parity; it is not a Stage 1 acceptance requirement. Complete it
+before a later stage depends on compiler visibility, export, or a stable
+registered composite boundary.
+
+For each migration, require eager and `torch.compile(fullgraph=True)` parity,
+fake/meta and export coverage, tensor-subclass dispatch, dynamic row counts,
+both optimized and fallback shapes, no unexpected extra kernel launches, and a
+no-regression latency benchmark. Explicit graph-boundary kernels remain
+necessary for RMSNorm/AdaLN, RMSNorm/RoPE, SwiGLU, or residual memory-traffic
+savings regardless of the registration API.
+
 ## Adoption stages
 
 ### Stage 0: freeze the research baseline
