@@ -39,13 +39,24 @@ def test_default_centering_is_disabled_for_portable_reference() -> None:
     assert not _default_center_value(query, key, False)
 
 
-def test_native_mixed_int8_hook_precedes_preprocessing(
+def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    guarded_devices: list[torch.device] = []
 
     class PreprocessingReachedError(RuntimeError):
         pass
+
+    class DeviceGuard:
+        def __init__(self, device: torch.device) -> None:
+            guarded_devices.append(device)
+
+        def __enter__(self) -> None:
+            events.append("device-enter")
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("device-exit")
 
     def record_hook() -> None:
         events.append("hook")
@@ -55,6 +66,7 @@ def test_native_mixed_int8_hook_precedes_preprocessing(
         raise PreprocessingReachedError
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 0))
+    monkeypatch.setattr(torch.cuda, "device", DeviceGuard)
     monkeypatch.setattr(
         triton_implementation,
         "install_uint8_int8_dot_hook",
@@ -80,7 +92,8 @@ def test_native_mixed_int8_hook_precedes_preprocessing(
             use_tensor_descriptors=False,
         )
 
-    assert events == ["hook", "preprocessing"]
+    assert guarded_devices == [query.device]
+    assert events == ["device-enter", "hook", "device-exit", "preprocessing"]
 
 
 @pytest.mark.parametrize(

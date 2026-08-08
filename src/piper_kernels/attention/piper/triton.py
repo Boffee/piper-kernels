@@ -1072,7 +1072,8 @@ def _prepare_piper_attention(
     if native_uint8 is None:
         native_uint8 = supports_uint8_int8_mma(query.device)
     if native_uint8:
-        install_uint8_int8_dot_hook()
+        with torch.cuda.device(query.device):
+            install_uint8_int8_dot_hook()
     split_pv_head_dim = (
         nvidia_cuda
         and capability[0] == 12
