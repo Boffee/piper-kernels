@@ -24,15 +24,29 @@ then use the resulting tensor as a normal linear weight:
 ```python
 import torch
 
-from piper_kernels.convrot import ConvRotInt8Tensor
+from piper_kernels.convrot import ConvRotInt8Tensor, linear_input_act
 
-weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=64)
-checkpoint_weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
+weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=256)
+checkpoint_weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=256)
 output = torch.nn.functional.linear(activation, weight, bias)
+
+# Fuse a [gate | up] SwiGLU activation into activation rotation/quantization.
+mlp_output = linear_input_act(gate_up, weight, "swiglu", bias)
 
 # In-place low-rank update with the standard Tensor.addmm_ contract.
 weight.addmm_(lora_b, lora_a, alpha=lora_strength)
 ```
+
+`linear_input_act` expects the raw final dimension as `[gate | up]`, twice the weight's
+input width. On the measured SM120 H256 path it computes SwiGLU, rotates, finds the row
+scale, and emits INT8 in one pure-Triton kernel. Other supported devices and shapes
+materialize SwiGLU and then dispatch the ordinary ConvRot linear. The helper is an
+experimental API on this optimization branch; the clean integration will reassess the
+public boundary.
+
+The experimental design rationale, rejected alternatives, resource observations, and
+reproducible H3/128K results are recorded in the
+[ConvRot optimization findings](docs/convrot-optimization.md).
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
 the result. It preserves the ConvRot tensor and packed storage identities, allowing

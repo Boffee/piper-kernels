@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Experimental SM120 ConvRot H256 optimization checkpoint with factorized one-pass
+  activation rotation/quantization, explicit fused-SwiGLU linear API, large-sequence-safe
+  addressing, H3 benchmark presets, phase diagnostics, and a documented clean-room
+  integration plan.
 - Pure-Triton canonical SageAttention2++ 8+8 forward inference for SM89 and SM12x,
   including a portable quantized reference, explicit `sage_attention_2pp` API,
   `torch.compile` support, and revision-pinned canonical CUDA benchmarks.

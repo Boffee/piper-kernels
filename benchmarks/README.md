@@ -123,8 +123,69 @@ uv run python benchmarks/benchmark_convrot.py
 ```
 
 Use `--help` to select activation rows, weight dimensions, group size, dtype,
-deterministic input seed, and timing windows. The script verifies exact agreement before
-reporting Triton and reference timings.
+deterministic input seed, and timing windows. The script verifies Piper against the portable
+reference before reporting timings. Ordinary linears use the output dtype's standard
+tolerance; fused SwiGLU must remain within 1% relative L2 error and is backed by stricter
+preparation-level tests. Comfy Kitchen must remain within 2% relative L2 error. Quality uses
+at most 256 rows sampled across M, including signed-32-bit input/output address boundaries and
+the final row.
+Timings always use the complete requested tensors, and machine output records the exact row
+indices.
+
+For memory-intensive shapes, add `--skip-reference-timing`. The benchmark still validates
+the stratified sample against the portable reference but avoids its full FP32 output and
+epilogue intermediates.
+
+Compare the same prepared inputs against ComfyUI's optional `comfy-kitchen` operator with:
+
+```shell
+uv run --with comfy-kitchen==0.2.28 python benchmarks/benchmark_convrot.py \
+  --compare-comfy-kitchen
+```
+
+The optional provider records its installed version and numerical quality against the same
+portable reference; it is not a production dependency.
+
+Exercise the four principal transformer linears at the measured 37,710-row MiniMax H3
+5-second workload with:
+
+```shell
+uv run --with comfy-kitchen==0.2.28 python benchmarks/benchmark_convrot.py \
+  --preset minimax-h3-5s --compare-comfy-kitchen
+```
+
+The preset covers H3's bias-free QKV, attention output, and both MLP projections at 37,710
+flattened token rows for the investigated video configuration. Its down projection consumes
+the raw `[gate | up]` FC1 output and includes SwiGLU, matching the model call chain instead of
+timing only an already-activated projection. Sequence length depends on batch, resolution,
+frames, patching, and conditioning tokens; 37,710 is a reproducible workload, not a universal
+model constant.
+
+Diagnose the activation-preparation kernels separately, with all outputs preallocated, using:
+
+```shell
+uv run python benchmarks/benchmark_convrot_preparation.py
+```
+
+This reports rotation, rowwise quantization, the two-launch split path, and the one-pass fused
+path for the three distinct MiniMax H3 widths. The traffic column is the algorithmic minimum,
+not a claim about measured DRAM transactions. Add `--compare-comfy-kitchen` for a preallocated
+launch of its pinned native CUDA kernel, or select one width with
+`--compiler-report --no-sass` to record Triton register, spill, shared-memory, and residency
+metadata.
+
+Measure the fused FC2 activation boundary directly with:
+
+```shell
+uv run --with comfy-kitchen==0.2.28 \
+  python benchmarks/benchmark_convrot_preparation.py \
+  --rows 37710 --in-features 14336 --input-act swiglu \
+  --compare-comfy-kitchen
+```
+
+The measured results, traffic math, compiler-resource observations, rejected approaches, and
+clean-room integration order are preserved in the
+[ConvRot optimization findings](../docs/convrot-optimization.md).
 
 Run the stock-Triton integer P x V microbenchmark with:
 

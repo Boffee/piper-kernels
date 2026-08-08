@@ -118,6 +118,9 @@ def test_output_arguments_support_namespaced_record_types(tmp_path: Path) -> Non
 
 def test_environment_capture_does_not_require_cuda(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    repository = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("GIT_DIR", str(repository / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repository))
 
     environment = capture_environment(tmp_path)
 

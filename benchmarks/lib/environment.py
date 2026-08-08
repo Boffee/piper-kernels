@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import platform
 import subprocess
 import sys
@@ -57,11 +58,16 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _run(command: list[str], cwd: Path | None = None) -> str | None:
+def _run(
+    command: list[str],
+    cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> str | None:
     try:
         result = subprocess.run(
             command,
             cwd=cwd,
+            env=environment,
             check=True,
             capture_output=True,
             text=True,
@@ -74,10 +80,32 @@ def _run(command: list[str], cwd: Path | None = None) -> str | None:
 def _git_state(repository: Path | None) -> tuple[str | None, bool | None]:
     if repository is None:
         return None, None
-    revision = _run(["git", "rev-parse", "HEAD"], repository)
+
+    # Git exports repository-local variables to hooks. Clear them so an explicit
+    # repository argument cannot accidentally resolve to the hook's repository.
+    environment = os.environ.copy()
+    for variable in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    ):
+        environment.pop(variable, None)
+
+    revision = _run(["git", "rev-parse", "HEAD"], repository, environment)
     if revision is None:
         return None, None
-    status = _run(["git", "status", "--porcelain", "--untracked-files=normal"], repository)
+    status = _run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        repository,
+        environment,
+    )
     return revision, bool(status)
 
 

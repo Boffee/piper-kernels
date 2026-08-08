@@ -1,13 +1,13 @@
 """Rotated INT8 W8A8 tensor subclass."""
 
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import torch
 from torchao.utils import TorchAOBaseTensor
 
 from .._rotation import rotate_groups
-from .dispatch import _addmm_, _linear
+from .dispatch import _addmm_, _linear, _linear_input_act
 from .reference import quantize_weight, validate_storage
 
 
@@ -97,6 +97,29 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
                 self.scale.stride(),
             )
         )
+
+
+def linear_input_act(
+    activation: torch.Tensor,
+    weight: ConvRotInt8Tensor,
+    input_act: Literal["swiglu"],
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply an input activation and ConvRot linear, fusing supported configurations."""
+    if not isinstance(activation, torch.Tensor):
+        raise TypeError(f"ConvRot input must be a tensor, got {type(activation).__name__}")
+    if not isinstance(weight, ConvRotInt8Tensor):
+        raise TypeError(f"ConvRot weight must be ConvRotInt8Tensor, got {type(weight).__name__}")
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
+    return _linear_input_act(
+        activation,
+        weight.qdata,
+        weight.scale,
+        weight.group_size,
+        input_act,
+        bias,
+    )
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten.linear.default)
