@@ -14,7 +14,7 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 | Package | Role |
 |---|---|
 | `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
-| `piper_kernels.attention` | Canonical SageAttention2++ 8+8 forward attention |
+| `piper_kernels.attention` | Piper Attention and canonical SageAttention2++ forward attention |
 
 ## ConvRot INT8
 
@@ -45,6 +45,52 @@ uses the portable PyTorch reference. Install the tensor format and optimized bac
 `piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, and
 attention-only consumers do not inherit the TorchAO dependency.
 
+## Piper Attention
+
+Piper Attention is the package's key-scaled integer-PV attention algorithm:
+
+```python
+from piper_kernels.attention import piper_attention
+
+output = piper_attention(query, key, value, is_causal=False)
+```
+
+It follows FlashAttention's fused online-softmax structure and SageAttention's K
+smoothing plus INT8 QK quantization. Its distinct PV path quantizes each V key row
+with one signed-INT8 scale, folds those scales into nonnegative probabilities, and
+uses `UINT8 x INT8 -> INT32` tensor-core products. The probability multiplier remains
+FP32 so every finite FP16 input scale is representable without a conversion in the hot
+loop. FP32 also remains the softmax and denominator coordinate; the selected long SM12x
+D128 schedule buffers a bounded PV numerator in FP16.
+
+For centered V, Piper Attention uses the exact identity
+
+```text
+softmax(QK) @ V = softmax(QK) @ (V - mean_sequence(V)) + mean_sequence(V)
+```
+
+It stores only the compact FP32 `[batch, head, feature]` mean, subtracts it while
+quantizing V, and restores it in the attention epilogue. This improves signed-INT8
+precision when V has a large feature bias and preserves constant V exactly. The
+default policy enables centering only for non-causal SM12x D128 calls with both
+sequence lengths at least 1024; pass `center_value=True` or `False` to override it.
+Centered non-causal SM12x D128 calls with at least 16384 keys additionally use the
+selected stable low-to-high centered-row-range order. That permutation is exact
+before quantization and reduces scale-coordinate variation in very long attention.
+
+Native mixed-sign MMA is selected on the supported NVIDIA backend through the packaged
+stock-Triton extension. The backend retains the exact affine identity
+`u @ v = (u - 128) @ v + 128 * sum(v)` as its signed-INT8 correctness and portability
+control. The public optimized dispatch supports NVIDIA SM8x and consumer Blackwell
+SM12x, whose Triton lowering uses the MMAv2 instruction rewritten by the packaged
+extension. SM89 and SM12x have measured schedules; Ampere currently uses the generic
+schedule. Hopper lowers the operation through unsupported WGMMA and therefore uses the
+slow portable quantized reference. Native ROCm mixed-sign lowering remains future work.
+
+Piper Attention is an independently developed Sage-derived design. The per-key
+quantizer, centering identity, and online-softmax lineage are not claimed as novel in
+isolation; the name identifies this package's selected combination and fused recurrence.
+
 ## SageAttention2++
 
 The attention package provides an independently written, pure-Triton backend for the
@@ -57,7 +103,8 @@ output = sage_attention_2pp(query, key, value, is_causal=False)
 ```
 
 Inputs use `[batch, heads, sequence, head_dim]` layout and may be FP16 or BF16. The
-optimized backend targets RTX 40-series SM89 and RTX 50-series SM12x GPUs. It supports
+optimized backend requires NVIDIA FP8 tensor cores with FP16 accumulation (SM89 or
+newer); measured schedules currently cover consumer SM89 and SM12x GPUs. It supports
 head dimensions 64 and 128, equal query/KV head counts, arbitrary positive sequence
 lengths, rectangular non-causal attention, strided sequence dimensions, and
 `torch.compile`. It is inference-only and does not support autograd.
@@ -69,7 +116,7 @@ in FP16, and tile results are buffered in FP32. All optimized device code is Tri
 the package contains no CUDA extension or inline PTX. Unsupported devices use the slow
 portable quantized reference.
 
-Install the optimized backend with `piper-kernels[triton]`. The official CUDA
+Install either optimized attention backend with `piper-kernels[triton]`. The official CUDA
 SageAttention package is a revision-pinned, optional benchmark dependency only; it is
 not imported by production code. See [benchmarks/README.md](benchmarks/README.md) for
 the reproducible provider comparison.

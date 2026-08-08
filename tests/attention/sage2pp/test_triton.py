@@ -5,20 +5,18 @@ from typing import Literal
 import pytest
 import torch
 
+from piper_kernels._triton.targets import supports_fp8_fp16_mma
 from piper_kernels.attention import sage_attention_2pp
-from piper_kernels.attention._sage2pp.backends.triton import _run_sage_attention_2pp
-from piper_kernels.attention._sage2pp.reference import reference_sage_attention_2pp
+from piper_kernels.attention.sage2pp.reference import reference_sage_attention_2pp
+from piper_kernels.attention.sage2pp.triton import _run_sage_attention_2pp
 
 
 def _sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
 
 
-def _consumer_fp8_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    capability = torch.cuda.get_device_capability()
-    return capability == (8, 9) or capability[0] == 12
+def _fp8_gpu_available() -> bool:
+    return torch.cuda.is_available() and supports_fp8_fp16_mma(torch.device("cuda"))
 
 
 def _qk_quantization() -> Literal["per_thread", "per_warp"]:
@@ -28,8 +26,8 @@ def _qk_quantization() -> Literal["per_thread", "per_warp"]:
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not _consumer_fp8_available(),
-        reason="requires consumer Ada SM89 or Blackwell SM12x",
+        not _fp8_gpu_available(),
+        reason="requires NVIDIA FP8 tensor cores with FP16 accumulation",
     ),
 ]
 

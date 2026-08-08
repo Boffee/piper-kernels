@@ -12,9 +12,9 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return query, torch.randn_like(query), torch.randn_like(query)
 
 
-def test_attention_exports_only_sage_attention_2pp() -> None:
+def test_attention_exports_sage_attention_2pp() -> None:
     assert piper_kernels.attention.sage_attention_2pp is sage_attention_2pp
-    assert piper_kernels.attention.__all__ == ["sage_attention_2pp"]
+    assert "sage_attention_2pp" in piper_kernels.attention.__all__
 
 
 def test_public_api_uses_portable_reference_on_cpu() -> None:

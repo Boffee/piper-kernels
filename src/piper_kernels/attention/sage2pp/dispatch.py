@@ -4,10 +4,12 @@ import math
 
 import torch
 
+from piper_kernels._triton.targets import supports_fp8_fp16_mma
+
 from .reference import reference_sage_attention_2pp
 
 try:
-    from .backends.triton import triton_sage_attention_2pp as _triton_sage_attention_2pp
+    from .triton import triton_sage_attention_2pp as _triton_sage_attention_2pp
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
@@ -88,10 +90,7 @@ def _validate_inputs(  # noqa: PLR0912
 
 
 def _supports_triton(device: torch.device) -> bool:
-    if _triton_sage_attention_2pp is None or device.type != "cuda":
-        return False
-    capability = torch.cuda.get_device_capability(device)
-    return capability == (8, 9) or capability[0] == 12
+    return _triton_sage_attention_2pp is not None and supports_fp8_fp16_mma(device)
 
 
 def sage_attention_2pp(
@@ -109,7 +108,8 @@ def sage_attention_2pp(
     sequence lengths may differ for non-causal attention. ``scale`` defaults
     to ``head_dim**-0.5``.
 
-    The optimized backend targets Ada SM89 and consumer Blackwell SM12x.
+    The optimized backend requires NVIDIA FP8 tensor cores with FP16
+    accumulation. Architecture-specific schedules are selected independently.
     Other devices use the portable quantized reference, which is intended for
     correctness rather than performance. This is an inference-only operator.
     """

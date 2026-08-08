@@ -140,13 +140,13 @@ requires no patched Triton, CUDA extension, native build, or executable inline P
 with Triton 3.7.1 and validates its compiler hook and generated MMA fail-closed, allowing newer
 Triton versions only while the same lowering remains compatible.
 
-Native mixed-sign lowering currently requires NVIDIA compute capability 8.0 or newer and the
-`m16n8k32` MMAv2 path. Turing, Hopper WGMMA, and ROCm mixed-sign lowering are not supported by
-this extension. The native benchmark installs the hook automatically before JIT compilation;
-production native-UINT8 launchers use the same selection-time installation. Unsupported targets
-should select the exact affine signed-INT8 proxy instead. The benchmark records the LHS, RHS, and
-accumulator dtypes explicitly, checks exact INT32 output including UINT8 values above 127, and
-records operand saturation.
+Native mixed-sign lowering currently requires NVIDIA SM8x or consumer Blackwell SM12x and the
+`m16n8k32` MMAv2 path. Turing, Hopper WGMMA, datacenter Blackwell, and ROCm mixed-sign lowering
+are not supported by this extension. The native benchmark installs the hook automatically before
+JIT compilation; production native-UINT8 launchers use the same selection-time installation.
+Unsupported targets should select the exact affine signed-INT8 proxy instead. The benchmark
+records the LHS, RHS, and accumulator dtypes explicitly, checks exact INT32 output including
+UINT8 values above 127, and records operand saturation.
 
 Inspect the generated mixed-sign MMA while verifying exact output with:
 
@@ -216,6 +216,101 @@ spills, 49,704 bytes of shared memory per workgroup, and four warps. Its SASS co
 expected 64 signed INT8 QK MMA instructions and 64 E4M3 x E4M3 to FP16 PV MMA instructions.
 The complete GPU suite passed 155 tests. These measurements are a regression reference for
 this hardware/software stack, not a portable performance guarantee.
+
+## Piper Attention
+
+Run the production Piper Attention comparison with:
+
+```shell
+uv run python benchmarks/benchmark_piper_attention.py
+```
+
+The default matrix includes the dispatch-selected Piper path, its uncentered control,
+and PyTorch SDPA. On FP8-capable GPUs it also includes pure-Triton SageAttention2++.
+Add `--canonical` for the same revision-pinned canonical CUDA SageAttention2++ and
+SageAttention2 providers described above. These explicit 8+8 providers require FP8;
+the canonical package's RTX 30 fallback uses a different FP16-PV algorithm and is not
+substituted silently. Select `piper-centered` to force centering or `piper-affine` to
+replace native mixed-sign MMA with the exact signed-INT8 affine proxy:
+
+```shell
+uv run python benchmarks/benchmark_piper_attention.py \
+  --sequence 8192 \
+  --providers piper piper-centered piper-uncentered piper-affine \
+              pure-triton-sage2pp pytorch-sdpa \
+  --canonical
+```
+
+Piper's provider uses the shared preparation/execution contract more granularly than
+the ordinary Sage and SDPA operators:
+
+- `preparation` includes compact K/V mean reduction, optional centered-row ordering,
+  Q/K/V quantization, scale metadata, and affine correction metadata when requested;
+- `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
+  and centered-mean epilogue;
+- `operator_end_to_end` runs preparation and the fused kernel as one complete call.
+
+Every row reports quality against SDPA, including SQNR and relative errors in JSON.
+Machine records identify centering, value-row order, Q/K granularity, and native versus
+affine mixed-sign execution. The benchmark intentionally imports only production
+modules. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research
+controls remain reproducible from the `wip/sage-integer-attention` checkpoint at
+`b75f3ee`; they are not copied into the installed package.
+
+Compiler inspection and phase-selective profiler capture work through the same options:
+
+```shell
+uv run python benchmarks/benchmark_piper_attention.py \
+  --sequence 8192 --providers piper --compiler-report --no-sass
+
+nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
+  uv run python benchmarks/benchmark_piper_attention.py \
+  --sequence 8192 --providers piper --profile --profile-phase prepared_execution
+```
+
+### Piper Attention regression baseline
+
+Issue #6 was validated on an RTX 5090 (SM120) with Torch 2.12.1+cu130 and
+Triton 3.7.1. BF16 non-causal self-attention measured the following warmed
+latencies; Piper's hot column is its prepared fused recurrence, while the complete
+column includes all preprocessing.
+
+| shape | provider | hot device p50 [p20, p80] (ms) | complete wall p50 [p20, p80] (ms) | SQNR vs SDPA (dB) |
+|:---|:---|---:|---:|---:|
+| B1/H8/N8192/D128 | Piper centered | 0.674 [0.672, 0.676] | 0.775 [0.772, 0.779] | 36.08 |
+| B1/H8/N8192/D128 | Piper uncentered | 0.675 [0.674, 0.677] | 0.776 [0.774, 0.778] | 36.05 |
+| B1/H8/N8192/D128 | Piper affine fallback | 0.706 [0.703, 0.710] | 0.785 [0.784, 0.787] | 36.08 |
+| B1/H8/N8192/D128 | pure Triton SageAttention2++ | 0.637 [0.636, 0.639] | 0.669 [0.668, 0.671] | 28.12 |
+| B1/H8/N8192/D128 | canonical CUDA SageAttention2++ | 0.609 [0.607, 0.610] | 0.614 [0.607, 0.617] | 28.13 |
+| B1/H1/N131072/D128 | Piper centered + ordered | 19.548 [19.272, 19.571] | 19.897 [19.867, 19.906] | 35.77 |
+| B1/H1/N131072/D128 | Piper uncentered | 19.579 [19.371, 19.600] | 19.824 [19.806, 19.845] | 35.48 |
+| B1/H1/N131072/D128 | pure Triton SageAttention2++ | 17.647 [17.611, 17.708] | 17.823 [17.777, 17.926] | 28.33 |
+| B1/H1/N131072/D128 | canonical CUDA SageAttention2++ | 17.155 [16.992, 17.171] | 17.177 [17.023, 17.195] | 28.33 |
+
+At N=8192 the fused Piper specialization used 254 registers per thread, 12
+compiler-reported spills, 33,588 bytes of shared memory, and four warps. Its PTX
+contained 64 signed INT8 QK MMA instructions and 64 native `U8.S8` PV MMA
+instructions. Preprocessing kernels reported no spills. These measurements are a
+regression checkpoint, not a cross-device performance guarantee.
+
+The production implementation was also replayed on the cached Diffusers BF16
+LTX-2.3 attention call used during development (`B1/H32/N6144/D128`). The table
+reports global quality and the lowest per-head SQNR; the ignored local capture is
+not a repository fixture because the versioned capture/replay format belongs to
+issue #11.
+
+| provider | global SQNR (dB) | relative L1 | mean absolute error | max absolute error | worst-head SQNR (dB) |
+|:---|---:|---:|---:|---:|---:|
+| Piper centered | 38.96 | 0.960% | 0.000907 | 0.0703 | 33.72 |
+| Piper uncentered | 38.96 | 0.962% | 0.000909 | 0.0781 | 33.70 |
+| pure Triton SageAttention2++ | 32.43 | 2.292% | 0.002166 | 0.1250 | 28.18 |
+
+This ordinary call has little V bias, so centering is nearly neutral. The committed
+adversarial biased-V regression requires centering to reduce MSE by at least 5x and
+the constant-V regression requires exact restoration. On the exhaustive LTX-2.3
+sci-fi trajectory from research checkpoint `b75f3ee`, stable centered-row ordering
+improved global attention-output SQNR from 39.12 to 39.52 dB; its rollout measured
+18.67 dB decoded PSNR and 9.60 dB latent SQNR against the exact render.
 
 ## Triton compiler inspection
 

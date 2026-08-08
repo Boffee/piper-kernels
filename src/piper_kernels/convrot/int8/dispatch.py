@@ -7,10 +7,10 @@ import torch
 from .reference import reference_addmm_, reference_linear, validate_storage
 
 try:
-    from .backends.triton import (
+    from .triton import (
         triton_convrot_int8_addmm_ as _triton_addmm_,
     )
-    from .backends.triton import (
+    from .triton import (
         triton_convrot_int8_linear as _triton_linear,
     )
 except ModuleNotFoundError as exc:
