@@ -27,6 +27,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Consolidated the Piper, SageAttention2++, canonical CUDA, and SDPA comparisons into
   the hardware-aware `benchmarks/benchmark_attention.py` development CLI.
+- Optimized SageAttention2++ recurrence and causal scheduling across supported GPUs,
+  with measured SM12x specializations for fused K/V dispatch, inline query
+  quantization, and long-sequence raw-score recurrence.
 
 ## [0.1.0] - 2026-08-03
 

@@ -61,8 +61,27 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
     assert "attention" in providers[PIPER_CENTERED].triton_jit_functions
     assert providers[PURE_TRITON_SAGE2PP].configuration["algorithm"] == ("sage_attention_2pp")
     assert "attention" in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
+    assert (
+        "quantize-key-value-role-dispatched"
+        in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
+    )
+    assert "quantize-query-per-warp" not in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
     assert providers[PYTORCH_SDPA].configuration["algorithm"] == ("scaled_dot_product_attention")
     assert not providers[PYTORCH_SDPA].triton_jit_functions
+
+
+def test_short_causal_sage_provider_registers_external_query_quantization() -> None:
+    tensor = torch.empty((1, 1, 8, 64), dtype=torch.float16)
+    providers = make_attention_providers(
+        (tensor, tensor, tensor),
+        provider_names=(PURE_TRITON_SAGE2PP,),
+        config=AttentionConfig(dtype="float16", is_causal=True),
+        capability=(12, 0),
+    )
+
+    jit_functions = providers[PURE_TRITON_SAGE2PP].triton_jit_functions
+    assert "quantize-query-per-warp" in jit_functions
+    assert "quantize-key-value-role-dispatched" in jit_functions
 
 
 def test_default_providers_use_hardware_aware_comparison_set() -> None:

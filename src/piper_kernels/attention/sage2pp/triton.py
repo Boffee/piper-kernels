@@ -24,6 +24,10 @@ from piper_kernels.attention.scheduling import select_query_block
 _P_FP8_LOG2_RANGE = tl.constexpr(8.807354922057604)
 _V_FP8_RANGE = tl.constexpr(2.25)
 _SCALE_EPSILON = tl.constexpr(1e-7)
+_LOG2_E = tl.constexpr(1.4426950408889634)
+# Measured SM12x crossover policy, not an algorithmic requirement.
+_CAUSAL_RAW_SCORE_MIN_KEY_LENGTH = 32 * 1024
+_NONCAUSAL_RAW_SCORE_MIN_KEY_LENGTH = 128 * 1024
 
 
 @triton.jit
@@ -333,6 +337,25 @@ def _load_attention_value_tile(
 
 
 @triton.jit
+def _quantize_query_tile(
+    query,
+    softmax_scale,
+    block_m: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Quantize the query rows owned exclusively by this attention CTA."""
+    groups: tl.constexpr = block_m // 32
+    grouped_query = query.to(tl.float32).reshape((groups, 32, head_dim))
+    maximum = tl.max(tl.max(tl.abs(grouped_query), axis=2), axis=1)
+    quantization_scale = maximum / 127.0 + _SCALE_EPSILON
+    quantized = qk_quantization.round_to_int8(
+        grouped_query / quantization_scale[:, None, None]
+    ).reshape((block_m, head_dim))
+    score_scale = quantization_scale * (softmax_scale * _LOG2_E)
+    return quantized, score_scale
+
+
+@triton.jit
 def _causal_attention_tile(
     query,
     query_scale,
@@ -352,6 +375,8 @@ def _causal_attention_tile(
     key_length,
     diagonal_or_tail: tl.constexpr,
     qk_per_warp: tl.constexpr,
+    inline_query_quantization: tl.constexpr,
+    raw_score_recurrence: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -378,8 +403,13 @@ def _causal_attention_tile(
             + (batch * heads + head) * tl.cdiv(key_length, block_n)
             + start_n // block_n
         )
-        score_scale = query_scale * key_scale
-        scores = integer_scores.to(tl.float32) * score_scale[:, None]
+        if inline_query_quantization:
+            groups: tl.constexpr = block_m // 32
+            score_scale = query_scale * key_scale
+            raw_scores = integer_scores.to(tl.float32).reshape((groups, 32, block_n))
+            scores = (raw_scores * score_scale[:, None, None]).reshape((block_m, block_n))
+        else:
+            scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale
     else:
         key_scale = tl.load(
             key_scale_ptr + (batch * heads + head) * key_length + current_n,
@@ -393,10 +423,26 @@ def _causal_attention_tile(
         )
         scores = tl.where(valid_keys, scores, -float("inf"))
 
-    block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_RANGE
+    if inline_query_quantization and raw_score_recurrence:
+        raw_block_max = tl.max(raw_scores, axis=2)
+        block_max = tl.fma(
+            raw_block_max,
+            score_scale[:, None],
+            -_P_FP8_LOG2_RANGE,
+        ).reshape((block_m,))
+    else:
+        block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_RANGE
     next_max = tl.maximum(running_max, block_max)
     old_weight = tl.exp2(running_max - next_max)
-    probabilities = tl.exp2(scores - next_max[:, None])
+    if inline_query_quantization and raw_score_recurrence:
+        probability_log2 = tl.fma(
+            raw_scores,
+            score_scale[:, None, None],
+            -next_max.reshape((groups, 32, 1)),
+        ).reshape((block_m, block_n))
+        probabilities = tl.exp2(probability_log2)
+    else:
+        probabilities = tl.exp2(scores - next_max[:, None])
     accumulator *= old_weight[:, None]
     denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
 
@@ -426,7 +472,7 @@ def _causal_attention_tile(
 
 
 @triton.jit
-def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monolithic
+def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop monolithic
     query_ptr,
     key_ptr,
     value_ptr,
@@ -436,8 +482,14 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monol
     output_ptr,
     query_length,
     key_length,
+    softmax_scale,
+    stride_qb,
+    stride_qh,
+    stride_qn,
     is_causal: tl.constexpr,
     qk_per_warp: tl.constexpr,
+    inline_query_quantization: tl.constexpr,
+    raw_score_recurrence: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -451,20 +503,32 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monol
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
 
-    query = tl.load(
+    query_values = tl.load(
         query_ptr
-        + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
+        + batch * stride_qb
+        + head * stride_qh
+        + offsets_m[:, None] * stride_qn
         + offsets_d[None, :],
         mask=offsets_m[:, None] < query_length,
         other=0,
     )
-    if qk_per_warp:
+    if inline_query_quantization:
+        groups: tl.constexpr = block_m // 32
+        query, query_scale = _quantize_query_tile(  # pyright: ignore[reportGeneralTypeIssues]
+            query_values,
+            softmax_scale,
+            block_m,
+            head_dim,
+        )
+    elif qk_per_warp:
+        query = query_values
         query_scale = tl.load(
             query_scale_ptr + (batch * heads + head) * tl.cdiv(query_length, 32) + offsets_m // 32,
             mask=offsets_m < query_length,
             other=0.0,
         )
     else:
+        query = query_values
         query_scale = tl.load(
             query_scale_ptr + (batch * heads + head) * query_length + offsets_m,
             mask=offsets_m < query_length,
@@ -504,6 +568,8 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monol
                 key_length,
                 diagonal_or_tail=False,
                 qk_per_warp=qk_per_warp,
+                inline_query_quantization=inline_query_quantization,
+                raw_score_recurrence=raw_score_recurrence,
                 heads=heads,
                 head_dim=head_dim,
                 block_m=block_m,
@@ -530,6 +596,8 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monol
                 key_length,
                 diagonal_or_tail=True,
                 qk_per_warp=qk_per_warp,
+                inline_query_quantization=inline_query_quantization,
+                raw_score_recurrence=False,
                 heads=heads,
                 head_dim=head_dim,
                 block_m=block_m,
@@ -558,8 +626,14 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monol
                     + (batch * heads + head) * tl.cdiv(key_length, block_n)
                     + start_n // block_n
                 )
-                score_scale = query_scale * key_scale
-                scores = integer_scores.to(tl.float32) * score_scale[:, None]
+                if inline_query_quantization:
+                    score_scale = query_scale * key_scale
+                    raw_scores = integer_scores.to(tl.float32).reshape((groups, 32, block_n))
+                    scores = (raw_scores * score_scale[:, None, None]).reshape(
+                        (block_m, block_n)
+                    )
+                else:
+                    scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale
             else:
                 key_scale = tl.load(
                     key_scale_ptr + (batch * heads + head) * key_length + current_n,
@@ -568,12 +642,35 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monol
                 )
                 scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
             valid_keys = current_n[None, :] < key_length
+            if inline_query_quantization and raw_score_recurrence:
+                valid_keys = tl.broadcast_to(valid_keys, (block_m, block_n))
             scores = tl.where(valid_keys, scores, -float("inf"))
 
-            block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_RANGE
+            if inline_query_quantization and raw_score_recurrence:
+                raw_scores = tl.where(
+                    valid_keys.reshape((groups, 32, block_n)),
+                    raw_scores,
+                    -float("inf"),
+                )
+                raw_block_max = tl.max(raw_scores, axis=2)
+                block_max = tl.fma(
+                    raw_block_max,
+                    score_scale[:, None],
+                    -_P_FP8_LOG2_RANGE,
+                ).reshape((block_m,))
+            else:
+                block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_RANGE
             next_max = tl.maximum(running_max, block_max)
             old_weight = tl.exp2(running_max - next_max)
-            probabilities = tl.exp2(scores - next_max[:, None])
+            if inline_query_quantization and raw_score_recurrence:
+                probability_log2 = tl.fma(
+                    raw_scores,
+                    score_scale[:, None, None],
+                    -next_max.reshape((groups, 32, 1)),
+                ).reshape((block_m, block_n))
+                probabilities = tl.exp2(probability_log2)
+            else:
+                probabilities = tl.exp2(scores - next_max[:, None])
             accumulator *= old_weight[:, None]
             denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
 
@@ -674,6 +771,34 @@ def _make_attention_arguments(
     )
 
 
+def _should_use_raw_score_recurrence(
+    qk_per_warp: bool,
+    is_causal: bool,
+    key_length: int,
+    head_dim: int,
+) -> bool:
+    """Select the measured long-loop recurrence without changing its math."""
+    if not qk_per_warp or head_dim != 128:
+        return False
+    minimum_key_length = (
+        _CAUSAL_RAW_SCORE_MIN_KEY_LENGTH if is_causal else _NONCAUSAL_RAW_SCORE_MIN_KEY_LENGTH
+    )
+    return key_length >= minimum_key_length
+
+
+def _should_inline_query_quantization(
+    qk_per_warp: bool,
+    is_causal: bool,
+    key_length: int,
+    head_dim: int,
+) -> bool:
+    """Fuse Q quantization only on the SM12x paths where it wins."""
+    return qk_per_warp and (
+        not is_causal
+        or _should_use_raw_score_recurrence(qk_per_warp, is_causal, key_length, head_dim)
+    )
+
+
 @torch.library.custom_op("piper_kernels::sage_attention_2pp", mutates_args=())
 def triton_sage_attention_2pp(
     query: torch.Tensor,
@@ -686,7 +811,7 @@ def triton_sage_attention_2pp(
     return _run_sage_attention_2pp(query, key, value, scale, is_causal)
 
 
-def _run_sage_attention_2pp(
+def _run_sage_attention_2pp(  # noqa: PLR0915 - keep architecture launch policy explicit
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -759,9 +884,8 @@ def _run_sage_attention_2pp(
         num_warps=4,
     )
 
-    # Contiguous intermediates let the hot kernel specialize its indexing while
-    # these preprocessing kernels continue to accept arbitrary input strides.
-    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+    # Contiguous K/V intermediates let the hot loop specialize its indexing
+    # while preprocessing continues to accept arbitrary input strides.
     key_int8_shape = (batch, heads, storage_key_length, head_dim)
     key_int8 = (
         torch.zeros(key_int8_shape, device=query.device, dtype=torch.int8)
@@ -779,36 +903,24 @@ def _run_sage_attention_2pp(
         )
     )
     qk_per_warp = device_major == 12
+    raw_score_recurrence = _should_use_raw_score_recurrence(
+        qk_per_warp,
+        is_causal,
+        key_length,
+        head_dim,
+    )
+    inline_query_quantization = _should_inline_query_quantization(
+        qk_per_warp,
+        is_causal,
+        key_length,
+        head_dim,
+    )
     if qk_per_warp:
-        query_scale_groups = (query_length + 31) // 32
         key_scale_groups = (key_length + 63) // 64
-        query_scale = torch.empty(
-            (batch, heads, query_scale_groups),
-            device=query.device,
-            dtype=torch.float32,
-        )
         key_scale = torch.empty(
             (batch, heads, key_scale_groups),
             device=query.device,
             dtype=torch.float32,
-        )
-        query_grid = (query_scale_groups, heads, batch)
-        qk_quantization.quantize_query_per_warp_kernel[query_grid](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
-            head_dim=head_dim,
-            num_warps=4,
         )
         _dispatch_kv_quantization_kernel[(key_scale_groups * 2, batch * heads)](
             key,
@@ -838,7 +950,40 @@ def _run_sage_attention_2pp(
             head_dim=head_dim,
             num_warps=4,
         )
+        if inline_query_quantization:
+            query_argument = query
+            # This argument is compiled away in the inline specialization.
+            query_scale_argument = value_scale
+        else:
+            query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+            query_scale_groups = (query_length + 31) // 32
+            query_scale = torch.empty(
+                (batch, heads, query_scale_groups),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            query_grid = (query_scale_groups, heads, batch)
+            qk_quantization.quantize_query_per_warp_kernel[query_grid](
+                query,
+                query_int8,
+                query_scale,
+                query_length,
+                scale,
+                query.stride(0),
+                query.stride(1),
+                query.stride(2),
+                query_int8.stride(0),
+                query_int8.stride(1),
+                query_int8.stride(2),
+                query_scale.stride(0),
+                query_scale.stride(1),
+                head_dim=head_dim,
+                num_warps=4,
+            )
+            query_argument = query_int8
+            query_scale_argument = query_scale
     else:
+        query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
         query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
         key_scale = torch.empty(key.shape[:3], device=query.device, dtype=torch.float32)
         query_grid = (triton.cdiv(query_length, 32) * 8, heads, batch)
@@ -859,6 +1004,8 @@ def _run_sage_attention_2pp(
             head_dim=head_dim,
             num_warps=4,
         )
+        query_argument = query_int8
+        query_scale_argument = query_scale
         key_grid = (triton.cdiv(key_length, 64) * 4, heads, batch)
         qk_quantization.quantize_key_per_thread_kernel[key_grid](
             key,
@@ -908,17 +1055,25 @@ def _run_sage_attention_2pp(
         use_tensor_descriptors,
     )
     _sage_attention_2pp_kernel[(triton.cdiv(query_length, block_m), heads, batch)](
-        query_int8,
+        query_argument,
         key_argument,
         value_argument,
-        query_scale,
+        query_scale_argument,
         key_scale,
         value_scale,
         output,
         query_length,
         key_length,
+        scale,
+        query_argument.stride(0),
+        query_argument.stride(1),
+        query_argument.stride(2),
         is_causal=is_causal,
         qk_per_warp=qk_per_warp,
+        inline_query_quantization=inline_query_quantization,
+        # Reducing before applying the positive row scale cuts spill traffic in
+        # very long loops, but the alternate schedule loses at shorter lengths.
+        raw_score_recurrence=raw_score_recurrence,
         heads=heads,
         head_dim=head_dim,
         block_m=block_m,

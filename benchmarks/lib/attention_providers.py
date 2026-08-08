@@ -148,18 +148,31 @@ def _qk_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
     }
 
 
-def _sage_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
-    quantization_kernels = (
-        {
-            "quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel,
+def _sage_jit_functions(
+    capability: tuple[int, int],
+    *,
+    is_causal: bool,
+    key_length: int,
+    head_dim: int,
+) -> dict[str, object]:
+    if capability[0] == 12:
+        quantization_kernels = {
             "quantize-key-value-role-dispatched": sage_backend._dispatch_kv_quantization_kernel,
         }
-        if capability[0] == 12
-        else {
+        if not sage_backend._should_inline_query_quantization(
+            True,
+            is_causal,
+            key_length,
+            head_dim,
+        ):
+            quantization_kernels["quantize-query-per-warp"] = (
+                qk_backend.quantize_query_per_warp_kernel
+            )
+    else:
+        quantization_kernels = {
             **_qk_jit_functions(capability),
             "quantize-value-per-channel": sage_backend._quantize_value_kernel,
         }
-    )
     return {
         "kv-statistics-partial": sage_backend._kv_statistics_partial_kernel,
         "kv-statistics-finish": sage_backend._finish_kv_statistics_kernel,
@@ -297,7 +310,12 @@ def make_attention_providers(
                 "qk_quantization": qk_quantization_granularity(capability),
                 "pv_accumulation": "fp32+fp16",
             },
-            triton_jit_functions=_sage_jit_functions(capability),
+            triton_jit_functions=_sage_jit_functions(
+                capability,
+                is_causal=config.is_causal,
+                key_length=key.shape[2],
+                head_dim=query.shape[3],
+            ),
         )
     if PYTORCH_SDPA in provider_names:
         providers[PYTORCH_SDPA] = BenchmarkProvider(
