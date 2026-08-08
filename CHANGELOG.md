@@ -21,6 +21,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   Blackwell SM12x through a packaged, fail-closed `m16n8k32` MMAv2 compiler extension
   with exactness and generated-code validation.
 
+### Changed
+
+- Consolidated the Piper, SageAttention2++, canonical CUDA, and SDPA comparisons into
+  the hardware-aware `benchmarks/benchmark_attention.py` development CLI.
+
 ## [0.1.0] - 2026-08-03
 
 ### Added

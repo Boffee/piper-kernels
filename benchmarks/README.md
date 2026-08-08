@@ -160,19 +160,30 @@ The PTX report contains `mma.sync.aligned.m16n8k32...s32.u8.s8.s32`. Add SASS in
 Backend-specific PTX, SASS, and AMDGCN inspection belongs to compiler/profiling tooling
 rather than this portable benchmark runner.
 
-Run the SageAttention2++ provider comparison with:
+Run full-attention comparisons with:
 
 ```shell
-uv run python benchmarks/benchmark_sage_attention_2pp.py
+uv run python benchmarks/benchmark_attention.py
 ```
 
-The default providers are the production pure-Triton SageAttention2++ backend and
-PyTorch SDPA. Add the revision-pinned official CUDA SageAttention2++ and SageAttention2
-providers with:
+The hardware-aware default always includes PyTorch SDPA, adds Piper and its uncentered
+control where Piper's mixed-sign MMA is supported, and adds pure-Triton SageAttention2++
+where FP8 tensor cores are supported. Choose any subset with `--providers`; `--help` lists
+the stable provider names. For example:
+
+```shell
+uv run python benchmarks/benchmark_attention.py \
+  --sequence 8192 \
+  --providers piper piper-centered piper-uncentered piper-affine \
+              pure-triton-sage2pp pytorch-sdpa
+```
+
+Add the revision-pinned official CUDA SageAttention2++ and SageAttention2 providers
+with:
 
 ```shell
 TORCH_CUDA_ARCH_LIST=12.0 uv sync --group benchmark
-uv run python benchmarks/benchmark_sage_attention_2pp.py --canonical
+uv run python benchmarks/benchmark_attention.py --canonical
 ```
 
 Replace `12.0` with `8.9` on RTX 40-series GPUs. The benchmark dependency is
@@ -181,22 +192,42 @@ imported by package production code. SM89 comparisons use canonical per-thread Q
 quantization; SM12x comparisons use canonical per-warp Q/K quantization. Both canonical
 providers enable K smoothing and differ only in their P x V accumulator strategy.
 
-Each row uses the common provider lifecycle and records first-call synchronized wall
-time, warmed device-event execution, warmed synchronized-wall operator latency, quality
-against SDPA, and effective TFLOP/s. Use `--sequence`, `--kv-sequence`, `--head-dim`,
-`--dtype`, and `--causal` to build a shape matrix. JSON and JSONL output use the shared
-versioned benchmark schema.
+Each row uses the common provider lifecycle and records first-call synchronized wall time,
+preparation, warmed device-event execution, complete operator latency, quality against SDPA,
+and effective TFLOP/s. Use `--sequence`, `--kv-sequence`, `--head-dim`, `--dtype`, and
+`--causal` to build a shape matrix. JSON and JSONL output use the shared versioned benchmark
+schema and identify the algorithm and implementation in each provider's configuration.
+
+Piper exposes a more granular lifecycle than ordinary Sage and SDPA operators:
+
+- `preparation` includes compact K/V mean reduction, optional centered-row ordering,
+  Q/K/V quantization, scale metadata, and affine correction metadata when requested;
+- `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
+  and centered-mean epilogue;
+- `operator_end_to_end` runs preparation and the fused kernel as one complete call.
+
+Machine records also identify centering, value-row order, Q/K granularity, and native versus
+affine mixed-sign execution. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled
+research controls remain reproducible from the `wip/sage-integer-attention` checkpoint at
+`b75f3ee`; they are not copied into the installed package.
 
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell
-uv run python benchmarks/benchmark_sage_attention_2pp.py \
-  --sequence 8192 --compiler-report --compiler-json artifacts/sage2pp-compiler.json
+uv run python benchmarks/benchmark_attention.py \
+  --sequence 8192 --providers pure-triton-sage2pp \
+  --compiler-report --compiler-json artifacts/sage2pp-compiler.json
+
+uv run python benchmarks/benchmark_attention.py \
+  --sequence 8192 --providers piper --compiler-report --no-sass
 
 nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
-  uv run python benchmarks/benchmark_sage_attention_2pp.py \
+  uv run python benchmarks/benchmark_attention.py \
   --sequence 8192 --profile --profile-provider pure-triton-sage2pp
 ```
+
+When more than one Triton provider is selected, use `--compiler-provider` to choose which
+one to inspect. Combined profiling and compiler inspection must target the same provider.
 
 ### SageAttention2++ regression baseline
 
@@ -216,57 +247,6 @@ spills, 49,704 bytes of shared memory per workgroup, and four warps. Its SASS co
 expected 64 signed INT8 QK MMA instructions and 64 E4M3 x E4M3 to FP16 PV MMA instructions.
 The complete GPU suite passed 155 tests. These measurements are a regression reference for
 this hardware/software stack, not a portable performance guarantee.
-
-## Piper Attention
-
-Run the production Piper Attention comparison with:
-
-```shell
-uv run python benchmarks/benchmark_piper_attention.py
-```
-
-The default matrix includes the dispatch-selected Piper path, its uncentered control,
-and PyTorch SDPA. On FP8-capable GPUs it also includes pure-Triton SageAttention2++.
-Add `--canonical` for the same revision-pinned canonical CUDA SageAttention2++ and
-SageAttention2 providers described above. These explicit 8+8 providers require FP8;
-the canonical package's RTX 30 fallback uses a different FP16-PV algorithm and is not
-substituted silently. Select `piper-centered` to force centering or `piper-affine` to
-replace native mixed-sign MMA with the exact signed-INT8 affine proxy:
-
-```shell
-uv run python benchmarks/benchmark_piper_attention.py \
-  --sequence 8192 \
-  --providers piper piper-centered piper-uncentered piper-affine \
-              pure-triton-sage2pp pytorch-sdpa \
-  --canonical
-```
-
-Piper's provider uses the shared preparation/execution contract more granularly than
-the ordinary Sage and SDPA operators:
-
-- `preparation` includes compact K/V mean reduction, optional centered-row ordering,
-  Q/K/V quantization, scale metadata, and affine correction metadata when requested;
-- `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
-  and centered-mean epilogue;
-- `operator_end_to_end` runs preparation and the fused kernel as one complete call.
-
-Every row reports quality against SDPA, including SQNR and relative errors in JSON.
-Machine records identify centering, value-row order, Q/K granularity, and native versus
-affine mixed-sign execution. The benchmark intentionally imports only production
-modules. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research
-controls remain reproducible from the `wip/sage-integer-attention` checkpoint at
-`b75f3ee`; they are not copied into the installed package.
-
-Compiler inspection and phase-selective profiler capture work through the same options:
-
-```shell
-uv run python benchmarks/benchmark_piper_attention.py \
-  --sequence 8192 --providers piper --compiler-report --no-sass
-
-nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
-  uv run python benchmarks/benchmark_piper_attention.py \
-  --sequence 8192 --providers piper --profile --profile-phase prepared_execution
-```
 
 ### Piper Attention regression baseline
 
