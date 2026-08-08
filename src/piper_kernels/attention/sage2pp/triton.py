@@ -165,6 +165,97 @@ def _quantize_value_kernel(
 
 
 @triton.jit
+def _dispatch_kv_quantization_kernel(
+    key_ptr,
+    value_ptr,
+    key_mean_ptr,
+    value_scale_ptr,
+    key_output_ptr,
+    value_output_ptr,
+    key_scale_ptr,
+    key_length,
+    key_groups,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_kob,
+    stride_koh,
+    stride_kon,
+    stride_vob,
+    stride_voh,
+    stride_von,
+    stride_ksb,
+    stride_ksh,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Dispatch uniform K and V quantization roles from one grid."""
+    role = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch = batch_head // heads
+    head = batch_head % heads
+    offsets_d = tl.arange(0, head_dim)
+
+    if role < key_groups:
+        key_offsets_n = role * 64 + tl.arange(0, 64)
+        key_mask = key_offsets_n[:, None] < key_length
+        key_mean = tl.load(key_mean_ptr + batch_head * head_dim + offsets_d)
+        key_values = tl.load(
+            key_ptr
+            + batch * stride_kb
+            + head * stride_kh
+            + key_offsets_n[:, None] * stride_kn
+            + offsets_d[None, :],
+            mask=key_mask,
+            other=0.0,
+        ).to(tl.float32)
+        key_values = tl.where(key_mask, key_values - key_mean[None, :], 0.0)
+        key_maximum = tl.max(tl.max(tl.abs(key_values), axis=1), axis=0)
+        key_scale = key_maximum / 127.0 + _SCALE_EPSILON
+        key_quantized = qk_quantization.round_to_int8(key_values / key_scale)
+        tl.store(
+            key_output_ptr
+            + batch * stride_kob
+            + head * stride_koh
+            + key_offsets_n[:, None] * stride_kon
+            + offsets_d[None, :],
+            key_quantized,
+            mask=key_mask,
+        )
+        tl.store(
+            key_scale_ptr + batch * stride_ksb + head * stride_ksh + role,
+            key_scale,
+        )
+    else:
+        value_scale_group = role - key_groups
+        value_offsets_n = value_scale_group * 64 + tl.arange(0, 64)
+        value_mask = value_offsets_n[:, None] < key_length
+        value_values = tl.load(
+            value_ptr
+            + batch * stride_vb
+            + head * stride_vh
+            + value_offsets_n[:, None] * stride_vn
+            + offsets_d[None, :],
+            mask=value_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_scale = tl.load(value_scale_ptr + batch_head * head_dim + offsets_d)
+        value_quantized = (value_values / value_scale[None, :]).to(tl.float8e4nv)
+        tl.store(
+            value_output_ptr
+            + batch * stride_vob
+            + head * stride_voh
+            + offsets_d[None, :] * stride_von
+            + value_offsets_n[:, None],
+            value_quantized,
+            mask=value_mask,
+        )
+
+
+@triton.jit
 def _load_value_tile(
     value_ptr,
     batch,
@@ -719,24 +810,32 @@ def _run_sage_attention_2pp(
             head_dim=head_dim,
             num_warps=4,
         )
-        key_grid = (key_scale_groups, heads, batch)
-        qk_quantization.quantize_key_per_block_kernel[key_grid](
+        _dispatch_kv_quantization_kernel[(key_scale_groups * 2, batch * heads)](
             key,
+            value,
             key_mean,
+            value_scale,
             key_int8,
+            value_fp8,
             key_scale,
             key_length,
+            key_scale_groups,
             key.stride(0),
             key.stride(1),
             key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
             key_int8.stride(0),
             key_int8.stride(1),
             key_int8.stride(2),
+            value_fp8.stride(0),
+            value_fp8.stride(1),
+            value_fp8.stride(2),
             key_scale.stride(0),
             key_scale.stride(1),
             heads=heads,
             head_dim=head_dim,
-            block_n=64,
             num_warps=4,
         )
     else:
@@ -779,23 +878,24 @@ def _run_sage_attention_2pp(
             head_dim=head_dim,
             num_warps=4,
         )
-    value_grid = (triton.cdiv(key_length, 64), heads, batch)
-    _quantize_value_kernel[value_grid](
-        value,
-        value_scale,
-        value_fp8,
-        key_length,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        value_fp8.stride(0),
-        value_fp8.stride(1),
-        value_fp8.stride(2),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=64,
-        num_warps=4,
-    )
+    if not qk_per_warp:
+        value_grid = (triton.cdiv(key_length, 64), heads, batch)
+        _quantize_value_kernel[value_grid](
+            value,
+            value_scale,
+            value_fp8,
+            key_length,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value_fp8.stride(0),
+            value_fp8.stride(1),
+            value_fp8.stride(2),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=64,
+            num_warps=4,
+        )
 
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     key_argument, value_argument = _make_attention_arguments(
