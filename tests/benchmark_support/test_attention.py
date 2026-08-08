@@ -1,5 +1,6 @@
 import pytest
-from lib.attention import AttentionConfig, AttentionShape
+import torch
+from lib.attention import AttentionConfig, AttentionShape, make_attention_inputs
 
 
 def test_attention_shape_expands_implicit_kv_heads() -> None:
@@ -54,3 +55,18 @@ def test_attention_config_uses_stable_names() -> None:
         "scale": 0.125,
         "qkv_layout": "BHSD",
     }
+
+
+def test_attention_inputs_follow_mha_and_gqa_shapes() -> None:
+    shape = AttentionShape(2, 8, 5, 7, 64, num_key_value_heads=2)
+
+    query, key, value = make_attention_inputs(
+        shape,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        generator=torch.Generator().manual_seed(10),
+    )
+
+    assert query.shape == (2, 8, 5, 64)
+    assert key.shape == value.shape == (2, 2, 7, 64)
+    assert query.dtype is key.dtype is value.dtype is torch.float16

@@ -18,7 +18,7 @@ from piper_kernels.attention.piper import triton as piper_backend
 from piper_kernels.attention.piper.dispatch import _default_center_value
 from piper_kernels.attention.sage2pp import triton as sage_backend
 
-from .attention import AttentionConfig
+from .attention import AttentionConfig, AttentionInputs
 from .providers import BenchmarkProvider
 
 CANONICAL_VERSION = "2.2.0"
@@ -47,7 +47,6 @@ PIPER_PROVIDERS = (PIPER, PIPER_CENTERED, PIPER_UNCENTERED, PIPER_AFFINE)
 FP8_SAGE_PROVIDERS = (PURE_TRITON_SAGE2PP, CANONICAL_SAGE2PP, CANONICAL_SAGE2)
 TRITON_PROVIDERS = (*PIPER_PROVIDERS, PURE_TRITON_SAGE2PP)
 
-type AttentionInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type AttentionProvider = BenchmarkProvider[object, torch.Tensor]
 type CanonicalSage = Callable[..., torch.Tensor]
 

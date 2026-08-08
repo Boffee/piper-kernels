@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
+type AttentionInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
 
 @dataclass(frozen=True, slots=True)
 class AttentionShape:
@@ -65,3 +69,28 @@ class AttentionConfig:
             "scale": self.scale,
             "qkv_layout": self.qkv_layout,
         }
+
+
+def make_attention_inputs(
+    shape: AttentionShape,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    generator: torch.Generator,
+) -> AttentionInputs:
+    """Create reproducible random Q/K/V tensors for an attention shape."""
+    query = torch.randn(
+        (shape.batch_size, shape.num_query_heads, shape.query_length, shape.head_dim),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    key_shape = (
+        shape.batch_size,
+        shape.effective_num_key_value_heads,
+        shape.key_value_length,
+        shape.head_dim,
+    )
+    key = torch.randn(key_shape, device=device, dtype=dtype, generator=generator)
+    value = torch.randn(key_shape, device=device, dtype=dtype, generator=generator)
+    return query, key, value

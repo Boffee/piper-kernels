@@ -47,6 +47,31 @@ measurement = measure_provider(provider, warmup_ms=100, measurement_time_ms=500)
 dimension without assuming self-attention or MHA. `AttentionConfig` records dtype,
 causality, scale, and an explicit QKV layout such as `BHSD`.
 
+## Offline configuration tuning
+
+`tune_candidates()` provides a small offline search loop for development. Kernel-specific
+adapters define named configurations and construct `BenchmarkProvider` instances; the shared
+runner compiles each candidate, applies an optional quality gate, measures either prepared
+execution or the complete operator, and selects the fastest passing candidate. Unsupported and
+out-of-resource candidates are recorded rather than aborting the search. Unexpected failures
+still propagate so implementation and compiler bugs remain visible.
+
+This tooling never changes production dispatch or autotunes in a user's hot path. Every candidate
+is available as a versioned record accepted by the common JSON/JSONL writer, and the winner is
+marked with `selected: true`.
+
+The executable Piper Attention example compares pointer and tensor-descriptor load schedules:
+
+```shell
+uv run python benchmarks/tune_piper_attention.py \
+  --sequence 8192 \
+  --json artifacts/piper-tuning.json
+```
+
+Use `--phase operator_end_to_end` to include preprocessing in the ranking. The default
+`prepared_execution` phase compares only the prepared fused recurrence. On targets where a
+candidate is unsupported, it remains in the report with `status: skipped`.
+
 ## Quality and reproducibility
 
 `measure_quality()` centralizes mean/max absolute error, relative L1 and L2 error,
