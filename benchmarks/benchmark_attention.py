@@ -20,6 +20,7 @@ from lib import (
     capture_environment,
     format_compiler_report,
     inspect_provider,
+    make_attention_inputs,
     measure_provider,
     measure_quality,
     output_target,
@@ -29,7 +30,6 @@ from lib import (
 from lib.attention_providers import (
     PROVIDER_NAMES,
     TRITON_PROVIDERS,
-    AttentionInputs,
     AttentionProvider,
     make_attention_providers,
     resolve_provider_names,
@@ -171,30 +171,6 @@ def _output_targets(args: argparse.Namespace) -> tuple[OutputTarget | None, Outp
 
 def _dtype(name: str) -> torch.dtype:
     return {"bfloat16": torch.bfloat16, "float16": torch.float16}[name]
-
-
-def _make_inputs(
-    shape: AttentionShape,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    generator: torch.Generator,
-) -> AttentionInputs:
-    query = torch.randn(
-        (shape.batch_size, shape.num_query_heads, shape.query_length, shape.head_dim),
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
-    key_shape = (
-        shape.batch_size,
-        shape.effective_num_key_value_heads,
-        shape.key_value_length,
-        shape.head_dim,
-    )
-    key = torch.randn(key_shape, device=device, dtype=dtype, generator=generator)
-    value = torch.randn(key_shape, device=device, dtype=dtype, generator=generator)
-    return query, key, value
 
 
 def _effective_tflops(
@@ -340,7 +316,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             key_value_length=key_value_length,
             head_dim=args.head_dim,
         )
-        inputs = _make_inputs(
+        inputs = make_attention_inputs(
             shape,
             dtype=_dtype(args.dtype),
             device=device,

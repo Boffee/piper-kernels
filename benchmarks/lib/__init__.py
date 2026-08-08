@@ -1,6 +1,6 @@
 """Reusable library for piper-kernels development benchmarks."""
 
-from .attention import AttentionConfig, AttentionShape
+from .attention import AttentionConfig, AttentionInputs, AttentionShape, make_attention_inputs
 from .environment import EnvironmentInfo, capture_environment
 from .profiling import (
     CaptureController,
@@ -40,9 +40,19 @@ from .triton_inspection import (
     format_compiler_report,
     inspect_provider,
 )
+from .tuning import (
+    TuningCandidate,
+    TuningPhase,
+    TuningRecord,
+    TuningRun,
+    TuningStatus,
+    UnsupportedTuningCandidateError,
+    tune_candidates,
+)
 
 __all__ = [
     "AttentionConfig",
+    "AttentionInputs",
     "AttentionShape",
     "BenchmarkProvider",
     "BenchmarkRecord",
@@ -66,12 +76,19 @@ __all__ = [
     "TritonCompilerRecord",
     "TritonInspectionError",
     "TritonSpecializationReport",
+    "TuningCandidate",
+    "TuningPhase",
+    "TuningRecord",
+    "TuningRun",
+    "TuningStatus",
+    "UnsupportedTuningCandidateError",
     "add_compiler_inspection_arguments",
     "add_output_arguments",
     "add_profile_arguments",
     "capture_environment",
     "format_compiler_report",
     "inspect_provider",
+    "make_attention_inputs",
     "measure_provider",
     "measure_quality",
     "measure_saturation",
@@ -80,5 +97,6 @@ __all__ = [
     "synchronized_wall_benchmark",
     "time_first_call",
     "triton_benchmark",
+    "tune_candidates",
     "write_records",
 ]

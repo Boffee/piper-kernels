@@ -20,6 +20,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Stock-Triton native `UINT8 x INT8 -> INT32` support on NVIDIA SM8x and consumer
   Blackwell SM12x through a packaged, fail-closed `m16n8k32` MMAv2 compiler extension
   with exactness and generated-code validation.
+- Reusable offline kernel-configuration tuning with quality gates, recorded candidate
+  failures, deterministic winner selection, and an executable Piper Attention example.
 
 ### Changed
 
