@@ -4,6 +4,7 @@ SageAttention2++ originates from the SageAttention project. See the repository
 NOTICE for upstream attribution.
 """
 
+import math
 from typing import Literal
 
 import torch
@@ -17,7 +18,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 
 _PV_BLOCK = 64
-_P_FP8_RANGE = 448.0
+_P_FP8_LN_RANGE = math.log(448.0)
 _V_FP8_RANGE = 2.25
 _SCALE_EPSILON = 1e-7
 
@@ -99,7 +100,9 @@ def reference_sage_attention_2pp(
                 -float("inf"),
             )
 
-        block_max = scores.amax(dim=-1)
+        # Canonical Sage2++ shifts the online-softmax frame so the largest
+        # probability is already in FP8's usable range.
+        block_max = scores.amax(dim=-1) - _P_FP8_LN_RANGE
         next_max = torch.maximum(running_max, block_max)
         old_weight = torch.exp(running_max - next_max)
         probabilities = torch.exp(scores - next_max[..., None])
@@ -108,13 +111,13 @@ def reference_sage_attention_2pp(
         accumulator *= old_weight[..., None]
         denominator = denominator * old_weight + probabilities.sum(dim=-1)
 
-        probability_fp8 = (probabilities * _P_FP8_RANGE).to(torch.float8_e4m3fn)
+        probability_fp8 = probabilities.to(torch.float8_e4m3fn)
         value_block = value_fp8[:, :, start:stop]
         # Rounding the complete 64-wide product to FP16 approximates the two
         # K=32 hardware MMAs that share an FP16 accumulator.
         partial = torch.matmul(probability_fp8.float(), value_block.float())
         partial = partial.to(torch.float16).float()
-        accumulator += partial * (value_scale[:, :, None, :] / _P_FP8_RANGE)
+        accumulator += partial * value_scale[:, :, None, :]
         running_max = next_max
 
     output = accumulator / denominator.clamp_min(1e-30)[..., None]

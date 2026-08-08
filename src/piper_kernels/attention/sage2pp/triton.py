@@ -19,7 +19,9 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 from piper_kernels.attention.scheduling import select_query_block
 
-_P_FP8_RANGE = tl.constexpr(448.0)
+# Canonical Sage2++ shifts the online-softmax frame by log2(448), so
+# probabilities are born in FP8's usable range instead of scaled afterward.
+_P_FP8_LOG2_RANGE = tl.constexpr(8.807354922057604)
 _V_FP8_RANGE = tl.constexpr(2.25)
 _SCALE_EPSILON = tl.constexpr(1e-7)
 
@@ -111,10 +113,9 @@ def _finish_kv_statistics_kernel(
         mask=offsets_d < head_dim,
     )
     value_scale = tl.max(value_maxima, axis=0) / _V_FP8_RANGE + _SCALE_EPSILON
-    # Fold the probability range into the scale consumed by the attention loop.
     tl.store(
         value_scale_ptr + output_offsets,
-        value_scale / _P_FP8_RANGE,
+        value_scale,
         mask=offsets_d < head_dim,
     )
 
@@ -150,7 +151,7 @@ def _quantize_value_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d) * _P_FP8_RANGE
+    scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
     quantized = (value / scale[None, :]).to(tl.float8e4nv)
     tl.store(
         output_ptr
@@ -241,7 +242,100 @@ def _load_attention_value_tile(
 
 
 @triton.jit
-def _sage_attention_2pp_kernel(
+def _causal_attention_tile(
+    query,
+    query_scale,
+    key_ptr,
+    value_ptr,
+    key_scale_ptr,
+    accumulator,
+    denominator,
+    running_max,
+    batch,
+    head,
+    batch_head,
+    start_n,
+    offsets_m,
+    offsets_n,
+    offsets_d,
+    key_length,
+    diagonal_or_tail: tl.constexpr,
+    qk_per_warp: tl.constexpr,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    use_tensor_descriptors: tl.constexpr,
+):
+    """Advance causal online-softmax state by one prefix or boundary tile."""
+    current_n = start_n + offsets_n
+    key = _load_attention_key_tile(
+        key_ptr,
+        batch_head,
+        start_n,
+        current_n,
+        offsets_d,
+        key_length,
+        head_dim,
+        block_n,
+        use_tensor_descriptors,
+    )
+    integer_scores = tl.dot(query, key)
+    if qk_per_warp:
+        key_scale = tl.load(
+            key_scale_ptr
+            + (batch * heads + head) * tl.cdiv(key_length, block_n)
+            + start_n // block_n
+        )
+        score_scale = query_scale * key_scale
+        scores = integer_scores.to(tl.float32) * score_scale[:, None]
+    else:
+        key_scale = tl.load(
+            key_scale_ptr + (batch * heads + head) * key_length + current_n,
+            mask=current_n < key_length,
+            other=0.0,
+        )
+        scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+    if diagonal_or_tail:
+        valid_keys = (current_n[None, :] < key_length) & (
+            current_n[None, :] <= offsets_m[:, None]
+        )
+        scores = tl.where(valid_keys, scores, -float("inf"))
+
+    block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_RANGE
+    next_max = tl.maximum(running_max, block_max)
+    old_weight = tl.exp2(running_max - next_max)
+    probabilities = tl.exp2(scores - next_max[:, None])
+    accumulator *= old_weight[:, None]
+    denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
+
+    probability_fp8 = probabilities.to(tl.float8e4nv)
+    value = _load_attention_value_tile(
+        value_ptr,
+        batch,
+        head,
+        batch_head,
+        start_n,
+        current_n,
+        offsets_d,
+        key_length,
+        use_tensor_descriptors,
+        heads,
+        head_dim,
+        block_n,
+    )
+    partial_fp16 = tl.dot(
+        probability_fp8,
+        value,
+        acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
+        out_dtype=tl.float16,
+    )
+    accumulator += partial_fp16.to(tl.float32)
+    return accumulator, denominator, next_max
+
+
+@triton.jit
+def _sage_attention_2pp_kernel(  # noqa: PLR0915 - keep the noncausal loop monolithic
     query_ptr,
     key_ptr,
     value_ptr,
@@ -292,71 +386,129 @@ def _sage_attention_2pp_kernel(
     if is_causal:
         end_n = tl.minimum(key_length, (query_block + 1) * block_m)
 
-    for start_n in tl.range(0, end_n, block_n, disable_licm=True):
-        current_n = start_n + offsets_n
-        batch_head = batch * heads + head
-        key = _load_attention_key_tile(
-            key_ptr,
-            batch_head,
-            start_n,
-            current_n,
-            offsets_d,
-            key_length,
-            head_dim,
-            block_n,
-            use_tensor_descriptors,
-        )
-        integer_scores = tl.dot(query, key)
-        if qk_per_warp:
-            key_scale = tl.load(
-                key_scale_ptr
-                + (batch * heads + head) * tl.cdiv(key_length, block_n)
-                + start_n // block_n
+    batch_head = batch * heads + head
+    if is_causal:
+        # Omit masks only for complete key tiles strictly before this query
+        # block. Ragged tails and overlapping 64-key scale groups stay masked.
+        full_key_end = key_length // block_n * block_n
+        causal_prefix_end = query_block * block_m // block_n * block_n
+        prefix_end = tl.minimum(causal_prefix_end, full_key_end)
+        for start_n in tl.range(0, prefix_end, block_n, disable_licm=True):
+            accumulator, denominator, running_max = _causal_attention_tile(
+                query,
+                query_scale,
+                key_ptr,
+                value_ptr,
+                key_scale_ptr,
+                accumulator,
+                denominator,
+                running_max,
+                batch,
+                head,
+                batch_head,
+                start_n,
+                offsets_m,
+                offsets_n,
+                offsets_d,
+                key_length,
+                diagonal_or_tail=False,
+                qk_per_warp=qk_per_warp,
+                heads=heads,
+                head_dim=head_dim,
+                block_m=block_m,
+                block_n=block_n,
+                use_tensor_descriptors=use_tensor_descriptors,
             )
-            score_scale = query_scale * key_scale
-            scores = integer_scores.to(tl.float32) * score_scale[:, None]
-        else:
-            key_scale = tl.load(
-                key_scale_ptr + (batch * heads + head) * key_length + current_n,
-                mask=current_n < key_length,
-                other=0.0,
+        for start_n in tl.range(prefix_end, end_n, block_n, disable_licm=True):
+            accumulator, denominator, running_max = _causal_attention_tile(
+                query,
+                query_scale,
+                key_ptr,
+                value_ptr,
+                key_scale_ptr,
+                accumulator,
+                denominator,
+                running_max,
+                batch,
+                head,
+                batch_head,
+                start_n,
+                offsets_m,
+                offsets_n,
+                offsets_d,
+                key_length,
+                diagonal_or_tail=True,
+                qk_per_warp=qk_per_warp,
+                heads=heads,
+                head_dim=head_dim,
+                block_m=block_m,
+                block_n=block_n,
+                use_tensor_descriptors=use_tensor_descriptors,
             )
-            scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
-        valid_keys = current_n[None, :] < key_length
-        if is_causal:
-            valid_keys &= current_n[None, :] <= offsets_m[:, None]
-        scores = tl.where(valid_keys, scores, -float("inf"))
+    else:
+        # Keep the noncausal loop monolithic to preserve its register allocation.
+        for start_n in tl.range(0, end_n, block_n, disable_licm=True):
+            current_n = start_n + offsets_n
+            key = _load_attention_key_tile(
+                key_ptr,
+                batch_head,
+                start_n,
+                current_n,
+                offsets_d,
+                key_length,
+                head_dim,
+                block_n,
+                use_tensor_descriptors,
+            )
+            integer_scores = tl.dot(query, key)
+            if qk_per_warp:
+                key_scale = tl.load(
+                    key_scale_ptr
+                    + (batch * heads + head) * tl.cdiv(key_length, block_n)
+                    + start_n // block_n
+                )
+                score_scale = query_scale * key_scale
+                scores = integer_scores.to(tl.float32) * score_scale[:, None]
+            else:
+                key_scale = tl.load(
+                    key_scale_ptr + (batch * heads + head) * key_length + current_n,
+                    mask=current_n < key_length,
+                    other=0.0,
+                )
+                scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+            valid_keys = current_n[None, :] < key_length
+            scores = tl.where(valid_keys, scores, -float("inf"))
 
-        block_max = tl.max(scores, axis=1)
-        next_max = tl.maximum(running_max, block_max)
-        old_weight = tl.exp2(running_max - next_max)
-        probabilities = tl.exp2(scores - next_max[:, None])
-        accumulator *= old_weight[:, None]
-        denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
+            block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_RANGE
+            next_max = tl.maximum(running_max, block_max)
+            old_weight = tl.exp2(running_max - next_max)
+            probabilities = tl.exp2(scores - next_max[:, None])
+            accumulator *= old_weight[:, None]
+            denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
 
-        probability_fp8 = (probabilities * _P_FP8_RANGE).to(tl.float8e4nv)
-        value = _load_attention_value_tile(
-            value_ptr,
-            batch,
-            head,
-            batch_head,
-            start_n,
-            current_n,
-            offsets_d,
-            key_length,
-            use_tensor_descriptors,
-            heads,
-            head_dim,
-            block_n,
-        )
-        partial_fp16 = tl.dot(
-            probability_fp8,
-            value,
-            acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
-            out_dtype=tl.float16,
-        )
-        accumulator += partial_fp16.to(tl.float32)
-        running_max = next_max
+            probability_fp8 = probabilities.to(tl.float8e4nv)
+            value = _load_attention_value_tile(
+                value_ptr,
+                batch,
+                head,
+                batch_head,
+                start_n,
+                current_n,
+                offsets_d,
+                key_length,
+                use_tensor_descriptors,
+                heads,
+                head_dim,
+                block_n,
+            )
+            partial_fp16 = tl.dot(
+                probability_fp8,
+                value,
+                acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
+                out_dtype=tl.float16,
+            )
+            accumulator += partial_fp16.to(tl.float32)
+            running_max = next_max
 
     output = accumulator / denominator[:, None]
     value_scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
