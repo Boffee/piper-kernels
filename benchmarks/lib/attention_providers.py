@@ -149,11 +149,18 @@ def _qk_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
 
 
 def _sage_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
+    quantization_kernels = (
+        {"quantize-key-value-role-dispatched": sage_backend._dispatch_kv_quantization_kernel}
+        if capability[0] == 12
+        else {
+            **_qk_jit_functions(capability),
+            "quantize-value-per-channel": sage_backend._quantize_value_kernel,
+        }
+    )
     return {
         "kv-statistics-partial": sage_backend._kv_statistics_partial_kernel,
         "kv-statistics-finish": sage_backend._finish_kv_statistics_kernel,
-        **_qk_jit_functions(capability),
-        "quantize-value-per-channel": sage_backend._quantize_value_kernel,
+        **quantization_kernels,
         "attention": sage_backend._sage_attention_2pp_kernel,
     }
 

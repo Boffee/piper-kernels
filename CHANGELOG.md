@@ -27,6 +27,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Consolidated the Piper, SageAttention2++, canonical CUDA, and SDPA comparisons into
   the hardware-aware `benchmarks/benchmark_attention.py` development CLI.
+- Brought the SM12x Triton SageAttention2++ path closer to canonical CUDA throughput by
+  fusing per-warp query quantization into attention, dispatching K/V quantization from
+  one launch, matching canonical's FP8-scaled online-softmax recurrence, and specializing
+  long score recurrences and causal mask-free prefixes through 128K tokens.
 
 ## [0.1.0] - 2026-08-03
 

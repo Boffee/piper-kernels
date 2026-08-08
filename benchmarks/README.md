@@ -256,6 +256,11 @@ one to inspect. Combined profiling and compiler inspection must target the same 
 
 ### SageAttention2++ regression baseline
 
+The later SM120 optimization investigation, including 32K–128K causal and non-causal
+results, roofline analysis, accepted changes, and rejected experiments, is recorded in
+[the SageAttention2++ SM120 performance findings](../docs/sage2pp-sm120-performance.md).
+The issue #8 table below remains the historical productionization checkpoint.
+
 The issue #8 productionization was validated on an RTX 5090 (SM120) with Torch
 2.12.1+cu130 and Triton 3.7.1. For FP16 B1/H8/D128 non-causal self-attention at
 N=8192, a one-second warmed sample measured:

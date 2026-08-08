@@ -5,6 +5,7 @@ from typing import Literal
 import pytest
 import torch
 
+import piper_kernels.attention.sage2pp.triton as sage_backend
 from piper_kernels._triton.targets import supports_fp8_fp16_mma
 from piper_kernels.attention import sage_attention_2pp
 from piper_kernels.attention.sage2pp.reference import reference_sage_attention_2pp
@@ -59,6 +60,53 @@ def test_triton_matches_quantized_reference(
 
     assert actual.shape == query.shape
     assert actual.dtype is dtype
+    assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="raw-score recurrence is selected for grouped SM12x quantization",
+)
+@pytest.mark.parametrize(
+    ("is_causal", "threshold_name"),
+    [
+        (False, "_NONCAUSAL_RAW_SCORE_MIN_KEY_LENGTH"),
+        (True, "_CAUSAL_RAW_SCORE_MIN_KEY_LENGTH"),
+    ],
+)
+def test_raw_score_recurrence_matches_quantized_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    is_causal: bool,
+    threshold_name: str,
+) -> None:
+    monkeypatch.setattr(sage_backend, threshold_name, 0)
+    assert sage_backend._should_use_raw_score_recurrence(True, is_causal, 193, 128)
+    assert not sage_backend._should_use_raw_score_recurrence(True, is_causal, 193, 64)
+    torch.manual_seed(432)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    with torch.no_grad():
+        actual = _run_sage_attention_2pp(
+            query,
+            key,
+            value,
+            128**-0.5,
+            is_causal,
+        )
+        expected = reference_sage_attention_2pp(
+            query,
+            key,
+            value,
+            128**-0.5,
+            is_causal,
+            qk_quantization="per_warp",
+        )
+    error = (actual.float() - expected.float()).abs()
+
     assert torch.isfinite(actual).all()
     assert error.mean().item() < 0.003
     assert error.max().item() < 0.12

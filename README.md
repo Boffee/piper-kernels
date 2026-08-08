@@ -119,7 +119,9 @@ portable quantized reference.
 Install either optimized attention backend with `piper-kernels[triton]`. The official CUDA
 SageAttention package is a revision-pinned, optional benchmark dependency only; it is
 not imported by production code. See [benchmarks/README.md](benchmarks/README.md) for
-the reproducible provider comparison.
+the reproducible provider comparison and the
+[SM120 SageAttention2++ performance findings](docs/sage2pp-sm120-performance.md) for the
+selected long-sequence design and rejected experiments.
 
 ## Dependency direction
 
