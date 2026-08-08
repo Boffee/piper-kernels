@@ -607,13 +607,12 @@ def _run_sage_attention_2pp(
     """Run canonical SageAttention2++ with architecture-specific scheduling."""
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
-    # The 128-row causal variant creates severe accumulator spills in the
-    # current NVIDIA lowering; 64 rows avoids that spill-heavy code shape.
-    block_m = (
-        64
-        if is_causal
-        else select_query_block(query, batch, heads, query_length)
-    )
+    device_major = torch.cuda.get_device_capability(query.device)[0]
+    block_m = select_query_block(query, batch, heads, query_length)
+    # For causal SM120 kernels, 64 rows win through 4K; at longer lengths the
+    # K/V reuse of 128 rows outweighs the larger accumulator footprint.
+    if is_causal and (device_major != 12 or query_length <= 4096):
+        block_m = min(block_m, 64)
     padded_key_length = int(triton.cdiv(key_length, 64)) * 64
     if use_tensor_descriptors is None:
         use_tensor_descriptors = _should_use_attention_tensor_descriptors(
@@ -688,7 +687,7 @@ def _run_sage_attention_2pp(
             dtype=torch.float8_e4m3fn,
         )
     )
-    qk_per_warp = torch.cuda.get_device_capability(query.device)[0] == 12
+    qk_per_warp = device_major == 12
     if qk_per_warp:
         query_scale_groups = (query_length + 31) // 32
         key_scale_groups = (key_length + 63) // 64
