@@ -1,9 +1,13 @@
-# ConvRot optimization findings
+# ConvRot core optimization findings
 
 This document records the ConvRot investigation on the `convrot-optimization`
 branch. It is an experimental reference, not a request to merge the branch
 mechanically. The intended next step is to reimplement the selected design from
 the main branch with a smaller, review-oriented patch.
+
+Start with [the incremental adoption roadmap](convrot-adoption.md). It separates
+the branch-implemented ConvRot operator from the later benchmark-only
+[follow-on experiments](convrot-follow-on-experiments.md).
 
 ```text
 Base commit:       acdd9a6
@@ -75,7 +79,7 @@ Kitchen's fused CUDA kernel instead keeps SwiGLU and rotation in FP32 and uses
 CUDA fast math, so the two fused implementations are close but not expected to
 be byte-identical.
 
-## Selected design
+## Branch-implemented core design
 
 ### 1. Factorize every H4 quartet
 
@@ -140,7 +144,7 @@ from this GEMM work. For the narrower attention-output and FC2 projections,
 activation preparation supplies the win and offsets a small GEMM disadvantage
 relative to Comfy Kitchen.
 
-### 4. Fuse SwiGLU only at an explicit API boundary
+### 4. Fuse raw FC2 input-SwiGLU only at an explicit API boundary
 
 `linear_input_act(input, weight, "swiglu", bias)` accepts a raw `[gate | up]`
 tensor whose final dimension is `2K`. It avoids implicit graph matching and
@@ -168,7 +172,7 @@ Row indices are cast to 64 bits before multiplying by row strides in fused
 preparation and GEMM pointer expressions. This is a correctness requirement, not
 a speed optimization.
 
-## Production dispatch retained on this branch
+## Branch runtime dispatch and fallbacks
 
 The exact one-pass path is intentionally conservative:
 
@@ -337,7 +341,7 @@ the three H3 widths. That normally limits it to one CTA per SM. The exact SM120
 binary inspected during this study reported 29 registers/thread without an input
 activation and 37 with SwiGLU, with no local stack spill.
 
-## Experiments and decisions
+## Core formulation decisions
 
 | Experiment | Finding | Decision |
 |:---|:---|:---|
@@ -381,7 +385,7 @@ because `tl.exp` and PyTorch's SiLU implementation are not guaranteed to use the
 same approximation. Tests therefore constrain preparation codes/scales directly
 and use an output tolerance for the fused public operation.
 
-## Clean-room implementation order
+## Core adoption ladder
 
 For the integration branch, reimplement the design in this order instead of
 copying the experimental diff wholesale:

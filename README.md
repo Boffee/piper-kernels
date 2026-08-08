@@ -44,9 +44,10 @@ materialize SwiGLU and then dispatch the ordinary ConvRot linear. The helper is 
 experimental API on this optimization branch; the clean integration will reassess the
 public boundary.
 
-The experimental design rationale, rejected alternatives, resource observations, and
-reproducible H3/128K results are recorded in the
-[ConvRot optimization findings](docs/convrot-optimization.md).
+Start with the [ConvRot incremental adoption roadmap](docs/convrot-adoption.md). The
+implemented design rationale, rejected core alternatives, resource observations, and
+reproducible H3/128K results are recorded separately in the
+[ConvRot core optimization report](docs/convrot-optimization.md).
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
 the result. It preserves the ConvRot tensor and packed storage identities, allowing

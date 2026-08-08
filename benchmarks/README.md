@@ -116,6 +116,8 @@ on field names. A shortened record looks like:
 
 ## Included benchmarks
 
+### ConvRot core validation
+
 Run the ConvRot provider comparison with:
 
 ```shell
@@ -183,9 +185,49 @@ uv run --with comfy-kitchen==0.2.28 \
   --compare-comfy-kitchen
 ```
 
-The measured results, traffic math, compiler-resource observations, rejected approaches, and
-clean-room integration order are preserved in the
-[ConvRot optimization findings](../docs/convrot-optimization.md).
+The implemented design, traffic math, compiler-resource observations, rejected core
+formulations, and clean-room landing order are preserved in the
+[ConvRot core optimization report](../docs/convrot-optimization.md). Start with the
+[incremental adoption roadmap](../docs/convrot-adoption.md) when deciding what belongs in a
+core ConvRot change versus an optional model integration.
+
+### ConvRot kernel-local research
+
+```shell
+uv run python benchmarks/benchmark_convrot_gemm_experiments.py \
+  --cases qkv attention-out mlp-fc1 mlp-fc2
+```
+
+This benchmark preserves the rejected packed-weight, descriptor/TMA, persistent, and
+warp-specialized GEMM experiments. None beat the implemented core pointer kernel on the
+measured SM120 shapes, so they are evidence rather than adoption candidates.
+
+### ConvRot graph-boundary research
+
+The remaining follow-on experiments fuse operations adjacent to ConvRot. They are
+benchmark-only prototypes and do not alter runtime dispatch or public APIs:
+
+```shell
+uv run --with comfy-kitchen==0.2.28 \
+  python benchmarks/benchmark_convrot_qkv_epilogue.py
+uv run python benchmarks/benchmark_convrot_gated_residual.py
+uv run python benchmarks/benchmark_convrot_rms_adaln_preparation.py \
+  --rows 37710 131072 --validate-rows 128
+uv run python benchmarks/benchmark_convrot_triton_op.py
+uv run python benchmarks/benchmark_convrot_fc1_output_swiglu.py
+```
+
+They test QKV RMS/RoPE, feature-wise gated residuals, RMSNorm/AdaLN input preparation,
+whether a traceable `torch.library.triton_op` removes that materialization boundary, and
+paired FC1 output-SwiGLU. Each script uses exact small-shape or stratified sampled checks
+against an explicit materialized boundary. Timed output tensors are preallocated except
+where the `triton_op` contract deliberately creates its two outputs internally; device-event
+timing excludes cached allocator host time. The synthetic segment row maps are also prebuilt;
+model integration must construct or cache them outside the timed projection.
+
+Results, limitations, and candidate ordering are recorded separately in the
+[ConvRot follow-on experiment report](../docs/convrot-follow-on-experiments.md). None of the
+isolated speedups should be summed into a model-level claim.
 
 Run the stock-Triton integer P x V microbenchmark with:
 
