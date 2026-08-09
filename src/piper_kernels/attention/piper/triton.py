@@ -1011,12 +1011,8 @@ class _PreparedPiperAttention:
     value_correction: torch.Tensor
     value_mean: torch.Tensor
     output: torch.Tensor
-    batch: int
-    heads: int
-    query_length: int
     key_length: int
     storage_key_length: int
-    head_dim: int
     block_m: int
     is_causal: bool
     grouped_qk: bool
@@ -1209,12 +1205,8 @@ def _prepare_piper_attention(
         value_correction=value_correction,
         value_mean=value_mean,
         output=output,
-        batch=batch,
-        heads=heads,
-        query_length=query_length,
         key_length=key_length,
         storage_key_length=storage_key_length,
-        head_dim=head_dim,
         block_m=block_m,
         is_causal=is_causal,
         grouped_qk=grouped_qk,
@@ -1228,6 +1220,7 @@ def _prepare_piper_attention(
 
 def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
     """Launch only the fused attention recurrence on prepared integer inputs."""
+    batch, heads, query_length, head_dim = prepared.output.shape
     attention_kernel = cast(Any, _piper_attention_kernel)
     launch_options = {
         "num_warps": 4,
@@ -1235,7 +1228,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
     }
 
     def launch(query_blocks: int, query_block_offset: int, unmasked_queries: bool) -> None:
-        attention_kernel[(query_blocks, prepared.heads, prepared.batch)](
+        attention_kernel[(query_blocks, heads, batch)](
             prepared.query,
             prepared.key,
             prepared.value,
@@ -1246,7 +1239,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             prepared.value_correction,
             prepared.value_mean,
             prepared.output,
-            prepared.query_length,
+            query_length,
             prepared.key_length,
             prepared.storage_key_length,
             query_block_offset=query_block_offset,
@@ -1260,21 +1253,21 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             unmasked_self_attention=(
                 unmasked_queries
                 and not prepared.is_causal
-                and prepared.query_length == prepared.key_length
+                and query_length == prepared.key_length
                 and prepared.key_length % _BLOCK_N == 0
             ),
-            heads=prepared.heads,
-            head_dim=prepared.head_dim,
+            heads=heads,
+            head_dim=head_dim,
             block_m=prepared.block_m,
             block_n=_BLOCK_N,
             use_tensor_descriptors=prepared.use_tensor_descriptors,
             **launch_options,
         )
 
-    full_query_blocks = prepared.query_length // prepared.block_m
+    full_query_blocks = query_length // prepared.block_m
     if full_query_blocks:
         launch(full_query_blocks, 0, True)
-    if prepared.query_length % prepared.block_m:
+    if query_length % prepared.block_m:
         launch(1, full_query_blocks, False)
     return prepared.output
 

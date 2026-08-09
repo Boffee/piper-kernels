@@ -829,11 +829,7 @@ class _PreparedSage2ppAttention:
     value_scale: torch.Tensor
     output: torch.Tensor
     softmax_scale: float
-    batch: int
-    heads: int
-    query_length: int
     key_length: int
-    head_dim: int
     is_causal: bool
     plan: _Sage2ppExecutionPlan
 
@@ -1130,11 +1126,7 @@ def _prepare_sage_attention_2pp(
         value_scale=value_scale,
         output=output,
         softmax_scale=scale,
-        batch=batch,
-        heads=heads,
-        query_length=query_length,
         key_length=key_length,
-        head_dim=head_dim,
         is_causal=is_causal,
         plan=plan,
     )
@@ -1142,10 +1134,9 @@ def _prepare_sage_attention_2pp(
 
 def _launch_sage_attention_2pp(prepared: _PreparedSage2ppAttention) -> torch.Tensor:
     """Launch only the fused attention recurrence on prepared quantized inputs."""
+    batch, heads, query_length, head_dim = prepared.output.shape
     plan = prepared.plan
-    _sage_attention_2pp_kernel[
-        (triton.cdiv(prepared.query_length, plan.block_m), prepared.heads, prepared.batch)
-    ](
+    _sage_attention_2pp_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
         prepared.query,
         prepared.key,
         prepared.value,
@@ -1153,7 +1144,7 @@ def _launch_sage_attention_2pp(prepared: _PreparedSage2ppAttention) -> torch.Ten
         prepared.key_scale,
         prepared.value_scale,
         prepared.output,
-        prepared.query_length,
+        query_length,
         prepared.key_length,
         prepared.softmax_scale,
         prepared.query.stride(0),
@@ -1165,8 +1156,8 @@ def _launch_sage_attention_2pp(prepared: _PreparedSage2ppAttention) -> torch.Ten
         # Reducing before applying the positive row scale cuts spill traffic in
         # very long loops, but the alternate schedule loses at shorter lengths.
         use_unscaled_score_recurrence=plan.use_unscaled_score_recurrence,
-        heads=prepared.heads,
-        head_dim=prepared.head_dim,
+        heads=heads,
+        head_dim=head_dim,
         block_m=plan.block_m,
         block_n=_BLOCK_N,
         use_tensor_descriptors=plan.use_tensor_descriptors,
