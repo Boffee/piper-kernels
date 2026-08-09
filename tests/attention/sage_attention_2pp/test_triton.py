@@ -9,11 +9,11 @@ import triton
 import triton.language as tl
 from lib.triton_inspection import compiled_artifact
 
-import piper_kernels.attention.sage2pp.triton as sage_backend
+import piper_kernels.attention.sage_attention_2pp.triton as sage_attention_2pp_backend
+from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention import sage_attention_2pp
-from piper_kernels.attention.sage2pp.reference import reference_sage_attention_2pp
-from piper_kernels.attention.sage2pp.triton import (
+from piper_kernels.attention.sage_attention_2pp.reference import reference_sage_attention_2pp
+from piper_kernels.attention.sage_attention_2pp.triton import (
     _ptx_float32_to_e4m3x4,
     _run_sage_attention_2pp,
 )
@@ -144,8 +144,8 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
     is_causal: bool,
     threshold_name: str,
 ) -> None:
-    monkeypatch.setattr(sage_backend, threshold_name, 0)
-    plan = sage_backend._select_sage2pp_execution_plan(
+    monkeypatch.setattr(sage_attention_2pp_backend, threshold_name, 0)
+    plan = sage_attention_2pp_backend._select_sage_attention_2pp_execution_plan(
         AcceleratorTarget(backend="cuda", architecture="sm120"),
         candidate_block_m=64,
         query_length=193,
@@ -192,7 +192,9 @@ def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
     query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    production_plan = sage_backend._default_sage2pp_execution_plan(query, key, False)
+    production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+        query, key, False
+    )
     alternate_plan = replace(
         production_plan,
         block_m=64,
@@ -309,7 +311,7 @@ def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
     value = torch.randn_like(query)
 
     with torch.no_grad():
-        prepared = sage_backend._prepare_sage_attention_2pp(
+        prepared = sage_attention_2pp_backend._prepare_sage_attention_2pp(
             query,
             key,
             value,
@@ -317,7 +319,7 @@ def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
             True,
         )
         assert prepared.plan.block_m == 128
-        actual = sage_backend._launch_sage_attention_2pp(prepared)
+        actual = sage_attention_2pp_backend._launch_sage_attention_2pp(prepared)
 
     assert torch.isfinite(actual).all()
 

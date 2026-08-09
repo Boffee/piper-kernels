@@ -25,8 +25,8 @@ from lib import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper import triton as piper_backend
-from piper_kernels.attention.piper.dispatch import _default_center_value
+from piper_kernels.attention.piper_attention import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention.dispatch import _default_center_value
 
 _SCHEDULES = ("pointer", "tensor-descriptor")
 
@@ -98,7 +98,7 @@ def _make_candidate(
         query, key, value = inputs
 
         def prepare() -> object:
-            return piper_backend._prepare_piper_attention(
+            return piper_attention_backend._prepare_piper_attention(
                 query,
                 key,
                 value,
@@ -111,12 +111,12 @@ def _make_candidate(
             )
 
         def run(prepared: object) -> torch.Tensor:
-            return piper_backend._launch_piper_attention(
-                cast(piper_backend._PreparedPiperAttention, prepared)
+            return piper_attention_backend._launch_piper_attention(
+                cast(piper_attention_backend._PreparedPiperAttention, prepared)
             )
 
         return BenchmarkProvider(
-            name=f"piper-{schedule}",
+            name=f"piper_attention_{schedule.replace('-', '_')}",
             prepare=prepare,
             run=run,
             synchronize=torch.cuda.synchronize,
@@ -176,7 +176,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         if args.center_value is None
         else args.center_value
     )
-    sort_value_rows = piper_backend._should_sort_value_rows(
+    sort_value_rows = piper_attention_backend._should_sort_value_rows(
         center_value=center_value,
         target=target,
         is_causal=args.causal,
@@ -211,7 +211,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     run = tune_candidates(
         candidates,
-        tuning="piper-attention-load-path",
+        tuning="piper_attention_load_path",
         shape=shape.as_dict(),
         environment=capture_environment(Path(__file__).resolve().parents[1]),
         phase=args.phase,

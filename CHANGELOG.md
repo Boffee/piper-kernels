@@ -36,8 +36,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   and loop-invariant hoisting with a three-stage loop pipeline for long
   non-causal D128. SM120 keeps its stock fused-V and D128-causal probability
   conversion where local paired benchmarks found packed conversion neutral or slower.
-- Consolidated the Piper, SageAttention2++, canonical CUDA, and SDPA comparisons into
-  the hardware-aware `benchmarks/benchmark_attention.py` development CLI.
+- Consolidated the Piper Attention, SageAttention2++, canonical CUDA, and SDPA
+  comparisons into the hardware-aware `benchmarks/benchmark_attention.py` development CLI.
+- Standardized implementation packages, benchmark provider IDs, and tuner identifiers on
+  `piper_attention` and `sage_attention_2pp`, with both public operators exported directly
+  from `piper_kernels`.
 - Optimized SageAttention2++ recurrence and causal scheduling across supported GPUs,
   with measured SM120 specializations for fused K/V quantization, fused query
   quantization, and long-sequence unscaled-score recurrence.

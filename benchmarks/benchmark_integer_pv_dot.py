@@ -1,6 +1,6 @@
 """Benchmark native and affine-proxy integer P@V dot products.
 
-All variants run with stock Triton. The ``u8-s8-native`` variant uses Piper's
+All variants run with stock Triton. The ``u8-s8-native`` variant uses Piper Attention's
 compiler extension to select NVIDIA's native mixed-sign integer MMA. The affine
 proxy models the exact UINT8 identity used by the attention experiment: its
 precomputed ``128 * sum(V)`` correction is loaded as the integer MMA accumulator.

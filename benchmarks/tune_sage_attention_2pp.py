@@ -30,7 +30,7 @@ from lib import (
 from lib.attention_providers import qk_quantization_granularity
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage2pp import triton as sage_backend
+from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 
 _BLOCK_M_VALUES = (32, 64, 128)
 _NUM_WARPS_VALUES = (2, 4, 8)
@@ -46,7 +46,7 @@ _PROBABILITY_CONVERSIONS = {"stock": False, "packed": True}
 
 
 @dataclass(frozen=True, slots=True)
-class _Sage2ppTuningChoice:
+class _SageAttention2ppTuningChoice:
     """Tunable fields layered over the target's production execution plan."""
 
     block_m: int
@@ -180,8 +180,8 @@ def _loop_stage_axis(
 
 def _candidate_choices(
     args: argparse.Namespace,
-    production_plan: sage_backend._Sage2ppExecutionPlan,
-) -> tuple[_Sage2ppTuningChoice, ...]:
+    production_plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
+) -> tuple[_SageAttention2ppTuningChoice, ...]:
     """Form the explicit Cartesian search, defaulting omitted axes to production."""
     axes = (
         _axis(args.block_m, production_plan.block_m),
@@ -230,17 +230,17 @@ def _candidate_choices(
             f"search expands to {candidate_count} candidates; narrow the axes or increase "
             "--max-candidates"
         )
-    return tuple(_Sage2ppTuningChoice(*values) for values in product(*axes))
+    return tuple(_SageAttention2ppTuningChoice(*values) for values in product(*axes))
 
 
 def _resolve_plan(
-    choice: _Sage2ppTuningChoice,
-    production_plan: sage_backend._Sage2ppExecutionPlan,
+    choice: _SageAttention2ppTuningChoice,
+    production_plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
     *,
     target: AcceleratorTarget,
     head_dim: int,
     is_causal: bool,
-) -> sage_backend._Sage2ppExecutionPlan:
+) -> sage_attention_2pp_backend._SageAttention2ppExecutionPlan:
     if choice.use_tensor_descriptors and (
         not target.is_cuda_capability(12) or choice.block_m != 128 or head_dim != 128
     ):
@@ -269,10 +269,10 @@ def _resolve_plan(
 
 
 def _make_candidate(
-    choice: _Sage2ppTuningChoice,
+    choice: _SageAttention2ppTuningChoice,
     inputs: AttentionInputs,
     *,
-    production_plan: sage_backend._Sage2ppExecutionPlan,
+    production_plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
     config: AttentionConfig,
     target: AcceleratorTarget,
     seed: int,
@@ -291,12 +291,12 @@ def _make_candidate(
 
         def prepare() -> AttentionInputs:
             # Match benchmark_attention.py: the hot device phase is the complete
-            # public Sage operator, including statistics and quantization kernels.
+            # public SageAttention2++ operator, including statistics and quantization kernels.
             return inputs
 
         def run(prepared: AttentionInputs) -> torch.Tensor:
             prepared_query, prepared_key, prepared_value = prepared
-            return sage_backend._run_sage_attention_2pp(
+            return sage_attention_2pp_backend._run_sage_attention_2pp(
                 prepared_query,
                 prepared_key,
                 prepared_value,
@@ -306,7 +306,7 @@ def _make_candidate(
             )
 
         return BenchmarkProvider(
-            name=f"sage2pp-{choice.name}",
+            name=f"sage_attention_2pp_{choice.name.replace('-', '_')}",
             prepare=prepare,
             run=run,
             synchronize=torch.cuda.synchronize,
@@ -316,7 +316,7 @@ def _make_candidate(
                 "algorithm": "sage_attention_2pp",
                 "qk_quantization": qk_quantization_granularity(target),
                 "pv_accumulation": "fp32+fp16",
-                "block_n": int(sage_backend._BLOCK_N),
+                "block_n": int(sage_attention_2pp_backend._BLOCK_N),
                 **plan.as_dict(),
                 "seed": seed,
             },
@@ -377,7 +377,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     query, key, value = inputs
     scale = args.head_dim**-0.5
     config = AttentionConfig(dtype=args.dtype, is_causal=args.causal, scale=scale)
-    production_plan = sage_backend._default_sage2pp_execution_plan(
+    production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
         query,
         key,
         args.causal,
@@ -404,7 +404,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     run = tune_candidates(
         candidates,
-        tuning="sage2pp-execution-plan",
+        tuning="sage_attention_2pp_execution_plan",
         shape=shape.as_dict(),
         environment=capture_environment(Path(__file__).resolve().parents[1]),
         phase=args.phase,

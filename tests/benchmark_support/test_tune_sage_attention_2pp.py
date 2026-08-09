@@ -1,6 +1,6 @@
 import pytest
 from lib.tuning import UnsupportedTuningCandidateError
-from tune_sage2pp_attention import (
+from tune_sage_attention_2pp import (
     _candidate_choices,
     _parse_args,
     _resolve_plan,
@@ -8,13 +8,15 @@ from tune_sage2pp_attention import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage2pp.triton import _select_sage2pp_execution_plan
+from piper_kernels.attention.sage_attention_2pp.triton import (
+    _select_sage_attention_2pp_execution_plan,
+)
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 
 
 def _production_plan():
-    return _select_sage2pp_execution_plan(
+    return _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=128,
         query_length=8192,

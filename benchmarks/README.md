@@ -70,7 +70,7 @@ The executable Piper Attention example compares pointer and tensor-descriptor lo
 ```shell
 uv run python benchmarks/tune_piper_attention.py \
   --sequence 8192 \
-  --json artifacts/piper-tuning.json
+  --json artifacts/piper_attention_tuning.json
 ```
 
 Use `--phase operator_end_to_end` to include preprocessing in the ranking. The default
@@ -82,23 +82,24 @@ production dispatch. Omitted axes retain the production value; values supplied f
 axes form a Cartesian search, capped at 256 candidates by default:
 
 ```shell
-uv run python benchmarks/tune_sage2pp_attention.py \
+uv run python benchmarks/tune_sage_attention_2pp.py \
   --sequence 8192 --head-dim 128 \
   --block-m 64 128 \
   --num-stages 2 3 \
   --load-path pointer tensor-descriptor \
-  --json artifacts/sage2pp-sm120-tuning.json
+  --json artifacts/sage_attention_2pp_sm120_tuning.json
 ```
 
-As in `benchmark_attention.py`, Sage's `prepared_execution` phase is the complete public
-operator—including statistics and Q/K/V quantization—not only the final recurrence kernel.
+As in `benchmark_attention.py`, SageAttention2++'s `prepared_execution` phase is the
+complete public operator—including statistics and Q/K/V quantization—not only the final
+recurrence kernel.
 Use `operator_end_to_end` when synchronized host and allocation overhead should participate in
 the ranking. Every candidate must also clear the configurable SQNR and non-finite quality gate.
 
-The Sage tuner currently runs on the optimized NVIDIA SM89+ backend, including SM120. It can
-search a future CUDA target once that target is supported by the kernel, but it does not enable a
-new backend. In particular, AMD `gfx1200`/`gfx1201` remain unsupported until the inline PTX FP8
-conversion and NVIDIA FP8-MMA path have HIP equivalents.
+The SageAttention2++ tuner currently runs on the optimized NVIDIA SM89+ backend, including
+SM120. It can search a future CUDA target once that target is supported by the kernel, but it
+does not enable a new backend. In particular, AMD `gfx1200`/`gfx1201` remain unsupported until
+the inline PTX FP8 conversion and NVIDIA FP8-MMA path have HIP equivalents.
 
 Selected records are evidence, not runtime policy: review the result across representative
 shapes and repeated processes, then deliberately freeze an accepted winner in the production
@@ -285,7 +286,7 @@ uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-native
 uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-affine-proxy
 ```
 
-The `u8-s8-native` variant uses Piper's stock-Triton compiler extension to emit native
+The `u8-s8-native` variant uses Piper Attention's stock-Triton compiler extension to emit native
 `UINT8 x INT8 -> INT32` MMAv2. The extension is packaged in the normal Python wheel and
 requires no patched Triton, CUDA extension, native build, or executable inline PTX. It is tested
 with Triton 3.7.1 and validates its compiler hook and generated MMA fail-closed, allowing newer
@@ -317,16 +318,17 @@ Run full-attention comparisons with:
 uv run python benchmarks/benchmark_attention.py
 ```
 
-The hardware-aware default always includes PyTorch SDPA, adds Piper and its uncentered
-control where Piper's mixed-sign MMA is supported, and adds pure-Triton SageAttention2++
+The hardware-aware default always includes PyTorch SDPA, adds Piper Attention and its uncentered
+control where Piper Attention's mixed-sign MMA is supported, and adds pure-Triton SageAttention2++
 where FP8 tensor cores are supported. Choose any subset with `--providers`; `--help` lists
 the stable provider names. For example:
 
 ```shell
 uv run python benchmarks/benchmark_attention.py \
   --sequence 8192 \
-  --providers piper piper-centered piper-uncentered piper-affine \
-              pure-triton-sage2pp pytorch-sdpa
+  --providers piper_attention piper_attention_centered \
+              piper_attention_uncentered piper_attention_affine \
+              sage_attention_2pp pytorch-sdpa
 ```
 
 Add the revision-pinned official CUDA SageAttention2++ and SageAttention2 providers
@@ -348,10 +350,10 @@ preparation, warmed device-event execution, complete operator latency, quality a
 and effective TFLOP/s. Use `--sequence`, `--kv-sequence`, `--head-dim`, `--dtype`, and
 `--causal` to build a shape matrix. JSON and JSONL output use the shared versioned benchmark
 schema and identify the algorithm and implementation in each provider's configuration.
-Pure-Triton Sage records also serialize their selected launch, fusion, loop, and packed-
-probability-conversion choices.
+Pure-Triton SageAttention2++ records also serialize their selected launch, fusion, loop, and
+packed-probability-conversion choices.
 
-Piper exposes a more granular lifecycle than ordinary Sage and SDPA operators:
+Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA operators:
 
 - `preparation` includes compact K/V mean reduction, optional centered-row ordering,
   Q/K/V quantization, scale metadata, and affine correction metadata when requested;
@@ -368,15 +370,15 @@ Compiler inspection and external profiling are available for one shape at a time
 
 ```shell
 uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --providers pure-triton-sage2pp \
-  --compiler-report --compiler-json artifacts/sage2pp-compiler.json
+  --sequence 8192 --providers sage_attention_2pp \
+  --compiler-report --compiler-json artifacts/sage_attention_2pp_compiler.json
 
 uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --providers piper --compiler-report --no-sass
+  --sequence 8192 --providers piper_attention --compiler-report --no-sass
 
 nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
   uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --profile --profile-provider pure-triton-sage2pp
+  --sequence 8192 --profile --profile-provider sage_attention_2pp
 ```
 
 When more than one Triton provider is selected, use `--compiler-provider` to choose which
@@ -454,22 +456,22 @@ kernel raised causal spills from 18 to 20. Quality metrics were unchanged.
 
 Issue #6 was validated on an RTX 5090 (SM120) with Torch 2.12.1+cu130 and
 Triton 3.7.1. BF16 non-causal self-attention measured the following warmed
-latencies; Piper's hot column is its prepared fused recurrence, while the complete
+latencies; Piper Attention's hot column is its prepared fused recurrence, while the complete
 column includes all preprocessing.
 
 | shape | provider | hot device p50 [p20, p80] (ms) | complete wall p50 [p20, p80] (ms) | SQNR vs SDPA (dB) |
 |:---|:---|---:|---:|---:|
-| B1/H8/N8192/D128 | Piper centered | 0.674 [0.672, 0.676] | 0.775 [0.772, 0.779] | 36.08 |
-| B1/H8/N8192/D128 | Piper uncentered | 0.675 [0.674, 0.677] | 0.776 [0.774, 0.778] | 36.05 |
-| B1/H8/N8192/D128 | Piper affine fallback | 0.706 [0.703, 0.710] | 0.785 [0.784, 0.787] | 36.08 |
+| B1/H8/N8192/D128 | Piper Attention centered | 0.674 [0.672, 0.676] | 0.775 [0.772, 0.779] | 36.08 |
+| B1/H8/N8192/D128 | Piper Attention uncentered | 0.675 [0.674, 0.677] | 0.776 [0.774, 0.778] | 36.05 |
+| B1/H8/N8192/D128 | Piper Attention affine fallback | 0.706 [0.703, 0.710] | 0.785 [0.784, 0.787] | 36.08 |
 | B1/H8/N8192/D128 | pure Triton SageAttention2++ | 0.637 [0.636, 0.639] | 0.669 [0.668, 0.671] | 28.12 |
 | B1/H8/N8192/D128 | canonical CUDA SageAttention2++ | 0.609 [0.607, 0.610] | 0.614 [0.607, 0.617] | 28.13 |
-| B1/H1/N131072/D128 | Piper centered + ordered | 19.548 [19.272, 19.571] | 19.897 [19.867, 19.906] | 35.77 |
-| B1/H1/N131072/D128 | Piper uncentered | 19.579 [19.371, 19.600] | 19.824 [19.806, 19.845] | 35.48 |
+| B1/H1/N131072/D128 | Piper Attention centered + ordered | 19.548 [19.272, 19.571] | 19.897 [19.867, 19.906] | 35.77 |
+| B1/H1/N131072/D128 | Piper Attention uncentered | 19.579 [19.371, 19.600] | 19.824 [19.806, 19.845] | 35.48 |
 | B1/H1/N131072/D128 | pure Triton SageAttention2++ | 17.647 [17.611, 17.708] | 17.823 [17.777, 17.926] | 28.33 |
 | B1/H1/N131072/D128 | canonical CUDA SageAttention2++ | 17.155 [16.992, 17.171] | 17.177 [17.023, 17.195] | 28.33 |
 
-At N=8192 the fused Piper specialization used 254 registers per thread, 12
+At N=8192 the fused Piper Attention specialization used 254 registers per thread, 12
 compiler-reported spills, 33,588 bytes of shared memory, and four warps. Its PTX
 contained 64 signed INT8 QK MMA instructions and 64 native `U8.S8` PV MMA
 instructions. Preprocessing kernels reported no spills. These measurements are a
@@ -483,8 +485,8 @@ issue #11.
 
 | provider | global SQNR (dB) | relative L1 | mean absolute error | max absolute error | worst-head SQNR (dB) |
 |:---|---:|---:|---:|---:|---:|
-| Piper centered | 38.96 | 0.960% | 0.000907 | 0.0703 | 33.72 |
-| Piper uncentered | 38.96 | 0.962% | 0.000909 | 0.0781 | 33.70 |
+| Piper Attention centered | 38.96 | 0.960% | 0.000907 | 0.0703 | 33.72 |
+| Piper Attention uncentered | 38.96 | 0.962% | 0.000909 | 0.0781 | 33.70 |
 | pure Triton SageAttention2++ | 32.43 | 2.292% | 0.002166 | 0.1250 | 28.18 |
 
 This ordinary call has little V bias, so centering is nearly neutral. The committed

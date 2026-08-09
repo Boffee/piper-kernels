@@ -4,11 +4,11 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage2pp.triton import (
-    _default_sage2pp_execution_plan,
+from piper_kernels.attention.sage_attention_2pp.triton import (
+    _default_sage_attention_2pp_execution_plan,
     _prepare_sage_attention_2pp,
-    _Sage2ppExecutionPlan,
-    _select_sage2pp_execution_plan,
+    _SageAttention2ppExecutionPlan,
+    _select_sage_attention_2pp_execution_plan,
 )
 
 _SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")
@@ -20,7 +20,7 @@ def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> 
     query = torch.empty((1, 8, 8192, 128), device="meta")
     key = torch.empty_like(query)
 
-    plan = _default_sage2pp_execution_plan(
+    plan = _default_sage_attention_2pp_execution_plan(
         query,
         key,
         False,
@@ -34,7 +34,7 @@ def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> 
 
 def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> None:
     query = torch.empty((1, 1, 64, 64), device="meta")
-    plan = _Sage2ppExecutionPlan(
+    plan = _SageAttention2ppExecutionPlan(
         block_m=64,
         grouped_qk=False,
         fuse_kv_quantization=False,
@@ -60,7 +60,7 @@ def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> N
     [
         (
             _SM89,
-            _Sage2ppExecutionPlan(
+            _SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=False,
                 fuse_kv_quantization=False,
@@ -73,7 +73,7 @@ def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> N
         ),
         (
             _SM120,
-            _Sage2ppExecutionPlan(
+            _SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=True,
                 fuse_kv_quantization=True,
@@ -84,7 +84,7 @@ def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> N
         ),
         (
             _SM121,
-            _Sage2ppExecutionPlan(
+            _SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=True,
                 fuse_kv_quantization=False,
@@ -97,9 +97,9 @@ def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> N
 )
 def test_execution_plan_separates_architecture_facts_from_exact_target_tuning(
     target: AcceleratorTarget,
-    expected: _Sage2ppExecutionPlan,
+    expected: _SageAttention2ppExecutionPlan,
 ) -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         target,
         candidate_block_m=128,
         query_length=8192,
@@ -126,7 +126,7 @@ def test_causal_block_schedule_uses_architecture_specific_tuning(
     query_length: int,
     expected_block_m: int,
 ) -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         target,
         candidate_block_m=128,
         query_length=query_length,
@@ -139,7 +139,7 @@ def test_causal_block_schedule_uses_architecture_specific_tuning(
 
 
 def test_long_sm89_d128_causal_schedule_uses_measured_launch_policy() -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         _SM89,
         candidate_block_m=128,
         query_length=8192,
@@ -154,7 +154,7 @@ def test_long_sm89_d128_causal_schedule_uses_measured_launch_policy() -> None:
 
 
 def test_long_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         _SM89,
         candidate_block_m=128,
         query_length=8192,
@@ -182,7 +182,7 @@ def test_sm120_query_fusion_and_recurrence_thresholds(
     fuse_query: bool,
     unscaled_recurrence: bool,
 ) -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=64,
         query_length=key_length,
@@ -203,7 +203,7 @@ def test_sm120_d64_preserves_query_quantization_policy(
     is_causal: bool,
     fuse_query: bool,
 ) -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=64,
         query_length=128 * 1024,
@@ -233,7 +233,7 @@ def test_probability_conversion_policy_is_specialized_by_target_and_shape(
     is_causal: bool,
     expected: bool,
 ) -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         target,
         candidate_block_m=128,
         query_length=8192,
@@ -253,7 +253,7 @@ def test_other_sm12x_targets_do_not_inherit_sm120_crossovers(
     is_causal: bool,
     key_length: int,
 ) -> None:
-    plan = _select_sage2pp_execution_plan(
+    plan = _select_sage_attention_2pp_execution_plan(
         _SM121,
         candidate_block_m=128,
         query_length=key_length,
@@ -270,7 +270,7 @@ def test_other_sm12x_targets_do_not_inherit_sm120_crossovers(
 
 
 def test_tensor_descriptor_override_wins_over_sm120_default() -> None:
-    default_plan = _select_sage2pp_execution_plan(
+    default_plan = _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=128,
         query_length=8192,
@@ -278,7 +278,7 @@ def test_tensor_descriptor_override_wins_over_sm120_default() -> None:
         head_dim=128,
         is_causal=False,
     )
-    pointer_plan = _select_sage2pp_execution_plan(
+    pointer_plan = _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=128,
         query_length=8192,

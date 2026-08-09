@@ -73,7 +73,7 @@ def _mma(name: str, accumulators: tuple[str, str, str, str], a: str, b: str) -> 
 
 def _marker(result: str, value: str) -> str:
     return (
-        f'  {result} = tail call i32 asm sideeffect "piper_u8s8_dot_marker $0, $1;", '
+        f'  {result} = tail call i32 asm sideeffect "piper_attention_u8s8_dot_marker $0, $1;", '
         f'"=r,r"(i32 {value})'
     )
 
@@ -120,7 +120,7 @@ def test_rewrite_marks_only_the_dot_accumulator_chain() -> None:
     qk_line = next(line for line in rewritten.splitlines() if "%qk =" in line)
     assert ".s32.s8.s8.s32" in qk_line
     assert rewritten.count(".s32.u8.s8.s32") == 2
-    assert "piper_u8s8_dot_marker" not in rewritten
+    assert "piper_attention_u8s8_dot_marker" not in rewritten
     assert "%used = add i32 %result, 1" in rewritten
 
 
@@ -201,7 +201,7 @@ def test_compiler_hook_composes_cache_identity_and_stage_order() -> None:
 @pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
 def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
     if not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma:
-        pytest.skip("requires Piper's supported MMAv2 lowering")
+        pytest.skip("requires Piper Attention's supported MMAv2 lowering")
     lhs = torch.arange(64 * 64, device="cuda", dtype=torch.int64)
     lhs = lhs.remainder(256).to(torch.uint8).reshape(64, 64)
     generator = torch.Generator(device="cuda").manual_seed(912)
@@ -227,7 +227,7 @@ def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
 @pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
 def test_generated_ptx_changes_only_the_marked_dot() -> None:
     if not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma:
-        pytest.skip("requires Piper's supported MMAv2 lowering")
+        pytest.skip("requires Piper Attention's supported MMAv2 lowering")
     unsigned_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.uint8)
     signed_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)
     rhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)
@@ -247,4 +247,4 @@ def test_generated_ptx_changes_only_the_marked_dot() -> None:
 
     assert "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32" in ptx
     assert "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32" in ptx
-    assert "piper_u8s8_dot_marker" not in ptx
+    assert "piper_attention_u8s8_dot_marker" not in ptx

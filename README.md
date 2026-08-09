@@ -13,8 +13,9 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
 | Package | Role |
 |---|---|
+| `piper_kernels` | Public Piper Attention and SageAttention2++ forward operators |
 | `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
-| `piper_kernels.attention` | Piper Attention and canonical SageAttention2++ forward attention |
+| `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
 
 ## ConvRot INT8
 
@@ -70,7 +71,7 @@ attention-only consumers do not inherit the TorchAO dependency.
 Piper Attention is the package's key-scaled integer-PV attention algorithm:
 
 ```python
-from piper_kernels.attention import piper_attention
+from piper_kernels import piper_attention
 
 output = piper_attention(query, key, value, is_causal=False)
 ```
@@ -113,11 +114,11 @@ isolation; the name identifies this package's selected combination and fused rec
 
 ## SageAttention2++
 
-The attention package provides an independently written, pure-Triton backend for the
+The package provides an independently written, pure-Triton backend for the
 canonical [SageAttention2++](https://github.com/thu-ml/SageAttention) 8+8 algorithm:
 
 ```python
-from piper_kernels.attention import sage_attention_2pp
+from piper_kernels import sage_attention_2pp
 
 output = sage_attention_2pp(query, key, value, is_causal=False)
 ```
@@ -130,7 +131,7 @@ dimensions 64 and 128, equal query/KV head counts, arbitrary positive sequence l
 rectangular non-causal attention, strided sequence dimensions, and `torch.compile`. It
 is inference-only and does not support autograd.
 
-This is SageAttention2++, not a Piper-specific attention algorithm: K is smoothed, Q/K
+This is SageAttention2++, not a Piper Attention-specific algorithm: K is smoothed, Q/K
 are quantized to INT8 with the canonical architecture-specific granularity, V and the
 online-softmax probabilities are quantized to E4M3, each 64-key P x V tile accumulates
 in FP16, and tile results are buffered in FP32. All optimized device code is Triton;

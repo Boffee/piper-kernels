@@ -1,11 +1,10 @@
-"""Portable reference for Piper's key-scaled integer-PV attention.
+"""Portable reference for the canonical SageAttention2++ 8+8 forward path.
 
-Piper Attention follows the fused online-softmax structure of FlashAttention
-and the INT8 QK smoothing/quantization of SageAttention. Its distinct PV path
-uses one signed-INT8 scale per V row and a nonnegative UINT8 probability
-operand. The reference is intentionally readable rather than fast.
+SageAttention2++ originates from the SageAttention project. See the repository
+NOTICE for upstream attribution.
 """
 
+import math
 from typing import Literal
 
 import torch
@@ -19,57 +18,36 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 
 _PV_BLOCK = 64
-_P_UINT8_RANGE = 255.0
-_V_INT8_RANGE = 127.0
+_P_FP8_LN_MAX = math.log(448.0)
+_V_FP8_MAX = 2.25
 _SCALE_EPSILON = 1e-7
 
 
-def _quantize_value_per_key(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = value.float().abs().amax(dim=-1) / _V_INT8_RANGE + _SCALE_EPSILON
-    quantized = (
-        (value.float() / scale[..., None])
-        .round()
-        .clamp(-_V_INT8_RANGE, _V_INT8_RANGE)
-        .to(torch.int8)
-    )
+def _quantize_value_per_channel(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = value.float().abs().amax(dim=2) / _V_FP8_MAX + _SCALE_EPSILON
+    quantized = (value.float() / scale[:, :, None, :]).to(torch.float8_e4m3fn)
     return quantized, scale
 
 
-def reference_piper_attention(  # noqa: PLR0915
+def reference_sage_attention_2pp(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
     *,
-    center_value: bool,
     qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
-    sort_value_rows: bool = False,
 ) -> torch.Tensor:
-    """Evaluate Piper Attention with ordinary PyTorch operations."""
-    if sort_value_rows and is_causal:
-        raise ValueError("value-row ordering is valid only for non-causal attention")
+    """Evaluate quantized SageAttention2++ using ordinary PyTorch operations.
 
+    This intentionally follows the 64-key online-softmax loop. Probability FP8
+    quantization depends on the running maximum, so quantizing a fully materialized
+    softmax matrix would not be an equivalent reference.
+    """
     output_dtype = query.dtype
     quantization_range = 127
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
-    value_float = value.float()
-    value_mean = (
-        value_float.mean(dim=2, keepdim=True)
-        if center_value
-        else torch.zeros_like(value_float[:, :, :1])
-    )
-    value_centered = value_float - value_mean
-
-    if sort_value_rows:
-        order = torch.argsort(value_centered.abs().amax(dim=-1), dim=-1, stable=True)
-        order_4d = order[..., None].expand_as(key_centered)
-        key_centered = torch.gather(key_centered, 2, order_4d)
-        value_centered = torch.gather(value_centered, 2, order_4d)
-
     if qk_quantization == "per_warp":
         query_int8, query_scale = quantize_per_group(
             query,
@@ -88,11 +66,11 @@ def reference_piper_attention(  # noqa: PLR0915
         key_int8, key_scale = quantize_key_per_thread(key_centered, quantization_range)
     else:
         raise ValueError(f"unknown Q/K quantization granularity: {qk_quantization}")
-    value_int8, value_scale = _quantize_value_per_key(value_centered)
+    value_fp8, value_scale = _quantize_value_per_channel(value)
 
     batch, heads, query_length, width = query.shape
     key_length = key.shape[2]
-    numerator = torch.zeros(
+    accumulator = torch.zeros(
         (batch, heads, query_length, width),
         device=query.device,
         dtype=torch.float32,
@@ -113,10 +91,7 @@ def reference_piper_attention(  # noqa: PLR0915
             key_block.transpose(-1, -2).float(),
         )
         scores = (
-            integer_scores
-            * query_scale[:, :, :, None]
-            * key_scale[:, :, None, start:stop]
-            * scale
+            integer_scores * query_scale[:, :, :, None] * key_scale[:, :, None, start:stop] * scale
         )
         if is_causal:
             key_positions = torch.arange(start, stop, device=query.device)
@@ -125,32 +100,25 @@ def reference_piper_attention(  # noqa: PLR0915
                 -float("inf"),
             )
 
-        block_value_scale = value_scale[:, :, start:stop]
-        shifted_scores = scores + torch.log(block_value_scale[:, :, None, :])
-        block_max = shifted_scores.amax(dim=-1)
+        # Canonical SageAttention2++ shifts the online-softmax frame so the largest
+        # probability is already in FP8's usable range.
+        block_max = scores.amax(dim=-1) - _P_FP8_LN_MAX
         next_max = torch.maximum(running_max, block_max)
         old_weight = torch.exp(running_max - next_max)
-        current_weight = torch.exp(block_max - next_max)
-        probabilities = torch.exp(scores - block_max[..., None])
+        probabilities = torch.exp(scores - next_max[..., None])
         probabilities = torch.nan_to_num(probabilities)
 
-        numerator *= old_weight[..., None]
-        denominator = (
-            denominator * old_weight
-            + probabilities.sum(dim=-1) * current_weight
-        )
-        probability_uint8 = (
-            probabilities
-            * block_value_scale[:, :, None, :]
-            * _P_UINT8_RANGE
-        ).round().clamp(0, _P_UINT8_RANGE)
-        partial = torch.matmul(
-            probability_uint8,
-            value_int8[:, :, start:stop].float(),
-        )
-        numerator += partial * (current_weight[..., None] / _P_UINT8_RANGE)
+        accumulator *= old_weight[..., None]
+        denominator = denominator * old_weight + probabilities.sum(dim=-1)
+
+        probability_fp8 = probabilities.to(torch.float8_e4m3fn)
+        value_block = value_fp8[:, :, start:stop]
+        # Rounding the complete 64-wide product to FP16 approximates the two
+        # K=32 hardware MMAs that share an FP16 accumulator.
+        partial = torch.matmul(probability_fp8.float(), value_block.float())
+        partial = partial.to(torch.float16).float()
+        accumulator += partial * value_scale[:, :, None, :]
         running_max = next_max
 
-    output = numerator / denominator.clamp_min(1e-30)[..., None]
-    output += value_mean
+    output = accumulator / denominator.clamp_min(1e-30)[..., None]
     return output.to(output_dtype)

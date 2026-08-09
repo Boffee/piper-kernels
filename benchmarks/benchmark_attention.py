@@ -55,7 +55,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--canonical",
         action="store_true",
-        help="add both revision-pinned canonical CUDA Sage providers",
+        help="add both revision-pinned canonical CUDA SageAttention providers",
     )
     parser.add_argument(
         "--sequence",
@@ -284,8 +284,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
     provider_names = resolve_provider_names(
         args.providers,
         include_canonical=args.canonical,
-        piper_supported=target.supports_uint8_int8_mma,
-        fp8_supported=target.supports_fp8_fp16_mma,
+        piper_attention_supported=target.supports_uint8_int8_mma,
+        sage_attention_2pp_supported=target.supports_fp8_fp16_mma,
     )
     _validate_args(args, provider_names)
     validate_provider_support(provider_names, target)

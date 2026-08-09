@@ -3,11 +3,12 @@
 import pytest
 import torch
 
-import piper_kernels.attention
+import piper_kernels
+from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention import piper_attention
-from piper_kernels.attention.piper import triton as triton_implementation
-from piper_kernels.attention.piper.dispatch import _default_center_value
+from piper_kernels.attention.piper_attention import dispatch as piper_attention_dispatch
+from piper_kernels.attention.piper_attention import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention.dispatch import _default_center_value
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -15,9 +16,9 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return query, torch.randn_like(query), torch.randn_like(query)
 
 
-def test_attention_exports_piper_attention() -> None:
-    assert piper_kernels.attention.piper_attention is piper_attention
-    assert "piper_attention" in piper_kernels.attention.__all__
+def test_package_root_exports_piper_attention() -> None:
+    assert piper_kernels.piper_attention is piper_attention
+    assert "piper_attention" in piper_kernels.__all__
 
 
 def test_public_api_uses_portable_reference_on_cpu() -> None:
@@ -74,19 +75,19 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 0))
     monkeypatch.setattr(torch.cuda, "device", DeviceGuard)
     monkeypatch.setattr(
-        triton_implementation,
+        piper_attention_backend,
         "install_uint8_int8_dot_hook",
         record_hook,
     )
     monkeypatch.setattr(
-        triton_implementation,
+        piper_attention_backend,
         "_compute_kv_means",
         stop_at_preprocessing,
     )
     query, key, value = _inputs()
 
     with pytest.raises(PreprocessingReachedError):
-        triton_implementation._prepare_piper_attention(
+        piper_attention_backend._prepare_piper_attention(
             query,
             key,
             value,
@@ -124,10 +125,7 @@ def test_default_centering_policy_is_shape_and_architecture_specific(
 ) -> None:
     query = torch.empty((1, 1, query_length, head_dim), dtype=torch.float16)
     key = torch.empty((1, 1, key_length, head_dim), dtype=torch.float16)
-    monkeypatch.setattr(
-        "piper_kernels.attention.piper.dispatch._supports_triton",
-        lambda _target: True,
-    )
+    monkeypatch.setattr(piper_attention_dispatch, "_supports_triton", lambda _target: True)
     target = AcceleratorTarget(
         backend="cuda",
         architecture=f"sm{capability[0]}{capability[1]}",

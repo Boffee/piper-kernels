@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-import piper_kernels.attention
-from piper_kernels.attention import sage_attention_2pp
+import piper_kernels
+from piper_kernels import sage_attention_2pp
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -12,9 +12,9 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return query, torch.randn_like(query), torch.randn_like(query)
 
 
-def test_attention_exports_sage_attention_2pp() -> None:
-    assert piper_kernels.attention.sage_attention_2pp is sage_attention_2pp
-    assert "sage_attention_2pp" in piper_kernels.attention.__all__
+def test_package_root_exports_sage_attention_2pp() -> None:
+    assert piper_kernels.sage_attention_2pp is sage_attention_2pp
+    assert "sage_attention_2pp" in piper_kernels.__all__
 
 
 def test_public_api_uses_portable_reference_on_cpu() -> None:

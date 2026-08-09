@@ -68,8 +68,7 @@ def _validate_inputs(  # noqa: PLR0912
         )
     if query.shape[3] not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(
-            "SageAttention2++ currently supports head dimensions 64 and 128, "
-            f"got {query.shape[3]}"
+            f"SageAttention2++ currently supports head dimensions 64 and 128, got {query.shape[3]}"
         )
     if query.shape[2] == 0 or key.shape[2] == 0:
         raise ValueError("SageAttention2++ does not accept empty query or key sequences")
