@@ -9,19 +9,32 @@ or inline PTX. See the repository NOTICE for upstream attribution.
 # Python call signature.
 # pyright: reportCallIssue=false
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.attention.scheduling import select_query_block
 
-_P_FP8_RANGE = tl.constexpr(448.0)
-_V_FP8_RANGE = tl.constexpr(2.25)
+# Triton 3.7 requires globals referenced inside JIT functions to be constexpr.
+_BLOCK_N = tl.constexpr(64)
+_QUERY_GROUP_SIZE = tl.constexpr(32)
+_INT8_MAX = tl.constexpr(127.0)
+# Canonical Sage2++ shifts the online-softmax frame by log2(448), so
+# probabilities are born in FP8's usable range instead of scaled afterward.
+_P_FP8_LOG2_MAX = tl.constexpr(8.807354922057604)
+_V_FP8_MAX = tl.constexpr(2.25)
 _SCALE_EPSILON = tl.constexpr(1e-7)
+_LOG2_E = tl.constexpr(1.4426950408889634)
+# Measured SM120 crossover policy, not an algorithmic requirement.
+_CAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH = 32 * 1024
+_NONCAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH = 128 * 1024
 
 
 @triton.jit
@@ -110,11 +123,10 @@ def _finish_kv_statistics_kernel(
         tl.sum(key_sums, axis=0) / key_length,
         mask=offsets_d < head_dim,
     )
-    value_scale = tl.max(value_maxima, axis=0) / _V_FP8_RANGE + _SCALE_EPSILON
-    # Fold the probability range into the scale consumed by the attention loop.
+    value_scale = tl.max(value_maxima, axis=0) / _V_FP8_MAX + _SCALE_EPSILON
     tl.store(
         value_scale_ptr + output_offsets,
-        value_scale / _P_FP8_RANGE,
+        value_scale,
         mask=offsets_d < head_dim,
     )
 
@@ -130,7 +142,7 @@ def _quantize_value_kernel(
     stride_vn,
     stride_ob,
     stride_oh,
-    stride_on,
+    stride_od,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
@@ -150,17 +162,108 @@ def _quantize_value_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d) * _P_FP8_RANGE
+    scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
     quantized = (value / scale[None, :]).to(tl.float8e4nv)
     tl.store(
         output_ptr
         + batch * stride_ob
         + head * stride_oh
-        + offsets_d[None, :] * stride_on
+        + offsets_d[None, :] * stride_od
         + offsets_n[:, None],
         quantized,
         mask=mask,
     )
+
+
+@triton.jit
+def _quantize_kv_per_block_kernel(
+    key_ptr,
+    value_ptr,
+    key_mean_ptr,
+    value_scale_ptr,
+    key_output_ptr,
+    value_output_ptr,
+    key_scale_ptr,
+    key_length,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_kob,
+    stride_koh,
+    stride_kon,
+    stride_vob,
+    stride_voh,
+    stride_vod,
+    stride_ksb,
+    stride_ksh,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Quantize one K or V block selected from a shared role grid."""
+    role = tl.program_id(0)
+    num_key_blocks = tl.num_programs(0) // 2
+    batch_head = tl.program_id(1)
+    batch = batch_head // heads
+    head = batch_head % heads
+    offsets_d = tl.arange(0, head_dim)
+
+    if role < num_key_blocks:
+        key_offsets_n = role * _BLOCK_N + tl.arange(0, _BLOCK_N)
+        key_mask = key_offsets_n[:, None] < key_length
+        key_mean = tl.load(key_mean_ptr + batch_head * head_dim + offsets_d)
+        key_values = tl.load(
+            key_ptr
+            + batch * stride_kb
+            + head * stride_kh
+            + key_offsets_n[:, None] * stride_kn
+            + offsets_d[None, :],
+            mask=key_mask,
+            other=0.0,
+        ).to(tl.float32)
+        key_values = tl.where(key_mask, key_values - key_mean[None, :], 0.0)
+        key_maximum = tl.max(tl.max(tl.abs(key_values), axis=1), axis=0)
+        key_scale = key_maximum / _INT8_MAX + _SCALE_EPSILON
+        key_quantized = qk_quantization.round_to_int8(key_values / key_scale)
+        tl.store(
+            key_output_ptr
+            + batch * stride_kob
+            + head * stride_koh
+            + key_offsets_n[:, None] * stride_kon
+            + offsets_d[None, :],
+            key_quantized,
+            mask=key_mask,
+        )
+        tl.store(
+            key_scale_ptr + batch * stride_ksb + head * stride_ksh + role,
+            key_scale,
+        )
+    else:
+        value_block = role - num_key_blocks
+        value_offsets_n = value_block * _BLOCK_N + tl.arange(0, _BLOCK_N)
+        value_mask = value_offsets_n[:, None] < key_length
+        value_values = tl.load(
+            value_ptr
+            + batch * stride_vb
+            + head * stride_vh
+            + value_offsets_n[:, None] * stride_vn
+            + offsets_d[None, :],
+            mask=value_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_scale = tl.load(value_scale_ptr + batch_head * head_dim + offsets_d)
+        value_quantized = (value_values / value_scale[None, :]).to(tl.float8e4nv)
+        tl.store(
+            value_output_ptr
+            + batch * stride_vob
+            + head * stride_voh
+            + offsets_d[None, :] * stride_vod
+            + value_offsets_n[:, None],
+            value_quantized,
+            mask=value_mask,
+        )
 
 
 @triton.jit
@@ -241,7 +344,148 @@ def _load_attention_value_tile(
 
 
 @triton.jit
-def _sage_attention_2pp_kernel(
+def _quantize_query_tile(
+    query,
+    softmax_scale,
+    block_m: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Quantize the query rows owned exclusively by this attention CTA."""
+    tl.static_assert(
+        block_m % _QUERY_GROUP_SIZE == 0,
+        "fused Q quantization requires complete query groups",
+    )
+    groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
+    grouped_query = query.to(tl.float32).reshape((groups, _QUERY_GROUP_SIZE, head_dim))
+    maximum = tl.max(tl.max(tl.abs(grouped_query), axis=2), axis=1)
+    quantization_scale = maximum / _INT8_MAX + _SCALE_EPSILON
+    quantized = qk_quantization.round_to_int8(
+        grouped_query / quantization_scale[:, None, None]
+    ).reshape((block_m, head_dim))
+    score_scale = quantization_scale * (softmax_scale * _LOG2_E)
+    return quantized, score_scale
+
+
+@triton.jit
+def _causal_attention_tile(
+    query,
+    query_scale,
+    key_ptr,
+    value_ptr,
+    key_scale_ptr,
+    accumulator,
+    denominator,
+    running_max,
+    batch,
+    head,
+    batch_head,
+    start_n,
+    offsets_m,
+    offsets_n,
+    offsets_d,
+    key_length,
+    diagonal_or_tail: tl.constexpr,
+    grouped_qk: tl.constexpr,
+    fuse_query_quantization: tl.constexpr,
+    use_unscaled_score_recurrence: tl.constexpr,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    use_tensor_descriptors: tl.constexpr,
+):
+    """Advance causal online-softmax state by one prefix or boundary tile."""
+    tl.static_assert(
+        not use_unscaled_score_recurrence or not diagonal_or_tail,
+        "unscaled-score recurrence requires a fully valid causal prefix tile",
+    )
+    current_n = start_n + offsets_n
+    key = _load_attention_key_tile(
+        key_ptr,
+        batch_head,
+        start_n,
+        current_n,
+        offsets_d,
+        key_length,
+        head_dim,
+        block_n,
+        use_tensor_descriptors,
+    )
+    integer_scores = tl.dot(query, key)
+    if grouped_qk:
+        key_scale = tl.load(
+            key_scale_ptr
+            + (batch * heads + head) * tl.cdiv(key_length, block_n)
+            + start_n // block_n
+        )
+        if fuse_query_quantization:
+            groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
+            score_scale = query_scale * key_scale
+            raw_scores = integer_scores.to(tl.float32).reshape((groups, _QUERY_GROUP_SIZE, block_n))
+            scores = (raw_scores * score_scale[:, None, None]).reshape((block_m, block_n))
+        else:
+            scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale
+    else:
+        key_scale = tl.load(
+            key_scale_ptr + (batch * heads + head) * key_length + current_n,
+            mask=current_n < key_length,
+            other=0.0,
+        )
+        scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+    if diagonal_or_tail:
+        valid_keys = (current_n[None, :] < key_length) & (current_n[None, :] <= offsets_m[:, None])
+        scores = tl.where(valid_keys, scores, -float("inf"))
+
+    if fuse_query_quantization and use_unscaled_score_recurrence:
+        raw_block_max = tl.max(raw_scores, axis=2)
+        block_max = tl.fma(
+            raw_block_max,
+            score_scale[:, None],
+            -_P_FP8_LOG2_MAX,
+        ).reshape((block_m,))
+    else:
+        block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_MAX
+    next_max = tl.maximum(running_max, block_max)
+    old_weight = tl.exp2(running_max - next_max)
+    if fuse_query_quantization and use_unscaled_score_recurrence:
+        probability_log2 = tl.fma(
+            raw_scores,
+            score_scale[:, None, None],
+            -next_max.reshape((groups, _QUERY_GROUP_SIZE, 1)),
+        ).reshape((block_m, block_n))
+        probabilities = tl.exp2(probability_log2)
+    else:
+        probabilities = tl.exp2(scores - next_max[:, None])
+    accumulator *= old_weight[:, None]
+    denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
+
+    probability_fp8 = probabilities.to(tl.float8e4nv)
+    value = _load_attention_value_tile(
+        value_ptr,
+        batch,
+        head,
+        batch_head,
+        start_n,
+        current_n,
+        offsets_d,
+        key_length,
+        use_tensor_descriptors,
+        heads,
+        head_dim,
+        block_n,
+    )
+    partial_fp16 = tl.dot(
+        probability_fp8,
+        value,
+        acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
+        out_dtype=tl.float16,
+    )
+    accumulator += partial_fp16.to(tl.float32)
+    return accumulator, denominator, next_max
+
+
+@triton.jit
+def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop monolithic
     query_ptr,
     key_ptr,
     value_ptr,
@@ -251,14 +495,29 @@ def _sage_attention_2pp_kernel(
     output_ptr,
     query_length,
     key_length,
+    softmax_scale,
+    stride_qb,
+    stride_qh,
+    stride_qn,
     is_causal: tl.constexpr,
-    qk_per_warp: tl.constexpr,
+    grouped_qk: tl.constexpr,
+    fuse_query_quantization: tl.constexpr,
+    use_unscaled_score_recurrence: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
+    tl.static_assert(
+        not fuse_query_quantization or grouped_qk,
+        "fused Q quantization requires grouped Q/K scales",
+    )
+    tl.static_assert(
+        not use_unscaled_score_recurrence or fuse_query_quantization,
+        "unscaled-score recurrence requires fused Q quantization",
+    )
+    tl.static_assert(block_n == _BLOCK_N, "SageAttention2++ requires 64-key tiles")
     query_block = tl.program_id(0)
     head = tl.program_id(1)
     batch = tl.program_id(2)
@@ -266,20 +525,34 @@ def _sage_attention_2pp_kernel(
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
 
-    query = tl.load(
+    query_values = tl.load(
         query_ptr
-        + ((batch * heads + head) * query_length + offsets_m[:, None]) * head_dim
+        + batch * stride_qb
+        + head * stride_qh
+        + offsets_m[:, None] * stride_qn
         + offsets_d[None, :],
         mask=offsets_m[:, None] < query_length,
         other=0,
     )
-    if qk_per_warp:
+    if fuse_query_quantization:
+        groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
+        query, query_scale = _quantize_query_tile(  # pyright: ignore[reportGeneralTypeIssues]
+            query_values,
+            softmax_scale,
+            block_m,
+            head_dim,
+        )
+    elif grouped_qk:
+        query = query_values
         query_scale = tl.load(
-            query_scale_ptr + (batch * heads + head) * tl.cdiv(query_length, 32) + offsets_m // 32,
+            query_scale_ptr
+            + (batch * heads + head) * tl.cdiv(query_length, _QUERY_GROUP_SIZE)
+            + offsets_m // _QUERY_GROUP_SIZE,
             mask=offsets_m < query_length,
             other=0.0,
         )
     else:
+        query = query_values
         query_scale = tl.load(
             query_scale_ptr + (batch * heads + head) * query_length + offsets_m,
             mask=offsets_m < query_length,
@@ -292,71 +565,162 @@ def _sage_attention_2pp_kernel(
     if is_causal:
         end_n = tl.minimum(key_length, (query_block + 1) * block_m)
 
-    for start_n in tl.range(0, end_n, block_n, disable_licm=True):
-        current_n = start_n + offsets_n
-        batch_head = batch * heads + head
-        key = _load_attention_key_tile(
-            key_ptr,
-            batch_head,
-            start_n,
-            current_n,
-            offsets_d,
-            key_length,
-            head_dim,
-            block_n,
-            use_tensor_descriptors,
-        )
-        integer_scores = tl.dot(query, key)
-        if qk_per_warp:
-            key_scale = tl.load(
-                key_scale_ptr
-                + (batch * heads + head) * tl.cdiv(key_length, block_n)
-                + start_n // block_n
+    batch_head = batch * heads + head
+    if is_causal:
+        # Omit masks only for complete key tiles strictly before this query
+        # block. Ragged tails and overlapping 64-key scale groups stay masked.
+        full_key_end = key_length // block_n * block_n
+        causal_prefix_end = query_block * block_m // block_n * block_n
+        prefix_end = tl.minimum(causal_prefix_end, full_key_end)
+        for start_n in tl.range(0, prefix_end, block_n, disable_licm=True):
+            accumulator, denominator, running_max = _causal_attention_tile(
+                query,
+                query_scale,
+                key_ptr,
+                value_ptr,
+                key_scale_ptr,
+                accumulator,
+                denominator,
+                running_max,
+                batch,
+                head,
+                batch_head,
+                start_n,
+                offsets_m,
+                offsets_n,
+                offsets_d,
+                key_length,
+                diagonal_or_tail=False,
+                grouped_qk=grouped_qk,
+                fuse_query_quantization=fuse_query_quantization,
+                use_unscaled_score_recurrence=use_unscaled_score_recurrence,
+                heads=heads,
+                head_dim=head_dim,
+                block_m=block_m,
+                block_n=block_n,
+                use_tensor_descriptors=use_tensor_descriptors,
             )
-            score_scale = query_scale * key_scale
-            scores = integer_scores.to(tl.float32) * score_scale[:, None]
-        else:
-            key_scale = tl.load(
-                key_scale_ptr + (batch * heads + head) * key_length + current_n,
-                mask=current_n < key_length,
-                other=0.0,
+        for start_n in tl.range(prefix_end, end_n, block_n, disable_licm=True):
+            accumulator, denominator, running_max = _causal_attention_tile(
+                query,
+                query_scale,
+                key_ptr,
+                value_ptr,
+                key_scale_ptr,
+                accumulator,
+                denominator,
+                running_max,
+                batch,
+                head,
+                batch_head,
+                start_n,
+                offsets_m,
+                offsets_n,
+                offsets_d,
+                key_length,
+                diagonal_or_tail=True,
+                grouped_qk=grouped_qk,
+                fuse_query_quantization=fuse_query_quantization,
+                use_unscaled_score_recurrence=False,
+                heads=heads,
+                head_dim=head_dim,
+                block_m=block_m,
+                block_n=block_n,
+                use_tensor_descriptors=use_tensor_descriptors,
             )
-            scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
-        valid_keys = current_n[None, :] < key_length
-        if is_causal:
-            valid_keys &= current_n[None, :] <= offsets_m[:, None]
-        scores = tl.where(valid_keys, scores, -float("inf"))
+    else:
+        # Keep the noncausal loop monolithic to preserve its register allocation.
+        for start_n in tl.range(0, end_n, block_n, disable_licm=True):
+            current_n = start_n + offsets_n
+            key = _load_attention_key_tile(
+                key_ptr,
+                batch_head,
+                start_n,
+                current_n,
+                offsets_d,
+                key_length,
+                head_dim,
+                block_n,
+                use_tensor_descriptors,
+            )
+            integer_scores = tl.dot(query, key)
+            if grouped_qk:
+                key_scale = tl.load(
+                    key_scale_ptr
+                    + (batch * heads + head) * tl.cdiv(key_length, block_n)
+                    + start_n // block_n
+                )
+                if fuse_query_quantization:
+                    score_scale = query_scale * key_scale
+                    raw_scores = integer_scores.to(tl.float32).reshape(
+                        (groups, _QUERY_GROUP_SIZE, block_n)
+                    )
+                    scores = (raw_scores * score_scale[:, None, None]).reshape((block_m, block_n))
+                else:
+                    scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale
+            else:
+                key_scale = tl.load(
+                    key_scale_ptr + (batch * heads + head) * key_length + current_n,
+                    mask=current_n < key_length,
+                    other=0.0,
+                )
+                scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+            valid_keys = current_n[None, :] < key_length
+            if fuse_query_quantization and use_unscaled_score_recurrence:
+                valid_keys = tl.broadcast_to(valid_keys, (block_m, block_n))
+            scores = tl.where(valid_keys, scores, -float("inf"))
 
-        block_max = tl.max(scores, axis=1)
-        next_max = tl.maximum(running_max, block_max)
-        old_weight = tl.exp2(running_max - next_max)
-        probabilities = tl.exp2(scores - next_max[:, None])
-        accumulator *= old_weight[:, None]
-        denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
+            if fuse_query_quantization and use_unscaled_score_recurrence:
+                raw_scores = tl.where(
+                    valid_keys.reshape((groups, _QUERY_GROUP_SIZE, block_n)),
+                    raw_scores,
+                    -float("inf"),
+                )
+                raw_block_max = tl.max(raw_scores, axis=2)
+                block_max = tl.fma(
+                    raw_block_max,
+                    score_scale[:, None],
+                    -_P_FP8_LOG2_MAX,
+                ).reshape((block_m,))
+            else:
+                block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_MAX
+            next_max = tl.maximum(running_max, block_max)
+            old_weight = tl.exp2(running_max - next_max)
+            if fuse_query_quantization and use_unscaled_score_recurrence:
+                probability_log2 = tl.fma(
+                    raw_scores,
+                    score_scale[:, None, None],
+                    -next_max.reshape((groups, _QUERY_GROUP_SIZE, 1)),
+                ).reshape((block_m, block_n))
+                probabilities = tl.exp2(probability_log2)
+            else:
+                probabilities = tl.exp2(scores - next_max[:, None])
+            accumulator *= old_weight[:, None]
+            denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
 
-        probability_fp8 = (probabilities * _P_FP8_RANGE).to(tl.float8e4nv)
-        value = _load_attention_value_tile(
-            value_ptr,
-            batch,
-            head,
-            batch_head,
-            start_n,
-            current_n,
-            offsets_d,
-            key_length,
-            use_tensor_descriptors,
-            heads,
-            head_dim,
-            block_n,
-        )
-        partial_fp16 = tl.dot(
-            probability_fp8,
-            value,
-            acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
-            out_dtype=tl.float16,
-        )
-        accumulator += partial_fp16.to(tl.float32)
-        running_max = next_max
+            probability_fp8 = probabilities.to(tl.float8e4nv)
+            value = _load_attention_value_tile(
+                value_ptr,
+                batch,
+                head,
+                batch_head,
+                start_n,
+                current_n,
+                offsets_d,
+                key_length,
+                use_tensor_descriptors,
+                heads,
+                head_dim,
+                block_n,
+            )
+            partial_fp16 = tl.dot(
+                probability_fp8,
+                value,
+                acc=tl.zeros((block_m, head_dim), dtype=tl.float16),
+                out_dtype=tl.float16,
+            )
+            accumulator += partial_fp16.to(tl.float32)
+            running_max = next_max
 
     output = accumulator / denominator[:, None]
     value_scale = tl.load(value_scale_ptr + (batch * heads + head) * head_dim + offsets_d)
@@ -373,115 +737,115 @@ def _sage_attention_2pp_kernel(
 def _make_attention_tensor_descriptors(
     key: torch.Tensor,
     value: torch.Tensor,
-    batch: int,
-    heads: int,
-    key_length: int,
-    head_dim: int,
 ) -> tuple[TensorDescriptor, TensorDescriptor]:
     """Describe flattened-BH K and feature-major V for descriptor loads."""
+    batch, heads, key_length, head_dim = key.shape
     key_descriptor = TensorDescriptor(
         base=key,
         shape=[batch * heads, key_length, head_dim],
         strides=[key_length * head_dim, head_dim, 1],
-        block_shape=[1, 64, head_dim],
+        block_shape=[1, int(_BLOCK_N), head_dim],
     )
     value_descriptor = TensorDescriptor(
         base=value,
         shape=[batch * heads, head_dim, key_length],
         strides=[head_dim * key_length, key_length, 1],
-        block_shape=[1, head_dim, 64],
+        block_shape=[1, head_dim, int(_BLOCK_N)],
     )
     return key_descriptor, value_descriptor
 
 
-def _should_use_attention_tensor_descriptors(
-    query: torch.Tensor,
-    block_m: int,
-    head_dim: int,
-    key_length: int,
-) -> bool:
-    """Use the descriptor schedule only for its measured SM120 sweet spot."""
-    device_major = torch.cuda.get_device_capability(query.device)[0]
-    return (
-        device_major == 12
-        and block_m == 128
-        and head_dim == 128
-        and key_length % 16 == 0
-    )
+@dataclass(frozen=True, slots=True)
+class _Sage2ppExecutionPlan:
+    """Host-side specialization choices for one SageAttention2++ invocation."""
+
+    block_m: int
+    grouped_qk: bool
+    fuse_kv_quantization: bool
+    fuse_query_quantization: bool
+    use_unscaled_score_recurrence: bool
+    use_tensor_descriptors: bool
+
+    def __post_init__(self) -> None:
+        if self.fuse_kv_quantization and not self.grouped_qk:
+            raise ValueError("fused K/V quantization requires grouped Q/K scales")
+        if self.fuse_query_quantization and not self.grouped_qk:
+            raise ValueError("fused Q quantization requires grouped Q/K scales")
+        if self.use_unscaled_score_recurrence and not self.fuse_query_quantization:
+            raise ValueError("unscaled-score recurrence requires fused Q quantization")
 
 
-def _make_attention_arguments(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    batch: int,
-    heads: int,
-    key_length: int,
-    head_dim: int,
-    use_tensor_descriptors: bool,
-) -> tuple[torch.Tensor | TensorDescriptor, torch.Tensor | TensorDescriptor]:
-    if not use_tensor_descriptors:
-        return key, value
-    return _make_attention_tensor_descriptors(
-        key,
-        value,
-        batch,
-        heads,
-        key_length,
-        head_dim,
-    )
-
-
-@torch.library.custom_op("piper_kernels::sage_attention_2pp", mutates_args=())
-def triton_sage_attention_2pp(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scale: float,
-    is_causal: bool,
-) -> torch.Tensor:
-    """Run preprocessing and the fused SageAttention2++ 8+8 kernel."""
-    return _run_sage_attention_2pp(query, key, value, scale, is_causal)
-
-
-def _run_sage_attention_2pp(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scale: float,
-    is_causal: bool,
+def _select_sage2pp_execution_plan(
+    target: AcceleratorTarget,
     *,
+    candidate_block_m: int,
+    query_length: int,
+    key_length: int,
+    head_dim: int,
+    is_causal: bool,
     use_tensor_descriptors: bool | None = None,
-) -> torch.Tensor:
-    """Run canonical SageAttention2++ with architecture-specific scheduling."""
-    batch, heads, query_length, head_dim = query.shape
-    key_length = key.shape[2]
-    # The 128-row causal variant creates severe accumulator spills in the
-    # current NVIDIA lowering; 64 rows avoids that spill-heavy code shape.
-    block_m = (
-        64
+) -> _Sage2ppExecutionPlan:
+    """Select measured policy separately from target hardware capabilities."""
+    grouped_qk = target.is_cuda_capability(12)
+    tuned_sm120 = target.is_cuda_capability(12, 0)
+
+    block_m = candidate_block_m
+    # On SM120, K/V reuse makes 128-row causal tiles worthwhile beyond 4K.
+    # Other targets retain the lower-footprint 64-row causal schedule.
+    if is_causal and (not tuned_sm120 or query_length <= 4096):
+        block_m = min(block_m, 64)
+
+    minimum_key_length = (
+        _CAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH
         if is_causal
-        else select_query_block(query, batch, heads, query_length)
+        else _NONCAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH
     )
-    padded_key_length = int(triton.cdiv(key_length, 64)) * 64
+    use_unscaled_score_recurrence = (
+        tuned_sm120 and head_dim == 128 and key_length >= minimum_key_length
+    )
+    fuse_query_quantization = tuned_sm120 and (not is_causal or use_unscaled_score_recurrence)
     if use_tensor_descriptors is None:
-        use_tensor_descriptors = _should_use_attention_tensor_descriptors(
-            query,
-            block_m,
-            head_dim,
-            padded_key_length,
-        )
-    storage_key_length = (
-        padded_key_length
-        if use_tensor_descriptors and key_length % 16 != 0
-        else key_length
+        use_tensor_descriptors = tuned_sm120 and block_m == 128 and head_dim == 128
+
+    return _Sage2ppExecutionPlan(
+        block_m=block_m,
+        grouped_qk=grouped_qk,
+        fuse_kv_quantization=tuned_sm120,
+        fuse_query_quantization=fuse_query_quantization,
+        use_unscaled_score_recurrence=use_unscaled_score_recurrence,
+        use_tensor_descriptors=use_tensor_descriptors,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSage2ppAttention:
+    """Quantized tensors and metadata required by the attention launch."""
+
+    query: torch.Tensor
+    key: torch.Tensor | TensorDescriptor
+    value: torch.Tensor | TensorDescriptor
+    query_scale: torch.Tensor
+    key_scale: torch.Tensor
+    value_scale: torch.Tensor
+    output: torch.Tensor
+    softmax_scale: float
+    key_length: int
+    is_causal: bool
+    plan: _Sage2ppExecutionPlan
+
+
+def _compute_kv_statistics(
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the per-head K mean and per-feature V scale."""
+    batch, heads, key_length, head_dim = key.shape
     statistics_block = 256
-    num_partials = (key_length + statistics_block - 1) // statistics_block
+    num_partials = int(triton.cdiv(key_length, statistics_block))
     partial_shape = (batch, heads, num_partials, head_dim)
-    key_sum_partial = torch.empty(partial_shape, device=query.device, dtype=torch.float32)
+    key_sum_partial = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
     value_max_partial = torch.empty_like(key_sum_partial)
-    statistics_grid = (num_partials, batch * heads)
-    _kv_statistics_partial_kernel[statistics_grid](
+    _kv_statistics_partial_kernel[(num_partials, batch * heads)](
         key,
         value,
         key_sum_partial,
@@ -500,11 +864,9 @@ def _run_sage_attention_2pp(
         num_warps=4,
     )
 
-    key_mean = torch.empty((batch, heads, head_dim), device=query.device, dtype=torch.float32)
+    key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
     value_scale = torch.empty_like(key_mean)
-    partial_block = triton.next_power_of_2(num_partials)
-    statistics_finish_grid = (triton.cdiv(head_dim, 32), batch * heads)
-    _finish_kv_statistics_kernel[statistics_finish_grid](
+    _finish_kv_statistics_kernel[(triton.cdiv(head_dim, 32), batch * heads)](
         key_sum_partial,
         value_max_partial,
         key_mean,
@@ -512,64 +874,74 @@ def _run_sage_attention_2pp(
         key_length,
         num_partials,
         head_dim=head_dim,
-        partial_block=partial_block,
+        partial_block=triton.next_power_of_2(num_partials),
         block_d=32,
         num_warps=4,
     )
+    return key_mean, value_scale
 
-    # Contiguous intermediates let the hot kernel specialize its indexing while
-    # these preprocessing kernels continue to accept arbitrary input strides.
-    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
-    key_int8_shape = (batch, heads, storage_key_length, head_dim)
+
+def _quantize_key_value(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_mean: torch.Tensor,
+    value_scale: torch.Tensor,
+    storage_key_length: int,
+    plan: _Sage2ppExecutionPlan,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize K/V using the preprocessing schedule selected by ``plan``."""
+    batch, heads, key_length, head_dim = key.shape
+    key_shape = (batch, heads, storage_key_length, head_dim)
+    value_shape = (batch, heads, head_dim, storage_key_length)
     key_int8 = (
-        torch.zeros(key_int8_shape, device=query.device, dtype=torch.int8)
+        torch.zeros(key_shape, device=key.device, dtype=torch.int8)
         if storage_key_length != key_length
-        else torch.empty(key_int8_shape, device=query.device, dtype=torch.int8)
+        else torch.empty(key_shape, device=key.device, dtype=torch.int8)
     )
-    value_fp8_shape = (batch, heads, head_dim, storage_key_length)
     value_fp8 = (
-        torch.zeros(value_fp8_shape, device=query.device, dtype=torch.float8_e4m3fn)
+        torch.zeros(value_shape, device=value.device, dtype=torch.float8_e4m3fn)
         if storage_key_length != key_length
-        else torch.empty(
-            value_fp8_shape,
-            device=query.device,
-            dtype=torch.float8_e4m3fn,
-        )
+        else torch.empty(value_shape, device=value.device, dtype=torch.float8_e4m3fn)
     )
-    qk_per_warp = torch.cuda.get_device_capability(query.device)[0] == 12
-    if qk_per_warp:
-        query_scale_groups = (query_length + 31) // 32
-        key_scale_groups = (key_length + 63) // 64
-        query_scale = torch.empty(
-            (batch, heads, query_scale_groups),
-            device=query.device,
-            dtype=torch.float32,
-        )
-        key_scale = torch.empty(
-            (batch, heads, key_scale_groups),
-            device=query.device,
-            dtype=torch.float32,
-        )
-        query_grid = (query_scale_groups, heads, batch)
-        qk_quantization.quantize_query_per_warp_kernel[query_grid](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
+
+    num_key_blocks = int(triton.cdiv(key_length, _BLOCK_N))
+    key_scale_shape = (
+        (batch, heads, num_key_blocks) if plan.grouped_qk else (batch, heads, key_length)
+    )
+    key_scale = torch.empty(key_scale_shape, device=key.device, dtype=torch.float32)
+
+    if plan.fuse_kv_quantization:
+        _quantize_kv_per_block_kernel[(num_key_blocks * 2, batch * heads)](
+            key,
+            value,
+            key_mean,
+            value_scale,
+            key_int8,
+            value_fp8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            value_fp8.stride(0),
+            value_fp8.stride(1),
+            value_fp8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
             head_dim=head_dim,
             num_warps=4,
         )
-        key_grid = (key_scale_groups, heads, batch)
-        qk_quantization.quantize_key_per_block_kernel[key_grid](
+        return key_int8, value_fp8, key_scale
+
+    if plan.grouped_qk:
+        qk_quantization.quantize_key_per_block_kernel[(num_key_blocks, heads, batch)](
             key,
             key_mean,
             key_int8,
@@ -585,32 +957,11 @@ def _run_sage_attention_2pp(
             key_scale.stride(1),
             heads=heads,
             head_dim=head_dim,
-            block_n=64,
+            block_n=_BLOCK_N,
             num_warps=4,
         )
     else:
-        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
-        key_scale = torch.empty(key.shape[:3], device=query.device, dtype=torch.float32)
-        query_grid = (triton.cdiv(query_length, 32) * 8, heads, batch)
-        qk_quantization.quantize_query_per_thread_kernel[query_grid](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
-            head_dim=head_dim,
-            num_warps=4,
-        )
-        key_grid = (triton.cdiv(key_length, 64) * 4, heads, batch)
-        qk_quantization.quantize_key_per_thread_kernel[key_grid](
+        qk_quantization.quantize_key_per_thread_kernel[(num_key_blocks * 4, heads, batch)](
             key,
             key_mean,
             key_int8,
@@ -628,8 +979,7 @@ def _run_sage_attention_2pp(
             head_dim=head_dim,
             num_warps=4,
         )
-    value_grid = (triton.cdiv(key_length, 64), heads, batch)
-    _quantize_value_kernel[value_grid](
+    _quantize_value_kernel[(num_key_blocks, heads, batch)](
         value,
         value_scale,
         value_fp8,
@@ -642,41 +992,212 @@ def _run_sage_attention_2pp(
         value_fp8.stride(2),
         heads=heads,
         head_dim=head_dim,
-        block_n=64,
+        block_n=_BLOCK_N,
         num_warps=4,
     )
+    return key_int8, value_fp8, key_scale
 
-    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-    key_argument, value_argument = _make_attention_arguments(
-        key_int8,
-        value_fp8,
-        batch,
-        heads,
-        storage_key_length,
-        head_dim,
-        use_tensor_descriptors,
-    )
-    _sage_attention_2pp_kernel[(triton.cdiv(query_length, block_m), heads, batch)](
-        query_int8,
-        key_argument,
-        value_argument,
-        query_scale,
-        key_scale,
-        value_scale,
-        output,
-        query_length,
-        key_length,
+
+def _prepare_query(
+    query: torch.Tensor,
+    value_scale: torch.Tensor,
+    softmax_scale: float,
+    plan: _Sage2ppExecutionPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return Q and its scale argument for the selected attention specialization."""
+    if plan.fuse_query_quantization:
+        # The placeholder scale argument is compiled away in this specialization.
+        return query, value_scale
+
+    batch, heads, query_length, head_dim = query.shape
+    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+    if plan.grouped_qk:
+        num_query_groups = int(triton.cdiv(query_length, _QUERY_GROUP_SIZE))
+        query_scale = torch.empty(
+            (batch, heads, num_query_groups),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        qk_quantization.quantize_query_per_warp_kernel[(num_query_groups, heads, batch)](
+            query,
+            query_int8,
+            query_scale,
+            query_length,
+            softmax_scale,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query_int8.stride(0),
+            query_int8.stride(1),
+            query_int8.stride(2),
+            query_scale.stride(0),
+            query_scale.stride(1),
+            head_dim=head_dim,
+            num_warps=4,
+        )
+    else:
+        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+        qk_quantization.quantize_query_per_thread_kernel[
+            (triton.cdiv(query_length, _QUERY_GROUP_SIZE) * 8, heads, batch)
+        ](
+            query,
+            query_int8,
+            query_scale,
+            query_length,
+            softmax_scale,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query_int8.stride(0),
+            query_int8.stride(1),
+            query_int8.stride(2),
+            query_scale.stride(0),
+            query_scale.stride(1),
+            head_dim=head_dim,
+            num_warps=4,
+        )
+    return query_int8, query_scale
+
+
+def _prepare_sage_attention_2pp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    *,
+    use_tensor_descriptors: bool | None = None,
+) -> _PreparedSage2ppAttention:
+    """Quantize inputs and construct the selected attention specialization."""
+    batch, heads, query_length, head_dim = query.shape
+    key_length = key.shape[2]
+    plan = _select_sage2pp_execution_plan(
+        AcceleratorTarget.from_device(query.device),
+        candidate_block_m=select_query_block(query, batch, heads, query_length),
+        query_length=query_length,
+        key_length=key_length,
+        head_dim=head_dim,
         is_causal=is_causal,
-        qk_per_warp=qk_per_warp,
+        use_tensor_descriptors=use_tensor_descriptors,
+    )
+    # The feature-major FP8 V descriptor requires its row stride to be
+    # 16-byte aligned; pad only storage whose sequence length violates it.
+    storage_key_length = (
+        int(triton.cdiv(key_length, _BLOCK_N)) * int(_BLOCK_N)
+        if plan.use_tensor_descriptors and key_length % 16 != 0
+        else key_length
+    )
+    key_mean, value_scale = _compute_kv_statistics(key, value)
+    if plan.fuse_kv_quantization:
+        key_int8, value_fp8, key_scale = _quantize_key_value(
+            key,
+            value,
+            key_mean,
+            value_scale,
+            storage_key_length,
+            plan,
+        )
+        query_argument, query_scale = _prepare_query(query, value_scale, scale, plan)
+    else:
+        # Preserve the portable path's established Q -> K -> V launch order.
+        query_argument, query_scale = _prepare_query(query, value_scale, scale, plan)
+        key_int8, value_fp8, key_scale = _quantize_key_value(
+            key,
+            value,
+            key_mean,
+            value_scale,
+            storage_key_length,
+            plan,
+        )
+    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+    key_argument: torch.Tensor | TensorDescriptor = key_int8
+    value_argument: torch.Tensor | TensorDescriptor = value_fp8
+    if plan.use_tensor_descriptors:
+        key_argument, value_argument = _make_attention_tensor_descriptors(
+            key_int8,
+            value_fp8,
+        )
+    return _PreparedSage2ppAttention(
+        query=query_argument,
+        key=key_argument,
+        value=value_argument,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        output=output,
+        softmax_scale=scale,
+        key_length=key_length,
+        is_causal=is_causal,
+        plan=plan,
+    )
+
+
+def _launch_sage_attention_2pp(prepared: _PreparedSage2ppAttention) -> torch.Tensor:
+    """Launch only the fused attention recurrence on prepared quantized inputs."""
+    batch, heads, query_length, head_dim = prepared.output.shape
+    plan = prepared.plan
+    _sage_attention_2pp_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
+        prepared.query,
+        prepared.key,
+        prepared.value,
+        prepared.query_scale,
+        prepared.key_scale,
+        prepared.value_scale,
+        prepared.output,
+        query_length,
+        prepared.key_length,
+        prepared.softmax_scale,
+        prepared.query.stride(0),
+        prepared.query.stride(1),
+        prepared.query.stride(2),
+        is_causal=prepared.is_causal,
+        grouped_qk=plan.grouped_qk,
+        fuse_query_quantization=plan.fuse_query_quantization,
+        # Reducing before applying the positive row scale cuts spill traffic in
+        # very long loops, but the alternate schedule loses at shorter lengths.
+        use_unscaled_score_recurrence=plan.use_unscaled_score_recurrence,
         heads=heads,
         head_dim=head_dim,
-        block_m=block_m,
-        block_n=64,
-        use_tensor_descriptors=use_tensor_descriptors,
+        block_m=plan.block_m,
+        block_n=_BLOCK_N,
+        use_tensor_descriptors=plan.use_tensor_descriptors,
         num_stages=3,
         num_warps=4,
     )
-    return output
+    return prepared.output
+
+
+def _run_sage_attention_2pp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    *,
+    use_tensor_descriptors: bool | None = None,
+) -> torch.Tensor:
+    """Run SageAttention2++ preprocessing and its fused recurrence."""
+    prepared = _prepare_sage_attention_2pp(
+        query,
+        key,
+        value,
+        scale,
+        is_causal,
+        use_tensor_descriptors=use_tensor_descriptors,
+    )
+    return _launch_sage_attention_2pp(prepared)
+
+
+@torch.library.custom_op("piper_kernels::sage_attention_2pp", mutates_args=())
+def triton_sage_attention_2pp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Run preprocessing and the fused SageAttention2++ 8+8 kernel."""
+    return _run_sage_attention_2pp(query, key, value, scale, is_causal)
 
 
 @triton_sage_attention_2pp.register_fake

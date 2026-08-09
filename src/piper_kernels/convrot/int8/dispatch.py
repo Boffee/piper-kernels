@@ -4,6 +4,8 @@ import math
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
 from .reference import reference_addmm_, reference_linear, validate_storage
 
 try:
@@ -26,7 +28,7 @@ def _can_use_triton(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
         and activation.device.type == "cuda"
         and activation.device == qdata.device
         and activation.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and torch.cuda.get_device_capability(activation.device) >= (7, 5)
+        and AcceleratorTarget.from_device(activation.device).cuda_capability_at_least(7, 5)
     )
 
 
@@ -86,7 +88,7 @@ def _can_use_triton_addmm(qdata: torch.Tensor, mat1: torch.Tensor) -> bool:
         _triton_addmm_ is not None
         and qdata.device.type == "cuda"
         and mat1.device == qdata.device
-        and torch.cuda.get_device_capability(qdata.device) >= (7, 5)
+        and AcceleratorTarget.from_device(qdata.device).cuda_capability_at_least(7, 5)
     )
 
 

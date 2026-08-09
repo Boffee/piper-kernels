@@ -24,6 +24,8 @@ import triton.language as tl
 from triton import knobs
 from triton.runtime import driver
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
 _MARKER = "piper_u8s8_dot_marker"
 _SIGNED_MMA = "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"
 _MIXED_MMA = "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32"
@@ -233,7 +235,8 @@ def _validate_target(target: object | None) -> None:
             f"native UINT8-by-INT8 dot requires NVIDIA MMAv2, got backend {backend!r}"
         )
     architecture = getattr(target, "arch", None)
-    if not isinstance(architecture, int) or architecture // 10 not in (8, 12):
+    accelerator_target = AcceleratorTarget.from_compiler_target(target)
+    if not accelerator_target.supports_uint8_int8_mma:
         raise MixedInt8DotCompatibilityError(
             "native UINT8-by-INT8 dot requires NVIDIA SM8x or consumer Blackwell SM12x, "
             f"got {architecture!r}"

@@ -117,7 +117,11 @@ def test_output_arguments_support_namespaced_record_types(tmp_path: Path) -> Non
 
 
 def test_environment_capture_does_not_require_cuda(monkeypatch, tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[2]
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    monkeypatch.setenv("GIT_DIR", str(repository / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repository))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(repository / ".git" / "index"))
 
     environment = capture_environment(tmp_path)
 
@@ -128,7 +132,7 @@ def test_environment_capture_does_not_require_cuda(monkeypatch, tmp_path: Path) 
 
 def test_environment_capture_identifies_rocm(monkeypatch, tmp_path: Path) -> None:
     class DeviceProperties:
-        gcnArchName = "gfx1201"  # noqa: N815 - PyTorch's ROCm property name.
+        gcnArchName = "gfx1201:sramecc+:xnack-"  # noqa: N815
 
     monkeypatch.setattr("torch.version.hip", "7.0")
     monkeypatch.setattr("torch.version.cuda", None)

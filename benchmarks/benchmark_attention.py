@@ -37,7 +37,7 @@ from lib.attention_providers import (
     validate_provider_support,
 )
 
-from piper_kernels._triton.targets import supports_fp8_fp16_mma, supports_uint8_int8_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -280,14 +280,15 @@ def _main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("attention benchmarking requires a CUDA or ROCm accelerator")
 
     device = torch.device("cuda")
+    target = AcceleratorTarget.from_device(device)
     provider_names = resolve_provider_names(
         args.providers,
         include_canonical=args.canonical,
-        piper_supported=supports_uint8_int8_mma(device),
-        fp8_supported=supports_fp8_fp16_mma(device),
+        piper_supported=target.supports_uint8_int8_mma,
+        fp8_supported=target.supports_fp8_fp16_mma,
     )
     _validate_args(args, provider_names)
-    validate_provider_support(provider_names, device)
+    validate_provider_support(provider_names, target)
     profile_name = _profile_provider_name(args, provider_names)
     compiler_name = _compiler_provider_name(args, provider_names)
     benchmark_target, compiler_target = _output_targets(args)
@@ -299,7 +300,6 @@ def _main(argv: Sequence[str] | None = None) -> None:
         scale=args.scale,
         qkv_layout="BHSD",
     )
-    capability = torch.cuda.get_device_capability(device)
     generator = torch.Generator(device=device).manual_seed(args.seed)
     records: list[BenchmarkRecord] = []
     compiler_report: TritonCompilerRecord | None = None
@@ -326,7 +326,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             inputs,
             provider_names=provider_names,
             config=config,
-            capability=capability,
+            target=target,
         )
         if profile_name is not None:
             _profile(

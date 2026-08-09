@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import platform
 import subprocess
 import sys
@@ -11,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import torch
+
+from piper_kernels._triton.targets import AcceleratorTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +60,23 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _run(command: list[str], cwd: Path | None = None) -> str | None:
+_GIT_REPOSITORY_ENVIRONMENT_VARIABLES = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+)
+
+
+def _run(
+    command: list[str],
+    cwd: Path | None = None,
+    *,
+    environment: dict[str, str] | None = None,
+) -> str | None:
     try:
         result = subprocess.run(
             command,
@@ -65,8 +84,9 @@ def _run(command: list[str], cwd: Path | None = None) -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            env=environment,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except FileNotFoundError, subprocess.CalledProcessError:
         return None
     return result.stdout.strip() or None
 
@@ -74,10 +94,22 @@ def _run(command: list[str], cwd: Path | None = None) -> str | None:
 def _git_state(repository: Path | None) -> tuple[str | None, bool | None]:
     if repository is None:
         return None, None
-    revision = _run(["git", "rev-parse", "HEAD"], repository)
+    environment = os.environ.copy()
+    for variable in _GIT_REPOSITORY_ENVIRONMENT_VARIABLES:
+        environment.pop(variable, None)
+
+    revision = _run(
+        ["git", "rev-parse", "HEAD"],
+        repository,
+        environment=environment,
+    )
     if revision is None:
         return None, None
-    status = _run(["git", "status", "--porcelain", "--untracked-files=normal"], repository)
+    status = _run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        repository,
+        environment=environment,
+    )
     return revision, bool(status)
 
 
@@ -111,13 +143,12 @@ def capture_environment(repository: Path | None = None) -> EnvironmentInfo:
     if torch.cuda.is_available():
         gpu_index = torch.cuda.current_device()
         gpu_name = torch.cuda.get_device_name(gpu_index)
-        if accelerator_backend == "rocm":
-            properties = torch.cuda.get_device_properties(gpu_index)
-            architecture = getattr(properties, "gcnArchName", None)
-            gpu_architecture = str(architecture) if architecture is not None else None
-        else:
-            major, minor = torch.cuda.get_device_capability(gpu_index)
-            gpu_architecture = f"SM{major}{minor}"
+        target = AcceleratorTarget.from_device(torch.device("cuda", gpu_index))
+        gpu_architecture = target.architecture
+        if target.is_nvidia_cuda:
+            gpu_architecture = (
+                target.architecture.upper() if target.architecture is not None else None
+            )
             driver_version = _nvidia_driver_version()
 
     git_revision, git_dirty = _git_state(repository)

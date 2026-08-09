@@ -5,7 +5,7 @@ from typing import Literal
 import pytest
 import torch
 
-from piper_kernels._triton.targets import supports_uint8_int8_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention import piper_attention
 from piper_kernels.attention.piper.reference import reference_piper_attention
 from piper_kernels.attention.piper.triton import (
@@ -16,7 +16,9 @@ from piper_kernels.attention.piper.triton import (
 
 
 def _piper_gpu_available() -> bool:
-    return torch.cuda.is_available() and supports_uint8_int8_mma(torch.device("cuda"))
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).supports_uint8_int8_mma
 
 
 def _sm120_available() -> bool:
