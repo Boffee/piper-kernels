@@ -7,7 +7,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from .._torch_compat import is_fake_mode_active
-from ._policy import can_fuse_rotation_quantization
+from ._policy import select_preparation_plan
 from .reference import reference_addmm_, reference_linear, validate_storage
 
 try:
@@ -28,27 +28,37 @@ except ModuleNotFoundError as exc:
     _triton_swiglu_linear = None
 
 
-def _accelerator_target(device: torch.device) -> AcceleratorTarget | None:
-    """Resolve a concrete target, failing closed for synthetic fake devices."""
+@torch.compiler.assume_constant_result
+def _cuda_capability(device: torch.device) -> tuple[int, int] | None:
+    """Resolve the process-stable CUDA capability as a compile-time target fact."""
     try:
-        return AcceleratorTarget.from_device(device)
+        return torch.cuda.get_device_capability(device)
     except Exception:
-        if torch.compiler.is_compiling():
-            return None
         if not is_fake_mode_active():
             raise
         return None
 
 
+def _accelerator_target(device: torch.device) -> AcceleratorTarget | None:
+    """Resolve a concrete target, failing closed for synthetic fake devices."""
+    if device.type != "cuda":
+        return AcceleratorTarget(backend=device.type)
+    if torch.version.hip is not None:
+        return AcceleratorTarget(backend="hip")
+    capability = _cuda_capability(device)
+    if capability is None:
+        return None
+    major, minor = capability
+    return AcceleratorTarget(backend="cuda", architecture=f"sm{major}{minor}")
+
+
 def _needs_fake_cuda_kernel(tensor: torch.Tensor) -> bool:
     """Return whether a CUDA fake has no concrete target for decomposed factories."""
-    if torch.compiler.is_compiling():
+    if tensor.device.type != "cuda" or torch.version.hip is not None:
         return False
-    return (
-        tensor.device.type == "cuda"
-        and is_fake_mode_active()
-        and _accelerator_target(tensor.device) is None
-    )
+    if torch.compiler.is_compiling():
+        return _cuda_capability(tensor.device) is None
+    return is_fake_mode_active() and _accelerator_target(tensor.device) is None
 
 
 def _can_use_triton(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
@@ -76,17 +86,17 @@ def _can_use_triton_swiglu(
     ):
         return False
     rows = activation.numel() // activation.shape[-1]
-    if not can_fuse_rotation_quantization(
-        rows,
-        int(qdata.shape[1]),
-        group_size,
-        activation.dtype,
-        activation.device,
-        sm120=True,
-    ):
-        return False
     target = _accelerator_target(activation.device)
-    return target is not None and target.is_cuda_capability(12, 0)
+    if target is None:
+        return False
+    return select_preparation_plan(
+        target,
+        rows=rows,
+        in_features=int(qdata.shape[1]),
+        group_size=group_size,
+        dtype=activation.dtype,
+        swiglu=True,
+    ).fuse_rotation_quantization
 
 
 def _reference_swiglu_linear(

@@ -208,20 +208,26 @@ uv run python benchmarks/benchmark_convrot_preparation.py
 
 uv run python benchmarks/benchmark_convrot_preparation.py \
   --rows 131072 --in-features 14336 --input-activation swiglu
+
+uv run --with comfy-kitchen==0.2.28 \
+  python benchmarks/benchmark_convrot_preparation.py \
+  --rows 37710 --in-features 5376 --compare-comfy-kitchen
 ```
 
 The preparation benchmark reports rotation, rowwise quantization, their two-launch split,
 and the one-pass fused candidate for the H3 widths. The traffic column is an algorithmic
-minimum, not a measured DRAM-transaction count. `--compare-comfy-kitchen` adds its pinned,
-preallocated CUDA preparation kernel when the optional package is installed. The final column
-names its Piper baseline explicitly: split preparation without an input activation and fused
-preparation for SwiGLU.
+minimum, not a measured DRAM-transaction count. Unlike the permissive public comparison above,
+the preparation adapter calls a private native entrypoint and accepts exactly
+`comfy-kitchen==0.2.28`. Its records include both the installed package version and the private
+adapter-contract version. The final column names its Piper baseline explicitly: split
+preparation without an input activation and fused preparation for SwiGLU.
 
 Add `--json PATH` or `--jsonl PATH` to serialize one common `BenchmarkRecord` per width and
 phase. Each record distinguishes linear `K` from raw input width and includes the phase,
 operation provenance, baseline, device timing, minimum traffic, and effective bandwidth.
 Compiler output remains independently selectable with `--compiler-json` or
-`--compiler-jsonl`, so both record types can be written by one invocation.
+`--compiler-jsonl`, so both record types can be written by one invocation. Benchmark and
+compiler records must use different output paths.
 
 The common compiler-report adapter can inspect one width per fresh process:
 

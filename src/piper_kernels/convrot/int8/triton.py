@@ -9,6 +9,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
 from . import _policy
 from .reference import _empty_inner_linear
 
@@ -311,29 +313,6 @@ def _input_dtype_code(dtype: torch.dtype) -> int:
     return 0
 
 
-def _is_sm120(device: torch.device) -> bool:
-    """Compatibility wrapper for the centralized architecture policy."""
-    return _policy.is_sm120(device)
-
-
-def _can_fuse_rotation_quantization(
-    m: int,
-    k: int,
-    group_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> bool:
-    """Compatibility wrapper for the centralized preparation policy."""
-    return _policy.can_fuse_rotation_quantization(
-        m,
-        k,
-        group_size,
-        dtype,
-        device,
-        sm120=_is_sm120(device),
-    )
-
-
 def _rotate_activations(
     activation: torch.Tensor,
     rotated: torch.Tensor,
@@ -379,24 +358,32 @@ def _fused_rotate_quantize_activations(
     group_size: int,
     input_dtype_code: int,
     input_activation_code: int = 0,
+    *,
+    plan: _policy.PreparationPlan | None = None,
 ) -> None:
     """Rotate, reduce, and quantize without materializing the rotated row."""
     m, input_width = activation.shape
     k = input_width // 2 if input_activation_code == 1 else input_width
-    block_size = max(128, 1 << (k - 1).bit_length())
-    large_swiglu = input_activation_code == 1 and block_size == 16_384
-    num_warps = 16 if large_swiglu and m >= 8192 else (8 if large_swiglu else 4)
+    if plan is None:
+        plan = _policy.select_preparation_plan(
+            AcceleratorTarget.from_device(activation.device),
+            rows=m,
+            in_features=k,
+            group_size=group_size,
+            dtype=activation.dtype,
+            swiglu=input_activation_code == 1,
+        )
     _rotate_quantize_rows_kernel[(m,)](
         activation,
         quantized,
         activation_scale,
         k,
-        block_size=block_size,
+        block_size=plan.block_size,
         group_size=group_size,
         inverse_sqrt_group=group_size**-0.5,
         input_dtype_code=input_dtype_code,
         input_activation_code=input_activation_code,
-        num_warps=num_warps,
+        num_warps=plan.fused_num_warps,
     )
 
 
@@ -466,13 +453,21 @@ def triton_convrot_int8_linear(
     input_dtype_code = _input_dtype_code(activation.dtype)
     quantized = torch.empty_like(activation_2d, dtype=torch.int8)
     activation_scale = torch.empty(m, device=activation.device, dtype=torch.float32)
-    if _can_fuse_rotation_quantization(m, k, group_size, activation.dtype, activation.device):
+    plan = _policy.select_preparation_plan(
+        AcceleratorTarget.from_device(activation.device),
+        rows=m,
+        in_features=k,
+        group_size=group_size,
+        dtype=activation.dtype,
+    )
+    if plan.fuse_rotation_quantization:
         _fused_rotate_quantize_activations(
             activation_2d,
             quantized,
             activation_scale,
             group_size,
             input_dtype_code,
+            plan=plan,
         )
     else:
         rotated = torch.empty_like(activation_2d)
@@ -510,6 +505,14 @@ def triton_convrot_int8_swiglu_linear(
 
     quantized = torch.empty((m, k), device=activation.device, dtype=torch.int8)
     activation_scale = torch.empty(m, device=activation.device, dtype=torch.float32)
+    plan = _policy.select_preparation_plan(
+        AcceleratorTarget.from_device(activation.device),
+        rows=m,
+        in_features=k,
+        group_size=group_size,
+        dtype=activation.dtype,
+        swiglu=True,
+    )
     _fused_rotate_quantize_activations(
         activation_2d,
         quantized,
@@ -517,6 +520,7 @@ def triton_convrot_int8_swiglu_linear(
         group_size,
         _input_dtype_code(activation.dtype),
         input_activation_code=1,
+        plan=plan,
     )
     return _int8_linear_from_quantized(
         activation,

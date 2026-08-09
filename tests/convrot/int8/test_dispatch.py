@@ -233,6 +233,28 @@ def test_public_fake_cuda_paths_do_not_require_a_physical_device(
     assert updated is weight
 
 
+def test_public_swiglu_fake_cuda_runs_under_fullgraph_compile_without_a_target() -> None:
+    unavailable_index = torch.cuda.device_count()
+    with FakeTensorMode():
+        device = torch.device(f"cuda:{unavailable_index}")
+        weight = ConvRotInt8Tensor.from_packed(
+            torch.empty(7, 256, dtype=torch.int8, device=device),
+            torch.empty(7, 1, dtype=torch.float32, device=device),
+            group_size=256,
+        )
+        activation = torch.empty(512, 512, dtype=torch.bfloat16, device=device)
+
+        def apply_swiglu(value: torch.Tensor) -> torch.Tensor:
+            return convrot_linear(value, weight, input_activation="swiglu")
+
+        result = torch.compile(apply_swiglu, backend="eager", fullgraph=True)(activation)
+
+    assert isinstance(result, FakeTensor)
+    assert result.shape == (512, 7)
+    assert result.dtype is torch.bfloat16
+    assert result.device == torch.device(f"cuda:{unavailable_index}")
+
+
 def test_addmm_rejects_grad_enabled_scale_but_allows_no_grad() -> None:
     weight = _weight(scale_requires_grad=True)
     mat1 = torch.randn(7, 3)

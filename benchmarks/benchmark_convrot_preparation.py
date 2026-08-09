@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.metadata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from lib import (
     BenchmarkProvider,
     BenchmarkRecord,
     EnvironmentInfo,
+    OutputTarget,
     PhaseTimings,
     Timing,
     add_compiler_inspection_arguments,
@@ -26,7 +28,20 @@ from lib import (
     write_records,
 )
 
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.convrot.int8 import _policy as convrot_policy
 from piper_kernels.convrot.int8 import triton as triton_backend
+
+COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
+
+
+@dataclass(frozen=True, slots=True)
+class ComfyKitchenPreparationAdapter:
+    """Version-checked access to Comfy Kitchen's private preparation API."""
+
+    cuda: ModuleType
+    installed_version: str
+    adapter_contract_version: str = COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +56,8 @@ class PreparationPhaseResult:
     effective_minimum_tbps: float
     baseline_phase: str
     speedup_vs_baseline: float
+    installed_version: str | None = None
+    adapter_contract_version: str | None = None
 
 
 _PHASE_PROVENANCE = {
@@ -166,21 +183,35 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _load_comfy_kitchen_cuda() -> ModuleType:
+def _load_comfy_kitchen_cuda() -> ComfyKitchenPreparationAdapter:
     """Load the version-pinned development adapter only when explicitly requested."""
+    try:
+        installed_version = importlib.metadata.version("comfy-kitchen")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise SystemExit(
+            "--compare-comfy-kitchen requires an optional "
+            f"comfy-kitchen=={COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION} installation"
+        ) from error
+    if installed_version != COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION:
+        raise SystemExit(
+            "the private preparation adapter supports "
+            f"comfy-kitchen=={COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION}; "
+            f"found {installed_version}"
+        )
     try:
         module = importlib.import_module("comfy_kitchen.backends.cuda")
     except (ImportError, OSError) as error:
         raise SystemExit(
-            "--compare-comfy-kitchen requires an optional comfy-kitchen installation "
-            "with its CUDA backend"
+            "--compare-comfy-kitchen requires the CUDA backend from "
+            f"comfy-kitchen=={COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION}"
         ) from error
     if not hasattr(module, "_C") or not callable(getattr(module, "_wrap_for_dlpack", None)):
         raise SystemExit(
             "the installed comfy-kitchen CUDA backend is incompatible with the "
-            "preparation benchmark; use comfy-kitchen==0.2.28"
+            "preparation benchmark; use "
+            f"comfy-kitchen=={COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION}"
         )
-    return module
+    return ComfyKitchenPreparationAdapter(module, installed_version)
 
 
 def _comfy_preparation_launcher(
@@ -241,7 +272,7 @@ def _benchmark_width(
     seed: int,
     warmup_ms: int,
     measurement_time_ms: int,
-    comfy_kitchen: ModuleType | None,
+    comfy_kitchen: ComfyKitchenPreparationAdapter | None,
     input_activation: str | None,
 ) -> tuple[PreparationPhaseResult, ...]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -259,6 +290,14 @@ def _benchmark_width(
     fused_qdata = torch.empty_like(split_qdata)
     fused_scale = torch.empty_like(split_scale)
     dtype_code = triton_backend._input_dtype_code(dtype)
+    preparation_plan = convrot_policy.select_preparation_plan(
+        AcceleratorTarget.from_device(raw_activation.device),
+        rows=rows,
+        in_features=in_features,
+        group_size=256,
+        dtype=dtype,
+        swiglu=input_activation == "swiglu",
+    )
 
     def rotate() -> None:
         triton_backend._rotate_activations(activation, rotated, 256)
@@ -278,6 +317,7 @@ def _benchmark_width(
             256,
             dtype_code,
             input_activation_code=1 if input_activation == "swiglu" else 0,
+            plan=preparation_plan,
         )
 
     split()
@@ -306,7 +346,7 @@ def _benchmark_width(
         comfy_qdata = torch.empty_like(split_qdata)
         comfy_scale = torch.empty((rows, 1), device="cuda", dtype=torch.float32)
         comfy_launch = _comfy_preparation_launcher(
-            comfy_kitchen,
+            comfy_kitchen.cuda,
             comfy_activation,
             comfy_qdata,
             comfy_scale,
@@ -353,6 +393,16 @@ def _benchmark_width(
                 effective_minimum_tbps=_effective_tbps(traffic, timing.median_ms),
                 baseline_phase=baseline_phase,
                 speedup_vs_baseline=baseline_median / timing.median_ms,
+                installed_version=(
+                    comfy_kitchen.installed_version
+                    if phase == "comfy-kitchen" and comfy_kitchen is not None
+                    else None
+                ),
+                adapter_contract_version=(
+                    comfy_kitchen.adapter_contract_version
+                    if phase == "comfy-kitchen" and comfy_kitchen is not None
+                    else None
+                ),
             )
         )
     return tuple(results)
@@ -392,6 +442,13 @@ def _preparation_records(
     input_layout = "up_gate" if input_activation == "swiglu" else "plain"
     records = []
     for result in results:
+        provider_provenance = {
+            "operation_provenance": result.operation_provenance,
+        }
+        if result.installed_version is not None:
+            provider_provenance["installed_version"] = result.installed_version
+        if result.adapter_contract_version is not None:
+            provider_provenance["adapter_contract_version"] = result.adapter_contract_version
         records.append(
             BenchmarkRecord(
                 benchmark="convrot-preparation",
@@ -405,7 +462,7 @@ def _preparation_records(
                     "phase": result.phase,
                     "baseline_provider": "piper-triton",
                     "baseline_phase": result.baseline_phase,
-                    "operation_provenance": result.operation_provenance,
+                    **provider_provenance,
                     "prepared_execution_scope": "fixed_source_preallocated_outputs",
                     "seed": seed,
                 },
@@ -457,6 +514,18 @@ def _compiler_requested(args: argparse.Namespace) -> bool:
     return args.compiler_report or output_target(args, option_prefix="compiler") is not None
 
 
+def _output_targets(args: argparse.Namespace) -> tuple[OutputTarget | None, OutputTarget | None]:
+    benchmark_target = output_target(args)
+    compiler_target = output_target(args, option_prefix="compiler")
+    if (
+        benchmark_target is not None
+        and compiler_target is not None
+        and benchmark_target.path.resolve() == compiler_target.path.resolve()
+    ):
+        raise SystemExit("benchmark and compiler output paths must be different")
+    return benchmark_target, compiler_target
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.rows <= 0 or any(width <= 0 for width in args.in_features):
         raise SystemExit("--rows and every --in-features value must be positive")
@@ -474,6 +543,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main(argv: Sequence[str] | None = None) -> None:
     """Run allocation-free phase timings for each requested activation width."""
     args = _parse_args(argv)
+    benchmark_output, compiler_output = _output_targets(args)
     _validate_args(args)
     dtype = _dtype(args.dtype)
     comfy_kitchen = _load_comfy_kitchen_cuda() if args.compare_comfy_kitchen else None
@@ -520,9 +590,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 environment,
             )
         )
-    write_records(records, output_target(args))
+    write_records(records, benchmark_output)
 
-    compiler_output = output_target(args, option_prefix="compiler")
     if _compiler_requested(args):
         report = inspect_provider(
             _inspection_provider(args),

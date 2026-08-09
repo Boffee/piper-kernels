@@ -1,6 +1,8 @@
 """Tests for ConvRot benchmark presets, records, and reference helpers."""
 
 import json
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -17,10 +19,13 @@ from benchmark_convrot import (
     _validate_args,
 )
 from benchmark_convrot_preparation import (
+    COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION,
     PreparationPhaseResult,
     _compiler_requested,
     _inspection_provider,
+    _load_comfy_kitchen_cuda,
     _minimum_global_bytes,
+    _output_targets,
     _preparation_records,
 )
 from benchmark_convrot_preparation import (
@@ -238,6 +243,78 @@ def test_preparation_cli_exposes_current_compiler_reporting(tmp_path) -> None:
     assert arguments.sass is False
 
 
+@pytest.mark.parametrize(
+    ("benchmark_option", "compiler_option"),
+    [
+        ("--json", "--compiler-json"),
+        ("--json", "--compiler-jsonl"),
+        ("--jsonl", "--compiler-json"),
+        ("--jsonl", "--compiler-jsonl"),
+    ],
+)
+def test_preparation_benchmark_and_compiler_outputs_must_not_collide(
+    tmp_path: Path,
+    benchmark_option: str,
+    compiler_option: str,
+) -> None:
+    path = tmp_path / "records.json"
+    arguments = _parse_preparation_args(
+        [
+            "--in-features",
+            "5376",
+            benchmark_option,
+            str(path),
+            compiler_option,
+            str(path),
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="must be different"):
+        _output_targets(arguments)
+
+
+def _comfy_cuda_module() -> ModuleType:
+    module = ModuleType("comfy_kitchen.backends.cuda")
+    module._C = object()
+    module._wrap_for_dlpack = lambda tensor: tensor
+    return module
+
+
+def test_private_comfy_preparation_adapter_accepts_its_declared_contract(
+    monkeypatch,
+) -> None:
+    module = _comfy_cuda_module()
+    monkeypatch.setattr(
+        "benchmark_convrot_preparation.importlib.metadata.version",
+        lambda _name: "0.2.28",
+    )
+    monkeypatch.setattr(
+        "benchmark_convrot_preparation.importlib.import_module",
+        lambda _name: module,
+    )
+
+    adapter = _load_comfy_kitchen_cuda()
+
+    assert COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION == "0.2.28"
+    assert adapter.cuda is module
+    assert adapter.installed_version == "0.2.28"
+    assert adapter.adapter_contract_version == "0.2.28"
+
+
+def test_private_comfy_preparation_adapter_rejects_other_versions(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "benchmark_convrot_preparation.importlib.metadata.version",
+        lambda _name: "0.2.29",
+    )
+    monkeypatch.setattr(
+        "benchmark_convrot_preparation.importlib.import_module",
+        lambda _name: pytest.fail("wrong-version package backend must not be imported"),
+    )
+
+    with pytest.raises(SystemExit, match=r"supports comfy-kitchen==0\.2\.28; found 0\.2\.29"):
+        _load_comfy_kitchen_cuda()
+
+
 def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     output_path = tmp_path / "preparation.jsonl"
     arguments = _parse_preparation_args(["--jsonl", str(output_path)])
@@ -278,6 +355,8 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     assert value["configuration"]["baseline_provider"] == "piper-triton"
     assert value["configuration"]["baseline_phase"] == "fused"
     assert value["configuration"]["operation_provenance"] == phase.operation_provenance
+    assert "installed_version" not in value["configuration"]
+    assert "adapter_contract_version" not in value["configuration"]
     assert value["timings"]["prepared_execution"]["clock"] == "device_event"
     assert value["extra"]["speedup_vs_baseline"] == 1.0
 
@@ -285,6 +364,38 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     written = json.loads(output_path.read_text())
     assert written["benchmark"] == "convrot-preparation"
     assert written["shape"]["raw_input_features"] == 1024
+
+
+def test_comfy_preparation_record_includes_installed_and_contract_versions() -> None:
+    phase = PreparationPhaseResult(
+        phase="comfy-kitchen",
+        provider="comfy-kitchen",
+        operation_provenance=("comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64"),
+        timing=Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT),
+        minimum_global_bytes=1024,
+        effective_minimum_tbps=2.0,
+        baseline_phase="fused",
+        speedup_vs_baseline=1.1,
+        installed_version="0.2.28",
+        adapter_contract_version=COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION,
+    )
+
+    (record,) = _preparation_records(
+        rows=3,
+        in_features=512,
+        dtype_name="bfloat16",
+        input_activation="swiglu",
+        seed=0,
+        warmup_ms=100,
+        measurement_time_ms=300,
+        results=[phase],
+        environment=_environment(),
+    )
+
+    configuration = record.as_dict()["configuration"]
+    assert configuration["installed_version"] == "0.2.28"
+    assert configuration["adapter_contract_version"] == "0.2.28"
+    assert configuration["operation_provenance"] == phase.operation_provenance
 
 
 def test_preparation_compiler_report_only_inspects_launched_phases() -> None:
