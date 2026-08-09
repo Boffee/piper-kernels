@@ -8,6 +8,7 @@ from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
 from piper_kernels.convrot._rotation import build_hadamard, rotate_groups
 from piper_kernels.convrot.int8.reference import (
     dynamic_quantize_rows,
+    reference_swiglu_linear,
 )
 
 
@@ -71,6 +72,29 @@ def test_cpu_convrot_linear_matches_materialized_up_gate_swiglu(with_bias: bool)
 
     expected = torch.nn.functional.linear(up * torch.nn.functional.silu(gate), weight, bias)
     actual = convrot_linear(activation, weight, bias, input_activation="swiglu")
+
+    assert torch.equal(actual, expected)
+
+
+def test_convrot_linear_supports_keyword_arguments() -> None:
+    torch.manual_seed(124)
+    weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
+    input_tensor = torch.randn(2, 64)
+    bias = torch.randn(11)
+
+    expected = reference_swiglu_linear(
+        input_tensor,
+        weight.qdata,
+        weight.scale,
+        weight.group_size,
+        bias,
+    )
+    actual = convrot_linear(
+        input=input_tensor,
+        weight=weight,
+        bias=bias,
+        input_activation="swiglu",
+    )
 
     assert torch.equal(actual, expected)
 

@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 
@@ -33,6 +33,7 @@ from piper_kernels.convrot.int8 import _policy as convrot_policy
 from piper_kernels.convrot.int8 import triton as triton_backend
 
 COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
+PIPER_TRITON_PROVIDER = "piper-triton"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,8 +57,7 @@ class PreparationPhaseResult:
     effective_minimum_tbps: float
     baseline_phase: str
     speedup_vs_baseline: float
-    installed_version: str | None = None
-    adapter_contract_version: str | None = None
+    provider_configuration: Mapping[str, object] = field(default_factory=dict)
 
 
 _PHASE_PROVENANCE = {
@@ -265,6 +265,35 @@ def _assert_fused_quality(
     )
 
 
+def _select_preparation_plan(
+    target: AcceleratorTarget,
+    rows: int,
+    in_features: int,
+    dtype: torch.dtype,
+    input_activation: str | None,
+) -> convrot_policy.PreparationPlan:
+    """Select the production plan recorded by one preparation benchmark case."""
+    return convrot_policy.select_preparation_plan(
+        target,
+        rows=rows,
+        in_features=in_features,
+        group_size=256,
+        dtype=dtype,
+        swiglu=input_activation == "swiglu",
+    )
+
+
+def _preparation_plan_configuration(
+    preparation_plan: convrot_policy.PreparationPlan,
+) -> dict[str, int | bool]:
+    """Return the shared timing/compiler provenance for one selected plan."""
+    return {
+        "fused_block_size": preparation_plan.fused_block_size,
+        "fused_num_warps": preparation_plan.fused_num_warps,
+        "production_fusion_eligible": preparation_plan.fuse_rotation_quantization,
+    }
+
+
 def _benchmark_width(
     rows: int,
     in_features: int,
@@ -274,6 +303,7 @@ def _benchmark_width(
     measurement_time_ms: int,
     comfy_kitchen: ComfyKitchenPreparationAdapter | None,
     input_activation: str | None,
+    preparation_plan: convrot_policy.PreparationPlan,
 ) -> tuple[PreparationPhaseResult, ...]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     raw_activation = torch.randn(
@@ -289,15 +319,7 @@ def _benchmark_width(
     split_scale = torch.empty(rows, device="cuda", dtype=torch.float32)
     fused_qdata = torch.empty_like(split_qdata)
     fused_scale = torch.empty_like(split_scale)
-    dtype_code = triton_backend._input_dtype_code(dtype)
-    preparation_plan = convrot_policy.select_preparation_plan(
-        AcceleratorTarget.from_device(raw_activation.device),
-        rows=rows,
-        in_features=in_features,
-        group_size=256,
-        dtype=dtype,
-        swiglu=input_activation == "swiglu",
-    )
+    dtype_code = triton_backend._logical_dtype_code(dtype)
 
     def rotate() -> None:
         triton_backend._rotate_activations(activation, rotated, 256)
@@ -316,7 +338,7 @@ def _benchmark_width(
             fused_scale,
             256,
             dtype_code,
-            input_activation_code=1 if input_activation == "swiglu" else 0,
+            apply_swiglu=input_activation == "swiglu",
             plan=preparation_plan,
         )
 
@@ -376,6 +398,15 @@ def _benchmark_width(
     results = []
     for phase, _launch in phases:
         timing = timings[phase]
+        is_comfy_kitchen = phase == "comfy-kitchen"
+        provider_configuration = (
+            {
+                "installed_version": comfy_kitchen.installed_version,
+                "adapter_contract_version": comfy_kitchen.adapter_contract_version,
+            }
+            if is_comfy_kitchen and comfy_kitchen is not None
+            else _preparation_plan_configuration(preparation_plan)
+        )
         traffic = _minimum_global_bytes(
             phase,
             rows,
@@ -386,23 +417,14 @@ def _benchmark_width(
         results.append(
             PreparationPhaseResult(
                 phase=phase,
-                provider="comfy-kitchen" if phase == "comfy-kitchen" else "piper-triton",
+                provider="comfy-kitchen" if is_comfy_kitchen else PIPER_TRITON_PROVIDER,
                 operation_provenance=_PHASE_PROVENANCE[phase],
                 timing=timing,
                 minimum_global_bytes=traffic,
                 effective_minimum_tbps=_effective_tbps(traffic, timing.median_ms),
                 baseline_phase=baseline_phase,
                 speedup_vs_baseline=baseline_median / timing.median_ms,
-                installed_version=(
-                    comfy_kitchen.installed_version
-                    if phase == "comfy-kitchen" and comfy_kitchen is not None
-                    else None
-                ),
-                adapter_contract_version=(
-                    comfy_kitchen.adapter_contract_version
-                    if phase == "comfy-kitchen" and comfy_kitchen is not None
-                    else None
-                ),
+                provider_configuration=provider_configuration,
             )
         )
     return tuple(results)
@@ -439,16 +461,14 @@ def _preparation_records(
         "raw_input_features": _raw_input_features(in_features, input_activation),
     }
     input_activation_name = input_activation or "none"
-    input_layout = "up_gate" if input_activation == "swiglu" else "plain"
+    logical_input_layout = "up_gate" if input_activation == "swiglu" else "plain"
     records = []
     for result in results:
-        provider_provenance = {
-            "operation_provenance": result.operation_provenance,
-        }
-        if result.installed_version is not None:
-            provider_provenance["installed_version"] = result.installed_version
-        if result.adapter_contract_version is not None:
-            provider_provenance["adapter_contract_version"] = result.adapter_contract_version
+        provider_input_layout = (
+            "gate_up"
+            if result.provider == "comfy-kitchen" and input_activation == "swiglu"
+            else logical_input_layout
+        )
         records.append(
             BenchmarkRecord(
                 benchmark="convrot-preparation",
@@ -458,11 +478,13 @@ def _preparation_records(
                     "dtype": dtype_name,
                     "group_size": 256,
                     "input_activation": input_activation_name,
-                    "input_layout": input_layout,
+                    "logical_input_layout": logical_input_layout,
+                    "provider_input_layout": provider_input_layout,
                     "phase": result.phase,
-                    "baseline_provider": "piper-triton",
+                    "baseline_provider": PIPER_TRITON_PROVIDER,
                     "baseline_phase": result.baseline_phase,
-                    **provider_provenance,
+                    "operation_provenance": result.operation_provenance,
+                    **result.provider_configuration,
                     "prepared_execution_scope": "fixed_source_preallocated_outputs",
                     "seed": seed,
                 },
@@ -486,7 +508,10 @@ def _preparation_records(
     return records
 
 
-def _inspection_provider(args: argparse.Namespace) -> BenchmarkProvider[None, None]:
+def _inspection_provider(
+    args: argparse.Namespace,
+    preparation_plan: convrot_policy.PreparationPlan,
+) -> BenchmarkProvider[None, None]:
     jit_functions = {"fused": triton_backend._rotate_quantize_rows_kernel}
     if args.input_activation is None:
         jit_functions = {
@@ -495,7 +520,7 @@ def _inspection_provider(args: argparse.Namespace) -> BenchmarkProvider[None, No
             **jit_functions,
         }
     return BenchmarkProvider(
-        name="triton-convrot-preparation",
+        name=PIPER_TRITON_PROVIDER,
         prepare=lambda: None,
         run=lambda _prepared: None,
         configuration={
@@ -504,7 +529,9 @@ def _inspection_provider(args: argparse.Namespace) -> BenchmarkProvider[None, No
             "dtype": args.dtype,
             "group_size": 256,
             "input_activation": args.input_activation or "none",
-            "input_layout": "up_gate" if args.input_activation == "swiglu" else "plain",
+            "logical_input_layout": ("up_gate" if args.input_activation == "swiglu" else "plain"),
+            "provider_input_layout": ("up_gate" if args.input_activation == "swiglu" else "plain"),
+            **_preparation_plan_configuration(preparation_plan),
         },
         triton_jit_functions=jit_functions,
     )
@@ -547,6 +574,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     _validate_args(args)
     dtype = _dtype(args.dtype)
     comfy_kitchen = _load_comfy_kitchen_cuda() if args.compare_comfy_kitchen else None
+    target = AcceleratorTarget.from_device(torch.device("cuda"))
+    inspection_plan = (
+        _select_preparation_plan(
+            target,
+            args.rows,
+            args.in_features[0],
+            dtype,
+            args.input_activation,
+        )
+        if _compiler_requested(args)
+        else None
+    )
     environment = capture_environment(Path(__file__).resolve().parents[1])
     print(
         f"GPU: {environment.gpu_name} ({environment.gpu_architecture}); "
@@ -565,6 +604,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("|---:|---:|:---|---:|---:|---:|---:|")
     records: list[BenchmarkRecord] = []
     for in_features in args.in_features:
+        preparation_plan = _select_preparation_plan(
+            target,
+            args.rows,
+            in_features,
+            dtype,
+            args.input_activation,
+        )
         results = _benchmark_width(
             args.rows,
             in_features,
@@ -574,6 +620,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.measurement_time_ms,
             comfy_kitchen,
             args.input_activation,
+            preparation_plan,
         )
         for result in results:
             _print_phase_result(in_features, args.input_activation, result)
@@ -593,8 +640,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     write_records(records, benchmark_output)
 
     if _compiler_requested(args):
+        assert inspection_plan is not None
         report = inspect_provider(
-            _inspection_provider(args),
+            _inspection_provider(args, inspection_plan),
             environment,
             include_sass=args.sass,
             nvdisasm=args.nvdisasm,

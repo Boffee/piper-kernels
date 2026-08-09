@@ -29,7 +29,7 @@ from lib import (
 
 from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
 from piper_kernels.convrot.int8 import dispatch as convrot_dispatch
-from piper_kernels.convrot.int8.reference import reference_linear
+from piper_kernels.convrot.int8.reference import reference_linear, reference_swiglu_linear
 
 
 @dataclass(slots=True, frozen=True)
@@ -257,6 +257,58 @@ def _selected_input_preparation(
     return "materialized"
 
 
+def _common_provider_configuration(
+    shape: BenchmarkShape,
+    group_size: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> dict[str, object]:
+    """Return provider-neutral operation settings for one ConvRot case."""
+    logical_input_layout = "up_gate" if shape.input_activation == "swiglu" else "plain"
+    return {
+        "dtype": str(dtype).removeprefix("torch."),
+        "group_size": group_size,
+        "input_activation": shape.input_activation or "none",
+        "logical_input_layout": logical_input_layout,
+        "provider_input_layout": logical_input_layout,
+        "has_bias": shape.has_bias,
+        "seed": seed,
+        "prepared_execution_scope": "complete_operator_on_fixed_source_tensors",
+    }
+
+
+def _comfy_provider_configuration(
+    common_configuration: dict[str, object],
+    shape: BenchmarkShape,
+    installed_version: str,
+) -> dict[str, object]:
+    """Describe Comfy Kitchen's public operator and input-layout adaptation."""
+    return {
+        **common_configuration,
+        "installed_version": installed_version,
+        "operation_entrypoint": "comfy_kitchen.int8_linear",
+        "input_preparation": "provider-managed" if shape.input_activation else "none",
+        "provider_input_layout": "gate_up" if shape.input_activation == "swiglu" else "plain",
+        "input_layout_adapter": shape.input_activation == "swiglu",
+    }
+
+
+def _reference_provider_configuration(
+    common_configuration: dict[str, object],
+    shape: BenchmarkShape,
+) -> dict[str, object]:
+    """Describe the portable reference entrypoint and its input preparation."""
+    return {
+        **common_configuration,
+        "operation_entrypoint": (
+            "piper_kernels.convrot.int8.reference.reference_swiglu_linear"
+            if shape.input_activation == "swiglu"
+            else "piper_kernels.convrot.int8.reference.reference_linear"
+        ),
+        "input_preparation": "materialized" if shape.input_activation else "none",
+    }
+
+
 @torch.inference_mode()
 def _run_shape(
     shape: BenchmarkShape,
@@ -319,8 +371,16 @@ def _run_shape(
     quality_index = torch.tensor(quality_row_indices, device="cuda")
 
     def reference(value: torch.Tensor = activation) -> torch.Tensor:
+        if shape.input_activation == "swiglu":
+            return reference_swiglu_linear(
+                value,
+                qdata,
+                scale,
+                group_size,
+                bias,
+            )
         return reference_linear(
-            _apply_input_activation(value, shape.input_activation),
+            value,
             qdata,
             scale,
             group_size,
@@ -337,15 +397,7 @@ def _run_shape(
             )
         return torch.nn.functional.linear(activation, weight, bias)
 
-    common_config = {
-        "dtype": str(dtype).removeprefix("torch."),
-        "group_size": group_size,
-        "input_activation": shape.input_activation or "none",
-        "input_layout": "up_gate" if shape.input_activation == "swiglu" else "plain",
-        "has_bias": shape.has_bias,
-        "seed": seed,
-        "prepared_execution_scope": "complete_operator_on_fixed_source_tensors",
-    }
+    common_config = _common_provider_configuration(shape, group_size, dtype, seed)
     piper_config = {
         **common_config,
         "operation_entrypoint": (
@@ -374,11 +426,7 @@ def _run_shape(
         sampled_activation = activation.index_select(0, quality_index)
         reference_quality_output = reference(sampled_activation)
     else:
-        reference_config = {
-            **common_config,
-            "operation_entrypoint": "piper_kernels.convrot.int8.reference.reference_linear",
-            "input_preparation": "materialized" if shape.input_activation else "none",
-        }
+        reference_config = _reference_provider_configuration(common_config, shape)
         full_reference_measurement = measure_provider(
             BenchmarkProvider(
                 name="torch-reference",
@@ -414,14 +462,11 @@ def _run_shape(
                 input_act=shape.input_activation,
             )
 
-        comfy_config = {
-            **common_config,
-            "version": _package_version("comfy-kitchen", comfy_kitchen),
-            "operation_entrypoint": "comfy_kitchen.int8_linear",
-            "input_preparation": "provider-managed" if shape.input_activation else "none",
-            "input_layout": "gate_up" if shape.input_activation == "swiglu" else "plain",
-            "input_layout_adapter": shape.input_activation == "swiglu",
-        }
+        comfy_config = _comfy_provider_configuration(
+            common_config,
+            shape,
+            _package_version("comfy-kitchen", comfy_kitchen),
+        )
         with _comfy_backend_context(comfy_kitchen):
             full_comfy_measurement = measure_provider(
                 BenchmarkProvider(
@@ -642,9 +687,6 @@ def _records_for_result(
         "out_features": shape.out_features,
         "in_features": shape.in_features,
         "raw_input_features": _raw_input_features(shape),
-        "input_activation": shape.input_activation or "none",
-        "input_layout": "up_gate" if shape.input_activation == "swiglu" else "plain",
-        "has_bias": shape.has_bias,
     }
     measurements = [
         (result.piper, result.quality),

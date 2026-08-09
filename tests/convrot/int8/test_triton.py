@@ -146,7 +146,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
         actual_scale,
         256,
         dtype_code,
-        input_activation_code=1,
+        apply_swiglu=True,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -157,6 +157,39 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
         rtol=2 * torch.finfo(dtype).eps,
         atol=0,
     )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (torch.float32, 0),
+        (torch.float16, 1),
+        (torch.bfloat16, 2),
+    ],
+)
+def test_logical_dtype_code(dtype: torch.dtype, expected: int) -> None:
+    assert triton_backend._logical_dtype_code(dtype) == expected
+
+
+@pytest.mark.parametrize("apply_swiglu", [False, True], ids=["plain", "swiglu"])
+def test_fused_preparation_validates_input_width_from_qdata(
+    apply_swiglu: bool,
+) -> None:
+    rows, in_features = 2, 16
+    expected_width = in_features * (2 if apply_swiglu else 1)
+    activation = torch.empty(rows, expected_width + 1)
+    activation_qdata = torch.empty(rows, in_features, dtype=torch.int8)
+    activation_scale = torch.empty(rows, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=f"must have shape \\({rows}, {expected_width}\\)"):
+        triton_backend._fused_rotate_quantize_activations(
+            activation,
+            activation_qdata,
+            activation_scale,
+            16,
+            triton_backend._logical_dtype_code(activation.dtype),
+            apply_swiglu=apply_swiglu,
+        )
 
 
 @pytest.mark.gpu

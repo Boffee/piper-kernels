@@ -7,7 +7,11 @@ import torch
 from torchao.utils import TorchAOBaseTensor
 
 from .._rotation import rotate_groups
-from .dispatch import _addmm_, _convrot_linear, _linear
+from .dispatch import (
+    _addmm_,
+    _linear_from_storage,
+    _linear_with_input_activation_from_storage,
+)
 from .reference import quantize_weight, validate_storage
 
 
@@ -140,14 +144,14 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
 
 
-def _convrot_int8_linear(
+def _convrot_int8_input_activation_linear(
     activation: torch.Tensor,
     weight: ConvRotInt8Tensor,
     bias: torch.Tensor | None,
     input_activation: str,
 ) -> torch.Tensor:
     """Apply an input activation through the INT8 storage-level implementation."""
-    return _convrot_linear(
+    return _linear_with_input_activation_from_storage(
         activation,
         weight.qdata,
         weight.scale,
@@ -197,7 +201,7 @@ def _convrot_linear_dispatch(
         )
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
-    return _linear(
+    return _linear_from_storage(
         activation,
         weight.qdata,
         weight.scale,

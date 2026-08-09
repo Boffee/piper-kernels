@@ -34,14 +34,21 @@ def test_preparation_plan_keeps_sm120_tuning_target_exact(
     )
 
     assert plan == PreparationPlan(
-        block_size=512,
+        fused_block_size=512,
         fuse_rotation_quantization=expected_fusion,
         fused_num_warps=4,
     )
 
 
 @pytest.mark.parametrize(
-    ("rows", "in_features", "group_size", "dtype", "block_size", "expected"),
+    (
+        "rows",
+        "in_features",
+        "group_size",
+        "dtype",
+        "expected_fused_block_size",
+        "expected_fusion",
+    ),
     [
         (512, 512, 256, torch.float16, 512, True),
         (512, 14_336, 256, torch.bfloat16, 16_384, True),
@@ -57,8 +64,8 @@ def test_preparation_plan_centralizes_fusion_boundaries(
     in_features: int,
     group_size: int,
     dtype: torch.dtype,
-    block_size: int,
-    expected: bool,
+    expected_fused_block_size: int,
+    expected_fusion: bool,
 ) -> None:
     plan = select_preparation_plan(
         _SM120,
@@ -68,8 +75,8 @@ def test_preparation_plan_centralizes_fusion_boundaries(
         dtype=dtype,
     )
 
-    assert plan.block_size == block_size
-    assert plan.fuse_rotation_quantization is expected
+    assert plan.fused_block_size == expected_fused_block_size
+    assert plan.fuse_rotation_quantization is expected_fusion
 
 
 @pytest.mark.parametrize(

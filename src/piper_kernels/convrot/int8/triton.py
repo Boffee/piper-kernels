@@ -105,19 +105,19 @@ def _rotate_quantize_rows_kernel(
     block_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    input_dtype_code: tl.constexpr,
-    input_activation_code: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    apply_swiglu: tl.constexpr,
 ):
     """Rotate and quantize one complete row without a global-memory intermediate."""
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
     offsets = tl.arange(0, block_size)
     mask = offsets < row_width
-    input_row_width = row_width * (2 if input_activation_code == 1 else 1)
+    input_row_width = row_width * (2 if apply_swiglu else 1)
     input_row_offset = row_i64 * input_row_width
     output_row_offset = row_i64 * row_width
 
-    if input_activation_code == 1:
+    if apply_swiglu:
         up = tl.load(
             x_ptr + input_row_offset + offsets,
             mask=mask,
@@ -129,10 +129,10 @@ def _rotate_quantize_rows_kernel(
             other=0.0,
         ).to(tl.float32)
         activated_gate = gate / (1.0 + tl.exp(-gate))
-        if input_dtype_code == 1:
+        if logical_dtype_code == 1:
             activated_gate = activated_gate.to(tl.float16).to(tl.float32)
             values = (up * activated_gate).to(tl.float16).to(tl.float32)
-        elif input_dtype_code == 2:
+        elif logical_dtype_code == 2:
             activated_gate = activated_gate.to(tl.bfloat16).to(tl.float32)
             values = (up * activated_gate).to(tl.bfloat16).to(tl.float32)
         else:
@@ -146,12 +146,12 @@ def _rotate_quantize_rows_kernel(
 
     values = _rotate_hadamard_groups(values, block_size, group_size)
     values *= inverse_sqrt_group
-    if input_dtype_code == 1:
+    if logical_dtype_code == 1:
         values = values.to(tl.float16)
-    elif input_dtype_code == 2:
+    elif logical_dtype_code == 2:
         values = values.to(tl.bfloat16)
     scale = tl.maximum(tl.max(tl.abs(values).to(tl.float32), axis=0) / 127.0, 1e-30)
-    scaled = _normalize_for_int8(values, scale, input_dtype_code)
+    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
     quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
     tl.store(q_ptr + output_row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
@@ -164,7 +164,7 @@ def _quantize_rows_kernel(
     scale_ptr,
     row_width,
     block_size: tl.constexpr,
-    input_dtype_code: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
 ):
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
@@ -173,7 +173,7 @@ def _quantize_rows_kernel(
     row_offset = row_i64 * row_width
     values = tl.load(x_ptr + row_offset + offsets, mask=mask, other=0.0)
     scale = tl.maximum(tl.max(tl.abs(values), axis=0) / 127.0, 1e-30)
-    scaled = _normalize_for_int8(values, scale, input_dtype_code)
+    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
     quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
     tl.store(q_ptr + row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
@@ -305,7 +305,8 @@ def _int8_matmul_kernel(
     )
 
 
-def _input_dtype_code(dtype: torch.dtype) -> int:
+def _logical_dtype_code(dtype: torch.dtype) -> int:
+    """Encode the logical floating-point dtype used while requantizing."""
     if dtype is torch.float16:
         return 1
     if dtype is torch.bfloat16:
@@ -334,36 +335,50 @@ def _rotate_activations(
 
 def _quantize_activations(
     rotated: torch.Tensor,
-    quantized: torch.Tensor,
+    activation_qdata: torch.Tensor,
     activation_scale: torch.Tensor,
-    input_dtype_code: int,
+    logical_dtype_code: int,
 ) -> None:
     """Apply the portable split-path rowwise quantization."""
     m, k = rotated.shape
     _quantize_rows_kernel[(m,)](
         rotated,
-        quantized,
+        activation_qdata,
         activation_scale,
         k,
         block_size=max(128, triton.next_power_of_2(k)),
-        input_dtype_code=input_dtype_code,
+        logical_dtype_code=logical_dtype_code,
         num_warps=8,
     )
 
 
 def _fused_rotate_quantize_activations(
     activation: torch.Tensor,
-    quantized: torch.Tensor,
+    activation_qdata: torch.Tensor,
     activation_scale: torch.Tensor,
     group_size: int,
-    input_dtype_code: int,
-    input_activation_code: int = 0,
+    logical_dtype_code: int,
     *,
+    apply_swiglu: bool = False,
     plan: _policy.PreparationPlan | None = None,
 ) -> None:
-    """Rotate, reduce, and quantize without materializing the rotated row."""
-    m, input_width = activation.shape
-    k = input_width // 2 if input_activation_code == 1 else input_width
+    """Rotate and quantize to ``activation_qdata`` without a rotated intermediate.
+
+    ``activation_qdata`` defines the logical row width. ``apply_swiglu`` requires
+    a raw ``[up | gate]`` input with twice that width.
+    """
+    if activation.ndim != 2 or activation_qdata.ndim != 2:
+        raise ValueError(
+            "fused preparation tensors must be 2-D, "
+            f"got shapes {tuple(activation.shape)} and {tuple(activation_qdata.shape)}"
+        )
+    m, k = activation_qdata.shape
+    expected_input_shape = (m, k * (2 if apply_swiglu else 1))
+    if tuple(activation.shape) != expected_input_shape:
+        raise ValueError(
+            f"fused preparation input must have shape {expected_input_shape}, "
+            f"got {tuple(activation.shape)}"
+        )
     if plan is None:
         plan = _policy.select_preparation_plan(
             AcceleratorTarget.from_device(activation.device),
@@ -371,43 +386,46 @@ def _fused_rotate_quantize_activations(
             in_features=k,
             group_size=group_size,
             dtype=activation.dtype,
-            swiglu=input_activation_code == 1,
+            swiglu=apply_swiglu,
         )
     _rotate_quantize_rows_kernel[(m,)](
         activation,
-        quantized,
+        activation_qdata,
         activation_scale,
         k,
-        block_size=plan.block_size,
+        block_size=plan.fused_block_size,
         group_size=group_size,
         inverse_sqrt_group=group_size**-0.5,
-        input_dtype_code=input_dtype_code,
-        input_activation_code=input_activation_code,
+        logical_dtype_code=logical_dtype_code,
+        apply_swiglu=apply_swiglu,
         num_warps=plan.fused_num_warps,
     )
 
 
 def _int8_linear_from_quantized(
-    activation: torch.Tensor,
-    quantized: torch.Tensor,
+    source_activation: torch.Tensor,
+    activation_qdata: torch.Tensor,
     activation_scale: torch.Tensor,
-    weight: torch.Tensor,
+    weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    output_prefix: tuple[int, ...],
 ) -> torch.Tensor:
     """Run the existing portable INT8 GEMM schedule on prepared activations."""
-    m, k = quantized.shape
-    n = weight.shape[0]
-    output = torch.empty((m, n), device=activation.device, dtype=activation.dtype)
+    m, k = activation_qdata.shape
+    n = weight_qdata.shape[0]
+    output = torch.empty(
+        (m, n),
+        device=source_activation.device,
+        dtype=source_activation.dtype,
+    )
     block_m = 32 if m < 64 else 64
     block_n = 64 if n < 128 else 128
     block_k = 32
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
-    bias_pointer = bias if bias is not None else activation
+    bias_pointer = bias if bias is not None else source_activation
     _int8_matmul_kernel[grid](
-        quantized,
-        weight,
+        activation_qdata,
+        weight_qdata,
         output,
         activation_scale,
         weight_scale,
@@ -415,10 +433,10 @@ def _int8_linear_from_quantized(
         m,
         n,
         k,
-        quantized.stride(0),
-        quantized.stride(1),
-        weight.stride(0),
-        weight.stride(1),
+        activation_qdata.stride(0),
+        activation_qdata.stride(1),
+        weight_qdata.stride(0),
+        weight_qdata.stride(1),
         output.stride(0),
         output.stride(1),
         block_m=block_m,
@@ -428,19 +446,19 @@ def _int8_linear_from_quantized(
         num_stages=3,
         num_warps=4,
     )
-    return output.reshape(*output_prefix, n)
+    return output.reshape(*source_activation.shape[:-1], n)
 
 
 def triton_convrot_int8_linear(
     activation: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
     """Run ConvRot activation rotation, dynamic quantization, and INT8 GEMM."""
     original_shape = activation.shape
-    n, k = weight.shape
+    n, k = qdata.shape
     if original_shape[-1] != k:
         raise ValueError(f"linear input has {original_shape[-1]} features, expected {k}")
     if k == 0:
@@ -450,8 +468,8 @@ def triton_convrot_int8_linear(
     if m == 0 or n == 0:
         return activation.new_empty((*original_shape[:-1], n))
 
-    input_dtype_code = _input_dtype_code(activation.dtype)
-    quantized = torch.empty_like(activation_2d, dtype=torch.int8)
+    logical_dtype_code = _logical_dtype_code(activation.dtype)
+    activation_qdata = torch.empty_like(activation_2d, dtype=torch.int8)
     activation_scale = torch.empty(m, device=activation.device, dtype=torch.float32)
     plan = _policy.select_preparation_plan(
         AcceleratorTarget.from_device(activation.device),
@@ -463,37 +481,41 @@ def triton_convrot_int8_linear(
     if plan.fuse_rotation_quantization:
         _fused_rotate_quantize_activations(
             activation_2d,
-            quantized,
+            activation_qdata,
             activation_scale,
             group_size,
-            input_dtype_code,
+            logical_dtype_code,
             plan=plan,
         )
     else:
         rotated = torch.empty_like(activation_2d)
         _rotate_activations(activation_2d, rotated, group_size)
-        _quantize_activations(rotated, quantized, activation_scale, input_dtype_code)
+        _quantize_activations(
+            rotated,
+            activation_qdata,
+            activation_scale,
+            logical_dtype_code,
+        )
     return _int8_linear_from_quantized(
         activation,
-        quantized,
+        activation_qdata,
         activation_scale,
-        weight,
-        weight_scale,
+        qdata,
+        scale,
         bias,
-        tuple(original_shape[:-1]),
     )
 
 
 def triton_convrot_int8_swiglu_linear(
     activation: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
     """Fuse ``[up | gate]`` SwiGLU with ConvRot preparation and INT8 GEMM."""
     original_shape = activation.shape
-    n, k = weight.shape
+    n, k = qdata.shape
     if original_shape[-1] != 2 * k:
         raise ValueError(f"fused SwiGLU input has {original_shape[-1]} features, expected {2 * k}")
     if k == 0:
@@ -503,7 +525,7 @@ def triton_convrot_int8_swiglu_linear(
     if m == 0 or n == 0:
         return activation.new_empty((*original_shape[:-1], n))
 
-    quantized = torch.empty((m, k), device=activation.device, dtype=torch.int8)
+    activation_qdata = torch.empty((m, k), device=activation.device, dtype=torch.int8)
     activation_scale = torch.empty(m, device=activation.device, dtype=torch.float32)
     plan = _policy.select_preparation_plan(
         AcceleratorTarget.from_device(activation.device),
@@ -515,21 +537,20 @@ def triton_convrot_int8_swiglu_linear(
     )
     _fused_rotate_quantize_activations(
         activation_2d,
-        quantized,
+        activation_qdata,
         activation_scale,
         group_size,
-        _input_dtype_code(activation.dtype),
-        input_activation_code=1,
+        _logical_dtype_code(activation.dtype),
+        apply_swiglu=True,
         plan=plan,
     )
     return _int8_linear_from_quantized(
         activation,
-        quantized,
+        activation_qdata,
         activation_scale,
-        weight,
-        weight_scale,
+        qdata,
+        scale,
         bias,
-        tuple(original_shape[:-1]),
     )
 
 
@@ -558,12 +579,7 @@ def triton_convrot_int8_addmm_(
     else:
         update = qdata
 
-    if mat1.dtype is torch.float16:
-        logical_dtype_code = 1
-    elif mat1.dtype is torch.bfloat16:
-        logical_dtype_code = 2
-    else:
-        logical_dtype_code = 0
+    logical_dtype_code = _logical_dtype_code(mat1.dtype)
     requant_block = max(128, triton.next_power_of_2(in_features))
     _requantize_addmm_rows_kernel[(out_features,)](
         qdata,

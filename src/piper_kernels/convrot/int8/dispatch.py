@@ -8,7 +8,12 @@ from piper_kernels._triton.targets import AcceleratorTarget
 
 from .._torch_compat import is_fake_mode_active
 from ._policy import select_preparation_plan
-from .reference import reference_addmm_, reference_linear, validate_storage
+from .reference import (
+    reference_addmm_,
+    reference_linear,
+    reference_swiglu_linear,
+    validate_storage,
+)
 
 try:
     from .triton import (
@@ -61,7 +66,7 @@ def _needs_fake_cuda_kernel(tensor: torch.Tensor) -> bool:
     return is_fake_mode_active() and _accelerator_target(tensor.device) is None
 
 
-def _can_use_triton(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
+def _can_use_triton_linear(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
     if (
         _triton_linear is None
         or activation.device.type != "cuda"
@@ -99,25 +104,6 @@ def _can_use_triton_swiglu(
     ).fuse_rotation_quantization
 
 
-def _reference_swiglu_linear(
-    activation: torch.Tensor,
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    group_size: int,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    """Materialize ``[up | gate]`` SwiGLU before the portable ConvRot linear."""
-    in_features = qdata.shape[1]
-    up, gate = activation.split(in_features, dim=-1)
-    return reference_linear(
-        up * torch.nn.functional.silu(gate),
-        qdata,
-        scale,
-        group_size,
-        bias,
-    )
-
-
 @torch.library.custom_op("piper_kernels::convrot_int8_linear", mutates_args=())
 def _convrot_int8_linear_op(
     activation: torch.Tensor,
@@ -139,7 +125,7 @@ def _convrot_int8_linear_cuda(
     group_size: int,
 ) -> torch.Tensor:
     """Select the optimized CUDA implementation when the target supports it."""
-    if _can_use_triton(activation, qdata):
+    if _can_use_triton_linear(activation, qdata):
         assert _triton_linear is not None
         return _triton_linear(activation, qdata, scale, bias, group_size)
     return reference_linear(activation, qdata, scale, group_size, bias)
@@ -165,7 +151,7 @@ def _convrot_int8_swiglu_linear_op(
     group_size: int,
 ) -> torch.Tensor:
     """Run portable ``[up | gate]`` SwiGLU plus an INT8 ConvRot linear."""
-    return _reference_swiglu_linear(activation, qdata, scale, group_size, bias)
+    return reference_swiglu_linear(activation, qdata, scale, group_size, bias)
 
 
 @_convrot_int8_swiglu_linear_op.register_kernel("cuda")
@@ -180,7 +166,7 @@ def _convrot_int8_swiglu_linear_cuda(
     if _can_use_triton_swiglu(activation, qdata, group_size):
         assert _triton_swiglu_linear is not None
         return _triton_swiglu_linear(activation, qdata, scale, bias, group_size)
-    return _reference_swiglu_linear(activation, qdata, scale, group_size, bias)
+    return reference_swiglu_linear(activation, qdata, scale, group_size, bias)
 
 
 @_convrot_int8_swiglu_linear_op.register_fake
@@ -348,16 +334,14 @@ def _validate_linear(
         )
     if activation.device != qdata.device:
         raise ValueError(
-            "ConvRot activation and weight must share a device, "
-            f"got {activation.device}/{qdata.device}"
+            f"ConvRot input and weight must share a device, got {activation.device}/{qdata.device}"
         )
     if activation.dtype is not dtype:
         raise ValueError(
-            "ConvRot activation must match the weight's logical dtype, "
-            f"got {activation.dtype}/{dtype}"
+            f"ConvRot input must match the weight's logical dtype, got {activation.dtype}/{dtype}"
         )
     if activation.layout is not torch.strided:
-        raise ValueError("ConvRot activation must use strided layout")
+        raise ValueError("ConvRot input must use strided layout")
 
     if bias is not None:
         if not isinstance(bias, torch.Tensor):
@@ -372,7 +356,7 @@ def _validate_linear(
             )
         if bias.device != activation.device:
             raise ValueError(
-                "ConvRot activation, weight, and bias must share a device, "
+                "ConvRot input, weight, and bias must share a device, "
                 f"got {activation.device}/{qdata.device}/{bias.device}"
             )
         if bias.dtype is not dtype:
@@ -401,12 +385,12 @@ def _run_linear(
     """Run a validated ordinary ConvRot linear through the selected backend."""
     # Keep the portable path decomposable under torch.compile. The registered
     # CUDA kernel rechecks eligibility so direct semantic-op calls remain safe.
-    if _needs_fake_cuda_kernel(activation) or _can_use_triton(activation, qdata):
+    if _needs_fake_cuda_kernel(activation) or _can_use_triton_linear(activation, qdata):
         return _convrot_int8_linear_op(activation, qdata, scale, bias, group_size)
     return reference_linear(activation, qdata, scale, group_size, bias)
 
 
-def _linear(
+def _linear_from_storage(
     activation: torch.Tensor,
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -435,7 +419,7 @@ def _linear(
     return _run_linear(activation, qdata, scale, group_size, bias)
 
 
-def _convrot_linear(
+def _linear_with_input_activation_from_storage(
     activation: torch.Tensor,
     qdata: torch.Tensor,
     scale: torch.Tensor,

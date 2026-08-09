@@ -155,3 +155,22 @@ def reference_linear(
     if bias is not None:
         result += bias.to(torch.float32)
     return result.to(activation.dtype).reshape(*original_shape[:-1], qdata.shape[0])
+
+
+def reference_swiglu_linear(
+    activation: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Materialize raw ``[up | gate]`` SwiGLU before a portable ConvRot linear."""
+    in_features = qdata.shape[1]
+    up, gate = torch.split(activation, [in_features, in_features], dim=-1)
+    return reference_linear(
+        up * torch.nn.functional.silu(gate),
+        qdata,
+        scale,
+        group_size,
+        bias,
+    )

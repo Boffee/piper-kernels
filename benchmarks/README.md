@@ -165,8 +165,10 @@ Machine output records the exact sampled indices.
 The Piper provider times the complete public entrypoint on fixed source tensors, so its
 `prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
 configuration records the public entrypoint and whether SwiGLU dispatch selected fused or
-materialized input preparation. The optional provider is recorded as provider-managed when
-its internal choice is not observable.
+materialized input preparation. Record shapes contain only the case name and logical dimensions;
+provider configuration distinguishes the logical input layout from the layout passed to that
+provider. The optional provider is recorded as provider-managed when its internal choice is not
+observable.
 
 Exercise the four principal bias-free MiniMax H3 transformer projections at the measured
 5-second row count or at 128K rows with:
@@ -199,7 +201,7 @@ uv run --with comfy-kitchen==0.2.28 \
 Comfy Kitchen is a benchmark-only dependency and is loaded only when requested. Its 0.2.x
 SwiGLU API consumes `[gate | up]`, so the benchmark prepares that provider's reordered input
 once outside the timed operator while keeping Piper's public `[up | gate]` contract. Provider
-metadata records the adapter and the installed package version.
+metadata records the adapter and the installed package version under `installed_version`.
 
 Diagnose activation preparation independently, using preallocated outputs, with:
 
@@ -224,7 +226,10 @@ preparation without an input activation and fused preparation for SwiGLU.
 
 Add `--json PATH` or `--jsonl PATH` to serialize one common `BenchmarkRecord` per width and
 phase. Each record distinguishes linear `K` from raw input width and includes the phase,
-operation provenance, baseline, device timing, minimum traffic, and effective bandwidth.
+operation provenance, baseline, device timing, minimum traffic, and effective bandwidth. Piper
+records additionally include the selected fused block size, warp count, and production-policy
+eligibility. Piper timing and compiler records use the same `piper-triton` provider identifier
+and plan configuration.
 Compiler output remains independently selectable with `--compiler-json` or
 `--compiler-jsonl`, so both record types can be written by one invocation. Benchmark and
 compiler records must use different output paths.

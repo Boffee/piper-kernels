@@ -8,18 +8,24 @@ import pytest
 import torch
 from benchmark_convrot import (
     BenchmarkShape,
+    Result,
     _apply_input_activation,
     _benchmark_shapes,
     _comfy_input,
+    _comfy_provider_configuration,
+    _common_provider_configuration,
     _parse_args,
     _quality_row_indices,
     _raw_input_features,
+    _records_for_result,
+    _reference_provider_configuration,
     _selected_input_preparation,
     _skip_reference_timing,
     _validate_args,
 )
 from benchmark_convrot_preparation import (
     COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION,
+    PIPER_TRITON_PROVIDER,
     PreparationPhaseResult,
     _compiler_requested,
     _inspection_provider,
@@ -31,7 +37,21 @@ from benchmark_convrot_preparation import (
 from benchmark_convrot_preparation import (
     _parse_args as _parse_preparation_args,
 )
-from lib import ClockDomain, EnvironmentInfo, Timing, output_target, write_records
+from benchmark_convrot_preparation import (
+    _validate_args as _validate_preparation_args,
+)
+from lib import (
+    ClockDomain,
+    EnvironmentInfo,
+    PhaseTimings,
+    ProviderMeasurement,
+    Timing,
+    measure_quality,
+    output_target,
+    write_records,
+)
+
+from piper_kernels.convrot.int8._policy import PreparationPlan
 
 
 def _environment() -> EnvironmentInfo:
@@ -49,6 +69,25 @@ def _environment() -> EnvironmentInfo:
         gpu_index=0,
         git_revision="a" * 40,
         git_dirty=False,
+    )
+
+
+def _preparation_plan() -> PreparationPlan:
+    return PreparationPlan(
+        fused_block_size=16_384,
+        fuse_rotation_quantization=True,
+        fused_num_warps=8,
+    )
+
+
+def _phase_timings() -> PhaseTimings:
+    return PhaseTimings(
+        warmup_ms=100,
+        measurement_time_ms=300,
+        first_call_ms=2.0,
+        preparation=None,
+        prepared_execution=Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT),
+        operator_end_to_end=None,
     )
 
 
@@ -176,6 +215,106 @@ def test_comfy_adapter_changes_up_gate_to_gate_up() -> None:
     assert adapted.tolist() == [[3.0, 4.0, 1.0, 2.0]]
 
 
+def test_main_provider_configuration_distinguishes_logical_and_provider_layouts() -> None:
+    shape = BenchmarkShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+
+    common = _common_provider_configuration(shape, 256, torch.bfloat16, 7)
+    comfy = _comfy_provider_configuration(common, shape, "0.2.28")
+    reference = _reference_provider_configuration(common, shape)
+
+    assert common["logical_input_layout"] == "up_gate"
+    assert common["provider_input_layout"] == "up_gate"
+    assert comfy["logical_input_layout"] == "up_gate"
+    assert comfy["provider_input_layout"] == "gate_up"
+    assert comfy["input_layout_adapter"] is True
+    assert comfy["installed_version"] == "0.2.28"
+    assert "version" not in comfy
+    assert reference["logical_input_layout"] == "up_gate"
+    assert reference["provider_input_layout"] == "up_gate"
+    assert reference["operation_entrypoint"].endswith(".reference_swiglu_linear")
+    assert reference["input_preparation"] == "materialized"
+
+
+def test_main_record_shape_contains_only_case_and_dimensions() -> None:
+    shape = BenchmarkShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    output = torch.ones((1, 1))
+    quality = measure_quality(output, output)
+    configuration = {
+        **_common_provider_configuration(shape, 256, torch.bfloat16, 7),
+        "operation_entrypoint": "piper_kernels.convrot.convrot_linear",
+        "input_preparation": "fused",
+    }
+    measurement = ProviderMeasurement(
+        provider="piper-convrot",
+        output=output,
+        timings=_phase_timings(),
+        configuration=configuration,
+    )
+    result = Result(
+        quality_row_indices=(0,),
+        input_preparation="fused",
+        piper=measurement,
+        reference=None,
+        quality=quality,
+    )
+
+    (record,) = _records_for_result(shape, result, _environment())
+    value = record.as_dict()
+
+    assert value["shape"] == {
+        "case": "mlp-fc2",
+        "rows": 3,
+        "out_features": 96,
+        "in_features": 512,
+        "raw_input_features": 1024,
+    }
+    assert value["configuration"]["input_activation"] == "swiglu"
+    assert value["configuration"]["has_bias"] is False
+    assert value["configuration"]["logical_input_layout"] == "up_gate"
+    assert value["configuration"]["provider_input_layout"] == "up_gate"
+
+
+def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
+    shape = BenchmarkShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    output = torch.ones((1, 1))
+    quality = measure_quality(output, output)
+    common = _common_provider_configuration(shape, 256, torch.bfloat16, 7)
+    piper = ProviderMeasurement(
+        provider="piper-convrot",
+        output=output,
+        timings=_phase_timings(),
+        configuration={
+            **common,
+            "operation_entrypoint": "piper_kernels.convrot.convrot_linear",
+            "input_preparation": "fused",
+        },
+    )
+    comfy = ProviderMeasurement(
+        provider="comfy-kitchen",
+        output=output,
+        timings=_phase_timings(),
+        configuration=_comfy_provider_configuration(common, shape, "0.2.28"),
+    )
+    result = Result(
+        quality_row_indices=(0,),
+        input_preparation="fused",
+        piper=piper,
+        reference=None,
+        quality=quality,
+        comfy_kitchen=comfy,
+        comfy_kitchen_quality=quality,
+    )
+
+    records = _records_for_result(shape, result, _environment())
+    comfy_record = next(record for record in records if record.provider == "comfy-kitchen")
+    configuration = comfy_record.as_dict()["configuration"]
+
+    assert configuration["installed_version"] == "0.2.28"
+    assert "version" not in configuration
+    assert configuration["logical_input_layout"] == "up_gate"
+    assert configuration["provider_input_layout"] == "gate_up"
+
+
 def test_quality_rows_include_large_projection_output_boundaries() -> None:
     for name, out_features in (("qkv", 21_504), ("mlp-fc1", 28_672)):
         shape = BenchmarkShape(name, 131_072, out_features, 5_376, has_bias=False)
@@ -241,6 +380,13 @@ def test_preparation_cli_exposes_current_compiler_reporting(tmp_path) -> None:
     assert arguments.json == benchmark_path
     assert arguments.compiler_json == compiler_path
     assert arguments.sass is False
+
+
+def test_preparation_compiler_reporting_rejects_multiple_widths() -> None:
+    arguments = _parse_preparation_args(["--in-features", "512", "768", "--compiler-report"])
+
+    with pytest.raises(SystemExit, match="exactly one --in-features"):
+        _validate_preparation_args(arguments)
 
 
 @pytest.mark.parametrize(
@@ -320,7 +466,7 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     arguments = _parse_preparation_args(["--jsonl", str(output_path)])
     phase = PreparationPhaseResult(
         phase="fused",
-        provider="piper-triton",
+        provider=PIPER_TRITON_PROVIDER,
         operation_provenance=(
             "piper_kernels.convrot.int8.triton._fused_rotate_quantize_activations"
         ),
@@ -329,6 +475,11 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
         effective_minimum_tbps=2.0,
         baseline_phase="fused",
         speedup_vs_baseline=1.0,
+        provider_configuration={
+            "fused_block_size": 16_384,
+            "fused_num_warps": 8,
+            "production_fusion_eligible": True,
+        },
     )
 
     (record,) = _preparation_records(
@@ -352,9 +503,14 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
         "raw_input_features": 1024,
     }
     assert value["configuration"]["input_activation"] == "swiglu"
-    assert value["configuration"]["baseline_provider"] == "piper-triton"
+    assert value["configuration"]["logical_input_layout"] == "up_gate"
+    assert value["configuration"]["provider_input_layout"] == "up_gate"
+    assert value["configuration"]["baseline_provider"] == PIPER_TRITON_PROVIDER
     assert value["configuration"]["baseline_phase"] == "fused"
     assert value["configuration"]["operation_provenance"] == phase.operation_provenance
+    assert value["configuration"]["fused_block_size"] == 16_384
+    assert value["configuration"]["fused_num_warps"] == 8
+    assert value["configuration"]["production_fusion_eligible"] is True
     assert "installed_version" not in value["configuration"]
     assert "adapter_contract_version" not in value["configuration"]
     assert value["timings"]["prepared_execution"]["clock"] == "device_event"
@@ -376,8 +532,10 @@ def test_comfy_preparation_record_includes_installed_and_contract_versions() -> 
         effective_minimum_tbps=2.0,
         baseline_phase="fused",
         speedup_vs_baseline=1.1,
-        installed_version="0.2.28",
-        adapter_contract_version=COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION,
+        provider_configuration={
+            "installed_version": "0.2.28",
+            "adapter_contract_version": COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION,
+        },
     )
 
     (record,) = _preparation_records(
@@ -396,13 +554,24 @@ def test_comfy_preparation_record_includes_installed_and_contract_versions() -> 
     assert configuration["installed_version"] == "0.2.28"
     assert configuration["adapter_contract_version"] == "0.2.28"
     assert configuration["operation_provenance"] == phase.operation_provenance
+    assert configuration["logical_input_layout"] == "up_gate"
+    assert configuration["provider_input_layout"] == "gate_up"
 
 
 def test_preparation_compiler_report_only_inspects_launched_phases() -> None:
-    ordinary = _inspection_provider(_parse_preparation_args(["--in-features", "512"]))
+    plan = _preparation_plan()
+    ordinary = _inspection_provider(_parse_preparation_args(["--in-features", "512"]), plan)
     swiglu = _inspection_provider(
-        _parse_preparation_args(["--in-features", "512", "--input-activation", "swiglu"])
+        _parse_preparation_args(["--in-features", "512", "--input-activation", "swiglu"]),
+        plan,
     )
 
+    assert ordinary.name == PIPER_TRITON_PROVIDER
+    assert swiglu.name == PIPER_TRITON_PROVIDER
     assert set(ordinary.triton_jit_functions) == {"rotate", "quantize", "fused"}
     assert set(swiglu.triton_jit_functions) == {"fused"}
+    assert swiglu.configuration["fused_block_size"] == 16_384
+    assert swiglu.configuration["fused_num_warps"] == 8
+    assert swiglu.configuration["production_fusion_eligible"] is True
+    assert swiglu.configuration["logical_input_layout"] == "up_gate"
+    assert swiglu.configuration["provider_input_layout"] == "up_gate"
