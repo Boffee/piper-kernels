@@ -6,18 +6,20 @@ import pytest
 import torch
 
 import piper_kernels.attention.sage2pp.triton as sage_backend
-from piper_kernels._triton.targets import supports_fp8_fp16_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention import sage_attention_2pp
 from piper_kernels.attention.sage2pp.reference import reference_sage_attention_2pp
 from piper_kernels.attention.sage2pp.triton import _run_sage_attention_2pp
 
 
 def _sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _fp8_gpu_available() -> bool:
-    return torch.cuda.is_available() and supports_fp8_fp16_mma(torch.device("cuda"))
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).supports_fp8_fp16_mma
 
 
 def _qk_quantization() -> Literal["per_thread", "per_warp"]:
@@ -67,25 +69,31 @@ def test_triton_matches_quantized_reference(
 
 @pytest.mark.skipif(
     not _sm120_available(),
-    reason="raw-score recurrence is selected for grouped SM12x quantization",
+    reason="unscaled-score recurrence is tuned for SM120",
 )
 @pytest.mark.parametrize(
     ("is_causal", "threshold_name"),
     [
-        (False, "_NONCAUSAL_RAW_SCORE_MIN_KEY_LENGTH"),
-        (True, "_CAUSAL_RAW_SCORE_MIN_KEY_LENGTH"),
+        (False, "_NONCAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH"),
+        (True, "_CAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH"),
     ],
 )
-def test_raw_score_recurrence_matches_quantized_reference(
+def test_unscaled_score_recurrence_matches_quantized_reference(
     monkeypatch: pytest.MonkeyPatch,
     is_causal: bool,
     threshold_name: str,
 ) -> None:
     monkeypatch.setattr(sage_backend, threshold_name, 0)
-    assert sage_backend._should_use_raw_score_recurrence(True, is_causal, 193, 128)
-    assert not sage_backend._should_use_raw_score_recurrence(True, is_causal, 193, 64)
-    assert sage_backend._should_inline_query_quantization(True, is_causal, 193, 128)
-    assert not sage_backend._should_inline_query_quantization(False, is_causal, 193, 128)
+    plan = sage_backend._select_sage2pp_execution_plan(
+        AcceleratorTarget(backend="cuda", cuda_capability=(12, 0)),
+        candidate_block_m=64,
+        query_length=193,
+        key_length=193,
+        head_dim=128,
+        is_causal=is_causal,
+    )
+    assert plan.fuse_query_quantization
+    assert plan.use_unscaled_score_recurrence
     torch.manual_seed(432)
     query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
@@ -163,7 +171,7 @@ def test_triton_supports_rectangular_and_strided_inputs(
 
 @pytest.mark.skipif(
     not _sm120_available(),
-    reason="tensor-descriptor padding is currently selected on SM12x",
+    reason="tensor-descriptor schedule is tuned for SM120",
 )
 def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
     torch.manual_seed(441)
@@ -183,6 +191,30 @@ def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
         )
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="128-row long-causal schedule is tuned for SM120",
+)
+def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
+    torch.manual_seed(442)
+    query = torch.randn(1, 8, 4224, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    with torch.no_grad():
+        prepared = sage_backend._prepare_sage_attention_2pp(
+            query,
+            key,
+            value,
+            128**-0.5,
+            True,
+        )
+        assert prepared.plan.block_m == 128
+        actual = sage_backend._launch_sage_attention_2pp(prepared)
+
+    assert torch.isfinite(actual).all()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

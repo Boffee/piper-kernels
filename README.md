@@ -104,10 +104,11 @@ output = sage_attention_2pp(query, key, value, is_causal=False)
 
 Inputs use `[batch, heads, sequence, head_dim]` layout and may be FP16 or BF16. The
 optimized backend requires NVIDIA FP8 tensor cores with FP16 accumulation (SM89 or
-newer); measured schedules currently cover consumer SM89 and SM12x GPUs. It supports
-head dimensions 64 and 128, equal query/KV head counts, arbitrary positive sequence
-lengths, rectangular non-causal attention, strided sequence dimensions, and
-`torch.compile`. It is inference-only and does not support autograd.
+newer); measured schedules currently cover consumer SM89 and SM120 GPUs, while other
+SM12x targets retain grouped Q/K quantization with generic scheduling. It supports head
+dimensions 64 and 128, equal query/KV head counts, arbitrary positive sequence lengths,
+rectangular non-causal attention, strided sequence dimensions, and `torch.compile`. It
+is inference-only and does not support autograd.
 
 This is SageAttention2++, not a Piper-specific attention algorithm: K is smoothed, Q/K
 are quantized to INT8 with the canonical architecture-specific granularity, V and the

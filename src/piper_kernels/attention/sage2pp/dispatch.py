@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from piper_kernels._triton.targets import supports_fp8_fp16_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 
 from .reference import reference_sage_attention_2pp
 
@@ -89,8 +89,8 @@ def _validate_inputs(  # noqa: PLR0912
     return converted_scale
 
 
-def _supports_triton(device: torch.device) -> bool:
-    return _triton_sage_attention_2pp is not None and supports_fp8_fp16_mma(device)
+def _supports_triton(target: AcceleratorTarget) -> bool:
+    return _triton_sage_attention_2pp is not None and target.supports_fp8_fp16_mma
 
 
 def sage_attention_2pp(
@@ -114,7 +114,8 @@ def sage_attention_2pp(
     correctness rather than performance. This is an inference-only operator.
     """
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)
-    if _supports_triton(query.device):
+    target = AcceleratorTarget.from_device(query.device)
+    if _supports_triton(target):
         assert _triton_sage_attention_2pp is not None
         return _triton_sage_attention_2pp(query, key, value, converted_scale, is_causal)
     return reference_sage_attention_2pp(query, key, value, converted_scale, is_causal)

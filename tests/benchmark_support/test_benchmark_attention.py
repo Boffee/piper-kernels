@@ -28,6 +28,10 @@ from lib.attention_providers import (
     validate_provider_support,
 )
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
+_SM120 = AcceleratorTarget(backend="cuda", cuda_capability=(12, 0))
+
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
@@ -37,7 +41,8 @@ def test_qk_granularity_matches_architecture(
     capability: tuple[int, int],
     expected: str,
 ) -> None:
-    assert qk_quantization_granularity(capability) == expected
+    target = AcceleratorTarget(backend="cuda", cuda_capability=capability)
+    assert qk_quantization_granularity(target) == expected
 
 
 def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
@@ -52,7 +57,7 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
             PYTORCH_SDPA,
         ),
         config=AttentionConfig(dtype="float16"),
-        capability=(12, 0),
+        target=_SM120,
     )
 
     assert providers[PIPER_CENTERED].configuration["center_value"] is True
@@ -62,7 +67,7 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
     assert providers[PURE_TRITON_SAGE2PP].configuration["algorithm"] == ("sage_attention_2pp")
     assert "attention" in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
     assert (
-        "quantize-key-value-role-dispatched"
+        "quantize-key-value-per-block"
         in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
     )
     assert "quantize-query-per-warp" not in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
@@ -71,17 +76,48 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
 
 
 def test_short_causal_sage_provider_registers_external_query_quantization() -> None:
-    tensor = torch.empty((1, 1, 8, 64), dtype=torch.float16)
+    # D128 isolates the short-sequence policy: causal D64 always uses external
+    # Q quantization regardless of sequence length.
+    tensor = torch.empty((1, 1, 8, 128), dtype=torch.float16)
     providers = make_attention_providers(
         (tensor, tensor, tensor),
         provider_names=(PURE_TRITON_SAGE2PP,),
         config=AttentionConfig(dtype="float16", is_causal=True),
-        capability=(12, 0),
+        target=_SM120,
     )
 
     jit_functions = providers[PURE_TRITON_SAGE2PP].triton_jit_functions
     assert "quantize-query-per-warp" in jit_functions
-    assert "quantize-key-value-role-dispatched" in jit_functions
+    assert "quantize-key-value-per-block" in jit_functions
+
+
+def test_long_causal_sage_provider_omits_external_query_quantization() -> None:
+    tensor = torch.empty((1, 1, 32 * 1024, 128), device="meta", dtype=torch.float16)
+    providers = make_attention_providers(
+        (tensor, tensor, tensor),
+        provider_names=(PURE_TRITON_SAGE2PP,),
+        config=AttentionConfig(dtype="float16", is_causal=True),
+        target=_SM120,
+    )
+
+    jit_functions = providers[PURE_TRITON_SAGE2PP].triton_jit_functions
+    assert "quantize-query-per-warp" not in jit_functions
+
+
+def test_other_sm12x_sage_provider_registers_portable_grouped_quantization() -> None:
+    tensor = torch.empty((1, 1, 8, 128), dtype=torch.float16)
+    providers = make_attention_providers(
+        (tensor, tensor, tensor),
+        provider_names=(PURE_TRITON_SAGE2PP,),
+        config=AttentionConfig(dtype="float16"),
+        target=AcceleratorTarget(backend="cuda", cuda_capability=(12, 1)),
+    )
+
+    jit_functions = providers[PURE_TRITON_SAGE2PP].triton_jit_functions
+    assert "quantize-query-per-warp" in jit_functions
+    assert "quantize-key-per-block" in jit_functions
+    assert "quantize-value-per-channel" in jit_functions
+    assert "quantize-key-value-per-block" not in jit_functions
 
 
 def test_default_providers_use_hardware_aware_comparison_set() -> None:
@@ -114,26 +150,20 @@ def test_canonical_flag_adds_both_pinned_providers() -> None:
     ) == (PYTORCH_SDPA, CANONICAL_SAGE2PP, CANONICAL_SAGE2)
 
 
-def test_explicit_sage2pp_provider_requires_fp8(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "lib.attention_providers.supports_fp8_fp16_mma",
-        lambda _device: False,
-    )
-
+def test_explicit_sage2pp_provider_requires_fp8() -> None:
     with pytest.raises(SystemExit, match="different FP16-PV algorithm"):
-        validate_provider_support((PURE_TRITON_SAGE2PP,), torch.device("cuda"))
+        validate_provider_support(
+            (PURE_TRITON_SAGE2PP,),
+            AcceleratorTarget(backend="cuda", cuda_capability=(8, 0)),
+        )
 
 
-def test_piper_provider_requires_supported_mmav2_lowering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "lib.attention_providers.supports_uint8_int8_mma",
-        lambda _device: False,
-    )
-
+def test_piper_provider_requires_supported_mmav2_lowering() -> None:
     with pytest.raises(SystemExit, match="SM8x or consumer Blackwell SM12x"):
-        validate_provider_support((PIPER,), torch.device("cuda"))
+        validate_provider_support(
+            (PIPER,),
+            AcceleratorTarget(backend="cuda", cuda_capability=(9, 0)),
+        )
 
 
 def test_profile_provider_defaults_to_first_selected_provider() -> None:

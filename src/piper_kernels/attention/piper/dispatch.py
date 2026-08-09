@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from piper_kernels._triton.targets import supports_uint8_int8_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 
 from .reference import reference_piper_attention
 
@@ -89,21 +89,21 @@ def _validate_inputs(  # noqa: PLR0912
     return converted_scale
 
 
-def _supports_triton(device: torch.device) -> bool:
-    return _triton_piper_attention is not None and supports_uint8_int8_mma(device)
+def _supports_triton(target: AcceleratorTarget) -> bool:
+    return _triton_piper_attention is not None and target.supports_uint8_int8_mma
 
 
 def _default_center_value(
     query: torch.Tensor,
     key: torch.Tensor,
     is_causal: bool,
+    target: AcceleratorTarget,
 ) -> bool:
     """Select the measured centered-V region without assuming it helps every target."""
-    if not _supports_triton(query.device):
+    if not _supports_triton(target):
         return False
-    capability = torch.cuda.get_device_capability(query.device)
     return (
-        capability[0] == 12
+        target.is_cuda_capability(12)
         and not is_causal
         and query.shape[-1] == 128
         and query.shape[2] >= 1024
@@ -140,12 +140,13 @@ def piper_attention(
     operator.
     """
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)
+    target = AcceleratorTarget.from_device(query.device)
     selected_centering = (
-        _default_center_value(query, key, is_causal)
+        _default_center_value(query, key, is_causal, target)
         if center_value is None
         else bool(center_value)
     )
-    if _supports_triton(query.device):
+    if _supports_triton(target):
         assert _triton_piper_attention is not None
         return _triton_piper_attention(
             query,

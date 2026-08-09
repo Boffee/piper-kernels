@@ -8,10 +8,7 @@ from typing import cast
 
 import torch
 
-from piper_kernels._triton.targets import (
-    supports_fp8_fp16_mma,
-    supports_uint8_int8_mma,
-)
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention import sage_attention_2pp
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_backend
 from piper_kernels.attention.piper import triton as piper_backend
@@ -51,9 +48,9 @@ type AttentionProvider = BenchmarkProvider[object, torch.Tensor]
 type CanonicalSage = Callable[..., torch.Tensor]
 
 
-def qk_quantization_granularity(capability: tuple[int, int]) -> str:
+def qk_quantization_granularity(target: AcceleratorTarget) -> str:
     """Return the Sage Q/K granularity used on an NVIDIA architecture."""
-    return "per_warp" if capability[0] == 12 else "per_thread"
+    return "per_warp" if target.is_cuda_capability(12) else "per_thread"
 
 
 def default_provider_names(
@@ -95,16 +92,16 @@ def resolve_provider_names(
 
 def validate_provider_support(
     provider_names: Sequence[str],
-    device: torch.device,
+    target: AcceleratorTarget,
 ) -> None:
     """Reject selected providers that cannot run on the active accelerator."""
     needs_piper = any(name in PIPER_PROVIDERS for name in provider_names)
     needs_fp8 = any(name in FP8_SAGE_PROVIDERS for name in provider_names)
-    if needs_piper and not supports_uint8_int8_mma(device):
+    if needs_piper and not target.supports_uint8_int8_mma:
         raise SystemExit(
             "Piper Attention providers require NVIDIA SM8x or consumer Blackwell SM12x"
         )
-    if needs_fp8 and not supports_fp8_fp16_mma(device):
+    if needs_fp8 and not target.supports_fp8_fp16_mma:
         raise SystemExit(
             "Sage 8+8 providers require NVIDIA FP8 tensor cores; "
             "the canonical RTX 30 fallback is a different FP16-PV algorithm"
@@ -136,8 +133,8 @@ def _load_canonical(capability: tuple[int, int]) -> CanonicalSage:
     return cast(CanonicalSage, module.sageattn_qk_int8_pv_fp8_cuda)
 
 
-def _qk_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
-    if capability[0] == 12:
+def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
+    if target.is_cuda_capability(12):
         return {
             "quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel,
             "quantize-key-per-block": qk_backend.quantize_key_per_block_kernel,
@@ -149,30 +146,44 @@ def _qk_jit_functions(capability: tuple[int, int]) -> dict[str, object]:
 
 
 def _sage_jit_functions(
-    capability: tuple[int, int],
+    target: AcceleratorTarget,
     *,
     is_causal: bool,
     key_length: int,
     head_dim: int,
 ) -> dict[str, object]:
-    if capability[0] == 12:
+    plan = sage_backend._select_sage2pp_execution_plan(
+        target,
+        candidate_block_m=64,
+        query_length=key_length,
+        key_length=key_length,
+        head_dim=head_dim,
+        is_causal=is_causal,
+        use_tensor_descriptors=False,
+    )
+    if plan.fuse_kv_quantization:
         quantization_kernels = {
-            "quantize-key-value-role-dispatched": sage_backend._dispatch_kv_quantization_kernel,
+            "quantize-key-value-per-block": sage_backend._quantize_kv_per_block_kernel,
         }
-        if not sage_backend._should_inline_query_quantization(
-            True,
-            is_causal,
-            key_length,
-            head_dim,
-        ):
-            quantization_kernels["quantize-query-per-warp"] = (
-                qk_backend.quantize_query_per_warp_kernel
-            )
     else:
+        key_name, key_kernel = (
+            ("quantize-key-per-block", qk_backend.quantize_key_per_block_kernel)
+            if plan.grouped_qk
+            else ("quantize-key-per-thread", qk_backend.quantize_key_per_thread_kernel)
+        )
         quantization_kernels = {
-            **_qk_jit_functions(capability),
+            key_name: key_kernel,
             "quantize-value-per-channel": sage_backend._quantize_value_kernel,
         }
+    if not plan.fuse_query_quantization:
+        query_kernel = (
+            qk_backend.quantize_query_per_warp_kernel
+            if plan.grouped_qk
+            else qk_backend.quantize_query_per_thread_kernel
+        )
+        quantization_kernels[
+            "quantize-query-per-warp" if plan.grouped_qk else "quantize-query-per-thread"
+        ] = query_kernel
     return {
         "kv-statistics-partial": sage_backend._kv_statistics_partial_kernel,
         "kv-statistics-finish": sage_backend._finish_kv_statistics_kernel,
@@ -182,12 +193,12 @@ def _sage_jit_functions(
 
 
 def _piper_jit_functions(
-    capability: tuple[int, int],
+    target: AcceleratorTarget,
     *,
     sort_value_rows: bool,
 ) -> dict[str, object]:
-    qk_kernels = _qk_jit_functions(capability)
-    if sort_value_rows and capability[0] == 12:
+    qk_kernels = _qk_jit_functions(target)
+    if sort_value_rows and target.is_cuda_capability(12):
         qk_kernels["quantize-key-per-block"] = piper_backend._quantize_ordered_key_per_block_kernel
     kernels = {
         "kv-mean-partial": piper_backend._kv_mean_partial_kernel,
@@ -206,7 +217,7 @@ def _make_piper_provider(
     inputs: AttentionInputs,
     *,
     config: AttentionConfig,
-    capability: tuple[int, int],
+    target: AcceleratorTarget,
     center_value: bool,
     native_uint8: bool,
 ) -> AttentionProvider:
@@ -214,8 +225,7 @@ def _make_piper_provider(
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
     sort_value_rows = piper_backend._should_sort_value_rows(
         center_value=center_value,
-        capability=capability,
-        nvidia_cuda=True,
+        target=target,
         is_causal=config.is_causal,
         head_dim=query.shape[-1],
         key_length=key.shape[2],
@@ -247,7 +257,7 @@ def _make_piper_provider(
             **config.as_dict(),
             "implementation": "pure_triton",
             "algorithm": "piper_attention",
-            "qk_quantization": qk_quantization_granularity(capability),
+            "qk_quantization": qk_quantization_granularity(target),
             "probability_dtype": "uint8",
             "value_dtype": "int8",
             "value_scale": "per_key",
@@ -256,7 +266,7 @@ def _make_piper_provider(
             "mixed_sign_mma": "native" if native_uint8 else "affine_proxy",
         },
         triton_jit_functions=_piper_jit_functions(
-            capability,
+            target,
             sort_value_rows=sort_value_rows,
         ),
     )
@@ -267,11 +277,12 @@ def make_attention_providers(
     *,
     provider_names: Sequence[str],
     config: AttentionConfig,
-    capability: tuple[int, int],
+    target: AcceleratorTarget,
 ) -> dict[str, AttentionProvider]:
     """Construct the selected providers in command-line order."""
     query, key, _ = inputs
-    default_centering = _default_center_value(query, key, config.is_causal)
+    qk_granularity = qk_quantization_granularity(target)
+    default_centering = _default_center_value(query, key, config.is_causal, target)
     providers: dict[str, AttentionProvider] = {}
     piper_settings = {
         PIPER: (default_centering, True),
@@ -285,7 +296,7 @@ def make_attention_providers(
                 name,
                 inputs,
                 config=config,
-                capability=capability,
+                target=target,
                 center_value=center_value,
                 native_uint8=native_uint8,
             )
@@ -307,11 +318,11 @@ def make_attention_providers(
                 **config.as_dict(),
                 "implementation": "pure_triton",
                 "algorithm": "sage_attention_2pp",
-                "qk_quantization": qk_quantization_granularity(capability),
+                "qk_quantization": qk_granularity,
                 "pv_accumulation": "fp32+fp16",
             },
             triton_jit_functions=_sage_jit_functions(
-                capability,
+                target,
                 is_causal=config.is_causal,
                 key_length=key.shape[2],
                 head_dim=query.shape[3],
@@ -330,9 +341,15 @@ def make_attention_providers(
             },
         )
 
+    canonical_requested = (
+        CANONICAL_SAGE2PP in provider_names or CANONICAL_SAGE2 in provider_names
+    )
+    canonical_capability = target.cuda_capability
+    if canonical_requested and canonical_capability is None:
+        raise SystemExit("canonical SageAttention providers require NVIDIA CUDA")
     canonical = (
-        _load_canonical(capability)
-        if CANONICAL_SAGE2PP in provider_names or CANONICAL_SAGE2 in provider_names
+        _load_canonical(canonical_capability)
+        if canonical_capability is not None and canonical_requested
         else None
     )
     if canonical is not None:
@@ -341,7 +358,7 @@ def make_attention_providers(
             "implementation": "canonical_cuda",
             "canonical_version": CANONICAL_VERSION,
             "canonical_revision": CANONICAL_REVISION,
-            "qk_quantization": qk_quantization_granularity(capability),
+            "qk_quantization": qk_granularity,
         }
 
         def canonical_run(pv_accumulation: str) -> Callable[[object], torch.Tensor]:
@@ -353,7 +370,7 @@ def make_attention_providers(
                     value,
                     tensor_layout="HND",
                     is_causal=config.is_causal,
-                    qk_quant_gran=qk_quantization_granularity(capability),
+                    qk_quant_gran=qk_granularity,
                     sm_scale=config.scale,
                     pv_accum_dtype=pv_accumulation,
                     smooth_k=True,

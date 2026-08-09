@@ -18,13 +18,13 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 
 _PV_BLOCK = 64
-_P_FP8_LN_RANGE = math.log(448.0)
-_V_FP8_RANGE = 2.25
+_P_FP8_LN_MAX = math.log(448.0)
+_V_FP8_MAX = 2.25
 _SCALE_EPSILON = 1e-7
 
 
 def _quantize_value_per_channel(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = value.float().abs().amax(dim=2) / _V_FP8_RANGE + _SCALE_EPSILON
+    scale = value.float().abs().amax(dim=2) / _V_FP8_MAX + _SCALE_EPSILON
     quantized = (value.float() / scale[:, :, None, :]).to(torch.float8_e4m3fn)
     return quantized, scale
 
@@ -102,7 +102,7 @@ def reference_sage_attention_2pp(
 
         # Canonical Sage2++ shifts the online-softmax frame so the largest
         # probability is already in FP8's usable range.
-        block_max = scores.amax(dim=-1) - _P_FP8_LN_RANGE
+        block_max = scores.amax(dim=-1) - _P_FP8_LN_MAX
         next_max = torch.maximum(running_max, block_max)
         old_weight = torch.exp(running_max - next_max)
         probabilities = torch.exp(scores - next_max[..., None])

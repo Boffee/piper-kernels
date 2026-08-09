@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import piper_kernels.attention
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention import piper_attention
 from piper_kernels.attention.piper import triton as triton_implementation
 from piper_kernels.attention.piper.dispatch import _default_center_value
@@ -36,7 +37,12 @@ def test_public_api_uses_portable_reference_on_cpu() -> None:
 def test_default_centering_is_disabled_for_portable_reference() -> None:
     query, key, _ = _inputs()
 
-    assert not _default_center_value(query, key, False)
+    assert not _default_center_value(
+        query,
+        key,
+        False,
+        AcceleratorTarget.from_device(query.device),
+    )
 
 
 def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
@@ -120,11 +126,11 @@ def test_default_centering_policy_is_shape_and_architecture_specific(
     key = torch.empty((1, 1, key_length, head_dim), dtype=torch.float16)
     monkeypatch.setattr(
         "piper_kernels.attention.piper.dispatch._supports_triton",
-        lambda _device: True,
+        lambda _target: True,
     )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    target = AcceleratorTarget(backend="cuda", cuda_capability=capability)
 
-    assert _default_center_value(query, key, is_causal) is expected
+    assert _default_center_value(query, key, is_causal, target) is expected
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int8])

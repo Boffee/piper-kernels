@@ -16,7 +16,7 @@ from piper_kernels._triton.mixed_int8 import (
     rewrite_uint8_int8_dot_llvm,
     uint8_int8_dot,
 )
-from piper_kernels._triton.targets import supports_uint8_int8_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 
 _NVIDIA_GPU_AVAILABLE = torch.cuda.is_available() and torch.version.cuda is not None
 
@@ -200,7 +200,7 @@ def test_compiler_hook_composes_cache_identity_and_stage_order() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
 def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
-    if not supports_uint8_int8_mma(torch.device("cuda")):
+    if not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma:
         pytest.skip("requires Piper's supported MMAv2 lowering")
     lhs = torch.arange(64 * 64, device="cuda", dtype=torch.int64)
     lhs = lhs.remainder(256).to(torch.uint8).reshape(64, 64)
@@ -226,7 +226,7 @@ def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
 def test_generated_ptx_changes_only_the_marked_dot() -> None:
-    if not supports_uint8_int8_mma(torch.device("cuda")):
+    if not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma:
         pytest.skip("requires Piper's supported MMAv2 lowering")
     unsigned_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.uint8)
     signed_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)

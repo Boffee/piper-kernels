@@ -24,7 +24,7 @@ from lib import (
     write_records,
 )
 
-from piper_kernels._triton.targets import supports_uint8_int8_mma
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper import triton as piper_backend
 from piper_kernels.attention.piper.dispatch import _default_center_value
 
@@ -85,13 +85,13 @@ def _make_candidate(
     is_causal: bool,
     center_value: bool,
     sort_value_rows: bool,
-    capability: tuple[int, int],
+    target: AcceleratorTarget,
     common_configuration: Mapping[str, object],
 ) -> TuningCandidate[object, torch.Tensor]:
     use_tensor_descriptors = schedule == "tensor-descriptor"
 
     def make_provider() -> BenchmarkProvider[object, torch.Tensor]:
-        if use_tensor_descriptors and capability[0] != 12:
+        if use_tensor_descriptors and not target.is_cuda_capability(12):
             raise UnsupportedTuningCandidateError(
                 "the tensor-descriptor candidate currently targets SM12x"
             )
@@ -154,7 +154,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("Piper Attention tuning requires an available NVIDIA GPU")
     device = torch.device("cuda")
-    if not supports_uint8_int8_mma(device):
+    target = AcceleratorTarget.from_device(device)
+    if not target.supports_uint8_int8_mma:
         raise SystemExit("Piper Attention tuning requires NVIDIA SM8x or SM12x")
 
     key_value_length = args.kv_sequence or args.sequence
@@ -171,15 +172,13 @@ def _main(argv: Sequence[str] | None = None) -> None:
     query, key, value = inputs
     scale = args.head_dim**-0.5
     center_value = (
-        _default_center_value(query, key, args.causal)
+        _default_center_value(query, key, args.causal, target)
         if args.center_value is None
         else args.center_value
     )
-    capability = torch.cuda.get_device_capability(device)
     sort_value_rows = piper_backend._should_sort_value_rows(
         center_value=center_value,
-        capability=capability,
-        nvidia_cuda=True,
+        target=target,
         is_causal=args.causal,
         head_dim=args.head_dim,
         key_length=key_value_length,
@@ -198,7 +197,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             is_causal=args.causal,
             center_value=center_value,
             sort_value_rows=sort_value_rows,
-            capability=capability,
+            target=target,
             common_configuration=common_configuration,
         )
         for schedule in args.schedules

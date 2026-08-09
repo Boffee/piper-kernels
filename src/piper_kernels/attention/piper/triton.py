@@ -23,10 +23,7 @@ from piper_kernels._triton.mixed_int8 import (
     install_uint8_int8_dot_hook,
     uint8_int8_dot,
 )
-from piper_kernels._triton.targets import (
-    is_nvidia_cuda,
-    supports_uint8_int8_mma,
-)
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -1027,15 +1024,13 @@ class _PreparedPiperAttention:
     split_pv_head_dim: bool
     scaled_fp16_numerator: bool
     center_value: bool
-    sort_value_rows: bool
     use_tensor_descriptors: bool
 
 
 def _should_sort_value_rows(
     *,
     center_value: bool,
-    capability: tuple[int, int],
-    nvidia_cuda: bool,
+    target: AcceleratorTarget,
     is_causal: bool,
     head_dim: int,
     key_length: int,
@@ -1043,8 +1038,7 @@ def _should_sort_value_rows(
     """Select exact V ordering only where its long-context cost is amortized."""
     return (
         center_value
-        and nvidia_cuda
-        and capability[0] == 12
+        and target.is_cuda_capability(12)
         and not is_causal
         and head_dim == 128
         and key_length >= 16384
@@ -1066,17 +1060,16 @@ def _prepare_piper_attention(
     """Quantize Q/K/V and construct the selected launch specialization."""
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
-    capability = torch.cuda.get_device_capability(query.device)
-    nvidia_cuda = is_nvidia_cuda(query.device)
-    grouped_qk = nvidia_cuda and capability[0] == 12
+    target = AcceleratorTarget.from_device(query.device)
+    grouped_qk = target.is_cuda_capability(12)
+    use_sm12x_schedule = target.is_cuda_capability(12)
     if native_uint8 is None:
-        native_uint8 = supports_uint8_int8_mma(query.device)
+        native_uint8 = target.supports_uint8_int8_mma
     if native_uint8:
         with torch.cuda.device(query.device):
             install_uint8_int8_dot_hook()
     split_pv_head_dim = (
-        nvidia_cuda
-        and capability[0] == 12
+        use_sm12x_schedule
         and not is_causal
         and head_dim == 128
         and query_length >= 1024
@@ -1086,8 +1079,7 @@ def _prepare_piper_attention(
     if sort_value_rows is None:
         sort_value_rows = _should_sort_value_rows(
             center_value=center_value,
-            capability=capability,
-            nvidia_cuda=nvidia_cuda,
+            target=target,
             is_causal=is_causal,
             head_dim=head_dim,
             key_length=key_length,
@@ -1109,8 +1101,7 @@ def _prepare_piper_attention(
     padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
     if use_tensor_descriptors is None:
         use_tensor_descriptors = (
-            nvidia_cuda
-            and capability[0] == 12
+            use_sm12x_schedule
             and block_m == 128
             and head_dim == 128
             and padded_key_length % 16 == 0
@@ -1231,7 +1222,6 @@ def _prepare_piper_attention(
         split_pv_head_dim=split_pv_head_dim,
         scaled_fp16_numerator=scaled_fp16_numerator,
         center_value=center_value,
-        sort_value_rows=sort_value_rows,
         use_tensor_descriptors=use_tensor_descriptors,
     )
 
