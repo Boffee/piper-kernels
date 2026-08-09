@@ -145,22 +145,7 @@ def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
     }
 
 
-def _sage_jit_functions(
-    target: AcceleratorTarget,
-    *,
-    is_causal: bool,
-    key_length: int,
-    head_dim: int,
-) -> dict[str, object]:
-    plan = sage_backend._select_sage2pp_execution_plan(
-        target,
-        candidate_block_m=64,
-        query_length=key_length,
-        key_length=key_length,
-        head_dim=head_dim,
-        is_causal=is_causal,
-        use_tensor_descriptors=False,
-    )
+def _sage_jit_functions(plan: sage_backend._Sage2ppExecutionPlan) -> dict[str, object]:
     if plan.fuse_kv_quantization:
         quantization_kernels = {
             "quantize-key-value-per-block": sage_backend._quantize_kv_per_block_kernel,
@@ -272,6 +257,49 @@ def _make_piper_provider(
     )
 
 
+def _make_sage2pp_provider(
+    name: str,
+    inputs: AttentionInputs,
+    *,
+    config: AttentionConfig,
+    target: AcceleratorTarget,
+) -> AttentionProvider:
+    query, key, _ = inputs
+    plan = sage_backend._default_sage2pp_execution_plan(
+        query,
+        key,
+        config.is_causal,
+        target=target,
+    )
+
+    def prepare() -> object:
+        return inputs
+
+    def run(prepared: object) -> torch.Tensor:
+        return sage_attention_2pp(
+            *cast(AttentionInputs, prepared),
+            scale=config.scale,
+            is_causal=config.is_causal,
+        )
+
+    return BenchmarkProvider(
+        name=name,
+        prepare=prepare,
+        run=run,
+        synchronize=torch.cuda.synchronize,
+        configuration={
+            **config.as_dict(),
+            "implementation": "pure_triton",
+            "algorithm": "sage_attention_2pp",
+            "qk_quantization": qk_quantization_granularity(target),
+            "pv_accumulation": "fp32+fp16",
+            "block_n": int(sage_backend._BLOCK_N),
+            **plan.as_dict(),
+        },
+        triton_jit_functions=_sage_jit_functions(plan),
+    )
+
+
 def make_attention_providers(
     inputs: AttentionInputs,
     *,
@@ -305,28 +333,11 @@ def make_attention_providers(
         return inputs
 
     if PURE_TRITON_SAGE2PP in provider_names:
-        providers[PURE_TRITON_SAGE2PP] = BenchmarkProvider(
-            name=PURE_TRITON_SAGE2PP,
-            prepare=prepare_inputs,
-            run=lambda prepared: sage_attention_2pp(
-                *cast(AttentionInputs, prepared),
-                scale=config.scale,
-                is_causal=config.is_causal,
-            ),
-            synchronize=torch.cuda.synchronize,
-            configuration={
-                **config.as_dict(),
-                "implementation": "pure_triton",
-                "algorithm": "sage_attention_2pp",
-                "qk_quantization": qk_granularity,
-                "pv_accumulation": "fp32+fp16",
-            },
-            triton_jit_functions=_sage_jit_functions(
-                target,
-                is_causal=config.is_causal,
-                key_length=key.shape[2],
-                head_dim=query.shape[3],
-            ),
+        providers[PURE_TRITON_SAGE2PP] = _make_sage2pp_provider(
+            PURE_TRITON_SAGE2PP,
+            inputs,
+            config=config,
+            target=target,
         )
     if PYTORCH_SDPA in provider_names:
         providers[PYTORCH_SDPA] = BenchmarkProvider(
@@ -341,9 +352,7 @@ def make_attention_providers(
             },
         )
 
-    canonical_requested = (
-        CANONICAL_SAGE2PP in provider_names or CANONICAL_SAGE2 in provider_names
-    )
+    canonical_requested = CANONICAL_SAGE2PP in provider_names or CANONICAL_SAGE2 in provider_names
     canonical_capability = target.cuda_capability
     if canonical_requested and canonical_capability is None:
         raise SystemExit("canonical SageAttention providers require NVIDIA CUDA")

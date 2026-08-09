@@ -134,7 +134,7 @@ This is SageAttention2++, not a Piper-specific attention algorithm: K is smoothe
 are quantized to INT8 with the canonical architecture-specific granularity, V and the
 online-softmax probabilities are quantized to E4M3, each 64-key P x V tile accumulates
 in FP16, and tile results are buffered in FP32. All optimized device code is Triton;
-the package contains no CUDA extension or inline PTX. Unsupported devices use the slow
+the package contains no CUDA extension. Unsupported devices use the slow
 portable quantized reference.
 
 Install either optimized attention backend with `piper-kernels[triton]`. The official CUDA

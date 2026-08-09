@@ -77,6 +77,36 @@ Use `--phase operator_end_to_end` to include preprocessing in the ranking. The d
 `prepared_execution` phase compares only the prepared fused recurrence. On targets where a
 candidate is unsupported, it remains in the report with `status: skipped`.
 
+The SageAttention2++ adapter searches the same immutable execution-plan fields used by
+production dispatch. Omitted axes retain the production value; values supplied for multiple
+axes form a Cartesian search, capped at 256 candidates by default:
+
+```shell
+uv run python benchmarks/tune_sage2pp_attention.py \
+  --sequence 8192 --head-dim 128 \
+  --block-m 64 128 \
+  --num-stages 2 3 \
+  --load-path pointer tensor-descriptor \
+  --json artifacts/sage2pp-sm120-tuning.json
+```
+
+As in `benchmark_attention.py`, Sage's `prepared_execution` phase is the complete public
+operator—including statistics and Q/K/V quantization—not only the final recurrence kernel.
+Use `operator_end_to_end` when synchronized host and allocation overhead should participate in
+the ranking. Every candidate must also clear the configurable SQNR and non-finite quality gate.
+
+The Sage tuner currently runs on the optimized NVIDIA SM89+ backend, including SM120. It can
+search a future CUDA target once that target is supported by the kernel, but it does not enable a
+new backend. In particular, AMD `gfx1200`/`gfx1201` remain unsupported until the inline PTX FP8
+conversion and NVIDIA FP8-MMA path have HIP equivalents.
+
+Selected records are evidence, not runtime policy: review the result across representative
+shapes and repeated processes, then deliberately freeze an accepted winner in the production
+execution-plan selector. The project does not use `triton.autotune` in the public operator path;
+doing so would add first-use compilation/search latency, multiply cache entries across dynamic
+shapes, and cannot apply the tuner's full-operator quality gate. Triton autotuning remains useful
+for narrow, opt-in single-kernel experiments, but offline search is the production-policy tool.
+
 ## Quality and reproducibility
 
 `measure_quality()` centralizes mean/max absolute error, relative L1 and L2 error,
@@ -318,6 +348,8 @@ preparation, warmed device-event execution, complete operator latency, quality a
 and effective TFLOP/s. Use `--sequence`, `--kv-sequence`, `--head-dim`, `--dtype`, and
 `--causal` to build a shape matrix. JSON and JSONL output use the shared versioned benchmark
 schema and identify the algorithm and implementation in each provider's configuration.
+Pure-Triton Sage records also serialize their selected launch, fusion, loop, and packed-
+probability-conversion choices.
 
 Piper exposes a more granular lifecycle than ordinary Sage and SDPA operators:
 
@@ -368,6 +400,55 @@ spills, 49,704 bytes of shared memory per workgroup, and four warps. Its SASS co
 expected 64 signed INT8 QK MMA instructions and 64 E4M3 x E4M3 to FP16 PV MMA instructions.
 The complete GPU suite passed 155 tests. These measurements are a regression reference for
 this hardware/software stack, not a portable performance guarantee.
+
+### SageAttention2++ SM89 tuning checkpoint
+
+The pure-Triton SageAttention2++ path was tuned on an RTX 4070 Ti SUPER (SM89)
+under Windows 11, driver 596.49, Python 3.14.7, Torch 2.12.1+cu130, CUDA 13.0,
+and Triton 3.7.1.post27. BF16 B1/H8/D128 warmed device-event medians measured:
+
+| sequence | execution | pure Triton (ms) | canonical CUDA (ms) | gap |
+|---:|:---|---:|---:|---:|
+| 8,192 | non-causal | 1.320 | 1.326 | -0.5% |
+| 8,192 | causal | 0.914 | 0.924 | -1.1% |
+| 32,768 | non-causal | 20.241 | 19.987 | +1.3% |
+| 32,768 | causal | 11.060 | 11.130 | -0.6% |
+| 131,072 | non-causal | 310.977 | 302.304 | +2.9% |
+| 131,072 | causal | 164.773 | 157.340 | +4.7% |
+
+Negative gaps mean Triton was faster. The retained D128 causal schedule uses 128
+query rows, four warps, two launch stages, and reverse CTA ordering from 8K onward.
+The long non-causal path uses 128 query rows, four warps, 64-key tiles,
+loop-invariant-code motion, and a three-stage loop pipeline. Packed native
+`cvt.rn.satfinite.e4m3x2.f32` replaces stock Triton's software E4M3 conversion
+on the SM89 probability and V paths. These imported measurements establish a 5%
+non-inferiority checkpoint; they were not reproduced locally without SM89 hardware.
+
+### Packed E4M3 conversion SM120 portability check
+
+The packed conversion was separately A/B tested on an RTX 5090 (SM120), driver
+595.71.05, Python 3.14.6, Torch 2.12.1+cu130, and Triton 3.7.1. Each result below is
+the median process result from three rounds with BF16 B1/H8 inputs, 300 ms warmup
+windows, and 1.5 second measurement windows. The 8K/32K runs alternated baseline and
+packed worktrees; the 128K runs rotated clean, ungated, and selective worktrees:
+
+| execution | head dim | sequence | ungated packed hot-latency change |
+|:---|---:|---:|---:|
+| non-causal | 64 | 8,192 / 32,768 | +0.27% / -0.12% |
+| causal | 64 | 8,192 / 32,768 | -0.88% / -0.40% |
+| non-causal | 128 | 8,192 / 32,768 | -0.51% / -0.38% |
+| causal | 128 | 8,192 / 32,768 | +1.50% / +1.61% |
+| non-causal | 128 | 131,072 | -0.94% |
+| causal | 128 | 131,072 | +1.40% |
+
+Compiler inspection showed the packed D128 causal attention kernel increasing from
+22 to 24 spills, while the packed fused-V quantizer added eight SASS instructions.
+Production therefore keeps stock conversion for SM120 fused V and D128 causal
+probabilities, while retaining packed probabilities on the beneficial paths. A final
+three-round comparison of this selective policy measured +0.02% / -0.05% hot deltas
+at causal D128 8K / 32K. At 128K, the selective policy retained a -1.19% non-causal
+gain and measured -0.07% causal versus clean; the corresponding ungated attention
+kernel raised causal spills from 18 to 20. Quality metrics were unchanged.
 
 ### Piper Attention regression baseline
 

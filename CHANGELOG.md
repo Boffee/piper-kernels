@@ -21,7 +21,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   Blackwell SM12x through a packaged, fail-closed `m16n8k32` MMAv2 compiler extension
   with exactness and generated-code validation.
 - Reusable offline kernel-configuration tuning with quality gates, recorded candidate
-  failures, deterministic winner selection, and an executable Piper Attention example.
+  failures, deterministic winner selection, and executable Piper Attention and
+  SageAttention2++ adapters.
 - Explicit opt-in `convrot_linear(..., input_activation="swiglu")` with a portable
   `[up | gate]` reference, exact-SM120 fused preparation, and fake/meta plus
   `torch.compile` support.
@@ -30,6 +31,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Tuned the pure-Triton SageAttention2++ path on SM89 with native packed
+  FP32-to-E4M3 conversion, 128-row two-stage reverse-order long-causal launches,
+  and loop-invariant hoisting with a three-stage loop pipeline for long
+  non-causal D128. SM120 keeps its stock fused-V and D128-causal probability
+  conversion where local paired benchmarks found packed conversion neutral or slower.
 - Consolidated the Piper, SageAttention2++, canonical CUDA, and SDPA comparisons into
   the hardware-aware `benchmarks/benchmark_attention.py` development CLI.
 - Optimized SageAttention2++ recurrence and causal scheduling across supported GPUs,

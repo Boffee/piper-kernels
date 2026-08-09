@@ -68,11 +68,11 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
     assert providers[PIPER_AFFINE].configuration["mixed_sign_mma"] == "affine_proxy"
     assert "attention" in providers[PIPER_CENTERED].triton_jit_functions
     assert providers[PURE_TRITON_SAGE2PP].configuration["algorithm"] == ("sage_attention_2pp")
+    assert providers[PURE_TRITON_SAGE2PP].configuration["block_n"] == 64
+    assert providers[PURE_TRITON_SAGE2PP].configuration["use_packed_probability_conversion"]
+    assert providers[PURE_TRITON_SAGE2PP].configuration["fuse_kv_quantization"]
     assert "attention" in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
-    assert (
-        "quantize-key-value-per-block"
-        in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
-    )
+    assert "quantize-key-value-per-block" in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
     assert "quantize-query-per-warp" not in providers[PURE_TRITON_SAGE2PP].triton_jit_functions
     assert providers[PYTORCH_SDPA].configuration["algorithm"] == ("scaled_dot_product_attention")
     assert not providers[PYTORCH_SDPA].triton_jit_functions

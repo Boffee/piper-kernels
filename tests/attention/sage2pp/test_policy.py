@@ -1,9 +1,12 @@
 """Host-side specialization policy tests for SageAttention2++."""
 
 import pytest
+import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage2pp.triton import (
+    _default_sage2pp_execution_plan,
+    _prepare_sage_attention_2pp,
     _Sage2ppExecutionPlan,
     _select_sage2pp_execution_plan,
 )
@@ -11,6 +14,45 @@ from piper_kernels.attention.sage2pp.triton import (
 _SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 _SM121 = AcceleratorTarget(backend="cuda", architecture="sm121")
+
+
+def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> None:
+    query = torch.empty((1, 8, 8192, 128), device="meta")
+    key = torch.empty_like(query)
+
+    plan = _default_sage2pp_execution_plan(
+        query,
+        key,
+        False,
+        target=_SM120,
+    )
+
+    assert plan.block_m == 64
+    assert plan.grouped_qk
+    assert plan.fuse_kv_quantization
+
+
+def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> None:
+    query = torch.empty((1, 1, 64, 64), device="meta")
+    plan = _Sage2ppExecutionPlan(
+        block_m=64,
+        grouped_qk=False,
+        fuse_kv_quantization=False,
+        fuse_query_quantization=False,
+        use_unscaled_score_recurrence=False,
+        use_tensor_descriptors=False,
+    )
+
+    with pytest.raises(ValueError, match="cannot both be specified"):
+        _prepare_sage_attention_2pp(
+            query,
+            query,
+            query,
+            0.125,
+            False,
+            use_tensor_descriptors=False,
+            execution_plan=plan,
+        )
 
 
 @pytest.mark.parametrize(
@@ -25,6 +67,8 @@ _SM121 = AcceleratorTarget(backend="cuda", architecture="sm121")
                 fuse_query_quantization=False,
                 use_unscaled_score_recurrence=False,
                 use_tensor_descriptors=False,
+                loop_num_stages=3,
+                disable_loop_licm=False,
             ),
         ),
         (
@@ -51,7 +95,7 @@ _SM121 = AcceleratorTarget(backend="cuda", architecture="sm121")
         ),
     ],
 )
-def test_execution_plan_separates_architecture_facts_from_sm120_tuning(
+def test_execution_plan_separates_architecture_facts_from_exact_target_tuning(
     target: AcceleratorTarget,
     expected: _Sage2ppExecutionPlan,
 ) -> None:
@@ -73,10 +117,11 @@ def test_execution_plan_separates_architecture_facts_from_sm120_tuning(
         (_SM120, 4096, 64),
         (_SM120, 4097, 128),
         (_SM121, 8192, 64),
-        (_SM89, 8192, 64),
+        (_SM89, 8191, 64),
+        (_SM89, 8192, 128),
     ],
 )
-def test_causal_block_schedule_is_tuned_only_for_sm120(
+def test_causal_block_schedule_uses_architecture_specific_tuning(
     target: AcceleratorTarget,
     query_length: int,
     expected_block_m: int,
@@ -91,6 +136,35 @@ def test_causal_block_schedule_is_tuned_only_for_sm120(
     )
 
     assert plan.block_m == expected_block_m
+
+
+def test_long_sm89_d128_causal_schedule_uses_measured_launch_policy() -> None:
+    plan = _select_sage2pp_execution_plan(
+        _SM89,
+        candidate_block_m=128,
+        query_length=8192,
+        key_length=8192,
+        head_dim=128,
+        is_causal=True,
+    )
+
+    assert plan.num_warps == 4
+    assert plan.num_stages == 2
+    assert plan.reverse_causal_blocks
+
+
+def test_long_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> None:
+    plan = _select_sage2pp_execution_plan(
+        _SM89,
+        candidate_block_m=128,
+        query_length=8192,
+        key_length=8192,
+        head_dim=128,
+        is_causal=False,
+    )
+
+    assert plan.loop_num_stages == 3
+    assert not plan.disable_loop_licm
 
 
 @pytest.mark.parametrize(
@@ -142,6 +216,33 @@ def test_sm120_d64_preserves_query_quantization_policy(
     assert plan.fuse_kv_quantization
     assert plan.fuse_query_quantization is fuse_query
     assert not plan.use_unscaled_score_recurrence
+
+
+@pytest.mark.parametrize(
+    ("target", "head_dim", "is_causal", "expected"),
+    [
+        (_SM89, 128, True, True),
+        (_SM120, 64, True, True),
+        (_SM120, 128, False, True),
+        (_SM120, 128, True, False),
+    ],
+)
+def test_probability_conversion_policy_is_specialized_by_target_and_shape(
+    target: AcceleratorTarget,
+    head_dim: int,
+    is_causal: bool,
+    expected: bool,
+) -> None:
+    plan = _select_sage2pp_execution_plan(
+        target,
+        candidate_block_m=128,
+        query_length=8192,
+        key_length=8192,
+        head_dim=head_dim,
+        is_causal=is_causal,
+    )
+
+    assert plan.use_packed_probability_conversion is expected
 
 
 @pytest.mark.parametrize(
