@@ -22,6 +22,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   with exactness and generated-code validation.
 - Reusable offline kernel-configuration tuning with quality gates, recorded candidate
   failures, deterministic winner selection, and an executable Piper Attention example.
+- Explicit opt-in `convrot_linear(..., input_activation="swiglu")` with a portable
+  `[up | gate]` reference, exact-SM120 fused preparation, and fake/meta plus
+  `torch.compile` support.
+- Canonical `ConvRotInt8Tensor.from_quantized(..., logical_dtype=...)` construction while
+  retaining the `from_packed(..., dtype=...)` compatibility API.
 
 ### Changed
 
@@ -30,6 +35,22 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Optimized SageAttention2++ recurrence and causal scheduling across supported GPUs,
   with measured SM120 specializations for fused K/V quantization, fused query
   quantization, and long-sequence unscaled-score recurrence.
+- Reduced ConvRot H4 rotation work through factorized quartets, added 64-bit-safe tensor
+  addressing, and fused H256 rotation with rowwise INT8 quantization on measured SM120
+  shapes while retaining the split preparation fallback everywhere else.
+- Moved the format-neutral ConvRot functional API out of the INT8 storage module and
+  separated semantic custom operators from their optional Triton implementations.
+
+### Fixed
+
+- Honored positional, keyword, and mixed `torch.nn.functional.linear` calls for ConvRot
+  weights, including keyword bias instead of silently dropping it.
+- Enforced consistent ConvRot linear shape, device, logical-dtype, storage-layout, and
+  inference-only contracts across reference, meta, and optimized execution.
+- Made synthetic fake-CUDA dispatch independent of physical device availability and
+  revalidated canonical storage after tensor-attribute replacement.
+- Made zero-width ConvRot weights consistent across quantization, dequantization, ordinary
+  and SwiGLU linear calls, in-place updates, CUDA execution, and `torch.compile`.
 
 ## [0.1.0] - 2026-08-03
 

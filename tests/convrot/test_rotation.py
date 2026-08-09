@@ -4,8 +4,10 @@ import hashlib
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels.convrot._rotation import build_hadamard
+from piper_kernels.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.convrot._torch_compat import is_fake_mode_active
 
 
 @pytest.mark.parametrize(
@@ -22,3 +24,21 @@ def test_regular_hadamard_order_matches_comfy_kitchen(size: int, digest: str) ->
     signs = (matrix * size**0.5).to(torch.int8).view(torch.uint8).flatten().tolist()
     assert hashlib.sha256(bytes(signs)).hexdigest() == digest
     assert torch.equal(matrix @ matrix.T, torch.eye(size))
+
+
+def test_fake_mode_detection_isolated_behind_compatibility_helper() -> None:
+    assert not is_fake_mode_active()
+    with FakeTensorMode():
+        assert is_fake_mode_active()
+
+
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (2, 0, 0)])
+def test_rotate_groups_preserves_zero_feature_shapes(shape: tuple[int, ...]) -> None:
+    value = torch.empty(shape, dtype=torch.bfloat16)
+
+    result = rotate_groups(value, 16)
+
+    assert result is not value
+    assert result.shape == value.shape
+    assert result.dtype is value.dtype
+    assert result.device == value.device

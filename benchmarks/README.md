@@ -1,8 +1,8 @@
 # Benchmarks
 
 Operator benchmarks live here rather than in the correctness test suite. Each benchmark
-reports hardware, software, Git state, shapes, kernel configuration, numerical quality,
-and consistently named timing phases. The support code in `lib/` is development-only;
+reports hardware, software, Git state, shapes, kernel configuration, numerical quality where
+applicable, and consistently named timing phases. The support code in `lib/` is development-only;
 it is not part of the installed `piper_kernels` API.
 
 ## Common provider and timing model
@@ -14,14 +14,19 @@ A provider has two explicit callables:
 - `run(prepared)` executes the operator using already-prepared inputs. It may launch
   one or more kernels.
 
+“Prepared” describes the benchmark boundary, not an operator's internals. Work performed
+inside a public operator—including ConvRot activation rotation and quantization—remains part
+of `run(prepared)`. A provider may use a no-op `prepare()` when it repeatedly invokes the
+complete operator on fixed source tensors.
+
 The common runner reports these phases:
 
 - `first_call_ms`: synchronized wall time for the first operator invocation, including
   any lazy compilation. It is not compiler CPU time in isolation and does not claim
   that compiler caches were initially empty.
 - `preparation`: warmed, synchronized wall latency of preparation-only work.
-- `prepared_execution`: warmed device-event latency of `run(prepared)` on fixed
-  prepared inputs.
+- `prepared_execution`: warmed device-event latency of `run(prepared)` on fixed source
+  objects, including any preparation internal to the timed operator.
 - `operator_end_to_end`: warmed, synchronized wall latency of `run(prepare())`.
 
 Synchronized wall timing captures host dispatch, allocation, packing, and device work.
@@ -148,8 +153,99 @@ uv run python benchmarks/benchmark_convrot.py
 ```
 
 Use `--help` to select activation rows, weight dimensions, group size, dtype,
-deterministic input seed, and timing windows. The script verifies exact agreement before
-reporting Triton and reference timings.
+deterministic input seed, and timing windows. The existing custom-shape interface remains
+the default. Custom-shape options such as `--rows` and `--input-activation` cannot be mixed
+with a named preset, because the preset supplies those values. `--in-features` is linear and
+weight width `K`; a raw `[up | gate]` SwiGLU input has `2K` features. The script validates
+ordinary linears with the output dtype's standard tolerance; the SwiGLU path uses a declared
+relative-L2 bound. Quality is computed over at most 256 rows stratified across `M`, including
+the final row and rows around every first signed-32-bit input or output element-offset crossing.
+Machine output records the exact sampled indices.
+
+The Piper provider times the complete public entrypoint on fixed source tensors, so its
+`prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
+configuration records the public entrypoint and whether SwiGLU dispatch selected fused or
+materialized input preparation. Record shapes contain only the case name and logical dimensions;
+provider configuration distinguishes the logical input layout from the layout passed to that
+provider. The optional provider is recorded as provider-managed when its internal choice is not
+observable.
+
+Exercise the four principal bias-free MiniMax H3 transformer projections at the measured
+5-second row count or at 128K rows with:
+
+```shell
+uv run python benchmarks/benchmark_convrot.py --preset minimax-h3-5s
+uv run python benchmarks/benchmark_convrot.py --preset minimax-h3-128k
+```
+
+Both presets cover QKV `(N, K) = (21504, 5376)`, attention output `(5376, 7168)`,
+MLP FC1 `(28672, 5376)`, and MLP FC2 `(5376, 14336)`. FC2 consumes the explicit
+raw `[up | gate]` input contract with 28672 features, applies SwiGLU, and supplies linear
+`K = 14336` to ConvRot. The 5-second preset uses `M = 37710`; the 128K preset uses
+`M = 131072`. Row count remains a reproducible workload choice rather than a universal
+model constant.
+
+The 128K preset automatically skips full portable-reference timing because its FP32 output
+temporary can exceed 10 GiB. It still runs each complete optimized tensor and validates the
+sampled boundary rows. Custom memory-intensive shapes can select the same behavior with
+`--skip-reference-timing`.
+
+Compare against the optional Comfy Kitchen CUDA provider with:
+
+```shell
+uv run --with comfy-kitchen==0.2.28 \
+  python benchmarks/benchmark_convrot.py \
+  --preset minimax-h3-5s --compare-comfy-kitchen
+```
+
+Comfy Kitchen is a benchmark-only dependency and is loaded only when requested. Its 0.2.x
+SwiGLU API consumes `[gate | up]`, so the benchmark prepares that provider's reordered input
+once outside the timed operator while keeping Piper's public `[up | gate]` contract. Provider
+metadata records the adapter and the installed package version under `installed_version`.
+
+Diagnose activation preparation independently, using preallocated outputs, with:
+
+```shell
+uv run python benchmarks/benchmark_convrot_preparation.py
+
+uv run python benchmarks/benchmark_convrot_preparation.py \
+  --rows 131072 --in-features 14336 --input-activation swiglu
+
+uv run --with comfy-kitchen==0.2.28 \
+  python benchmarks/benchmark_convrot_preparation.py \
+  --rows 37710 --in-features 5376 --compare-comfy-kitchen
+```
+
+The preparation benchmark reports rotation, rowwise quantization, their two-launch split,
+and the one-pass fused candidate for the H3 widths. The traffic column is an algorithmic
+minimum, not a measured DRAM-transaction count. Unlike the permissive public comparison above,
+the preparation adapter calls a private native entrypoint and accepts exactly
+`comfy-kitchen==0.2.28`. Its records include both the installed package version and the private
+adapter-contract version. The final column names its Piper baseline explicitly: split
+preparation without an input activation and fused preparation for SwiGLU.
+
+Add `--json PATH` or `--jsonl PATH` to serialize one common `BenchmarkRecord` per width and
+phase. Each record distinguishes linear `K` from raw input width and includes the phase,
+operation provenance, baseline, device timing, minimum traffic, and effective bandwidth. Piper
+records additionally include the selected fused block size, warp count, and production-policy
+eligibility. Piper timing and compiler records use the same `piper-triton` provider identifier
+and plan configuration.
+Compiler output remains independently selectable with `--compiler-json` or
+`--compiler-jsonl`, so both record types can be written by one invocation. Benchmark and
+compiler records must use different output paths.
+
+The common compiler-report adapter can inspect one width per fresh process:
+
+```shell
+uv run python benchmarks/benchmark_convrot_preparation.py \
+  --rows 37710 --in-features 5376 \
+  --compiler-report --no-sass \
+  --compiler-json artifacts/convrot-preparation-5376.json
+```
+
+Compiler records include specialization fingerprints, registers, spills, shared memory,
+warps, stages, and resource-based residency ceilings. Repeat in separate processes for each
+width so process-wide Triton specialization caches remain unambiguous.
 
 Run the stock-Triton integer P x V microbenchmark with:
 

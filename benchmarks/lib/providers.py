@@ -80,7 +80,8 @@ def measure_provider(
     """
     first_call_ms = None
     if measure_first_call:
-        _, first_call_ms = time_first_call(provider.run_operator, provider.synchronize)
+        first_output, first_call_ms = time_first_call(provider.run_operator, provider.synchronize)
+        del first_output
 
     def default_wall_timer(
         function: Callable[[], Any],

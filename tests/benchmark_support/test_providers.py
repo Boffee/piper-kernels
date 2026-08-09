@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from weakref import ReferenceType, ref
 
 from lib.providers import BenchmarkProvider, measure_provider
 from lib.timing import ClockDomain, Timing
@@ -61,12 +62,8 @@ def test_measure_provider_exercises_explicit_phases() -> None:
     assert measurement.output > 0
     assert measurement.configuration == {"block": 64}
     assert measurement.timings.first_call_ms is not None
-    assert measurement.timings.preparation == Timing(
-        2.0, 1.8, 2.2, ClockDomain.SYNCHRONIZED_WALL
-    )
-    assert measurement.timings.prepared_execution == Timing(
-        1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT
-    )
+    assert measurement.timings.preparation == Timing(2.0, 1.8, 2.2, ClockDomain.SYNCHRONIZED_WALL)
+    assert measurement.timings.prepared_execution == Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT)
     assert measurement.timings.operator_end_to_end == Timing(
         2.0, 1.8, 2.2, ClockDomain.SYNCHRONIZED_WALL
     )
@@ -90,3 +87,28 @@ def test_measure_provider_can_skip_inapplicable_phases() -> None:
     assert measurement.timings.first_call_ms is None
     assert measurement.timings.preparation is None
     assert measurement.timings.operator_end_to_end is None
+
+
+def test_measure_provider_releases_the_first_call_output() -> None:
+    class Output:
+        pass
+
+    outputs: list[ReferenceType[Output]] = []
+
+    def run(_prepared: None) -> Output:
+        output = Output()
+        outputs.append(ref(output))
+        return output
+
+    measurement = measure_provider(
+        BenchmarkProvider(name="large-output", prepare=lambda: None, run=run),
+        warmup_ms=2,
+        measurement_time_ms=5,
+        device_timer=_fake_device_timer,
+        wall_timer=_fake_wall_timer,
+        measure_preparation=False,
+        measure_operator_end_to_end=False,
+    )
+
+    assert outputs[0]() is None
+    assert outputs[-1]() is measurement.output
