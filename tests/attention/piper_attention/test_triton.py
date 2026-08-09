@@ -5,10 +5,10 @@ from typing import Literal
 import pytest
 import torch
 
+from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention import piper_attention
-from piper_kernels.attention.piper.reference import reference_piper_attention
-from piper_kernels.attention.piper.triton import (
+from piper_kernels.attention.piper_attention.reference import reference_piper_attention
+from piper_kernels.attention.piper_attention.triton import (
     _launch_piper_attention,
     _prepare_piper_attention,
     _run_piper_attention,
@@ -16,9 +16,10 @@ from piper_kernels.attention.piper.triton import (
 
 
 def _piper_gpu_available() -> bool:
-    return torch.cuda.is_available() and AcceleratorTarget.from_device(
-        torch.device("cuda")
-    ).supports_uint8_int8_mma
+    return (
+        torch.cuda.is_available()
+        and AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma
+    )
 
 
 def _sm120_available() -> bool:

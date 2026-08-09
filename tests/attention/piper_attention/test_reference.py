@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from piper_kernels.attention.piper.reference import reference_piper_attention
+from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
 
 @pytest.mark.parametrize("center_value", [False, True])

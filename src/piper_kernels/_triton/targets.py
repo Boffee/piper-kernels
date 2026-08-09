@@ -98,7 +98,7 @@ class AcceleratorTarget:
 
     @property
     def supports_uint8_int8_mma(self) -> bool:
-        """Return whether Piper's NVIDIA UINT8-by-INT8 MMAv2 lowering is supported."""
+        """Return whether Piper Attention's NVIDIA UINT8-by-INT8 MMAv2 lowering is supported."""
         # The packaged compiler hook rewrites the m16n8k32 MMAv2 lowering used by
         # consumer SM8x and SM12x. Hopper lowers this dot through WGMMA instead.
         return self.is_cuda_capability(8) or self.is_cuda_capability(12)

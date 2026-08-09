@@ -1,15 +1,22 @@
 """GPU tests for the pure-Triton SageAttention2++ backend."""
 
+from dataclasses import replace
 from typing import Literal
 
 import pytest
 import torch
+import triton
+import triton.language as tl
+from lib.triton_inspection import compiled_artifact
 
-import piper_kernels.attention.sage2pp.triton as sage_backend
+import piper_kernels.attention.sage_attention_2pp.triton as sage_attention_2pp_backend
+from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention import sage_attention_2pp
-from piper_kernels.attention.sage2pp.reference import reference_sage_attention_2pp
-from piper_kernels.attention.sage2pp.triton import _run_sage_attention_2pp
+from piper_kernels.attention.sage_attention_2pp.reference import reference_sage_attention_2pp
+from piper_kernels.attention.sage_attention_2pp.triton import (
+    _ptx_float32_to_e4m3x4,
+    _run_sage_attention_2pp,
+)
 
 
 def _sm120_available() -> bool:
@@ -17,9 +24,10 @@ def _sm120_available() -> bool:
 
 
 def _fp8_gpu_available() -> bool:
-    return torch.cuda.is_available() and AcceleratorTarget.from_device(
-        torch.device("cuda")
-    ).supports_fp8_fp16_mma
+    return (
+        torch.cuda.is_available()
+        and AcceleratorTarget.from_device(torch.device("cuda")).supports_fp8_fp16_mma
+    )
 
 
 def _qk_quantization() -> Literal["per_thread", "per_warp"]:
@@ -33,6 +41,59 @@ pytestmark = [
         reason="requires NVIDIA FP8 tensor cores with FP16 accumulation",
     ),
 ]
+
+
+@triton.jit
+def _stock_fp8_conversion_kernel(input_ptr, output_ptr):
+    offsets = tl.arange(0, 256)
+    values = tl.load(input_ptr + offsets)
+    tl.store(output_ptr + offsets, values.to(tl.float8e4nv))
+
+
+@triton.jit
+def _packed_fp8_conversion_kernel(input_ptr, output_ptr):
+    offsets = tl.arange(0, 256)
+    values = tl.load(input_ptr + offsets)
+    tl.store(output_ptr + offsets, _ptx_float32_to_e4m3x4(values))
+
+
+def test_packed_fp8_conversion_matches_stock_triton() -> None:
+    values = torch.linspace(-448.0, 448.0, 256, device="cuda", dtype=torch.float32)
+    edge_values = torch.tensor(
+        [
+            -448.0,
+            -447.0,
+            -256.0,
+            -1.0625,
+            -1.0,
+            -0.9375,
+            -0.015625,
+            -0.001953125,
+            -0.0,
+            0.0,
+            0.001953125,
+            0.015625,
+            0.9375,
+            1.0,
+            1.0625,
+            256.0,
+            447.0,
+            448.0,
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    values[: edge_values.numel()] = edge_values
+    stock = torch.empty(256, device="cuda", dtype=torch.float8_e4m3fn)
+    packed = torch.empty_like(stock)
+
+    _stock_fp8_conversion_kernel[(1,)](values, stock, num_warps=4)
+    _packed_fp8_conversion_kernel[(1,)](values, packed, num_warps=4)
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed.view(torch.uint8), stock.view(torch.uint8))
+    ptx = compiled_artifact(_packed_fp8_conversion_kernel, "ptx")
+    assert ptx.count("cvt.rn.satfinite.e4m3x2.f32") == 2
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -83,8 +144,8 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
     is_causal: bool,
     threshold_name: str,
 ) -> None:
-    monkeypatch.setattr(sage_backend, threshold_name, 0)
-    plan = sage_backend._select_sage2pp_execution_plan(
+    monkeypatch.setattr(sage_attention_2pp_backend, threshold_name, 0)
+    plan = sage_attention_2pp_backend._select_sage_attention_2pp_execution_plan(
         AcceleratorTarget(backend="cuda", architecture="sm120"),
         candidate_block_m=64,
         query_length=193,
@@ -113,6 +174,52 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
             value,
             128**-0.5,
             is_causal,
+            qk_quantization="per_warp",
+        )
+    error = (actual.float() - expected.float()).abs()
+
+    assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
+
+
+@pytest.mark.skipif(
+    not _sm120_available(),
+    reason="alternate execution-plan candidates are validated on SM120",
+)
+def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
+    torch.manual_seed(433)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+        query, key, False
+    )
+    alternate_plan = replace(
+        production_plan,
+        block_m=64,
+        num_stages=2,
+        use_tensor_descriptors=False,
+        fuse_kv_quantization=False,
+        fuse_query_quantization=False,
+        use_unscaled_score_recurrence=False,
+    )
+
+    with torch.no_grad():
+        actual = _run_sage_attention_2pp(
+            query,
+            key,
+            value,
+            128**-0.5,
+            False,
+            execution_plan=alternate_plan,
+        )
+        expected = reference_sage_attention_2pp(
+            query,
+            key,
+            value,
+            128**-0.5,
+            False,
             qk_quantization="per_warp",
         )
     error = (actual.float() - expected.float()).abs()
@@ -204,7 +311,7 @@ def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
     value = torch.randn_like(query)
 
     with torch.no_grad():
-        prepared = sage_backend._prepare_sage_attention_2pp(
+        prepared = sage_attention_2pp_backend._prepare_sage_attention_2pp(
             query,
             key,
             value,
@@ -212,7 +319,7 @@ def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
             True,
         )
         assert prepared.plan.block_m == 128
-        actual = sage_backend._launch_sage_attention_2pp(prepared)
+        actual = sage_attention_2pp_backend._launch_sage_attention_2pp(prepared)
 
     assert torch.isfinite(actual).all()
 

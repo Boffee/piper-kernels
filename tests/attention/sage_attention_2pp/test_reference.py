@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from piper_kernels.attention.sage2pp.reference import reference_sage_attention_2pp
+from piper_kernels.attention.sage_attention_2pp.reference import reference_sage_attention_2pp
 
 
 @pytest.mark.parametrize("is_causal", [False, True])

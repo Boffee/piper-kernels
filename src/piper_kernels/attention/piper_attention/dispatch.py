@@ -120,7 +120,7 @@ def piper_attention(
     is_causal: bool = False,
     center_value: bool | None = None,
 ) -> torch.Tensor:
-    """Run Piper's key-scaled UINT8-P/INT8-V forward attention.
+    """Run Piper Attention's key-scaled UINT8-P/INT8-V forward attention.
 
     Query, key, and value use ``[batch, heads, sequence, head_dim]`` layout
     with FP16 or BF16 elements and contiguous head dimensions. Query and key

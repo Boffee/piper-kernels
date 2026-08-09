@@ -26,19 +26,19 @@ from triton.runtime import driver
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-_MARKER = "piper_u8s8_dot_marker"
+_MARKER = "piper_attention_u8s8_dot_marker"
 _SIGNED_MMA = "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"
 _MIXED_MMA = "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32"
 _SSA_VALUE = re.compile(r"%[-a-zA-Z$._0-9]+")
 _SSA_DEFINITION = re.compile(r"\s*(%[-a-zA-Z$._0-9]+)\s*=")
-_CACHE_KEY = "piper-u8s8-dot-llvm-v3"
+_CACHE_KEY = "piper_attention_u8s8_dot_llvm_v3"
 _CACHE_HASH = hashlib.sha256(_CACHE_KEY.encode()).hexdigest()
 _INSTALL_LOCK = threading.Lock()
 _DOT_RESULT_OPERATIONS = ("extractvalue", "insertvalue", "bitcast")
 
 
 class MixedInt8DotError(RuntimeError):
-    """Base error for Piper's mixed-sign integer dot extension."""
+    """Base error for Piper Attention's mixed-sign integer dot extension."""
 
 
 class MixedInt8DotCompatibilityError(MixedInt8DotError):
@@ -50,7 +50,7 @@ def _mark_uint8_int8_dot(value):
     # This deliberately invalid PTX mnemonic makes a missing compiler hook fail during
     # assembly instead of silently executing a signed dot. The LLVM-stage rewrite removes it.
     return tl.inline_asm_elementwise(
-        asm="piper_u8s8_dot_marker $0, $1;",
+        asm="piper_attention_u8s8_dot_marker $0, $1;",
         constraints="=r,r",
         args=[value],
         dtype=tl.int32,
