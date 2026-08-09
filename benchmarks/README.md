@@ -403,6 +403,25 @@ expected 64 signed INT8 QK MMA instructions and 64 E4M3 x E4M3 to FP16 PV MMA in
 The complete GPU suite passed 155 tests. These measurements are a regression reference for
 this hardware/software stack, not a portable performance guarantee.
 
+### PyTorch 2.13 migration checkpoint
+
+The minimum-version upgrade was benchmarked on an RTX 5090 (SM120), driver 595.71.05,
+Python 3.14.6, CUDA 13.0, and Triton 3.7.1. Each result is the median of three process-level
+medians using BF16 B1/H8/D128 non-causal self-attention, a 300 ms warmup window, and a
+1.5 second measurement window. Positive deltas mean Torch 2.13 was slower.
+
+| sequence | Torch 2.12.1 hot (ms) | Torch 2.13.0 hot (ms) | hot delta | Torch 2.12.1 complete (ms) | Torch 2.13.0 complete (ms) | complete delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 0.0366 | 0.0372 | +1.57% | 0.0931 | 0.0927 | -0.46% |
+| 2,048 | 0.0822 | 0.0825 | +0.31% | 0.1352 | 0.1349 | -0.24% |
+| 4,096 | 0.1741 | 0.1741 | +0.00% | 0.2238 | 0.2231 | -0.30% |
+| 8,192 | 0.6124 | 0.6124 | +0.00% | 0.6479 | 0.6471 | -0.13% |
+| 16,384 | 2.2415 | 2.2395 | -0.09% | 2.2600 | 2.2558 | -0.18% |
+
+The 1K hot result differs by one device-timer quantum (about 0.0006 ms). At larger shapes,
+Torch 2.13 changed hot latency by at most 0.31% and slightly improved every complete-operator
+median. All reported quality metrics were identical between versions.
+
 ### SageAttention2++ SM89 tuning checkpoint
 
 The pure-Triton SageAttention2++ path was tuned on an RTX 4070 Ti SUPER (SM89)

@@ -15,7 +15,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.12",
+    "torch>=2.13",
 ]
 
 [project.urls]
@@ -93,9 +93,6 @@ reportMissingImports = "none"
 reportPrivateImportUsage = "none"
 
 [tool.uv]
-# PyTorch 2.13's CUDA 13.0 index metadata currently carries mismatched hashes.
-# Keep local development on 2.12 without constraining published consumers.
-constraint-dependencies = ["torch<2.13"]
 # The benchmark-only canonical CUDA extension imports the active PyTorch
 # installation from setup.py while compiling.
 no-build-isolation-package = ["sageattention"]

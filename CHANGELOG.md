@@ -31,6 +31,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Raised the minimum supported PyTorch version from 2.12 to 2.13.
 - Tuned the pure-Triton SageAttention2++ path on SM89 with native packed
   FP32-to-E4M3 conversion, 128-row two-stage reverse-order long-causal launches,
   and loop-invariant hoisting with a three-stage loop pipeline for long
