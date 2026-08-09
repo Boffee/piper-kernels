@@ -132,7 +132,7 @@ def test_environment_capture_does_not_require_cuda(monkeypatch, tmp_path: Path) 
 
 def test_environment_capture_identifies_rocm(monkeypatch, tmp_path: Path) -> None:
     class DeviceProperties:
-        gcnArchName = "gfx1201"  # noqa: N815 - PyTorch's ROCm property name.
+        gcnArchName = "gfx1201:sramecc+:xnack-"  # noqa: N815
 
     monkeypatch.setattr("torch.version.hip", "7.0")
     monkeypatch.setattr("torch.version.cuda", None)

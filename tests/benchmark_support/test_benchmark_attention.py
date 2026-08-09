@@ -30,7 +30,7 @@ from lib.attention_providers import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-_SM120 = AcceleratorTarget(backend="cuda", cuda_capability=(12, 0))
+_SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 
 
 @pytest.mark.parametrize(
@@ -41,7 +41,10 @@ def test_qk_granularity_matches_architecture(
     capability: tuple[int, int],
     expected: str,
 ) -> None:
-    target = AcceleratorTarget(backend="cuda", cuda_capability=capability)
+    target = AcceleratorTarget(
+        backend="cuda",
+        architecture=f"sm{capability[0]}{capability[1]}",
+    )
     assert qk_quantization_granularity(target) == expected
 
 
@@ -110,7 +113,7 @@ def test_other_sm12x_sage_provider_registers_portable_grouped_quantization() -> 
         (tensor, tensor, tensor),
         provider_names=(PURE_TRITON_SAGE2PP,),
         config=AttentionConfig(dtype="float16"),
-        target=AcceleratorTarget(backend="cuda", cuda_capability=(12, 1)),
+        target=AcceleratorTarget(backend="cuda", architecture="sm121"),
     )
 
     jit_functions = providers[PURE_TRITON_SAGE2PP].triton_jit_functions
@@ -154,7 +157,7 @@ def test_explicit_sage2pp_provider_requires_fp8() -> None:
     with pytest.raises(SystemExit, match="different FP16-PV algorithm"):
         validate_provider_support(
             (PURE_TRITON_SAGE2PP,),
-            AcceleratorTarget(backend="cuda", cuda_capability=(8, 0)),
+            AcceleratorTarget(backend="cuda", architecture="sm80"),
         )
 
 
@@ -162,7 +165,7 @@ def test_piper_provider_requires_supported_mmav2_lowering() -> None:
     with pytest.raises(SystemExit, match="SM8x or consumer Blackwell SM12x"):
         validate_provider_support(
             (PIPER,),
-            AcceleratorTarget(backend="cuda", cuda_capability=(9, 0)),
+            AcceleratorTarget(backend="cuda", architecture="sm90"),
         )
 
 

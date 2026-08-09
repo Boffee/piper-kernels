@@ -8,9 +8,9 @@ from piper_kernels.attention.sage2pp.triton import (
     _select_sage2pp_execution_plan,
 )
 
-_SM89 = AcceleratorTarget(backend="cuda", cuda_capability=(8, 9))
-_SM120 = AcceleratorTarget(backend="cuda", cuda_capability=(12, 0))
-_SM121 = AcceleratorTarget(backend="cuda", cuda_capability=(12, 1))
+_SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")
+_SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
+_SM121 = AcceleratorTarget(backend="cuda", architecture="sm121")
 
 
 @pytest.mark.parametrize(

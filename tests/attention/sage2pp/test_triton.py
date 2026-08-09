@@ -85,7 +85,7 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
 ) -> None:
     monkeypatch.setattr(sage_backend, threshold_name, 0)
     plan = sage_backend._select_sage2pp_execution_plan(
-        AcceleratorTarget(backend="cuda", cuda_capability=(12, 0)),
+        AcceleratorTarget(backend="cuda", architecture="sm120"),
         candidate_block_m=64,
         query_length=193,
         key_length=193,

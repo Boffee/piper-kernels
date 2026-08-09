@@ -128,7 +128,10 @@ def test_default_centering_policy_is_shape_and_architecture_specific(
         "piper_kernels.attention.piper.dispatch._supports_triton",
         lambda _target: True,
     )
-    target = AcceleratorTarget(backend="cuda", cuda_capability=capability)
+    target = AcceleratorTarget(
+        backend="cuda",
+        architecture=f"sm{capability[0]}{capability[1]}",
+    )
 
     assert _default_center_value(query, key, is_causal, target) is expected
 
