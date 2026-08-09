@@ -1,4 +1,4 @@
-"""INT8 ConvRot tensor and operator implementation."""
+"""INT8 ConvRot tensor implementation."""
 
 from .tensor import ConvRotInt8Tensor
 

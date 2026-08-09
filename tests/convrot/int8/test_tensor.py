@@ -46,6 +46,106 @@ def test_from_packed_normalizes_flat_scale_to_column() -> None:
     assert torch.equal(wrapped.scale[:, 0], scale)
 
 
+def test_from_quantized_canonicalizes_storage_and_names_logical_dtype() -> None:
+    qdata = torch.randint(-128, 128, (8, 128), dtype=torch.int8)[:, ::2]
+    scale = torch.arange(1, 17, dtype=torch.float32).reshape(16, 1)[::2]
+    assert not qdata.is_contiguous()
+    assert not scale.is_contiguous()
+
+    wrapped = ConvRotInt8Tensor.from_quantized(
+        qdata,
+        scale,
+        group_size=64,
+        logical_dtype=torch.float32,
+    )
+
+    assert wrapped.dtype is torch.float32
+    assert wrapped.qdata.is_contiguous()
+    assert wrapped.scale.is_contiguous()
+    assert torch.equal(wrapped.qdata, qdata)
+    assert torch.equal(wrapped.scale, scale)
+
+
+def test_from_packed_remains_compatible_with_from_quantized() -> None:
+    qdata = torch.randint(-128, 128, (8, 64), dtype=torch.int8)
+    scale = torch.rand(8, dtype=torch.float32)
+
+    packed = ConvRotInt8Tensor.from_packed(
+        qdata,
+        scale,
+        group_size=64,
+        dtype=torch.float16,
+    )
+    quantized = ConvRotInt8Tensor.from_quantized(
+        qdata,
+        scale,
+        group_size=64,
+        logical_dtype=torch.float16,
+    )
+
+    assert packed.dtype is quantized.dtype is torch.float16
+    assert torch.equal(packed.qdata, quantized.qdata)
+    assert torch.equal(packed.scale, quantized.scale)
+
+
+def test_from_packed_preserves_legacy_scale_reshape() -> None:
+    scale = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+
+    wrapped = ConvRotInt8Tensor.from_packed(
+        torch.empty(8, 64, dtype=torch.int8),
+        scale,
+        group_size=64,
+    )
+
+    assert wrapped.scale.shape == (8, 1)
+    assert torch.equal(wrapped.scale[:, 0], scale.flatten())
+
+
+def test_from_packed_canonicalizes_noncontiguous_storage() -> None:
+    qdata = torch.empty(8, 128, dtype=torch.int8)[:, ::2]
+    scale = torch.empty(16, 1, dtype=torch.float32)[::2]
+
+    wrapped = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
+
+    assert wrapped.qdata.is_contiguous()
+    assert wrapped.scale.is_contiguous()
+
+
+@pytest.mark.parametrize("scale_shape", [(1, 8), (2, 4), (8, 1, 1)])
+def test_from_quantized_rejects_ambiguous_scale_shapes(
+    scale_shape: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="from_quantized scale must have shape"):
+        ConvRotInt8Tensor.from_quantized(
+            torch.empty(8, 64, dtype=torch.int8),
+            torch.empty(scale_shape, dtype=torch.float32),
+            group_size=64,
+        )
+
+
+def test_constructor_rejects_noncanonical_storage_layouts() -> None:
+    qdata = torch.empty(8, 128, dtype=torch.int8)[:, ::2]
+    scale = torch.empty(16, 1, dtype=torch.float32)[::2]
+
+    with pytest.raises(ValueError, match="qdata and scale must be contiguous"):
+        ConvRotInt8Tensor(qdata, torch.empty(8, 1), 64)
+    with pytest.raises(ValueError, match="qdata and scale must be contiguous"):
+        ConvRotInt8Tensor(torch.empty(8, 64, dtype=torch.int8), scale, 64)
+
+
+@pytest.mark.parametrize("storage_name", ["qdata", "scale"])
+def test_dequantize_revalidates_canonical_storage_layout(storage_name: str) -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(8, 64), group_size=64)
+    if storage_name == "qdata":
+        wrapped.qdata = torch.empty(8, 128, dtype=torch.int8)[:, ::2]
+    else:
+        wrapped.scale = torch.empty(8, 2, dtype=torch.float32)[:, ::2]
+    assert not getattr(wrapped, storage_name).is_contiguous()
+
+    with pytest.raises(ValueError, match="qdata and scale must be contiguous"):
+        wrapped.dequantize()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_from_hp_rotates_and_quantizes_each_weight_row(dtype: torch.dtype) -> None:
     torch.manual_seed(12)
@@ -202,3 +302,40 @@ def test_rejects_unsupported_group_size(group_size: int) -> None:
             torch.empty(8, 1, dtype=torch.float32),
             group_size=group_size,
         )
+
+
+@pytest.mark.parametrize("out_features", [0, 3])
+def test_zero_feature_weight_round_trips_through_quantization_and_dequantization(
+    out_features: int,
+) -> None:
+    dense = torch.empty(out_features, 0, dtype=torch.bfloat16)
+
+    weight = ConvRotInt8Tensor.from_hp(dense, group_size=16)
+    result = weight.dequantize()
+
+    assert weight.qdata.shape == dense.shape
+    assert weight.scale.shape == (out_features, 1)
+    assert torch.all(weight.scale == 1e-30)
+    assert result.shape == dense.shape
+    assert result.dtype is dense.dtype
+    assert result.device == dense.device
+
+
+@pytest.mark.parametrize("out_features", [0, 3])
+def test_cpu_addmm_handles_zero_feature_weight(out_features: int) -> None:
+    weight = ConvRotInt8Tensor.from_packed(
+        torch.empty(out_features, 0, dtype=torch.int8),
+        torch.ones(out_features, 1, dtype=torch.float32),
+        group_size=16,
+        dtype=torch.float32,
+    )
+    mat1 = torch.randn(out_features, 5)
+    mat2 = torch.empty(5, 0)
+
+    result = weight.addmm_(mat1, mat2, beta=0.5, alpha=1.25)
+
+    assert result is weight
+    assert weight.qdata.shape == (out_features, 0)
+    assert weight.scale.shape == (out_features, 1)
+    assert torch.all(weight.scale == 1e-30)
+    assert weight.dequantize().shape == (out_features, 0)

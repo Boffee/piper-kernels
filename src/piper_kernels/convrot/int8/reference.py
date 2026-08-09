@@ -57,6 +57,11 @@ def validate_storage(
         raise ValueError(
             f"ConvRot INT8 qdata and scale must share a device, got {qdata.device}/{scale.device}"
         )
+    if not qdata.is_contiguous() or not scale.is_contiguous():
+        raise ValueError(
+            "ConvRot INT8 qdata and scale must be contiguous; "
+            "use from_quantized to canonicalize storage"
+        )
     if dtype not in _SUPPORTED_LOGICAL_DTYPES:
         raise ValueError(
             f"ConvRot logical dtype must be float16, bfloat16, or float32, got {dtype}"
@@ -65,6 +70,14 @@ def validate_storage(
 
 def dynamic_quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamically quantize each row to signed INT8 with a float32 scale."""
+    if value.ndim > 0 and value.shape[-1] == 0:
+        scale = torch.full(
+            (*value.shape[:-1], 1),
+            1e-30,
+            dtype=torch.float32,
+            device=value.device,
+        )
+        return value.to(torch.int8), scale
     scale = (value.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
     logical_scale = scale.to(value.dtype)
     if value.dtype is torch.float16:
@@ -104,6 +117,16 @@ def reference_addmm_(
     scale.copy_(merged_scale)
 
 
+def _empty_inner_linear(
+    activation: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return the dense-linear result when the reduction dimension is empty."""
+    result = activation.new_zeros((*activation.shape[:-1], out_features))
+    return result if bias is None else result + bias
+
+
 def reference_linear(
     activation: torch.Tensor,
     qdata: torch.Tensor,
@@ -113,6 +136,8 @@ def reference_linear(
 ) -> torch.Tensor:
     """Run the portable PyTorch ConvRot W8A8 linear implementation."""
     original_shape = activation.shape
+    if original_shape[-1] == 0:
+        return _empty_inner_linear(activation, qdata.shape[0], bias)
     activation_2d = activation.reshape(-1, original_shape[-1])
     rotated = rotate_groups(activation_2d, group_size)
     activation_qdata, activation_scale = dynamic_quantize_rows(rotated)

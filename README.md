@@ -24,18 +24,38 @@ then use the resulting tensor as a normal linear weight:
 ```python
 import torch
 
-from piper_kernels.convrot import ConvRotInt8Tensor
+from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
 
-weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=64)
-checkpoint_weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=64)
+weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=256)
+checkpoint_weight = ConvRotInt8Tensor.from_quantized(
+    qdata,
+    scale,
+    group_size=256,
+    logical_dtype=torch.bfloat16,
+)
 output = torch.nn.functional.linear(activation, weight, bias)
+
+# Optionally fuse a raw [up | gate] SwiGLU input with ConvRot preparation.
+mlp_output = convrot_linear(up_gate, weight, bias, input_activation="swiglu")
 
 # In-place low-rank update with the standard Tensor.addmm_ contract.
 weight.addmm_(lora_b, lora_a, alpha=lora_strength)
 ```
 
+`from_quantized(..., logical_dtype=...)` is the preferred checkpoint-storage factory.
+`from_packed(..., dtype=...)` remains available for compatibility with the 0.1 API.
+
+For a weight with shape `[out_features, in_features]`, the SwiGLU input has shape
+`[..., 2 * in_features]` and the output has shape `[..., out_features]`.
+`convrot_linear(..., input_activation="swiglu")` computes `up * silu(gate)` before the
+linear. Its optimized preparation fusion is selected only for measured SM120
+configurations with group size 256. Other supported configurations materialize SwiGLU,
+then dispatch through the ordinary ConvRot linear path, which may still use an optimized
+backend. Ordinary `torch.nn.functional.linear` calls remain unchanged and do not apply an
+activation. Both linear entry points are inference-only and reject autograd inputs.
+
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
-the result. It preserves the ConvRot tensor and packed storage identities, allowing
+the result. It preserves the ConvRot tensor and quantized storage identities, allowing
 offload integrations to keep their existing buffers. Repeated updates are lossy, so
 reload a pristine base weight before changing or removing a previously merged adapter.
 This is an inference operation and does not support autograd.

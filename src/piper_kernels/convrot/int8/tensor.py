@@ -7,12 +7,16 @@ import torch
 from torchao.utils import TorchAOBaseTensor
 
 from .._rotation import rotate_groups
-from .dispatch import _addmm_, _linear
+from .dispatch import _addmm_, _convrot_linear, _linear
 from .reference import quantize_weight, validate_storage
 
 
 class ConvRotInt8Tensor(TorchAOBaseTensor):
-    """INT8 rotated weight with per-output scale and logical floating dtype."""
+    """INT8 rotated weight with per-output scale and logical floating dtype.
+
+    Use :meth:`from_quantized` for existing quantized storage or :meth:`from_hp`
+    to rotate and quantize a floating-point weight.
+    """
 
     tensor_data_names: ClassVar[list[str]] = ["qdata", "scale"]
     tensor_attribute_names: ClassVar[list[str]] = ["group_size", "dtype"]
@@ -48,6 +52,37 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         self.group_size = group_size
 
     @classmethod
+    def from_quantized(
+        cls,
+        qdata: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        group_size: int,
+        logical_dtype: torch.dtype = torch.bfloat16,
+    ) -> "ConvRotInt8Tensor":
+        """Build a weight from quantized storage and canonicalize its layout.
+
+        ``qdata`` contains the rotated INT8 weight and ``scale`` contains one
+        float32 value per output row. A flat scale or an ``[out_features, 1]``
+        scale is accepted. ``logical_dtype`` controls the wrapper's floating
+        dtype and the dtype expected by ConvRot linear operations.
+        """
+        if qdata.ndim == 2:
+            out_features = qdata.shape[0]
+            valid_scale_shapes = ((out_features,), (out_features, 1))
+            if tuple(scale.shape) not in valid_scale_shapes:
+                raise ValueError(
+                    "ConvRot INT8 from_quantized scale must have shape "
+                    f"({out_features},) or ({out_features}, 1), got {tuple(scale.shape)}"
+                )
+        return cls(
+            qdata.contiguous(),
+            scale.reshape(-1, 1).contiguous(),
+            group_size,
+            logical_dtype,
+        )
+
+    @classmethod
     def from_packed(
         cls,
         qdata: torch.Tensor,
@@ -56,7 +91,12 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         group_size: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> "ConvRotInt8Tensor":
-        """Normalize serialized INT8 ConvRot storage into its canonical representation."""
+        """Build from packed storage using the original ``dtype`` keyword.
+
+        This compatibility factory preserves the original scale-reshaping
+        behavior and ``dtype`` keyword. New code should prefer
+        :meth:`from_quantized` and its clearer ``logical_dtype`` spelling.
+        """
         return cls(
             qdata.contiguous(),
             scale.reshape(-1, 1).contiguous(),
@@ -78,6 +118,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
 
     def dequantize(self) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis."""
+        validate_storage(self.qdata, self.scale, self.group_size, self.dtype)
         rotated = self.qdata.to(self.dtype) * self.scale.to(self.dtype)
         return rotate_groups(rotated, self.group_size)
 
@@ -99,17 +140,57 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
 
 
+def _convrot_int8_linear(
+    activation: torch.Tensor,
+    weight: ConvRotInt8Tensor,
+    bias: torch.Tensor | None,
+    input_activation: str,
+) -> torch.Tensor:
+    """Apply an input activation through the INT8 storage-level implementation."""
+    return _convrot_linear(
+        activation,
+        weight.qdata,
+        weight.scale,
+        weight.dtype,
+        weight.group_size,
+        bias,
+        input_activation,
+    )
+
+
+def _bind_linear_arguments(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[Any, Any, Any]:
+    """Bind ``linear(input, weight, bias=None)`` positional and keyword forms."""
+    parameter_names = ("input", "weight", "bias")
+    if len(args) > len(parameter_names):
+        raise TypeError(f"linear() expected at most 3 positional arguments, got {len(args)}")
+
+    bound = dict(zip(parameter_names, args, strict=False))
+    for name, value in kwargs.items():
+        if name not in parameter_names:
+            raise TypeError(f"linear() got an unexpected keyword argument {name!r}")
+        if name in bound:
+            raise TypeError(f"linear() got multiple values for argument {name!r}")
+        bound[name] = value
+
+    missing = [name for name in parameter_names[:2] if name not in bound]
+    if missing:
+        names = " and ".join(repr(name) for name in missing)
+        raise TypeError(f"linear() missing required argument: {names}")
+    return bound["input"], bound["weight"], bound.get("bias")
+
+
 @ConvRotInt8Tensor.implements(torch.ops.aten.linear.default)
 @ConvRotInt8Tensor.implements_torch_function(torch.nn.functional.linear)
 def _convrot_linear_dispatch(
     _func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
-    _kwargs: dict[str, Any],
+    kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    activation = args[0]
-    weight = args[1]
-    bias = args[2] if len(args) > 2 else None
+    activation, weight, bias = _bind_linear_arguments(args, kwargs)
     if not isinstance(activation, torch.Tensor) or not isinstance(weight, ConvRotInt8Tensor):
         raise TypeError(
             "ConvRot linear dispatch requires a tensor input and ConvRotInt8Tensor weight"
@@ -120,6 +201,7 @@ def _convrot_linear_dispatch(
         activation,
         weight.qdata,
         weight.scale,
+        weight.dtype,
         weight.group_size,
         bias,
     )
