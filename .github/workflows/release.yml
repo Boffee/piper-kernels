@@ -61,7 +61,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           uv venv --python 3.14 .wheel-test
-          uv pip install --python .wheel-test/bin/python --no-deps dist/*.whl
+          uv pip install --python .wheel-test/bin/python dist/*.whl
           .wheel-test/bin/python -c "import importlib.metadata, os, piper_kernels; assert importlib.metadata.version('piper-kernels') == os.environ['RELEASE_TAG'].removeprefix('v')"
 
       - name: Upload distributions

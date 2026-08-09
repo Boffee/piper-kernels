@@ -56,7 +56,7 @@ jobs:
       - name: Smoke-test built wheel
         run: |
           uv venv --python 3.14 .wheel-test
-          uv pip install --python .wheel-test/bin/python --no-deps dist/*.whl
+          uv pip install --python .wheel-test/bin/python dist/*.whl
           .wheel-test/bin/python -c "import importlib.metadata, piper_kernels; assert importlib.metadata.version('piper-kernels')"
 
       - name: Upload distributions
