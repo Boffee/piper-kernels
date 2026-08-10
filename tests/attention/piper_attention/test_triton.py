@@ -83,6 +83,11 @@ def test_packed_uint8_conversion_matches_stock_triton(
             255.49998,
             256.0,
             300.0,
+            # PTX clamps finite FP32-to-S32 overflow before the saturated pack.
+            2147483648.0,
+            4294967296.0,
+            1.0e20,
+            torch.finfo(torch.float32).max,
         ],
         device="cuda",
         dtype=torch.float32,
