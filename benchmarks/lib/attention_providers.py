@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import cast
 
 import torch
@@ -12,7 +13,6 @@ from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_backend
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
-from piper_kernels.attention.piper_attention.dispatch import _default_center_value
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 
 from .attention import AttentionConfig, AttentionInputs
@@ -22,8 +22,6 @@ CANONICAL_VERSION = "2.2.0"
 CANONICAL_REVISION = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
 
 PIPER_ATTENTION = "piper_attention"
-PIPER_ATTENTION_CENTERED = "piper_attention_centered"
-PIPER_ATTENTION_UNCENTERED = "piper_attention_uncentered"
 PIPER_ATTENTION_AFFINE = "piper_attention_affine"
 SAGE_ATTENTION_2PP = "sage_attention_2pp"
 PYTORCH_SDPA = "pytorch-sdpa"
@@ -32,8 +30,6 @@ CANONICAL_CUDA_SAGE_ATTENTION_2 = "canonical_cuda_sage_attention_2"
 
 PROVIDER_NAMES = (
     PIPER_ATTENTION,
-    PIPER_ATTENTION_CENTERED,
-    PIPER_ATTENTION_UNCENTERED,
     PIPER_ATTENTION_AFFINE,
     SAGE_ATTENTION_2PP,
     PYTORCH_SDPA,
@@ -42,8 +38,6 @@ PROVIDER_NAMES = (
 )
 PIPER_ATTENTION_PROVIDERS = (
     PIPER_ATTENTION,
-    PIPER_ATTENTION_CENTERED,
-    PIPER_ATTENTION_UNCENTERED,
     PIPER_ATTENTION_AFFINE,
 )
 SAGE_ATTENTION_FP8_PROVIDERS = (
@@ -68,7 +62,7 @@ def default_provider_names(
     sage_attention_2pp_supported: bool,
 ) -> tuple[str, ...]:
     """Return a useful comparison set for the active accelerator."""
-    names = [PIPER_ATTENTION, PIPER_ATTENTION_UNCENTERED] if piper_attention_supported else []
+    names = [PIPER_ATTENTION] if piper_attention_supported else []
     if sage_attention_2pp_supported:
         names.append(SAGE_ATTENTION_2PP)
     names.append(PYTORCH_SDPA)
@@ -194,26 +188,15 @@ def _sage_attention_2pp_jit_functions(
 
 def _piper_attention_jit_functions(
     target: AcceleratorTarget,
-    *,
-    sort_value_rows: bool,
 ) -> dict[str, object]:
     qk_kernels = _qk_jit_functions(target)
-    if sort_value_rows and target.is_cuda_capability(12):
-        qk_kernels["quantize-key-per-block"] = (
-            piper_attention_backend._quantize_ordered_key_per_block_kernel
-        )
-    kernels = {
+    return {
         "kv-mean-partial": piper_attention_backend._kv_mean_partial_kernel,
         "kv-mean-finish": piper_attention_backend._kv_mean_finalize_kernel,
         **qk_kernels,
         "quantize-value-per-key": piper_attention_backend._quantize_value_per_key_kernel,
         "attention": piper_attention_backend._piper_attention_kernel,
     }
-    if sort_value_rows:
-        kernels["centered-value-row-range"] = (
-            piper_attention_backend._centered_value_row_range_kernel
-        )
-    return kernels
 
 
 def _make_piper_attention_provider(
@@ -222,18 +205,17 @@ def _make_piper_attention_provider(
     *,
     config: AttentionConfig,
     target: AcceleratorTarget,
-    center_value: bool,
     native_uint8: bool,
 ) -> AttentionProvider:
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
-    sort_value_rows = piper_attention_backend._should_sort_value_rows(
-        center_value=center_value,
+    plan = piper_attention_backend._default_piper_attention_execution_plan(
+        query,
+        key,
+        config.is_causal,
         target=target,
-        is_causal=config.is_causal,
-        head_dim=query.shape[-1],
-        key_length=key.shape[2],
     )
+    plan = replace(plan, native_uint8=native_uint8)
 
     def prepare() -> object:
         return piper_attention_backend._prepare_piper_attention(
@@ -242,9 +224,7 @@ def _make_piper_attention_provider(
             value,
             scale,
             config.is_causal,
-            center_value,
-            native_uint8=native_uint8,
-            sort_value_rows=sort_value_rows,
+            execution_plan=plan,
         )
 
     def run(prepared: object) -> torch.Tensor:
@@ -261,18 +241,13 @@ def _make_piper_attention_provider(
             **config.as_dict(),
             "implementation": "pure_triton",
             "algorithm": "piper_attention",
+            **plan.as_dict(),
             "qk_quantization": qk_quantization_granularity(target),
             "probability_dtype": "uint8",
             "value_dtype": "int8",
             "value_scale": "per_key",
-            "center_value": center_value,
-            "value_row_order": "centered_range_ascending" if sort_value_rows else "original",
-            "mixed_sign_mma": "native" if native_uint8 else "affine_proxy",
         },
-        triton_jit_functions=_piper_attention_jit_functions(
-            target,
-            sort_value_rows=sort_value_rows,
-        ),
+        triton_jit_functions=_piper_attention_jit_functions(target),
     )
 
 
@@ -327,24 +302,19 @@ def make_attention_providers(
     target: AcceleratorTarget,
 ) -> dict[str, AttentionProvider]:
     """Construct the selected providers in command-line order."""
-    query, key, _ = inputs
     qk_granularity = qk_quantization_granularity(target)
-    default_centering = _default_center_value(query, key, config.is_causal, target)
     providers: dict[str, AttentionProvider] = {}
     piper_attention_settings = {
-        PIPER_ATTENTION: (default_centering, True),
-        PIPER_ATTENTION_CENTERED: (True, True),
-        PIPER_ATTENTION_UNCENTERED: (False, True),
-        PIPER_ATTENTION_AFFINE: (default_centering, False),
+        PIPER_ATTENTION: True,
+        PIPER_ATTENTION_AFFINE: False,
     }
-    for name, (center_value, native_uint8) in piper_attention_settings.items():
+    for name, native_uint8 in piper_attention_settings.items():
         if name in provider_names:
             providers[name] = _make_piper_attention_provider(
                 name,
                 inputs,
                 config=config,
                 target=target,
-                center_value=center_value,
                 native_uint8=native_uint8,
             )
 

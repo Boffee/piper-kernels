@@ -6,13 +6,11 @@ import torch
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
 
-@pytest.mark.parametrize("center_value", [False, True])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_reference_is_close_to_exact_attention(
     head_dim: int,
     is_causal: bool,
-    center_value: bool,
 ) -> None:
     torch.manual_seed(51)
     query = torch.randn(1, 2, 65, head_dim, dtype=torch.bfloat16)
@@ -25,7 +23,6 @@ def test_reference_is_close_to_exact_attention(
         value,
         head_dim**-0.5,
         is_causal,
-        center_value=center_value,
     )
     expected = torch.nn.functional.scaled_dot_product_attention(
         query,
@@ -55,28 +52,25 @@ def test_reference_centering_restores_constant_value_exactly() -> None:
         value,
         64**-0.5,
         False,
-        center_value=True,
     )
 
     torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
 
 
-def test_reference_supports_sorted_value_rows() -> None:
+def test_causal_reference_is_independent_of_future_value_rows() -> None:
     torch.manual_seed(53)
-    query = torch.randn(1, 1, 67, 128, dtype=torch.bfloat16)
+    query = torch.randn(1, 1, 65, 64, dtype=torch.float16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
+    changed_value = value.clone()
+    changed_value[:, :, 32:] = torch.randn_like(changed_value[:, :, 32:]) * 32
 
-    actual = reference_piper_attention(
-        query,
-        key,
-        value,
-        128**-0.5,
-        False,
-        center_value=True,
-        qk_quantization="per_warp",
-        sort_value_rows=True,
+    original = reference_piper_attention(query, key, value, 64**-0.5, True)
+    changed = reference_piper_attention(query, key, changed_value, 64**-0.5, True)
+
+    torch.testing.assert_close(
+        original[:, :, :32],
+        changed[:, :, :32],
+        atol=0.0,
+        rtol=0.0,
     )
-
-    assert actual.shape == query.shape
-    assert torch.isfinite(actual).all()

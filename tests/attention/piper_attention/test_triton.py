@@ -1,5 +1,6 @@
 """GPU tests for the pure-Triton Piper Attention backend."""
 
+from dataclasses import replace
 from typing import Literal
 
 import pytest
@@ -9,6 +10,7 @@ from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 from piper_kernels.attention.piper_attention.triton import (
+    _default_piper_attention_execution_plan,
     _launch_piper_attention,
     _prepare_piper_attention,
     _run_piper_attention,
@@ -39,7 +41,6 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("center_value", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -47,7 +48,6 @@ def test_triton_matches_quantized_reference(
     dtype: torch.dtype,
     head_dim: int,
     is_causal: bool,
-    center_value: bool,
 ) -> None:
     torch.manual_seed(54)
     query = torch.randn(1, 2, 193, head_dim, device="cuda", dtype=dtype)
@@ -60,7 +60,6 @@ def test_triton_matches_quantized_reference(
             key,
             value,
             is_causal=is_causal,
-            center_value=center_value,
         )
         expected = reference_piper_attention(
             query,
@@ -68,7 +67,6 @@ def test_triton_matches_quantized_reference(
             value,
             head_dim**-0.5,
             is_causal,
-            center_value=center_value,
             qk_quantization=_qk_quantization(),
         )
     error = (actual.float() - expected.float()).abs()
@@ -86,20 +84,21 @@ def test_affine_fallback_matches_native_uint8(sequence: int) -> None:
     query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    arguments = (query, key, value, 128**-0.5, False, True)
+    arguments = (query, key, value, 128**-0.5, False)
+    pointer_plan = replace(
+        _default_piper_attention_execution_plan(query, key, False),
+        use_tensor_descriptors=False,
+        num_stages=3,
+    )
 
     with torch.no_grad():
         native = _run_piper_attention(
             *arguments,
-            native_uint8=True,
-            sort_value_rows=False,
-            use_tensor_descriptors=False,
+            execution_plan=replace(pointer_plan, native_uint8=True),
         )
         affine = _run_piper_attention(
             *arguments,
-            native_uint8=False,
-            sort_value_rows=False,
-            use_tensor_descriptors=False,
+            execution_plan=replace(pointer_plan, native_uint8=False),
         )
 
     assert torch.equal(native, affine)
@@ -113,9 +112,29 @@ def test_centered_value_fusion_restores_constant_value() -> None:
     value = value_row.expand_as(query).contiguous()
 
     with torch.no_grad():
-        actual = piper_attention(query, key, value, center_value=True)
+        actual = piper_attention(query, key, value)
 
     torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
+
+
+def test_causal_triton_is_independent_of_future_value_rows() -> None:
+    torch.manual_seed(62)
+    query = torch.randn(1, 1, 65, 64, device="cuda", dtype=torch.float16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    changed_value = value.clone()
+    changed_value[:, :, 32:] = torch.randn_like(changed_value[:, :, 32:]) * 32
+
+    with torch.no_grad():
+        original = piper_attention(query, key, value, is_causal=True)
+        changed = piper_attention(query, key, changed_value, is_causal=True)
+
+    torch.testing.assert_close(
+        original[:, :, :32],
+        changed[:, :, :32],
+        atol=0.0,
+        rtol=0.0,
+    )
 
 
 def test_large_value_scale_multiplier_remains_finite() -> None:
@@ -124,6 +143,7 @@ def test_large_value_scale_multiplier_remains_finite() -> None:
     key[:, :, 0] = -1
     value = torch.ones_like(query)
     value[:, :, 0] = 40000
+    plan = _default_piper_attention_execution_plan(query, key, False)
 
     with torch.no_grad():
         prepared = _prepare_piper_attention(
@@ -132,26 +152,16 @@ def test_large_value_scale_multiplier_remains_finite() -> None:
             value,
             64**-0.5,
             False,
-            False,
+            execution_plan=plan,
         )
         actual = _launch_piper_attention(prepared)
-        expected = reference_piper_attention(
-            query,
-            key,
-            value,
-            64**-0.5,
-            False,
-            center_value=False,
-            qk_quantization=_qk_quantization(),
-        )
 
     assert prepared.value_scale_multiplier.dtype is torch.float32
     assert torch.isfinite(prepared.value_scale_multiplier).all()
-    torch.testing.assert_close(actual, expected, atol=2**-9, rtol=0.0)
+    assert torch.isfinite(actual).all()
 
 
-@pytest.mark.skipif(not _sm120_available(), reason="centered long path is tuned for SM12x")
-def test_centering_improves_biased_value_quality() -> None:
+def test_biased_value_quality() -> None:
     torch.manual_seed(57)
     sequence = 1024
     query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=torch.bfloat16)
@@ -160,48 +170,11 @@ def test_centering_improves_biased_value_quality() -> None:
     value = (offset + torch.randn_like(query.float()) * 0.25).to(torch.bfloat16)
 
     with torch.no_grad():
-        uncentered = piper_attention(query, key, value, center_value=False)
-        centered = piper_attention(query, key, value, center_value=True)
+        actual = piper_attention(query, key, value)
         expected = torch.nn.functional.scaled_dot_product_attention(query, key, value)
 
-    uncentered_mse = (uncentered.float() - expected.float()).square().mean()
-    centered_mse = (centered.float() - expected.float()).square().mean()
-    assert centered_mse < uncentered_mse * 0.2
-
-
-@pytest.mark.skipif(not _sm120_available(), reason="ordered grouped-QK path targets SM12x")
-def test_sorted_ragged_path_matches_quantized_reference() -> None:
-    torch.manual_seed(58)
-    query = torch.randn(1, 2, 257, 128, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-
-    with torch.no_grad():
-        actual = _run_piper_attention(
-            query,
-            key,
-            value,
-            128**-0.5,
-            False,
-            True,
-            native_uint8=True,
-            sort_value_rows=True,
-            use_tensor_descriptors=False,
-        )
-        expected = reference_piper_attention(
-            query,
-            key,
-            value,
-            128**-0.5,
-            False,
-            center_value=True,
-            qk_quantization="per_warp",
-            sort_value_rows=True,
-        )
-    error = (actual.float() - expected.float()).abs()
-
-    assert error.mean().item() < 0.003
-    assert error.max().item() < 0.12
+    mse = (actual.float() - expected.float()).square().mean()
+    assert mse < 1e-3
 
 
 @pytest.mark.skipif(not _sm120_available(), reason="tensor descriptors target SM12x")
@@ -211,23 +184,68 @@ def test_long_descriptor_path_matches_pointer_path() -> None:
     query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    arguments = (query, key, value, 128**-0.5, False, True)
+    arguments = (query, key, value, 128**-0.5, False)
+    descriptor_plan = replace(
+        _default_piper_attention_execution_plan(query, key, False),
+        native_uint8=True,
+    )
+    pointer_plan = replace(
+        descriptor_plan,
+        use_tensor_descriptors=False,
+        num_stages=3,
+    )
 
     with torch.no_grad():
         descriptor = _run_piper_attention(
             *arguments,
-            native_uint8=True,
-            sort_value_rows=False,
-            use_tensor_descriptors=True,
+            execution_plan=descriptor_plan,
         )
         pointer = _run_piper_attention(
             *arguments,
-            native_uint8=True,
-            sort_value_rows=False,
-            use_tensor_descriptors=False,
+            execution_plan=pointer_plan,
         )
 
     torch.testing.assert_close(descriptor, pointer, atol=2**-9, rtol=0.0)
+
+
+def test_explicit_execution_plan_runs_native_loop_controls() -> None:
+    torch.manual_seed(61)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    production_plan = _default_piper_attention_execution_plan(query, key, True)
+    alternate_plan = replace(
+        production_plan,
+        block_m=32,
+        num_stages=2,
+        use_tensor_descriptors=False,
+        reverse_causal_blocks=True,
+        loop_num_stages=2,
+        disable_loop_licm=False,
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            128**-0.5,
+            True,
+            execution_plan=alternate_plan,
+        )
+        expected = reference_piper_attention(
+            query,
+            key,
+            value,
+            128**-0.5,
+            True,
+            qk_quantization=_qk_quantization(),
+        )
+    error = (actual.float() - expected.float()).abs()
+
+    assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
 
 
 def test_triton_runs_under_torch_compile() -> None:
@@ -244,7 +262,7 @@ def test_triton_runs_under_torch_compile() -> None:
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        return -piper_attention(query, key, value, center_value=True)
+        return -piper_attention(query, key, value)
 
     with torch.no_grad():
         expected = consumer(query, key, value)

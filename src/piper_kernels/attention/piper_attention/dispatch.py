@@ -93,24 +93,6 @@ def _supports_triton(target: AcceleratorTarget) -> bool:
     return _triton_piper_attention is not None and target.supports_uint8_int8_mma
 
 
-def _default_center_value(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    is_causal: bool,
-    target: AcceleratorTarget,
-) -> bool:
-    """Select the measured centered-V region without assuming it helps every target."""
-    if not _supports_triton(target):
-        return False
-    return (
-        target.is_cuda_capability(12)
-        and not is_causal
-        and query.shape[-1] == 128
-        and query.shape[2] >= 1024
-        and key.shape[2] >= 1024
-    )
-
-
 def piper_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -118,7 +100,6 @@ def piper_attention(
     *,
     scale: float | None = None,
     is_causal: bool = False,
-    center_value: bool | None = None,
 ) -> torch.Tensor:
     """Run Piper Attention's key-scaled UINT8-P/INT8-V forward attention.
 
@@ -129,10 +110,10 @@ def piper_attention(
 
     The algorithm retains Sage-style INT8 QK and FP32 online softmax, then
     quantizes each V row with its own signed-INT8 scale and folds that scale
-    into a UINT8 probability operand. ``center_value=True`` subtracts the
-    sequence-wide per-feature V mean before quantization and restores it in
-    the epilogue. ``None`` enables centering only in its measured long,
-    non-causal SM12x D128 region.
+    into a UINT8 probability operand. Non-causal calls center V by its
+    sequence-wide per-feature mean and restore that mean in the epilogue;
+    causal calls remain uncentered so future V rows cannot affect earlier
+    outputs through quantization.
 
     The optimized backend supports NVIDIA SM8x and consumer Blackwell SM12x,
     where the packaged compiler extension can select mixed-sign MMAv2. Other
@@ -141,11 +122,6 @@ def piper_attention(
     """
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)
     target = AcceleratorTarget.from_device(query.device)
-    selected_centering = (
-        _default_center_value(query, key, is_causal, target)
-        if center_value is None
-        else bool(center_value)
-    )
     if _supports_triton(target):
         assert _triton_piper_attention is not None
         return _triton_piper_attention(
@@ -154,7 +130,6 @@ def piper_attention(
             value,
             converted_scale,
             is_causal,
-            selected_centering,
         )
     return reference_piper_attention(
         query,
@@ -162,5 +137,4 @@ def piper_attention(
         value,
         converted_scale,
         is_causal,
-        center_value=selected_centering,
     )

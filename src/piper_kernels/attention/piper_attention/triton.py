@@ -11,7 +11,7 @@ identical affine signed-INT8 formulation is retained as the portable control.
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, cast
 
 import torch
@@ -53,14 +53,14 @@ def _kv_mean_partial_kernel(
     stride_vb,
     stride_vh,
     stride_vn,
-    center_value: tl.constexpr,
+    is_causal: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     chunk_n: tl.constexpr,
     block_n: tl.constexpr,
     block_d: tl.constexpr,
 ):
-    """Reduce one raw K/V sequence chunk into compact FP32 partials."""
+    """Reduce one raw K chunk and, when non-causal, its V chunk."""
     chunk = tl.program_id(0)
     feature_block = tl.program_id(1)
     batch_head = tl.program_id(2)
@@ -69,7 +69,7 @@ def _kv_mean_partial_kernel(
     offsets_d = feature_block * block_d + tl.arange(0, block_d)
     offsets_n = tl.arange(0, block_n)
     key_accumulator = tl.zeros((block_d,), dtype=tl.float32)
-    if center_value:
+    if not is_causal:
         value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
     chunk_start = chunk * chunk_n
     for offset in tl.range(0, chunk_n, block_n, disable_licm=True):
@@ -85,7 +85,7 @@ def _kv_mean_partial_kernel(
             other=0.0,
         ).to(tl.float32)
         key_accumulator += tl.sum(key, axis=0)
-        if center_value:
+        if not is_causal:
             value = tl.load(
                 value_ptr
                 + batch * stride_vb
@@ -98,7 +98,7 @@ def _kv_mean_partial_kernel(
             value_accumulator += tl.sum(value, axis=0)
     output_offsets = (batch_head * num_chunks + chunk) * head_dim + offsets_d
     tl.store(key_partial_ptr + output_offsets, key_accumulator, mask=offsets_d < head_dim)
-    if center_value:
+    if not is_causal:
         tl.store(
             value_partial_ptr + output_offsets,
             value_accumulator,
@@ -114,12 +114,12 @@ def _kv_mean_finalize_kernel(
     value_mean_ptr,
     key_length,
     num_chunks,
-    center_value: tl.constexpr,
+    is_causal: tl.constexpr,
     head_dim: tl.constexpr,
     block_chunks: tl.constexpr,
     block_d: tl.constexpr,
 ):
-    """Merge K/V chunk partials into compact FP32 means."""
+    """Merge K and optional non-causal V partials into compact FP32 means."""
     batch_head = tl.program_id(0)
     feature_block = tl.program_id(1)
     offsets_c = tl.arange(0, block_chunks)
@@ -137,7 +137,7 @@ def _kv_mean_finalize_kernel(
         tl.sum(key_partials, axis=0) / key_length,
         mask=output_mask,
     )
-    if center_value:
+    if not is_causal:
         value_partials = tl.load(
             value_partial_ptr + partial_offsets,
             mask=mask,
@@ -151,107 +151,9 @@ def _kv_mean_finalize_kernel(
 
 
 @triton.jit
-def _centered_value_row_range_kernel(
-    value_ptr,
-    value_mean_ptr,
-    range_ptr,
-    key_length,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    """Compute centered per-row V ranges without materializing centered V."""
-    key_block = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    offsets_n = key_block * block_n + tl.arange(0, block_n)
-    offsets_d = tl.arange(0, head_dim)
-    valid = offsets_n < key_length
-    value = tl.load(
-        value_ptr
-        + batch * stride_vb
-        + head * stride_vh
-        + offsets_n[:, None] * stride_vn
-        + offsets_d[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    value_mean = tl.load(value_mean_ptr + (batch * heads + head) * head_dim + offsets_d)
-    centered = tl.where(valid[:, None], value - value_mean[None, :], 0.0)
-    tl.store(
-        range_ptr + (batch * heads + head) * key_length + offsets_n,
-        tl.max(tl.abs(centered), axis=1),
-        mask=valid,
-    )
-
-
-@triton.jit
-def _quantize_ordered_key_per_block_kernel(
-    key_ptr,
-    key_mean_ptr,
-    order_ptr,
-    output_ptr,
-    scale_ptr,
-    key_length,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_sb,
-    stride_sh,
-    heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    """Gather ordered K rows directly into grouped INT8 storage."""
-    scale_group = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    offsets_n = scale_group * block_n + tl.arange(0, block_n)
-    offsets_d = tl.arange(0, head_dim)
-    valid = offsets_n < key_length
-    batch_head = batch * heads + head
-    source_n = tl.load(
-        order_ptr + batch_head * key_length + offsets_n,
-        mask=valid,
-        other=0,
-    )
-    mean = tl.load(key_mean_ptr + batch_head * head_dim + offsets_d)
-    values = tl.load(
-        key_ptr
-        + batch * stride_kb
-        + head * stride_kh
-        + source_n[:, None] * stride_kn
-        + offsets_d[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    values = tl.where(valid[:, None], values - mean[None, :], 0.0)
-    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(values / scale)
-    tl.store(
-        output_ptr
-        + batch * stride_ob
-        + head * stride_oh
-        + offsets_n[:, None] * stride_on
-        + offsets_d[None, :],
-        quantized,
-        mask=valid[:, None],
-    )
-    tl.store(scale_ptr + batch * stride_sb + head * stride_sh + scale_group, scale)
-
-
-@triton.jit
 def _quantize_value_per_key_kernel(
     value_ptr,
     value_mean_ptr,
-    order_ptr,
     scale_multiplier_ptr,
     log_scale_ptr,
     correction_ptr,
@@ -264,14 +166,13 @@ def _quantize_value_per_key_kernel(
     stride_oh,
     stride_od,
     stride_ok,
-    center_value: tl.constexpr,
-    ordered: tl.constexpr,
+    is_causal: tl.constexpr,
     store_correction: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    """Quantize centered V with one symmetric signed-INT8 scale per key."""
+    """Quantize V with one symmetric signed-INT8 scale per key."""
     key_block = tl.program_id(0)
     head = tl.program_id(1)
     batch = tl.program_id(2)
@@ -279,24 +180,16 @@ def _quantize_value_per_key_kernel(
     offsets_d = tl.arange(0, head_dim)
     valid = offsets_n < key_length
     batch_head = batch * heads + head
-    if ordered:
-        source_n = tl.load(
-            order_ptr + batch_head * key_length + offsets_n,
-            mask=valid,
-            other=0,
-        )
-    else:
-        source_n = offsets_n
     value = tl.load(
         value_ptr
         + batch * stride_vb
         + head * stride_vh
-        + source_n[:, None] * stride_vn
+        + offsets_n[:, None] * stride_vn
         + offsets_d[None, :],
         mask=valid[:, None],
         other=0.0,
     ).to(tl.float32)
-    if center_value:
+    if not is_causal:
         value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
         value = tl.where(valid[:, None], value - value_mean[None, :], 0.0)
     scale = tl.max(tl.abs(value), axis=1) / _V_INT8_RANGE + _SCALE_EPSILON
@@ -407,7 +300,6 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     native_uint8: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
     scaled_fp16_numerator: tl.constexpr,
-    center_value: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     unmasked_self_attention: tl.constexpr,
     heads: tl.constexpr,
@@ -415,9 +307,15 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
+    reverse_causal_blocks: tl.constexpr,
+    loop_num_stages: tl.constexpr,
+    disable_loop_licm: tl.constexpr,
 ):
     """Fused exact-log UINT8-P/INT8-V online attention."""
-    query_block = tl.program_id(0) + query_block_offset
+    query_block = tl.program_id(0)
+    if is_causal and reverse_causal_blocks:
+        query_block = tl.num_programs(0) - 1 - query_block
+    query_block += query_block_offset
     head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
@@ -470,7 +368,13 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     if is_causal:
         end_n = tl.minimum(key_length, (query_block + 1) * block_m)
 
-    for start_n in tl.range(0, end_n, block_n, disable_licm=True):
+    for start_n in tl.range(
+        0,
+        end_n,
+        block_n,
+        num_stages=loop_num_stages,
+        disable_licm=disable_loop_licm,
+    ):
         current_n = start_n + offsets_n
         key = _load_key_tile(
             key_ptr,
@@ -700,7 +604,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         else:
             output_low = accumulator_low / denominator_safe
             output_high = accumulator_high / denominator_safe
-        if center_value:
+        if not is_causal:
             value_mean_base = value_mean_ptr + batch_head * head_dim
             output_low += tl.load(value_mean_base + offsets_vd)[None, :]
             output_high += tl.load(
@@ -725,7 +629,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
             )
         else:
             output = accumulator / denominator_safe
-        if center_value:
+        if not is_causal:
             output += tl.load(
                 value_mean_ptr + batch_head * head_dim + offsets_d
             )[None, :]
@@ -742,7 +646,7 @@ def _compute_kv_means(
     key: torch.Tensor,
     value: torch.Tensor,
     *,
-    center_value: bool,
+    is_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, key_length, head_dim = key.shape
     num_chunks = int(triton.cdiv(key_length, _MEAN_CHUNK_N))
@@ -750,13 +654,13 @@ def _compute_kv_means(
     key_partial = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
     value_partial = (
         torch.empty_like(key_partial)
-        if center_value
+        if not is_causal
         else torch.empty((1,), device=value.device, dtype=torch.float32)
     )
     key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
     value_mean = (
         torch.empty_like(key_mean)
-        if center_value
+        if not is_causal
         else torch.empty((1,), device=value.device, dtype=torch.float32)
     )
     _kv_mean_partial_kernel[
@@ -778,7 +682,7 @@ def _compute_kv_means(
         value.stride(0),
         value.stride(1),
         value.stride(2),
-        center_value=center_value,
+        is_causal=is_causal,
         heads=heads,
         head_dim=head_dim,
         chunk_n=_MEAN_CHUNK_N,
@@ -795,42 +699,13 @@ def _compute_kv_means(
         value_mean,
         key_length,
         num_chunks,
-        center_value=center_value,
+        is_causal=is_causal,
         head_dim=head_dim,
         block_chunks=triton.next_power_of_2(num_chunks),
         block_d=_MEAN_BLOCK_D,
         num_warps=4,
     )
     return key_mean, value_mean
-
-
-def _build_centered_value_order(
-    value: torch.Tensor,
-    value_mean: torch.Tensor,
-) -> torch.Tensor:
-    batch, heads, key_length, head_dim = value.shape
-    value_range = torch.empty(
-        (batch, heads, key_length),
-        device=value.device,
-        dtype=torch.float32,
-    )
-    block_n = 32
-    _centered_value_row_range_kernel[
-        (triton.cdiv(key_length, block_n), heads, batch)
-    ](
-        value,
-        value_mean,
-        value_range,
-        key_length,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=block_n,
-        num_warps=4,
-    )
-    return torch.argsort(value_range, dim=-1, stable=True).to(torch.int32)
 
 
 def _prepare_qk(
@@ -841,7 +716,6 @@ def _prepare_qk(
     *,
     grouped_qk: bool,
     storage_key_length: int,
-    key_order: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
@@ -882,50 +756,26 @@ def _prepare_qk(
             head_dim=head_dim,
             num_warps=4,
         )
-        if key_order is None:
-            qk_quantization.quantize_key_per_block_kernel[(key_groups, heads, batch)](
-                key,
-                key_mean,
-                key_int8,
-                key_scale,
-                key_length,
-                key.stride(0),
-                key.stride(1),
-                key.stride(2),
-                key_int8.stride(0),
-                key_int8.stride(1),
-                key_int8.stride(2),
-                key_scale.stride(0),
-                key_scale.stride(1),
-                heads=heads,
-                head_dim=head_dim,
-                block_n=_BLOCK_N,
-                num_warps=4,
-            )
-        else:
-            _quantize_ordered_key_per_block_kernel[(key_groups, heads, batch)](
-                key,
-                key_mean,
-                key_order,
-                key_int8,
-                key_scale,
-                key_length,
-                key.stride(0),
-                key.stride(1),
-                key.stride(2),
-                key_int8.stride(0),
-                key_int8.stride(1),
-                key_int8.stride(2),
-                key_scale.stride(0),
-                key_scale.stride(1),
-                heads=heads,
-                head_dim=head_dim,
-                block_n=_BLOCK_N,
-                num_warps=4,
-            )
+        qk_quantization.quantize_key_per_block_kernel[(key_groups, heads, batch)](
+            key,
+            key_mean,
+            key_int8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=_BLOCK_N,
+            num_warps=4,
+        )
     else:
-        if key_order is not None:
-            raise ValueError("ordered K/V preparation requires grouped QK")
         query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
         key_scale = torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
         qk_quantization.quantize_query_per_thread_kernel[
@@ -1000,6 +850,108 @@ def _make_descriptors(
 
 
 @dataclass(frozen=True, slots=True)
+class _PiperAttentionExecutionPlan:
+    """Host-side specialization and launch choices for one Piper invocation."""
+
+    block_m: int
+    grouped_qk: bool
+    native_uint8: bool
+    split_pv_head_dim: bool
+    scaled_fp16_numerator: bool
+    use_tensor_descriptors: bool
+    num_warps: int = 4
+    num_stages: int = 3
+    reverse_causal_blocks: bool = False
+    loop_num_stages: int | None = None
+    disable_loop_licm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.block_m not in (32, 64, 128):
+            raise ValueError("Piper Attention block_m must be 32, 64, or 128")
+        if self.num_warps not in (2, 4, 8):
+            raise ValueError("Piper Attention num_warps must be 2, 4, or 8")
+        if self.num_stages not in (1, 2, 3, 4):
+            raise ValueError("Piper Attention num_stages must be 1, 2, 3, or 4")
+        if self.loop_num_stages not in (None, 1, 2, 3, 4):
+            raise ValueError("Piper Attention loop_num_stages must be None, 1, 2, 3, or 4")
+        if self.scaled_fp16_numerator and not self.split_pv_head_dim:
+            raise ValueError("scaled FP16 numerator recurrence requires split PV")
+
+    def as_dict(self) -> dict[str, object]:
+        """Return execution choices as serializable benchmark metadata."""
+        return asdict(self)
+
+
+def _select_piper_attention_execution_plan(
+    target: AcceleratorTarget,
+    *,
+    candidate_block_m: int,
+    query_length: int,
+    key_length: int,
+    head_dim: int,
+    is_causal: bool,
+) -> _PiperAttentionExecutionPlan:
+    """Select established policy without borrowing schedules from other kernels."""
+    grouped_qk = target.is_cuda_capability(12)
+    native_uint8 = target.supports_uint8_int8_mma
+    split_pv_head_dim = (
+        target.is_cuda_capability(12)
+        and not is_causal
+        and head_dim == 128
+        and query_length >= 1024
+        and key_length >= 1024
+    )
+    scaled_fp16_numerator = split_pv_head_dim and key_length <= 131072
+
+    block_m = (
+        64
+        if is_causal
+        else 128
+        if scaled_fp16_numerator and query_length >= 8192 and key_length >= 8192
+        else 64
+        if split_pv_head_dim
+        else candidate_block_m
+    )
+    use_tensor_descriptors = (
+        target.is_cuda_capability(12) and block_m == 128 and head_dim == 128
+    )
+    return _PiperAttentionExecutionPlan(
+        block_m=block_m,
+        grouped_qk=grouped_qk,
+        native_uint8=native_uint8,
+        split_pv_head_dim=split_pv_head_dim,
+        scaled_fp16_numerator=scaled_fp16_numerator,
+        use_tensor_descriptors=use_tensor_descriptors,
+        num_stages=2 if use_tensor_descriptors else 3,
+    )
+
+
+def _default_piper_attention_execution_plan(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    is_causal: bool,
+    *,
+    target: AcceleratorTarget | None = None,
+) -> _PiperAttentionExecutionPlan:
+    """Resolve production policy for preparation, benchmarks, and tuning."""
+    batch, heads, query_length, head_dim = query.shape
+    candidate_block_m = (
+        select_query_block(query, batch, heads, query_length)
+        if query.device.type == "cuda"
+        else 64
+    )
+    target = AcceleratorTarget.from_device(query.device) if target is None else target
+    return _select_piper_attention_execution_plan(
+        target,
+        candidate_block_m=candidate_block_m,
+        query_length=query_length,
+        key_length=key.shape[2],
+        head_dim=head_dim,
+        is_causal=is_causal,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedPiperAttention:
     query: torch.Tensor
     key: torch.Tensor | TensorDescriptor
@@ -1013,32 +965,8 @@ class _PreparedPiperAttention:
     output: torch.Tensor
     key_length: int
     storage_key_length: int
-    block_m: int
     is_causal: bool
-    grouped_qk: bool
-    native_uint8: bool
-    split_pv_head_dim: bool
-    scaled_fp16_numerator: bool
-    center_value: bool
-    use_tensor_descriptors: bool
-
-
-def _should_sort_value_rows(
-    *,
-    center_value: bool,
-    target: AcceleratorTarget,
-    is_causal: bool,
-    head_dim: int,
-    key_length: int,
-) -> bool:
-    """Select exact V ordering only where its long-context cost is amortized."""
-    return (
-        center_value
-        and target.is_cuda_capability(12)
-        and not is_causal
-        and head_dim == 128
-        and key_length >= 16384
-    )
+    plan: _PiperAttentionExecutionPlan
 
 
 def _prepare_piper_attention(
@@ -1047,81 +975,37 @@ def _prepare_piper_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-    center_value: bool,
     *,
-    native_uint8: bool | None = None,
-    sort_value_rows: bool | None = None,
-    use_tensor_descriptors: bool | None = None,
+    execution_plan: _PiperAttentionExecutionPlan,
 ) -> _PreparedPiperAttention:
     """Quantize Q/K/V and construct the selected launch specialization."""
-    batch, heads, query_length, head_dim = query.shape
+    batch, heads, _query_length, head_dim = query.shape
     key_length = key.shape[2]
-    target = AcceleratorTarget.from_device(query.device)
-    grouped_qk = target.is_cuda_capability(12)
-    use_sm12x_schedule = target.is_cuda_capability(12)
-    if native_uint8 is None:
-        native_uint8 = target.supports_uint8_int8_mma
-    if native_uint8:
+    plan = execution_plan
+    if plan.split_pv_head_dim and head_dim != 128:
+        raise ValueError("split-PV Piper Attention requires head_dim=128")
+    if plan.reverse_causal_blocks and not is_causal:
+        raise ValueError("reverse block order requires causal attention")
+    if plan.native_uint8:
         with torch.cuda.device(query.device):
             install_uint8_int8_dot_hook()
-    split_pv_head_dim = (
-        use_sm12x_schedule
-        and not is_causal
-        and head_dim == 128
-        and query_length >= 1024
-        and key_length >= 1024
-    )
-    scaled_fp16_numerator = split_pv_head_dim and key_length <= 131072
-    if sort_value_rows is None:
-        sort_value_rows = _should_sort_value_rows(
-            center_value=center_value,
-            target=target,
-            is_causal=is_causal,
-            head_dim=head_dim,
-            key_length=key_length,
-        )
-    if sort_value_rows and (not center_value or is_causal or not grouped_qk):
-        raise ValueError(
-            "value-row ordering requires centered non-causal grouped-QK attention"
-        )
-
-    block_m = (
-        64
-        if is_causal
-        else 128
-        if scaled_fp16_numerator and query_length >= 8192 and key_length >= 8192
-        else 64
-        if split_pv_head_dim
-        else select_query_block(query, batch, heads, query_length)
-    )
     padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
-    if use_tensor_descriptors is None:
-        use_tensor_descriptors = (
-            use_sm12x_schedule
-            and block_m == 128
-            and head_dim == 128
-            and padded_key_length % 16 == 0
-        )
-    storage_key_length = padded_key_length if use_tensor_descriptors else key_length
+    storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
 
+    # A sequence-wide V mean is valid only for non-causal attention. Per-row
+    # INT8 rounding would otherwise let future V rows perturb earlier outputs.
     key_mean, value_mean = _compute_kv_means(
         key,
         value,
-        center_value=center_value,
-    )
-    key_order = (
-        _build_centered_value_order(value, value_mean)
-        if sort_value_rows
-        else None
+        is_causal=is_causal,
     )
     query_int8, key_int8, query_scale, key_scale = _prepare_qk(
         query,
         key,
         key_mean,
         scale,
-        grouped_qk=grouped_qk,
+        grouped_qk=plan.grouped_qk,
         storage_key_length=storage_key_length,
-        key_order=key_order,
     )
 
     value_shape = (batch, heads, head_dim, storage_key_length)
@@ -1146,20 +1030,14 @@ def _prepare_piper_attention(
             device=value.device,
             dtype=torch.int16,
         )
-        if not native_uint8
+        if not plan.native_uint8
         else torch.empty((1,), device=value.device, dtype=torch.int16)
-    )
-    order_argument = (
-        key_order
-        if key_order is not None
-        else torch.empty((1,), device=value.device, dtype=torch.int32)
     )
     _quantize_value_per_key_kernel[
         (triton.cdiv(key_length, _BLOCK_N), heads, batch)
     ](
         value,
         value_mean,
-        order_argument,
         value_scale_multiplier,
         value_log_scale,
         value_correction,
@@ -1172,9 +1050,8 @@ def _prepare_piper_attention(
         value_int8.stride(1),
         value_int8.stride(2),
         value_int8.stride(3),
-        center_value=center_value,
-        ordered=key_order is not None,
-        store_correction=not native_uint8,
+        is_causal=is_causal,
+        store_correction=not plan.native_uint8,
         heads=heads,
         head_dim=head_dim,
         block_n=_BLOCK_N,
@@ -1183,7 +1060,7 @@ def _prepare_piper_attention(
 
     key_argument: torch.Tensor | TensorDescriptor = key_int8
     value_argument: torch.Tensor | TensorDescriptor = value_int8
-    if use_tensor_descriptors:
+    if plan.use_tensor_descriptors:
         key_argument, value_argument = _make_descriptors(
             key_int8,
             value_int8,
@@ -1191,7 +1068,7 @@ def _prepare_piper_attention(
             heads,
             storage_key_length,
             head_dim,
-            split_pv_head_dim=split_pv_head_dim,
+            split_pv_head_dim=plan.split_pv_head_dim,
         )
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     return _PreparedPiperAttention(
@@ -1207,24 +1084,19 @@ def _prepare_piper_attention(
         output=output,
         key_length=key_length,
         storage_key_length=storage_key_length,
-        block_m=block_m,
         is_causal=is_causal,
-        grouped_qk=grouped_qk,
-        native_uint8=native_uint8,
-        split_pv_head_dim=split_pv_head_dim,
-        scaled_fp16_numerator=scaled_fp16_numerator,
-        center_value=center_value,
-        use_tensor_descriptors=use_tensor_descriptors,
+        plan=plan,
     )
 
 
 def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
     """Launch only the fused attention recurrence on prepared integer inputs."""
     batch, heads, query_length, head_dim = prepared.output.shape
+    plan = prepared.plan
     attention_kernel = cast(Any, _piper_attention_kernel)
     launch_options = {
-        "num_warps": 4,
-        "num_stages": 2 if prepared.use_tensor_descriptors else 3,
+        "num_warps": plan.num_warps,
+        "num_stages": plan.num_stages,
     }
 
     def launch(query_blocks: int, query_block_offset: int, unmasked_queries: bool) -> None:
@@ -1244,11 +1116,10 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             prepared.storage_key_length,
             query_block_offset=query_block_offset,
             is_causal=prepared.is_causal,
-            grouped_qk=prepared.grouped_qk,
-            native_uint8=prepared.native_uint8,
-            split_pv_head_dim=prepared.split_pv_head_dim,
-            scaled_fp16_numerator=prepared.scaled_fp16_numerator,
-            center_value=prepared.center_value,
+            grouped_qk=plan.grouped_qk,
+            native_uint8=plan.native_uint8,
+            split_pv_head_dim=plan.split_pv_head_dim,
+            scaled_fp16_numerator=plan.scaled_fp16_numerator,
             unmasked_query_tiles=unmasked_queries,
             unmasked_self_attention=(
                 unmasked_queries
@@ -1258,16 +1129,22 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             ),
             heads=heads,
             head_dim=head_dim,
-            block_m=prepared.block_m,
+            block_m=plan.block_m,
             block_n=_BLOCK_N,
-            use_tensor_descriptors=prepared.use_tensor_descriptors,
+            use_tensor_descriptors=plan.use_tensor_descriptors,
+            reverse_causal_blocks=plan.reverse_causal_blocks,
+            loop_num_stages=plan.loop_num_stages,
+            disable_loop_licm=plan.disable_loop_licm,
             **launch_options,
         )
 
-    full_query_blocks = query_length // prepared.block_m
+    full_query_blocks = query_length // plan.block_m
+    has_partial_query_block = query_length % plan.block_m != 0
+    if plan.reverse_causal_blocks and has_partial_query_block:
+        launch(1, full_query_blocks, False)
     if full_query_blocks:
         launch(full_query_blocks, 0, True)
-    if query_length % prepared.block_m:
+    if not plan.reverse_causal_blocks and has_partial_query_block:
         launch(1, full_query_blocks, False)
     return prepared.output
 
@@ -1278,23 +1155,26 @@ def _run_piper_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-    center_value: bool,
     *,
-    native_uint8: bool | None = None,
-    sort_value_rows: bool | None = None,
-    use_tensor_descriptors: bool | None = None,
+    execution_plan: _PiperAttentionExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused recurrence."""
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else _default_piper_attention_execution_plan(
+            query,
+            key,
+            is_causal,
+        )
+    )
     prepared = _prepare_piper_attention(
         query,
         key,
         value,
         scale,
         is_causal,
-        center_value,
-        native_uint8=native_uint8,
-        sort_value_rows=sort_value_rows,
-        use_tensor_descriptors=use_tensor_descriptors,
+        execution_plan=plan,
     )
     return _launch_piper_attention(prepared)
 
@@ -1306,7 +1186,6 @@ def triton_piper_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-    center_value: bool,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused integer-PV kernel."""
     return _run_piper_attention(
@@ -1315,7 +1194,6 @@ def triton_piper_attention(
         value,
         scale,
         is_causal,
-        center_value,
     )
 
 
@@ -1326,6 +1204,5 @@ def _triton_piper_attention_fake(
     _value: torch.Tensor,
     _scale: float,
     _is_causal: bool,
-    _center_value: bool,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)

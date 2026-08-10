@@ -103,14 +103,12 @@ For centered V, Piper Attention uses the exact identity
 softmax(QK) @ V = softmax(QK) @ (V - mean_sequence(V)) + mean_sequence(V)
 ```
 
-It stores only the compact FP32 `[batch, head, feature]` mean, subtracts it while
-quantizing V, and restores it in the attention epilogue. This improves signed-INT8
-precision when V has a large feature bias and preserves constant V exactly. The
-default policy enables centering only for non-causal SM12x D128 calls with both
-sequence lengths at least 1024; pass `center_value=True` or `False` to override it.
-Centered non-causal SM12x D128 calls with at least 16384 keys additionally use the
-selected stable low-to-high centered-row-range order. That permutation is exact
-before quantization and reduces scale-coordinate variation in very long attention.
+For non-causal attention, it stores only the compact FP32
+`[batch, head, feature]` mean, subtracts it while quantizing V, and restores it in the
+attention epilogue. This improves signed-INT8 precision when V has a large feature bias
+and preserves constant V exactly. Causal attention leaves V uncentered so per-row INT8
+rounding cannot make an earlier output depend on future V rows. Both paths preserve the
+original K/V sequence order.
 
 Native mixed-sign MMA is selected on the supported NVIDIA backend through the packaged
 stock-Triton extension. The backend retains the exact affine identity

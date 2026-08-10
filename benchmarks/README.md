@@ -65,7 +65,9 @@ This tooling never changes production dispatch or autotunes in a user's hot path
 is available as a versioned record accepted by the common JSON/JSONL writer, and the winner is
 marked with `selected: true`.
 
-The executable Piper Attention example compares pointer and tensor-descriptor load schedules:
+The executable Piper Attention tuner consumes the same immutable execution plan as production.
+Omitted axes retain their production values, so the default invocation measures exactly the
+production plan:
 
 ```shell
 uv run python benchmarks/tune_piper_attention.py \
@@ -75,7 +77,25 @@ uv run python benchmarks/tune_piper_attention.py \
 
 Use `--phase operator_end_to_end` to include preprocessing in the ranking. The default
 `prepared_execution` phase compares only the prepared fused recurrence. On targets where a
-candidate is unsupported, it remains in the report with `status: skipped`.
+candidate is unsupported, it remains in the report with `status: skipped`. Candidates with
+non-finite output mismatches or less than 20 dB SQNR are rejected by default; use
+`--minimum-sqnr-db` to change the finite threshold.
+
+Explicit Piper axes form a deduplicated Cartesian search, capped at 256 candidates. This makes
+Triton's native loop-pipeline and loop-invariant-code-motion controls measurable without
+silently applying a SageAttention2++ schedule to Piper Attention:
+
+```shell
+uv run python benchmarks/tune_piper_attention.py \
+  --sequence 8192 --head-dim 128 --causal \
+  --load-path pointer tensor-descriptor \
+  --block-m 64 128 \
+  --num-stages 2 3 \
+  --causal-block-order forward reverse \
+  --loop-num-stages none 3 \
+  --loop-licm disabled enabled \
+  --json artifacts/piper_attention_execution_plan.json
+```
 
 The SageAttention2++ adapter searches the same immutable execution-plan fields used by
 production dispatch. Omitted axes retain the production value; values supplied for multiple
@@ -318,16 +338,15 @@ Run full-attention comparisons with:
 uv run python benchmarks/benchmark_attention.py
 ```
 
-The hardware-aware default always includes PyTorch SDPA, adds Piper Attention and its uncentered
-control where Piper Attention's mixed-sign MMA is supported, and adds pure-Triton SageAttention2++
-where FP8 tensor cores are supported. Choose any subset with `--providers`; `--help` lists
-the stable provider names. For example:
+The hardware-aware default always includes PyTorch SDPA, adds Piper Attention where its
+mixed-sign MMA is supported, and adds pure-Triton SageAttention2++ where FP8 tensor cores
+are supported. Choose any subset with `--providers`; `--help` lists the stable provider
+names. For example:
 
 ```shell
 uv run python benchmarks/benchmark_attention.py \
   --sequence 8192 \
-  --providers piper_attention piper_attention_centered \
-              piper_attention_uncentered piper_attention_affine \
+  --providers piper_attention piper_attention_affine \
               sage_attention_2pp pytorch-sdpa
 ```
 
@@ -355,16 +374,16 @@ packed-probability-conversion choices.
 
 Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA operators:
 
-- `preparation` includes compact K/V mean reduction, optional centered-row ordering,
-  Q/K/V quantization, scale metadata, and affine correction metadata when requested;
+- `preparation` includes compact K mean reduction, non-causal V mean reduction, Q/K/V
+  quantization, scale metadata, and affine correction metadata when requested;
 - `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
-  and centered-mean epilogue;
+  plus the centered-mean epilogue for non-causal calls;
 - `operator_end_to_end` runs preparation and the fused kernel as one complete call.
 
-Machine records also identify centering, value-row order, Q/K granularity, and native versus
-affine mixed-sign execution. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled
-research controls remain reproducible from the `wip/sage-integer-attention` checkpoint at
-`b75f3ee`; they are not copied into the installed package.
+Machine records also identify Q/K granularity and native versus affine mixed-sign execution.
+Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research controls remain
+reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`; they are not copied
+into the installed package.
 
 Compiler inspection and external profiling are available for one shape at a time:
 
@@ -476,7 +495,8 @@ kernel raised causal spills from 18 to 20. Quality metrics were unchanged.
 Issue #6 was validated on an RTX 5090 (SM120) with Torch 2.12.1+cu130 and
 Triton 3.7.1. BF16 non-causal self-attention measured the following warmed
 latencies; Piper Attention's hot column is its prepared fused recurrence, while the complete
-column includes all preprocessing.
+column includes all preprocessing. The uncentered rows are historical development controls;
+the production operator centers non-causal V and leaves causal V uncentered.
 
 | shape | provider | hot device p50 [p20, p80] (ms) | complete wall p50 [p20, p80] (ms) | SQNR vs SDPA (dB) |
 |:---|:---|---:|---:|---:|
@@ -485,7 +505,6 @@ column includes all preprocessing.
 | B1/H8/N8192/D128 | Piper Attention affine fallback | 0.706 [0.703, 0.710] | 0.785 [0.784, 0.787] | 36.08 |
 | B1/H8/N8192/D128 | pure Triton SageAttention2++ | 0.637 [0.636, 0.639] | 0.669 [0.668, 0.671] | 28.12 |
 | B1/H8/N8192/D128 | canonical CUDA SageAttention2++ | 0.609 [0.607, 0.610] | 0.614 [0.607, 0.617] | 28.13 |
-| B1/H1/N131072/D128 | Piper Attention centered + ordered | 19.548 [19.272, 19.571] | 19.897 [19.867, 19.906] | 35.77 |
 | B1/H1/N131072/D128 | Piper Attention uncentered | 19.579 [19.371, 19.600] | 19.824 [19.806, 19.845] | 35.48 |
 | B1/H1/N131072/D128 | pure Triton SageAttention2++ | 17.647 [17.611, 17.708] | 17.823 [17.777, 17.926] | 28.33 |
 | B1/H1/N131072/D128 | canonical CUDA SageAttention2++ | 17.155 [16.992, 17.171] | 17.177 [17.023, 17.195] | 28.33 |
@@ -509,11 +528,8 @@ issue #11.
 | pure Triton SageAttention2++ | 32.43 | 2.292% | 0.002166 | 0.1250 | 28.18 |
 
 This ordinary call has little V bias, so centering is nearly neutral. The committed
-adversarial biased-V regression requires centering to reduce MSE by at least 5x and
-the constant-V regression requires exact restoration. On the exhaustive LTX-2.3
-sci-fi trajectory from research checkpoint `b75f3ee`, stable centered-row ordering
-improved global attention-output SQNR from 39.12 to 39.52 dB; its rollout measured
-18.67 dB decoded PSNR and 9.60 dB latent SQNR against the exact render.
+adversarial biased-V regression covers the centered path, and the constant-V regression
+requires exact restoration.
 
 ## Triton compiler inspection
 

@@ -11,7 +11,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   including dependency/import CI and correct Windows benchmark version reporting.
 - Piper Attention forward inference for NVIDIA SM8x and consumer Blackwell SM12x with
   Sage-style INT8 QK, per-key signed-INT8 V scales, FP32 probability multipliers,
-  native UINT8 probability MMA, exact affine fallback, optional sequence-centered V,
+  native UINT8 probability MMA, exact affine fallback, non-causal sequence-centered V,
   portable reference, and `torch.compile` support.
 - Pure-Triton canonical SageAttention2++ 8+8 forward inference on NVIDIA GPUs with FP8
   tensor cores and FP16 accumulation, including a portable quantized reference,
@@ -33,6 +33,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Centralized Piper Attention specialization and launch policy in an immutable execution plan
+  shared by production, benchmark metadata, and quality-gated offline tuning. Triton loop
+  pipelining, loop invariant code motion, and causal query-block ordering are explicit tuning
+  dimensions while production schedules remain unchanged; in particular, SM89 does not inherit
+  SageAttention2++ tuning without Piper-specific measurements.
 - Raised the minimum supported PyTorch version from 2.12 to 2.13.
 - Tuned the pure-Triton SageAttention2++ path on SM89 with native packed
   FP32-to-E4M3 conversion, 128-row two-stage reverse-order long-causal launches,
@@ -55,6 +60,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Kept causal Piper Attention V uncentered so sequence-wide mean statistics and per-row
+  INT8 rounding cannot make earlier outputs depend on future V rows.
 - Honored positional, keyword, and mixed `torch.nn.functional.linear` calls for ConvRot
   weights, including keyword bias instead of silently dropping it.
 - Enforced consistent ConvRot linear shape, device, logical-dtype, storage-layout, and

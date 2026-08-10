@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from itertools import product
 from pathlib import Path
 from typing import cast
 
@@ -26,9 +29,14 @@ from lib import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
-from piper_kernels.attention.piper_attention.dispatch import _default_center_value
 
-_SCHEDULES = ("pointer", "tensor-descriptor")
+_BLOCK_M_VALUES = (32, 64, 128)
+_NUM_WARPS_VALUES = (2, 4, 8)
+_NUM_STAGES_VALUES = (1, 2, 3, 4)
+_LOAD_PATHS = {"pointer": False, "tensor-descriptor": True}
+_CAUSAL_BLOCK_ORDERS = {"forward": False, "reverse": True}
+_LOOP_LICM = {"disabled": True, "enabled": False}
+_OPTIONAL_LOOP_STAGES = ("none", "1", "2", "3", "4")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -40,18 +48,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--load-path", choices=tuple(_LOAD_PATHS), nargs="+")
+    parser.add_argument("--block-m", type=int, choices=_BLOCK_M_VALUES, nargs="+")
+    parser.add_argument("--num-warps", type=int, choices=_NUM_WARPS_VALUES, nargs="+")
+    parser.add_argument("--num-stages", type=int, choices=_NUM_STAGES_VALUES, nargs="+")
     parser.add_argument(
-        "--center-value",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="override the production centering policy",
-    )
-    parser.add_argument(
-        "--schedules",
-        choices=_SCHEDULES,
+        "--causal-block-order",
+        choices=tuple(_CAUSAL_BLOCK_ORDERS),
         nargs="+",
-        default=list(_SCHEDULES),
     )
+    parser.add_argument("--loop-num-stages", choices=_OPTIONAL_LOOP_STAGES, nargs="+")
+    parser.add_argument("--loop-licm", choices=tuple(_LOOP_LICM), nargs="+")
     parser.add_argument(
         "--phase",
         type=TuningPhase,
@@ -60,6 +67,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-ms", type=int, default=50)
     parser.add_argument("--measurement-time-ms", type=int, default=200)
+    parser.add_argument("--minimum-sqnr-db", type=float, default=20.0)
+    parser.add_argument("--max-candidates", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     add_output_arguments(parser, record_name="tuning candidate")
     return parser.parse_args(argv)
@@ -73,25 +82,128 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("batch size and heads must be positive")
     if args.causal and lengths[0] != lengths[1]:
         raise SystemExit("causal attention requires equal query and key/value lengths")
+    if (
+        not args.causal
+        and args.causal_block_order is not None
+        and "reverse" in args.causal_block_order
+    ):
+        raise SystemExit("reverse causal-block order requires causal attention")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
+    if not math.isfinite(args.minimum_sqnr_db):
+        raise SystemExit("minimum SQNR must be finite")
+    if args.max_candidates <= 0:
+        raise SystemExit("maximum candidate count must be positive")
+
+
+def _unique[T](values: Sequence[T]) -> tuple[T, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+def _axis[T](values: Sequence[T] | None, production_value: T) -> tuple[T, ...]:
+    return (production_value,) if values is None else _unique(values)
+
+
+def _mapped_axis[T](
+    values: Sequence[str] | None,
+    production_value: T,
+    mapping: Mapping[str, T],
+) -> tuple[T, ...]:
+    return (
+        (production_value,)
+        if values is None
+        else _unique(tuple(mapping[value] for value in values))
+    )
+
+
+def _loop_stage_axis(
+    values: Sequence[str] | None,
+    production_value: int | None,
+) -> tuple[int | None, ...]:
+    if values is None:
+        return (production_value,)
+    return _unique(tuple(None if value == "none" else int(value) for value in values))
+
+
+def _candidate_plans(
+    args: argparse.Namespace,
+    production_plan: piper_attention_backend._PiperAttentionExecutionPlan,
+) -> tuple[piper_attention_backend._PiperAttentionExecutionPlan, ...]:
+    """Build an explicit bounded search around production policy."""
+    axes = (
+        _axis(args.block_m, production_plan.block_m),
+        _axis(args.num_warps, production_plan.num_warps),
+        _axis(args.num_stages, production_plan.num_stages),
+        _mapped_axis(
+            args.load_path,
+            production_plan.use_tensor_descriptors,
+            _LOAD_PATHS,
+        ),
+        _mapped_axis(
+            args.causal_block_order,
+            production_plan.reverse_causal_blocks,
+            _CAUSAL_BLOCK_ORDERS,
+        ),
+        _loop_stage_axis(args.loop_num_stages, production_plan.loop_num_stages),
+        _mapped_axis(
+            args.loop_licm,
+            production_plan.disable_loop_licm,
+            _LOOP_LICM,
+        ),
+    )
+    plans = tuple(
+        replace(
+            production_plan,
+            block_m=block_m,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            use_tensor_descriptors=use_tensor_descriptors,
+            reverse_causal_blocks=reverse_causal_blocks,
+            loop_num_stages=loop_num_stages,
+            disable_loop_licm=disable_loop_licm,
+        )
+        for (
+            block_m,
+            num_warps,
+            num_stages,
+            use_tensor_descriptors,
+            reverse_causal_blocks,
+            loop_num_stages,
+            disable_loop_licm,
+        ) in product(*axes)
+    )
+    if len(plans) > args.max_candidates:
+        raise SystemExit(
+            f"search expands to {len(plans)} candidates; narrow the axes or increase "
+            "--max-candidates"
+        )
+    return plans
+
+
+def _plan_name(plan: piper_attention_backend._PiperAttentionExecutionPlan) -> str:
+    load_path = "descriptor" if plan.use_tensor_descriptors else "pointer"
+    loop_stages = plan.loop_num_stages if plan.loop_num_stages is not None else "none"
+    block_order = "reverse" if plan.reverse_causal_blocks else "forward"
+    licm = "licm" if not plan.disable_loop_licm else "no-licm"
+    return (
+        f"{load_path}-m{plan.block_m}-w{plan.num_warps}-s{plan.num_stages}-"
+        f"{block_order}-loop{loop_stages}-{licm}"
+    )
 
 
 def _make_candidate(
-    schedule: str,
+    plan: piper_attention_backend._PiperAttentionExecutionPlan,
     inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     *,
     scale: float,
     is_causal: bool,
-    center_value: bool,
-    sort_value_rows: bool,
     target: AcceleratorTarget,
     common_configuration: Mapping[str, object],
 ) -> TuningCandidate[object, torch.Tensor]:
-    use_tensor_descriptors = schedule == "tensor-descriptor"
+    name = _plan_name(plan)
 
     def make_provider() -> BenchmarkProvider[object, torch.Tensor]:
-        if use_tensor_descriptors and not target.is_cuda_capability(12):
+        if plan.use_tensor_descriptors and not target.is_cuda_capability(12):
             raise UnsupportedTuningCandidateError(
                 "the tensor-descriptor candidate currently targets SM12x"
             )
@@ -104,10 +216,7 @@ def _make_candidate(
                 value,
                 scale,
                 is_causal,
-                center_value,
-                native_uint8=True,
-                sort_value_rows=sort_value_rows,
-                use_tensor_descriptors=use_tensor_descriptors,
+                execution_plan=plan,
             )
 
         def run(prepared: object) -> torch.Tensor:
@@ -116,20 +225,18 @@ def _make_candidate(
             )
 
         return BenchmarkProvider(
-            name=f"piper_attention_{schedule.replace('-', '_')}",
+            name=f"piper_attention_{name.replace('-', '_')}",
             prepare=prepare,
             run=run,
             synchronize=torch.cuda.synchronize,
         )
 
     return TuningCandidate(
-        name=schedule,
+        name=name,
         configuration={
             **common_configuration,
             "algorithm": "piper_attention",
-            "load_path": schedule,
-            "center_value": center_value,
-            "value_row_order": ("centered_range_ascending" if sort_value_rows else "original"),
+            **plan.as_dict(),
         },
         make_provider=make_provider,
     )
@@ -171,17 +278,11 @@ def _main(argv: Sequence[str] | None = None) -> None:
     inputs = make_attention_inputs(shape, dtype=dtype, device=device, generator=generator)
     query, key, value = inputs
     scale = args.head_dim**-0.5
-    center_value = (
-        _default_center_value(query, key, args.causal, target)
-        if args.center_value is None
-        else args.center_value
-    )
-    sort_value_rows = piper_attention_backend._should_sort_value_rows(
-        center_value=center_value,
+    production_plan = piper_attention_backend._default_piper_attention_execution_plan(
+        query,
+        key,
+        args.causal,
         target=target,
-        is_causal=args.causal,
-        head_dim=args.head_dim,
-        key_length=key_value_length,
     )
     common_configuration = {
         "dtype": args.dtype,
@@ -191,16 +292,14 @@ def _main(argv: Sequence[str] | None = None) -> None:
     }
     candidates = tuple(
         _make_candidate(
-            schedule,
+            plan,
             inputs,
             scale=scale,
             is_causal=args.causal,
-            center_value=center_value,
-            sort_value_rows=sort_value_rows,
             target=target,
             common_configuration=common_configuration,
         )
-        for schedule in args.schedules
+        for plan in _candidate_plans(args, production_plan)
     )
     expected = torch.nn.functional.scaled_dot_product_attention(
         query,
@@ -211,18 +310,21 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     run = tune_candidates(
         candidates,
-        tuning="piper_attention_load_path",
+        tuning="piper_attention_execution_plan",
         shape=shape.as_dict(),
         environment=capture_environment(Path(__file__).resolve().parents[1]),
         phase=args.phase,
         warmup_ms=args.warmup_ms,
         measurement_time_ms=args.measurement_time_ms,
         measure_candidate_quality=lambda output: measure_quality(output, expected),
+        quality_gate=lambda quality: (
+            quality.nonfinite_mismatch_count == 0 and quality.sqnr_db >= args.minimum_sqnr_db
+        ),
     )
     _print_results(run.records)
     write_records(run.records, output_target(args))
     if run.winner is None:
-        raise SystemExit("no tuning candidate passed")
+        raise SystemExit("no tuning candidate passed the quality gate")
     print(f"selected: {run.winner.candidate}")
 
 
