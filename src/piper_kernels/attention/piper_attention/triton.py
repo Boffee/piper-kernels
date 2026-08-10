@@ -40,6 +40,30 @@ _SCALE_EPSILON = tl.constexpr(1e-7)
 
 
 @triton.jit
+def _ptx_float32_to_uint8x4(values):
+    """Truncate and saturate four probability codes with packed SM72+ PTX."""
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .s32 a, b, c, d;
+            .reg .b32 lo;
+            cvt.rzi.s32.f32 a, $1;
+            cvt.rzi.s32.f32 b, $2;
+            cvt.rzi.s32.f32 c, $3;
+            cvt.rzi.s32.f32 d, $4;
+            cvt.pack.sat.u8.s32.b32 lo, d, c, 0;
+            cvt.pack.sat.u8.s32.b32 $0, b, a, lo;
+        }
+        """,
+        constraints="=r,f,f,f,f",
+        args=[values],
+        dtype=tl.uint8,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def _kv_mean_partial_kernel(
     key_ptr,
     value_ptr,
@@ -310,6 +334,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     reverse_causal_blocks: tl.constexpr,
     loop_num_stages: tl.constexpr,
     disable_loop_licm: tl.constexpr,
+    use_packed_probability_conversion: tl.constexpr,
 ):
     """Fused exact-log UINT8-P/INT8-V online attention."""
     query_block = tl.program_id(0)
@@ -444,14 +469,18 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
             mask=current_n < key_length,
             other=0.0,
         )
-        probability_codes = tl.minimum(
-            _P_UINT8_RANGE,
-            probabilities * value_scale_multiplier[None, :] + 0.5,
-        ).to(tl.int32)
-        if native_uint8:
-            probability_uint8 = probability_codes.to(tl.uint8)
+        probability_values = probabilities * value_scale_multiplier[None, :] + 0.5
+        if native_uint8 and use_packed_probability_conversion:
+            probability_uint8 = _ptx_float32_to_uint8x4(probability_values)
         else:
-            probability_int8 = (probability_codes - _P_ZERO_POINT).to(tl.int8)
+            probability_codes = tl.minimum(
+                _P_UINT8_RANGE,
+                probability_values,
+            ).to(tl.int32)
+            if native_uint8:
+                probability_uint8 = probability_codes.to(tl.uint8)
+            else:
+                probability_int8 = (probability_codes - _P_ZERO_POINT).to(tl.int8)
         correction_block = batch_head * tl.cdiv(key_length, block_n) + start_n // block_n
 
         if split_pv_head_dim:
@@ -864,6 +893,7 @@ class _PiperAttentionExecutionPlan:
     reverse_causal_blocks: bool = False
     loop_num_stages: int | None = None
     disable_loop_licm: bool = True
+    use_packed_probability_conversion: bool = False
 
     def __post_init__(self) -> None:
         if self.block_m not in (32, 64, 128):
@@ -876,6 +906,8 @@ class _PiperAttentionExecutionPlan:
             raise ValueError("Piper Attention loop_num_stages must be None, 1, 2, 3, or 4")
         if self.scaled_fp16_numerator and not self.split_pv_head_dim:
             raise ValueError("scaled FP16 numerator recurrence requires split PV")
+        if self.use_packed_probability_conversion and not self.native_uint8:
+            raise ValueError("packed probability conversion requires native UINT8 MMA")
 
     def as_dict(self) -> dict[str, object]:
         """Return execution choices as serializable benchmark metadata."""
@@ -902,6 +934,12 @@ def _select_piper_attention_execution_plan(
         and key_length >= 1024
     )
     scaled_fp16_numerator = split_pv_head_dim and key_length <= 131072
+    # Paired SM120 measurements favor packed conversion for D64 and
+    # non-causal D128, while the D128 causal specialization is neutral to
+    # slightly slower and retains stock Triton lowering.
+    use_packed_probability_conversion = target.is_cuda_capability(12, 0) and not (
+        is_causal and head_dim == 128
+    )
 
     block_m = (
         64
@@ -923,6 +961,7 @@ def _select_piper_attention_execution_plan(
         scaled_fp16_numerator=scaled_fp16_numerator,
         use_tensor_descriptors=use_tensor_descriptors,
         num_stages=2 if use_tensor_descriptors else 3,
+        use_packed_probability_conversion=use_packed_probability_conversion,
     )
 
 
@@ -1135,6 +1174,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             reverse_causal_blocks=plan.reverse_causal_blocks,
             loop_num_stages=plan.loop_num_stages,
             disable_loop_licm=plan.disable_loop_licm,
+            use_packed_probability_conversion=plan.use_packed_probability_conversion,
             **launch_options,
         )
 

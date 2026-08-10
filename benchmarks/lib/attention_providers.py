@@ -215,7 +215,13 @@ def _make_piper_attention_provider(
         config.is_causal,
         target=target,
     )
-    plan = replace(plan, native_uint8=native_uint8)
+    plan = replace(
+        plan,
+        native_uint8=native_uint8,
+        use_packed_probability_conversion=(
+            native_uint8 and plan.use_packed_probability_conversion
+        ),
+    )
 
     def prepare() -> object:
         return piper_attention_backend._prepare_piper_attention(

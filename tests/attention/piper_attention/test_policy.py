@@ -51,15 +51,16 @@ def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> 
     assert plan.grouped_qk
     assert plan.native_uint8
     assert plan.split_pv_head_dim
+    assert plan.use_packed_probability_conversion
 
 
 @pytest.mark.parametrize(
-    ("target", "grouped_qk", "split_pv", "descriptors"),
+    ("target", "grouped_qk", "split_pv", "descriptors", "packed_probability"),
     [
-        (_SM80, False, False, False),
-        (_SM89, False, False, False),
-        (_SM120, True, True, True),
-        (_SM121, True, True, True),
+        (_SM80, False, False, False, False),
+        (_SM89, False, False, False, False),
+        (_SM120, True, True, True, True),
+        (_SM121, True, True, True, False),
     ],
 )
 def test_execution_plan_preserves_existing_architecture_policy(
@@ -67,6 +68,7 @@ def test_execution_plan_preserves_existing_architecture_policy(
     grouped_qk: bool,
     split_pv: bool,
     descriptors: bool,
+    packed_probability: bool,
 ) -> None:
     plan = _select(target)
 
@@ -74,7 +76,27 @@ def test_execution_plan_preserves_existing_architecture_policy(
     assert plan.split_pv_head_dim is split_pv
     assert plan.scaled_fp16_numerator is split_pv
     assert plan.use_tensor_descriptors is descriptors
+    assert plan.use_packed_probability_conversion is packed_probability
     assert plan.num_stages == (2 if descriptors else 3)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "is_causal", "expected"),
+    [
+        (64, False, True),
+        (64, True, True),
+        (128, False, True),
+        (128, True, False),
+    ],
+)
+def test_sm120_probability_conversion_policy(
+    head_dim: int,
+    is_causal: bool,
+    expected: bool,
+) -> None:
+    plan = _select(_SM120, head_dim=head_dim, is_causal=is_causal)
+
+    assert plan.use_packed_probability_conversion is expected
 
 
 def test_sm89_does_not_inherit_sage_attention_schedule() -> None:
@@ -120,6 +142,7 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "reverse_causal_blocks": True,
         "loop_num_stages": 2,
         "disable_loop_licm": False,
+        "use_packed_probability_conversion": False,
     }
 
 
@@ -149,6 +172,7 @@ def test_execution_plan_rejects_reverse_order_for_noncausal_invocation() -> None
         {"num_stages": 5},
         {"loop_num_stages": 5},
         {"split_pv_head_dim": False, "scaled_fp16_numerator": True},
+        {"native_uint8": False, "use_packed_probability_conversion": True},
     ],
 )
 def test_execution_plan_rejects_inconsistent_specializations(

@@ -5,6 +5,9 @@ from typing import Literal
 
 import pytest
 import torch
+import triton
+import triton.language as tl
+from lib.triton_inspection import compiled_artifact
 
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -13,6 +16,7 @@ from piper_kernels.attention.piper_attention.triton import (
     _default_piper_attention_execution_plan,
     _launch_piper_attention,
     _prepare_piper_attention,
+    _ptx_float32_to_uint8x4,
     _run_piper_attention,
 )
 
@@ -39,6 +43,69 @@ pytestmark = [
         reason="requires NVIDIA SM8x or consumer Blackwell SM12x mixed-sign MMAv2",
     ),
 ]
+
+
+@triton.jit
+def _stock_uint8_conversion_kernel(input_ptr, output_ptr):
+    offsets = tl.arange(0, 256)
+    values = tl.load(input_ptr + offsets)
+    codes = tl.minimum(255.0, values).to(tl.int32)
+    tl.store(output_ptr + offsets, codes.to(tl.uint8))
+
+
+@triton.jit
+def _packed_uint8_conversion_kernel(input_ptr, output_ptr):
+    offsets = tl.arange(0, 256)
+    values = tl.load(input_ptr + offsets)
+    tl.store(output_ptr + offsets, _ptx_float32_to_uint8x4(values))
+
+
+@pytest.mark.parametrize("round_probability_codes", [False, True])
+def test_packed_uint8_conversion_matches_stock_triton(
+    round_probability_codes: bool,
+) -> None:
+    values = torch.linspace(0.0, 300.0, 256, device="cuda", dtype=torch.float32)
+    edge_values = torch.tensor(
+        [
+            0.0,
+            0.49999997,
+            0.5,
+            0.99999994,
+            1.0,
+            1.4999999,
+            1.5,
+            127.49999,
+            127.5,
+            254.49998,
+            254.5,
+            254.99998,
+            255.0,
+            255.49998,
+            256.0,
+            300.0,
+            # PTX clamps finite FP32-to-S32 overflow before the saturated pack.
+            2147483648.0,
+            4294967296.0,
+            1.0e20,
+            torch.finfo(torch.float32).max,
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    values[: edge_values.numel()] = edge_values
+    if round_probability_codes:
+        values += 0.5
+    stock = torch.empty(256, device="cuda", dtype=torch.uint8)
+    packed = torch.empty_like(stock)
+
+    _stock_uint8_conversion_kernel[(1,)](values, stock, num_warps=4)
+    _packed_uint8_conversion_kernel[(1,)](values, packed, num_warps=4)
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed, stock)
+    ptx = compiled_artifact(_packed_uint8_conversion_kernel, "ptx")
+    assert ptx.count("cvt.rzi.s32.f32") == 4
+    assert ptx.count("cvt.pack.sat.u8.s32.b32") == 2
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -78,6 +145,40 @@ def test_triton_matches_quantized_reference(
     assert error.max().item() < 0.12
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_packed_probability_conversion_matches_stock_attention(
+    is_causal: bool,
+) -> None:
+    torch.manual_seed(63 + is_causal)
+    query = torch.randn(1, 1, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    plan = replace(
+        _default_piper_attention_execution_plan(query, key, is_causal),
+        use_tensor_descriptors=False,
+        num_stages=3,
+    )
+    arguments = (query, key, value, 128**-0.5, is_causal)
+
+    with torch.no_grad():
+        stock = _run_piper_attention(
+            *arguments,
+            execution_plan=replace(
+                plan,
+                use_packed_probability_conversion=False,
+            ),
+        )
+        packed = _run_piper_attention(
+            *arguments,
+            execution_plan=replace(
+                plan,
+                use_packed_probability_conversion=True,
+            ),
+        )
+
+    assert torch.equal(packed, stock)
+
+
 @pytest.mark.parametrize("sequence", [193, 1024])
 def test_affine_fallback_matches_native_uint8(sequence: int) -> None:
     torch.manual_seed(55 + sequence)
@@ -98,7 +199,11 @@ def test_affine_fallback_matches_native_uint8(sequence: int) -> None:
         )
         affine = _run_piper_attention(
             *arguments,
-            execution_plan=replace(pointer_plan, native_uint8=False),
+            execution_plan=replace(
+                pointer_plan,
+                native_uint8=False,
+                use_packed_probability_conversion=False,
+            ),
         )
 
     assert torch.equal(native, affine)

@@ -37,6 +37,7 @@ _LOAD_PATHS = {"pointer": False, "tensor-descriptor": True}
 _CAUSAL_BLOCK_ORDERS = {"forward": False, "reverse": True}
 _LOOP_LICM = {"disabled": True, "enabled": False}
 _OPTIONAL_LOOP_STAGES = ("none", "1", "2", "3", "4")
+_PROBABILITY_CONVERSIONS = {"stock": False, "packed": True}
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -59,6 +60,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--loop-num-stages", choices=_OPTIONAL_LOOP_STAGES, nargs="+")
     parser.add_argument("--loop-licm", choices=tuple(_LOOP_LICM), nargs="+")
+    parser.add_argument(
+        "--probability-conversion",
+        choices=tuple(_PROBABILITY_CONVERSIONS),
+        nargs="+",
+    )
     parser.add_argument(
         "--phase",
         type=TuningPhase,
@@ -150,6 +156,11 @@ def _candidate_plans(
             production_plan.disable_loop_licm,
             _LOOP_LICM,
         ),
+        _mapped_axis(
+            args.probability_conversion,
+            production_plan.use_packed_probability_conversion,
+            _PROBABILITY_CONVERSIONS,
+        ),
     )
     plans = tuple(
         replace(
@@ -161,6 +172,7 @@ def _candidate_plans(
             reverse_causal_blocks=reverse_causal_blocks,
             loop_num_stages=loop_num_stages,
             disable_loop_licm=disable_loop_licm,
+            use_packed_probability_conversion=use_packed_probability_conversion,
         )
         for (
             block_m,
@@ -170,6 +182,7 @@ def _candidate_plans(
             reverse_causal_blocks,
             loop_num_stages,
             disable_loop_licm,
+            use_packed_probability_conversion,
         ) in product(*axes)
     )
     if len(plans) > args.max_candidates:
@@ -185,9 +198,10 @@ def _plan_name(plan: piper_attention_backend._PiperAttentionExecutionPlan) -> st
     loop_stages = plan.loop_num_stages if plan.loop_num_stages is not None else "none"
     block_order = "reverse" if plan.reverse_causal_blocks else "forward"
     licm = "licm" if not plan.disable_loop_licm else "no-licm"
+    probability_conversion = "packed-p" if plan.use_packed_probability_conversion else "stock-p"
     return (
         f"{load_path}-m{plan.block_m}-w{plan.num_warps}-s{plan.num_stages}-"
-        f"{block_order}-loop{loop_stages}-{licm}"
+        f"{block_order}-loop{loop_stages}-{licm}-{probability_conversion}"
     )
 
 

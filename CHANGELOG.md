@@ -38,6 +38,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   pipelining, loop invariant code motion, and causal query-block ordering are explicit tuning
   dimensions while production schedules remain unchanged; in particular, SM89 does not inherit
   SageAttention2++ tuning without Piper-specific measurements.
+- Selected packed four-code UINT8 probability conversion for measured SM120 Piper D64
+  and non-causal D128 paths, while retaining stock conversion for causal D128.
 - Raised the minimum supported PyTorch version from 2.12 to 2.13.
 - Tuned the pure-Triton SageAttention2++ path on SM89 with native packed
   FP32-to-E4M3 conversion, 128-row two-stage reverse-order long-causal launches,
