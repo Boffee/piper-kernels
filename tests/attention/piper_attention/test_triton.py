@@ -117,6 +117,26 @@ def test_centered_value_fusion_restores_constant_value() -> None:
     torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
 
 
+def test_causal_triton_is_independent_of_future_value_rows() -> None:
+    torch.manual_seed(62)
+    query = torch.randn(1, 1, 65, 64, device="cuda", dtype=torch.float16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    changed_value = value.clone()
+    changed_value[:, :, 32:] = torch.randn_like(changed_value[:, :, 32:]) * 32
+
+    with torch.no_grad():
+        original = piper_attention(query, key, value, is_causal=True)
+        changed = piper_attention(query, key, changed_value, is_causal=True)
+
+    torch.testing.assert_close(
+        original[:, :, :32],
+        changed[:, :, :32],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
 def test_large_value_scale_multiplier_remains_finite() -> None:
     query = torch.ones((1, 1, 64, 64), device="cuda", dtype=torch.float16)
     key = torch.ones_like(query)

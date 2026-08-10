@@ -109,9 +109,11 @@ def piper_attention(
     to ``head_dim**-0.5``.
 
     The algorithm retains Sage-style INT8 QK and FP32 online softmax, then
-    centers V by its sequence-wide per-feature mean, quantizes each centered
-    row with its own signed-INT8 scale, and folds that scale into a UINT8
-    probability operand. The mean is restored in the epilogue.
+    quantizes each V row with its own signed-INT8 scale and folds that scale
+    into a UINT8 probability operand. Non-causal calls center V by its
+    sequence-wide per-feature mean and restore that mean in the epilogue;
+    causal calls remain uncentered so future V rows cannot affect earlier
+    outputs through quantization.
 
     The optimized backend supports NVIDIA SM8x and consumer Blackwell SM12x,
     where the packaged compiler extension can select mixed-sign MMAv2. Other

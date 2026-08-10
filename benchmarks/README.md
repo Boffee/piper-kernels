@@ -374,10 +374,10 @@ packed-probability-conversion choices.
 
 Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA operators:
 
-- `preparation` includes compact K/V mean reduction, Q/K/V quantization, scale metadata,
-  and affine correction metadata when requested;
+- `preparation` includes compact K mean reduction, non-causal V mean reduction, Q/K/V
+  quantization, scale metadata, and affine correction metadata when requested;
 - `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
-  and centered-mean epilogue;
+  plus the centered-mean epilogue for non-causal calls;
 - `operator_end_to_end` runs preparation and the fused kernel as one complete call.
 
 Machine records also identify Q/K granularity and native versus affine mixed-sign execution.
@@ -496,7 +496,7 @@ Issue #6 was validated on an RTX 5090 (SM120) with Torch 2.12.1+cu130 and
 Triton 3.7.1. BF16 non-causal self-attention measured the following warmed
 latencies; Piper Attention's hot column is its prepared fused recurrence, while the complete
 column includes all preprocessing. The uncentered rows are historical development controls;
-the production operator now always centers V.
+the production operator centers non-causal V and leaves causal V uncentered.
 
 | shape | provider | hot device p50 [p20, p80] (ms) | complete wall p50 [p20, p80] (ms) | SQNR vs SDPA (dB) |
 |:---|:---|---:|---:|---:|

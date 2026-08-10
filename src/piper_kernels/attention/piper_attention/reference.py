@@ -52,7 +52,11 @@ def reference_piper_attention(
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
     value_float = value.float()
-    value_mean = value_float.mean(dim=2, keepdim=True)
+    value_mean = (
+        torch.zeros_like(value_float[:, :, :1])
+        if is_causal
+        else value_float.mean(dim=2, keepdim=True)
+    )
     value_centered = value_float - value_mean
 
     if qk_quantization == "per_warp":

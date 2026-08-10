@@ -55,3 +55,22 @@ def test_reference_centering_restores_constant_value_exactly() -> None:
     )
 
     torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
+
+
+def test_causal_reference_is_independent_of_future_value_rows() -> None:
+    torch.manual_seed(53)
+    query = torch.randn(1, 1, 65, 64, dtype=torch.float16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    changed_value = value.clone()
+    changed_value[:, :, 32:] = torch.randn_like(changed_value[:, :, 32:]) * 32
+
+    original = reference_piper_attention(query, key, value, 64**-0.5, True)
+    changed = reference_piper_attention(query, key, changed_value, 64**-0.5, True)
+
+    torch.testing.assert_close(
+        original[:, :, :32],
+        changed[:, :, :32],
+        atol=0.0,
+        rtol=0.0,
+    )
