@@ -36,6 +36,7 @@ def test_tuner_defaults_to_production_plan() -> None:
     assert arguments.block_m is None
     assert arguments.num_warps is None
     assert arguments.num_stages is None
+    assert arguments.probability_conversion is None
 
 
 def test_omitted_axes_measure_only_the_production_plan() -> None:
@@ -60,13 +61,24 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
             "--loop-num-stages",
             "none",
             "2",
+            "--probability-conversion",
+            "stock",
+            "packed",
         ]
     )
 
     plans = _candidate_plans(arguments, _production_plan())
 
-    assert len(plans) == 8
-    assert len({tuple(plan.as_dict().items()) for plan in plans}) == 8
+    assert len(plans) == 16
+    assert len({tuple(plan.as_dict().items()) for plan in plans}) == 16
+
+
+def test_probability_conversion_axis_selects_stock_and_packed_plans() -> None:
+    arguments = _parse_args(["--probability-conversion", "stock", "packed", "packed"])
+
+    plans = _candidate_plans(arguments, _production_plan())
+
+    assert [plan.use_packed_probability_conversion for plan in plans] == [False, True]
 
 
 def test_candidate_configuration_uses_raw_execution_plan_fields() -> None:

@@ -115,9 +115,11 @@ stock-Triton extension. The backend retains the exact affine identity
 `u @ v = (u - 128) @ v + 128 * sum(v)` as its signed-INT8 correctness and portability
 control. The public optimized dispatch supports NVIDIA SM8x and consumer Blackwell
 SM12x, whose Triton lowering uses the MMAv2 instruction rewritten by the packaged
-extension. SM89 and SM12x have measured schedules; Ampere currently uses the generic
-schedule. Hopper lowers the operation through unsupported WGMMA and therefore uses the
-slow portable quantized reference. Native ROCm mixed-sign lowering remains future work.
+extension. Exact SM120 uses packed four-code probability conversion for D64 and
+non-causal D128, while causal D128 retains the faster stock conversion. SM89 and SM12x
+have measured schedules; Ampere currently uses the generic schedule. Hopper lowers the
+operation through unsupported WGMMA and therefore uses the slow portable quantized
+reference. Native ROCm mixed-sign lowering remains future work.
 
 Piper Attention is an independently developed Sage-derived design. The per-key
 quantizer, centering identity, and online-softmax lineage are not claimed as novel in

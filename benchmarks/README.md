@@ -94,6 +94,7 @@ uv run python benchmarks/tune_piper_attention.py \
   --causal-block-order forward reverse \
   --loop-num-stages none 3 \
   --loop-licm disabled enabled \
+  --probability-conversion stock packed \
   --json artifacts/piper_attention_execution_plan.json
 ```
 
