@@ -26,8 +26,6 @@ def _select(
     key_length: int = 8192,
     head_dim: int = 128,
     is_causal: bool = False,
-    center_value: bool = True,
-    use_tensor_descriptors: bool | None = None,
 ) -> _PiperAttentionExecutionPlan:
     return _select_piper_attention_execution_plan(
         target,
@@ -36,8 +34,6 @@ def _select(
         key_length=key_length,
         head_dim=head_dim,
         is_causal=is_causal,
-        center_value=center_value,
-        use_tensor_descriptors=use_tensor_descriptors,
     )
 
 
@@ -48,7 +44,6 @@ def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> 
         query,
         query,
         False,
-        True,
         target=_SM120,
     )
 
@@ -91,9 +86,13 @@ def test_sm89_does_not_inherit_sage_attention_schedule() -> None:
     assert plan.disable_loop_licm
 
 
-def test_tensor_descriptor_override_updates_launch_pipeline() -> None:
+def test_alternate_plan_can_disable_tensor_descriptors() -> None:
     descriptor_plan = _select(_SM120)
-    pointer_plan = _select(_SM120, use_tensor_descriptors=False)
+    pointer_plan = replace(
+        descriptor_plan,
+        use_tensor_descriptors=False,
+        num_stages=3,
+    )
 
     assert descriptor_plan.use_tensor_descriptors
     assert descriptor_plan.num_stages == 2
@@ -103,7 +102,7 @@ def test_tensor_descriptor_override_updates_launch_pipeline() -> None:
 
 def test_execution_plan_serializes_all_launch_choices() -> None:
     plan = replace(
-        _select(_SM120, is_causal=True, use_tensor_descriptors=False),
+        _select(_SM120, is_causal=True),
         reverse_causal_blocks=True,
         loop_num_stages=2,
         disable_loop_licm=False,
@@ -125,19 +124,20 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
     }
 
 
-def test_explicit_execution_plan_cannot_conflict_with_field_overrides() -> None:
+def test_execution_plan_rejects_reverse_order_for_noncausal_invocation() -> None:
     query = torch.empty((1, 1, 64, 64), device="meta")
-    plan = _select(_SM80, query_length=64, key_length=64, head_dim=64)
+    plan = replace(
+        _select(_SM80, query_length=64, key_length=64, head_dim=64),
+        reverse_causal_blocks=True,
+    )
 
-    with pytest.raises(ValueError, match="cannot both be specified"):
+    with pytest.raises(ValueError, match="requires causal attention"):
         _prepare_piper_attention(
             query,
             query,
             query,
             0.125,
             False,
-            False,
-            use_tensor_descriptors=False,
             execution_plan=plan,
         )
 

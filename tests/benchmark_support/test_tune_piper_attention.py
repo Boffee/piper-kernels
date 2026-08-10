@@ -24,7 +24,6 @@ def _production_plan(*, is_causal: bool = False):
         key_length=8192,
         head_dim=128,
         is_causal=is_causal,
-        center_value=True,
     )
 
 
@@ -33,7 +32,6 @@ def test_tuner_defaults_to_production_plan() -> None:
 
     assert arguments.load_path is None
     assert arguments.phase is TuningPhase.PREPARED_EXECUTION
-    assert arguments.center_value is None
     assert arguments.minimum_sqnr_db == 20.0
     assert arguments.block_m is None
     assert arguments.num_warps is None
@@ -80,7 +78,6 @@ def test_candidate_configuration_uses_raw_execution_plan_fields() -> None:
         (tensor, tensor, tensor),
         scale=128**-0.5,
         is_causal=False,
-        center_value=True,
         target=_SM120,
         common_configuration={"dtype": "float16"},
     )
@@ -129,19 +126,6 @@ def test_tuner_accepts_causal_native_loop_controls() -> None:
     assert all(plan.reverse_causal_blocks for plan in plans)
     assert all(plan.loop_num_stages == 3 for plan in plans)
     assert all(not plan.disable_loop_licm for plan in plans)
-
-
-def test_tuner_accepts_end_to_end_uncentered_search() -> None:
-    arguments = _parse_args(
-        [
-            "--phase",
-            "operator_end_to_end",
-            "--no-center-value",
-        ]
-    )
-
-    assert arguments.phase is TuningPhase.OPERATOR_END_TO_END
-    assert arguments.center_value is False
 
 
 def test_tuner_rejects_causal_cross_attention() -> None:

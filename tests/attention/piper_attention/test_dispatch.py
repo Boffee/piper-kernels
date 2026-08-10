@@ -1,14 +1,13 @@
 """Public API and validation tests for Piper Attention."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
 import piper_kernels
 from piper_kernels import piper_attention
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention import dispatch as piper_attention_dispatch
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
-from piper_kernels.attention.piper_attention.dispatch import _default_center_value
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -28,22 +27,11 @@ def test_public_api_uses_portable_reference_on_cpu() -> None:
     value = torch.randn_like(key)
 
     with torch.no_grad():
-        output = piper_attention(query, key, value, scale=0.2, center_value=True)
+        output = piper_attention(query, key, value, scale=0.2)
 
     assert output.shape == query.shape
     assert output.dtype is query.dtype
     assert torch.isfinite(output).all()
-
-
-def test_default_centering_is_disabled_for_portable_reference() -> None:
-    query, key, _ = _inputs()
-
-    assert not _default_center_value(
-        query,
-        key,
-        False,
-        AcceleratorTarget.from_device(query.device),
-    )
 
 
 def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
@@ -85,6 +73,14 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         stop_at_preprocessing,
     )
     query, key, value = _inputs()
+    plan = replace(
+        piper_attention_backend._default_piper_attention_execution_plan(
+            query,
+            key,
+            True,
+        ),
+        native_uint8=True,
+    )
 
     with pytest.raises(PreprocessingReachedError):
         piper_attention_backend._prepare_piper_attention(
@@ -93,46 +89,11 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
             value,
             64**-0.5,
             True,
-            False,
-            native_uint8=True,
-            sort_value_rows=False,
-            use_tensor_descriptors=False,
+            execution_plan=plan,
         )
 
     assert guarded_devices == [query.device]
     assert events == ["device-enter", "hook", "device-exit", "preprocessing"]
-
-
-@pytest.mark.parametrize(
-    ("query_length", "key_length", "head_dim", "is_causal", "capability", "expected"),
-    [
-        (1024, 1024, 128, False, (12, 0), True),
-        (1023, 1024, 128, False, (12, 0), False),
-        (1024, 1023, 128, False, (12, 0), False),
-        (1024, 1024, 64, False, (12, 0), False),
-        (1024, 1024, 128, True, (12, 0), False),
-        (1024, 1024, 128, False, (8, 9), False),
-    ],
-)
-def test_default_centering_policy_is_shape_and_architecture_specific(
-    monkeypatch: pytest.MonkeyPatch,
-    query_length: int,
-    key_length: int,
-    head_dim: int,
-    is_causal: bool,
-    capability: tuple[int, int],
-    expected: bool,
-) -> None:
-    query = torch.empty((1, 1, query_length, head_dim), dtype=torch.float16)
-    key = torch.empty((1, 1, key_length, head_dim), dtype=torch.float16)
-    monkeypatch.setattr(piper_attention_dispatch, "_supports_triton", lambda _target: True)
-    target = AcceleratorTarget(
-        backend="cuda",
-        architecture=f"sm{capability[0]}{capability[1]}",
-    )
-
-    assert _default_center_value(query, key, is_causal, target) is expected
-
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int8])
 def test_rejects_unsupported_dtype(dtype: torch.dtype) -> None:

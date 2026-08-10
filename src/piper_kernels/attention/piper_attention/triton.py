@@ -53,7 +53,6 @@ def _kv_mean_partial_kernel(
     stride_vb,
     stride_vh,
     stride_vn,
-    center_value: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     chunk_n: tl.constexpr,
@@ -69,8 +68,7 @@ def _kv_mean_partial_kernel(
     offsets_d = feature_block * block_d + tl.arange(0, block_d)
     offsets_n = tl.arange(0, block_n)
     key_accumulator = tl.zeros((block_d,), dtype=tl.float32)
-    if center_value:
-        value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
+    value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
     chunk_start = chunk * chunk_n
     for offset in tl.range(0, chunk_n, block_n, disable_licm=True):
         current_n = chunk_start + offset + offsets_n
@@ -85,25 +83,23 @@ def _kv_mean_partial_kernel(
             other=0.0,
         ).to(tl.float32)
         key_accumulator += tl.sum(key, axis=0)
-        if center_value:
-            value = tl.load(
-                value_ptr
-                + batch * stride_vb
-                + head * stride_vh
-                + current_n[:, None] * stride_vn
-                + offsets_d[None, :],
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            value_accumulator += tl.sum(value, axis=0)
+        value = tl.load(
+            value_ptr
+            + batch * stride_vb
+            + head * stride_vh
+            + current_n[:, None] * stride_vn
+            + offsets_d[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        value_accumulator += tl.sum(value, axis=0)
     output_offsets = (batch_head * num_chunks + chunk) * head_dim + offsets_d
     tl.store(key_partial_ptr + output_offsets, key_accumulator, mask=offsets_d < head_dim)
-    if center_value:
-        tl.store(
-            value_partial_ptr + output_offsets,
-            value_accumulator,
-            mask=offsets_d < head_dim,
-        )
+    tl.store(
+        value_partial_ptr + output_offsets,
+        value_accumulator,
+        mask=offsets_d < head_dim,
+    )
 
 
 @triton.jit
@@ -114,7 +110,6 @@ def _kv_mean_finalize_kernel(
     value_mean_ptr,
     key_length,
     num_chunks,
-    center_value: tl.constexpr,
     head_dim: tl.constexpr,
     block_chunks: tl.constexpr,
     block_d: tl.constexpr,
@@ -137,17 +132,16 @@ def _kv_mean_finalize_kernel(
         tl.sum(key_partials, axis=0) / key_length,
         mask=output_mask,
     )
-    if center_value:
-        value_partials = tl.load(
-            value_partial_ptr + partial_offsets,
-            mask=mask,
-            other=0.0,
-        )
-        tl.store(
-            value_mean_ptr + output_offsets,
-            tl.sum(value_partials, axis=0) / key_length,
-            mask=output_mask,
-        )
+    value_partials = tl.load(
+        value_partial_ptr + partial_offsets,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(
+        value_mean_ptr + output_offsets,
+        tl.sum(value_partials, axis=0) / key_length,
+        mask=output_mask,
+    )
 
 
 @triton.jit
@@ -264,7 +258,6 @@ def _quantize_value_per_key_kernel(
     stride_oh,
     stride_od,
     stride_ok,
-    center_value: tl.constexpr,
     ordered: tl.constexpr,
     store_correction: tl.constexpr,
     heads: tl.constexpr,
@@ -296,9 +289,8 @@ def _quantize_value_per_key_kernel(
         mask=valid[:, None],
         other=0.0,
     ).to(tl.float32)
-    if center_value:
-        value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
-        value = tl.where(valid[:, None], value - value_mean[None, :], 0.0)
+    value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
+    value = tl.where(valid[:, None], value - value_mean[None, :], 0.0)
     scale = tl.max(tl.abs(value), axis=1) / _V_INT8_RANGE + _SCALE_EPSILON
     quantized = qk_quantization.round_to_int8(value / scale[:, None])
     tl.store(
@@ -407,7 +399,6 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     native_uint8: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
     scaled_fp16_numerator: tl.constexpr,
-    center_value: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     unmasked_self_attention: tl.constexpr,
     heads: tl.constexpr,
@@ -712,12 +703,11 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         else:
             output_low = accumulator_low / denominator_safe
             output_high = accumulator_high / denominator_safe
-        if center_value:
-            value_mean_base = value_mean_ptr + batch_head * head_dim
-            output_low += tl.load(value_mean_base + offsets_vd)[None, :]
-            output_high += tl.load(
-                value_mean_base + half_head_dim + offsets_vd
-            )[None, :]
+        value_mean_base = value_mean_ptr + batch_head * head_dim
+        output_low += tl.load(value_mean_base + offsets_vd)[None, :]
+        output_high += tl.load(
+            value_mean_base + half_head_dim + offsets_vd
+        )[None, :]
         output_base = output_ptr + (batch_head * query_length + offsets_m[:, None]) * head_dim
         tl.store(
             output_base + offsets_vd[None, :],
@@ -737,10 +727,9 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
             )
         else:
             output = accumulator / denominator_safe
-        if center_value:
-            output += tl.load(
-                value_mean_ptr + batch_head * head_dim + offsets_d
-            )[None, :]
+        output += tl.load(
+            value_mean_ptr + batch_head * head_dim + offsets_d
+        )[None, :]
         tl.store(
             output_ptr
             + (batch_head * query_length + offsets_m[:, None]) * head_dim
@@ -753,24 +742,14 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
 def _compute_kv_means(
     key: torch.Tensor,
     value: torch.Tensor,
-    *,
-    center_value: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, key_length, head_dim = key.shape
     num_chunks = int(triton.cdiv(key_length, _MEAN_CHUNK_N))
     partial_shape = (batch, heads, num_chunks, head_dim)
     key_partial = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
-    value_partial = (
-        torch.empty_like(key_partial)
-        if center_value
-        else torch.empty((1,), device=value.device, dtype=torch.float32)
-    )
+    value_partial = torch.empty_like(key_partial)
     key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
-    value_mean = (
-        torch.empty_like(key_mean)
-        if center_value
-        else torch.empty((1,), device=value.device, dtype=torch.float32)
-    )
+    value_mean = torch.empty_like(key_mean)
     _kv_mean_partial_kernel[
         (
             num_chunks,
@@ -790,7 +769,6 @@ def _compute_kv_means(
         value.stride(0),
         value.stride(1),
         value.stride(2),
-        center_value=center_value,
         heads=heads,
         head_dim=head_dim,
         chunk_n=_MEAN_CHUNK_N,
@@ -807,7 +785,6 @@ def _compute_kv_means(
         value_mean,
         key_length,
         num_chunks,
-        center_value=center_value,
         head_dim=head_dim,
         block_chunks=triton.next_power_of_2(num_chunks),
         block_d=_MEAN_BLOCK_D,
@@ -1013,7 +990,6 @@ def _make_descriptors(
 
 def _should_sort_value_rows(
     *,
-    center_value: bool,
     target: AcceleratorTarget,
     is_causal: bool,
     head_dim: int,
@@ -1021,8 +997,7 @@ def _should_sort_value_rows(
 ) -> bool:
     """Select exact V ordering only where its long-context cost is amortized."""
     return (
-        center_value
-        and target.is_cuda_capability(12)
+        target.is_cuda_capability(12)
         and not is_causal
         and head_dim == 128
         and key_length >= 16384
@@ -1073,16 +1048,10 @@ def _select_piper_attention_execution_plan(
     key_length: int,
     head_dim: int,
     is_causal: bool,
-    center_value: bool,
-    native_uint8: bool | None = None,
-    sort_value_rows: bool | None = None,
-    use_tensor_descriptors: bool | None = None,
 ) -> _PiperAttentionExecutionPlan:
     """Select established policy without borrowing schedules from other kernels."""
     grouped_qk = target.is_cuda_capability(12)
-    native_uint8 = (
-        target.supports_uint8_int8_mma if native_uint8 is None else native_uint8
-    )
+    native_uint8 = target.supports_uint8_int8_mma
     split_pv_head_dim = (
         target.is_cuda_capability(12)
         and not is_causal
@@ -1091,14 +1060,12 @@ def _select_piper_attention_execution_plan(
         and key_length >= 1024
     )
     scaled_fp16_numerator = split_pv_head_dim and key_length <= 131072
-    if sort_value_rows is None:
-        sort_value_rows = _should_sort_value_rows(
-            center_value=center_value,
-            target=target,
-            is_causal=is_causal,
-            head_dim=head_dim,
-            key_length=key_length,
-        )
+    sort_value_rows = _should_sort_value_rows(
+        target=target,
+        is_causal=is_causal,
+        head_dim=head_dim,
+        key_length=key_length,
+    )
 
     block_m = (
         64
@@ -1109,12 +1076,9 @@ def _select_piper_attention_execution_plan(
         if split_pv_head_dim
         else candidate_block_m
     )
-    if use_tensor_descriptors is None:
-        use_tensor_descriptors = (
-            target.is_cuda_capability(12)
-            and block_m == 128
-            and head_dim == 128
-        )
+    use_tensor_descriptors = (
+        target.is_cuda_capability(12) and block_m == 128 and head_dim == 128
+    )
     return _PiperAttentionExecutionPlan(
         block_m=block_m,
         grouped_qk=grouped_qk,
@@ -1131,12 +1095,8 @@ def _default_piper_attention_execution_plan(
     query: torch.Tensor,
     key: torch.Tensor,
     is_causal: bool,
-    center_value: bool,
     *,
     target: AcceleratorTarget | None = None,
-    native_uint8: bool | None = None,
-    sort_value_rows: bool | None = None,
-    use_tensor_descriptors: bool | None = None,
 ) -> _PiperAttentionExecutionPlan:
     """Resolve production policy for preparation, benchmarks, and tuning."""
     batch, heads, query_length, head_dim = query.shape
@@ -1153,10 +1113,6 @@ def _default_piper_attention_execution_plan(
         key_length=key.shape[2],
         head_dim=head_dim,
         is_causal=is_causal,
-        center_value=center_value,
-        native_uint8=native_uint8,
-        sort_value_rows=sort_value_rows,
-        use_tensor_descriptors=use_tensor_descriptors,
     )
 
 
@@ -1175,7 +1131,6 @@ class _PreparedPiperAttention:
     key_length: int
     storage_key_length: int
     is_causal: bool
-    center_value: bool
     plan: _PiperAttentionExecutionPlan
 
 
@@ -1185,38 +1140,17 @@ def _prepare_piper_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-    center_value: bool,
     *,
-    native_uint8: bool | None = None,
-    sort_value_rows: bool | None = None,
-    use_tensor_descriptors: bool | None = None,
-    execution_plan: _PiperAttentionExecutionPlan | None = None,
+    execution_plan: _PiperAttentionExecutionPlan,
 ) -> _PreparedPiperAttention:
     """Quantize Q/K/V and construct the selected launch specialization."""
-    if execution_plan is not None and any(
-        override is not None
-        for override in (native_uint8, sort_value_rows, use_tensor_descriptors)
-    ):
-        raise ValueError("execution_plan and individual plan overrides cannot both be specified")
     batch, heads, _query_length, head_dim = query.shape
     key_length = key.shape[2]
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else _default_piper_attention_execution_plan(
-            query,
-            key,
-            is_causal,
-            center_value,
-            native_uint8=native_uint8,
-            sort_value_rows=sort_value_rows,
-            use_tensor_descriptors=use_tensor_descriptors,
-        )
-    )
+    plan = execution_plan
     if plan.split_pv_head_dim and head_dim != 128:
         raise ValueError("split-PV Piper Attention requires head_dim=128")
-    if plan.sort_value_rows and (not center_value or is_causal):
-        raise ValueError("value-row ordering requires centered non-causal attention")
+    if plan.sort_value_rows and is_causal:
+        raise ValueError("value-row ordering requires non-causal attention")
     if plan.reverse_causal_blocks and not is_causal:
         raise ValueError("reverse block order requires causal attention")
     if plan.native_uint8:
@@ -1225,11 +1159,7 @@ def _prepare_piper_attention(
     padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
     storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
 
-    key_mean, value_mean = _compute_kv_means(
-        key,
-        value,
-        center_value=center_value,
-    )
+    key_mean, value_mean = _compute_kv_means(key, value)
     key_order = (
         _build_centered_value_order(value, value_mean)
         if plan.sort_value_rows
@@ -1293,7 +1223,6 @@ def _prepare_piper_attention(
         value_int8.stride(1),
         value_int8.stride(2),
         value_int8.stride(3),
-        center_value=center_value,
         ordered=key_order is not None,
         store_correction=not plan.native_uint8,
         heads=heads,
@@ -1329,7 +1258,6 @@ def _prepare_piper_attention(
         key_length=key_length,
         storage_key_length=storage_key_length,
         is_causal=is_causal,
-        center_value=center_value,
         plan=plan,
     )
 
@@ -1365,7 +1293,6 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             native_uint8=plan.native_uint8,
             split_pv_head_dim=plan.split_pv_head_dim,
             scaled_fp16_numerator=plan.scaled_fp16_numerator,
-            center_value=prepared.center_value,
             unmasked_query_tiles=unmasked_queries,
             unmasked_self_attention=(
                 unmasked_queries
@@ -1401,25 +1328,26 @@ def _run_piper_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-    center_value: bool,
     *,
-    native_uint8: bool | None = None,
-    sort_value_rows: bool | None = None,
-    use_tensor_descriptors: bool | None = None,
     execution_plan: _PiperAttentionExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused recurrence."""
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else _default_piper_attention_execution_plan(
+            query,
+            key,
+            is_causal,
+        )
+    )
     prepared = _prepare_piper_attention(
         query,
         key,
         value,
         scale,
         is_causal,
-        center_value,
-        native_uint8=native_uint8,
-        sort_value_rows=sort_value_rows,
-        use_tensor_descriptors=use_tensor_descriptors,
-        execution_plan=execution_plan,
+        execution_plan=plan,
     )
     return _launch_piper_attention(prepared)
 
@@ -1431,7 +1359,6 @@ def triton_piper_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-    center_value: bool,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused integer-PV kernel."""
     return _run_piper_attention(
@@ -1440,7 +1367,6 @@ def triton_piper_attention(
         value,
         scale,
         is_causal,
-        center_value,
     )
 
 
@@ -1451,6 +1377,5 @@ def _triton_piper_attention_fake(
     _value: torch.Tensor,
     _scale: float,
     _is_causal: bool,
-    _center_value: bool,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)

@@ -828,6 +828,14 @@ class _SageAttention2ppExecutionPlan:
     disable_loop_licm: bool = True
 
     def __post_init__(self) -> None:
+        if self.block_m not in (32, 64, 128):
+            raise ValueError("SageAttention2++ block_m must be 32, 64, or 128")
+        if self.num_warps not in (2, 4, 8):
+            raise ValueError("SageAttention2++ num_warps must be 2, 4, or 8")
+        if self.num_stages not in (1, 2, 3, 4):
+            raise ValueError("SageAttention2++ num_stages must be 1, 2, 3, or 4")
+        if self.loop_num_stages not in (None, 1, 2, 3, 4):
+            raise ValueError("SageAttention2++ loop_num_stages must be None, 1, 2, 3, or 4")
         if self.fuse_kv_quantization and not self.grouped_qk:
             raise ValueError("fused K/V quantization requires grouped Q/K scales")
         if self.fuse_query_quantization and not self.grouped_qk:
@@ -845,7 +853,6 @@ def _generic_sage_attention_2pp_execution_plan(
     *,
     candidate_block_m: int,
     is_causal: bool,
-    use_tensor_descriptors: bool | None = None,
 ) -> _SageAttention2ppExecutionPlan:
     """Build capability-based defaults before exact-target tuning is applied."""
     return _SageAttention2ppExecutionPlan(
@@ -854,7 +861,7 @@ def _generic_sage_attention_2pp_execution_plan(
         fuse_kv_quantization=False,
         fuse_query_quantization=False,
         use_unscaled_score_recurrence=False,
-        use_tensor_descriptors=bool(use_tensor_descriptors),
+        use_tensor_descriptors=False,
     )
 
 
@@ -892,7 +899,6 @@ def _apply_sm120_sage_attention_2pp_policy(
     key_length: int,
     head_dim: int,
     is_causal: bool,
-    use_tensor_descriptors: bool | None,
 ) -> _SageAttention2ppExecutionPlan:
     """Apply schedules and preprocessing choices measured on exact SM120."""
     block_m = (
@@ -906,8 +912,7 @@ def _apply_sm120_sage_attention_2pp_policy(
     )
     use_unscaled_score_recurrence = head_dim == 128 and key_length >= minimum_key_length
     fuse_query_quantization = not is_causal or use_unscaled_score_recurrence
-    if use_tensor_descriptors is None:
-        use_tensor_descriptors = block_m == 128 and head_dim == 128
+    use_tensor_descriptors = block_m == 128 and head_dim == 128
     # Packed probability conversion saves instructions on SM120, but increases
     # spills in measured D128 causal specializations and regresses latency. Keep
     # the stock lowering for that path.
@@ -932,14 +937,12 @@ def _select_sage_attention_2pp_execution_plan(
     key_length: int,
     head_dim: int,
     is_causal: bool,
-    use_tensor_descriptors: bool | None = None,
 ) -> _SageAttention2ppExecutionPlan:
     """Combine portable capability defaults with exact-target measured policy."""
     plan = _generic_sage_attention_2pp_execution_plan(
         target,
         candidate_block_m=candidate_block_m,
         is_causal=is_causal,
-        use_tensor_descriptors=use_tensor_descriptors,
     )
     if target.is_cuda_capability(8, 9):
         return _apply_sm89_sage_attention_2pp_policy(
@@ -957,7 +960,6 @@ def _select_sage_attention_2pp_execution_plan(
             key_length=key_length,
             head_dim=head_dim,
             is_causal=is_causal,
-            use_tensor_descriptors=use_tensor_descriptors,
         )
     return plan
 
@@ -968,7 +970,6 @@ def _default_sage_attention_2pp_execution_plan(
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
-    use_tensor_descriptors: bool | None = None,
 ) -> _SageAttention2ppExecutionPlan:
     """Resolve the production plan used by both benchmark metadata and launch."""
     batch, heads, query_length, head_dim = query.shape
@@ -983,7 +984,6 @@ def _default_sage_attention_2pp_execution_plan(
         key_length=key.shape[2],
         head_dim=head_dim,
         is_causal=is_causal,
-        use_tensor_descriptors=use_tensor_descriptors,
     )
 
 
@@ -1236,23 +1236,13 @@ def _prepare_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    use_tensor_descriptors: bool | None = None,
-    execution_plan: _SageAttention2ppExecutionPlan | None = None,
+    execution_plan: _SageAttention2ppExecutionPlan,
 ) -> _PreparedSageAttention2pp:
     """Quantize inputs and construct the selected attention specialization."""
-    if execution_plan is not None and use_tensor_descriptors is not None:
-        raise ValueError("execution_plan and use_tensor_descriptors cannot both be specified")
     key_length = key.shape[2]
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else _default_sage_attention_2pp_execution_plan(
-            query,
-            key,
-            is_causal,
-            use_tensor_descriptors=use_tensor_descriptors,
-        )
-    )
+    plan = execution_plan
+    if plan.reverse_causal_blocks and not is_causal:
+        raise ValueError("reverse block order requires causal attention")
     # The feature-major FP8 V descriptor requires its row stride to be
     # 16-byte aligned; pad only storage whose sequence length violates it.
     storage_key_length = (
@@ -1351,18 +1341,25 @@ def _run_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    use_tensor_descriptors: bool | None = None,
     execution_plan: _SageAttention2ppExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run SageAttention2++ preprocessing and its fused recurrence."""
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else _default_sage_attention_2pp_execution_plan(
+            query,
+            key,
+            is_causal,
+        )
+    )
     prepared = _prepare_sage_attention_2pp(
         query,
         key,
         value,
         scale,
         is_causal,
-        use_tensor_descriptors=use_tensor_descriptors,
-        execution_plan=execution_plan,
+        execution_plan=plan,
     )
     return _launch_sage_attention_2pp(prepared)
 

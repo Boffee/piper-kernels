@@ -44,7 +44,6 @@ def reference_piper_attention(  # noqa: PLR0915
     scale: float,
     is_causal: bool,
     *,
-    center_value: bool,
     qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
     sort_value_rows: bool = False,
 ) -> torch.Tensor:
@@ -57,11 +56,7 @@ def reference_piper_attention(  # noqa: PLR0915
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
     value_float = value.float()
-    value_mean = (
-        value_float.mean(dim=2, keepdim=True)
-        if center_value
-        else torch.zeros_like(value_float[:, :, :1])
-    )
+    value_mean = value_float.mean(dim=2, keepdim=True)
     value_centered = value_float - value_mean
 
     if sort_value_rows:

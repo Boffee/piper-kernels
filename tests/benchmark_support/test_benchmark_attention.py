@@ -18,8 +18,6 @@ from lib.attention_providers import (
     CANONICAL_CUDA_SAGE_ATTENTION_2PP,
     PIPER_ATTENTION,
     PIPER_ATTENTION_AFFINE,
-    PIPER_ATTENTION_CENTERED,
-    PIPER_ATTENTION_UNCENTERED,
     PYTORCH_SDPA,
     SAGE_ATTENTION_2PP,
     make_attention_providers,
@@ -35,8 +33,6 @@ _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 
 def test_provider_ids_use_canonical_attention_names() -> None:
     assert PIPER_ATTENTION == "piper_attention"
-    assert PIPER_ATTENTION_CENTERED == "piper_attention_centered"
-    assert PIPER_ATTENTION_UNCENTERED == "piper_attention_uncentered"
     assert PIPER_ATTENTION_AFFINE == "piper_attention_affine"
     assert SAGE_ATTENTION_2PP == "sage_attention_2pp"
     assert CANONICAL_CUDA_SAGE_ATTENTION_2PP == "canonical_cuda_sage_attention_2pp"
@@ -62,8 +58,7 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
     providers = make_attention_providers(
         (tensor, tensor, tensor),
         provider_names=(
-            PIPER_ATTENTION_CENTERED,
-            PIPER_ATTENTION_UNCENTERED,
+            PIPER_ATTENTION,
             PIPER_ATTENTION_AFFINE,
             SAGE_ATTENTION_2PP,
             PYTORCH_SDPA,
@@ -72,12 +67,10 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
         target=_SM120,
     )
 
-    assert providers[PIPER_ATTENTION_CENTERED].configuration["center_value"] is True
-    assert providers[PIPER_ATTENTION_UNCENTERED].configuration["center_value"] is False
     assert providers[PIPER_ATTENTION_AFFINE].configuration["native_uint8"] is False
     assert "mixed_sign_mma" not in providers[PIPER_ATTENTION_AFFINE].configuration
-    assert "value_row_order" not in providers[PIPER_ATTENTION_CENTERED].configuration
-    assert "attention" in providers[PIPER_ATTENTION_CENTERED].triton_jit_functions
+    assert "value_row_order" not in providers[PIPER_ATTENTION].configuration
+    assert "attention" in providers[PIPER_ATTENTION].triton_jit_functions
     assert providers[SAGE_ATTENTION_2PP].configuration["algorithm"] == ("sage_attention_2pp")
     assert providers[SAGE_ATTENTION_2PP].configuration["block_n"] == 64
     assert providers[SAGE_ATTENTION_2PP].configuration["use_packed_probability_conversion"]
@@ -140,13 +133,13 @@ def test_default_providers_use_hardware_aware_comparison_set() -> None:
         include_canonical=False,
         piper_attention_supported=True,
         sage_attention_2pp_supported=True,
-    ) == (PIPER_ATTENTION, PIPER_ATTENTION_UNCENTERED, SAGE_ATTENTION_2PP, PYTORCH_SDPA)
+    ) == (PIPER_ATTENTION, SAGE_ATTENTION_2PP, PYTORCH_SDPA)
     assert resolve_provider_names(
         None,
         include_canonical=False,
         piper_attention_supported=True,
         sage_attention_2pp_supported=False,
-    ) == (PIPER_ATTENTION, PIPER_ATTENTION_UNCENTERED, PYTORCH_SDPA)
+    ) == (PIPER_ATTENTION, PYTORCH_SDPA)
     assert resolve_provider_names(
         None,
         include_canonical=False,
@@ -209,7 +202,7 @@ def test_compiler_provider_is_inferred_when_unambiguous() -> None:
 
 def test_compiler_provider_must_be_explicit_when_ambiguous() -> None:
     arguments = _parse_args(["--sequence", "128", "--compiler-report"])
-    names = (PIPER_ATTENTION, PIPER_ATTENTION_UNCENTERED, SAGE_ATTENTION_2PP, PYTORCH_SDPA)
+    names = (PIPER_ATTENTION, SAGE_ATTENTION_2PP, PYTORCH_SDPA)
 
     with pytest.raises(SystemExit, match="--compiler-provider"):
         _compiler_provider_name(arguments, names)

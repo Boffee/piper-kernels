@@ -1,5 +1,7 @@
 """Host-side specialization policy tests for SageAttention2++."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -30,29 +32,6 @@ def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> 
     assert plan.block_m == 64
     assert plan.grouped_qk
     assert plan.fuse_kv_quantization
-
-
-def test_explicit_execution_plan_cannot_conflict_with_descriptor_override() -> None:
-    query = torch.empty((1, 1, 64, 64), device="meta")
-    plan = _SageAttention2ppExecutionPlan(
-        block_m=64,
-        grouped_qk=False,
-        fuse_kv_quantization=False,
-        fuse_query_quantization=False,
-        use_unscaled_score_recurrence=False,
-        use_tensor_descriptors=False,
-    )
-
-    with pytest.raises(ValueError, match="cannot both be specified"):
-        _prepare_sage_attention_2pp(
-            query,
-            query,
-            query,
-            0.125,
-            False,
-            use_tensor_descriptors=False,
-            execution_plan=plan,
-        )
 
 
 @pytest.mark.parametrize(
@@ -269,7 +248,7 @@ def test_other_sm12x_targets_do_not_inherit_sm120_crossovers(
     assert not plan.use_tensor_descriptors
 
 
-def test_tensor_descriptor_override_wins_over_sm120_default() -> None:
+def test_alternate_plan_can_disable_tensor_descriptors() -> None:
     default_plan = _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=128,
@@ -278,15 +257,60 @@ def test_tensor_descriptor_override_wins_over_sm120_default() -> None:
         head_dim=128,
         is_causal=False,
     )
-    pointer_plan = _select_sage_attention_2pp_execution_plan(
+    pointer_plan = replace(default_plan, use_tensor_descriptors=False)
+
+    assert default_plan.use_tensor_descriptors
+    assert not pointer_plan.use_tensor_descriptors
+
+
+def test_execution_plan_rejects_reverse_order_for_noncausal_invocation() -> None:
+    query = torch.empty((1, 1, 64, 64), device="meta")
+    plan = replace(
+        _select_sage_attention_2pp_execution_plan(
+            _SM89,
+            candidate_block_m=64,
+            query_length=64,
+            key_length=64,
+            head_dim=64,
+            is_causal=False,
+        ),
+        reverse_causal_blocks=True,
+    )
+
+    with pytest.raises(ValueError, match="requires causal attention"):
+        _prepare_sage_attention_2pp(
+            query,
+            query,
+            query,
+            0.125,
+            False,
+            execution_plan=plan,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"block_m": 16},
+        {"num_warps": 1},
+        {"num_stages": 5},
+        {"loop_num_stages": 5},
+        {"grouped_qk": False, "fuse_kv_quantization": True},
+        {"grouped_qk": False, "fuse_query_quantization": True},
+        {"fuse_query_quantization": False, "use_unscaled_score_recurrence": True},
+    ],
+)
+def test_execution_plan_rejects_inconsistent_specializations(
+    changes: dict[str, object],
+) -> None:
+    plan = _select_sage_attention_2pp_execution_plan(
         _SM120,
         candidate_block_m=128,
         query_length=8192,
         key_length=8192,
         head_dim=128,
         is_causal=False,
-        use_tensor_descriptors=False,
     )
 
-    assert default_plan.use_tensor_descriptors
-    assert not pointer_plan.use_tensor_descriptors
+    with pytest.raises(ValueError, match=r"must be|requires"):
+        replace(plan, **changes)

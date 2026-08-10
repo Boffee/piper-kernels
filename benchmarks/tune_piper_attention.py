@@ -29,7 +29,6 @@ from lib import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
-from piper_kernels.attention.piper_attention.dispatch import _default_center_value
 
 _BLOCK_M_VALUES = (32, 64, 128)
 _NUM_WARPS_VALUES = (2, 4, 8)
@@ -49,12 +48,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument(
-        "--center-value",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="override the production centering policy",
-    )
     parser.add_argument("--load-path", choices=tuple(_LOAD_PATHS), nargs="+")
     parser.add_argument("--block-m", type=int, choices=_BLOCK_M_VALUES, nargs="+")
     parser.add_argument("--num-warps", type=int, choices=_NUM_WARPS_VALUES, nargs="+")
@@ -204,7 +197,6 @@ def _make_candidate(
     *,
     scale: float,
     is_causal: bool,
-    center_value: bool,
     target: AcceleratorTarget,
     common_configuration: Mapping[str, object],
 ) -> TuningCandidate[object, torch.Tensor]:
@@ -224,7 +216,6 @@ def _make_candidate(
                 value,
                 scale,
                 is_causal,
-                center_value,
                 execution_plan=plan,
             )
 
@@ -246,7 +237,6 @@ def _make_candidate(
             **common_configuration,
             "algorithm": "piper_attention",
             **plan.as_dict(),
-            "center_value": center_value,
         },
         make_provider=make_provider,
     )
@@ -288,18 +278,11 @@ def _main(argv: Sequence[str] | None = None) -> None:
     inputs = make_attention_inputs(shape, dtype=dtype, device=device, generator=generator)
     query, key, value = inputs
     scale = args.head_dim**-0.5
-    center_value = (
-        _default_center_value(query, key, args.causal, target)
-        if args.center_value is None
-        else args.center_value
-    )
     production_plan = piper_attention_backend._default_piper_attention_execution_plan(
         query,
         key,
         args.causal,
-        center_value,
         target=target,
-        native_uint8=True,
     )
     common_configuration = {
         "dtype": args.dtype,
@@ -313,7 +296,6 @@ def _main(argv: Sequence[str] | None = None) -> None:
             inputs,
             scale=scale,
             is_causal=args.causal,
-            center_value=center_value,
             target=target,
             common_configuration=common_configuration,
         )

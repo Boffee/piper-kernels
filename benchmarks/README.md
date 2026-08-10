@@ -338,16 +338,15 @@ Run full-attention comparisons with:
 uv run python benchmarks/benchmark_attention.py
 ```
 
-The hardware-aware default always includes PyTorch SDPA, adds Piper Attention and its uncentered
-control where Piper Attention's mixed-sign MMA is supported, and adds pure-Triton SageAttention2++
-where FP8 tensor cores are supported. Choose any subset with `--providers`; `--help` lists
-the stable provider names. For example:
+The hardware-aware default always includes PyTorch SDPA, adds Piper Attention where its
+mixed-sign MMA is supported, and adds pure-Triton SageAttention2++ where FP8 tensor cores
+are supported. Choose any subset with `--providers`; `--help` lists the stable provider
+names. For example:
 
 ```shell
 uv run python benchmarks/benchmark_attention.py \
   --sequence 8192 \
-  --providers piper_attention piper_attention_centered \
-              piper_attention_uncentered piper_attention_affine \
+  --providers piper_attention piper_attention_affine \
               sage_attention_2pp pytorch-sdpa
 ```
 
@@ -381,10 +380,10 @@ Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA
   and centered-mean epilogue;
 - `operator_end_to_end` runs preparation and the fused kernel as one complete call.
 
-Machine records also identify centering, value-row order, Q/K granularity, and native versus
-affine mixed-sign execution. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled
-research controls remain reproducible from the `wip/sage-integer-attention` checkpoint at
-`b75f3ee`; they are not copied into the installed package.
+Machine records also identify value-row order, Q/K granularity, and native versus affine
+mixed-sign execution. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research
+controls remain reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`;
+they are not copied into the installed package.
 
 Compiler inspection and external profiling are available for one shape at a time:
 
@@ -496,7 +495,8 @@ kernel raised causal spills from 18 to 20. Quality metrics were unchanged.
 Issue #6 was validated on an RTX 5090 (SM120) with Torch 2.12.1+cu130 and
 Triton 3.7.1. BF16 non-causal self-attention measured the following warmed
 latencies; Piper Attention's hot column is its prepared fused recurrence, while the complete
-column includes all preprocessing.
+column includes all preprocessing. The uncentered rows are historical development controls;
+the production operator now always centers V.
 
 | shape | provider | hot device p50 [p20, p80] (ms) | complete wall p50 [p20, p80] (ms) | SQNR vs SDPA (dB) |
 |:---|:---|---:|---:|---:|

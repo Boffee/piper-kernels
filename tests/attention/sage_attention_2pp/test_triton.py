@@ -285,6 +285,14 @@ def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
     query = torch.randn(1, 24, 1025, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
+    pointer_plan = replace(
+        sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+            query,
+            key,
+            False,
+        ),
+        use_tensor_descriptors=False,
+    )
 
     with torch.no_grad():
         actual = sage_attention_2pp(query, key, value)
@@ -294,7 +302,7 @@ def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
             value,
             128**-0.5,
             False,
-            use_tensor_descriptors=False,
+            execution_plan=pointer_plan,
         )
 
     assert torch.equal(actual, expected)
@@ -309,6 +317,11 @@ def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
     query = torch.randn(1, 8, 4224, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
+    plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+        query,
+        key,
+        True,
+    )
 
     with torch.no_grad():
         prepared = sage_attention_2pp_backend._prepare_sage_attention_2pp(
@@ -317,6 +330,7 @@ def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
             value,
             128**-0.5,
             True,
+            execution_plan=plan,
         )
         assert prepared.plan.block_m == 128
         actual = sage_attention_2pp_backend._launch_sage_attention_2pp(prepared)
