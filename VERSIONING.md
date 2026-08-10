@@ -7,8 +7,9 @@ Piper Kernels uses Python's PEP 440 version format and `v<version>` Git tags. Th
 
 The package is pre-1.0 while its operator interfaces are being established:
 
-- Patch releases (`0.1.1`) preserve the documented public API and contain fixes or compatible
-  performance improvements.
+- Patch releases (`0.1.1`) preserve existing documented behavior and contain fixes,
+  compatible performance improvements, or backward-compatible extensions to existing
+  operators.
 - Minor releases (`0.2.0`) may add operators or deliberately change a public pre-1.0 contract.
 - Release candidates (`0.2.0rc1`) are used when a change needs integration testing before a
   stable release.
