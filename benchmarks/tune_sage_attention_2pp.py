@@ -3,31 +3,36 @@
 from __future__ import annotations
 
 import argparse
-import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from itertools import product
 from pathlib import Path
 
 import torch
-from lib import (
+from lib.attention import (
     AttentionConfig,
     AttentionInputs,
     AttentionShape,
-    BenchmarkProvider,
-    TuningCandidate,
-    TuningPhase,
-    TuningRecord,
-    UnsupportedTuningCandidateError,
-    add_output_arguments,
-    capture_environment,
     make_attention_inputs,
-    measure_quality,
-    output_target,
-    tune_candidates,
-    write_records,
 )
 from lib.attention_providers import qk_quantization_granularity
+from lib.environment import capture_environment
+from lib.providers import BenchmarkProvider
+from lib.quality import measure_quality
+from lib.reporting import output_target, write_records
+from lib.tuning import (
+    TuningCandidate,
+    UnsupportedTuningCandidateError,
+    add_tuning_arguments,
+    boolean_tuning_axis,
+    meets_minimum_sqnr,
+    optional_integer_tuning_axis,
+    print_tuning_results,
+    tune_candidates,
+    tuning_axis,
+    tuning_candidate_count,
+    validate_tuning_arguments,
+)
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
@@ -125,18 +130,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument(
-        "--phase",
-        type=TuningPhase,
-        choices=tuple(TuningPhase),
-        default=TuningPhase.PREPARED_EXECUTION,
-    )
-    parser.add_argument("--warmup-ms", type=int, default=50)
-    parser.add_argument("--measurement-time-ms", type=int, default=200)
-    parser.add_argument("--minimum-sqnr-db", type=float, default=20.0)
-    parser.add_argument("--max-candidates", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=0)
-    add_output_arguments(parser, record_name="tuning candidate")
+    add_tuning_arguments(parser)
     return parser.parse_args(argv)
 
 
@@ -150,33 +144,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("causal attention requires equal query and key/value lengths")
     if not args.causal and args.reverse_causal_blocks is True:
         raise SystemExit("reverse causal-block order requires causal attention")
-    if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
-        raise SystemExit("warmup must be non-negative and measurement time must be positive")
-    if not math.isfinite(args.minimum_sqnr_db):
-        raise SystemExit("minimum SQNR must be finite")
-    if args.max_candidates <= 0:
-        raise SystemExit("maximum candidate count must be positive")
-
-
-def _unique[T](values: Sequence[T]) -> tuple[T, ...]:
-    return tuple(dict.fromkeys(values))
-
-
-def _axis[T](values: Sequence[T] | None, production_value: T) -> tuple[T, ...]:
-    return (production_value,) if values is None else _unique(values)
-
-
-def _boolean_axis(value: bool | None, production_value: bool) -> tuple[bool, ...]:
-    return (production_value if value is None else value,)
-
-
-def _loop_stage_axis(
-    values: Sequence[str] | None,
-    production_value: int | None,
-) -> tuple[int | None, ...]:
-    if values is None:
-        return (production_value,)
-    return _unique(tuple(None if value == "none" else int(value) for value in values))
+    validate_tuning_arguments(args)
 
 
 def _candidate_choices(
@@ -185,25 +153,37 @@ def _candidate_choices(
 ) -> tuple[_SageAttention2ppTuningChoice, ...]:
     """Form the explicit Cartesian search, defaulting omitted axes to production."""
     axes = (
-        _axis(args.block_m, production_plan.block_m),
-        _axis(args.num_warps, production_plan.num_warps),
-        _axis(args.num_stages, production_plan.num_stages),
-        _boolean_axis(args.use_tensor_descriptors, production_plan.use_tensor_descriptors),
-        _boolean_axis(args.fuse_kv_quantization, production_plan.fuse_kv_quantization),
-        _boolean_axis(args.fuse_query_quantization, production_plan.fuse_query_quantization),
-        _boolean_axis(
+        tuning_axis(args.block_m, production_plan.block_m),
+        tuning_axis(args.num_warps, production_plan.num_warps),
+        tuning_axis(args.num_stages, production_plan.num_stages),
+        boolean_tuning_axis(
+            args.use_tensor_descriptors,
+            production_plan.use_tensor_descriptors,
+        ),
+        boolean_tuning_axis(
+            args.fuse_kv_quantization,
+            production_plan.fuse_kv_quantization,
+        ),
+        boolean_tuning_axis(
+            args.fuse_query_quantization,
+            production_plan.fuse_query_quantization,
+        ),
+        boolean_tuning_axis(
             args.use_unscaled_score_recurrence,
             production_plan.use_unscaled_score_recurrence,
         ),
-        _boolean_axis(args.reverse_causal_blocks, production_plan.reverse_causal_blocks),
-        _loop_stage_axis(args.loop_num_stages, production_plan.loop_num_stages),
-        _boolean_axis(args.loop_licm, production_plan.loop_licm),
-        _boolean_axis(
+        boolean_tuning_axis(
+            args.reverse_causal_blocks,
+            production_plan.reverse_causal_blocks,
+        ),
+        optional_integer_tuning_axis(args.loop_num_stages, production_plan.loop_num_stages),
+        boolean_tuning_axis(args.loop_licm, production_plan.loop_licm),
+        boolean_tuning_axis(
             args.use_packed_probability_conversion,
             production_plan.use_packed_probability_conversion,
         ),
     )
-    candidate_count = math.prod(len(axis) for axis in axes)
+    candidate_count = tuning_candidate_count(axes)
     if candidate_count > args.max_candidates:
         raise SystemExit(
             f"search expands to {candidate_count} candidates; narrow the axes or increase "
@@ -314,18 +294,6 @@ def _make_candidate(
     )
 
 
-def _print_results(records: Sequence[TuningRecord]) -> None:
-    print("| candidate | status | selected | p50 (ms) | SQNR (dB) | reason |")
-    print("|:---|:---|:---:|---:|---:|:---|")
-    for record in records:
-        timing = "-" if record.timing is None else f"{record.timing.median_ms:.3f}"
-        quality = "-" if record.quality is None else f"{record.quality.sqnr_db:.2f}"
-        print(
-            f"| {record.candidate} | {record.status.value} | {record.selected} "
-            f"| {timing} | {quality} | {record.reason or ''} |"
-        )
-
-
 @torch.inference_mode()
 def _main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
@@ -390,11 +358,9 @@ def _main(argv: Sequence[str] | None = None) -> None:
         warmup_ms=args.warmup_ms,
         measurement_time_ms=args.measurement_time_ms,
         measure_candidate_quality=lambda output: measure_quality(output, expected),
-        quality_gate=lambda quality: (
-            quality.nonfinite_mismatch_count == 0 and quality.sqnr_db >= args.minimum_sqnr_db
-        ),
+        quality_gate=lambda quality: meets_minimum_sqnr(quality, args.minimum_sqnr_db),
     )
-    _print_results(run.records)
+    print_tuning_results(run.records)
     write_records(run.records, output_target(args))
     if run.winner is None:
         raise SystemExit("no tuning candidate passed the quality gate")

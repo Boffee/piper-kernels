@@ -7,26 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
-from lib import (
-    AttentionConfig,
-    AttentionShape,
-    BenchmarkRecord,
-    EnvironmentInfo,
-    OutputTarget,
-    TritonCompilerRecord,
-    add_compiler_inspection_arguments,
-    add_output_arguments,
-    add_profile_arguments,
-    capture_environment,
-    format_compiler_report,
-    inspect_provider,
-    make_attention_inputs,
-    measure_provider,
-    measure_quality,
-    output_target,
-    profile_provider,
-    write_records,
-)
+from lib.attention import AttentionConfig, AttentionShape, make_attention_inputs
 from lib.attention_providers import (
     PROVIDER_NAMES,
     TRITON_PROVIDERS,
@@ -35,6 +16,23 @@ from lib.attention_providers import (
     resolve_provider_names,
     run_sdpa,
     validate_provider_support,
+)
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.profiling import add_profile_arguments, profile_provider
+from lib.providers import measure_provider
+from lib.quality import measure_quality
+from lib.reporting import (
+    BenchmarkRecord,
+    OutputTarget,
+    add_output_arguments,
+    output_target,
+    write_records,
+)
+from lib.triton_inspection import (
+    TritonCompilerRecord,
+    add_compiler_inspection_arguments,
+    format_compiler_report,
+    inspect_provider,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget

@@ -1,10 +1,15 @@
-"""Host-side specialization policy tests for INT8 ConvRot preparation."""
+"""Host-side execution-plan policy tests for INT8 ConvRot."""
+
+from dataclasses import replace
 
 import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot.int8._policy import PreparationPlan, select_preparation_plan
+from piper_kernels.convrot.int8._policy import (
+    ConvRotInt8LinearExecutionPlan,
+    select_execution_plan,
+)
 
 _SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
@@ -21,23 +26,21 @@ _HIP = AcceleratorTarget(backend="hip", architecture="gfx1200")
         (_HIP, False),
     ],
 )
-def test_preparation_plan_keeps_sm120_tuning_target_exact(
+def test_execution_plan_keeps_sm120_tuning_target_exact(
     target: AcceleratorTarget,
     expected_fusion: bool,
 ) -> None:
-    plan = select_preparation_plan(
+    plan = select_execution_plan(
         target,
         rows=512,
+        out_features=96,
         in_features=512,
         group_size=256,
         dtype=torch.float16,
     )
 
-    assert plan == PreparationPlan(
-        fused_block_size=512,
-        fuse_rotation_quantization=expected_fusion,
-        fused_num_warps=4,
-    )
+    assert plan.fuse_rotation_quantization is expected_fusion
+    assert plan.fused_num_warps == 4
 
 
 @pytest.mark.parametrize(
@@ -46,36 +49,34 @@ def test_preparation_plan_keeps_sm120_tuning_target_exact(
         "in_features",
         "group_size",
         "dtype",
-        "expected_fused_block_size",
         "expected_fusion",
     ),
     [
-        (512, 512, 256, torch.float16, 512, True),
-        (512, 14_336, 256, torch.bfloat16, 16_384, True),
-        (511, 512, 256, torch.float16, 512, False),
-        (512, 0, 256, torch.float16, 128, False),
-        (512, 512, 64, torch.float16, 512, False),
-        (512, 512, 256, torch.float32, 512, False),
-        (512, 16_640, 256, torch.bfloat16, 32_768, False),
+        (512, 512, 256, torch.float16, True),
+        (512, 14_336, 256, torch.bfloat16, True),
+        (511, 512, 256, torch.float16, False),
+        (512, 0, 256, torch.float16, False),
+        (512, 512, 64, torch.float16, False),
+        (512, 512, 256, torch.float32, False),
+        (512, 16_640, 256, torch.bfloat16, False),
     ],
 )
-def test_preparation_plan_centralizes_fusion_boundaries(
+def test_execution_plan_centralizes_fusion_boundaries(
     rows: int,
     in_features: int,
     group_size: int,
     dtype: torch.dtype,
-    expected_fused_block_size: int,
     expected_fusion: bool,
 ) -> None:
-    plan = select_preparation_plan(
+    plan = select_execution_plan(
         _SM120,
         rows=rows,
+        out_features=96,
         in_features=in_features,
         group_size=group_size,
         dtype=dtype,
     )
 
-    assert plan.fused_block_size == expected_fused_block_size
     assert plan.fuse_rotation_quantization is expected_fusion
 
 
@@ -91,16 +92,17 @@ def test_preparation_plan_centralizes_fusion_boundaries(
         (_HIP, 8192, 14_336, True, 4),
     ],
 )
-def test_preparation_plan_centralizes_fused_launch_schedule(
+def test_execution_plan_centralizes_fused_launch_schedule(
     target: AcceleratorTarget,
     rows: int,
     in_features: int,
     swiglu: bool,
     expected_warps: int,
 ) -> None:
-    plan = select_preparation_plan(
+    plan = select_execution_plan(
         target,
         rows=rows,
+        out_features=96,
         in_features=in_features,
         group_size=256,
         dtype=torch.bfloat16,
@@ -108,3 +110,121 @@ def test_preparation_plan_centralizes_fused_launch_schedule(
     )
 
     assert plan.fused_num_warps == expected_warps
+
+
+@pytest.mark.parametrize(
+    ("rows", "out_features", "expected_block_m", "expected_block_n"),
+    [
+        (1, 96, 32, 64),
+        (63, 127, 32, 64),
+        (64, 128, 64, 128),
+        (37_710, 21_504, 64, 128),
+    ],
+)
+def test_execution_plan_preserves_existing_matmul_schedule(
+    rows: int,
+    out_features: int,
+    expected_block_m: int,
+    expected_block_n: int,
+) -> None:
+    plan = select_execution_plan(
+        _SM120,
+        rows=rows,
+        out_features=out_features,
+        in_features=512,
+        group_size=256,
+        dtype=torch.bfloat16,
+    )
+
+    assert plan.matmul_block_m == expected_block_m
+    assert plan.matmul_block_n == expected_block_n
+    assert plan.matmul_block_k == 32
+    assert plan.matmul_num_warps == 4
+    assert plan.matmul_num_stages == 3
+
+
+def test_execution_plan_serializes_flat_tuning_fields() -> None:
+    plan = select_execution_plan(
+        _SM120,
+        rows=512,
+        out_features=96,
+        in_features=512,
+        group_size=256,
+        dtype=torch.float16,
+    )
+
+    assert plan.as_dict() == {
+        "fuse_rotation_quantization": True,
+        "fused_num_warps": 4,
+        "rotation_num_warps": 4,
+        "quantization_num_warps": 8,
+        "matmul_block_m": 64,
+        "matmul_block_n": 64,
+        "matmul_block_k": 32,
+        "matmul_num_warps": 4,
+        "matmul_num_stages": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"matmul_block_m": 8},
+        {"matmul_block_n": 512},
+        {"matmul_block_k": 16},
+        {"matmul_num_warps": 16},
+        {"matmul_num_stages": 5},
+    ],
+)
+def test_execution_plan_rejects_invalid_matmul_launch_choices(
+    changes: dict[str, int],
+) -> None:
+    plan = ConvRotInt8LinearExecutionPlan(
+        fuse_rotation_quantization=True,
+        fused_num_warps=4,
+        rotation_num_warps=4,
+        quantization_num_warps=8,
+        matmul_block_m=64,
+        matmul_block_n=128,
+        matmul_block_k=32,
+    )
+
+    with pytest.raises(ValueError, match="ConvRot"):
+        replace(plan, **changes)
+
+
+def test_execution_plan_rejects_invalid_fused_warp_count() -> None:
+    plan = select_execution_plan(
+        _SM120,
+        rows=512,
+        out_features=96,
+        in_features=512,
+        group_size=256,
+        dtype=torch.float16,
+    )
+
+    with pytest.raises(ValueError, match="ConvRot"):
+        replace(plan, fused_num_warps=1)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"rotation_num_warps": 16},
+        {"quantization_num_warps": 16},
+    ],
+)
+def test_execution_plan_rejects_invalid_split_launch_choices(
+    changes: dict[str, int],
+) -> None:
+    plan = select_execution_plan(
+        _SM120,
+        rows=512,
+        out_features=96,
+        in_features=512,
+        group_size=256,
+        dtype=torch.float16,
+    )
+
+    with pytest.raises(ValueError, match="ConvRot"):
+        replace(plan, **changes)

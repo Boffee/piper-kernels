@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -11,20 +13,18 @@ from typing import Any, Generic, TypeVar
 from triton.runtime.errors import OutOfResources
 
 from .environment import EnvironmentInfo
-from .providers import BenchmarkProvider, DistributionTimer
+from .providers import (
+    BenchmarkProvider,
+    DistributionTimer,
+    ProviderPhase,
+    provider_phase_launch,
+)
 from .quality import QualityMetrics
-from .reporting import SCHEMA_VERSION
+from .reporting import SCHEMA_VERSION, add_output_arguments
 from .timing import Timing, synchronized_wall_benchmark, triton_benchmark
 
 PreparedT = TypeVar("PreparedT")
 OutputT = TypeVar("OutputT")
-
-
-class TuningPhase(StrEnum):
-    """Provider execution phase measured by an offline tuning run."""
-
-    PREPARED_EXECUTION = "prepared_execution"
-    OPERATOR_END_TO_END = "operator_end_to_end"
 
 
 class TuningStatus(StrEnum):
@@ -56,7 +56,7 @@ class TuningRecord:
     candidate: str
     shape: Mapping[str, Any]
     configuration: Mapping[str, Any]
-    phase: TuningPhase
+    phase: ProviderPhase
     status: TuningStatus
     selected: bool
     warmup_ms: int
@@ -100,30 +100,141 @@ class TuningRun:
         return next((record for record in self.records if record.selected), None)
 
 
+@dataclass(frozen=True, slots=True)
+class _TuningRunContext:
+    tuning: str
+    shape: Mapping[str, Any]
+    phase: ProviderPhase
+    warmup_ms: int
+    measurement_time_ms: int
+    environment: EnvironmentInfo
+
+    def record(
+        self,
+        candidate: TuningCandidate[Any, Any],
+        configuration: Mapping[str, Any],
+        status: TuningStatus,
+        *,
+        timing: Timing | None = None,
+        quality: QualityMetrics | None = None,
+        reason: str | None = None,
+    ) -> TuningRecord:
+        """Create one result while keeping run-wide fields in one place."""
+        return TuningRecord(
+            tuning=self.tuning,
+            candidate=candidate.name,
+            shape=self.shape,
+            configuration=configuration,
+            phase=self.phase,
+            status=status,
+            selected=False,
+            warmup_ms=self.warmup_ms,
+            measurement_time_ms=self.measurement_time_ms,
+            timing=timing,
+            quality=quality,
+            reason=reason,
+            environment=self.environment,
+        )
+
+
+def add_tuning_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add controls shared by every offline tuning CLI."""
+    parser.add_argument(
+        "--phase",
+        type=ProviderPhase,
+        choices=tuple(ProviderPhase),
+        default=ProviderPhase.PREPARED_EXECUTION,
+    )
+    parser.add_argument("--warmup-ms", type=int, default=50)
+    parser.add_argument("--measurement-time-ms", type=int, default=200)
+    parser.add_argument("--minimum-sqnr-db", type=float, default=20.0)
+    parser.add_argument("--max-candidates", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=0)
+    add_output_arguments(parser, record_name="tuning candidate")
+
+
+def validate_tuning_arguments(arguments: argparse.Namespace) -> None:
+    """Validate controls shared by every offline tuning CLI."""
+    if arguments.warmup_ms < 0 or arguments.measurement_time_ms <= 0:
+        raise SystemExit("warmup must be non-negative and measurement time must be positive")
+    if not math.isfinite(arguments.minimum_sqnr_db):
+        raise SystemExit("minimum SQNR must be finite")
+    if arguments.max_candidates <= 0:
+        raise SystemExit("maximum candidate count must be positive")
+
+
+def tuning_axis[T](values: Sequence[T] | None, production_value: T) -> tuple[T, ...]:
+    """Resolve one optional tuning axis and remove duplicate explicit values."""
+    return (production_value,) if values is None else tuple(dict.fromkeys(values))
+
+
+def boolean_tuning_axis(value: bool | None, production_value: bool) -> tuple[bool, ...]:
+    """Resolve one Boolean optional action against its production value."""
+    return (production_value if value is None else value,)
+
+
+def optional_integer_tuning_axis(
+    values: Sequence[str] | None,
+    production_value: int | None,
+) -> tuple[int | None, ...]:
+    """Resolve a tuning axis whose CLI spelling uses ``none`` for ``None``."""
+    if values is None:
+        return (production_value,)
+    resolved = (None if value == "none" else int(value) for value in values)
+    return tuple(dict.fromkeys(resolved))
+
+
+def tuning_candidate_count(axes: Sequence[Sequence[object]]) -> int:
+    """Return the size of a Cartesian tuning search without materializing it."""
+    return math.prod(len(axis) for axis in axes)
+
+
+def meets_minimum_sqnr(quality: QualityMetrics, minimum_sqnr_db: float) -> bool:
+    """Apply the common finite-output and SQNR quality gate."""
+    return quality.nonfinite_mismatch_count == 0 and quality.sqnr_db >= minimum_sqnr_db
+
+
+def print_tuning_results(records: Sequence[TuningRecord]) -> None:
+    """Print the common compact tuning-result table."""
+    print("| candidate | status | selected | p50 (ms) | SQNR (dB) | reason |")
+    print("|:---|:---|:---:|---:|---:|:---|")
+    for record in records:
+        timing = "-" if record.timing is None else f"{record.timing.median_ms:.3f}"
+        quality = "-" if record.quality is None else f"{record.quality.sqnr_db:.2f}"
+        print(
+            f"| {record.candidate} | {record.status.value} | {record.selected} "
+            f"| {timing} | {quality} | {record.reason or ''} |"
+        )
+
+
 def _reason(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-def tune_candidates(
+def _phase_timer(
+    provider: BenchmarkProvider[Any, Any],
+    phase: ProviderPhase,
+    device_timer: DistributionTimer,
+) -> DistributionTimer:
+    """Select the timer matching a provider execution boundary."""
+    if phase is ProviderPhase.PREPARED_EXECUTION:
+        return device_timer
+    return partial(
+        synchronized_wall_benchmark,
+        synchronize=provider.synchronize,
+    )
+
+
+def _validate_tuning_run[PreparedT, OutputT](
     candidates: Sequence[TuningCandidate[PreparedT, OutputT]],
     *,
     tuning: str,
-    shape: Mapping[str, Any],
-    environment: EnvironmentInfo,
-    phase: TuningPhase = TuningPhase.PREPARED_EXECUTION,
-    warmup_ms: int = 50,
-    measurement_time_ms: int = 200,
-    measure_candidate_quality: Callable[[OutputT], QualityMetrics] | None = None,
-    quality_gate: Callable[[QualityMetrics], bool] | None = None,
-    device_timer: DistributionTimer = triton_benchmark,
-) -> TuningRun:
-    """Measure candidates and select the fastest one that passes quality checks.
-
-    Candidate factories define kernel-specific legality and launch details. Raise
-    :class:`UnsupportedTuningCandidateError` for an unsupported configuration. Triton
-    out-of-resource failures are skipped automatically. Unexpected exceptions propagate
-    so compiler and benchmark bugs remain visible.
-    """
+    warmup_ms: int,
+    measurement_time_ms: int,
+    measure_candidate_quality: Callable[[OutputT], QualityMetrics] | None,
+    quality_gate: Callable[[QualityMetrics], bool] | None,
+) -> None:
+    """Validate invariants required by the shared candidate loop."""
     if not candidates:
         raise ValueError("at least one tuning candidate is required")
     if not tuning:
@@ -138,6 +249,44 @@ def tune_candidates(
     if len(set(names)) != len(names):
         raise ValueError("tuning candidate names must be unique")
 
+
+def tune_candidates(
+    candidates: Sequence[TuningCandidate[PreparedT, OutputT]],
+    *,
+    tuning: str,
+    shape: Mapping[str, Any],
+    environment: EnvironmentInfo,
+    phase: ProviderPhase = ProviderPhase.PREPARED_EXECUTION,
+    warmup_ms: int = 50,
+    measurement_time_ms: int = 200,
+    measure_candidate_quality: Callable[[OutputT], QualityMetrics] | None = None,
+    quality_gate: Callable[[QualityMetrics], bool] | None = None,
+    device_timer: DistributionTimer = triton_benchmark,
+) -> TuningRun:
+    """Measure candidates and select the fastest one that passes quality checks.
+
+    Candidate factories define kernel-specific legality and launch details. Raise
+    :class:`UnsupportedTuningCandidateError` for an unsupported configuration. Triton
+    out-of-resource failures are skipped automatically. Unexpected exceptions propagate
+    so compiler and benchmark bugs remain visible.
+    """
+    _validate_tuning_run(
+        candidates,
+        tuning=tuning,
+        warmup_ms=warmup_ms,
+        measurement_time_ms=measurement_time_ms,
+        measure_candidate_quality=measure_candidate_quality,
+        quality_gate=quality_gate,
+    )
+
+    context = _TuningRunContext(
+        tuning=tuning,
+        shape=shape,
+        phase=phase,
+        warmup_ms=warmup_ms,
+        measurement_time_ms=measurement_time_ms,
+        environment=environment,
+    )
     skipped_errors = (UnsupportedTuningCandidateError, OutOfResources)
     records: list[TuningRecord] = []
     for candidate in candidates:
@@ -145,76 +294,43 @@ def tune_candidates(
         try:
             provider = candidate.make_provider()
             configuration.update(provider.configuration)
-            if phase is TuningPhase.PREPARED_EXECUTION:
-                prepared = provider.prepare()
-
-                launch = partial(provider.run, prepared)
-                output = launch()
-                provider.synchronize()
-                timer = device_timer
-            else:
-                launch = provider.run_operator
-                output = launch()
-                provider.synchronize()
-
-                timer = partial(
-                    synchronized_wall_benchmark,
-                    synchronize=provider.synchronize,
-                )
+            launch = provider_phase_launch(provider, phase)
+            output = launch()
+            provider.synchronize()
+            timer = _phase_timer(provider, phase, device_timer)
 
             quality = (
                 measure_candidate_quality(output) if measure_candidate_quality is not None else None
             )
             if quality is not None and quality_gate is not None and not quality_gate(quality):
                 records.append(
-                    TuningRecord(
-                        tuning=tuning,
-                        candidate=candidate.name,
-                        shape=shape,
-                        configuration=configuration,
-                        phase=phase,
-                        status=TuningStatus.QUALITY_REJECTED,
-                        selected=False,
-                        warmup_ms=warmup_ms,
-                        measurement_time_ms=measurement_time_ms,
+                    context.record(
+                        candidate,
+                        configuration,
+                        TuningStatus.QUALITY_REJECTED,
                         quality=quality,
                         reason="quality gate rejected candidate",
-                        environment=environment,
                     )
                 )
                 continue
 
             timing = timer(launch, warmup_ms, measurement_time_ms)
             records.append(
-                TuningRecord(
-                    tuning=tuning,
-                    candidate=candidate.name,
-                    shape=shape,
-                    configuration=configuration,
-                    phase=phase,
-                    status=TuningStatus.MEASURED,
-                    selected=False,
-                    warmup_ms=warmup_ms,
-                    measurement_time_ms=measurement_time_ms,
+                context.record(
+                    candidate,
+                    configuration,
+                    TuningStatus.MEASURED,
                     timing=timing,
                     quality=quality,
-                    environment=environment,
                 )
             )
         except skipped_errors as error:
             records.append(
-                TuningRecord(
-                    tuning=tuning,
-                    candidate=candidate.name,
-                    shape=shape,
-                    configuration=configuration,
-                    phase=phase,
-                    status=TuningStatus.SKIPPED,
-                    selected=False,
-                    warmup_ms=warmup_ms,
-                    measurement_time_ms=measurement_time_ms,
+                context.record(
+                    candidate,
+                    configuration,
+                    TuningStatus.SKIPPED,
                     reason=_reason(error),
-                    environment=environment,
                 )
             )
 

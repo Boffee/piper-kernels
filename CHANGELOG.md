@@ -5,6 +5,24 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Quality-gated offline ConvRot INT8 forward-linear execution-plan tuning across dynamic
+  preparation and GEMM schedules, with stratified large-shape output validation.
+
+### Changed
+
+- Centralized ConvRot INT8 preparation and GEMM launch policy in one flat immutable execution
+  plan shared by production, benchmark metadata, and offline tuning, with injectable preparation
+  and launch boundaries for development measurements. Supported CUDA SwiGLU dispatch now leaves
+  fused-versus-split preparation exclusively to that plan. ConvRot benchmarking and tuning now
+  share one reproducible workload, sampled-reference, metadata, and provider-adapter harness;
+  benchmark timing, offline tuning, and profiling also share one provider-phase launch contract.
+  Benchmark support consumers now import helpers from their owning `lib.*` modules instead of a
+  flattened package export surface. Offline tuners also share their common CLI controls, search
+  axes, quality gate, result rendering, and record construction, while ConvRot tuning consumes
+  legal schedule values directly from production policy.
+
 ## [0.2.1] - 2026-08-10
 
 ### Added

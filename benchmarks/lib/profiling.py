@@ -5,22 +5,14 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Protocol, TypeVar
 
 import torch
 
-from .providers import BenchmarkProvider
+from .providers import BenchmarkProvider, ProviderPhase, provider_phase_launch
 
 PreparedT = TypeVar("PreparedT")
 OutputT = TypeVar("OutputT")
-
-
-class ProfilePhase(StrEnum):
-    """Provider phase launched inside the capture range."""
-
-    PREPARED_EXECUTION = "prepared_execution"
-    OPERATOR_END_TO_END = "operator_end_to_end"
 
 
 class CaptureController(Protocol):
@@ -71,7 +63,7 @@ class ProviderProfile:
     """Summary of a completed provider capture."""
 
     provider: str
-    phase: ProfilePhase
+    phase: ProviderPhase
     iterations: int
     warmup_iterations: int
     range_name: str
@@ -101,7 +93,7 @@ def profile_provider(
     *,
     iterations: int,
     warmup_iterations: int = 5,
-    phase: ProfilePhase = ProfilePhase.OPERATOR_END_TO_END,
+    phase: ProviderPhase = ProviderPhase.OPERATOR_END_TO_END,
     range_name: str = "profile",
     include_setup: bool = False,
     controller: CaptureController | None = None,
@@ -119,14 +111,7 @@ def profile_provider(
     if not range_name:
         raise ValueError("profile range name cannot be empty")
 
-    if phase is ProfilePhase.PREPARED_EXECUTION:
-        prepared = provider.prepare()
-
-        def launch() -> OutputT:
-            return provider.run(prepared)
-
-    else:
-        launch = provider.run_operator
+    launch = provider_phase_launch(provider, phase)
 
     capture = controller or CudaProfilerController()
     if not include_setup:
@@ -170,9 +155,9 @@ def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile-warmup-iterations", type=int, default=5)
     parser.add_argument(
         "--profile-phase",
-        type=ProfilePhase,
-        choices=tuple(ProfilePhase),
-        default=ProfilePhase.OPERATOR_END_TO_END,
+        type=ProviderPhase,
+        choices=tuple(ProviderPhase),
+        default=ProviderPhase.OPERATOR_END_TO_END,
     )
     parser.add_argument("--profile-range-name", default="profile")
     parser.add_argument(

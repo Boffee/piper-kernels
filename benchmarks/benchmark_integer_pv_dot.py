@@ -17,24 +17,22 @@ from pathlib import Path
 import torch
 import triton
 import triton.language as tl
-from lib import (
-    BenchmarkProvider,
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.profiling import add_profile_arguments, profile_provider
+from lib.providers import BenchmarkProvider, measure_provider
+from lib.quality import measure_quality, measure_saturation
+from lib.reporting import (
     BenchmarkRecord,
-    EnvironmentInfo,
     OutputTarget,
+    add_output_arguments,
+    output_target,
+    write_records,
+)
+from lib.triton_inspection import (
     TritonCompilerRecord,
     add_compiler_inspection_arguments,
-    add_output_arguments,
-    add_profile_arguments,
-    capture_environment,
     format_compiler_report,
     inspect_provider,
-    measure_provider,
-    measure_quality,
-    measure_saturation,
-    output_target,
-    profile_provider,
-    write_records,
 )
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook, uint8_int8_dot

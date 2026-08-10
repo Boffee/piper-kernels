@@ -1,0 +1,238 @@
+"""Shared workload and provider adapters for ConvRot benchmarking and tuning."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+
+import torch
+
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.convrot.int8 import _policy as convrot_policy
+from piper_kernels.convrot.int8 import triton as convrot_backend
+from piper_kernels.convrot.int8.reference import reference_linear, reference_swiglu_linear
+
+from .convrot import (
+    ConvRotConfig,
+    ConvRotInputs,
+    ConvRotShape,
+    make_convrot_inputs,
+    quality_row_indices,
+)
+from .providers import BenchmarkProvider, ProviderMeasurement
+from .quality import QualityMetrics, measure_quality
+
+
+@dataclass(frozen=True, slots=True)
+class ConvRotWorkload:
+    """Tensors, policy, and sampled-reference boundary for one ConvRot case."""
+
+    shape: ConvRotShape
+    config: ConvRotConfig
+    inputs: ConvRotInputs
+    production_plan: convrot_policy.ConvRotInt8LinearExecutionPlan
+    sampled_row_indices: tuple[int, ...]
+    quality_index: torch.Tensor
+
+    @property
+    def input_preparation(self) -> str | None:
+        """Return the selected public SwiGLU preparation description."""
+        if self.shape.input_activation is None:
+            return None
+        return "fused" if self.production_plan.fuse_rotation_quantization else "materialized"
+
+    def common_configuration(self) -> dict[str, object]:
+        """Return provider-neutral workload metadata."""
+        logical_input_layout = "up_gate" if self.shape.input_activation == "swiglu" else "plain"
+        return {
+            **self.config.as_dict(),
+            "input_activation": self.shape.input_activation or "none",
+            "logical_input_layout": logical_input_layout,
+            "provider_input_layout": logical_input_layout,
+            "has_bias": self.shape.has_bias,
+            "prepared_execution_scope": "complete_operator_on_fixed_source_tensors",
+        }
+
+    def sampled_reference(self) -> torch.Tensor:
+        """Evaluate the portable reference only on the declared quality rows."""
+        _activation, qdata, scale, bias = self.inputs
+        sampled_activation = self.inputs[0].index_select(0, self.quality_index)
+        return _run_convrot_reference(self, (sampled_activation, qdata, scale, bias))
+
+    def measure_sampled_quality(
+        self,
+        output: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> QualityMetrics:
+        """Measure sampled output quality against a matching sampled reference."""
+        actual = output.index_select(0, self.quality_index)
+        return measure_quality(actual, expected)
+
+
+def make_convrot_workload(
+    shape: ConvRotShape,
+    config: ConvRotConfig,
+    *,
+    device: torch.device,
+    maximum_quality_rows: int = 256,
+    target: AcceleratorTarget | None = None,
+) -> ConvRotWorkload:
+    """Create shared tensors, production policy, and quality sampling metadata."""
+    inputs = make_convrot_inputs(shape, config, device=device)
+    activation, qdata, _scale, _bias = inputs
+    production_plan = convrot_backend._default_convrot_int8_execution_plan(
+        activation,
+        qdata,
+        config.group_size,
+        apply_swiglu=shape.input_activation == "swiglu",
+        target=target,
+    )
+    sampled_row_indices = quality_row_indices(shape, maximum_rows=maximum_quality_rows)
+    quality_index = torch.tensor(sampled_row_indices, device=device)
+    return ConvRotWorkload(
+        shape=shape,
+        config=config,
+        inputs=inputs,
+        production_plan=production_plan,
+        sampled_row_indices=sampled_row_indices,
+        quality_index=quality_index,
+    )
+
+
+def _run_convrot_reference(
+    workload: ConvRotWorkload,
+    inputs: ConvRotInputs,
+) -> torch.Tensor:
+    """Run the matching portable reference on the supplied workload inputs."""
+    activation, qdata, scale, bias = inputs
+    if workload.shape.input_activation == "swiglu":
+        return reference_swiglu_linear(
+            activation,
+            qdata,
+            scale,
+            workload.config.group_size,
+            bias,
+        )
+    return reference_linear(
+        activation,
+        qdata,
+        scale,
+        workload.config.group_size,
+        bias,
+    )
+
+
+def make_public_convrot_provider(
+    workload: ConvRotWorkload,
+) -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:
+    """Build a provider that exercises normal production dispatch."""
+    shape = workload.shape
+    config = workload.config
+    _activation, qdata, scale, bias = workload.inputs
+    weight = ConvRotInt8Tensor.from_quantized(
+        qdata,
+        scale,
+        group_size=config.group_size,
+        logical_dtype=config.dtype,
+    )
+
+    def run(prepared: ConvRotInputs) -> torch.Tensor:
+        prepared_activation = prepared[0]
+        if shape.input_activation == "swiglu":
+            return convrot_linear(
+                prepared_activation,
+                weight,
+                bias,
+                input_activation="swiglu",
+            )
+        return torch.nn.functional.linear(prepared_activation, weight, bias)
+
+    return BenchmarkProvider(
+        name="piper-convrot",
+        prepare=lambda: workload.inputs,
+        run=run,
+        synchronize=torch.cuda.synchronize,
+        configuration={
+            **workload.common_configuration(),
+            "operation_entrypoint": (
+                "piper_kernels.convrot.convrot_linear"
+                if shape.input_activation == "swiglu"
+                else "torch.nn.functional.linear"
+            ),
+            "input_preparation": workload.input_preparation or "none",
+            **workload.production_plan.as_dict(),
+        },
+    )
+
+
+def make_reference_convrot_provider(
+    workload: ConvRotWorkload,
+) -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:
+    """Build the matching full-width portable reference provider."""
+    return BenchmarkProvider(
+        name="torch-reference",
+        prepare=lambda: workload.inputs,
+        run=lambda prepared: _run_convrot_reference(workload, prepared),
+        synchronize=torch.cuda.synchronize,
+        configuration={
+            **workload.common_configuration(),
+            "operation_entrypoint": (
+                "piper_kernels.convrot.int8.reference.reference_swiglu_linear"
+                if workload.shape.input_activation == "swiglu"
+                else "piper_kernels.convrot.int8.reference.reference_linear"
+            ),
+            "input_preparation": ("materialized" if workload.shape.input_activation else "none"),
+        },
+    )
+
+
+def planned_convrot_configuration(
+    workload: ConvRotWorkload,
+    plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
+) -> dict[str, object]:
+    """Return complete metadata for one explicitly injected execution plan."""
+    return {
+        **workload.common_configuration(),
+        "algorithm": "convrot_int8_linear",
+        "quality_rows": len(workload.sampled_row_indices),
+        "quality_row_indices": workload.sampled_row_indices,
+        **plan.as_dict(),
+    }
+
+
+def make_planned_convrot_provider(
+    workload: ConvRotWorkload,
+    plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
+    *,
+    name: str,
+) -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:
+    """Build a provider that injects one plan into the complete device pipeline."""
+
+    def run(prepared: ConvRotInputs) -> torch.Tensor:
+        activation, qdata, scale, bias = prepared
+        return convrot_backend._run_convrot_int8_linear(
+            activation,
+            qdata,
+            scale,
+            bias,
+            workload.config.group_size,
+            apply_swiglu=workload.shape.input_activation == "swiglu",
+            execution_plan=plan,
+        )
+
+    return BenchmarkProvider(
+        name=name,
+        prepare=lambda: workload.inputs,
+        run=run,
+        synchronize=torch.cuda.synchronize,
+        configuration=planned_convrot_configuration(workload, plan),
+    )
+
+
+def sample_convrot_measurement(
+    workload: ConvRotWorkload,
+    measurement: ProviderMeasurement[torch.Tensor],
+) -> ProviderMeasurement[torch.Tensor]:
+    """Retain sampled rows before releasing a potentially multi-gigabyte output."""
+    sampled = measurement.output.index_select(0, workload.quality_index)
+    return replace(measurement, output=sampled)

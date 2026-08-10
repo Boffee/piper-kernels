@@ -7,50 +7,47 @@ import importlib
 import importlib.metadata
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import cast
 
 import torch
-from lib import (
-    BenchmarkProvider,
+from lib.convrot import (
+    CONVROT_DTYPE_NAMES,
+    ConvRotConfig,
+    ConvRotShape,
+    comfy_convrot_input,
+    convrot_dtype,
+    parse_input_activation,
+    raw_input_features,
+)
+from lib.convrot_providers import (
+    make_convrot_workload,
+    make_public_convrot_provider,
+    make_reference_convrot_provider,
+    sample_convrot_measurement,
+)
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.providers import BenchmarkProvider, ProviderMeasurement, measure_provider
+from lib.quality import QualityMetrics, measure_quality
+from lib.reporting import (
     BenchmarkRecord,
-    EnvironmentInfo,
-    ProviderMeasurement,
-    QualityMetrics,
     add_output_arguments,
-    capture_environment,
-    measure_provider,
-    measure_quality,
     output_target,
     write_records,
 )
 
-from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
-from piper_kernels.convrot.int8 import dispatch as convrot_dispatch
-from piper_kernels.convrot.int8.reference import reference_linear, reference_swiglu_linear
+from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 
-@dataclass(slots=True, frozen=True)
-class BenchmarkShape:
-    """One named ConvRot linear shape, where ``in_features`` is linear K."""
-
-    name: str
-    rows: int
-    out_features: int
-    in_features: int
-    input_activation: str | None = None
-    has_bias: bool = True
-
-
-def _minimax_h3_shapes(rows: int) -> tuple[BenchmarkShape, ...]:
+def _minimax_h3_shapes(rows: int) -> tuple[ConvRotShape, ...]:
     """Return the principal bias-free MiniMax H3 transformer projections."""
     return (
-        BenchmarkShape("qkv", rows, 21_504, 5_376, has_bias=False),
-        BenchmarkShape("attention-out", rows, 5_376, 7_168, has_bias=False),
-        BenchmarkShape("mlp-fc1", rows, 28_672, 5_376, has_bias=False),
-        BenchmarkShape(
+        ConvRotShape("qkv", rows, 21_504, 5_376, has_bias=False),
+        ConvRotShape("attention-out", rows, 5_376, 7_168, has_bias=False),
+        ConvRotShape("mlp-fc1", rows, 28_672, 5_376, has_bias=False),
+        ConvRotShape(
             "mlp-fc2",
             rows,
             5_376,
@@ -63,7 +60,6 @@ def _minimax_h3_shapes(rows: int) -> tuple[BenchmarkShape, ...]:
 
 _MINIMAX_H3_5S_SHAPES = _minimax_h3_shapes(37_710)
 _MINIMAX_H3_128K_SHAPES = _minimax_h3_shapes(131_072)
-_MAX_QUALITY_ROWS = 256
 _MAX_SWIGLU_RELATIVE_L2_ERROR = 0.01
 _MAX_COMFY_RELATIVE_L2_ERROR = 0.02
 _CUSTOM_SHAPE_DEFAULTS = {
@@ -115,79 +111,13 @@ class Result:
         )
 
 
-def _dtype(name: str) -> torch.dtype:
-    return {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }[name]
-
-
-def _parse_input_activation(value: str) -> str | None:
-    """Map the CLI compatibility spelling ``none`` to Python ``None``."""
-    if value == "none":
-        return None
-    if value == "swiglu":
-        return value
-    raise argparse.ArgumentTypeError("input activation must be 'none' or 'swiglu'")
-
-
-def _raw_input_features(shape: BenchmarkShape) -> int:
-    """Return the source width before applying an optional input activation."""
-    return shape.in_features * (2 if shape.input_activation == "swiglu" else 1)
-
-
-def _quality_row_indices(shape: BenchmarkShape) -> tuple[int, ...]:
-    """Stratify quality rows and retain every first signed-32-bit crossing."""
-    target = min(shape.rows, _MAX_QUALITY_ROWS)
-    if target == shape.rows:
-        return tuple(range(shape.rows))
-
-    sampled = {round(index * (shape.rows - 1) / (target - 1)) for index in range(target)}
-    critical = {0, shape.rows - 1}
-    raw_input_width = _raw_input_features(shape)
-    for row_width in (raw_input_width, shape.in_features, shape.out_features):
-        boundary = ((1 << 31) + row_width - 1) // row_width
-        critical.update(
-            row for row in (boundary - 1, boundary, boundary + 1) if 0 <= row < shape.rows
-        )
-
-    for row in sorted(critical):
-        if row in sampled:
-            continue
-        victim = min(sampled - critical, key=lambda candidate: abs(candidate - row))
-        sampled.remove(victim)
-        sampled.add(row)
-    return tuple(sorted(sampled))
-
-
-def _apply_input_activation(activation: torch.Tensor, input_activation: str | None) -> torch.Tensor:
-    """Apply the benchmark's public raw-input activation contract."""
-    if input_activation is None:
-        return activation
-    if input_activation != "swiglu":
-        raise ValueError(f"unsupported input activation {input_activation!r}")
-    up, gate = activation.chunk(2, dim=-1)
-    return up * torch.nn.functional.silu(gate)
-
-
-def _comfy_input(activation: torch.Tensor, input_activation: str | None) -> torch.Tensor:
-    """Adapt Piper's [up|gate] contract to Comfy Kitchen 0.2.x [gate|up]."""
-    if input_activation is None:
-        return activation
-    if input_activation != "swiglu":
-        raise ValueError(f"unsupported input activation {input_activation!r}")
-    up, gate = activation.chunk(2, dim=-1)
-    return torch.cat((gate, up), dim=-1)
-
-
-def _assert_quality(
+def _validated_quality(
     actual: torch.Tensor,
     expected: torch.Tensor,
     input_activation: str | None,
-) -> None:
+) -> QualityMetrics:
+    quality = measure_quality(actual, expected)
     if input_activation == "swiglu":
-        quality = measure_quality(actual, expected)
         if (
             quality.nonfinite_mismatch_count
             or quality.relative_l2_error > _MAX_SWIGLU_RELATIVE_L2_ERROR
@@ -197,17 +127,9 @@ def _assert_quality(
                 f"relative L2 {quality.relative_l2_error:.6f}, "
                 f"non-finite mismatches {quality.nonfinite_mismatch_count}"
             )
-        return
-    torch.testing.assert_close(actual, expected)
-
-
-def _sample_measurement(
-    measurement: ProviderMeasurement[torch.Tensor],
-    quality_index: torch.Tensor,
-) -> ProviderMeasurement[torch.Tensor]:
-    """Drop a potentially multi-gigabyte result after retaining sampled rows."""
-    sampled = measurement.output.index_select(0, quality_index)
-    return replace(measurement, output=sampled)
+    else:
+        torch.testing.assert_close(actual, expected)
+    return quality
 
 
 def _package_version(distribution: str, module: ModuleType) -> str:
@@ -241,45 +163,9 @@ def _comfy_backend_context(
     return cast(AbstractContextManager[object], use_backend("cuda"))
 
 
-def _selected_input_preparation(
-    activation: torch.Tensor,
-    qdata: torch.Tensor,
-    group_size: int,
-    input_activation: str | None,
-) -> str | None:
-    """Report the input-activation preparation selected by public dispatch."""
-    if input_activation is None:
-        return None
-    if input_activation != "swiglu":
-        raise ValueError(f"unsupported input activation {input_activation!r}")
-    if convrot_dispatch._can_use_triton_swiglu(activation, qdata, group_size):
-        return "fused"
-    return "materialized"
-
-
-def _common_provider_configuration(
-    shape: BenchmarkShape,
-    group_size: int,
-    dtype: torch.dtype,
-    seed: int,
-) -> dict[str, object]:
-    """Return provider-neutral operation settings for one ConvRot case."""
-    logical_input_layout = "up_gate" if shape.input_activation == "swiglu" else "plain"
-    return {
-        "dtype": str(dtype).removeprefix("torch."),
-        "group_size": group_size,
-        "input_activation": shape.input_activation or "none",
-        "logical_input_layout": logical_input_layout,
-        "provider_input_layout": logical_input_layout,
-        "has_bias": shape.has_bias,
-        "seed": seed,
-        "prepared_execution_scope": "complete_operator_on_fixed_source_tensors",
-    }
-
-
 def _comfy_provider_configuration(
     common_configuration: dict[str, object],
-    shape: BenchmarkShape,
+    shape: ConvRotShape,
     installed_version: str,
 ) -> dict[str, object]:
     """Describe Comfy Kitchen's public operator and input-layout adaptation."""
@@ -293,162 +179,54 @@ def _comfy_provider_configuration(
     }
 
 
-def _reference_provider_configuration(
-    common_configuration: dict[str, object],
-    shape: BenchmarkShape,
-) -> dict[str, object]:
-    """Describe the portable reference entrypoint and its input preparation."""
-    return {
-        **common_configuration,
-        "operation_entrypoint": (
-            "piper_kernels.convrot.int8.reference.reference_swiglu_linear"
-            if shape.input_activation == "swiglu"
-            else "piper_kernels.convrot.int8.reference.reference_linear"
-        ),
-        "input_preparation": "materialized" if shape.input_activation else "none",
-    }
-
-
 @torch.inference_mode()
 def _run_shape(
-    shape: BenchmarkShape,
-    group_size: int,
-    dtype: torch.dtype,
-    seed: int,
+    shape: ConvRotShape,
+    config: ConvRotConfig,
     warmup_ms: int,
     measurement_time_ms: int,
     comfy_kitchen: ModuleType | None,
     skip_reference_timing: bool,
 ) -> Result:
-    rows = shape.rows
-    out_features = shape.out_features
-    in_features = shape.in_features
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    qdata = torch.randint(
-        -127,
-        128,
-        (out_features, in_features),
-        device="cuda",
-        dtype=torch.int8,
-        generator=generator,
+    workload = make_convrot_workload(
+        shape,
+        config,
+        device=torch.device("cuda"),
     )
-    scale = (
-        torch.rand(
-            out_features,
-            1,
-            device="cuda",
-            dtype=torch.float32,
-            generator=generator,
-        )
-        * 0.01
-    )
-    activation = torch.randn(
-        rows,
-        _raw_input_features(shape),
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
-    )
-    bias = (
-        torch.randn(out_features, device="cuda", dtype=dtype, generator=generator)
-        if shape.has_bias
-        else None
-    )
-    weight = ConvRotInt8Tensor.from_quantized(
-        qdata,
-        scale,
-        group_size=group_size,
-        logical_dtype=dtype,
-    )
-    input_preparation = _selected_input_preparation(
-        activation,
-        qdata,
-        group_size,
-        shape.input_activation,
-    )
-
-    quality_row_indices = _quality_row_indices(shape)
-    quality_index = torch.tensor(quality_row_indices, device="cuda")
-
-    def reference(value: torch.Tensor = activation) -> torch.Tensor:
-        if shape.input_activation == "swiglu":
-            return reference_swiglu_linear(
-                value,
-                qdata,
-                scale,
-                group_size,
-                bias,
-            )
-        return reference_linear(
-            value,
-            qdata,
-            scale,
-            group_size,
-            bias,
-        )
-
-    def piper_operator() -> torch.Tensor:
-        if shape.input_activation == "swiglu":
-            return convrot_linear(
-                activation,
-                weight,
-                bias,
-                input_activation="swiglu",
-            )
-        return torch.nn.functional.linear(activation, weight, bias)
-
-    common_config = _common_provider_configuration(shape, group_size, dtype, seed)
-    piper_config = {
-        **common_config,
-        "operation_entrypoint": (
-            "piper_kernels.convrot.convrot_linear"
-            if shape.input_activation == "swiglu"
-            else "torch.nn.functional.linear"
-        ),
-        "input_preparation": input_preparation or "none",
-    }
     piper_measurement = measure_provider(
-        BenchmarkProvider(
-            name="piper-convrot",
-            prepare=lambda: None,
-            run=lambda _prepared: piper_operator(),
-            synchronize=torch.cuda.synchronize,
-            configuration=piper_config,
-        ),
+        make_public_convrot_provider(workload),
         warmup_ms=warmup_ms,
         measurement_time_ms=measurement_time_ms,
         measure_preparation=False,
     )
-    piper_measurement = _sample_measurement(piper_measurement, quality_index)
+    piper_measurement = sample_convrot_measurement(workload, piper_measurement)
 
     if skip_reference_timing:
         reference_measurement = None
-        sampled_activation = activation.index_select(0, quality_index)
-        reference_quality_output = reference(sampled_activation)
+        reference_quality_output = workload.sampled_reference()
     else:
-        reference_config = _reference_provider_configuration(common_config, shape)
-        full_reference_measurement = measure_provider(
-            BenchmarkProvider(
-                name="torch-reference",
-                prepare=lambda: None,
-                run=lambda _prepared: reference(),
-                synchronize=torch.cuda.synchronize,
-                configuration=reference_config,
+        reference_measurement = sample_convrot_measurement(
+            workload,
+            measure_provider(
+                make_reference_convrot_provider(workload),
+                warmup_ms=warmup_ms,
+                measurement_time_ms=measurement_time_ms,
+                measure_first_call=False,
+                measure_preparation=False,
             ),
-            warmup_ms=warmup_ms,
-            measurement_time_ms=measurement_time_ms,
-            measure_first_call=False,
-            measure_preparation=False,
         )
-        reference_measurement = _sample_measurement(full_reference_measurement, quality_index)
-        del full_reference_measurement
         reference_quality_output = reference_measurement.output
-    _assert_quality(piper_measurement.output, reference_quality_output, shape.input_activation)
+    piper_quality = _validated_quality(
+        piper_measurement.output,
+        reference_quality_output,
+        shape.input_activation,
+    )
 
     comfy_measurement = None
     comfy_quality = None
     if comfy_kitchen is not None:
-        comfy_activation = _comfy_input(activation, shape.input_activation)
+        activation, qdata, scale, bias = workload.inputs
+        comfy_activation = comfy_convrot_input(activation, shape.input_activation)
 
         def comfy_optimized() -> torch.Tensor:
             return comfy_kitchen.int8_linear(
@@ -456,32 +234,33 @@ def _run_shape(
                 qdata,
                 scale,
                 bias,
-                dtype,
+                config.dtype,
                 convrot=True,
-                convrot_groupsize=group_size,
+                convrot_groupsize=config.group_size,
                 input_act=shape.input_activation,
             )
 
         comfy_config = _comfy_provider_configuration(
-            common_config,
+            workload.common_configuration(),
             shape,
             _package_version("comfy-kitchen", comfy_kitchen),
         )
         with _comfy_backend_context(comfy_kitchen):
-            full_comfy_measurement = measure_provider(
-                BenchmarkProvider(
-                    name="comfy-kitchen",
-                    prepare=lambda: None,
-                    run=lambda _prepared: comfy_optimized(),
-                    synchronize=torch.cuda.synchronize,
-                    configuration=comfy_config,
+            comfy_measurement = sample_convrot_measurement(
+                workload,
+                measure_provider(
+                    BenchmarkProvider(
+                        name="comfy-kitchen",
+                        prepare=lambda: workload.inputs,
+                        run=lambda _prepared: comfy_optimized(),
+                        synchronize=torch.cuda.synchronize,
+                        configuration=comfy_config,
+                    ),
+                    warmup_ms=warmup_ms,
+                    measurement_time_ms=measurement_time_ms,
+                    measure_preparation=False,
                 ),
-                warmup_ms=warmup_ms,
-                measurement_time_ms=measurement_time_ms,
-                measure_preparation=False,
             )
-        comfy_measurement = _sample_measurement(full_comfy_measurement, quality_index)
-        del full_comfy_measurement
         comfy_quality = measure_quality(comfy_measurement.output, reference_quality_output)
         if (
             comfy_quality.nonfinite_mismatch_count
@@ -494,11 +273,11 @@ def _run_shape(
             )
 
     return Result(
-        quality_row_indices=quality_row_indices,
-        input_preparation=input_preparation,
+        quality_row_indices=workload.sampled_row_indices,
+        input_preparation=workload.input_preparation,
         piper=piper_measurement,
         reference=reference_measurement,
-        quality=measure_quality(piper_measurement.output, reference_quality_output),
+        quality=piper_quality,
         comfy_kitchen=comfy_measurement,
         comfy_kitchen_quality=comfy_quality,
     )
@@ -531,10 +310,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=argparse.SUPPRESS,
         help=("custom-shape linear/weight width K; raw SwiGLU input width is 2K (default: 4096)"),
     )
-    parser.add_argument("--group-size", type=int, choices=[16, 64, 256], default=256)
+    parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
-        type=_parse_input_activation,
+        type=parse_input_activation,
         metavar="{none,swiglu}",
         default=argparse.SUPPRESS,
         help="custom-shape raw-input activation; SwiGLU expects [up | gate] with width 2K",
@@ -547,7 +326,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        choices=["bfloat16", "float16", "float32"],
+        choices=CONVROT_DTYPE_NAMES,
         default="bfloat16",
     )
     parser.add_argument("--warmup-ms", type=int, default=100)
@@ -577,13 +356,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return arguments
 
 
-def _benchmark_shapes(args: argparse.Namespace) -> tuple[BenchmarkShape, ...]:
+def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
     if args.preset == "minimax-h3-5s":
         return _MINIMAX_H3_5S_SHAPES
     if args.preset == "minimax-h3-128k":
         return _MINIMAX_H3_128K_SHAPES
     return tuple(
-        BenchmarkShape(
+        ConvRotShape(
             "custom",
             rows,
             args.out_features,
@@ -599,19 +378,17 @@ def _skip_reference_timing(args: argparse.Namespace) -> bool:
     return args.skip_reference_timing or args.preset == "minimax-h3-128k"
 
 
-def _validate_args(args: argparse.Namespace, shapes: Sequence[BenchmarkShape]) -> None:
+def _validate_args(args: argparse.Namespace) -> None:
     if args.preset != "custom" and args.custom_shape_options:
         options = ", ".join(args.custom_shape_options)
         raise SystemExit(f"--preset {args.preset} cannot be combined with {options}")
-    if any(
-        dimension <= 0
-        for shape in shapes
-        for dimension in (shape.rows, shape.out_features, shape.in_features)
+    if args.preset == "custom" and (
+        any(rows <= 0 for rows in args.rows) or args.out_features <= 0 or args.in_features <= 0
     ):
         raise SystemExit("rows, out_features, and in_features must all be positive")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
-    if any(shape.in_features % args.group_size for shape in shapes):
+    if args.preset == "custom" and args.in_features % args.group_size:
         raise SystemExit("every in_features value must be divisible by --group-size")
     if args.compare_comfy_kitchen and args.dtype == "float32":
         raise SystemExit("comfy-kitchen comparison supports float16 and bfloat16")
@@ -645,7 +422,7 @@ def _print_header(compare_comfy_kitchen: bool, skip_reference_timing: bool) -> N
     print("|" + "|".join(":---" if index < 4 else "---:" for index in range(len(columns))) + "|")
 
 
-def _print_result(shape: BenchmarkShape, result: Result) -> None:
+def _print_result(shape: ConvRotShape, result: Result) -> None:
     first_call_ms = result.piper.timings.first_call_ms
     assert first_call_ms is not None
     cells = [
@@ -656,7 +433,7 @@ def _print_result(shape: BenchmarkShape, result: Result) -> None:
         str(shape.rows),
         str(shape.out_features),
         str(shape.in_features),
-        str(_raw_input_features(shape)),
+        str(raw_input_features(shape.in_features, shape.input_activation)),
         f"{first_call_ms:.3f}",
         result.piper.timings.prepared_execution.display(),
     ]
@@ -677,17 +454,11 @@ def _print_result(shape: BenchmarkShape, result: Result) -> None:
 
 
 def _records_for_result(
-    shape: BenchmarkShape,
+    shape: ConvRotShape,
     result: Result,
     environment: EnvironmentInfo,
 ) -> list[BenchmarkRecord]:
-    shape_record = {
-        "case": shape.name,
-        "rows": shape.rows,
-        "out_features": shape.out_features,
-        "in_features": shape.in_features,
-        "raw_input_features": _raw_input_features(shape),
-    }
+    shape_record = shape.as_dict()
     measurements = [
         (result.piper, result.quality),
         (result.comfy_kitchen, result.comfy_kitchen_quality),
@@ -724,12 +495,16 @@ def _records_for_result(
 def main(argv: Sequence[str] | None = None) -> None:
     """Run the requested benchmark matrix and print a Markdown table."""
     args = _parse_args(argv)
+    _validate_args(args)
     shapes = _benchmark_shapes(args)
-    _validate_args(args, shapes)
     if not torch.cuda.is_available():
         raise SystemExit("ConvRot benchmarking requires a Triton-supported GPU")
 
-    dtype = _dtype(args.dtype)
+    config = ConvRotConfig(
+        dtype=convrot_dtype(args.dtype),
+        group_size=args.group_size,
+        seed=args.seed,
+    )
     comfy_kitchen = _load_comfy_kitchen() if args.compare_comfy_kitchen else None
     skip_reference_timing = _skip_reference_timing(args)
     environment = capture_environment(Path(__file__).resolve().parents[1])
@@ -737,7 +512,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"GPU: {environment.gpu_name}; backend: {environment.accelerator_backend}; "
         f"architecture: {environment.gpu_architecture}"
     )
-    print(f"Torch: {torch.__version__}; dtype: {dtype}; group size: {args.group_size}")
+    print(f"Torch: {torch.__version__}; dtype: {config.dtype}; group size: {config.group_size}")
     if args.preset == "minimax-h3-128k":
         print("Reference: sampled boundary rows (full reference timing disabled for 128K)")
     print()
@@ -746,9 +521,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for shape in shapes:
         result = _run_shape(
             shape,
-            args.group_size,
-            dtype,
-            args.seed,
+            config,
             args.warmup_ms,
             args.measurement_time_ms,
             comfy_kitchen,

@@ -12,7 +12,7 @@ from benchmark_attention import (
     _profile_provider_name,
     _validate_args,
 )
-from lib import AttentionConfig, AttentionShape
+from lib.attention import AttentionConfig, AttentionShape
 from lib.attention_providers import (
     CANONICAL_CUDA_SAGE_ATTENTION_2,
     CANONICAL_CUDA_SAGE_ATTENTION_2PP,

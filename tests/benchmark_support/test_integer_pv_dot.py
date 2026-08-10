@@ -6,7 +6,7 @@ from benchmark_integer_pv_dot import (
     _parse_args,
     _reference_output,
 )
-from lib.profiling import ProfilePhase
+from lib.providers import ProviderPhase
 
 
 def test_reference_output_validates_every_tile() -> None:
@@ -69,7 +69,7 @@ def test_cli_exposes_generic_compiler_and_profile_controls(tmp_path) -> None:
     assert arguments.sass is False
     assert arguments.nvdisasm.as_posix() == "/opt/cuda/bin/nvdisasm"
     assert arguments.profile
-    assert arguments.profile_phase is ProfilePhase.PREPARED_EXECUTION
+    assert arguments.profile_phase is ProviderPhase.PREPARED_EXECUTION
     assert arguments.profile_range_name == "integer-pv"
     assert arguments.profile_include_setup
 

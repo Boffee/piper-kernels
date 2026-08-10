@@ -1,6 +1,6 @@
 import pytest
 import torch
-from lib.tuning import TuningPhase
+from lib.providers import ProviderPhase
 from tune_piper_attention import (
     _candidate_plans,
     _make_candidate,
@@ -31,7 +31,7 @@ def test_tuner_defaults_to_production_plan() -> None:
     arguments = _parse_args([])
 
     assert arguments.use_tensor_descriptors is None
-    assert arguments.phase is TuningPhase.PREPARED_EXECUTION
+    assert arguments.phase is ProviderPhase.PREPARED_EXECUTION
     assert arguments.minimum_sqnr_db == 20.0
     assert arguments.block_m is None
     assert arguments.num_warps is None

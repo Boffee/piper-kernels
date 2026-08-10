@@ -126,6 +126,34 @@ SM120. It can search a future CUDA target once that target is supported by the k
 does not enable a new backend. In particular, AMD `gfx1200`/`gfx1201` remain unsupported until
 the inline PTX FP8 conversion and NVIDIA FP8-MMA path have HIP equivalents.
 
+The ConvRot INT8 forward-linear tuner searches the immutable production execution plan shared
+by ordinary and explicit SwiGLU linears. Its default `prepared_execution` boundary deliberately
+keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed operator because
+all are paid on every public invocation. It ranks their device-stream work on fixed source
+tensors; `operator_end_to_end` selects synchronized wall timing when host dispatch and allocation
+overhead should also participate. Quality is evaluated on a stratified row sample that retains
+signed-32-bit address crossings. The public benchmark and tuner construct the same deterministic
+ConvRot workload, sampled reference, common metadata, and provider adapters; the benchmark uses
+normal public dispatch while the tuner substitutes explicit execution-plan candidates.
+
+```shell
+uv run python benchmarks/tune_convrot_int8_linear.py \
+  --rows 37710 --out-features 5376 --in-features 14336 \
+  --input-activation swiglu --no-bias \
+  --fuse-rotation-quantization --fused-num-warps 8 16 \
+  --matmul-block-m 32 64 128 --matmul-block-n 64 128 \
+  --matmul-block-k 32 64 --matmul-num-warps 4 8 \
+  --json artifacts/convrot_int8_linear_sm120_tuning.json
+```
+
+Omitted axes retain the production values, explicit numeric axes form a deduplicated Cartesian
+search, and `--max-candidates` limits compilation. Fused preparation is a candidate choice rather
+than a claim of production eligibility, allowing development measurements outside the currently
+selected exact-SM120 region. Forced split candidates can independently search
+`--rotation-num-warps` and `--quantization-num-warps`; forced fused candidates search
+`--fused-num-warps`. The first tuner intentionally excludes the mutating ConvRot `addmm_` path,
+which requires a separate workload and quality protocol.
+
 Selected records are evidence, not runtime policy: review the result across representative
 shapes and repeated processes, then deliberately freeze an accepted winner in the production
 execution-plan selector. The project does not use `triton.autotune` in the public operator path;
@@ -220,8 +248,9 @@ Machine output records the exact sampled indices.
 
 The Piper provider times the complete public entrypoint on fixed source tensors, so its
 `prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
-configuration records the public entrypoint and whether SwiGLU dispatch selected fused or
-materialized input preparation. Record shapes contain only the case name and logical dimensions;
+configuration records the public entrypoint and whether the production execution plan selected
+fused or materialized SwiGLU preparation, plus its exact preparation and GEMM fields. Record
+shapes contain only the case name and logical dimensions;
 provider configuration distinguishes the logical input layout from the layout passed to that
 provider. The optional provider is recorded as provider-managed when its internal choice is not
 observable.
@@ -283,9 +312,9 @@ preparation without an input activation and fused preparation for SwiGLU.
 Add `--json PATH` or `--jsonl PATH` to serialize one common `BenchmarkRecord` per width and
 phase. Each record distinguishes linear `K` from raw input width and includes the phase,
 operation provenance, baseline, device timing, minimum traffic, and effective bandwidth. Piper
-records additionally include the selected fused block size, warp count, and production-policy
-eligibility. Piper timing and compiler records use the same `piper-triton` provider identifier
-and plan configuration.
+records additionally include the selected fusion mode and fused and split-path warp counts.
+Piper timing and compiler records use the same `piper-triton` provider identifier and plan
+configuration.
 Compiler output remains independently selectable with `--compiler-json` or
 `--compiler-jsonl`, so both record types can be written by one invocation. Benchmark and
 compiler records must use different output paths.

@@ -7,19 +7,11 @@ from types import ModuleType
 import pytest
 import torch
 from benchmark_convrot import (
-    BenchmarkShape,
     Result,
-    _apply_input_activation,
     _benchmark_shapes,
-    _comfy_input,
     _comfy_provider_configuration,
-    _common_provider_configuration,
     _parse_args,
-    _quality_row_indices,
-    _raw_input_features,
     _records_for_result,
-    _reference_provider_configuration,
-    _selected_input_preparation,
     _skip_reference_timing,
     _validate_args,
 )
@@ -33,6 +25,7 @@ from benchmark_convrot_preparation import (
     _minimum_global_bytes,
     _output_targets,
     _preparation_records,
+    _PreparationConfiguration,
 )
 from benchmark_convrot_preparation import (
     _parse_args as _parse_preparation_args,
@@ -40,18 +33,25 @@ from benchmark_convrot_preparation import (
 from benchmark_convrot_preparation import (
     _validate_args as _validate_preparation_args,
 )
-from lib import (
-    ClockDomain,
-    EnvironmentInfo,
-    PhaseTimings,
-    ProviderMeasurement,
-    Timing,
-    measure_quality,
-    output_target,
-    write_records,
+from lib.convrot import (
+    ConvRotConfig,
+    ConvRotShape,
+    apply_input_activation,
+    comfy_convrot_input,
+    make_convrot_inputs,
+    quality_row_indices,
+    raw_input_features,
 )
-
-from piper_kernels.convrot.int8._policy import PreparationPlan
+from lib.convrot_providers import (
+    make_convrot_workload,
+    make_public_convrot_provider,
+    make_reference_convrot_provider,
+)
+from lib.environment import EnvironmentInfo
+from lib.providers import ProviderMeasurement
+from lib.quality import measure_quality
+from lib.reporting import output_target, write_records
+from lib.timing import ClockDomain, PhaseTimings, Timing
 
 
 def _environment() -> EnvironmentInfo:
@@ -72,12 +72,13 @@ def _environment() -> EnvironmentInfo:
     )
 
 
-def _preparation_plan() -> PreparationPlan:
-    return PreparationPlan(
-        fused_block_size=16_384,
-        fuse_rotation_quantization=True,
-        fused_num_warps=8,
-    )
+def _preparation_configuration() -> _PreparationConfiguration:
+    return {
+        "fuse_rotation_quantization": True,
+        "fused_num_warps": 8,
+        "rotation_num_warps": 4,
+        "quantization_num_warps": 8,
+    }
 
 
 def _phase_timings() -> PhaseTimings:
@@ -153,7 +154,7 @@ def test_custom_shape_can_include_swiglu_without_bias() -> None:
 
     assert shape.input_activation == "swiglu"
     assert not shape.has_bias
-    assert _raw_input_features(shape) == 1024
+    assert raw_input_features(shape.in_features, shape.input_activation) == 1024
 
 
 def test_cli_none_input_activation_is_python_none() -> None:
@@ -161,6 +162,61 @@ def test_cli_none_input_activation_is_python_none() -> None:
     assert _parse_args(["--input-activation", "none"]).input_activation is None
     assert _parse_preparation_args([]).input_activation is None
     assert _parse_preparation_args(["--input-activation", "none"]).input_activation is None
+
+
+def test_shared_shape_and_inputs_define_one_reproducible_workload() -> None:
+    shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    config = ConvRotConfig(torch.float32, 256, 7)
+
+    first = make_convrot_inputs(shape, config, device=torch.device("cpu"))
+    second = make_convrot_inputs(shape, config, device=torch.device("cpu"))
+
+    assert shape.as_dict() == {
+        "case": "mlp-fc2",
+        "rows": 3,
+        "out_features": 96,
+        "in_features": 512,
+        "raw_input_features": 1024,
+    }
+    assert first[0].shape == (3, 1024)
+    assert first[1].shape == (96, 512)
+    assert first[2].shape == (96, 1)
+    assert first[3] is None
+    for first_tensor, second_tensor in zip(first[:3], second[:3], strict=True):
+        torch.testing.assert_close(first_tensor, second_tensor)
+
+
+def test_shared_public_and_reference_providers_use_the_same_workload() -> None:
+    workload = make_convrot_workload(
+        ConvRotShape("custom", 2, 3, 256, has_bias=False),
+        ConvRotConfig(torch.float32, 256, 7),
+        device=torch.device("cpu"),
+    )
+    public = make_public_convrot_provider(workload)
+    reference = make_reference_convrot_provider(workload)
+
+    assert public.prepare() is workload.inputs
+    assert reference.prepare() is workload.inputs
+    torch.testing.assert_close(
+        public.run(workload.inputs),
+        reference.run(workload.inputs),
+    )
+    assert workload.production_plan.as_dict().items() <= public.configuration.items()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--rows", "0"],
+        ["--out-features", "0"],
+        ["--in-features", "0"],
+    ],
+)
+def test_custom_shape_cli_rejects_nonpositive_dimensions(arguments: list[str]) -> None:
+    parsed = _parse_args(arguments)
+
+    with pytest.raises(SystemExit, match="must all be positive"):
+        _validate_args(parsed)
 
 
 @pytest.mark.parametrize(
@@ -177,31 +233,13 @@ def test_named_preset_rejects_custom_shape_options(custom_option: list[str]) -> 
     arguments = _parse_args(["--preset", "minimax-h3-5s", *custom_option])
 
     with pytest.raises(SystemExit, match="cannot be combined"):
-        _validate_args(arguments, _benchmark_shapes(arguments))
-
-
-def test_selected_input_preparation_matches_public_dispatch(monkeypatch) -> None:
-    activation = torch.empty(2, 1024)
-    qdata = torch.empty(96, 512, dtype=torch.int8)
-    monkeypatch.setattr(
-        "benchmark_convrot.convrot_dispatch._can_use_triton_swiglu",
-        lambda *_args: True,
-    )
-
-    assert _selected_input_preparation(activation, qdata, 256, "swiglu") == "fused"
-
-    monkeypatch.setattr(
-        "benchmark_convrot.convrot_dispatch._can_use_triton_swiglu",
-        lambda *_args: False,
-    )
-    assert _selected_input_preparation(activation, qdata, 256, "swiglu") == "materialized"
-    assert _selected_input_preparation(activation, qdata, 256, None) is None
+        _validate_args(arguments)
 
 
 def test_swiglu_reference_uses_up_gate_order() -> None:
     raw = torch.tensor([[2.0, -3.0, 0.5, 1.5]])
 
-    actual = _apply_input_activation(raw, "swiglu")
+    actual = apply_input_activation(raw, "swiglu")
 
     up, gate = raw.chunk(2, dim=-1)
     torch.testing.assert_close(actual, up * torch.nn.functional.silu(gate))
@@ -210,17 +248,19 @@ def test_swiglu_reference_uses_up_gate_order() -> None:
 def test_comfy_adapter_changes_up_gate_to_gate_up() -> None:
     raw = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
 
-    adapted = _comfy_input(raw, "swiglu")
+    adapted = comfy_convrot_input(raw, "swiglu")
 
     assert adapted.tolist() == [[3.0, 4.0, 1.0, 2.0]]
 
 
 def test_main_provider_configuration_distinguishes_logical_and_provider_layouts() -> None:
-    shape = BenchmarkShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    config = ConvRotConfig(torch.bfloat16, 256, 7)
+    workload = make_convrot_workload(shape, config, device=torch.device("cpu"))
 
-    common = _common_provider_configuration(shape, 256, torch.bfloat16, 7)
+    common = workload.common_configuration()
     comfy = _comfy_provider_configuration(common, shape, "0.2.28")
-    reference = _reference_provider_configuration(common, shape)
+    reference = make_reference_convrot_provider(workload).configuration
 
     assert common["logical_input_layout"] == "up_gate"
     assert common["provider_input_layout"] == "up_gate"
@@ -236,11 +276,16 @@ def test_main_provider_configuration_distinguishes_logical_and_provider_layouts(
 
 
 def test_main_record_shape_contains_only_case_and_dimensions() -> None:
-    shape = BenchmarkShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     output = torch.ones((1, 1))
     quality = measure_quality(output, output)
+    workload = make_convrot_workload(
+        shape,
+        ConvRotConfig(torch.bfloat16, 256, 7),
+        device=torch.device("cpu"),
+    )
     configuration = {
-        **_common_provider_configuration(shape, 256, torch.bfloat16, 7),
+        **workload.common_configuration(),
         "operation_entrypoint": "piper_kernels.convrot.convrot_linear",
         "input_preparation": "fused",
     }
@@ -275,10 +320,15 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
 
 
 def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
-    shape = BenchmarkShape("mlp-fc2", 3, 96, 512, "swiglu", False)
+    shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     output = torch.ones((1, 1))
     quality = measure_quality(output, output)
-    common = _common_provider_configuration(shape, 256, torch.bfloat16, 7)
+    workload = make_convrot_workload(
+        shape,
+        ConvRotConfig(torch.bfloat16, 256, 7),
+        device=torch.device("cpu"),
+    )
+    common = workload.common_configuration()
     piper = ProviderMeasurement(
         provider="piper-convrot",
         output=output,
@@ -317,9 +367,9 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
 
 def test_quality_rows_include_large_projection_output_boundaries() -> None:
     for name, out_features in (("qkv", 21_504), ("mlp-fc1", 28_672)):
-        shape = BenchmarkShape(name, 131_072, out_features, 5_376, has_bias=False)
+        shape = ConvRotShape(name, 131_072, out_features, 5_376, has_bias=False)
 
-        rows = _quality_row_indices(shape)
+        rows = quality_row_indices(shape)
 
         output_boundary = ((1 << 31) + shape.out_features - 1) // shape.out_features
         assert len(rows) == 256
@@ -329,9 +379,9 @@ def test_quality_rows_include_large_projection_output_boundaries() -> None:
 
 
 def test_quality_rows_include_raw_swiglu_input_address_boundary() -> None:
-    shape = BenchmarkShape("mlp-fc2", 131_072, 5_376, 14_336, "swiglu", False)
+    shape = ConvRotShape("mlp-fc2", 131_072, 5_376, 14_336, "swiglu", False)
 
-    rows = _quality_row_indices(shape)
+    rows = quality_row_indices(shape)
 
     raw_width = 2 * shape.in_features
     input_boundary = ((1 << 31) + raw_width - 1) // raw_width
@@ -476,9 +526,10 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
         baseline_phase="fused",
         speedup_vs_baseline=1.0,
         provider_configuration={
-            "fused_block_size": 16_384,
+            "fuse_rotation_quantization": True,
             "fused_num_warps": 8,
-            "production_fusion_eligible": True,
+            "rotation_num_warps": 4,
+            "quantization_num_warps": 8,
         },
     )
 
@@ -508,9 +559,10 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     assert value["configuration"]["baseline_provider"] == PIPER_TRITON_PROVIDER
     assert value["configuration"]["baseline_phase"] == "fused"
     assert value["configuration"]["operation_provenance"] == phase.operation_provenance
-    assert value["configuration"]["fused_block_size"] == 16_384
+    assert value["configuration"]["fuse_rotation_quantization"] is True
     assert value["configuration"]["fused_num_warps"] == 8
-    assert value["configuration"]["production_fusion_eligible"] is True
+    assert value["configuration"]["rotation_num_warps"] == 4
+    assert value["configuration"]["quantization_num_warps"] == 8
     assert "installed_version" not in value["configuration"]
     assert "adapter_contract_version" not in value["configuration"]
     assert value["timings"]["prepared_execution"]["clock"] == "device_event"
@@ -559,19 +611,23 @@ def test_comfy_preparation_record_includes_installed_and_contract_versions() -> 
 
 
 def test_preparation_compiler_report_only_inspects_launched_phases() -> None:
-    plan = _preparation_plan()
-    ordinary = _inspection_provider(_parse_preparation_args(["--in-features", "512"]), plan)
+    configuration = _preparation_configuration()
+    ordinary = _inspection_provider(
+        _parse_preparation_args(["--in-features", "512"]),
+        configuration,
+    )
     swiglu = _inspection_provider(
         _parse_preparation_args(["--in-features", "512", "--input-activation", "swiglu"]),
-        plan,
+        configuration,
     )
 
     assert ordinary.name == PIPER_TRITON_PROVIDER
     assert swiglu.name == PIPER_TRITON_PROVIDER
     assert set(ordinary.triton_jit_functions) == {"rotate", "quantize", "fused"}
     assert set(swiglu.triton_jit_functions) == {"fused"}
-    assert swiglu.configuration["fused_block_size"] == 16_384
     assert swiglu.configuration["fused_num_warps"] == 8
-    assert swiglu.configuration["production_fusion_eligible"] is True
+    assert swiglu.configuration["rotation_num_warps"] == 4
+    assert swiglu.configuration["quantization_num_warps"] == 8
+    assert swiglu.configuration["fuse_rotation_quantization"] is True
     assert swiglu.configuration["logical_input_layout"] == "up_gate"
     assert swiglu.configuration["provider_input_layout"] == "up_gate"
