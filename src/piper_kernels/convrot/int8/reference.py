@@ -2,6 +2,8 @@
 
 import torch
 
+from piper_kernels._stochastic_quantization import _stochastic_round_to_int
+
 from .._rotation import rotate_groups, validate_group_size
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -68,7 +70,11 @@ def validate_storage(
         )
 
 
-def dynamic_quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def dynamic_quantize_rows(
+    value: torch.Tensor,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamically quantize each row to signed INT8 with a float32 scale."""
     if value.ndim > 0 and value.shape[-1] == 0:
         scale = torch.full(
@@ -93,6 +99,15 @@ def dynamic_quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         # The minimum scale remains representable in bfloat16 and float32.
         scaled = value / logical_scale
     qdata = scaled.round().clamp(-128, 127).to(torch.int8)
+    if rounding_seed is not None:
+        stochastic_scaled = value.to(torch.float32) / scale
+        qdata = _stochastic_round_to_int(
+            stochastic_scaled,
+            seed=rounding_seed,
+            quant_min=-128,
+            quant_max=127,
+            deterministic=qdata,
+        ).to(torch.int8)
     return qdata, scale
 
 
@@ -104,6 +119,7 @@ def reference_addmm_(
     group_size: int,
     beta: float,
     alpha: float,
+    rounding_seed: int | None = None,
 ) -> None:
     """Add a matrix product to a logical ConvRot weight and requantize it in place."""
     if beta == 0:
@@ -112,7 +128,10 @@ def reference_addmm_(
         rotated_weight = qdata.to(mat1.dtype) * scale.to(mat1.dtype)
     rotated_mat2 = rotate_groups(mat2, group_size)
     merged = torch.addmm(rotated_weight, mat1, rotated_mat2, beta=beta, alpha=alpha)
-    merged_qdata, merged_scale = dynamic_quantize_rows(merged)
+    merged_qdata, merged_scale = dynamic_quantize_rows(
+        merged,
+        rounding_seed=rounding_seed,
+    )
     qdata.copy_(merged_qdata)
     scale.copy_(merged_scale)
 

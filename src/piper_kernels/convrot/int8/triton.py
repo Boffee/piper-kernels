@@ -9,6 +9,10 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.stochastic_quantization import (
+    _seed_argument,
+    _stochastic_round_to_int,
+)
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from . import _policy
@@ -192,10 +196,12 @@ def _requantize_addmm_rows_kernel(
     stride_update_col,
     beta,
     alpha,
+    rounding_seed,
     block_size: tl.constexpr,
     logical_dtype_code: tl.constexpr,
     has_base: tl.constexpr,
     has_update: tl.constexpr,
+    stochastic: tl.constexpr,
 ):
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
@@ -226,6 +232,17 @@ def _requantize_addmm_rows_kernel(
     scale = tl.maximum(tl.max(tl.abs(values).to(tl.float32), axis=0) / 127.0, 1e-30)
     scaled = _normalize_for_int8(values, scale, logical_dtype_code)
     quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+    if stochastic:
+        stochastic_scaled = values.to(tl.float32) / scale
+        logical_offsets = row_i64 * row_width + offsets_i64
+        quantized = _stochastic_round_to_int(
+            stochastic_scaled,
+            quantized,
+            rounding_seed,
+            logical_offsets,
+            -128,
+            127,
+        ).to(tl.int8)
     tl.store(
         q_ptr + row_i64 * stride_q_row + offsets_i64 * stride_q_col,
         quantized,
@@ -562,6 +579,7 @@ def triton_convrot_int8_addmm_(
     group_size: int,
     beta: float,
     alpha: float,
+    rounding_seed: int | None = None,
 ) -> None:
     """Apply an addmm update in the rotated basis and requantize the weight in place."""
     out_features, in_features = qdata.shape
@@ -593,9 +611,11 @@ def triton_convrot_int8_addmm_(
         update.stride(1),
         beta,
         alpha,
+        _seed_argument(rounding_seed),
         block_size=requant_block,
         logical_dtype_code=logical_dtype_code,
         has_base=beta != 0,
         has_update=has_update,
+        stochastic=rounding_seed is not None,
         num_warps=8,
     )

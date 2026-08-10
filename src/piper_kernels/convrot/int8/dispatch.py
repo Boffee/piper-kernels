@@ -252,9 +252,19 @@ def _convrot_int8_addmm_op(
     group_size: int,
     beta: float,
     alpha: float,
+    rounding_seed: int | None = None,
 ) -> None:
     """Run the portable implementation of the semantic INT8 ConvRot update."""
-    reference_addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha)
+    reference_addmm_(
+        qdata,
+        scale,
+        mat1,
+        mat2,
+        group_size,
+        beta,
+        alpha,
+        rounding_seed,
+    )
 
 
 @_convrot_int8_addmm_op.register_kernel("cuda")
@@ -266,13 +276,32 @@ def _convrot_int8_addmm_cuda(
     group_size: int,
     beta: float,
     alpha: float,
+    rounding_seed: int | None = None,
 ) -> None:
     """Select the optimized CUDA implementation when the target supports it."""
     if _can_use_triton_addmm(qdata, mat1):
         assert _triton_addmm_ is not None
-        _triton_addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha)
+        _triton_addmm_(
+            qdata,
+            scale,
+            mat1,
+            mat2,
+            group_size,
+            beta,
+            alpha,
+            rounding_seed,
+        )
         return
-    reference_addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha)
+    reference_addmm_(
+        qdata,
+        scale,
+        mat1,
+        mat2,
+        group_size,
+        beta,
+        alpha,
+        rounding_seed,
+    )
 
 
 @_convrot_int8_addmm_op.register_fake
@@ -284,6 +313,7 @@ def _convrot_int8_addmm_fake(
     _group_size: int,
     _beta: float,
     _alpha: float,
+    _rounding_seed: int | None = None,
 ) -> None:
     return None
 
@@ -298,13 +328,24 @@ def _addmm_(
     *,
     beta: int | float | complex = 1,
     alpha: int | float | complex = 1,
+    rounding_seed: int | None = None,
 ) -> None:
     """Apply the logical ``beta * weight + alpha * mat1 @ mat2`` update in place."""
     _validate_addmm(qdata, scale, dtype, group_size, mat1, mat2)
     beta_float = _validate_scalar(beta, "beta")
     alpha_float = _validate_scalar(alpha, "alpha")
+    if rounding_seed is not None:
+        if isinstance(rounding_seed, bool) or not isinstance(rounding_seed, int):
+            raise TypeError("ConvRot INT8 addmm_ rounding_seed must be an unsigned 64-bit integer")
+        if not 0 <= rounding_seed < (1 << 64):
+            raise ValueError("ConvRot INT8 addmm_ rounding_seed must be an unsigned 64-bit integer")
     if beta_float == 1 and alpha_float == 0:
         return
+    seed_argument = (
+        rounding_seed
+        if rounding_seed is None or rounding_seed < (1 << 63)
+        else rounding_seed - (1 << 64)
+    )
     _convrot_int8_addmm_op(
         qdata,
         scale,
@@ -313,6 +354,7 @@ def _addmm_(
         group_size,
         beta_float,
         alpha_float,
+        seed_argument,
     )
 
 

@@ -126,6 +126,36 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         rotated = self.qdata.to(self.dtype) * self.scale.to(self.dtype)
         return rotate_groups(rotated, self.group_size)
 
+    def addmm_(
+        self,
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        *,
+        beta: int | float | complex = 1,
+        alpha: int | float | complex = 1,
+        rounding_seed: int | None = None,
+    ) -> "ConvRotInt8Tensor":
+        """Update and requantize in place, optionally using stochastic rounding.
+
+        ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
+        makes terminal INT8 code selection reproducible for a fixed device and
+        backend without consuming the process-global random-number generator.
+        """
+        if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
+            raise TypeError("ConvRot addmm_ matrices must be tensors")
+        _addmm_(
+            self.qdata,
+            self.scale,
+            self.dtype,
+            self.group_size,
+            mat1,
+            mat2,
+            beta=beta,
+            alpha=alpha,
+            rounding_seed=rounding_seed,
+        )
+        return self
+
     def _stable_hash_for_caching(self) -> str:
         """Return a metadata fingerprint for AOTAutograd's cross-process cache."""
         return repr(

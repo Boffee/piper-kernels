@@ -218,6 +218,87 @@ def test_addmm_no_op_does_not_requantize_storage() -> None:
     assert wrapped.scale._version == scale_version
 
 
+def _stochastic_addmm_fixture(
+    *,
+    rows: int = 128,
+    cols: int = 128,
+) -> tuple[ConvRotInt8Tensor, torch.Tensor, torch.Tensor]:
+    rotated_update = torch.ones(rows, cols, dtype=torch.bfloat16)
+    rotated_update[:, -1] = 2.0
+    mat1 = torch.eye(rows, dtype=torch.bfloat16)
+    mat2 = rotate_groups(rotated_update, 16)
+    weight = ConvRotInt8Tensor.from_packed(
+        torch.zeros(rows, cols, dtype=torch.int8),
+        torch.ones(rows, 1, dtype=torch.float32),
+        group_size=16,
+        dtype=torch.bfloat16,
+    )
+    return weight, mat1, mat2
+
+
+def test_addmm_stochastic_rounding_replays_without_consuming_global_rng() -> None:
+    seed = (1 << 64) - 1
+    first, mat1, mat2 = _stochastic_addmm_fixture()
+    replay = first.clone()
+    other = first.clone()
+    deterministic = first.clone()
+    torch.manual_seed(1701)
+    rng_before = torch.random.get_rng_state()
+
+    first.addmm_(mat1, mat2, beta=0, rounding_seed=seed)
+    replay.addmm_(mat1, mat2, beta=0, rounding_seed=seed)
+    other.addmm_(mat1, mat2, beta=0, rounding_seed=seed - 1)
+    deterministic.addmm_(mat1, mat2, beta=0)
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert torch.equal(first.qdata, replay.qdata)
+    assert torch.equal(first.scale, replay.scale)
+    assert not torch.equal(first.qdata, other.qdata)
+    assert torch.equal(first.scale, other.scale)
+    assert torch.equal(first.scale, deterministic.scale)
+
+
+def test_addmm_stochastic_rounding_uses_unbiased_fp32_scaled_probability() -> None:
+    weight, mat1, mat2 = _stochastic_addmm_fixture(rows=256, cols=256)
+
+    weight.addmm_(mat1, mat2, beta=0, rounding_seed=12345)
+
+    samples = weight.qdata[:, :-1]
+    assert bool(((samples == 63) | (samples == 64)).all())
+    assert samples.to(torch.float32).mean().item() == pytest.approx(63.5, abs=0.01)
+    assert bool((weight.qdata[:, -1] == 127).all())
+    torch.testing.assert_close(
+        weight.scale,
+        torch.full_like(weight.scale, 2.0 / 127.0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rounding_seed", "error"),
+    [
+        (True, TypeError),
+        (1.5, TypeError),
+        (-1, ValueError),
+        (1 << 64, ValueError),
+    ],
+)
+def test_addmm_rejects_invalid_stochastic_rounding_seed(
+    rounding_seed: object,
+    error: type[Exception],
+) -> None:
+    weight, mat1, mat2 = _stochastic_addmm_fixture(rows=4, cols=16)
+    qdata_before = weight.qdata.clone()
+    scale_before = weight.scale.clone()
+
+    with pytest.raises(error, match="unsigned 64-bit integer"):
+        weight.addmm_(mat1, mat2, rounding_seed=rounding_seed)  # type: ignore[arg-type]
+
+    assert torch.equal(weight.qdata, qdata_before)
+    assert torch.equal(weight.scale, scale_before)
+
+
 @pytest.mark.parametrize(
     ("mat1", "mat2", "message"),
     [

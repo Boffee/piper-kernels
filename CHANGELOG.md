@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Reproducible stochastic INT8 terminal-code selection for ConvRot `addmm_` LoRA merges,
+  using deterministic row scales and the same unbiased probability formulation as Piper
+  Offload.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

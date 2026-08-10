@@ -54,6 +54,9 @@ mlp_output = convrot_linear(up_gate, weight, bias, input_activation="swiglu")
 
 # In-place low-rank update with the standard Tensor.addmm_ contract.
 weight.addmm_(lora_b, lora_a, alpha=lora_strength)
+
+# Reproducible stochastic terminal-code selection for a quantized LoRA merge.
+weight.addmm_(lora_b, lora_a, alpha=lora_strength, rounding_seed=seed)
 ```
 
 `from_quantized(..., logical_dtype=...)` is the preferred checkpoint-storage factory.
@@ -72,7 +75,12 @@ activation. Both linear entry points are inference-only and reject autograd inpu
 the result. It preserves the ConvRot tensor and quantized storage identities, allowing
 offload integrations to keep their existing buffers. Repeated updates are lossy, so
 reload a pristine base weight before changing or removing a previously merged adapter.
-This is an inference operation and does not support autograd.
+Passing an unsigned 64-bit `rounding_seed` stochastically selects one of the two adjacent
+INT8 codes with probability proportional to distance, without changing the deterministic
+row scales or consuming PyTorch's process-global random-number generator. Omitting the seed
+retains nearest-integer rounding. This is an inference operation and does not support
+autograd. Torch and Triton each replay for a fixed seed, device, and backend; their random
+samples are not promised to match each other or different Triton versions byte-for-byte.
 
 The operator selects its Triton implementation on supported CUDA devices and otherwise
 uses the portable PyTorch reference. Install the tensor format and optimized backend with

@@ -480,7 +480,7 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
 
     result = torch.library.opcheck(
         convrot_dispatch._convrot_int8_addmm_op,
-        (qdata, scale, mat1, mat2, 64, 0.5, 1.25),
+        (qdata, scale, mat1, mat2, 64, 0.5, 1.25, 123),
     )
 
     assert set(result.values()) == {"SUCCESS"}
@@ -627,20 +627,60 @@ def test_triton_addmm_runs_under_torch_compile() -> None:
     mat2 = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
     expected = ConvRotInt8Tensor.from_hp(weight, group_size=64)
     actual = expected.clone()
-    expected.addmm_(mat1, mat2, beta=0.5, alpha=1.25)
+    expected.addmm_(mat1, mat2, beta=0.5, alpha=1.25, rounding_seed=123)
 
     def merge(
         target: ConvRotInt8Tensor,
         left: torch.Tensor,
         right: torch.Tensor,
     ) -> ConvRotInt8Tensor:
-        return target.addmm_(left, right, beta=0.5, alpha=1.25)
+        return target.addmm_(
+            left,
+            right,
+            beta=0.5,
+            alpha=1.25,
+            rounding_seed=123,
+        )
 
     result = torch.compile(merge, fullgraph=True)(actual, mat1, mat2)
 
     assert result is actual
     assert torch.equal(actual.qdata, expected.qdata)
     assert torch.equal(actual.scale, expected.scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_triton_addmm_stochastic_rounding_replays_and_is_unbiased() -> None:
+    rows, cols = 32, 8192
+    rotated_update = torch.ones(rows, cols, dtype=torch.bfloat16, device="cuda")
+    rotated_update[:, -1] = 2.0
+    mat1 = torch.eye(rows, dtype=torch.bfloat16, device="cuda")
+    mat2 = rotate_groups(rotated_update, 256)
+
+    def make_weight() -> ConvRotInt8Tensor:
+        return ConvRotInt8Tensor.from_packed(
+            torch.zeros(rows, cols, dtype=torch.int8, device="cuda"),
+            torch.ones(rows, 1, dtype=torch.float32, device="cuda"),
+            group_size=256,
+            dtype=torch.bfloat16,
+        )
+
+    first = make_weight()
+    replay = make_weight()
+    other = make_weight()
+    first.addmm_(mat1, mat2, beta=0, rounding_seed=(1 << 64) - 1)
+    replay.addmm_(mat1, mat2, beta=0, rounding_seed=(1 << 64) - 1)
+    other.addmm_(mat1, mat2, beta=0, rounding_seed=(1 << 64) - 2)
+
+    assert torch.equal(first.qdata, replay.qdata)
+    assert torch.equal(first.scale, replay.scale)
+    assert not torch.equal(first.qdata, other.qdata)
+    assert torch.equal(first.scale, other.scale)
+    samples = first.qdata[:, :-1]
+    assert bool(((samples == 63) | (samples == 64)).all())
+    assert samples.to(torch.float32).mean().item() == pytest.approx(63.5, abs=0.01)
+    assert bool((first.qdata[:, -1] == 127).all())
 
 
 @pytest.mark.gpu
