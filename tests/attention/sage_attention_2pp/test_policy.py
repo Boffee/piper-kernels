@@ -47,7 +47,7 @@ def test_default_execution_plan_supports_meta_tensors_with_resolved_target() -> 
                 use_unscaled_score_recurrence=False,
                 use_tensor_descriptors=False,
                 loop_num_stages=3,
-                disable_loop_licm=False,
+                loop_licm=True,
             ),
         ),
         (
@@ -143,7 +143,7 @@ def test_long_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> N
     )
 
     assert plan.loop_num_stages == 3
-    assert not plan.disable_loop_licm
+    assert plan.loop_licm
 
 
 @pytest.mark.parametrize(

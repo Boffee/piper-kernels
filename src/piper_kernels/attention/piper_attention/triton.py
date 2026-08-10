@@ -333,7 +333,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     use_tensor_descriptors: tl.constexpr,
     reverse_causal_blocks: tl.constexpr,
     loop_num_stages: tl.constexpr,
-    disable_loop_licm: tl.constexpr,
+    loop_licm: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
 ):
     """Fused exact-log UINT8-P/INT8-V online attention."""
@@ -398,7 +398,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         end_n,
         block_n,
         num_stages=loop_num_stages,
-        disable_licm=disable_loop_licm,
+        disable_licm=not loop_licm,
     ):
         current_n = start_n + offsets_n
         key = _load_key_tile(
@@ -892,7 +892,7 @@ class _PiperAttentionExecutionPlan:
     num_stages: int = 3
     reverse_causal_blocks: bool = False
     loop_num_stages: int | None = None
-    disable_loop_licm: bool = True
+    loop_licm: bool = False
     use_packed_probability_conversion: bool = False
 
     def __post_init__(self) -> None:
@@ -1173,7 +1173,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             use_tensor_descriptors=plan.use_tensor_descriptors,
             reverse_causal_blocks=plan.reverse_causal_blocks,
             loop_num_stages=plan.loop_num_stages,
-            disable_loop_licm=plan.disable_loop_licm,
+            loop_licm=plan.loop_licm,
             use_packed_probability_conversion=plan.use_packed_probability_conversion,
             **launch_options,
         )

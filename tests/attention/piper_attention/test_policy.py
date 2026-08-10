@@ -105,7 +105,7 @@ def test_sm89_does_not_inherit_sage_attention_schedule() -> None:
     assert plan.block_m == 64
     assert not plan.reverse_causal_blocks
     assert plan.loop_num_stages is None
-    assert plan.disable_loop_licm
+    assert not plan.loop_licm
 
 
 def test_alternate_plan_can_disable_tensor_descriptors() -> None:
@@ -127,7 +127,7 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         _select(_SM120, is_causal=True),
         reverse_causal_blocks=True,
         loop_num_stages=2,
-        disable_loop_licm=False,
+        loop_licm=True,
     )
 
     assert plan.as_dict() == {
@@ -141,7 +141,7 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "num_stages": 3,
         "reverse_causal_blocks": True,
         "loop_num_stages": 2,
-        "disable_loop_licm": False,
+        "loop_licm": True,
         "use_packed_probability_conversion": False,
     }
 

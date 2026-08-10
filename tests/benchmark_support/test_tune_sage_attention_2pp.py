@@ -47,12 +47,13 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
             "64",
             "128",
             "128",
+            "--num-warps",
+            "2",
+            "4",
             "--num-stages",
             "2",
             "3",
-            "--probability-conversion",
-            "stock",
-            "packed",
+            "--use-packed-probability-conversion",
         ]
     )
 
@@ -60,6 +61,30 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
 
     assert len(choices) == 8
     assert len({choice.name for choice in choices}) == 8
+
+
+def test_boolean_axes_use_execution_plan_field_names_directly() -> None:
+    arguments = _parse_args(
+        [
+            "--no-use-tensor-descriptors",
+            "--no-fuse-kv-quantization",
+            "--no-fuse-query-quantization",
+            "--no-use-unscaled-score-recurrence",
+            "--no-reverse-causal-blocks",
+            "--no-loop-licm",
+            "--no-use-packed-probability-conversion",
+        ]
+    )
+
+    choice = _candidate_choices(arguments, _production_plan())[0]
+
+    assert not choice.use_tensor_descriptors
+    assert not choice.fuse_kv_quantization
+    assert not choice.fuse_query_quantization
+    assert not choice.use_unscaled_score_recurrence
+    assert not choice.reverse_causal_blocks
+    assert not choice.loop_licm
+    assert not choice.use_packed_probability_conversion
 
 
 def test_candidate_limit_prevents_accidental_compile_explosion() -> None:
@@ -81,7 +106,7 @@ def test_candidate_limit_prevents_accidental_compile_explosion() -> None:
 
 
 def test_noncausal_search_rejects_reverse_block_order() -> None:
-    arguments = _parse_args(["--causal-block-order", "reverse"])
+    arguments = _parse_args(["--reverse-causal-blocks"])
 
     with pytest.raises(SystemExit, match="requires causal attention"):
         _validate_args(arguments)
@@ -108,8 +133,7 @@ def test_plan_resolution_applies_valid_schedule_overrides() -> None:
             [
                 "--block-m",
                 "64",
-                "--load-path",
-                "pointer",
+                "--no-use-tensor-descriptors",
                 "--num-warps",
                 "8",
                 "--num-stages",

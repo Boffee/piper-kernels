@@ -85,16 +85,20 @@ Explicit Piper axes form a deduplicated Cartesian search, capped at 256 candidat
 Triton's native loop-pipeline and loop-invariant-code-motion controls measurable without
 silently applying a SageAttention2++ schedule to Piper Attention:
 
+Boolean options use `argparse`'s standard optional-boolean form and match the execution-plan field
+names. `--option` selects true, `--no-option` selects false, and omitting the option retains the
+production value.
+
 ```shell
 uv run python benchmarks/tune_piper_attention.py \
   --sequence 8192 --head-dim 128 --causal \
-  --load-path pointer tensor-descriptor \
+  --use-tensor-descriptors \
   --block-m 64 128 \
   --num-stages 2 3 \
-  --causal-block-order forward reverse \
+  --reverse-causal-blocks \
   --loop-num-stages none 3 \
-  --loop-licm disabled enabled \
-  --probability-conversion stock packed \
+  --loop-licm \
+  --use-packed-probability-conversion \
   --json artifacts/piper_attention_execution_plan.json
 ```
 
@@ -107,7 +111,7 @@ uv run python benchmarks/tune_sage_attention_2pp.py \
   --sequence 8192 --head-dim 128 \
   --block-m 64 128 \
   --num-stages 2 3 \
-  --load-path pointer tensor-descriptor \
+  --use-tensor-descriptors \
   --json artifacts/sage_attention_2pp_sm120_tuning.json
 ```
 

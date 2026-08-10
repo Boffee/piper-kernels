@@ -532,7 +532,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
     use_packed_probability_conversion: tl.constexpr,
     reverse_causal_blocks: tl.constexpr,
     loop_num_stages: tl.constexpr,
-    disable_loop_licm: tl.constexpr,
+    loop_licm: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -609,7 +609,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
             prefix_end,
             block_n,
             num_stages=loop_num_stages,
-            disable_licm=disable_loop_licm,
+            disable_licm=not loop_licm,
         ):
             accumulator, denominator, running_max = _causal_attention_tile(
                 query,
@@ -644,7 +644,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
             end_n,
             block_n,
             num_stages=loop_num_stages,
-            disable_licm=disable_loop_licm,
+            disable_licm=not loop_licm,
         ):
             accumulator, denominator, running_max = _causal_attention_tile(
                 query,
@@ -681,7 +681,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
             end_n,
             block_n,
             num_stages=loop_num_stages,
-            disable_licm=disable_loop_licm,
+            disable_licm=not loop_licm,
         ):
             current_n = start_n + offsets_n
             key = _load_attention_key_tile(
@@ -825,7 +825,7 @@ class _SageAttention2ppExecutionPlan:
     num_stages: int = 3
     reverse_causal_blocks: bool = False
     loop_num_stages: int | None = None
-    disable_loop_licm: bool = True
+    loop_licm: bool = False
 
     def __post_init__(self) -> None:
         if self.block_m not in (32, 64, 128):
@@ -886,7 +886,7 @@ def _apply_sm89_sage_attention_2pp_policy(
         return replace(
             plan,
             loop_num_stages=3,
-            disable_loop_licm=False,
+            loop_licm=True,
         )
     return plan
 
@@ -1322,7 +1322,7 @@ def _launch_sage_attention_2pp(prepared: _PreparedSageAttention2pp) -> torch.Ten
         use_packed_probability_conversion=plan.use_packed_probability_conversion,
         reverse_causal_blocks=plan.reverse_causal_blocks,
         loop_num_stages=plan.loop_num_stages,
-        disable_loop_licm=plan.disable_loop_licm,
+        loop_licm=plan.loop_licm,
         heads=heads,
         head_dim=head_dim,
         block_m=plan.block_m,
