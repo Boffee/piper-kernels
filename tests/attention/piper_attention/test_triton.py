@@ -326,7 +326,7 @@ def test_explicit_execution_plan_runs_native_loop_controls() -> None:
         use_tensor_descriptors=False,
         reverse_causal_blocks=True,
         loop_num_stages=2,
-        disable_loop_licm=False,
+        loop_licm=True,
     )
 
     with torch.no_grad():

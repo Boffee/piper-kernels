@@ -30,13 +30,13 @@ def _production_plan(*, is_causal: bool = False):
 def test_tuner_defaults_to_production_plan() -> None:
     arguments = _parse_args([])
 
-    assert arguments.load_path is None
+    assert arguments.use_tensor_descriptors is None
     assert arguments.phase is TuningPhase.PREPARED_EXECUTION
     assert arguments.minimum_sqnr_db == 20.0
     assert arguments.block_m is None
     assert arguments.num_warps is None
     assert arguments.num_stages is None
-    assert arguments.probability_conversion is None
+    assert arguments.use_packed_probability_conversion is None
 
 
 def test_omitted_axes_measure_only_the_production_plan() -> None:
@@ -49,21 +49,21 @@ def test_omitted_axes_measure_only_the_production_plan() -> None:
 def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
     arguments = _parse_args(
         [
-            "--load-path",
-            "pointer",
+            "--no-use-tensor-descriptors",
             "--block-m",
             "64",
             "128",
             "128",
+            "--num-warps",
+            "2",
+            "4",
             "--num-stages",
             "2",
             "3",
             "--loop-num-stages",
             "none",
             "2",
-            "--probability-conversion",
-            "stock",
-            "packed",
+            "--use-packed-probability-conversion",
         ]
     )
 
@@ -73,12 +73,19 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
     assert len({tuple(plan.as_dict().items()) for plan in plans}) == 16
 
 
-def test_probability_conversion_axis_selects_stock_and_packed_plans() -> None:
-    arguments = _parse_args(["--probability-conversion", "stock", "packed", "packed"])
+@pytest.mark.parametrize(
+    ("option", "expected"),
+    [
+        ("--no-use-packed-probability-conversion", False),
+        ("--use-packed-probability-conversion", True),
+    ],
+)
+def test_probability_conversion_boolean_override(option: str, expected: bool) -> None:
+    arguments = _parse_args([option])
 
     plans = _candidate_plans(arguments, _production_plan())
 
-    assert [plan.use_packed_probability_conversion for plan in plans] == [False, True]
+    assert [plan.use_packed_probability_conversion for plan in plans] == [expected]
 
 
 def test_candidate_configuration_uses_raw_execution_plan_fields() -> None:
@@ -101,8 +108,7 @@ def test_candidate_configuration_uses_raw_execution_plan_fields() -> None:
 def test_candidate_limit_prevents_accidental_compile_explosion() -> None:
     arguments = _parse_args(
         [
-            "--load-path",
-            "pointer",
+            "--no-use-tensor-descriptors",
             "--block-m",
             "64",
             "128",
@@ -122,12 +128,10 @@ def test_tuner_accepts_causal_native_loop_controls() -> None:
     arguments = _parse_args(
         [
             "--causal",
-            "--causal-block-order",
-            "reverse",
+            "--reverse-causal-blocks",
             "--loop-num-stages",
             "3",
             "--loop-licm",
-            "enabled",
         ]
     )
 
@@ -136,7 +140,7 @@ def test_tuner_accepts_causal_native_loop_controls() -> None:
 
     assert all(plan.reverse_causal_blocks for plan in plans)
     assert all(plan.loop_num_stages == 3 for plan in plans)
-    assert all(not plan.disable_loop_licm for plan in plans)
+    assert all(plan.loop_licm for plan in plans)
 
 
 def test_tuner_rejects_causal_cross_attention() -> None:
@@ -147,7 +151,7 @@ def test_tuner_rejects_causal_cross_attention() -> None:
 
 
 def test_tuner_rejects_reverse_order_for_noncausal_attention() -> None:
-    arguments = _parse_args(["--causal-block-order", "reverse"])
+    arguments = _parse_args(["--reverse-causal-blocks"])
 
     with pytest.raises(SystemExit, match="requires causal attention"):
         _validate_args(arguments)

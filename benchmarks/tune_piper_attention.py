@@ -33,11 +33,7 @@ from piper_kernels.attention.piper_attention import triton as piper_attention_ba
 _BLOCK_M_VALUES = (32, 64, 128)
 _NUM_WARPS_VALUES = (2, 4, 8)
 _NUM_STAGES_VALUES = (1, 2, 3, 4)
-_LOAD_PATHS = {"pointer": False, "tensor-descriptor": True}
-_CAUSAL_BLOCK_ORDERS = {"forward": False, "reverse": True}
-_LOOP_LICM = {"disabled": True, "enabled": False}
 _OPTIONAL_LOOP_STAGES = ("none", "1", "2", "3", "4")
-_PROBABILITY_CONVERSIONS = {"stock": False, "packed": True}
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -49,21 +45,29 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--load-path", choices=tuple(_LOAD_PATHS), nargs="+")
+    parser.add_argument(
+        "--use-tensor-descriptors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--block-m", type=int, choices=_BLOCK_M_VALUES, nargs="+")
     parser.add_argument("--num-warps", type=int, choices=_NUM_WARPS_VALUES, nargs="+")
     parser.add_argument("--num-stages", type=int, choices=_NUM_STAGES_VALUES, nargs="+")
     parser.add_argument(
-        "--causal-block-order",
-        choices=tuple(_CAUSAL_BLOCK_ORDERS),
-        nargs="+",
+        "--reverse-causal-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument("--loop-num-stages", choices=_OPTIONAL_LOOP_STAGES, nargs="+")
-    parser.add_argument("--loop-licm", choices=tuple(_LOOP_LICM), nargs="+")
     parser.add_argument(
-        "--probability-conversion",
-        choices=tuple(_PROBABILITY_CONVERSIONS),
-        nargs="+",
+        "--loop-licm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--use-packed-probability-conversion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument(
         "--phase",
@@ -88,11 +92,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("batch size and heads must be positive")
     if args.causal and lengths[0] != lengths[1]:
         raise SystemExit("causal attention requires equal query and key/value lengths")
-    if (
-        not args.causal
-        and args.causal_block_order is not None
-        and "reverse" in args.causal_block_order
-    ):
+    if not args.causal and args.reverse_causal_blocks is True:
         raise SystemExit("reverse causal-block order requires causal attention")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
@@ -110,16 +110,8 @@ def _axis[T](values: Sequence[T] | None, production_value: T) -> tuple[T, ...]:
     return (production_value,) if values is None else _unique(values)
 
 
-def _mapped_axis[T](
-    values: Sequence[str] | None,
-    production_value: T,
-    mapping: Mapping[str, T],
-) -> tuple[T, ...]:
-    return (
-        (production_value,)
-        if values is None
-        else _unique(tuple(mapping[value] for value in values))
-    )
+def _boolean_axis(value: bool | None, production_value: bool) -> tuple[bool, ...]:
+    return (production_value if value is None else value,)
 
 
 def _loop_stage_axis(
@@ -140,26 +132,13 @@ def _candidate_plans(
         _axis(args.block_m, production_plan.block_m),
         _axis(args.num_warps, production_plan.num_warps),
         _axis(args.num_stages, production_plan.num_stages),
-        _mapped_axis(
-            args.load_path,
-            production_plan.use_tensor_descriptors,
-            _LOAD_PATHS,
-        ),
-        _mapped_axis(
-            args.causal_block_order,
-            production_plan.reverse_causal_blocks,
-            _CAUSAL_BLOCK_ORDERS,
-        ),
+        _boolean_axis(args.use_tensor_descriptors, production_plan.use_tensor_descriptors),
+        _boolean_axis(args.reverse_causal_blocks, production_plan.reverse_causal_blocks),
         _loop_stage_axis(args.loop_num_stages, production_plan.loop_num_stages),
-        _mapped_axis(
-            args.loop_licm,
-            production_plan.disable_loop_licm,
-            _LOOP_LICM,
-        ),
-        _mapped_axis(
-            args.probability_conversion,
+        _boolean_axis(args.loop_licm, production_plan.loop_licm),
+        _boolean_axis(
+            args.use_packed_probability_conversion,
             production_plan.use_packed_probability_conversion,
-            _PROBABILITY_CONVERSIONS,
         ),
     )
     plans = tuple(
@@ -171,7 +150,7 @@ def _candidate_plans(
             use_tensor_descriptors=use_tensor_descriptors,
             reverse_causal_blocks=reverse_causal_blocks,
             loop_num_stages=loop_num_stages,
-            disable_loop_licm=disable_loop_licm,
+            loop_licm=loop_licm,
             use_packed_probability_conversion=use_packed_probability_conversion,
         )
         for (
@@ -181,7 +160,7 @@ def _candidate_plans(
             use_tensor_descriptors,
             reverse_causal_blocks,
             loop_num_stages,
-            disable_loop_licm,
+            loop_licm,
             use_packed_probability_conversion,
         ) in product(*axes)
     )
@@ -197,7 +176,7 @@ def _plan_name(plan: piper_attention_backend._PiperAttentionExecutionPlan) -> st
     load_path = "descriptor" if plan.use_tensor_descriptors else "pointer"
     loop_stages = plan.loop_num_stages if plan.loop_num_stages is not None else "none"
     block_order = "reverse" if plan.reverse_causal_blocks else "forward"
-    licm = "licm" if not plan.disable_loop_licm else "no-licm"
+    licm = "licm" if plan.loop_licm else "no-licm"
     probability_conversion = "packed-p" if plan.use_packed_probability_conversion else "stock-p"
     return (
         f"{load_path}-m{plan.block_m}-w{plan.num_warps}-s{plan.num_stages}-"

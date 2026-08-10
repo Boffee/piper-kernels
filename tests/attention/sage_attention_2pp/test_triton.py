@@ -203,6 +203,8 @@ def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
         fuse_kv_quantization=False,
         fuse_query_quantization=False,
         use_unscaled_score_recurrence=False,
+        loop_num_stages=3,
+        loop_licm=True,
     )
 
     with torch.no_grad():

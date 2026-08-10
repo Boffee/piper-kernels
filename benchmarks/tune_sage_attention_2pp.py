@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from itertools import product
 from pathlib import Path
@@ -36,13 +36,6 @@ _BLOCK_M_VALUES = (32, 64, 128)
 _NUM_WARPS_VALUES = (2, 4, 8)
 _NUM_STAGES_VALUES = (1, 2, 3, 4)
 _OPTIONAL_LOOP_STAGES = ("none", "1", "2", "3", "4")
-_LOAD_PATHS = {"pointer": False, "tensor-descriptor": True}
-_KV_QUANTIZATION = {"separate": False, "fused": True}
-_QUERY_QUANTIZATION = {"separate": False, "fused": True}
-_SCORE_RECURRENCE = {"scaled": False, "unscaled": True}
-_CAUSAL_BLOCK_ORDERS = {"forward": False, "reverse": True}
-_LOOP_LICM = {"disabled": True, "enabled": False}
-_PROBABILITY_CONVERSIONS = {"stock": False, "packed": True}
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +51,7 @@ class _SageAttention2ppTuningChoice:
     use_unscaled_score_recurrence: bool
     reverse_causal_blocks: bool
     loop_num_stages: int | None
-    disable_loop_licm: bool
+    loop_licm: bool
     use_packed_probability_conversion: bool
 
     @property
@@ -74,7 +67,7 @@ class _SageAttention2ppTuningChoice:
             "unscaled-score" if self.use_unscaled_score_recurrence else "scaled-score",
             "reverse" if self.reverse_causal_blocks else "forward",
             f"loop{self.loop_num_stages or 'none'}",
-            "licm" if not self.disable_loop_licm else "no-licm",
+            "licm" if self.loop_licm else "no-licm",
             "packed-p" if self.use_packed_probability_conversion else "stock-p",
         )
         return "-".join(tokens)
@@ -96,21 +89,41 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-m", type=int, choices=_BLOCK_M_VALUES, nargs="+")
     parser.add_argument("--num-warps", type=int, choices=_NUM_WARPS_VALUES, nargs="+")
     parser.add_argument("--num-stages", type=int, choices=_NUM_STAGES_VALUES, nargs="+")
-    parser.add_argument("--load-path", choices=tuple(_LOAD_PATHS), nargs="+")
-    parser.add_argument("--kv-quantization", choices=tuple(_KV_QUANTIZATION), nargs="+")
-    parser.add_argument("--query-quantization", choices=tuple(_QUERY_QUANTIZATION), nargs="+")
-    parser.add_argument("--score-recurrence", choices=tuple(_SCORE_RECURRENCE), nargs="+")
     parser.add_argument(
-        "--causal-block-order",
-        choices=tuple(_CAUSAL_BLOCK_ORDERS),
-        nargs="+",
+        "--use-tensor-descriptors",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--fuse-kv-quantization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--fuse-query-quantization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--use-unscaled-score-recurrence",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--reverse-causal-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument("--loop-num-stages", choices=_OPTIONAL_LOOP_STAGES, nargs="+")
-    parser.add_argument("--loop-licm", choices=tuple(_LOOP_LICM), nargs="+")
     parser.add_argument(
-        "--probability-conversion",
-        choices=tuple(_PROBABILITY_CONVERSIONS),
-        nargs="+",
+        "--loop-licm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--use-packed-probability-conversion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument(
         "--phase",
@@ -135,11 +148,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("batch size and heads must be positive")
     if args.causal and lengths[0] != lengths[1]:
         raise SystemExit("causal attention requires equal query and key/value lengths")
-    if (
-        not args.causal
-        and args.causal_block_order is not None
-        and "reverse" in args.causal_block_order
-    ):
+    if not args.causal and args.reverse_causal_blocks is True:
         raise SystemExit("reverse causal-block order requires causal attention")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
@@ -157,16 +166,8 @@ def _axis[T](values: Sequence[T] | None, production_value: T) -> tuple[T, ...]:
     return (production_value,) if values is None else _unique(values)
 
 
-def _mapped_axis[T](
-    values: Sequence[str] | None,
-    production_value: T,
-    mapping: Mapping[str, T],
-) -> tuple[T, ...]:
-    return (
-        (production_value,)
-        if values is None
-        else _unique(tuple(mapping[value] for value in values))
-    )
+def _boolean_axis(value: bool | None, production_value: bool) -> tuple[bool, ...]:
+    return (production_value if value is None else value,)
 
 
 def _loop_stage_axis(
@@ -187,41 +188,19 @@ def _candidate_choices(
         _axis(args.block_m, production_plan.block_m),
         _axis(args.num_warps, production_plan.num_warps),
         _axis(args.num_stages, production_plan.num_stages),
-        _mapped_axis(
-            args.load_path,
-            production_plan.use_tensor_descriptors,
-            _LOAD_PATHS,
-        ),
-        _mapped_axis(
-            args.kv_quantization,
-            production_plan.fuse_kv_quantization,
-            _KV_QUANTIZATION,
-        ),
-        _mapped_axis(
-            args.query_quantization,
-            production_plan.fuse_query_quantization,
-            _QUERY_QUANTIZATION,
-        ),
-        _mapped_axis(
-            args.score_recurrence,
+        _boolean_axis(args.use_tensor_descriptors, production_plan.use_tensor_descriptors),
+        _boolean_axis(args.fuse_kv_quantization, production_plan.fuse_kv_quantization),
+        _boolean_axis(args.fuse_query_quantization, production_plan.fuse_query_quantization),
+        _boolean_axis(
+            args.use_unscaled_score_recurrence,
             production_plan.use_unscaled_score_recurrence,
-            _SCORE_RECURRENCE,
         ),
-        _mapped_axis(
-            args.causal_block_order,
-            production_plan.reverse_causal_blocks,
-            _CAUSAL_BLOCK_ORDERS,
-        ),
+        _boolean_axis(args.reverse_causal_blocks, production_plan.reverse_causal_blocks),
         _loop_stage_axis(args.loop_num_stages, production_plan.loop_num_stages),
-        _mapped_axis(
-            args.loop_licm,
-            production_plan.disable_loop_licm,
-            _LOOP_LICM,
-        ),
-        _mapped_axis(
-            args.probability_conversion,
+        _boolean_axis(args.loop_licm, production_plan.loop_licm),
+        _boolean_axis(
+            args.use_packed_probability_conversion,
             production_plan.use_packed_probability_conversion,
-            _PROBABILITY_CONVERSIONS,
         ),
     )
     candidate_count = math.prod(len(axis) for axis in axes)
@@ -261,7 +240,7 @@ def _resolve_plan(
             use_unscaled_score_recurrence=choice.use_unscaled_score_recurrence,
             reverse_causal_blocks=choice.reverse_causal_blocks,
             loop_num_stages=choice.loop_num_stages,
-            disable_loop_licm=choice.disable_loop_licm,
+            loop_licm=choice.loop_licm,
             use_packed_probability_conversion=choice.use_packed_probability_conversion,
         )
     except ValueError as error:
