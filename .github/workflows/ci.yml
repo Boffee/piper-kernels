@@ -33,7 +33,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install Python
-        run: uv python install 3.14
+        run: uv python install 3.13
 
       - name: Install development environment
         run: uv sync --locked --dev
@@ -55,7 +55,7 @@ jobs:
 
       - name: Smoke-test built wheel
         run: |
-          uv venv --python 3.14 .wheel-test
+          uv venv --python 3.13 .wheel-test
           uv pip install --python .wheel-test/bin/python dist/*.whl
           .wheel-test/bin/python -c "import importlib.metadata, piper_kernels; assert importlib.metadata.version('piper-kernels')"
 
@@ -87,7 +87,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install Python
-        run: uv python install 3.14
+        run: uv python install 3.13
 
       - name: Install Windows test environment
         run: uv sync --locked --no-dev --group test --extra triton

@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
 ### Added
 
 - Native Windows Triton setup through the platform-selected `triton-windows` package,
@@ -33,6 +35,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Lowered the minimum supported Python version from 3.14 to 3.13.
 - Centralized Piper Attention specialization and launch policy in an immutable execution plan
   shared by production, benchmark metadata, and quality-gated offline tuning. Triton loop
   pipelining, loop invariant code motion, and causal query-block ordering are explicit tuning
@@ -80,5 +83,6 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Boffee/piper-kernels/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Boffee/piper-kernels/releases/tag/v0.1.0

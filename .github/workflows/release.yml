@@ -26,7 +26,7 @@ jobs:
           version: "0.12.1"
 
       - name: Install Python
-        run: uv python install 3.14
+        run: uv python install 3.13
 
       - name: Verify tag matches package version
         env:
@@ -60,7 +60,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          uv venv --python 3.14 .wheel-test
+          uv venv --python 3.13 .wheel-test
           uv pip install --python .wheel-test/bin/python dist/*.whl
           .wheel-test/bin/python -c "import importlib.metadata, os, piper_kernels; assert importlib.metadata.version('piper-kernels') == os.environ['RELEASE_TAG'].removeprefix('v')"
 

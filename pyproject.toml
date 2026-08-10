@@ -1,17 +1,17 @@
 [project]
 name = "piper-kernels"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reusable PyTorch inference operators and Triton kernels."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 keywords = ["inference", "pytorch", "quantization", "triton"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -60,7 +60,7 @@ markers = [
 pythonpath = ["benchmarks"]
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
@@ -93,7 +93,7 @@ known-first-party = ["piper_kernels"]
 [tool.pyright]
 include = ["src/piper_kernels"]
 exclude = ["tests", "benchmarks"]
-pythonVersion = "3.14"
+pythonVersion = "3.13"
 typeCheckingMode = "standard"
 reportMissingImports = "none"
 reportPrivateImportUsage = "none"
