@@ -195,10 +195,10 @@ def _sage_attention_2pp_jit_functions(
 def _piper_attention_jit_functions(
     target: AcceleratorTarget,
     *,
-    sort_value_rows: bool,
+    plan: piper_attention_backend._PiperAttentionExecutionPlan,
 ) -> dict[str, object]:
     qk_kernels = _qk_jit_functions(target)
-    if sort_value_rows and target.is_cuda_capability(12):
+    if plan.sort_value_rows:
         qk_kernels["quantize-key-per-block"] = (
             piper_attention_backend._quantize_ordered_key_per_block_kernel
         )
@@ -209,7 +209,7 @@ def _piper_attention_jit_functions(
         "quantize-value-per-key": piper_attention_backend._quantize_value_per_key_kernel,
         "attention": piper_attention_backend._piper_attention_kernel,
     }
-    if sort_value_rows:
+    if plan.sort_value_rows:
         kernels["centered-value-row-range"] = (
             piper_attention_backend._centered_value_row_range_kernel
         )
@@ -227,12 +227,13 @@ def _make_piper_attention_provider(
 ) -> AttentionProvider:
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
-    sort_value_rows = piper_attention_backend._should_sort_value_rows(
-        center_value=center_value,
+    plan = piper_attention_backend._default_piper_attention_execution_plan(
+        query,
+        key,
+        config.is_causal,
+        center_value,
         target=target,
-        is_causal=config.is_causal,
-        head_dim=query.shape[-1],
-        key_length=key.shape[2],
+        native_uint8=native_uint8,
     )
 
     def prepare() -> object:
@@ -243,8 +244,7 @@ def _make_piper_attention_provider(
             scale,
             config.is_causal,
             center_value,
-            native_uint8=native_uint8,
-            sort_value_rows=sort_value_rows,
+            execution_plan=plan,
         )
 
     def run(prepared: object) -> torch.Tensor:
@@ -261,17 +261,16 @@ def _make_piper_attention_provider(
             **config.as_dict(),
             "implementation": "pure_triton",
             "algorithm": "piper_attention",
+            **plan.as_dict(),
             "qk_quantization": qk_quantization_granularity(target),
             "probability_dtype": "uint8",
             "value_dtype": "int8",
             "value_scale": "per_key",
             "center_value": center_value,
-            "value_row_order": "centered_range_ascending" if sort_value_rows else "original",
-            "mixed_sign_mma": "native" if native_uint8 else "affine_proxy",
         },
         triton_jit_functions=_piper_attention_jit_functions(
             target,
-            sort_value_rows=sort_value_rows,
+            plan=plan,
         ),
     )
 

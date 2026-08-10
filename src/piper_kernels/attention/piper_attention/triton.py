@@ -11,7 +11,7 @@ identical affine signed-INT8 formulation is retained as the portable control.
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, cast
 
 import torch
@@ -415,9 +415,15 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
+    reverse_causal_blocks: tl.constexpr,
+    loop_num_stages: tl.constexpr,
+    disable_loop_licm: tl.constexpr,
 ):
     """Fused exact-log UINT8-P/INT8-V online attention."""
-    query_block = tl.program_id(0) + query_block_offset
+    query_block = tl.program_id(0)
+    if is_causal and reverse_causal_blocks:
+        query_block = tl.num_programs(0) - 1 - query_block
+    query_block += query_block_offset
     head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
@@ -470,7 +476,13 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     if is_causal:
         end_n = tl.minimum(key_length, (query_block + 1) * block_m)
 
-    for start_n in tl.range(0, end_n, block_n, disable_licm=True):
+    for start_n in tl.range(
+        0,
+        end_n,
+        block_n,
+        num_stages=loop_num_stages,
+        disable_licm=disable_loop_licm,
+    ):
         current_n = start_n + offsets_n
         key = _load_key_tile(
             key_ptr,
@@ -999,30 +1011,6 @@ def _make_descriptors(
     return key_descriptor, value_descriptor
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedPiperAttention:
-    query: torch.Tensor
-    key: torch.Tensor | TensorDescriptor
-    value: torch.Tensor | TensorDescriptor
-    query_scale: torch.Tensor
-    key_scale: torch.Tensor
-    value_scale_multiplier: torch.Tensor
-    value_log_scale: torch.Tensor
-    value_correction: torch.Tensor
-    value_mean: torch.Tensor
-    output: torch.Tensor
-    key_length: int
-    storage_key_length: int
-    block_m: int
-    is_causal: bool
-    grouped_qk: bool
-    native_uint8: bool
-    split_pv_head_dim: bool
-    scaled_fp16_numerator: bool
-    center_value: bool
-    use_tensor_descriptors: bool
-
-
 def _should_sort_value_rows(
     *,
     center_value: bool,
@@ -1041,31 +1029,62 @@ def _should_sort_value_rows(
     )
 
 
-def _prepare_piper_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scale: float,
+@dataclass(frozen=True, slots=True)
+class _PiperAttentionExecutionPlan:
+    """Host-side specialization and launch choices for one Piper invocation."""
+
+    block_m: int
+    grouped_qk: bool
+    native_uint8: bool
+    split_pv_head_dim: bool
+    scaled_fp16_numerator: bool
+    sort_value_rows: bool
+    use_tensor_descriptors: bool
+    num_warps: int = 4
+    num_stages: int = 3
+    reverse_causal_blocks: bool = False
+    loop_num_stages: int | None = None
+    disable_loop_licm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.block_m not in (32, 64, 128):
+            raise ValueError("Piper Attention block_m must be 32, 64, or 128")
+        if self.num_warps not in (2, 4, 8):
+            raise ValueError("Piper Attention num_warps must be 2, 4, or 8")
+        if self.num_stages not in (1, 2, 3, 4):
+            raise ValueError("Piper Attention num_stages must be 1, 2, 3, or 4")
+        if self.loop_num_stages not in (None, 1, 2, 3, 4):
+            raise ValueError("Piper Attention loop_num_stages must be None, 1, 2, 3, or 4")
+        if self.scaled_fp16_numerator and not self.split_pv_head_dim:
+            raise ValueError("scaled FP16 numerator recurrence requires split PV")
+        if self.sort_value_rows and not self.grouped_qk:
+            raise ValueError("value-row ordering requires grouped QK")
+
+    def as_dict(self) -> dict[str, object]:
+        """Return execution choices as serializable benchmark metadata."""
+        return asdict(self)
+
+
+def _select_piper_attention_execution_plan(
+    target: AcceleratorTarget,
+    *,
+    candidate_block_m: int,
+    query_length: int,
+    key_length: int,
+    head_dim: int,
     is_causal: bool,
     center_value: bool,
-    *,
     native_uint8: bool | None = None,
     sort_value_rows: bool | None = None,
     use_tensor_descriptors: bool | None = None,
-) -> _PreparedPiperAttention:
-    """Quantize Q/K/V and construct the selected launch specialization."""
-    batch, heads, query_length, head_dim = query.shape
-    key_length = key.shape[2]
-    target = AcceleratorTarget.from_device(query.device)
+) -> _PiperAttentionExecutionPlan:
+    """Select established policy without borrowing schedules from other kernels."""
     grouped_qk = target.is_cuda_capability(12)
-    use_sm12x_schedule = target.is_cuda_capability(12)
-    if native_uint8 is None:
-        native_uint8 = target.supports_uint8_int8_mma
-    if native_uint8:
-        with torch.cuda.device(query.device):
-            install_uint8_int8_dot_hook()
+    native_uint8 = (
+        target.supports_uint8_int8_mma if native_uint8 is None else native_uint8
+    )
     split_pv_head_dim = (
-        use_sm12x_schedule
+        target.is_cuda_capability(12)
         and not is_causal
         and head_dim == 128
         and query_length >= 1024
@@ -1080,10 +1099,6 @@ def _prepare_piper_attention(
             head_dim=head_dim,
             key_length=key_length,
         )
-    if sort_value_rows and (not center_value or is_causal or not grouped_qk):
-        raise ValueError(
-            "value-row ordering requires centered non-causal grouped-QK attention"
-        )
 
     block_m = (
         64
@@ -1092,17 +1107,123 @@ def _prepare_piper_attention(
         if scaled_fp16_numerator and query_length >= 8192 and key_length >= 8192
         else 64
         if split_pv_head_dim
-        else select_query_block(query, batch, heads, query_length)
+        else candidate_block_m
     )
-    padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
     if use_tensor_descriptors is None:
         use_tensor_descriptors = (
-            use_sm12x_schedule
+            target.is_cuda_capability(12)
             and block_m == 128
             and head_dim == 128
-            and padded_key_length % 16 == 0
         )
-    storage_key_length = padded_key_length if use_tensor_descriptors else key_length
+    return _PiperAttentionExecutionPlan(
+        block_m=block_m,
+        grouped_qk=grouped_qk,
+        native_uint8=native_uint8,
+        split_pv_head_dim=split_pv_head_dim,
+        scaled_fp16_numerator=scaled_fp16_numerator,
+        sort_value_rows=sort_value_rows,
+        use_tensor_descriptors=use_tensor_descriptors,
+        num_stages=2 if use_tensor_descriptors else 3,
+    )
+
+
+def _default_piper_attention_execution_plan(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    is_causal: bool,
+    center_value: bool,
+    *,
+    target: AcceleratorTarget | None = None,
+    native_uint8: bool | None = None,
+    sort_value_rows: bool | None = None,
+    use_tensor_descriptors: bool | None = None,
+) -> _PiperAttentionExecutionPlan:
+    """Resolve production policy for preparation, benchmarks, and tuning."""
+    batch, heads, query_length, head_dim = query.shape
+    candidate_block_m = (
+        select_query_block(query, batch, heads, query_length)
+        if query.device.type == "cuda"
+        else 64
+    )
+    target = AcceleratorTarget.from_device(query.device) if target is None else target
+    return _select_piper_attention_execution_plan(
+        target,
+        candidate_block_m=candidate_block_m,
+        query_length=query_length,
+        key_length=key.shape[2],
+        head_dim=head_dim,
+        is_causal=is_causal,
+        center_value=center_value,
+        native_uint8=native_uint8,
+        sort_value_rows=sort_value_rows,
+        use_tensor_descriptors=use_tensor_descriptors,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPiperAttention:
+    query: torch.Tensor
+    key: torch.Tensor | TensorDescriptor
+    value: torch.Tensor | TensorDescriptor
+    query_scale: torch.Tensor
+    key_scale: torch.Tensor
+    value_scale_multiplier: torch.Tensor
+    value_log_scale: torch.Tensor
+    value_correction: torch.Tensor
+    value_mean: torch.Tensor
+    output: torch.Tensor
+    key_length: int
+    storage_key_length: int
+    is_causal: bool
+    center_value: bool
+    plan: _PiperAttentionExecutionPlan
+
+
+def _prepare_piper_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    center_value: bool,
+    *,
+    native_uint8: bool | None = None,
+    sort_value_rows: bool | None = None,
+    use_tensor_descriptors: bool | None = None,
+    execution_plan: _PiperAttentionExecutionPlan | None = None,
+) -> _PreparedPiperAttention:
+    """Quantize Q/K/V and construct the selected launch specialization."""
+    if execution_plan is not None and any(
+        override is not None
+        for override in (native_uint8, sort_value_rows, use_tensor_descriptors)
+    ):
+        raise ValueError("execution_plan and individual plan overrides cannot both be specified")
+    batch, heads, _query_length, head_dim = query.shape
+    key_length = key.shape[2]
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else _default_piper_attention_execution_plan(
+            query,
+            key,
+            is_causal,
+            center_value,
+            native_uint8=native_uint8,
+            sort_value_rows=sort_value_rows,
+            use_tensor_descriptors=use_tensor_descriptors,
+        )
+    )
+    if plan.split_pv_head_dim and head_dim != 128:
+        raise ValueError("split-PV Piper Attention requires head_dim=128")
+    if plan.sort_value_rows and (not center_value or is_causal):
+        raise ValueError("value-row ordering requires centered non-causal attention")
+    if plan.reverse_causal_blocks and not is_causal:
+        raise ValueError("reverse block order requires causal attention")
+    if plan.native_uint8:
+        with torch.cuda.device(query.device):
+            install_uint8_int8_dot_hook()
+    padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
+    storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
 
     key_mean, value_mean = _compute_kv_means(
         key,
@@ -1111,7 +1232,7 @@ def _prepare_piper_attention(
     )
     key_order = (
         _build_centered_value_order(value, value_mean)
-        if sort_value_rows
+        if plan.sort_value_rows
         else None
     )
     query_int8, key_int8, query_scale, key_scale = _prepare_qk(
@@ -1119,7 +1240,7 @@ def _prepare_piper_attention(
         key,
         key_mean,
         scale,
-        grouped_qk=grouped_qk,
+        grouped_qk=plan.grouped_qk,
         storage_key_length=storage_key_length,
         key_order=key_order,
     )
@@ -1146,7 +1267,7 @@ def _prepare_piper_attention(
             device=value.device,
             dtype=torch.int16,
         )
-        if not native_uint8
+        if not plan.native_uint8
         else torch.empty((1,), device=value.device, dtype=torch.int16)
     )
     order_argument = (
@@ -1174,7 +1295,7 @@ def _prepare_piper_attention(
         value_int8.stride(3),
         center_value=center_value,
         ordered=key_order is not None,
-        store_correction=not native_uint8,
+        store_correction=not plan.native_uint8,
         heads=heads,
         head_dim=head_dim,
         block_n=_BLOCK_N,
@@ -1183,7 +1304,7 @@ def _prepare_piper_attention(
 
     key_argument: torch.Tensor | TensorDescriptor = key_int8
     value_argument: torch.Tensor | TensorDescriptor = value_int8
-    if use_tensor_descriptors:
+    if plan.use_tensor_descriptors:
         key_argument, value_argument = _make_descriptors(
             key_int8,
             value_int8,
@@ -1191,7 +1312,7 @@ def _prepare_piper_attention(
             heads,
             storage_key_length,
             head_dim,
-            split_pv_head_dim=split_pv_head_dim,
+            split_pv_head_dim=plan.split_pv_head_dim,
         )
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     return _PreparedPiperAttention(
@@ -1207,24 +1328,20 @@ def _prepare_piper_attention(
         output=output,
         key_length=key_length,
         storage_key_length=storage_key_length,
-        block_m=block_m,
         is_causal=is_causal,
-        grouped_qk=grouped_qk,
-        native_uint8=native_uint8,
-        split_pv_head_dim=split_pv_head_dim,
-        scaled_fp16_numerator=scaled_fp16_numerator,
         center_value=center_value,
-        use_tensor_descriptors=use_tensor_descriptors,
+        plan=plan,
     )
 
 
 def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
     """Launch only the fused attention recurrence on prepared integer inputs."""
     batch, heads, query_length, head_dim = prepared.output.shape
+    plan = prepared.plan
     attention_kernel = cast(Any, _piper_attention_kernel)
     launch_options = {
-        "num_warps": 4,
-        "num_stages": 2 if prepared.use_tensor_descriptors else 3,
+        "num_warps": plan.num_warps,
+        "num_stages": plan.num_stages,
     }
 
     def launch(query_blocks: int, query_block_offset: int, unmasked_queries: bool) -> None:
@@ -1244,10 +1361,10 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             prepared.storage_key_length,
             query_block_offset=query_block_offset,
             is_causal=prepared.is_causal,
-            grouped_qk=prepared.grouped_qk,
-            native_uint8=prepared.native_uint8,
-            split_pv_head_dim=prepared.split_pv_head_dim,
-            scaled_fp16_numerator=prepared.scaled_fp16_numerator,
+            grouped_qk=plan.grouped_qk,
+            native_uint8=plan.native_uint8,
+            split_pv_head_dim=plan.split_pv_head_dim,
+            scaled_fp16_numerator=plan.scaled_fp16_numerator,
             center_value=prepared.center_value,
             unmasked_query_tiles=unmasked_queries,
             unmasked_self_attention=(
@@ -1258,16 +1375,22 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             ),
             heads=heads,
             head_dim=head_dim,
-            block_m=prepared.block_m,
+            block_m=plan.block_m,
             block_n=_BLOCK_N,
-            use_tensor_descriptors=prepared.use_tensor_descriptors,
+            use_tensor_descriptors=plan.use_tensor_descriptors,
+            reverse_causal_blocks=plan.reverse_causal_blocks,
+            loop_num_stages=plan.loop_num_stages,
+            disable_loop_licm=plan.disable_loop_licm,
             **launch_options,
         )
 
-    full_query_blocks = query_length // prepared.block_m
+    full_query_blocks = query_length // plan.block_m
+    has_partial_query_block = query_length % plan.block_m != 0
+    if plan.reverse_causal_blocks and has_partial_query_block:
+        launch(1, full_query_blocks, False)
     if full_query_blocks:
         launch(full_query_blocks, 0, True)
-    if query_length % prepared.block_m:
+    if not plan.reverse_causal_blocks and has_partial_query_block:
         launch(1, full_query_blocks, False)
     return prepared.output
 
@@ -1283,6 +1406,7 @@ def _run_piper_attention(
     native_uint8: bool | None = None,
     sort_value_rows: bool | None = None,
     use_tensor_descriptors: bool | None = None,
+    execution_plan: _PiperAttentionExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused recurrence."""
     prepared = _prepare_piper_attention(
@@ -1295,6 +1419,7 @@ def _run_piper_attention(
         native_uint8=native_uint8,
         sort_value_rows=sort_value_rows,
         use_tensor_descriptors=use_tensor_descriptors,
+        execution_plan=execution_plan,
     )
     return _launch_piper_attention(prepared)
 

@@ -1,5 +1,6 @@
 """GPU tests for the pure-Triton Piper Attention backend."""
 
+from dataclasses import replace
 from typing import Literal
 
 import pytest
@@ -9,6 +10,7 @@ from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 from piper_kernels.attention.piper_attention.triton import (
+    _default_piper_attention_execution_plan,
     _launch_piper_attention,
     _prepare_piper_attention,
     _run_piper_attention,
@@ -228,6 +230,48 @@ def test_long_descriptor_path_matches_pointer_path() -> None:
         )
 
     torch.testing.assert_close(descriptor, pointer, atol=2**-9, rtol=0.0)
+
+
+def test_explicit_execution_plan_runs_native_loop_controls() -> None:
+    torch.manual_seed(61)
+    query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    production_plan = _default_piper_attention_execution_plan(query, key, True, True)
+    alternate_plan = replace(
+        production_plan,
+        block_m=32,
+        num_stages=2,
+        use_tensor_descriptors=False,
+        reverse_causal_blocks=True,
+        loop_num_stages=2,
+        disable_loop_licm=False,
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            128**-0.5,
+            True,
+            True,
+            execution_plan=alternate_plan,
+        )
+        expected = reference_piper_attention(
+            query,
+            key,
+            value,
+            128**-0.5,
+            True,
+            center_value=True,
+            qk_quantization=_qk_quantization(),
+        )
+    error = (actual.float() - expected.float()).abs()
+
+    assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
 
 
 def test_triton_runs_under_torch_compile() -> None:

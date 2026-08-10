@@ -74,7 +74,9 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
 
     assert providers[PIPER_ATTENTION_CENTERED].configuration["center_value"] is True
     assert providers[PIPER_ATTENTION_UNCENTERED].configuration["center_value"] is False
-    assert providers[PIPER_ATTENTION_AFFINE].configuration["mixed_sign_mma"] == "affine_proxy"
+    assert providers[PIPER_ATTENTION_AFFINE].configuration["native_uint8"] is False
+    assert "mixed_sign_mma" not in providers[PIPER_ATTENTION_AFFINE].configuration
+    assert "value_row_order" not in providers[PIPER_ATTENTION_CENTERED].configuration
     assert "attention" in providers[PIPER_ATTENTION_CENTERED].triton_jit_functions
     assert providers[SAGE_ATTENTION_2PP].configuration["algorithm"] == ("sage_attention_2pp")
     assert providers[SAGE_ATTENTION_2PP].configuration["block_n"] == 64

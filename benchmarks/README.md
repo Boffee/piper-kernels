@@ -65,7 +65,9 @@ This tooling never changes production dispatch or autotunes in a user's hot path
 is available as a versioned record accepted by the common JSON/JSONL writer, and the winner is
 marked with `selected: true`.
 
-The executable Piper Attention example compares pointer and tensor-descriptor load schedules:
+The executable Piper Attention tuner consumes the same immutable execution plan as production.
+Omitted axes retain their production values, so the default invocation measures exactly the
+production plan:
 
 ```shell
 uv run python benchmarks/tune_piper_attention.py \
@@ -75,7 +77,25 @@ uv run python benchmarks/tune_piper_attention.py \
 
 Use `--phase operator_end_to_end` to include preprocessing in the ranking. The default
 `prepared_execution` phase compares only the prepared fused recurrence. On targets where a
-candidate is unsupported, it remains in the report with `status: skipped`.
+candidate is unsupported, it remains in the report with `status: skipped`. Candidates with
+non-finite output mismatches or less than 20 dB SQNR are rejected by default; use
+`--minimum-sqnr-db` to change the finite threshold.
+
+Explicit Piper axes form a deduplicated Cartesian search, capped at 256 candidates. This makes
+Triton's native loop-pipeline and loop-invariant-code-motion controls measurable without
+silently applying a SageAttention2++ schedule to Piper Attention:
+
+```shell
+uv run python benchmarks/tune_piper_attention.py \
+  --sequence 8192 --head-dim 128 --causal \
+  --load-path pointer tensor-descriptor \
+  --block-m 64 128 \
+  --num-stages 2 3 \
+  --causal-block-order forward reverse \
+  --loop-num-stages none 3 \
+  --loop-licm disabled enabled \
+  --json artifacts/piper_attention_execution_plan.json
+```
 
 The SageAttention2++ adapter searches the same immutable execution-plan fields used by
 production dispatch. Omitted axes retain the production value; values supplied for multiple

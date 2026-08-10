@@ -33,6 +33,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Centralized Piper Attention specialization and launch policy in an immutable execution plan
+  shared by production, benchmark metadata, and quality-gated offline tuning. Triton loop
+  pipelining, loop invariant code motion, and causal query-block ordering are explicit tuning
+  dimensions while production schedules remain unchanged; in particular, SM89 does not inherit
+  SageAttention2++ tuning without Piper-specific measurements.
 - Raised the minimum supported PyTorch version from 2.12 to 2.13.
 - Tuned the pure-Triton SageAttention2++ path on SM89 with native packed
   FP32-to-E4M3 conversion, 128-row two-stage reverse-order long-causal launches,
