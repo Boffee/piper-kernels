@@ -42,11 +42,14 @@ benchmark = [
     "sageattention==2.2.0; sys_platform == 'linux'",
     "setuptools>=81.0",
 ]
+test = [
+    "pytest~=9.0",
+]
 dev = [
+    { include-group = "test" },
     "piper-kernels[convrot,triton]",
     "pre-commit>=4.0",
     "pyright>=1.1.409",
-    "pytest~=9.0",
     "ruff>=0.14.3",
 ]
 

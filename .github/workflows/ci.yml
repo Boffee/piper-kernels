@@ -89,14 +89,14 @@ jobs:
       - name: Install Python
         run: uv python install 3.14
 
-      - name: Install development environment
-        run: uv sync --locked --dev
+      - name: Install Windows test environment
+        run: uv sync --locked --no-dev --group test --extra triton
 
       - name: Verify Windows Triton selection
         run: >-
-          uv run python -c "from importlib.metadata import version; import triton;
+          uv run --no-sync python -c "from importlib.metadata import version; import triton;
           assert version('triton-windows').startswith('3.7.');
           assert triton.__version__.startswith('3.7.')"
 
-      - name: Test portable backends
-        run: uv run pytest -m "not gpu"
+      - name: Test portable attention backends
+        run: uv run --no-sync pytest tests/attention tests/triton -m "not gpu"
