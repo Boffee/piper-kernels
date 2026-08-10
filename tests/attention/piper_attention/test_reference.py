@@ -55,23 +55,3 @@ def test_reference_centering_restores_constant_value_exactly() -> None:
     )
 
     torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
-
-
-def test_reference_supports_sorted_value_rows() -> None:
-    torch.manual_seed(53)
-    query = torch.randn(1, 1, 67, 128, dtype=torch.bfloat16)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-
-    actual = reference_piper_attention(
-        query,
-        key,
-        value,
-        128**-0.5,
-        False,
-        qk_quantization="per_warp",
-        sort_value_rows=True,
-    )
-
-    assert actual.shape == query.shape
-    assert torch.isfinite(actual).all()

@@ -145,107 +145,9 @@ def _kv_mean_finalize_kernel(
 
 
 @triton.jit
-def _centered_value_row_range_kernel(
-    value_ptr,
-    value_mean_ptr,
-    range_ptr,
-    key_length,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    """Compute centered per-row V ranges without materializing centered V."""
-    key_block = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    offsets_n = key_block * block_n + tl.arange(0, block_n)
-    offsets_d = tl.arange(0, head_dim)
-    valid = offsets_n < key_length
-    value = tl.load(
-        value_ptr
-        + batch * stride_vb
-        + head * stride_vh
-        + offsets_n[:, None] * stride_vn
-        + offsets_d[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    value_mean = tl.load(value_mean_ptr + (batch * heads + head) * head_dim + offsets_d)
-    centered = tl.where(valid[:, None], value - value_mean[None, :], 0.0)
-    tl.store(
-        range_ptr + (batch * heads + head) * key_length + offsets_n,
-        tl.max(tl.abs(centered), axis=1),
-        mask=valid,
-    )
-
-
-@triton.jit
-def _quantize_ordered_key_per_block_kernel(
-    key_ptr,
-    key_mean_ptr,
-    order_ptr,
-    output_ptr,
-    scale_ptr,
-    key_length,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_sb,
-    stride_sh,
-    heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    """Gather ordered K rows directly into grouped INT8 storage."""
-    scale_group = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    offsets_n = scale_group * block_n + tl.arange(0, block_n)
-    offsets_d = tl.arange(0, head_dim)
-    valid = offsets_n < key_length
-    batch_head = batch * heads + head
-    source_n = tl.load(
-        order_ptr + batch_head * key_length + offsets_n,
-        mask=valid,
-        other=0,
-    )
-    mean = tl.load(key_mean_ptr + batch_head * head_dim + offsets_d)
-    values = tl.load(
-        key_ptr
-        + batch * stride_kb
-        + head * stride_kh
-        + source_n[:, None] * stride_kn
-        + offsets_d[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    values = tl.where(valid[:, None], values - mean[None, :], 0.0)
-    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(values / scale)
-    tl.store(
-        output_ptr
-        + batch * stride_ob
-        + head * stride_oh
-        + offsets_n[:, None] * stride_on
-        + offsets_d[None, :],
-        quantized,
-        mask=valid[:, None],
-    )
-    tl.store(scale_ptr + batch * stride_sb + head * stride_sh + scale_group, scale)
-
-
-@triton.jit
 def _quantize_value_per_key_kernel(
     value_ptr,
     value_mean_ptr,
-    order_ptr,
     scale_multiplier_ptr,
     log_scale_ptr,
     correction_ptr,
@@ -258,7 +160,6 @@ def _quantize_value_per_key_kernel(
     stride_oh,
     stride_od,
     stride_ok,
-    ordered: tl.constexpr,
     store_correction: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -272,19 +173,11 @@ def _quantize_value_per_key_kernel(
     offsets_d = tl.arange(0, head_dim)
     valid = offsets_n < key_length
     batch_head = batch * heads + head
-    if ordered:
-        source_n = tl.load(
-            order_ptr + batch_head * key_length + offsets_n,
-            mask=valid,
-            other=0,
-        )
-    else:
-        source_n = offsets_n
     value = tl.load(
         value_ptr
         + batch * stride_vb
         + head * stride_vh
-        + source_n[:, None] * stride_vn
+        + offsets_n[:, None] * stride_vn
         + offsets_d[None, :],
         mask=valid[:, None],
         other=0.0,
@@ -793,35 +686,6 @@ def _compute_kv_means(
     return key_mean, value_mean
 
 
-def _build_centered_value_order(
-    value: torch.Tensor,
-    value_mean: torch.Tensor,
-) -> torch.Tensor:
-    batch, heads, key_length, head_dim = value.shape
-    value_range = torch.empty(
-        (batch, heads, key_length),
-        device=value.device,
-        dtype=torch.float32,
-    )
-    block_n = 32
-    _centered_value_row_range_kernel[
-        (triton.cdiv(key_length, block_n), heads, batch)
-    ](
-        value,
-        value_mean,
-        value_range,
-        key_length,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=block_n,
-        num_warps=4,
-    )
-    return torch.argsort(value_range, dim=-1, stable=True).to(torch.int32)
-
-
 def _prepare_qk(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -830,7 +694,6 @@ def _prepare_qk(
     *,
     grouped_qk: bool,
     storage_key_length: int,
-    key_order: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, query_length, head_dim = query.shape
     key_length = key.shape[2]
@@ -871,50 +734,26 @@ def _prepare_qk(
             head_dim=head_dim,
             num_warps=4,
         )
-        if key_order is None:
-            qk_quantization.quantize_key_per_block_kernel[(key_groups, heads, batch)](
-                key,
-                key_mean,
-                key_int8,
-                key_scale,
-                key_length,
-                key.stride(0),
-                key.stride(1),
-                key.stride(2),
-                key_int8.stride(0),
-                key_int8.stride(1),
-                key_int8.stride(2),
-                key_scale.stride(0),
-                key_scale.stride(1),
-                heads=heads,
-                head_dim=head_dim,
-                block_n=_BLOCK_N,
-                num_warps=4,
-            )
-        else:
-            _quantize_ordered_key_per_block_kernel[(key_groups, heads, batch)](
-                key,
-                key_mean,
-                key_order,
-                key_int8,
-                key_scale,
-                key_length,
-                key.stride(0),
-                key.stride(1),
-                key.stride(2),
-                key_int8.stride(0),
-                key_int8.stride(1),
-                key_int8.stride(2),
-                key_scale.stride(0),
-                key_scale.stride(1),
-                heads=heads,
-                head_dim=head_dim,
-                block_n=_BLOCK_N,
-                num_warps=4,
-            )
+        qk_quantization.quantize_key_per_block_kernel[(key_groups, heads, batch)](
+            key,
+            key_mean,
+            key_int8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=_BLOCK_N,
+            num_warps=4,
+        )
     else:
-        if key_order is not None:
-            raise ValueError("ordered K/V preparation requires grouped QK")
         query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
         key_scale = torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
         qk_quantization.quantize_query_per_thread_kernel[
@@ -988,22 +827,6 @@ def _make_descriptors(
     return key_descriptor, value_descriptor
 
 
-def _should_sort_value_rows(
-    *,
-    target: AcceleratorTarget,
-    is_causal: bool,
-    head_dim: int,
-    key_length: int,
-) -> bool:
-    """Select exact V ordering only where its long-context cost is amortized."""
-    return (
-        target.is_cuda_capability(12)
-        and not is_causal
-        and head_dim == 128
-        and key_length >= 16384
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class _PiperAttentionExecutionPlan:
     """Host-side specialization and launch choices for one Piper invocation."""
@@ -1013,7 +836,6 @@ class _PiperAttentionExecutionPlan:
     native_uint8: bool
     split_pv_head_dim: bool
     scaled_fp16_numerator: bool
-    sort_value_rows: bool
     use_tensor_descriptors: bool
     num_warps: int = 4
     num_stages: int = 3
@@ -1032,8 +854,6 @@ class _PiperAttentionExecutionPlan:
             raise ValueError("Piper Attention loop_num_stages must be None, 1, 2, 3, or 4")
         if self.scaled_fp16_numerator and not self.split_pv_head_dim:
             raise ValueError("scaled FP16 numerator recurrence requires split PV")
-        if self.sort_value_rows and not self.grouped_qk:
-            raise ValueError("value-row ordering requires grouped QK")
 
     def as_dict(self) -> dict[str, object]:
         """Return execution choices as serializable benchmark metadata."""
@@ -1060,12 +880,6 @@ def _select_piper_attention_execution_plan(
         and key_length >= 1024
     )
     scaled_fp16_numerator = split_pv_head_dim and key_length <= 131072
-    sort_value_rows = _should_sort_value_rows(
-        target=target,
-        is_causal=is_causal,
-        head_dim=head_dim,
-        key_length=key_length,
-    )
 
     block_m = (
         64
@@ -1085,7 +899,6 @@ def _select_piper_attention_execution_plan(
         native_uint8=native_uint8,
         split_pv_head_dim=split_pv_head_dim,
         scaled_fp16_numerator=scaled_fp16_numerator,
-        sort_value_rows=sort_value_rows,
         use_tensor_descriptors=use_tensor_descriptors,
         num_stages=2 if use_tensor_descriptors else 3,
     )
@@ -1149,8 +962,6 @@ def _prepare_piper_attention(
     plan = execution_plan
     if plan.split_pv_head_dim and head_dim != 128:
         raise ValueError("split-PV Piper Attention requires head_dim=128")
-    if plan.sort_value_rows and is_causal:
-        raise ValueError("value-row ordering requires non-causal attention")
     if plan.reverse_causal_blocks and not is_causal:
         raise ValueError("reverse block order requires causal attention")
     if plan.native_uint8:
@@ -1160,11 +971,6 @@ def _prepare_piper_attention(
     storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
 
     key_mean, value_mean = _compute_kv_means(key, value)
-    key_order = (
-        _build_centered_value_order(value, value_mean)
-        if plan.sort_value_rows
-        else None
-    )
     query_int8, key_int8, query_scale, key_scale = _prepare_qk(
         query,
         key,
@@ -1172,7 +978,6 @@ def _prepare_piper_attention(
         scale,
         grouped_qk=plan.grouped_qk,
         storage_key_length=storage_key_length,
-        key_order=key_order,
     )
 
     value_shape = (batch, heads, head_dim, storage_key_length)
@@ -1200,17 +1005,11 @@ def _prepare_piper_attention(
         if not plan.native_uint8
         else torch.empty((1,), device=value.device, dtype=torch.int16)
     )
-    order_argument = (
-        key_order
-        if key_order is not None
-        else torch.empty((1,), device=value.device, dtype=torch.int32)
-    )
     _quantize_value_per_key_kernel[
         (triton.cdiv(key_length, _BLOCK_N), heads, batch)
     ](
         value,
         value_mean,
-        order_argument,
         value_scale_multiplier,
         value_log_scale,
         value_correction,
@@ -1223,7 +1022,6 @@ def _prepare_piper_attention(
         value_int8.stride(1),
         value_int8.stride(2),
         value_int8.stride(3),
-        ordered=key_order is not None,
         store_correction=not plan.native_uint8,
         heads=heads,
         head_dim=head_dim,

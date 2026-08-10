@@ -374,16 +374,16 @@ packed-probability-conversion choices.
 
 Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA operators:
 
-- `preparation` includes compact K/V mean reduction, optional centered-row ordering,
-  Q/K/V quantization, scale metadata, and affine correction metadata when requested;
+- `preparation` includes compact K/V mean reduction, Q/K/V quantization, scale metadata,
+  and affine correction metadata when requested;
 - `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
   and centered-mean epilogue;
 - `operator_end_to_end` runs preparation and the fused kernel as one complete call.
 
-Machine records also identify value-row order, Q/K granularity, and native versus affine
-mixed-sign execution. Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research
-controls remain reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`;
-they are not copied into the installed package.
+Machine records also identify Q/K granularity and native versus affine mixed-sign execution.
+Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research controls remain
+reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`; they are not copied
+into the installed package.
 
 Compiler inspection and external profiling are available for one shape at a time:
 
@@ -505,7 +505,6 @@ the production operator now always centers V.
 | B1/H8/N8192/D128 | Piper Attention affine fallback | 0.706 [0.703, 0.710] | 0.785 [0.784, 0.787] | 36.08 |
 | B1/H8/N8192/D128 | pure Triton SageAttention2++ | 0.637 [0.636, 0.639] | 0.669 [0.668, 0.671] | 28.12 |
 | B1/H8/N8192/D128 | canonical CUDA SageAttention2++ | 0.609 [0.607, 0.610] | 0.614 [0.607, 0.617] | 28.13 |
-| B1/H1/N131072/D128 | Piper Attention centered + ordered | 19.548 [19.272, 19.571] | 19.897 [19.867, 19.906] | 35.77 |
 | B1/H1/N131072/D128 | Piper Attention uncentered | 19.579 [19.371, 19.600] | 19.824 [19.806, 19.845] | 35.48 |
 | B1/H1/N131072/D128 | pure Triton SageAttention2++ | 17.647 [17.611, 17.708] | 17.823 [17.777, 17.926] | 28.33 |
 | B1/H1/N131072/D128 | canonical CUDA SageAttention2++ | 17.155 [16.992, 17.171] | 17.177 [17.023, 17.195] | 28.33 |
@@ -529,11 +528,8 @@ issue #11.
 | pure Triton SageAttention2++ | 32.43 | 2.292% | 0.002166 | 0.1250 | 28.18 |
 
 This ordinary call has little V bias, so centering is nearly neutral. The committed
-adversarial biased-V regression requires centering to reduce MSE by at least 5x and
-the constant-V regression requires exact restoration. On the exhaustive LTX-2.3
-sci-fi trajectory from research checkpoint `b75f3ee`, stable centered-row ordering
-improved global attention-output SQNR from 39.12 to 39.52 dB; its rollout measured
-18.67 dB decoded PSNR and 9.60 dB latent SQNR against the exact render.
+adversarial biased-V regression covers the centered path, and the constant-V regression
+requires exact restoration.
 
 ## Triton compiler inspection
 

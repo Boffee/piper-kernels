@@ -106,10 +106,7 @@ softmax(QK) @ V = softmax(QK) @ (V - mean_sequence(V)) + mean_sequence(V)
 It stores only the compact FP32 `[batch, head, feature]` mean, subtracts it while
 quantizing V, and restores it in the attention epilogue. This improves signed-INT8
 precision when V has a large feature bias and preserves constant V exactly. Piper
-Attention always centers V. Non-causal SM12x D128 calls with at least 16384 keys
-additionally use the selected stable low-to-high centered-row-range order. That
-permutation is exact before quantization and reduces scale-coordinate variation in
-very long attention.
+Attention always centers V and preserves the original K/V sequence order.
 
 Native mixed-sign MMA is selected on the supported NVIDIA backend through the packaged
 stock-Triton extension. The backend retains the exact affine identity

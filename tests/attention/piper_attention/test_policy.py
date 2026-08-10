@@ -114,7 +114,6 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "native_uint8": True,
         "split_pv_head_dim": False,
         "scaled_fp16_numerator": False,
-        "sort_value_rows": False,
         "use_tensor_descriptors": False,
         "num_warps": 4,
         "num_stages": 3,
@@ -150,7 +149,6 @@ def test_execution_plan_rejects_reverse_order_for_noncausal_invocation() -> None
         {"num_stages": 5},
         {"loop_num_stages": 5},
         {"split_pv_head_dim": False, "scaled_fp16_numerator": True},
-        {"grouped_qk": False, "sort_value_rows": True},
     ],
 )
 def test_execution_plan_rejects_inconsistent_specializations(

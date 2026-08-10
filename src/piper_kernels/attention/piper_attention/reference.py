@@ -37,7 +37,7 @@ def _quantize_value_per_key(
     return quantized, scale
 
 
-def reference_piper_attention(  # noqa: PLR0915
+def reference_piper_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -45,12 +45,8 @@ def reference_piper_attention(  # noqa: PLR0915
     is_causal: bool,
     *,
     qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
-    sort_value_rows: bool = False,
 ) -> torch.Tensor:
     """Evaluate Piper Attention with ordinary PyTorch operations."""
-    if sort_value_rows and is_causal:
-        raise ValueError("value-row ordering is valid only for non-causal attention")
-
     output_dtype = query.dtype
     quantization_range = 127
     key_float = key.float()
@@ -58,12 +54,6 @@ def reference_piper_attention(  # noqa: PLR0915
     value_float = value.float()
     value_mean = value_float.mean(dim=2, keepdim=True)
     value_centered = value_float - value_mean
-
-    if sort_value_rows:
-        order = torch.argsort(value_centered.abs().amax(dim=-1), dim=-1, stable=True)
-        order_4d = order[..., None].expand_as(key_centered)
-        key_centered = torch.gather(key_centered, 2, order_4d)
-        value_centered = torch.gather(value_centered, 2, order_4d)
 
     if qk_quantization == "per_warp":
         query_int8, query_scale = quantize_per_group(

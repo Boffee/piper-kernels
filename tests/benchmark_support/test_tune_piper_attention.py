@@ -84,7 +84,6 @@ def test_candidate_configuration_uses_raw_execution_plan_fields() -> None:
 
     assert plan.as_dict().items() <= candidate.configuration.items()
     assert "load_path" not in candidate.configuration
-    assert "value_row_order" not in candidate.configuration
 
 
 def test_candidate_limit_prevents_accidental_compile_explosion() -> None:

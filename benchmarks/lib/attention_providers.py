@@ -188,26 +188,15 @@ def _sage_attention_2pp_jit_functions(
 
 def _piper_attention_jit_functions(
     target: AcceleratorTarget,
-    *,
-    plan: piper_attention_backend._PiperAttentionExecutionPlan,
 ) -> dict[str, object]:
     qk_kernels = _qk_jit_functions(target)
-    if plan.sort_value_rows:
-        qk_kernels["quantize-key-per-block"] = (
-            piper_attention_backend._quantize_ordered_key_per_block_kernel
-        )
-    kernels = {
+    return {
         "kv-mean-partial": piper_attention_backend._kv_mean_partial_kernel,
         "kv-mean-finish": piper_attention_backend._kv_mean_finalize_kernel,
         **qk_kernels,
         "quantize-value-per-key": piper_attention_backend._quantize_value_per_key_kernel,
         "attention": piper_attention_backend._piper_attention_kernel,
     }
-    if plan.sort_value_rows:
-        kernels["centered-value-row-range"] = (
-            piper_attention_backend._centered_value_row_range_kernel
-        )
-    return kernels
 
 
 def _make_piper_attention_provider(
@@ -258,10 +247,7 @@ def _make_piper_attention_provider(
             "value_dtype": "int8",
             "value_scale": "per_key",
         },
-        triton_jit_functions=_piper_attention_jit_functions(
-            target,
-            plan=plan,
-        ),
+        triton_jit_functions=_piper_attention_jit_functions(target),
     )
 
 

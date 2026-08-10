@@ -87,7 +87,6 @@ def test_affine_fallback_matches_native_uint8(sequence: int) -> None:
     arguments = (query, key, value, 128**-0.5, False)
     pointer_plan = replace(
         _default_piper_attention_execution_plan(query, key, False),
-        sort_value_rows=False,
         use_tensor_descriptors=False,
         num_stages=3,
     )
@@ -158,44 +157,6 @@ def test_biased_value_quality() -> None:
     assert mse < 1e-3
 
 
-@pytest.mark.skipif(not _sm120_available(), reason="ordered grouped-QK path targets SM12x")
-def test_sorted_ragged_path_matches_quantized_reference() -> None:
-    torch.manual_seed(58)
-    query = torch.randn(1, 2, 257, 128, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-    plan = replace(
-        _default_piper_attention_execution_plan(query, key, False),
-        native_uint8=True,
-        sort_value_rows=True,
-        use_tensor_descriptors=False,
-        num_stages=3,
-    )
-
-    with torch.no_grad():
-        actual = _run_piper_attention(
-            query,
-            key,
-            value,
-            128**-0.5,
-            False,
-            execution_plan=plan,
-        )
-        expected = reference_piper_attention(
-            query,
-            key,
-            value,
-            128**-0.5,
-            False,
-            qk_quantization="per_warp",
-            sort_value_rows=True,
-        )
-    error = (actual.float() - expected.float()).abs()
-
-    assert error.mean().item() < 0.003
-    assert error.max().item() < 0.12
-
-
 @pytest.mark.skipif(not _sm120_available(), reason="tensor descriptors target SM12x")
 def test_long_descriptor_path_matches_pointer_path() -> None:
     torch.manual_seed(59)
@@ -207,7 +168,6 @@ def test_long_descriptor_path_matches_pointer_path() -> None:
     descriptor_plan = replace(
         _default_piper_attention_execution_plan(query, key, False),
         native_uint8=True,
-        sort_value_rows=False,
     )
     pointer_plan = replace(
         descriptor_plan,
