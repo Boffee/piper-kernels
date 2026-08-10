@@ -17,6 +17,19 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 | `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
 | `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
 
+## Triton setup
+
+Install the optimized backends with `piper-kernels[triton]`, or include ConvRot's tensor
+format with `piper-kernels[convrot,triton]`. The extra selects Triton 3.7 on each supported
+platform: upstream `triton` on Linux and
+[`triton-windows`](https://github.com/triton-lang/triton-windows) on 64-bit Windows.
+
+Optimized Windows execution requires Windows 10 or 11, a supported NVIDIA GPU with a
+current driver, and the Visual C++ Redistributable for Visual Studio 2015-2022. The
+Windows wheel bundles its CUDA toolchain and TinyCC, so a separate CUDA toolkit or Visual
+Studio install is not required for Piper's Triton kernels. The base package remains
+portable and does not require either Triton distribution.
+
 ## ConvRot INT8
 
 Quantize a dense weight, or wrap existing checkpoint storage without dequantizing it,

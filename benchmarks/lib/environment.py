@@ -60,6 +60,10 @@ def _package_version(name: str) -> str | None:
         return None
 
 
+def _triton_version() -> str | None:
+    return _package_version("triton") or _package_version("triton-windows")
+
+
 _GIT_REPOSITORY_ENVIRONMENT_VARIABLES = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -157,7 +161,7 @@ def capture_environment(repository: Path | None = None) -> EnvironmentInfo:
         python_version=sys.version.split()[0],
         platform=platform.platform(),
         torch_version=str(torch.__version__),
-        triton_version=_package_version("triton"),
+        triton_version=_triton_version(),
         accelerator_backend=accelerator_backend,
         accelerator_runtime_version=runtime_version,
         accelerator_driver_version=driver_version,

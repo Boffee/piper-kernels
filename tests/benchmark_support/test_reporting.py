@@ -1,7 +1,9 @@
 import argparse
+import importlib.metadata
 import json
 from pathlib import Path
 
+import lib.environment as environment_module
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.quality import QualityMetrics
 from lib.reporting import (
@@ -128,6 +130,17 @@ def test_environment_capture_does_not_require_cuda(monkeypatch, tmp_path: Path) 
     assert environment.gpu_name is None
     assert environment.gpu_architecture is None
     assert environment.git_revision is None
+
+
+def test_triton_version_accepts_windows_distribution(monkeypatch) -> None:
+    def package_version(name: str) -> str:
+        if name == "triton-windows":
+            return "3.7.1.post27"
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(environment_module.importlib.metadata, "version", package_version)
+
+    assert environment_module._triton_version() == "3.7.1.post27"
 
 
 def test_environment_capture_identifies_rocm(monkeypatch, tmp_path: Path) -> None:

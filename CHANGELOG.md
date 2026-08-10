@@ -7,6 +7,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Native Windows Triton setup through the platform-selected `triton-windows` package,
+  including dependency/import CI and correct Windows benchmark version reporting.
 - Piper Attention forward inference for NVIDIA SM8x and consumer Blackwell SM12x with
   Sage-style INT8 QK, per-key signed-INT8 V scales, FP32 probability multipliers,
   native UINT8 probability MMA, exact affine fallback, optional sequence-centered V,
