@@ -326,7 +326,7 @@ def test_semantic_addmm_custom_op_passes_opcheck() -> None:
 
     result = torch.library.opcheck(
         convrot_dispatch._convrot_int8_addmm_op,
-        (qdata, scale, mat1, mat2, 16, 0.5, 1.25),
+        (qdata, scale, mat1, mat2, 16, 0.5, 1.25, 123),
     )
 
     assert set(result.values()) == {"SUCCESS"}
