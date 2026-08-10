@@ -90,7 +90,7 @@ def _run(
             text=True,
             env=environment,
         )
-    except FileNotFoundError, subprocess.CalledProcessError:
+    except (FileNotFoundError, subprocess.CalledProcessError):
         return None
     return result.stdout.strip() or None
 

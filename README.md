@@ -3,7 +3,7 @@
 Reusable PyTorch inference operators and optimized kernels for the Piper ecosystem and
 other consumers.
 
-Piper Kernels requires Python 3.14 or newer.
+Piper Kernels requires Python 3.13 or newer.
 
 The package owns operator semantics, portable PyTorch references, tensor subclasses,
 and optimized backends. It deliberately does not know about model repositories,
