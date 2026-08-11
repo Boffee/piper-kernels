@@ -45,7 +45,7 @@ class ConvRotWorkload:
         }
 
     def reference(self) -> torch.Tensor:
-        """Evaluate the portable reference on the complete workload."""
+        """Evaluate the complete workload with the shared portable reference."""
         return _run_convrot_reference(self, self.inputs)
 
 
@@ -136,27 +136,6 @@ def make_public_convrot_provider(
             ),
             "input_preparation": workload.input_preparation or "none",
             **workload.production_plan.as_dict(),
-        },
-    )
-
-
-def make_reference_convrot_provider(
-    workload: ConvRotWorkload,
-) -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:
-    """Build the matching full-width portable reference provider."""
-    return BenchmarkProvider(
-        name="torch-reference",
-        prepare=lambda: workload.inputs,
-        run=lambda prepared: _run_convrot_reference(workload, prepared),
-        synchronize=torch.cuda.synchronize,
-        configuration={
-            **workload.common_configuration(),
-            "operation_entrypoint": (
-                "piper_kernels.convrot.int8.reference.reference_swiglu_linear"
-                if workload.shape.input_activation == "swiglu"
-                else "piper_kernels.convrot.int8.reference.reference_linear"
-            ),
-            "input_preparation": ("materialized" if workload.shape.input_activation else "none"),
         },
     )
 

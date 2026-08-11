@@ -240,14 +240,11 @@ uv run python benchmarks/benchmark_convrot.py
 ```
 
 Use `--help` to select activation rows, weight dimensions, group size, dtype,
-deterministic input seed, and timing windows. The existing custom-shape interface remains
-the default. Custom-shape options such as `--rows` and `--input-activation` cannot be mixed
-with a named preset, because the preset supplies those values. `--in-features` is linear and
-weight width `K`; omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw
-`[up | gate]` input with `2K` features. The script validates every low-precision output element
-against the portable reference. Fused FP32 norm reductions avoid low-precision overflow without
-materializing full promoted copies; the Piper provider must clear the declared SQNR and
-non-finite gate.
+deterministic input seed, and timing windows. `--in-features` is linear and weight width `K`;
+omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw `[up | gate]` input
+with `2K` features. The script validates the complete low-precision output against the portable
+reference. Fused FP32 norm reductions avoid low-precision overflow without materializing full
+promoted copies; the Piper provider must clear the declared SQNR and non-finite gate.
 
 The Piper provider times the complete public entrypoint on fixed source tensors, so its
 `prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
@@ -258,30 +255,16 @@ provider configuration distinguishes the logical input layout from the layout pa
 provider. The optional provider is recorded as provider-managed when its internal choice is not
 observable.
 
-Exercise the four principal bias-free MiniMax H3 transformer projections at the measured
-5-second row count or at 128K rows with:
-
-```shell
-uv run python benchmarks/benchmark_convrot.py --preset minimax-h3-5s
-uv run python benchmarks/benchmark_convrot.py --preset minimax-h3-128k
-```
-
-Both presets cover QKV `(N, K) = (21504, 5376)`, attention output `(5376, 7168)`,
-MLP FC1 `(28672, 5376)`, and MLP FC2 `(5376, 14336)`. FC2 consumes the explicit
-raw `[up | gate]` input contract with 28672 features, applies SwiGLU, and supplies linear
-`K = 14336` to ConvRot. The 5-second preset uses `M = 37710`; the 128K preset uses
-`M = 131072`. Row count remains a reproducible workload choice rather than a universal
-model constant.
-
-The benchmark times the portable reference and reuses its full output to validate every output
-element from the optimized providers.
+The benchmark runs the portable reference once per explicit shape and reuses its complete output
+for quality. Only production providers are timed.
 
 Compare against the optional Comfy Kitchen CUDA provider with:
 
 ```shell
 uv run --with comfy-kitchen==0.2.28 \
   python benchmarks/benchmark_convrot.py \
-  --preset minimax-h3-5s --compare-comfy-kitchen
+  --rows 256 --out-features 4096 --in-features 4096 \
+  --compare-comfy-kitchen
 ```
 
 Comfy Kitchen is a benchmark-only dependency and is loaded only when requested. Its 0.2.x
@@ -295,15 +278,15 @@ Diagnose activation preparation independently, using preallocated outputs, with:
 uv run python benchmarks/benchmark_convrot_preparation.py
 
 uv run python benchmarks/benchmark_convrot_preparation.py \
-  --rows 131072 --in-features 14336 --input-activation swiglu
+  --rows 32768 --in-features 4096 --input-activation swiglu
 
 uv run --with comfy-kitchen==0.2.28 \
   python benchmarks/benchmark_convrot_preparation.py \
-  --rows 37710 --in-features 5376 --compare-comfy-kitchen
+  --rows 32768 --in-features 4096 --compare-comfy-kitchen
 ```
 
 The preparation benchmark reports rotation, rowwise quantization, their two-launch split,
-and the one-pass fused candidate for the H3 widths. The traffic column is an algorithmic
+and the one-pass fused candidate for the requested widths. The traffic column is an algorithmic
 minimum, not a measured DRAM-transaction count. Unlike the permissive public comparison above,
 the preparation adapter calls a private native entrypoint and accepts exactly
 `comfy-kitchen==0.2.28`. Its records include both the installed package version and the private

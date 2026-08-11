@@ -115,15 +115,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rows",
         type=int,
-        default=37_710,
-        help="activation rows M (default: 37710)",
+        default=256,
+        help="activation rows M (default: 256)",
     )
     parser.add_argument(
         "--in-features",
         type=int,
         nargs="+",
-        default=[5_376, 7_168, 14_336],
-        help="linear/weight widths K; raw SwiGLU input width is 2K",
+        default=[4096],
+        help="linear/weight widths K (default: 4096); raw SwiGLU input width is 2K",
     )
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument(

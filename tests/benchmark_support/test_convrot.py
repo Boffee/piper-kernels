@@ -1,4 +1,4 @@
-"""Tests for ConvRot benchmark presets, records, and reference helpers."""
+"""Tests for ConvRot benchmark records and reference helpers."""
 
 import json
 from pathlib import Path
@@ -43,7 +43,6 @@ from lib.convrot import (
 from lib.convrot_providers import (
     make_convrot_workload,
     make_public_convrot_provider,
-    make_reference_convrot_provider,
 )
 from lib.environment import EnvironmentInfo
 from lib.providers import ProviderMeasurement
@@ -90,48 +89,36 @@ def _phase_timings() -> PhaseTimings:
     )
 
 
-def test_custom_shapes_expand_requested_rows() -> None:
+def test_shapes_expand_requested_rows() -> None:
     arguments = _parse_args(["--rows", "3", "7", "--out-features", "96", "--in-features", "512"])
 
     shapes = _benchmark_shapes(arguments)
 
     actual = [(shape.name, shape.rows, shape.out_features, shape.in_features) for shape in shapes]
     assert actual == [
-        ("custom", 3, 96, 512),
-        ("custom", 7, 96, 512),
+        ("linear", 3, 96, 512),
+        ("linear", 7, 96, 512),
     ]
 
 
-def test_minimax_h3_five_second_preset_uses_principal_linears() -> None:
-    arguments = _parse_args(["--preset", "minimax-h3-5s"])
+def test_default_shapes_use_generic_power_of_two_dimensions() -> None:
+    arguments = _parse_args([])
+    preparation_arguments = _parse_preparation_args([])
 
-    shapes = _benchmark_shapes(arguments)
-
-    actual = [(shape.name, shape.rows, shape.out_features, shape.in_features) for shape in shapes]
-    assert actual == [
-        ("qkv", 37_710, 21_504, 5_376),
-        ("attention-out", 37_710, 5_376, 7_168),
-        ("mlp-fc1", 37_710, 28_672, 5_376),
-        ("mlp-fc2", 37_710, 5_376, 14_336),
+    assert [
+        (shape.rows, shape.out_features, shape.in_features)
+        for shape in _benchmark_shapes(arguments)
+    ] == [
+        (1, 4096, 4096),
+        (16, 4096, 4096),
+        (64, 4096, 4096),
+        (256, 4096, 4096),
     ]
-    assert [shape.input_activation for shape in shapes] == [None, None, None, "swiglu"]
-    assert not any(shape.has_bias for shape in shapes)
+    assert preparation_arguments.rows == 256
+    assert preparation_arguments.in_features == [4096]
 
 
-def test_minimax_h3_128k_preset_uses_principal_linears() -> None:
-    arguments = _parse_args(["--preset", "minimax-h3-128k"])
-
-    shapes = _benchmark_shapes(arguments)
-
-    assert [(shape.rows, shape.out_features, shape.in_features) for shape in shapes] == [
-        (131_072, 21_504, 5_376),
-        (131_072, 5_376, 7_168),
-        (131_072, 28_672, 5_376),
-        (131_072, 5_376, 14_336),
-    ]
-
-
-def test_custom_shape_can_include_swiglu_without_bias() -> None:
+def test_shape_can_include_swiglu_without_bias() -> None:
     arguments = _parse_args(
         [
             "--rows",
@@ -187,20 +174,19 @@ def test_shared_shape_and_inputs_define_one_reproducible_workload() -> None:
         torch.testing.assert_close(first_tensor, second_tensor)
 
 
-def test_shared_public_and_reference_providers_use_the_same_workload() -> None:
+def test_shared_public_provider_and_reference_use_the_same_workload() -> None:
     workload = make_convrot_workload(
         ConvRotShape("custom", 2, 3, 256, has_bias=False),
         ConvRotConfig(torch.float32, 256, 7),
         device=torch.device("cpu"),
     )
     public = make_public_convrot_provider(workload)
-    reference = make_reference_convrot_provider(workload)
+    public_output = public.run(workload.inputs)
 
     assert public.prepare() is workload.inputs
-    assert reference.prepare() is workload.inputs
     torch.testing.assert_close(
-        public.run(workload.inputs),
-        reference.run(workload.inputs),
+        public_output,
+        workload.reference(),
     )
     assert workload.production_plan.as_dict().items() <= public.configuration.items()
 
@@ -213,28 +199,11 @@ def test_shared_public_and_reference_providers_use_the_same_workload() -> None:
         ["--in-features", "0"],
     ],
 )
-def test_custom_shape_cli_rejects_nonpositive_dimensions(arguments: list[str]) -> None:
+def test_shape_cli_rejects_nonpositive_dimensions(arguments: list[str]) -> None:
     parsed = _parse_args(arguments)
 
     with pytest.raises(SystemExit, match="must all be positive"):
         _validate_args(parsed)
-
-
-@pytest.mark.parametrize(
-    "custom_option",
-    [
-        ["--rows", "1"],
-        ["--out-features", "96"],
-        ["--in-features", "512"],
-        ["--input-activation", "swiglu"],
-        ["--no-bias"],
-    ],
-)
-def test_named_preset_rejects_custom_shape_options(custom_option: list[str]) -> None:
-    arguments = _parse_args(["--preset", "minimax-h3-5s", *custom_option])
-
-    with pytest.raises(SystemExit, match="cannot be combined"):
-        _validate_args(arguments)
 
 
 def test_swiglu_reference_uses_up_gate_order() -> None:
@@ -261,7 +230,6 @@ def test_main_provider_configuration_distinguishes_logical_and_provider_layouts(
 
     common = workload.common_configuration()
     comfy = _comfy_provider_configuration(common, shape, "0.2.28")
-    reference = make_reference_convrot_provider(workload).configuration
 
     assert common["logical_input_layout"] == "up_gate"
     assert common["provider_input_layout"] == "up_gate"
@@ -270,10 +238,6 @@ def test_main_provider_configuration_distinguishes_logical_and_provider_layouts(
     assert comfy["input_layout_adapter"] is True
     assert comfy["installed_version"] == "0.2.28"
     assert "version" not in comfy
-    assert reference["logical_input_layout"] == "up_gate"
-    assert reference["provider_input_layout"] == "up_gate"
-    assert reference["operation_entrypoint"].endswith(".reference_swiglu_linear")
-    assert reference["input_preparation"] == "materialized"
 
 
 def test_main_record_shape_contains_only_case_and_dimensions() -> None:
@@ -299,20 +263,10 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
     result = Result(
         input_preparation="fused",
         piper=measurement,
-        reference=ProviderMeasurement(
-            provider="torch-reference",
-            output=None,
-            timings=_phase_timings(),
-            configuration=make_reference_convrot_provider(workload).configuration,
-        ),
         quality=quality,
     )
 
-    record = next(
-        record
-        for record in _records_for_result(shape, result, _environment())
-        if record.provider == "piper-convrot"
-    )
+    (record,) = _records_for_result(shape, result, _environment())
     value = record.as_dict()
 
     assert value["shape"] == {
@@ -357,12 +311,6 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
     result = Result(
         input_preparation="fused",
         piper=piper,
-        reference=ProviderMeasurement(
-            provider="torch-reference",
-            output=None,
-            timings=_phase_timings(),
-            configuration=make_reference_convrot_provider(workload).configuration,
-        ),
         quality=quality,
         comfy_kitchen=comfy,
         comfy_kitchen_quality=quality,

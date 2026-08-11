@@ -1,4 +1,4 @@
-"""Benchmark Piper ConvRot entrypoints against portable and optional providers."""
+"""Benchmark Piper ConvRot entrypoints with portable-reference quality."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from lib.convrot import (
 from lib.convrot_providers import (
     make_convrot_workload,
     make_public_convrot_provider,
-    make_reference_convrot_provider,
 )
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.providers import BenchmarkProvider, ProviderMeasurement, measure_provider
@@ -38,62 +37,19 @@ from lib.reporting import (
 
 from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
 
-
-def _minimax_h3_shapes(rows: int) -> tuple[ConvRotShape, ...]:
-    """Return the principal bias-free MiniMax H3 transformer projections."""
-    return (
-        ConvRotShape("qkv", rows, 21_504, 5_376, has_bias=False),
-        ConvRotShape("attention-out", rows, 5_376, 7_168, has_bias=False),
-        ConvRotShape("mlp-fc1", rows, 28_672, 5_376, has_bias=False),
-        ConvRotShape(
-            "mlp-fc2",
-            rows,
-            5_376,
-            14_336,
-            input_activation="swiglu",
-            has_bias=False,
-        ),
-    )
-
-
-_MINIMAX_H3_5S_SHAPES = _minimax_h3_shapes(37_710)
-_MINIMAX_H3_128K_SHAPES = _minimax_h3_shapes(131_072)
 _MIN_PIPER_SQNR_DB = 20.0
 _MAX_COMFY_RELATIVE_L2_ERROR = 0.02
-_CUSTOM_SHAPE_DEFAULTS = {
-    "rows": [1, 16, 64, 256],
-    "out_features": 4096,
-    "in_features": 4096,
-    "input_activation": None,
-    "no_bias": False,
-}
-_CUSTOM_SHAPE_OPTIONS = {
-    "rows": "--rows",
-    "out_features": "--out-features",
-    "in_features": "--in-features",
-    "input_activation": "--input-activation",
-    "no_bias": "--no-bias",
-}
 
 
 @dataclass(slots=True, frozen=True)
 class Result:
-    """Timing and full-output quality for one activation and weight shape."""
+    """Provider timing and full-reference quality for one shape."""
 
     input_preparation: str | None
     piper: ProviderMeasurement[None]
-    reference: ProviderMeasurement[None]
     quality: QualityMetrics
     comfy_kitchen: ProviderMeasurement[None] | None = None
     comfy_kitchen_quality: QualityMetrics | None = None
-
-    @property
-    def speedup(self) -> float:
-        """Return the warmed reference-to-Piper execution-time ratio."""
-        return (
-            self.reference.timings.prepared_execution.median_ms
-            / self.piper.timings.prepared_execution.median_ms
-        )
 
     @property
     def comfy_kitchen_speedup(self) -> float | None:
@@ -192,16 +148,9 @@ def _run_shape(
         config,
         device=torch.device("cuda"),
     )
-    reference_with_output = measure_provider(
-        make_reference_convrot_provider(workload),
-        warmup_ms=warmup_ms,
-        measurement_time_ms=measurement_time_ms,
-        measure_first_call=False,
-        measure_preparation=False,
-    )
-    reference_output = reference_with_output.output
-    reference_measurement = _without_output(reference_with_output)
-    del reference_with_output
+    reference_output = workload.reference()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
     piper_with_output = measure_provider(
         make_public_convrot_provider(workload),
@@ -268,7 +217,6 @@ def _run_shape(
     return Result(
         input_preparation=workload.input_preparation,
         piper=piper_measurement,
-        reference=reference_measurement,
         quality=piper_quality,
         comfy_kitchen=comfy_measurement,
         comfy_kitchen_quality=comfy_quality,
@@ -278,42 +226,35 @@ def _run_shape(
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--preset",
-        choices=["custom", "minimax-h3-5s", "minimax-h3-128k"],
-        default="custom",
-        help="benchmark custom dimensions or a principal MiniMax H3 shape matrix",
-    )
-    parser.add_argument(
         "--rows",
         type=int,
         nargs="+",
-        default=argparse.SUPPRESS,
-        help="custom-shape activation rows M (default: 1 16 64 256)",
+        default=[1, 16, 64, 256],
+        help="activation rows M (default: 1 16 64 256)",
     )
     parser.add_argument(
         "--out-features",
         type=int,
-        default=argparse.SUPPRESS,
-        help="custom-shape linear output width N (default: 4096)",
+        default=4096,
+        help="linear output width N (default: 4096)",
     )
     parser.add_argument(
         "--in-features",
         type=int,
-        default=argparse.SUPPRESS,
-        help=("custom-shape linear/weight width K; raw SwiGLU input width is 2K (default: 4096)"),
+        default=4096,
+        help="linear/weight width K; raw SwiGLU input width is 2K (default: 4096)",
     )
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
         choices=("swiglu",),
-        default=argparse.SUPPRESS,
-        help="custom-shape raw-input activation; SwiGLU expects [up | gate] with width 2K",
+        default=None,
+        help="raw-input activation; SwiGLU expects [up | gate] with width 2K",
     )
     parser.add_argument(
         "--no-bias",
         action="store_true",
-        default=argparse.SUPPRESS,
-        help="omit bias from the custom shape",
+        help="omit bias",
     )
     parser.add_argument(
         "--dtype",
@@ -329,24 +270,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="benchmark the optional comfy-kitchen CUDA ConvRot provider",
     )
     add_output_arguments(parser)
-    arguments = parser.parse_args(argv)
-    arguments.custom_shape_options = tuple(
-        option for name, option in _CUSTOM_SHAPE_OPTIONS.items() if hasattr(arguments, name)
-    )
-    for name, default in _CUSTOM_SHAPE_DEFAULTS.items():
-        if not hasattr(arguments, name):
-            setattr(arguments, name, default)
-    return arguments
+    return parser.parse_args(argv)
 
 
 def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
-    if args.preset == "minimax-h3-5s":
-        return _MINIMAX_H3_5S_SHAPES
-    if args.preset == "minimax-h3-128k":
-        return _MINIMAX_H3_128K_SHAPES
     return tuple(
         ConvRotShape(
-            "custom",
+            "linear",
             rows,
             args.out_features,
             args.in_features,
@@ -358,16 +288,11 @@ def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if args.preset != "custom" and args.custom_shape_options:
-        options = ", ".join(args.custom_shape_options)
-        raise SystemExit(f"--preset {args.preset} cannot be combined with {options}")
-    if args.preset == "custom" and (
-        any(rows <= 0 for rows in args.rows) or args.out_features <= 0 or args.in_features <= 0
-    ):
+    if any(rows <= 0 for rows in args.rows) or args.out_features <= 0 or args.in_features <= 0:
         raise SystemExit("rows, out_features, and in_features must all be positive")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
-    if args.preset == "custom" and args.in_features % args.group_size:
+    if args.in_features % args.group_size:
         raise SystemExit("every in_features value must be divisible by --group-size")
     if args.compare_comfy_kitchen and args.dtype == "float32":
         raise SystemExit("comfy-kitchen comparison supports float16 and bfloat16")
@@ -393,12 +318,6 @@ def _print_header(compare_comfy_kitchen: bool) -> None:
                 "comfy-kitchen / Piper",
             ]
         )
-    columns.extend(
-        [
-            "reference fixed-source execution, device p50 [p20, p80] (ms)",
-            "reference / Piper",
-        ]
-    )
     print("| " + " | ".join(columns) + " |")
     print("|" + "|".join(":---" if index < 4 else "---:" for index in range(len(columns))) + "|")
 
@@ -426,12 +345,6 @@ def _print_result(shape: ConvRotShape, result: Result) -> None:
                 f"{result.comfy_kitchen_speedup:.2f}x",
             ]
         )
-    cells.extend(
-        [
-            result.reference.timings.prepared_execution.display(),
-            f"{result.speedup:.2f}x",
-        ]
-    )
     print("| " + " | ".join(cells) + " |")
 
 
@@ -444,7 +357,6 @@ def _records_for_result(
     measurements = [
         (result.piper, result.quality),
         (result.comfy_kitchen, result.comfy_kitchen_quality),
-        (result.reference, None),
     ]
     records = []
     for measurement, quality in measurements:
