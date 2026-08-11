@@ -80,9 +80,7 @@ class PhaseTimings:
 
     def __post_init__(self) -> None:
         if self.warmup_ms < 0 or self.measurement_time_ms <= 0:
-            raise ValueError(
-                "warmup must be non-negative and measurement time must be positive"
-            )
+            raise ValueError("warmup must be non-negative and measurement time must be positive")
 
     def as_dict(self) -> dict[str, float | str | dict[str, float | str] | None]:
         """Return stable machine-readable field names."""
@@ -91,16 +89,12 @@ class PhaseTimings:
             "measurement_time_ms": self.measurement_time_ms,
             "first_call_ms": self.first_call_ms,
             "first_call_clock": (
-                None
-                if self.first_call_ms is None
-                else ClockDomain.SYNCHRONIZED_WALL.value
+                None if self.first_call_ms is None else ClockDomain.SYNCHRONIZED_WALL.value
             ),
             "preparation": None if self.preparation is None else self.preparation.as_dict(),
             "prepared_execution": self.prepared_execution.as_dict(),
             "operator_end_to_end": (
-                None
-                if self.operator_end_to_end is None
-                else self.operator_end_to_end.as_dict()
+                None if self.operator_end_to_end is None else self.operator_end_to_end.as_dict()
             ),
         }
 
@@ -137,9 +131,7 @@ def synchronized_wall_benchmark(
 ) -> Timing:
     """Measure host and device latency with a synchronized wall clock."""
     if warmup_ms < 0 or measurement_time_ms <= 0:
-        raise ValueError(
-            "warmup must be non-negative and measurement time must be positive"
-        )
+        raise ValueError("warmup must be non-negative and measurement time must be positive")
 
     sync = synchronize or (lambda: None)
     sync()
@@ -174,9 +166,7 @@ def triton_benchmark(
 ) -> Timing:
     """Measure device-stream latency with Triton's GPU-event benchmark helper."""
     if warmup_ms < 0 or measurement_time_ms <= 0:
-        raise ValueError(
-            "warmup must be non-negative and measurement time must be positive"
-        )
+        raise ValueError("warmup must be non-negative and measurement time must be positive")
 
     testing = cast(_TritonTesting, importlib.import_module("triton.testing"))
     median, p20, p80 = testing.do_bench(

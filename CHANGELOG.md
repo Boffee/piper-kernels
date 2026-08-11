@@ -12,6 +12,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Shared Sage-style Q/K reference and Triton preparation now have one implementation across
+  Piper Attention and SageAttention2++. Benchmark tooling now verifies the pinned canonical
+  SageAttention installation before recording provenance, participates in the standard type and
+  formatting checks, and shares common attention-tuner CLI and result-reporting paths. General
+  ConvRot tests use the preferred `from_quantized` factory while focused compatibility coverage
+  retains `from_packed`.
 - Centralized ConvRot INT8 preparation and GEMM launch policy in one flat immutable execution
   plan shared by production, benchmark metadata, and offline tuning, with injectable preparation
   and launch boundaries for development measurements. Supported CUDA SwiGLU dispatch now leaves

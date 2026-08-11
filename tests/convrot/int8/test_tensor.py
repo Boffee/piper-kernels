@@ -10,18 +10,18 @@ from piper_kernels.convrot._rotation import rotate_groups
 def test_dequantize_unrotates_the_stored_weight() -> None:
     qdata = torch.arange(-128, 128, dtype=torch.int8).reshape(16, 16)
     scale = torch.linspace(0.001, 0.016, 16).reshape(16, 1)
-    wrapped = ConvRotInt8Tensor.from_packed(
+    wrapped = ConvRotInt8Tensor.from_quantized(
         qdata,
         scale,
         group_size=16,
-        dtype=torch.float32,
+        logical_dtype=torch.float32,
     )
     expected = rotate_groups(qdata.float() * scale, 16)
     assert torch.equal(wrapped.dequantize(), expected)
 
 
 def test_meta_tensor_preserves_storage_and_rotation_metadata() -> None:
-    wrapped = ConvRotInt8Tensor.from_packed(
+    wrapped = ConvRotInt8Tensor.from_quantized(
         torch.empty(8, 64, dtype=torch.int8, device="meta"),
         torch.empty(8, 1, dtype=torch.float32, device="meta"),
         group_size=64,
@@ -227,11 +227,11 @@ def _stochastic_addmm_fixture(
     rotated_update[:, -1] = 2.0
     mat1 = torch.eye(rows, dtype=torch.bfloat16)
     mat2 = rotate_groups(rotated_update, 16)
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.zeros(rows, cols, dtype=torch.int8),
         torch.ones(rows, 1, dtype=torch.float32),
         group_size=16,
-        dtype=torch.bfloat16,
+        logical_dtype=torch.bfloat16,
     )
     return weight, mat1, mat2
 
@@ -378,7 +378,7 @@ def test_constructor_rejects_noncanonical_scale_shape(
 @pytest.mark.parametrize("group_size", [15, 32, 128])
 def test_rejects_unsupported_group_size(group_size: int) -> None:
     with pytest.raises(ValueError, match="group size must be one of"):
-        ConvRotInt8Tensor.from_packed(
+        ConvRotInt8Tensor.from_quantized(
             torch.empty(8, 256, dtype=torch.int8),
             torch.empty(8, 1, dtype=torch.float32),
             group_size=group_size,
@@ -404,11 +404,11 @@ def test_zero_feature_weight_round_trips_through_quantization_and_dequantization
 
 @pytest.mark.parametrize("out_features", [0, 3])
 def test_cpu_addmm_handles_zero_feature_weight(out_features: int) -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(out_features, 0, dtype=torch.int8),
         torch.ones(out_features, 1, dtype=torch.float32),
         group_size=16,
-        dtype=torch.float32,
+        logical_dtype=torch.float32,
     )
     mat1 = torch.randn(out_features, 5)
     mat2 = torch.empty(5, 0)

@@ -10,7 +10,6 @@ from pathlib import Path
 
 import torch
 from lib.attention import (
-    ATTENTION_DTYPE_NAMES,
     AttentionConfig,
     AttentionInputs,
     AttentionShape,
@@ -19,33 +18,30 @@ from lib.attention import (
     run_sdpa,
 )
 from lib.attention_providers import qk_quantization_granularity
+from lib.attention_tuning import (
+    add_attention_tuning_arguments,
+    validate_attention_tuning_arguments,
+)
 from lib.environment import capture_environment
 from lib.providers import BenchmarkProvider
 from lib.quality import measure_quality
-from lib.reporting import output_target, write_records
+from lib.reporting import output_target
 from lib.tuning import (
     TuningCandidate,
     UnsupportedTuningCandidateError,
-    add_tuning_arguments,
     boolean_tuning_axis,
     meets_minimum_sqnr,
-    parse_optional_integer,
-    print_tuning_results,
+    report_tuning_run,
     tune_candidates,
     tuning_axis,
-    validate_tuning_arguments,
     validate_tuning_candidate_count,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
-from piper_kernels.attention.scheduling import (
-    BLOCK_M_VALUES,
-    LOOP_NUM_STAGES_VALUES,
-    NUM_STAGES_VALUES,
-    NUM_WARPS_VALUES,
-)
+
+_validate_args = validate_attention_tuning_arguments
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,21 +85,7 @@ class _SageAttention2ppTuningChoice:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequence", type=int, default=8192)
-    parser.add_argument("--kv-sequence", type=int)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
-    parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
-    parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--block-m", type=int, choices=BLOCK_M_VALUES, nargs="+")
-    parser.add_argument("--num-warps", type=int, choices=NUM_WARPS_VALUES, nargs="+")
-    parser.add_argument("--num-stages", type=int, choices=NUM_STAGES_VALUES, nargs="+")
-    parser.add_argument(
-        "--use-tensor-descriptors",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
+    add_attention_tuning_arguments(parser)
     parser.add_argument(
         "--fuse-kv-quantization",
         action=argparse.BooleanOptionalAction,
@@ -119,44 +101,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument(
-        "--reverse-causal-blocks",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--loop-num-stages",
-        type=parse_optional_integer,
-        choices=LOOP_NUM_STAGES_VALUES,
-        metavar="{0,1,2,3,4}",
-        nargs="+",
-        help="loop pipeline stages; 0 uses compiler default; omitted retains production",
-    )
-    parser.add_argument(
-        "--loop-licm",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--use-packed-probability-conversion",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    add_tuning_arguments(parser)
     return parser.parse_args(argv)
-
-
-def _validate_args(args: argparse.Namespace) -> None:
-    lengths = (args.sequence, args.kv_sequence or args.sequence)
-    if any(length <= 0 for length in lengths):
-        raise SystemExit("attention sequence lengths must be positive")
-    if args.batch_size <= 0 or args.heads <= 0:
-        raise SystemExit("batch size and heads must be positive")
-    if args.causal and lengths[0] != lengths[1]:
-        raise SystemExit("causal attention requires equal query and key/value lengths")
-    if not args.causal and args.reverse_causal_blocks is True:
-        raise SystemExit("reverse causal-block order requires causal attention")
-    validate_tuning_arguments(args)
 
 
 def _candidate_choices(
@@ -360,11 +305,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         measure_candidate_quality=lambda output: measure_quality(output, expected),
         quality_gate=lambda quality: meets_minimum_sqnr(quality, args.minimum_sqnr_db),
     )
-    print_tuning_results(run.records)
-    write_records(run.records, output_target(args))
-    if run.winner is None:
-        raise SystemExit("no tuning candidate passed the quality gate")
-    print(f"selected: {run.winner.candidate}")
+    report_tuning_run(run, output_target(args))
 
 
 def main() -> None:

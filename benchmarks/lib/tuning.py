@@ -20,7 +20,12 @@ from .providers import (
     provider_phase_launch,
 )
 from .quality import QualityMetrics
-from .reporting import SCHEMA_VERSION, add_output_arguments
+from .reporting import (
+    SCHEMA_VERSION,
+    OutputTarget,
+    add_output_arguments,
+    write_records,
+)
 from .timing import Timing, synchronized_wall_benchmark, triton_benchmark
 
 PreparedT = TypeVar("PreparedT")
@@ -208,6 +213,15 @@ def print_tuning_results(records: Sequence[TuningRecord]) -> None:
             f"| {record.candidate} | {record.status.value} | {record.selected} "
             f"| {timing} | {quality} | {record.reason or ''} |"
         )
+
+
+def report_tuning_run(run: TuningRun, target: OutputTarget | None) -> None:
+    """Render, persist, and require a winner from a completed tuning run."""
+    print_tuning_results(run.records)
+    write_records(run.records, target)
+    if run.winner is None:
+        raise SystemExit("no tuning candidate passed the quality gate")
+    print(f"selected: {run.winner.candidate}")
 
 
 def _reason(error: Exception) -> str:

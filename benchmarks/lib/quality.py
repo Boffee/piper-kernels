@@ -143,6 +143,8 @@ def _measure_finite_floating_quality(
     actual_l2 = torch.linalg.vector_norm(actual, dtype=comparison_dtype)
 
     epsilon = torch.finfo(comparison_dtype).tiny
+    reference_l1_safe = reference_l1.clamp_min(epsilon)
+    reference_l2_safe = reference_l2.clamp_min(epsilon)
     sqnr = 20 * torch.log10(reference_l2 / error_l2)
     if actual_l2 == 0 or reference_l2 == 0:
         cosine_similarity = 1.0 if actual_l2 == 0 and reference_l2 == 0 else 0.0
@@ -154,8 +156,8 @@ def _measure_finite_floating_quality(
     return QualityMetrics(
         mean_absolute_error=float(mean_absolute_error),
         max_absolute_error=float(max_absolute_error),
-        relative_l1_error=float(absolute_error_sum / reference_l1.clamp_min(epsilon)),
-        relative_l2_error=float(error_l2 / reference_l2.clamp_min(epsilon)),
+        relative_l1_error=float(absolute_error_sum / reference_l1_safe),
+        relative_l2_error=float(error_l2 / reference_l2_safe),
         sqnr_db=float(sqnr),
         cosine_similarity=cosine_similarity,
         actual_nonfinite_count=0,

@@ -91,8 +91,8 @@ max-args = 10
 known-first-party = ["piper_kernels"]
 
 [tool.pyright]
-include = ["src/piper_kernels"]
-exclude = ["tests", "benchmarks"]
+include = ["src/piper_kernels", "benchmarks"]
+exclude = ["tests"]
 pythonVersion = "3.13"
 typeCheckingMode = "standard"
 reportMissingImports = "none"

@@ -151,10 +151,7 @@ def _kv_mean_finalize_kernel(
     offsets_c = tl.arange(0, block_chunks)
     offsets_d = feature_block * block_d + tl.arange(0, block_d)
     mask = (offsets_c[:, None] < num_chunks) & (offsets_d[None, :] < head_dim)
-    partial_offsets = (
-        (batch_head * num_chunks + offsets_c[:, None]) * head_dim
-        + offsets_d[None, :]
-    )
+    partial_offsets = (batch_head * num_chunks + offsets_c[:, None]) * head_dim + offsets_d[None, :]
     key_partials = tl.load(key_partial_ptr + partial_offsets, mask=mask, other=0.0)
     output_offsets = batch_head * head_dim + offsets_d
     output_mask = offsets_d < head_dim
@@ -232,9 +229,8 @@ def _quantize_value_per_key_kernel(
     )
     if store_correction:
         correction_offsets = (
-            (batch_head * tl.cdiv(key_length, block_n) + key_block) * head_dim
-            + offsets_d
-        )
+            batch_head * tl.cdiv(key_length, block_n) + key_block
+        ) * head_dim + offsets_d
         tl.store(
             correction_ptr + correction_offsets,
             tl.sum(quantized.to(tl.int32), axis=0),
@@ -291,14 +287,13 @@ def _load_value_tile(
     use_tensor_descriptors: tl.constexpr,
 ):
     if use_tensor_descriptors:
-        return value_ptr.load([batch_head, feature_start, start_n]).reshape(
-            (feature_block, block_n)
-        ).T
+        return (
+            value_ptr.load([batch_head, feature_start, start_n]).reshape((feature_block, block_n)).T
+        )
     else:
         return tl.load(
             value_ptr
-            + (batch_head * head_dim + feature_start + offsets_d[None, :])
-            * storage_key_length
+            + (batch_head * head_dim + feature_start + offsets_d[None, :]) * storage_key_length
             + current_n[:, None],
             mask=current_n[:, None] < key_length,
             other=0,
@@ -363,9 +358,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     )
     if grouped_qk:
         query_scale = tl.load(
-            query_scale_ptr
-            + batch_head * tl.cdiv(query_length, 32)
-            + offsets_m // 32,
+            query_scale_ptr + batch_head * tl.cdiv(query_length, 32) + offsets_m // 32,
             mask=valid_queries,
             other=0.0,
         )
@@ -418,9 +411,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         integer_scores = tl.dot(query, key, out_dtype=tl.int32)
         if grouped_qk:
             key_scale = tl.load(
-                key_scale_ptr
-                + batch_head * tl.cdiv(key_length, block_n)
-                + start_n // block_n
+                key_scale_ptr + batch_head * tl.cdiv(key_length, block_n) + start_n // block_n
             )
             scores = integer_scores.to(tl.float32) * (query_scale * key_scale)[:, None]
         else:
@@ -462,10 +453,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
             tl.exp2(scores - block_max[:, None]),
             0.0,
         )
-        denominator = (
-            denominator * old_weight
-            + tl.sum(probabilities, axis=1) * current_weight
-        )
+        denominator = denominator * old_weight + tl.sum(probabilities, axis=1) * current_weight
         value_scale_multiplier = tl.load(
             value_scale_multiplier_ptr + batch_head * key_length + current_n,
             mask=current_n < key_length,
@@ -520,16 +508,12 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
             else:
                 correction_base = correction_block * head_dim
                 correction_low = (
-                    tl.load(value_correction_ptr + correction_base + offsets_vd).to(tl.int32)
-                    << 7
+                    tl.load(value_correction_ptr + correction_base + offsets_vd).to(tl.int32) << 7
                 )
                 correction_high = (
-                    tl.load(
-                        value_correction_ptr
-                        + correction_base
-                        + half_head_dim
-                        + offsets_vd
-                    ).to(tl.int32)
+                    tl.load(value_correction_ptr + correction_base + half_head_dim + offsets_vd).to(
+                        tl.int32
+                    )
                     << 7
                 )
                 partial_low = tl.dot(
@@ -547,32 +531,22 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                     out_dtype=tl.int32,
                 )
             if scaled_fp16_numerator:
-                partial_low_scaled = (partial_low.to(tl.float32) * (1.0 / 65536.0)).to(
+                partial_low_scaled = (partial_low.to(tl.float32) * (1.0 / 65536.0)).to(tl.float16)
+                partial_high_scaled = (partial_high.to(tl.float32) * (1.0 / 65536.0)).to(tl.float16)
+                accumulator_low = accumulator_low * old_weight[:, None].to(
                     tl.float16
-                )
-                partial_high_scaled = (partial_high.to(tl.float32) * (1.0 / 65536.0)).to(
+                ) + partial_low_scaled * current_weight[:, None].to(tl.float16)
+                accumulator_high = accumulator_high * old_weight[:, None].to(
                     tl.float16
-                )
-                accumulator_low = (
-                    accumulator_low * old_weight[:, None].to(tl.float16)
-                    + partial_low_scaled * current_weight[:, None].to(tl.float16)
-                )
-                accumulator_high = (
-                    accumulator_high * old_weight[:, None].to(tl.float16)
-                    + partial_high_scaled * current_weight[:, None].to(tl.float16)
-                )
+                ) + partial_high_scaled * current_weight[:, None].to(tl.float16)
             else:
                 accumulator_low = (
                     accumulator_low * old_weight[:, None]
-                    + partial_low.to(tl.float32)
-                    * (1.0 / _P_UINT8_RANGE)
-                    * current_weight[:, None]
+                    + partial_low.to(tl.float32) * (1.0 / _P_UINT8_RANGE) * current_weight[:, None]
                 )
                 accumulator_high = (
                     accumulator_high * old_weight[:, None]
-                    + partial_high.to(tl.float32)
-                    * (1.0 / _P_UINT8_RANGE)
-                    * current_weight[:, None]
+                    + partial_high.to(tl.float32) * (1.0 / _P_UINT8_RANGE) * current_weight[:, None]
                 )
         else:
             value_tile = _load_value_tile(
@@ -593,32 +567,26 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 partial = uint8_int8_dot(probability_uint8, value_tile)
             else:
                 correction = (
-                    tl.load(
-                        value_correction_ptr
-                        + correction_block * head_dim
-                        + offsets_d
-                    ).to(tl.int32)
+                    tl.load(value_correction_ptr + correction_block * head_dim + offsets_d).to(
+                        tl.int32
+                    )
                     << 7
                 )
                 partial = tl.dot(
                     probability_int8,
                     value_tile,
-                    acc=tl.zeros((block_m, head_dim), dtype=tl.int32)
-                    + correction[None, :],
+                    acc=tl.zeros((block_m, head_dim), dtype=tl.int32) + correction[None, :],
                     out_dtype=tl.int32,
                 )
             if scaled_fp16_numerator:
                 partial_scaled = (partial.to(tl.float32) * (1.0 / 65536.0)).to(tl.float16)
-                accumulator = (
-                    accumulator * old_weight[:, None].to(tl.float16)
-                    + partial_scaled * current_weight[:, None].to(tl.float16)
-                )
+                accumulator = accumulator * old_weight[:, None].to(
+                    tl.float16
+                ) + partial_scaled * current_weight[:, None].to(tl.float16)
             else:
                 accumulator = (
                     accumulator * old_weight[:, None]
-                    + partial.to(tl.float32)
-                    * (1.0 / _P_UINT8_RANGE)
-                    * current_weight[:, None]
+                    + partial.to(tl.float32) * (1.0 / _P_UINT8_RANGE) * current_weight[:, None]
                 )
         running_max = next_max
 
@@ -638,9 +606,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         if not is_causal:
             value_mean_base = value_mean_ptr + batch_head * head_dim
             output_low += tl.load(value_mean_base + offsets_vd)[None, :]
-            output_high += tl.load(
-                value_mean_base + half_head_dim + offsets_vd
-            )[None, :]
+            output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]
         output_base = output_ptr + (batch_head * query_length + offsets_m[:, None]) * head_dim
         tl.store(
             output_base + offsets_vd[None, :],
@@ -655,15 +621,11 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     else:
         if scaled_fp16_numerator:
             denominator_code_scale: tl.constexpr = _P_UINT8_RANGE / 65536.0
-            output = accumulator.to(tl.float32) / (
-                denominator_safe * denominator_code_scale
-            )
+            output = accumulator.to(tl.float32) / (denominator_safe * denominator_code_scale)
         else:
             output = accumulator / denominator_safe
         if not is_causal:
-            output += tl.load(
-                value_mean_ptr + batch_head * head_dim + offsets_d
-            )[None, :]
+            output += tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)[None, :]
         tl.store(
             output_ptr
             + (batch_head * query_length + offsets_m[:, None]) * head_dim
@@ -721,9 +683,7 @@ def _compute_kv_means(
         block_d=_MEAN_BLOCK_D,
         num_warps=4,
     )
-    _kv_mean_finalize_kernel[
-        (batch * heads, int(triton.cdiv(head_dim, _MEAN_BLOCK_D)))
-    ](
+    _kv_mean_finalize_kernel[(batch * heads, int(triton.cdiv(head_dim, _MEAN_BLOCK_D)))](
         key_partial,
         value_partial,
         key_mean,
@@ -737,118 +697,6 @@ def _compute_kv_means(
         num_warps=4,
     )
     return key_mean, value_mean
-
-
-def _prepare_qk(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    key_mean: torch.Tensor,
-    scale: float,
-    *,
-    grouped_qk: bool,
-    storage_key_length: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch, heads, query_length, head_dim = query.shape
-    key_length = key.shape[2]
-    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
-    key_shape = (batch, heads, storage_key_length, head_dim)
-    key_int8 = (
-        torch.zeros(key_shape, device=key.device, dtype=torch.int8)
-        if storage_key_length != key_length
-        else torch.empty(key_shape, device=key.device, dtype=torch.int8)
-    )
-    if grouped_qk:
-        query_groups = int(triton.cdiv(query_length, 32))
-        key_groups = int(triton.cdiv(key_length, _BLOCK_N))
-        query_scale = torch.empty(
-            (batch, heads, query_groups),
-            device=query.device,
-            dtype=torch.float32,
-        )
-        key_scale = torch.empty(
-            (batch, heads, key_groups),
-            device=key.device,
-            dtype=torch.float32,
-        )
-        qk_quantization.quantize_query_per_warp_kernel[(query_groups, heads, batch)](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
-            head_dim=head_dim,
-            num_warps=4,
-        )
-        qk_quantization.quantize_key_per_block_kernel[(key_groups, heads, batch)](
-            key,
-            key_mean,
-            key_int8,
-            key_scale,
-            key_length,
-            key.stride(0),
-            key.stride(1),
-            key.stride(2),
-            key_int8.stride(0),
-            key_int8.stride(1),
-            key_int8.stride(2),
-            key_scale.stride(0),
-            key_scale.stride(1),
-            heads=heads,
-            head_dim=head_dim,
-            block_n=_BLOCK_N,
-            num_warps=4,
-        )
-    else:
-        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
-        key_scale = torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
-        qk_quantization.quantize_query_per_thread_kernel[
-            (triton.cdiv(query_length, 32) * 8, heads, batch)
-        ](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
-            head_dim=head_dim,
-            num_warps=4,
-        )
-        qk_quantization.quantize_key_per_thread_kernel[
-            (triton.cdiv(key_length, _BLOCK_N) * 4, heads, batch)
-        ](
-            key,
-            key_mean,
-            key_int8,
-            key_scale,
-            key_length,
-            key.stride(0),
-            key.stride(1),
-            key.stride(2),
-            key_int8.stride(0),
-            key_int8.stride(1),
-            key_int8.stride(2),
-            key_scale.stride(0),
-            key_scale.stride(1),
-            heads=heads,
-            head_dim=head_dim,
-            num_warps=4,
-        )
-    return query_int8, key_int8, query_scale, key_scale
 
 
 def _make_descriptors(
@@ -890,9 +738,7 @@ def _default_piper_attention_execution_plan(
     """Resolve production policy for preparation, benchmarks, and tuning."""
     batch, heads, query_length, head_dim = query.shape
     candidate_block_m = (
-        select_query_block(query, batch, heads, query_length)
-        if query.device.type == "cuda"
-        else 64
+        select_query_block(query, batch, heads, query_length) if query.device.type == "cuda" else 64
     )
     target = AcceleratorTarget.from_device(query.device) if target is None else target
     return _policy.select_execution_plan(
@@ -953,12 +799,15 @@ def _prepare_piper_attention(
         value,
         is_causal=is_causal,
     )
-    query_int8, key_int8, query_scale, key_scale = _prepare_qk(
+    query_int8, query_scale = qk_quantization.prepare_query(
         query,
+        scale,
+        grouped=plan.grouped_qk,
+    )
+    key_int8, key_scale = qk_quantization.prepare_key(
         key,
         key_mean,
-        scale,
-        grouped_qk=plan.grouped_qk,
+        grouped=plan.grouped_qk,
         storage_key_length=storage_key_length,
     )
 
@@ -987,9 +836,7 @@ def _prepare_piper_attention(
         if not plan.native_uint8
         else torch.empty((1,), device=value.device, dtype=torch.int16)
     )
-    _quantize_value_per_key_kernel[
-        (triton.cdiv(key_length, _BLOCK_N), heads, batch)
-    ](
+    _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), heads, batch)](
         value,
         value_mean,
         value_scale_multiplier,

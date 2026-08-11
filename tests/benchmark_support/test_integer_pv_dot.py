@@ -75,9 +75,7 @@ def test_cli_exposes_generic_compiler_and_profile_controls(tmp_path) -> None:
 
 
 def test_profile_mode_rejects_benchmark_result_output(tmp_path) -> None:
-    arguments = _parse_args(
-        ["s8-s8", "--profile", "--json", str(tmp_path / "benchmark.json")]
-    )
+    arguments = _parse_args(["s8-s8", "--profile", "--json", str(tmp_path / "benchmark.json")])
 
     with pytest.raises(SystemExit, match="cannot produce benchmark"):
         _benchmark_output(arguments)
@@ -124,9 +122,7 @@ def test_benchmark_and_compiler_outputs_must_not_collide(
     tmp_path, benchmark_option: str, compiler_option: str
 ) -> None:
     path = tmp_path / "records.json"
-    arguments = _parse_args(
-        ["s8-s8", benchmark_option, str(path), compiler_option, str(path)]
-    )
+    arguments = _parse_args(["s8-s8", benchmark_option, str(path), compiler_option, str(path)])
 
     with pytest.raises(SystemExit, match="must be different"):
         _benchmark_output(arguments)

@@ -140,7 +140,6 @@ def write_records(records: Iterable[SerializableRecord], target: OutputTarget | 
         content = json.dumps(values, indent=2, allow_nan=False) + "\n"
     else:
         content = "".join(
-            json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n"
-            for value in values
+            json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n" for value in values
         )
     target.path.write_text(content, encoding="utf-8")

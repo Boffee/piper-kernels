@@ -34,6 +34,8 @@ _P_FP8_LOG2_MAX = tl.constexpr(8.807354922057604)
 _V_FP8_MAX = tl.constexpr(2.25)
 _SCALE_EPSILON = tl.constexpr(1e-7)
 _LOG2_E = tl.constexpr(1.4426950408889634)
+
+
 @triton.jit
 def _ptx_float32_to_e4m3x4(values):
     """Use the native packed SM89+ conversion used by canonical SageAttention."""
@@ -904,13 +906,7 @@ def _quantize_key_value(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize K/V using the preprocessing schedule selected by ``plan``."""
     batch, heads, key_length, head_dim = key.shape
-    key_shape = (batch, heads, storage_key_length, head_dim)
     value_shape = (batch, heads, head_dim, storage_key_length)
-    key_int8 = (
-        torch.zeros(key_shape, device=key.device, dtype=torch.int8)
-        if storage_key_length != key_length
-        else torch.empty(key_shape, device=key.device, dtype=torch.int8)
-    )
     value_fp8 = (
         torch.zeros(value_shape, device=value.device, dtype=torch.float8_e4m3fn)
         if storage_key_length != key_length
@@ -918,12 +914,18 @@ def _quantize_key_value(
     )
 
     num_key_blocks = int(triton.cdiv(key_length, _BLOCK_N))
-    key_scale_shape = (
-        (batch, heads, num_key_blocks) if plan.grouped_qk else (batch, heads, key_length)
-    )
-    key_scale = torch.empty(key_scale_shape, device=key.device, dtype=torch.float32)
-
     if plan.fuse_kv_quantization:
+        key_shape = (batch, heads, storage_key_length, head_dim)
+        key_int8 = (
+            torch.zeros(key_shape, device=key.device, dtype=torch.int8)
+            if storage_key_length != key_length
+            else torch.empty(key_shape, device=key.device, dtype=torch.int8)
+        )
+        key_scale = torch.empty(
+            (batch, heads, num_key_blocks),
+            device=key.device,
+            dtype=torch.float32,
+        )
         _quantize_kv_per_block_kernel[(num_key_blocks * 2, batch * heads)](
             key,
             value,
@@ -953,45 +955,12 @@ def _quantize_key_value(
         )
         return key_int8, value_fp8, key_scale
 
-    if plan.grouped_qk:
-        qk_quantization.quantize_key_per_block_kernel[(num_key_blocks, heads, batch)](
-            key,
-            key_mean,
-            key_int8,
-            key_scale,
-            key_length,
-            key.stride(0),
-            key.stride(1),
-            key.stride(2),
-            key_int8.stride(0),
-            key_int8.stride(1),
-            key_int8.stride(2),
-            key_scale.stride(0),
-            key_scale.stride(1),
-            heads=heads,
-            head_dim=head_dim,
-            block_n=_BLOCK_N,
-            num_warps=4,
-        )
-    else:
-        qk_quantization.quantize_key_per_thread_kernel[(num_key_blocks * 4, heads, batch)](
-            key,
-            key_mean,
-            key_int8,
-            key_scale,
-            key_length,
-            key.stride(0),
-            key.stride(1),
-            key.stride(2),
-            key_int8.stride(0),
-            key_int8.stride(1),
-            key_int8.stride(2),
-            key_scale.stride(0),
-            key_scale.stride(1),
-            heads=heads,
-            head_dim=head_dim,
-            num_warps=4,
-        )
+    key_int8, key_scale = qk_quantization.prepare_key(
+        key,
+        key_mean,
+        grouped=plan.grouped_qk,
+        storage_key_length=storage_key_length,
+    )
     _quantize_value_kernel[(num_key_blocks, heads, batch)](
         value,
         value_scale,
@@ -1021,55 +990,11 @@ def _prepare_query(
     if plan.fuse_query_quantization:
         # The placeholder scale argument is compiled away in this specialization.
         return query, value_scale
-
-    batch, heads, query_length, head_dim = query.shape
-    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
-    if plan.grouped_qk:
-        num_query_groups = int(triton.cdiv(query_length, _QUERY_GROUP_SIZE))
-        query_scale = torch.empty(
-            (batch, heads, num_query_groups),
-            device=query.device,
-            dtype=torch.float32,
-        )
-        qk_quantization.quantize_query_per_warp_kernel[(num_query_groups, heads, batch)](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            softmax_scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
-            head_dim=head_dim,
-            num_warps=4,
-        )
-    else:
-        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
-        qk_quantization.quantize_query_per_thread_kernel[
-            (triton.cdiv(query_length, _QUERY_GROUP_SIZE) * 8, heads, batch)
-        ](
-            query,
-            query_int8,
-            query_scale,
-            query_length,
-            softmax_scale,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            query_int8.stride(0),
-            query_int8.stride(1),
-            query_int8.stride(2),
-            query_scale.stride(0),
-            query_scale.stride(1),
-            head_dim=head_dim,
-            num_warps=4,
-        )
-    return query_int8, query_scale
+    return qk_quantization.prepare_query(
+        query,
+        softmax_scale,
+        grouped=plan.grouped_qk,
+    )
 
 
 def _prepare_sage_attention_2pp(

@@ -1,10 +1,13 @@
 """Portable reference for Sage-style INT8 Q/K quantization."""
 
+from typing import Literal
+
 import torch
 
 QUERY_BLOCK = 32
 KEY_BLOCK = 64
 SCALE_EPSILON = 1e-7
+type QKQuantizationGranularity = Literal["per_thread", "per_warp"]
 
 
 def _pad_sequence(value: torch.Tensor, multiple: int) -> tuple[torch.Tensor, int]:
@@ -72,3 +75,34 @@ def quantize_per_group(
         .to(torch.int8)
     )
     return quantized.reshape_as(padded)[:, :, :length], scale
+
+
+def quantize_query_key(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    granularity: QKQuantizationGranularity,
+    quantization_range: int = 127,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Center K and quantize Q/K with the selected SageAttention granularity."""
+    key_float = key.float()
+    key_centered = key_float - key_float.mean(dim=2, keepdim=True)
+    if granularity == "per_warp":
+        query_int8, query_scale = quantize_per_group(
+            query,
+            QUERY_BLOCK,
+            quantization_range,
+        )
+        key_int8, key_scale = quantize_per_group(
+            key_centered,
+            KEY_BLOCK,
+            quantization_range,
+        )
+        query_scale = query_scale.repeat_interleave(QUERY_BLOCK, dim=2)[:, :, : query.shape[2]]
+        key_scale = key_scale.repeat_interleave(KEY_BLOCK, dim=2)[:, :, : key.shape[2]]
+    elif granularity == "per_thread":
+        query_int8, query_scale = quantize_query_per_thread(query, quantization_range)
+        key_int8, key_scale = quantize_key_per_thread(key_centered, quantization_range)
+    else:
+        raise ValueError(f"unknown Q/K quantization granularity: {granularity}")
+    return query_int8, key_int8, query_scale, key_scale

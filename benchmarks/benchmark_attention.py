@@ -164,7 +164,7 @@ def _compiler_provider_name(
             "compiler inspection requires --compiler-provider when multiple Triton "
             "providers are selected"
         )
-    return selected[0]
+    return next(iter(selected))
 
 
 def _output_targets(args: argparse.Namespace) -> tuple[OutputTarget | None, OutputTarget | None]:

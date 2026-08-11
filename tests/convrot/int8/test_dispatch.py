@@ -67,7 +67,7 @@ def _weight(
     dtype: torch.dtype = torch.float32,
     scale_requires_grad: bool = False,
 ) -> ConvRotInt8Tensor:
-    return ConvRotInt8Tensor.from_packed(
+    return ConvRotInt8Tensor.from_quantized(
         torch.arange(-128, 96, dtype=torch.int8, device=device).reshape(7, 32),
         torch.full(
             (7, 1),
@@ -77,7 +77,7 @@ def _weight(
             requires_grad=scale_requires_grad,
         ),
         group_size=16,
-        dtype=dtype,
+        logical_dtype=dtype,
     )
 
 
@@ -206,7 +206,7 @@ def test_public_fake_cuda_paths_do_not_require_a_physical_device(
     monkeypatch.setattr(torch.cuda, "get_device_capability", unavailable_capability)
     with FakeTensorMode():
         device = torch.device("cuda:137")
-        weight = ConvRotInt8Tensor.from_packed(
+        weight = ConvRotInt8Tensor.from_quantized(
             torch.empty(7, 256, dtype=torch.int8, device=device),
             torch.empty(7, 1, dtype=torch.float32, device=device),
             group_size=256,
@@ -237,7 +237,7 @@ def test_public_swiglu_fake_cuda_runs_under_fullgraph_compile_without_a_target()
     unavailable_index = torch.cuda.device_count()
     with FakeTensorMode():
         device = torch.device(f"cuda:{unavailable_index}")
-        weight = ConvRotInt8Tensor.from_packed(
+        weight = ConvRotInt8Tensor.from_quantized(
             torch.empty(7, 256, dtype=torch.int8, device=device),
             torch.empty(7, 1, dtype=torch.float32, device=device),
             group_size=256,

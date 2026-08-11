@@ -4,11 +4,14 @@
 # Python call signature.
 # pyright: reportCallIssue=false
 
+import torch
 import triton
 import triton.language as tl
 
 _LOG2_E = tl.constexpr(1.4426950408889634)
 _SCALE_EPSILON = tl.constexpr(1e-7)
+_QUERY_BLOCK = 32
+_KEY_BLOCK = 64
 
 
 @triton.jit
@@ -230,3 +233,124 @@ def quantize_key_per_block_kernel(
         scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
         scale,
     )
+
+
+def prepare_query(
+    query: torch.Tensor,
+    softmax_scale: float,
+    *,
+    grouped: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate and quantize Q with the selected SageAttention granularity."""
+    batch, heads, query_length, head_dim = query.shape
+    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+    if grouped:
+        scale_groups = int(triton.cdiv(query_length, _QUERY_BLOCK))
+        query_scale = torch.empty(
+            (batch, heads, scale_groups),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        quantize_query_per_warp_kernel[(scale_groups, heads, batch)](
+            query,
+            query_int8,
+            query_scale,
+            query_length,
+            softmax_scale,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query_int8.stride(0),
+            query_int8.stride(1),
+            query_int8.stride(2),
+            query_scale.stride(0),
+            query_scale.stride(1),
+            head_dim=head_dim,
+            num_warps=4,
+        )
+    else:
+        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+        quantize_query_per_thread_kernel[
+            (triton.cdiv(query_length, _QUERY_BLOCK) * 8, heads, batch)
+        ](
+            query,
+            query_int8,
+            query_scale,
+            query_length,
+            softmax_scale,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query_int8.stride(0),
+            query_int8.stride(1),
+            query_int8.stride(2),
+            query_scale.stride(0),
+            query_scale.stride(1),
+            head_dim=head_dim,
+            num_warps=4,
+        )
+    return query_int8, query_scale
+
+
+def prepare_key(
+    key: torch.Tensor,
+    key_mean: torch.Tensor,
+    *,
+    grouped: bool,
+    storage_key_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate and quantize centered K with the selected SageAttention granularity."""
+    batch, heads, key_length, head_dim = key.shape
+    key_shape = (batch, heads, storage_key_length, head_dim)
+    key_int8 = (
+        torch.zeros(key_shape, device=key.device, dtype=torch.int8)
+        if storage_key_length != key_length
+        else torch.empty(key_shape, device=key.device, dtype=torch.int8)
+    )
+    if grouped:
+        scale_groups = int(triton.cdiv(key_length, _KEY_BLOCK))
+        key_scale = torch.empty(
+            (batch, heads, scale_groups),
+            device=key.device,
+            dtype=torch.float32,
+        )
+        quantize_key_per_block_kernel[(scale_groups, heads, batch)](
+            key,
+            key_mean,
+            key_int8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=_KEY_BLOCK,
+            num_warps=4,
+        )
+    else:
+        key_scale = torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
+        quantize_key_per_thread_kernel[(triton.cdiv(key_length, _KEY_BLOCK) * 4, heads, batch)](
+            key,
+            key_mean,
+            key_int8,
+            key_scale,
+            key_length,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads=heads,
+            head_dim=head_dim,
+            num_warps=4,
+        )
+    return key_int8, key_scale

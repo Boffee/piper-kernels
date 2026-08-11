@@ -14,6 +14,7 @@ except ModuleNotFoundError as exc:
         raise
     _triton_sage_attention_2pp = None
 
+
 def _validate_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
