@@ -74,9 +74,7 @@ def test_cuda_capability_matching_distinguishes_family_and_exact_target() -> Non
 
 
 def test_compiler_target_normalizes_architecture_identity() -> None:
-    target = AcceleratorTarget.from_compiler_target(
-        SimpleNamespace(backend="cuda", arch=121)
-    )
+    target = AcceleratorTarget.from_compiler_target(SimpleNamespace(backend="cuda", arch=121))
 
     assert target == AcceleratorTarget(backend="cuda", architecture="sm121")
     for architecture in ("gfx1200", "gfx1201"):

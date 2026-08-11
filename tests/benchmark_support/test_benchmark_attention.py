@@ -1,6 +1,10 @@
 """Tests for the unified full-attention benchmark."""
 
+import json
+import tomllib
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,10 +20,13 @@ from lib.attention import AttentionConfig, AttentionShape
 from lib.attention_providers import (
     CANONICAL_CUDA_SAGE_ATTENTION_2,
     CANONICAL_CUDA_SAGE_ATTENTION_2PP,
+    CANONICAL_REVISION,
+    CANONICAL_VERSION,
     PIPER_ATTENTION,
     PIPER_ATTENTION_AFFINE,
     PYTORCH_SDPA,
     SAGE_ATTENTION_2PP,
+    _load_canonical_sage_attention,
     make_attention_providers,
     qk_quantization_granularity,
     resolve_provider_names,
@@ -29,6 +36,18 @@ from lib.attention_providers import (
 from piper_kernels._triton.targets import AcceleratorTarget
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
+
+
+def _canonical_distribution(
+    *,
+    version: str = CANONICAL_VERSION,
+    revision: str | None = CANONICAL_REVISION,
+) -> SimpleNamespace:
+    direct_url = None if revision is None else json.dumps({"vcs_info": {"commit_id": revision}})
+    return SimpleNamespace(
+        version=version,
+        read_text=lambda name: direct_url if name == "direct_url.json" else None,
+    )
 
 
 def test_provider_ids_use_canonical_attention_names() -> None:
@@ -161,6 +180,72 @@ def test_canonical_flag_adds_both_pinned_providers() -> None:
         CANONICAL_CUDA_SAGE_ATTENTION_2PP,
         CANONICAL_CUDA_SAGE_ATTENTION_2,
     )
+
+
+def test_canonical_provenance_matches_project_pin() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((repository / "pyproject.toml").read_text())
+
+    assert (
+        f"sageattention=={CANONICAL_VERSION}; sys_platform == 'linux'"
+        in project["dependency-groups"]["benchmark"]
+    )
+    assert project["tool"]["uv"]["sources"]["sageattention"]["rev"] == CANONICAL_REVISION
+
+
+@pytest.mark.parametrize(
+    ("distribution", "message"),
+    [
+        (_canonical_distribution(version="9.9.9"), "require sageattention=="),
+        (_canonical_distribution(revision="wrong-revision"), "require revision"),
+        (_canonical_distribution(revision=None), "no VCS revision metadata"),
+    ],
+)
+def test_canonical_provider_rejects_unpinned_installations(
+    monkeypatch: pytest.MonkeyPatch,
+    distribution: SimpleNamespace,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        "lib.attention_providers.importlib.metadata.distribution",
+        lambda _name: distribution,
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        _load_canonical_sage_attention((12, 0))
+
+
+def test_canonical_provider_reports_missing_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(_name: str) -> None:
+        raise PackageNotFoundError
+
+    monkeypatch.setattr(
+        "lib.attention_providers.importlib.metadata.distribution",
+        missing,
+    )
+
+    with pytest.raises(SystemExit, match="uv sync --group benchmark"):
+        _load_canonical_sage_attention((12, 0))
+
+
+def test_canonical_provider_loads_verified_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def operator() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "lib.attention_providers.importlib.metadata.distribution",
+        lambda _name: _canonical_distribution(),
+    )
+    monkeypatch.setattr(
+        "lib.attention_providers.importlib.import_module",
+        lambda _name: SimpleNamespace(sageattn_qk_int8_pv_fp8_cuda=operator),
+    )
+
+    assert _load_canonical_sage_attention((12, 0)) is operator
 
 
 def test_explicit_sage_attention_2pp_provider_requires_fp8() -> None:

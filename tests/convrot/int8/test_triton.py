@@ -27,7 +27,7 @@ def test_triton_linear_matches_gpu_reference(group_size: int) -> None:
     in_features = 2 * group_size
     qdata = torch.randint(-127, 128, (96, in_features), dtype=torch.int8, device="cuda")
     scale = torch.rand(96, 1, dtype=torch.float32, device="cuda") * 0.01
-    wrapped = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=group_size)
+    wrapped = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=group_size)
     activation = torch.randn(37, in_features, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(96, dtype=torch.bfloat16, device="cuda")
 
@@ -293,7 +293,12 @@ def test_fused_up_gate_swiglu_linear_matches_materialized_path(
         device="cuda",
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
-    weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=256, dtype=dtype)
+    weight = ConvRotInt8Tensor.from_quantized(
+        qdata,
+        scale,
+        group_size=256,
+        logical_dtype=dtype,
+    )
     raw_activation = torch.randn(rows, 2 * in_features, dtype=dtype, device="cuda")
     bias = torch.randn(out_features, dtype=dtype, device="cuda") if with_bias else None
     up, gate = raw_activation.chunk(2, dim=-1)
@@ -317,7 +322,7 @@ def test_convrot_swiglu_linear_handles_empty_rows(with_bias: bool) -> None:
     in_features, out_features = 512, 96
     qdata = torch.empty(out_features, in_features, dtype=torch.int8, device="cuda")
     scale = torch.empty(out_features, 1, dtype=torch.float32, device="cuda")
-    weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=256)
+    weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
     raw_activation = torch.empty(2, 0, 2 * in_features, dtype=torch.bfloat16, device="cuda")
     bias = torch.empty(out_features, dtype=torch.bfloat16, device="cuda") if with_bias else None
 
@@ -341,11 +346,11 @@ def test_cuda_linear_handles_zero_input_features(
     out_features = 3
     qdata = torch.empty(out_features, 0, dtype=torch.int8, device="cuda")
     scale = torch.ones(out_features, 1, dtype=torch.float32, device="cuda")
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         qdata,
         scale,
         group_size=16,
-        dtype=torch.bfloat16,
+        logical_dtype=torch.bfloat16,
     )
     activation = torch.empty((*prefix, 0), dtype=torch.bfloat16, device="cuda")
     bias = torch.arange(out_features, dtype=torch.bfloat16, device="cuda") if with_bias else None
@@ -375,7 +380,7 @@ def test_cuda_linear_preserves_zero_output_and_row_dimensions(
     input_activation: str | None,
 ) -> None:
     in_features = 16
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(0, in_features, dtype=torch.int8, device="cuda"),
         torch.empty(0, 1, dtype=torch.float32, device="cuda"),
         group_size=16,
@@ -400,7 +405,7 @@ def test_cuda_linear_preserves_zero_output_and_row_dimensions(
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_cuda_zero_input_features_run_under_fullgraph_compile() -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(3, 0, dtype=torch.int8, device="cuda"),
         torch.ones(3, 1, dtype=torch.float32, device="cuda"),
         group_size=16,
@@ -587,7 +592,7 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
         device="cuda",
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
-    weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=256)
+    weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
     input_factor = 1 if input_activation is None else 2
     activation = torch.randn(
         rows,
@@ -623,7 +628,7 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
 def test_triton_linear_runs_under_fullgraph_compile_with_noncontiguous_input() -> None:
     module = nn.Linear(64, 96, bias=True, device="meta", dtype=torch.bfloat16)
     module.weight = nn.Parameter(
-        ConvRotInt8Tensor.from_packed(
+        ConvRotInt8Tensor.from_quantized(
             torch.randint(-127, 128, (96, 64), dtype=torch.int8, device="cuda"),
             torch.rand(96, 1, dtype=torch.float32, device="cuda") * 0.01,
             group_size=64,
@@ -655,7 +660,7 @@ def test_swiglu_linear_runs_under_fullgraph_compile_with_noncontiguous_input(row
         device="cuda",
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
-    weight = ConvRotInt8Tensor.from_packed(qdata, scale, group_size=256)
+    weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
     activation_storage = torch.randn(
         rows,
         2,
@@ -746,11 +751,11 @@ def test_triton_addmm_stochastic_rounding_replays_and_is_unbiased() -> None:
     mat2 = rotate_groups(rotated_update, 256)
 
     def make_weight() -> ConvRotInt8Tensor:
-        return ConvRotInt8Tensor.from_packed(
+        return ConvRotInt8Tensor.from_quantized(
             torch.zeros(rows, cols, dtype=torch.int8, device="cuda"),
             torch.ones(rows, 1, dtype=torch.float32, device="cuda"),
             group_size=256,
-            dtype=torch.bfloat16,
+            logical_dtype=torch.bfloat16,
         )
 
     first = make_weight()
@@ -774,7 +779,7 @@ def test_triton_addmm_stochastic_rounding_replays_and_is_unbiased() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("out_features", [0, 3])
 def test_triton_addmm_handles_zero_feature_weight(out_features: int) -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(out_features, 0, dtype=torch.int8, device="cuda"),
         torch.ones(out_features, 1, dtype=torch.float32, device="cuda"),
         group_size=16,
@@ -800,11 +805,11 @@ def test_triton_addmm_handles_underflowing_float16_scale() -> None:
     mat2 = rotate_groups(rotated_update, 16)
     qdata = torch.zeros(1, 16, dtype=torch.int8, device="cuda")
     scale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
-    actual = ConvRotInt8Tensor.from_packed(
+    actual = ConvRotInt8Tensor.from_quantized(
         qdata.clone(),
         scale.clone(),
         group_size=16,
-        dtype=torch.float16,
+        logical_dtype=torch.float16,
     )
     expected = actual.clone()
 
@@ -825,11 +830,11 @@ def test_triton_linear_handles_underflowing_float16_activation_scale() -> None:
     activation = rotate_groups(rotated_activation, 16)
     qdata = torch.arange(-8, 8, dtype=torch.int8, device="cuda").reshape(1, 16)
     scale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         qdata,
         scale,
         group_size=16,
-        dtype=torch.float16,
+        logical_dtype=torch.float16,
     )
 
     expected = reference_linear(activation, qdata, scale, 16)

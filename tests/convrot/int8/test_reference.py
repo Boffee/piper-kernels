@@ -19,11 +19,11 @@ def test_cpu_linear_matches_explicit_w8a8_reference() -> None:
     rotated_weight = rotate_groups(weight, group_size)
     weight_scale = (rotated_weight.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-30)
     weight_qdata = (rotated_weight / weight_scale).round().clamp(-128, 127).to(torch.int8)
-    wrapped = ConvRotInt8Tensor.from_packed(
+    wrapped = ConvRotInt8Tensor.from_quantized(
         weight_qdata,
         weight_scale,
         group_size=group_size,
-        dtype=torch.float32,
+        logical_dtype=torch.float32,
     )
     activation = torch.randn(7, in_features)
     bias = torch.randn(out_features)
@@ -118,11 +118,11 @@ def test_linear_handles_zero_input_features(
     with_bias: bool,
     input_activation: str | None,
 ) -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(3, 0, dtype=torch.int8),
         torch.ones(3, 1, dtype=torch.float32),
         group_size=16,
-        dtype=torch.float16,
+        logical_dtype=torch.float16,
     )
     activation = torch.empty((*prefix, 0), dtype=torch.float16)
     bias = torch.tensor((1.0, 2.0, 3.0), dtype=torch.float16) if with_bias else None
@@ -150,11 +150,11 @@ def test_linear_preserves_zero_output_and_row_dimensions(
     input_activation: str | None,
 ) -> None:
     in_features = 16
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(0, in_features, dtype=torch.int8),
         torch.empty(0, 1, dtype=torch.float32),
         group_size=16,
-        dtype=torch.float32,
+        logical_dtype=torch.float32,
     )
     input_factor = 1 if input_activation is None else 2
     activation = torch.empty((*prefix, input_factor * in_features))
@@ -170,11 +170,11 @@ def test_linear_preserves_zero_output_and_row_dimensions(
 
 
 def test_zero_input_features_run_under_fullgraph_compile() -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(3, 0, dtype=torch.int8),
         torch.ones(3, 1, dtype=torch.float32),
         group_size=16,
-        dtype=torch.float32,
+        logical_dtype=torch.float32,
     )
     activation = torch.empty(2, 4, 0)
     bias = torch.arange(3, dtype=torch.float32)
@@ -194,11 +194,11 @@ def test_zero_input_features_run_under_fullgraph_compile() -> None:
 
 
 def test_convrot_linear_propagates_meta_metadata() -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(11, 32, dtype=torch.int8, device="meta"),
         torch.empty(11, 1, dtype=torch.float32, device="meta"),
         group_size=16,
-        dtype=torch.bfloat16,
+        logical_dtype=torch.bfloat16,
     )
     activation = torch.empty(2, 7, 64, dtype=torch.bfloat16, device="meta")
     bias = torch.empty(11, dtype=torch.bfloat16, device="meta")
@@ -213,11 +213,11 @@ def test_convrot_linear_propagates_meta_metadata() -> None:
 def test_convrot_linear_supports_fake_tensors() -> None:
     build_hadamard(16)
     with FakeTensorMode():
-        weight = ConvRotInt8Tensor.from_packed(
+        weight = ConvRotInt8Tensor.from_quantized(
             torch.empty(11, 32, dtype=torch.int8),
             torch.empty(11, 1, dtype=torch.float32),
             group_size=16,
-            dtype=torch.float32,
+            logical_dtype=torch.float32,
         )
         activation = torch.empty(2, 7, 64)
         result = convrot_linear(activation, weight, input_activation="swiglu")
@@ -228,11 +228,11 @@ def test_convrot_linear_supports_fake_tensors() -> None:
 
 
 def test_meta_linear_and_input_activation_run_under_torch_compile() -> None:
-    weight = ConvRotInt8Tensor.from_packed(
+    weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(11, 32, dtype=torch.int8, device="meta"),
         torch.empty(11, 1, dtype=torch.float32, device="meta"),
         group_size=16,
-        dtype=torch.bfloat16,
+        logical_dtype=torch.bfloat16,
     )
     activation = torch.empty(2, 7, 64, dtype=torch.bfloat16, device="meta")
     bias = torch.empty(11, dtype=torch.bfloat16, device="meta")

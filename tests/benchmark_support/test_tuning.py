@@ -4,6 +4,7 @@ import pytest
 from lib.environment import EnvironmentInfo
 from lib.providers import BenchmarkProvider, ProviderPhase
 from lib.quality import QualityMetrics
+from lib.reporting import OutputFormat, OutputTarget
 from lib.timing import ClockDomain, Timing
 from lib.tuning import (
     TuningCandidate,
@@ -12,6 +13,7 @@ from lib.tuning import (
     boolean_tuning_axis,
     meets_minimum_sqnr,
     parse_optional_integer,
+    report_tuning_run,
     tune_candidates,
     tuning_axis,
     validate_tuning_candidate_count,
@@ -239,3 +241,24 @@ def test_tuning_validates_candidate_lists(
             shape={},
             environment=_environment(),
         )
+
+
+def test_report_tuning_run_prints_and_writes_selected_candidate(
+    tmp_path,
+    capsys,
+) -> None:
+    run = tune_candidates(
+        (_candidate("winner", 1),),
+        tuning="attention",
+        shape={},
+        environment=_environment(),
+        warmup_ms=2,
+        measurement_time_ms=5,
+        device_timer=_timer,
+    )
+    path = tmp_path / "tuning.json"
+
+    report_tuning_run(run, OutputTarget(path, OutputFormat.JSON))
+
+    assert "selected: winner" in capsys.readouterr().out
+    assert '"candidate": "winner"' in path.read_text()

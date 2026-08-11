@@ -176,6 +176,7 @@ project.
 uv sync --dev
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv run pyright
 uv build
 ```

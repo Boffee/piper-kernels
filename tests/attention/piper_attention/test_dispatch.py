@@ -95,6 +95,7 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
     assert guarded_devices == [query.device]
     assert events == ["device-enter", "hook", "device-exit", "preprocessing"]
 
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int8])
 def test_rejects_unsupported_dtype(dtype: torch.dtype) -> None:
     query = torch.zeros((1, 1, 8, 64), dtype=dtype)

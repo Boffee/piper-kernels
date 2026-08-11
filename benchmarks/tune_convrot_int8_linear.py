@@ -25,13 +25,13 @@ from lib.convrot_providers import (
 from lib.environment import capture_environment
 from lib.providers import BenchmarkProvider
 from lib.quality import measure_quality
-from lib.reporting import output_target, write_records
+from lib.reporting import output_target
 from lib.tuning import (
     TuningCandidate,
     add_tuning_arguments,
     boolean_tuning_axis,
     meets_minimum_sqnr,
-    print_tuning_results,
+    report_tuning_run,
     tune_candidates,
     tuning_axis,
     validate_tuning_arguments,
@@ -272,11 +272,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         measure_candidate_quality=lambda output: measure_quality(output, expected),
         quality_gate=lambda quality: meets_minimum_sqnr(quality, args.minimum_sqnr_db),
     )
-    print_tuning_results(run.records)
-    write_records(run.records, output_target(args))
-    if run.winner is None:
-        raise SystemExit("no tuning candidate passed the quality gate")
-    print(f"selected: {run.winner.candidate}")
+    report_tuning_run(run, output_target(args))
 
 
 def main() -> None:

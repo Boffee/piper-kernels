@@ -159,9 +159,10 @@ def test_provider_report_covers_resources_ptx_sass_and_json(tmp_path: Path) -> N
     assert value["provider"] == "test-provider"
     assert value["configuration"] == {"block_m": 64}
     assert value["environment"]["git_revision"] == "a" * 40
-    assert value["specializations"][0]["residency_ceiling"][
-        "resident_workgroups_per_compute_unit"
-    ] == 6
+    assert (
+        value["specializations"][0]["residency_ceiling"]["resident_workgroups_per_compute_unit"]
+        == 6
+    )
 
 
 def test_clustered_cuda_report_keeps_resources_and_residency_workgroup_scoped() -> None:

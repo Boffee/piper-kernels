@@ -9,6 +9,13 @@ repos:
         types_or: [python, pyi]
         require_serial: true
 
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --frozen ruff format
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
       - id: pyright
         name: pyright
         entry: uv run --frozen pyright
@@ -21,6 +28,6 @@ repos:
         name: tests (cpu-only)
         entry: env CUDA_VISIBLE_DEVICES= uv run --frozen pytest -q
         language: system
-        files: ^(src/|tests/|pyproject\.toml)
+        files: ^(src/|benchmarks/|tests/|pyproject\.toml)
         pass_filenames: false
         require_serial: true

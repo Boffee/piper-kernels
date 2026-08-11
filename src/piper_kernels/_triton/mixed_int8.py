@@ -87,11 +87,7 @@ def _mma_accumulator_dependencies(line: str) -> list[str]:
         raise MixedInt8DotCompatibilityError(
             f"expected four integer MMA accumulator operands in Triton LLVM IR: {line}"
         )
-    return [
-        value
-        for argument in accumulator_arguments
-        for value in _SSA_VALUE.findall(argument)
-    ]
+    return [value for argument in accumulator_arguments for value in _SSA_VALUE.findall(argument)]
 
 
 def _trace_marked_mma_chain(
@@ -192,9 +188,7 @@ class _MixedInt8StageHook:
             )
         previous_key, previous_hash = previous_identity
         combined_key = f"{previous_key}\0{_CACHE_KEY}"
-        combined_hash = hashlib.sha256(
-            f"{previous_hash}\0{_CACHE_HASH}".encode()
-        ).hexdigest()
+        combined_hash = hashlib.sha256(f"{previous_hash}\0{_CACHE_HASH}".encode()).hexdigest()
         return combined_key, combined_hash
 
     def __call__(

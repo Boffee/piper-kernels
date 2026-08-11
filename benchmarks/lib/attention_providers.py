@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import cast
@@ -114,6 +116,36 @@ def validate_provider_support(
 
 def _load_canonical_sage_attention(capability: tuple[int, int]) -> CanonicalSageAttention:
     try:
+        distribution = importlib.metadata.distribution("sageattention")
+    except importlib.metadata.PackageNotFoundError as error:
+        architecture = f"{capability[0]}.{capability[1]}"
+        raise SystemExit(
+            "Canonical SageAttention is unavailable. Build the pinned benchmark "
+            "dependency with:\n"
+            f"  TORCH_CUDA_ARCH_LIST={architecture} uv sync --group benchmark"
+        ) from error
+    if distribution.version != CANONICAL_VERSION:
+        raise SystemExit(
+            "Canonical SageAttention benchmarks require "
+            f"sageattention=={CANONICAL_VERSION}; found {distribution.version}"
+        )
+
+    direct_url = distribution.read_text("direct_url.json")
+    try:
+        direct_url_metadata = None if direct_url is None else json.loads(direct_url)
+    except json.JSONDecodeError as error:
+        raise SystemExit("sageattention has invalid direct_url.json provenance metadata") from error
+    vcs_info = (
+        direct_url_metadata.get("vcs_info") if isinstance(direct_url_metadata, dict) else None
+    )
+    installed_revision = vcs_info.get("commit_id") if isinstance(vcs_info, dict) else None
+    if installed_revision != CANONICAL_REVISION:
+        raise SystemExit(
+            "Canonical SageAttention benchmarks require revision "
+            f"{CANONICAL_REVISION}; found {installed_revision or 'no VCS revision metadata'}"
+        )
+
+    try:
         module = importlib.import_module("sageattention")
     except (ImportError, OSError) as error:
         architecture = f"{capability[0]}.{capability[1]}"
@@ -140,6 +172,7 @@ def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
 def _sage_attention_2pp_jit_functions(
     plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
 ) -> dict[str, object]:
+    quantization_kernels: dict[str, object]
     if plan.fuse_kv_quantization:
         quantization_kernels = {
             "quantize-key-value-per-block": (

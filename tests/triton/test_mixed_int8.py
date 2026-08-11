@@ -21,9 +21,9 @@ from piper_kernels._triton.targets import AcceleratorTarget
 _NVIDIA_GPU_AVAILABLE = torch.cuda.is_available() and torch.version.cuda is not None
 
 _MMA_PREFIX = (
-    '  {name} = tail call {{ i32, i32, i32, i32 }} asm sideeffect '
+    "  {name} = tail call {{ i32, i32, i32, i32 }} asm sideeffect "
     '"mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32 '
-    '{{ $0, $1, $2, $3 }}, {{ $8, $9, $10, $11 }}, {{ $12, $13 }}, '
+    "{{ $0, $1, $2, $3 }}, {{ $8, $9, $10, $11 }}, {{ $12, $13 }}, "
     '{{ $4, $5, $6, $7 }};", "=r,=r,=r,=r,0,1,2,3,r,r,r,r,r,r"'
 )
 
@@ -50,12 +50,8 @@ def _mixed_and_signed_dot_kernel(
     offsets_m = tl.arange(0, 64)
     offsets_n = tl.arange(0, 64)
     offsets_k = tl.arange(0, 64)
-    unsigned_lhs = tl.load(
-        unsigned_lhs_ptr + offsets_m[:, None] * 64 + offsets_k[None, :]
-    )
-    signed_lhs = tl.load(
-        signed_lhs_ptr + offsets_m[:, None] * 64 + offsets_k[None, :]
-    )
+    unsigned_lhs = tl.load(unsigned_lhs_ptr + offsets_m[:, None] * 64 + offsets_k[None, :])
+    signed_lhs = tl.load(signed_lhs_ptr + offsets_m[:, None] * 64 + offsets_k[None, :])
     rhs = tl.load(rhs_ptr + offsets_k[:, None] * 64 + offsets_n[None, :])
     mixed_output = uint8_int8_dot(unsigned_lhs, rhs)
     signed_output = tl.dot(signed_lhs, rhs, out_dtype=tl.int32)
@@ -65,9 +61,7 @@ def _mixed_and_signed_dot_kernel(
 
 
 def _mma(name: str, accumulators: tuple[str, str, str, str], a: str, b: str) -> str:
-    arguments = ", ".join(
-        [*(f"i32 {value}" for value in accumulators), f"i32 {a}", f"i32 {b}"]
-    )
+    arguments = ", ".join([*(f"i32 {value}" for value in accumulators), f"i32 {a}", f"i32 {b}"])
     return f"{_MMA_PREFIX.format(name=name)}({arguments})"
 
 
@@ -142,9 +136,7 @@ def test_rewrite_rejects_each_marker_without_integer_mma() -> None:
 def test_rewrite_rejects_an_unsupported_integer_mma_shape() -> None:
     llvm_ir = "\n".join(
         [
-            _mma("%pv", ("0", "0", "0", "0"), "%p", "%value").replace(
-                "m16n8k32", "m8n8k16"
-            ),
+            _mma("%pv", ("0", "0", "0", "0"), "%p", "%value").replace("m16n8k32", "m8n8k16"),
             "  %result = extractvalue { i32, i32, i32, i32 } %pv, 0",
             _marker("%marked", "%result"),
         ]

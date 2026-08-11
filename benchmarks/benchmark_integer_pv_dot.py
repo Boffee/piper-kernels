@@ -8,6 +8,7 @@ precomputed ``128 * sum(V)`` correction is loaded as the integer MMA accumulator
 
 # Triton's JIT pointer arguments intentionally omit Python annotations.
 # ruff: noqa: ANN001, ANN202
+# pyright: reportCallIssue=false
 
 import argparse
 from collections.abc import Sequence
@@ -55,16 +56,10 @@ def _dot_kernel(
     offsets_n = tl.arange(0, block_n)
     offsets_k = tl.arange(0, block_k)
     a = tl.load(
-        a_ptr
-        + tile * block_m * block_k
-        + offsets_m[:, None] * block_k
-        + offsets_k[None, :]
+        a_ptr + tile * block_m * block_k + offsets_m[:, None] * block_k + offsets_k[None, :]
     )
     b = tl.load(
-        b_ptr
-        + tile * block_k * block_n
-        + offsets_k[:, None] * block_n
-        + offsets_n[None, :]
+        b_ptr + tile * block_k * block_n + offsets_k[:, None] * block_n + offsets_n[None, :]
     )
     if use_affine_proxy:
         a = (a.to(tl.int32) - 128).to(tl.int8)
@@ -76,10 +71,7 @@ def _dot_kernel(
     else:
         result = tl.dot(a, b, out_dtype=tl.int32)
     tl.store(
-        output_ptr
-        + tile * block_m * block_n
-        + offsets_m[:, None] * block_n
-        + offsets_n[None, :],
+        output_ptr + tile * block_m * block_n + offsets_m[:, None] * block_n + offsets_n[None, :],
         result,
     )
 
@@ -281,9 +273,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         return prepared.output
 
     lhs_dtype = "int8" if args.variant == "s8-s8" else "uint8"
-    implementation = (
-        "affine-proxy" if args.variant == "u8-s8-affine-proxy" else "native"
-    )
+    implementation = "affine-proxy" if args.variant == "u8-s8-affine-proxy" else "native"
     configuration = {
         "lhs_dtype": lhs_dtype,
         "rhs_dtype": "int8",
@@ -317,9 +307,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     actual = measurement.output.cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     operations = 2 * args.tiles * args.block_m * args.block_n * args.block_k
-    tops = (
-        operations / (measurement.timings.prepared_execution.median_ms * 1e-3) / 1e12
-    )
+    tops = operations / (measurement.timings.prepared_execution.median_ms * 1e-3) / 1e12
     environment = capture_environment(repository)
     compiler_report = _compiler_report_if_requested(args, provider, environment)
 
@@ -337,8 +325,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     assert measurement.timings.operator_end_to_end is not None
     print(f"first_call_synchronized_wall_ms={measurement.timings.first_call_ms:.6f}")
     print(
-        "preparation_synchronized_wall_p50_p20_p80_ms="
-        f"{measurement.timings.preparation.display(6)}"
+        f"preparation_synchronized_wall_p50_p20_p80_ms={measurement.timings.preparation.display(6)}"
     )
     print(
         "prepared_execution_device_event_p50_p20_p80_ms="

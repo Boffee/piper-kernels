@@ -6,16 +6,11 @@ uses one signed-INT8 scale per V row and a nonnegative UINT8 probability
 operand. The reference is intentionally readable rather than fast.
 """
 
-from typing import Literal
-
 import torch
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
-    KEY_BLOCK,
-    QUERY_BLOCK,
-    quantize_key_per_thread,
-    quantize_per_group,
-    quantize_query_per_thread,
+    QKQuantizationGranularity,
+    quantize_query_key,
 )
 
 _PV_BLOCK = 64
@@ -44,13 +39,10 @@ def reference_piper_attention(
     scale: float,
     is_causal: bool,
     *,
-    qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
+    qk_quantization: QKQuantizationGranularity = "per_thread",
 ) -> torch.Tensor:
     """Evaluate Piper Attention with ordinary PyTorch operations."""
     output_dtype = query.dtype
-    quantization_range = 127
-    key_float = key.float()
-    key_centered = key_float - key_float.mean(dim=2, keepdim=True)
     value_float = value.float()
     value_mean = (
         torch.zeros_like(value_float[:, :, :1])
@@ -59,24 +51,11 @@ def reference_piper_attention(
     )
     value_centered = value_float - value_mean
 
-    if qk_quantization == "per_warp":
-        query_int8, query_scale = quantize_per_group(
-            query,
-            QUERY_BLOCK,
-            quantization_range,
-        )
-        key_int8, key_scale = quantize_per_group(
-            key_centered,
-            KEY_BLOCK,
-            quantization_range,
-        )
-        query_scale = query_scale.repeat_interleave(QUERY_BLOCK, dim=2)[:, :, : query.shape[2]]
-        key_scale = key_scale.repeat_interleave(KEY_BLOCK, dim=2)[:, :, : key.shape[2]]
-    elif qk_quantization == "per_thread":
-        query_int8, query_scale = quantize_query_per_thread(query, quantization_range)
-        key_int8, key_scale = quantize_key_per_thread(key_centered, quantization_range)
-    else:
-        raise ValueError(f"unknown Q/K quantization granularity: {qk_quantization}")
+    query_int8, key_int8, query_scale, key_scale = quantize_query_key(
+        query,
+        key,
+        granularity=qk_quantization,
+    )
     value_int8, value_scale = _quantize_value_per_key(value_centered)
 
     batch, heads, query_length, width = query.shape
@@ -102,10 +81,7 @@ def reference_piper_attention(
             key_block.transpose(-1, -2).float(),
         )
         scores = (
-            integer_scores
-            * query_scale[:, :, :, None]
-            * key_scale[:, :, None, start:stop]
-            * scale
+            integer_scores * query_scale[:, :, :, None] * key_scale[:, :, None, start:stop] * scale
         )
         if is_causal:
             key_positions = torch.arange(start, stop, device=query.device)
@@ -124,15 +100,12 @@ def reference_piper_attention(
         probabilities = torch.nan_to_num(probabilities)
 
         numerator *= old_weight[..., None]
-        denominator = (
-            denominator * old_weight
-            + probabilities.sum(dim=-1) * current_weight
-        )
+        denominator = denominator * old_weight + probabilities.sum(dim=-1) * current_weight
         probability_uint8 = (
-            probabilities
-            * block_value_scale[:, :, None, :]
-            * _P_UINT8_RANGE
-        ).round().clamp(0, _P_UINT8_RANGE)
+            (probabilities * block_value_scale[:, :, None, :] * _P_UINT8_RANGE)
+            .round()
+            .clamp(0, _P_UINT8_RANGE)
+        )
         partial = torch.matmul(
             probability_uint8,
             value_int8[:, :, start:stop].float(),

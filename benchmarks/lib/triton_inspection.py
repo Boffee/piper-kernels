@@ -180,9 +180,7 @@ class TritonCompiledSpecialization:
     _compiled_kernel: object = field(repr=False, compare=False)
 
 
-_SASS_INSTRUCTION_PATTERN = re.compile(
-    r"/\*[0-9a-fA-F]+\*/\s+(?:@!?P\d+\s+)?([A-Z][A-Z0-9_.]*)"
-)
+_SASS_INSTRUCTION_PATTERN = re.compile(r"/\*[0-9a-fA-F]+\*/\s+(?:@!?P\d+\s+)?([A-Z][A-Z0-9_.]*)")
 _PTX_INSTRUCTION_PATTERN = re.compile(
     r"^\s*(?:@!?%p\d+\s+)?([a-z][a-z0-9_.]*)(?=\s|;)",
     re.MULTILINE,
@@ -203,9 +201,7 @@ def _summarize_opcodes(opcodes: Sequence[str]) -> InstructionSummary:
         instruction_count=sum(full.values()),
         families=dict(sorted(families.items())),
         mma_opcodes={
-            opcode: count
-            for opcode, count in sorted(full.items())
-            if _is_mma_opcode(opcode)
+            opcode: count for opcode, count in sorted(full.items()) if _is_mma_opcode(opcode)
         },
     )
 
@@ -286,9 +282,7 @@ def current_device_resource_limits(device_index: int | None = None) -> DeviceRes
         )
     return DeviceResourceLimits(
         registers_per_compute_unit=optional_integer("regs_per_multiprocessor"),
-        shared_memory_bytes_per_compute_unit=optional_integer(
-            "shared_memory_per_multiprocessor"
-        ),
+        shared_memory_bytes_per_compute_unit=optional_integer("shared_memory_per_multiprocessor"),
         max_threads_per_compute_unit=optional_integer("max_threads_per_multi_processor"),
         warp_size=warp_size,
     )
@@ -322,16 +316,12 @@ def resource_residency_ceiling(
             limits.shared_memory_bytes_per_compute_unit // shared_memory_bytes_per_workgroup
         )
     if limits.max_threads_per_compute_unit is not None:
-        workgroup_limits["threads"] = (
-            limits.max_threads_per_compute_unit // threads_per_workgroup
-        )
+        workgroup_limits["threads"] = limits.max_threads_per_compute_unit // threads_per_workgroup
 
     resident_workgroups = min(workgroup_limits.values()) if workgroup_limits else None
     limiting_resources = (
         tuple(
-            sorted(
-                name for name, value in workgroup_limits.items() if value == resident_workgroups
-            )
+            sorted(name for name, value in workgroup_limits.items() if value == resident_workgroups)
         )
         if resident_workgroups is not None
         else ()
@@ -339,9 +329,7 @@ def resource_residency_ceiling(
     return ResidencyCeiling(
         resident_workgroups_per_compute_unit=resident_workgroups,
         resident_warps_per_compute_unit=(
-            None
-            if resident_workgroups is None
-            else resident_workgroups * warps_per_workgroup
+            None if resident_workgroups is None else resident_workgroups * warps_per_workgroup
         ),
         limiting_resources=limiting_resources,
         workgroup_limits=workgroup_limits,
@@ -525,9 +513,7 @@ def _inspect_specialization(
         shared_memory_bytes_per_workgroup=shared_memory,
         warps_per_workgroup=warps,
         stages=_optional_integer(metadata, "num_stages"),
-        ctas_per_cluster=(
-            _optional_integer(metadata, "num_ctas") if backend == "cuda" else None
-        ),
+        ctas_per_cluster=(_optional_integer(metadata, "num_ctas") if backend == "cuda" else None),
         residency_ceiling=residency,
         ptx=ptx_summary,
         sass=sass_summary,

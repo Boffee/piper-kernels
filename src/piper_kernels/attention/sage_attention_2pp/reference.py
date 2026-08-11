@@ -5,16 +5,12 @@ NOTICE for upstream attribution.
 """
 
 import math
-from typing import Literal
 
 import torch
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
-    KEY_BLOCK,
-    QUERY_BLOCK,
-    quantize_key_per_thread,
-    quantize_per_group,
-    quantize_query_per_thread,
+    QKQuantizationGranularity,
+    quantize_query_key,
 )
 
 _PV_BLOCK = 64
@@ -36,7 +32,7 @@ def reference_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    qk_quantization: Literal["per_thread", "per_warp"] = "per_thread",
+    qk_quantization: QKQuantizationGranularity = "per_thread",
 ) -> torch.Tensor:
     """Evaluate quantized SageAttention2++ using ordinary PyTorch operations.
 
@@ -45,27 +41,11 @@ def reference_sage_attention_2pp(
     softmax matrix would not be an equivalent reference.
     """
     output_dtype = query.dtype
-    quantization_range = 127
-    key_float = key.float()
-    key_centered = key_float - key_float.mean(dim=2, keepdim=True)
-    if qk_quantization == "per_warp":
-        query_int8, query_scale = quantize_per_group(
-            query,
-            QUERY_BLOCK,
-            quantization_range,
-        )
-        key_int8, key_scale = quantize_per_group(
-            key_centered,
-            KEY_BLOCK,
-            quantization_range,
-        )
-        query_scale = query_scale.repeat_interleave(QUERY_BLOCK, dim=2)[:, :, : query.shape[2]]
-        key_scale = key_scale.repeat_interleave(KEY_BLOCK, dim=2)[:, :, : key.shape[2]]
-    elif qk_quantization == "per_thread":
-        query_int8, query_scale = quantize_query_per_thread(query, quantization_range)
-        key_int8, key_scale = quantize_key_per_thread(key_centered, quantization_range)
-    else:
-        raise ValueError(f"unknown Q/K quantization granularity: {qk_quantization}")
+    query_int8, key_int8, query_scale, key_scale = quantize_query_key(
+        query,
+        key,
+        granularity=qk_quantization,
+    )
     value_fp8, value_scale = _quantize_value_per_channel(value)
 
     batch, heads, query_length, width = query.shape
