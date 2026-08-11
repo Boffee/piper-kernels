@@ -133,10 +133,10 @@ by ordinary and explicit SwiGLU linears. Its default `prepared_execution` bounda
 keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed operator because
 all are paid on every public invocation. It ranks their device-stream work on fixed source
 tensors; `operator_end_to_end` selects synchronized wall timing when host dispatch and allocation
-overhead should also participate. Quality is evaluated on a stratified row sample that retains
-signed-32-bit address crossings. The public benchmark and tuner construct the same deterministic
-ConvRot workload, sampled reference, common metadata, and provider adapters; the benchmark uses
-normal public dispatch while the tuner substitutes explicit execution-plan candidates.
+overhead should also participate. Quality compares every low-precision output element and uses
+FP32 only for scalar reductions. The public benchmark and tuner construct the same deterministic
+ConvRot workload, full portable reference, common metadata, and provider adapters; the benchmark
+uses normal public dispatch while the tuner substitutes explicit execution-plan candidates.
 
 ```shell
 uv run python benchmarks/tune_convrot_int8_linear.py \
@@ -243,11 +243,10 @@ deterministic input seed, and timing windows. The existing custom-shape interfac
 the default. Custom-shape options such as `--rows` and `--input-activation` cannot be mixed
 with a named preset, because the preset supplies those values. `--in-features` is linear and
 weight width `K`; omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw
-`[up | gate]` input with `2K` features. The script validates
-ordinary linears with the output dtype's standard tolerance; the SwiGLU path uses a declared
-relative-L2 bound. Quality is computed over at most 256 rows stratified across `M`, including
-the final row and rows around every first signed-32-bit input or output element-offset crossing.
-Machine output records the exact sampled indices.
+`[up | gate]` input with `2K` features. The script validates every low-precision output element
+against the portable reference. Elementwise error and energy terms retain the output dtype while
+their scalar reductions accumulate in FP32; the Piper provider must clear the declared SQNR and
+non-finite gate.
 
 The Piper provider times the complete public entrypoint on fixed source tensors, so its
 `prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
@@ -273,10 +272,8 @@ raw `[up | gate]` input contract with 28672 features, applies SwiGLU, and suppli
 `M = 131072`. Row count remains a reproducible workload choice rather than a universal
 model constant.
 
-The 128K preset automatically skips full portable-reference timing because its FP32 output
-temporary can exceed 10 GiB. It still runs each complete optimized tensor and validates the
-sampled boundary rows. Custom memory-intensive shapes can select the same behavior with
-`--skip-reference-timing`.
+The benchmark times the portable reference and reuses its full output to validate every output
+element from the optimized providers.
 
 Compare against the optional Comfy Kitchen CUDA provider with:
 

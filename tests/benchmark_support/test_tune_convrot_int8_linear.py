@@ -53,7 +53,6 @@ def test_tuner_defaults_to_complete_production_device_path() -> None:
     assert arguments.matmul_num_warps is None
     assert arguments.matmul_num_stages is None
     assert arguments.minimum_sqnr_db == 20.0
-    assert arguments.quality_rows == 256
 
 
 def test_tuner_input_activation_is_enabled_only_explicitly() -> None:
@@ -185,7 +184,6 @@ def test_candidate_configuration_contains_flat_execution_plan_fields() -> None:
     assert plan.as_dict().items() <= candidate.configuration.items()
     assert "preparation" not in candidate.configuration
     assert candidate.configuration["dtype"] == "bfloat16"
-    assert candidate.configuration["quality_row_indices"] == (0, 1)
 
 
 def test_candidate_provider_injects_plan_into_complete_operator(
@@ -216,7 +214,6 @@ def test_candidate_provider_injects_plan_into_complete_operator(
     [
         (["--rows", "0"], "must all be positive"),
         (["--in-features", "65", "--group-size", "64"], "must be divisible"),
-        (["--quality-rows", "0"], "quality rows must be positive"),
         (["--minimum-sqnr-db=nan"], "minimum SQNR must be finite"),
         (["--max-candidates", "0"], "maximum candidate count must be positive"),
     ],

@@ -52,6 +52,21 @@ def test_quality_preserves_float64_precision() -> None:
     assert math.isfinite(quality.sqnr_db)
 
 
+def test_quality_uses_low_precision_elements_with_fp32_reductions() -> None:
+    generator = torch.Generator().manual_seed(0)
+    reference = torch.randn((256, 128), dtype=torch.bfloat16, generator=generator)
+    actual = (
+        reference.float()
+        + 0.03 * torch.randn(reference.shape, dtype=torch.float32, generator=generator)
+    ).to(torch.bfloat16)
+
+    quality = measure_quality(actual, reference)
+    fp32_error = actual.float() - reference.float()
+    fp32_sqnr = 10 * torch.log10(reference.float().square().sum() / fp32_error.square().sum())
+
+    assert quality.sqnr_db == pytest.approx(float(fp32_sqnr), abs=0.01)
+
+
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 def test_quality_rejects_full_width_integer_inputs(dtype: torch.dtype) -> None:
     actual = torch.tensor([9_007_199_254_740_993], dtype=dtype)

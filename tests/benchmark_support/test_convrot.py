@@ -12,7 +12,6 @@ from benchmark_convrot import (
     _comfy_provider_configuration,
     _parse_args,
     _records_for_result,
-    _skip_reference_timing,
     _validate_args,
 )
 from benchmark_convrot_preparation import (
@@ -39,7 +38,6 @@ from lib.convrot import (
     apply_input_activation,
     comfy_convrot_input,
     make_convrot_inputs,
-    quality_row_indices,
     raw_input_features,
 )
 from lib.convrot_providers import (
@@ -118,10 +116,9 @@ def test_minimax_h3_five_second_preset_uses_principal_linears() -> None:
     ]
     assert [shape.input_activation for shape in shapes] == [None, None, None, "swiglu"]
     assert not any(shape.has_bias for shape in shapes)
-    assert not _skip_reference_timing(arguments)
 
 
-def test_minimax_h3_128k_preset_uses_sampled_reference_mode() -> None:
+def test_minimax_h3_128k_preset_uses_principal_linears() -> None:
     arguments = _parse_args(["--preset", "minimax-h3-128k"])
 
     shapes = _benchmark_shapes(arguments)
@@ -132,7 +129,6 @@ def test_minimax_h3_128k_preset_uses_sampled_reference_mode() -> None:
         (131_072, 28_672, 5_376),
         (131_072, 5_376, 14_336),
     ]
-    assert _skip_reference_timing(arguments)
 
 
 def test_custom_shape_can_include_swiglu_without_bias() -> None:
@@ -301,14 +297,22 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
         configuration=configuration,
     )
     result = Result(
-        quality_row_indices=(0,),
         input_preparation="fused",
         piper=measurement,
-        reference=None,
+        reference=ProviderMeasurement(
+            provider="torch-reference",
+            output=None,
+            timings=_phase_timings(),
+            configuration=make_reference_convrot_provider(workload).configuration,
+        ),
         quality=quality,
     )
 
-    (record,) = _records_for_result(shape, result, _environment())
+    record = next(
+        record
+        for record in _records_for_result(shape, result, _environment())
+        if record.provider == "piper-convrot"
+    )
     value = record.as_dict()
 
     assert value["shape"] == {
@@ -351,10 +355,14 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
         configuration=_comfy_provider_configuration(common, shape, "0.2.28"),
     )
     result = Result(
-        quality_row_indices=(0,),
         input_preparation="fused",
         piper=piper,
-        reference=None,
+        reference=ProviderMeasurement(
+            provider="torch-reference",
+            output=None,
+            timings=_phase_timings(),
+            configuration=make_reference_convrot_provider(workload).configuration,
+        ),
         quality=quality,
         comfy_kitchen=comfy,
         comfy_kitchen_quality=quality,
@@ -368,29 +376,6 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
     assert "version" not in configuration
     assert configuration["logical_input_layout"] == "up_gate"
     assert configuration["provider_input_layout"] == "gate_up"
-
-
-def test_quality_rows_include_large_projection_output_boundaries() -> None:
-    for name, out_features in (("qkv", 21_504), ("mlp-fc1", 28_672)):
-        shape = ConvRotShape(name, 131_072, out_features, 5_376, has_bias=False)
-
-        rows = quality_row_indices(shape)
-
-        output_boundary = ((1 << 31) + shape.out_features - 1) // shape.out_features
-        assert len(rows) == 256
-        assert rows[0] == 0
-        assert rows[-1] == shape.rows - 1
-        assert {output_boundary - 1, output_boundary, output_boundary + 1} <= set(rows)
-
-
-def test_quality_rows_include_raw_swiglu_input_address_boundary() -> None:
-    shape = ConvRotShape("mlp-fc2", 131_072, 5_376, 14_336, "swiglu", False)
-
-    rows = quality_row_indices(shape)
-
-    raw_width = 2 * shape.in_features
-    input_boundary = ((1 << 31) + raw_width - 1) // raw_width
-    assert {input_boundary - 1, input_boundary, input_boundary + 1} <= set(rows)
 
 
 def test_preparation_minimum_global_traffic_accounts_for_split_intermediate() -> None:

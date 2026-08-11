@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 
@@ -12,27 +12,18 @@ from piper_kernels.convrot.int8 import _policy as convrot_policy
 from piper_kernels.convrot.int8 import triton as convrot_backend
 from piper_kernels.convrot.int8.reference import reference_linear, reference_swiglu_linear
 
-from .convrot import (
-    ConvRotConfig,
-    ConvRotInputs,
-    ConvRotShape,
-    make_convrot_inputs,
-    quality_row_indices,
-)
-from .providers import BenchmarkProvider, ProviderMeasurement
-from .quality import QualityMetrics, measure_quality
+from .convrot import ConvRotConfig, ConvRotInputs, ConvRotShape, make_convrot_inputs
+from .providers import BenchmarkProvider
 
 
 @dataclass(frozen=True, slots=True)
 class ConvRotWorkload:
-    """Tensors, policy, and sampled-reference boundary for one ConvRot case."""
+    """Tensors and production policy for one ConvRot case."""
 
     shape: ConvRotShape
     config: ConvRotConfig
     inputs: ConvRotInputs
     production_plan: convrot_policy.ConvRotInt8LinearExecutionPlan
-    sampled_row_indices: tuple[int, ...]
-    quality_index: torch.Tensor
 
     @property
     def input_preparation(self) -> str | None:
@@ -53,20 +44,9 @@ class ConvRotWorkload:
             "prepared_execution_scope": "complete_operator_on_fixed_source_tensors",
         }
 
-    def sampled_reference(self) -> torch.Tensor:
-        """Evaluate the portable reference only on the declared quality rows."""
-        activation, qdata, scale, bias = self.inputs
-        sampled_activation = activation.index_select(0, self.quality_index)
-        return _run_convrot_reference(self, (sampled_activation, qdata, scale, bias))
-
-    def measure_sampled_quality(
-        self,
-        output: torch.Tensor,
-        expected: torch.Tensor,
-    ) -> QualityMetrics:
-        """Measure sampled output quality against a matching sampled reference."""
-        actual = output.index_select(0, self.quality_index)
-        return measure_quality(actual, expected)
+    def reference(self) -> torch.Tensor:
+        """Evaluate the portable reference on the complete workload."""
+        return _run_convrot_reference(self, self.inputs)
 
 
 def make_convrot_workload(
@@ -74,10 +54,9 @@ def make_convrot_workload(
     config: ConvRotConfig,
     *,
     device: torch.device,
-    maximum_quality_rows: int = 256,
     target: AcceleratorTarget | None = None,
 ) -> ConvRotWorkload:
-    """Create shared tensors, production policy, and quality sampling metadata."""
+    """Create shared tensors and resolve the production execution plan."""
     inputs = make_convrot_inputs(shape, config, device=device)
     activation, qdata, _scale, _bias = inputs
     production_plan = convrot_backend._default_convrot_int8_execution_plan(
@@ -87,15 +66,11 @@ def make_convrot_workload(
         apply_swiglu=shape.input_activation == "swiglu",
         target=target,
     )
-    sampled_row_indices = quality_row_indices(shape, maximum_rows=maximum_quality_rows)
-    quality_index = torch.tensor(sampled_row_indices, device=device)
     return ConvRotWorkload(
         shape=shape,
         config=config,
         inputs=inputs,
         production_plan=production_plan,
-        sampled_row_indices=sampled_row_indices,
-        quality_index=quality_index,
     )
 
 
@@ -194,8 +169,6 @@ def planned_convrot_configuration(
     return {
         **workload.common_configuration(),
         "algorithm": "convrot_int8_linear",
-        "quality_rows": len(workload.sampled_row_indices),
-        "quality_row_indices": workload.sampled_row_indices,
         **plan.as_dict(),
     }
 
@@ -227,12 +200,3 @@ def make_planned_convrot_provider(
         synchronize=torch.cuda.synchronize,
         configuration=planned_convrot_configuration(workload, plan),
     )
-
-
-def sample_convrot_measurement(
-    workload: ConvRotWorkload,
-    measurement: ProviderMeasurement[torch.Tensor],
-) -> ProviderMeasurement[torch.Tensor]:
-    """Retain sampled rows before releasing a potentially multi-gigabyte output."""
-    sampled = measurement.output.index_select(0, workload.quality_index)
-    return replace(measurement, output=sampled)

@@ -24,6 +24,7 @@ from lib.convrot_providers import (
 )
 from lib.environment import capture_environment
 from lib.providers import BenchmarkProvider
+from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
 from lib.tuning import (
     TuningCandidate,
@@ -112,7 +113,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=convrot_policy._MATMUL_NUM_STAGES_VALUES,
         nargs="+",
     )
-    parser.add_argument("--quality-rows", type=int, default=256)
     add_tuning_arguments(parser)
     return parser.parse_args(argv)
 
@@ -122,8 +122,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("rows, out_features, and in_features must all be positive")
     if args.in_features % args.group_size:
         raise SystemExit("in_features must be divisible by --group-size")
-    if args.quality_rows <= 0:
-        raise SystemExit("quality rows must be positive")
     validate_tuning_arguments(args)
 
 
@@ -256,14 +254,13 @@ def _main(argv: Sequence[str] | None = None) -> None:
         shape,
         config,
         device=device,
-        maximum_quality_rows=args.quality_rows,
         target=target,
     )
     candidates = tuple(
         _make_candidate(plan, workload) for plan in _candidate_plans(args, workload.production_plan)
     )
 
-    expected = workload.sampled_reference()
+    expected = workload.reference()
     run = tune_candidates(
         candidates,
         tuning="convrot_int8_linear_execution_plan",
@@ -272,10 +269,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         phase=args.phase,
         warmup_ms=args.warmup_ms,
         measurement_time_ms=args.measurement_time_ms,
-        measure_candidate_quality=lambda output: workload.measure_sampled_quality(
-            output,
-            expected,
-        ),
+        measure_candidate_quality=lambda output: measure_quality(output, expected),
         quality_gate=lambda quality: meets_minimum_sqnr(quality, args.minimum_sqnr_db),
     )
     print_tuning_results(run.records)

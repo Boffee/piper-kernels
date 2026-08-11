@@ -25,7 +25,6 @@ from lib.convrot_providers import (
     make_convrot_workload,
     make_public_convrot_provider,
     make_reference_convrot_provider,
-    sample_convrot_measurement,
 )
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.providers import BenchmarkProvider, ProviderMeasurement, measure_provider
@@ -59,7 +58,7 @@ def _minimax_h3_shapes(rows: int) -> tuple[ConvRotShape, ...]:
 
 _MINIMAX_H3_5S_SHAPES = _minimax_h3_shapes(37_710)
 _MINIMAX_H3_128K_SHAPES = _minimax_h3_shapes(131_072)
-_MAX_SWIGLU_RELATIVE_L2_ERROR = 0.01
+_MIN_PIPER_SQNR_DB = 20.0
 _MAX_COMFY_RELATIVE_L2_ERROR = 0.02
 _CUSTOM_SHAPE_DEFAULTS = {
     "rows": [1, 16, 64, 256],
@@ -79,21 +78,18 @@ _CUSTOM_SHAPE_OPTIONS = {
 
 @dataclass(slots=True, frozen=True)
 class Result:
-    """Timing and sampled-quality result for one activation and weight shape."""
+    """Timing and full-output quality for one activation and weight shape."""
 
-    quality_row_indices: tuple[int, ...]
     input_preparation: str | None
-    piper: ProviderMeasurement[torch.Tensor]
-    reference: ProviderMeasurement[torch.Tensor] | None
+    piper: ProviderMeasurement[None]
+    reference: ProviderMeasurement[None]
     quality: QualityMetrics
-    comfy_kitchen: ProviderMeasurement[torch.Tensor] | None = None
+    comfy_kitchen: ProviderMeasurement[None] | None = None
     comfy_kitchen_quality: QualityMetrics | None = None
 
     @property
-    def speedup(self) -> float | None:
-        """Return the warmed reference-to-Piper execution-time ratio when timed."""
-        if self.reference is None:
-            return None
+    def speedup(self) -> float:
+        """Return the warmed reference-to-Piper execution-time ratio."""
         return (
             self.reference.timings.prepared_execution.median_ms
             / self.piper.timings.prepared_execution.median_ms
@@ -113,22 +109,27 @@ class Result:
 def _validated_quality(
     actual: torch.Tensor,
     expected: torch.Tensor,
-    input_activation: str | None,
 ) -> QualityMetrics:
     quality = measure_quality(actual, expected)
-    if input_activation == "swiglu":
-        if (
-            quality.nonfinite_mismatch_count
-            or quality.relative_l2_error > _MAX_SWIGLU_RELATIVE_L2_ERROR
-        ):
-            raise AssertionError(
-                "SwiGLU quality exceeded the declared limit: "
-                f"relative L2 {quality.relative_l2_error:.6f}, "
-                f"non-finite mismatches {quality.nonfinite_mismatch_count}"
-            )
-    else:
-        torch.testing.assert_close(actual, expected)
+    if quality.nonfinite_mismatch_count or not quality.sqnr_db >= _MIN_PIPER_SQNR_DB:
+        raise AssertionError(
+            "ConvRot quality exceeded the declared limit: "
+            f"SQNR {quality.sqnr_db:.2f} dB, "
+            f"non-finite mismatches {quality.nonfinite_mismatch_count}"
+        )
     return quality
+
+
+def _without_output(
+    measurement: ProviderMeasurement[torch.Tensor],
+) -> ProviderMeasurement[None]:
+    """Retain timing metadata after its potentially large output is validated."""
+    return ProviderMeasurement(
+        provider=measurement.provider,
+        output=None,
+        timings=measurement.timings,
+        configuration=measurement.configuration,
+    )
 
 
 def _package_version(distribution: str, module: ModuleType) -> str:
@@ -185,41 +186,35 @@ def _run_shape(
     warmup_ms: int,
     measurement_time_ms: int,
     comfy_kitchen: ModuleType | None,
-    skip_reference_timing: bool,
 ) -> Result:
     workload = make_convrot_workload(
         shape,
         config,
         device=torch.device("cuda"),
     )
-    piper_measurement = measure_provider(
+    reference_with_output = measure_provider(
+        make_reference_convrot_provider(workload),
+        warmup_ms=warmup_ms,
+        measurement_time_ms=measurement_time_ms,
+        measure_first_call=False,
+        measure_preparation=False,
+    )
+    reference_output = reference_with_output.output
+    reference_measurement = _without_output(reference_with_output)
+    del reference_with_output
+
+    piper_with_output = measure_provider(
         make_public_convrot_provider(workload),
         warmup_ms=warmup_ms,
         measurement_time_ms=measurement_time_ms,
         measure_preparation=False,
     )
-    piper_measurement = sample_convrot_measurement(workload, piper_measurement)
-
-    if skip_reference_timing:
-        reference_measurement = None
-        reference_quality_output = workload.sampled_reference()
-    else:
-        reference_measurement = sample_convrot_measurement(
-            workload,
-            measure_provider(
-                make_reference_convrot_provider(workload),
-                warmup_ms=warmup_ms,
-                measurement_time_ms=measurement_time_ms,
-                measure_first_call=False,
-                measure_preparation=False,
-            ),
-        )
-        reference_quality_output = reference_measurement.output
     piper_quality = _validated_quality(
-        piper_measurement.output,
-        reference_quality_output,
-        shape.input_activation,
+        piper_with_output.output,
+        reference_output,
     )
+    piper_measurement = _without_output(piper_with_output)
+    del piper_with_output
 
     comfy_measurement = None
     comfy_quality = None
@@ -245,22 +240,19 @@ def _run_shape(
             _package_version("comfy-kitchen", comfy_kitchen),
         )
         with _comfy_backend_context(comfy_kitchen):
-            comfy_measurement = sample_convrot_measurement(
-                workload,
-                measure_provider(
-                    BenchmarkProvider(
-                        name="comfy-kitchen",
-                        prepare=lambda: workload.inputs,
-                        run=lambda _prepared: comfy_optimized(),
-                        synchronize=torch.cuda.synchronize,
-                        configuration=comfy_config,
-                    ),
-                    warmup_ms=warmup_ms,
-                    measurement_time_ms=measurement_time_ms,
-                    measure_preparation=False,
+            comfy_with_output = measure_provider(
+                BenchmarkProvider(
+                    name="comfy-kitchen",
+                    prepare=lambda: workload.inputs,
+                    run=lambda _prepared: comfy_optimized(),
+                    synchronize=torch.cuda.synchronize,
+                    configuration=comfy_config,
                 ),
+                warmup_ms=warmup_ms,
+                measurement_time_ms=measurement_time_ms,
+                measure_preparation=False,
             )
-        comfy_quality = measure_quality(comfy_measurement.output, reference_quality_output)
+        comfy_quality = measure_quality(comfy_with_output.output, reference_output)
         if (
             comfy_quality.nonfinite_mismatch_count
             or comfy_quality.relative_l2_error > _MAX_COMFY_RELATIVE_L2_ERROR
@@ -270,9 +262,10 @@ def _run_shape(
                 f"relative L2 {comfy_quality.relative_l2_error:.6f}, "
                 f"non-finite mismatches {comfy_quality.nonfinite_mismatch_count}"
             )
+        comfy_measurement = _without_output(comfy_with_output)
+        del comfy_with_output, comfy_optimized, comfy_activation
 
     return Result(
-        quality_row_indices=workload.sampled_row_indices,
         input_preparation=workload.input_preparation,
         piper=piper_measurement,
         reference=reference_measurement,
@@ -335,14 +328,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="benchmark the optional comfy-kitchen CUDA ConvRot provider",
     )
-    parser.add_argument(
-        "--skip-reference-timing",
-        action="store_true",
-        help=(
-            "validate a stratified row sample but skip the full portable-reference timing; "
-            "this is automatic for the 128K preset"
-        ),
-    )
     add_output_arguments(parser)
     arguments = parser.parse_args(argv)
     arguments.custom_shape_options = tuple(
@@ -372,10 +357,6 @@ def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
     )
 
 
-def _skip_reference_timing(args: argparse.Namespace) -> bool:
-    return args.skip_reference_timing or args.preset == "minimax-h3-128k"
-
-
 def _validate_args(args: argparse.Namespace) -> None:
     if args.preset != "custom" and args.custom_shape_options:
         options = ", ".join(args.custom_shape_options)
@@ -392,7 +373,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("comfy-kitchen comparison supports float16 and bfloat16")
 
 
-def _print_header(compare_comfy_kitchen: bool, skip_reference_timing: bool) -> None:
+def _print_header(compare_comfy_kitchen: bool) -> None:
     columns = [
         "case",
         "input activation",
@@ -412,10 +393,12 @@ def _print_header(compare_comfy_kitchen: bool, skip_reference_timing: bool) -> N
                 "comfy-kitchen / Piper",
             ]
         )
-    if not skip_reference_timing:
-        if not compare_comfy_kitchen:
-            columns.append("reference fixed-source execution, device p50 [p20, p80] (ms)")
-        columns.append("reference / Piper")
+    columns.extend(
+        [
+            "reference fixed-source execution, device p50 [p20, p80] (ms)",
+            "reference / Piper",
+        ]
+    )
     print("| " + " | ".join(columns) + " |")
     print("|" + "|".join(":---" if index < 4 else "---:" for index in range(len(columns))) + "|")
 
@@ -443,11 +426,12 @@ def _print_result(shape: ConvRotShape, result: Result) -> None:
                 f"{result.comfy_kitchen_speedup:.2f}x",
             ]
         )
-    if result.reference is not None:
-        assert result.speedup is not None
-        if result.comfy_kitchen is None:
-            cells.append(result.reference.timings.prepared_execution.display())
-        cells.append(f"{result.speedup:.2f}x")
+    cells.extend(
+        [
+            result.reference.timings.prepared_execution.display(),
+            f"{result.speedup:.2f}x",
+        ]
+    )
     print("| " + " | ".join(cells) + " |")
 
 
@@ -460,17 +444,11 @@ def _records_for_result(
     measurements = [
         (result.piper, result.quality),
         (result.comfy_kitchen, result.comfy_kitchen_quality),
+        (result.reference, None),
     ]
-    if result.reference is not None:
-        measurements.append(
-            (
-                result.reference,
-                measure_quality(result.reference.output, result.reference.output),
-            )
-        )
     records = []
     for measurement, quality in measurements:
-        if measurement is None or quality is None:
+        if measurement is None:
             continue
         records.append(
             BenchmarkRecord(
@@ -481,10 +459,6 @@ def _records_for_result(
                 timings=measurement.timings,
                 quality=quality,
                 environment=environment,
-                extra={
-                    "quality_rows": len(result.quality_row_indices),
-                    "quality_row_indices": list(result.quality_row_indices),
-                },
             )
         )
     return records
@@ -504,17 +478,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         seed=args.seed,
     )
     comfy_kitchen = _load_comfy_kitchen() if args.compare_comfy_kitchen else None
-    skip_reference_timing = _skip_reference_timing(args)
     environment = capture_environment(Path(__file__).resolve().parents[1])
     print(
         f"GPU: {environment.gpu_name}; backend: {environment.accelerator_backend}; "
         f"architecture: {environment.gpu_architecture}"
     )
     print(f"Torch: {torch.__version__}; dtype: {config.dtype}; group size: {config.group_size}")
-    if args.preset == "minimax-h3-128k":
-        print("Reference: sampled boundary rows (full reference timing disabled for 128K)")
     print()
-    _print_header(args.compare_comfy_kitchen, skip_reference_timing)
+    _print_header(args.compare_comfy_kitchen)
     records: list[BenchmarkRecord] = []
     for shape in shapes:
         result = _run_shape(
@@ -523,11 +494,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.warmup_ms,
             args.measurement_time_ms,
             comfy_kitchen,
-            skip_reference_timing,
         )
         _print_result(shape, result)
         records.extend(_records_for_result(shape, result, environment))
         del result
+        torch.cuda.empty_cache()
     write_records(records, output_target(args))
 
 
