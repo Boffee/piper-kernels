@@ -19,7 +19,6 @@ from lib.convrot import (
     ConvRotShape,
     comfy_convrot_input,
     convrot_dtype,
-    parse_input_activation,
     raw_input_features,
 )
 from lib.convrot_providers import (
@@ -313,8 +312,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
-        type=parse_input_activation,
-        metavar="{none,swiglu}",
+        choices=("swiglu",),
         default=argparse.SUPPRESS,
         help="custom-shape raw-input activation; SwiGLU expects [up | gate] with width 2K",
     )

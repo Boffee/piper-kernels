@@ -56,6 +56,13 @@ def test_tuner_defaults_to_complete_production_device_path() -> None:
     assert arguments.quality_rows == 256
 
 
+def test_tuner_input_activation_is_enabled_only_explicitly() -> None:
+    assert _parse_args([]).input_activation is None
+    assert _parse_args(["--input-activation", "swiglu"]).input_activation == "swiglu"
+    with pytest.raises(SystemExit):
+        _parse_args(["--input-activation", "none"])
+
+
 def test_omitted_axes_measure_only_the_production_plan() -> None:
     production_plan = _production_plan()
 

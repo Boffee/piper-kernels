@@ -6,11 +6,13 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.piper_attention._policy import (
+    PiperAttentionExecutionPlan,
+    select_execution_plan,
+)
 from piper_kernels.attention.piper_attention.triton import (
     _default_piper_attention_execution_plan,
-    _PiperAttentionExecutionPlan,
     _prepare_piper_attention,
-    _select_piper_attention_execution_plan,
 )
 
 _SM80 = AcceleratorTarget(backend="cuda", architecture="sm80")
@@ -26,8 +28,8 @@ def _select(
     key_length: int = 8192,
     head_dim: int = 128,
     is_causal: bool = False,
-) -> _PiperAttentionExecutionPlan:
-    return _select_piper_attention_execution_plan(
+) -> PiperAttentionExecutionPlan:
+    return select_execution_plan(
         target,
         candidate_block_m=128,
         query_length=query_length,

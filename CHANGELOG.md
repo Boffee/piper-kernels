@@ -21,7 +21,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   Benchmark support consumers now import helpers from their owning `lib.*` modules instead of a
   flattened package export surface. Offline tuners also share their common CLI controls, search
   axes, quality gate, result rendering, and record construction, while ConvRot tuning consumes
-  legal schedule values directly from production policy.
+  legal schedule values directly from production policy. Attention benchmarks and tuners now
+  share workload dtype and seed metadata, the SDPA quality reference, legal execution-plan values,
+  candidate-budget validation, independently reproducible inputs, fixed-layout metadata, and
+  smaller provider-construction orchestration boundaries. Piper Attention and SageAttention2++
+  also share their input-validation contract and keep backend-independent execution policy outside
+  their Triton launch modules. ConvRot CLIs now represent an absent input activation by omitting
+  `--input-activation` rather than accepting a string sentinel.
 
 ## [0.2.1] - 2026-08-10
 

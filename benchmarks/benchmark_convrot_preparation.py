@@ -16,7 +16,6 @@ from lib.convrot import (
     apply_input_activation,
     comfy_convrot_input,
     convrot_dtype,
-    parse_input_activation,
     raw_input_features,
 )
 from lib.environment import EnvironmentInfo, capture_environment
@@ -129,8 +128,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument(
         "--input-activation",
-        type=parse_input_activation,
-        metavar="{none,swiglu}",
+        choices=("swiglu",),
         default=None,
         help="raw-input activation; SwiGLU expects [up | gate] with width 2K",
     )

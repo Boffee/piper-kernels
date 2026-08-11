@@ -1,10 +1,9 @@
 """Validation and backend selection for Piper Attention."""
 
-import math
-
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention._validation import validate_attention_inputs
 
 from .reference import reference_piper_attention
 
@@ -15,78 +14,21 @@ except ModuleNotFoundError as exc:
         raise
     _triton_piper_attention = None
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
-_SUPPORTED_HEAD_DIMS = (64, 128)
-
-
-def _validate_inputs(  # noqa: PLR0912
+def _validate_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float | None,
     is_causal: bool,
 ) -> float:
-    tensors = {"query": query, "key": key, "value": value}
-    for name, tensor in tensors.items():
-        if tensor.ndim != 4:
-            raise ValueError(
-                f"Piper Attention {name} must have shape "
-                f"[batch, heads, sequence, head_dim], got {tuple(tensor.shape)}"
-            )
-        if tensor.dtype not in _SUPPORTED_DTYPES:
-            raise ValueError(
-                f"Piper Attention {name} must use float16 or bfloat16, got {tensor.dtype}"
-            )
-        if tensor.layout is not torch.strided:
-            raise ValueError(f"Piper Attention {name} must use strided layout")
-        if tensor.stride(-1) != 1:
-            raise ValueError(f"Piper Attention {name}'s head dimension must be contiguous")
-
-    if query.device != key.device or query.device != value.device:
-        raise ValueError(
-            "Piper Attention query, key, and value must share a device, "
-            f"got {query.device}/{key.device}/{value.device}"
-        )
-    if query.dtype is not key.dtype or query.dtype is not value.dtype:
-        raise ValueError(
-            "Piper Attention query, key, and value must share a dtype, "
-            f"got {query.dtype}/{key.dtype}/{value.dtype}"
-        )
-    if query.shape[:2] != key.shape[:2] or key.shape[:2] != value.shape[:2]:
-        raise ValueError(
-            "Piper Attention currently requires equal batch and head dimensions, got "
-            f"{query.shape[:2]}/{key.shape[:2]}/{value.shape[:2]}"
-        )
-    if key.shape[2] != value.shape[2]:
-        raise ValueError(
-            f"Piper Attention key/value lengths must match, got {key.shape[2]}/{value.shape[2]}"
-        )
-    if query.shape[3] != key.shape[3] or key.shape[3] != value.shape[3]:
-        raise ValueError(
-            "Piper Attention head dimensions must match, got "
-            f"{query.shape[3]}/{key.shape[3]}/{value.shape[3]}"
-        )
-    if query.shape[3] not in _SUPPORTED_HEAD_DIMS:
-        raise ValueError(
-            "Piper Attention currently supports head dimensions 64 and 128, "
-            f"got {query.shape[3]}"
-        )
-    if query.shape[2] == 0 or key.shape[2] == 0:
-        raise ValueError("Piper Attention does not accept empty query or key sequences")
-    if is_causal and query.shape[2] != key.shape[2]:
-        raise ValueError(
-            "Causal Piper Attention currently requires equal query and key lengths, got "
-            f"{query.shape[2]}/{key.shape[2]}"
-        )
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors.values()):
-        raise RuntimeError(
-            "Piper Attention is an inference-only operator and does not support autograd"
-        )
-
-    converted_scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
-    if not math.isfinite(converted_scale) or converted_scale <= 0:
-        raise ValueError(f"Piper Attention scale must be finite and positive, got {scale}")
-    return converted_scale
+    return validate_attention_inputs(
+        "Piper Attention",
+        query,
+        key,
+        value,
+        scale,
+        is_causal,
+    )
 
 
 def _supports_triton(target: AcceleratorTarget) -> bool:

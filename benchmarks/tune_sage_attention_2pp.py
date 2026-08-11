@@ -10,10 +10,13 @@ from pathlib import Path
 
 import torch
 from lib.attention import (
+    ATTENTION_DTYPE_NAMES,
     AttentionConfig,
     AttentionInputs,
     AttentionShape,
+    attention_dtype,
     make_attention_inputs,
+    run_sdpa,
 )
 from lib.attention_providers import qk_quantization_granularity
 from lib.environment import capture_environment
@@ -26,21 +29,23 @@ from lib.tuning import (
     add_tuning_arguments,
     boolean_tuning_axis,
     meets_minimum_sqnr,
-    optional_integer_tuning_axis,
+    parse_optional_integer,
     print_tuning_results,
     tune_candidates,
     tuning_axis,
-    tuning_candidate_count,
     validate_tuning_arguments,
+    validate_tuning_candidate_count,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
-
-_BLOCK_M_VALUES = (32, 64, 128)
-_NUM_WARPS_VALUES = (2, 4, 8)
-_NUM_STAGES_VALUES = (1, 2, 3, 4)
-_OPTIONAL_LOOP_STAGES = ("none", "1", "2", "3", "4")
+from piper_kernels.attention.scheduling import (
+    BLOCK_M_VALUES,
+    LOOP_NUM_STAGES_VALUES,
+    NUM_STAGES_VALUES,
+    NUM_WARPS_VALUES,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +76,7 @@ class _SageAttention2ppTuningChoice:
             "fused-q" if self.fuse_query_quantization else "separate-q",
             "unscaled-score" if self.use_unscaled_score_recurrence else "scaled-score",
             "reverse" if self.reverse_causal_blocks else "forward",
-            f"loop{self.loop_num_stages or 'none'}",
+            f"loop{self.loop_num_stages or 'default'}",
             "licm" if self.loop_licm else "no-licm",
             "packed-p" if self.use_packed_probability_conversion else "stock-p",
         )
@@ -89,11 +94,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
-    parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
+    parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--block-m", type=int, choices=_BLOCK_M_VALUES, nargs="+")
-    parser.add_argument("--num-warps", type=int, choices=_NUM_WARPS_VALUES, nargs="+")
-    parser.add_argument("--num-stages", type=int, choices=_NUM_STAGES_VALUES, nargs="+")
+    parser.add_argument("--block-m", type=int, choices=BLOCK_M_VALUES, nargs="+")
+    parser.add_argument("--num-warps", type=int, choices=NUM_WARPS_VALUES, nargs="+")
+    parser.add_argument("--num-stages", type=int, choices=NUM_STAGES_VALUES, nargs="+")
     parser.add_argument(
         "--use-tensor-descriptors",
         action=argparse.BooleanOptionalAction,
@@ -119,7 +124,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--loop-num-stages", choices=_OPTIONAL_LOOP_STAGES, nargs="+")
+    parser.add_argument(
+        "--loop-num-stages",
+        type=parse_optional_integer,
+        choices=LOOP_NUM_STAGES_VALUES,
+        metavar="{0,1,2,3,4}",
+        nargs="+",
+        help="loop pipeline stages; 0 uses compiler default; omitted retains production",
+    )
     parser.add_argument(
         "--loop-licm",
         action=argparse.BooleanOptionalAction,
@@ -149,7 +161,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_choices(
     args: argparse.Namespace,
-    production_plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
+    production_plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
 ) -> tuple[_SageAttention2ppTuningChoice, ...]:
     """Form the explicit Cartesian search, defaulting omitted axes to production."""
     axes = (
@@ -176,30 +188,25 @@ def _candidate_choices(
             args.reverse_causal_blocks,
             production_plan.reverse_causal_blocks,
         ),
-        optional_integer_tuning_axis(args.loop_num_stages, production_plan.loop_num_stages),
+        tuning_axis(args.loop_num_stages, production_plan.loop_num_stages),
         boolean_tuning_axis(args.loop_licm, production_plan.loop_licm),
         boolean_tuning_axis(
             args.use_packed_probability_conversion,
             production_plan.use_packed_probability_conversion,
         ),
     )
-    candidate_count = tuning_candidate_count(axes)
-    if candidate_count > args.max_candidates:
-        raise SystemExit(
-            f"search expands to {candidate_count} candidates; narrow the axes or increase "
-            "--max-candidates"
-        )
+    validate_tuning_candidate_count(axes, args.max_candidates)
     return tuple(_SageAttention2ppTuningChoice(*values) for values in product(*axes))
 
 
 def _resolve_plan(
     choice: _SageAttention2ppTuningChoice,
-    production_plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
+    production_plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
     *,
     target: AcceleratorTarget,
     head_dim: int,
     is_causal: bool,
-) -> sage_attention_2pp_backend._SageAttention2ppExecutionPlan:
+) -> sage_attention_2pp_policy.SageAttention2ppExecutionPlan:
     if choice.use_tensor_descriptors and (
         not target.is_cuda_capability(12) or choice.block_m != 128 or head_dim != 128
     ):
@@ -231,10 +238,9 @@ def _make_candidate(
     choice: _SageAttention2ppTuningChoice,
     inputs: AttentionInputs,
     *,
-    production_plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
+    production_plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
     config: AttentionConfig,
     target: AcceleratorTarget,
-    seed: int,
 ) -> TuningCandidate[AttentionInputs, torch.Tensor]:
     query, _, _ = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
@@ -277,7 +283,6 @@ def _make_candidate(
                 "pv_accumulation": "fp32+fp16",
                 "block_n": int(sage_attention_2pp_backend._BLOCK_N),
                 **plan.as_dict(),
-                "seed": seed,
             },
         )
 
@@ -288,7 +293,6 @@ def _make_candidate(
             **choice.as_dict(),
             "implementation": "pure_triton",
             "algorithm": "sage_attention_2pp",
-            "seed": seed,
         },
         make_provider=make_provider,
     )
@@ -318,12 +322,15 @@ def _main(argv: Sequence[str] | None = None) -> None:
         key_value_length,
         args.head_dim,
     )
-    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    inputs = make_attention_inputs(shape, dtype=dtype, device=device, generator=generator)
-    query, key, value = inputs
     scale = args.head_dim**-0.5
-    config = AttentionConfig(dtype=args.dtype, is_causal=args.causal, scale=scale)
+    config = AttentionConfig(
+        dtype=attention_dtype(args.dtype),
+        is_causal=args.causal,
+        scale=scale,
+        seed=args.seed,
+    )
+    inputs = make_attention_inputs(shape, config=config, device=device)
+    query, key, _ = inputs
     production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
         query,
         key,
@@ -338,17 +345,10 @@ def _main(argv: Sequence[str] | None = None) -> None:
             production_plan=production_plan,
             config=config,
             target=target,
-            seed=args.seed,
         )
         for choice in choices
     )
-    expected = torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        is_causal=args.causal,
-        scale=scale,
-    )
+    expected = run_sdpa(inputs, config)
     run = tune_candidates(
         candidates,
         tuning="sage_attention_2pp_execution_plan",

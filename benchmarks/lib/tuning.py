@@ -111,7 +111,7 @@ class _TuningRunContext:
 
     def record(
         self,
-        candidate: TuningCandidate[Any, Any],
+        candidate_name: str,
         configuration: Mapping[str, Any],
         status: TuningStatus,
         *,
@@ -122,7 +122,7 @@ class _TuningRunContext:
         """Create one result while keeping run-wide fields in one place."""
         return TuningRecord(
             tuning=self.tuning,
-            candidate=candidate.name,
+            candidate=candidate_name,
             shape=self.shape,
             configuration=configuration,
             phase=self.phase,
@@ -173,20 +173,23 @@ def boolean_tuning_axis(value: bool | None, production_value: bool) -> tuple[boo
     return (production_value if value is None else value,)
 
 
-def optional_integer_tuning_axis(
-    values: Sequence[str] | None,
-    production_value: int | None,
-) -> tuple[int | None, ...]:
-    """Resolve a tuning axis whose CLI spelling uses ``none`` for ``None``."""
-    if values is None:
-        return (production_value,)
-    resolved = (None if value == "none" else int(value) for value in values)
-    return tuple(dict.fromkeys(resolved))
+def parse_optional_integer(value: str) -> int | None:
+    """Parse zero as an omitted integer value for a numeric tuning axis."""
+    converted = int(value)
+    return None if converted == 0 else converted
 
 
-def tuning_candidate_count(axes: Sequence[Sequence[object]]) -> int:
-    """Return the size of a Cartesian tuning search without materializing it."""
-    return math.prod(len(axis) for axis in axes)
+def validate_tuning_candidate_count(
+    axes: Sequence[Sequence[object]],
+    maximum_candidates: int,
+) -> None:
+    """Reject a Cartesian search that exceeds the configured candidate budget."""
+    candidate_count = math.prod(len(axis) for axis in axes)
+    if candidate_count > maximum_candidates:
+        raise SystemExit(
+            f"search expands to {candidate_count} candidates; narrow the axes or increase "
+            "--max-candidates"
+        )
 
 
 def meets_minimum_sqnr(quality: QualityMetrics, minimum_sqnr_db: float) -> bool:
@@ -305,7 +308,7 @@ def tune_candidates(
             if quality is not None and quality_gate is not None and not quality_gate(quality):
                 records.append(
                     context.record(
-                        candidate,
+                        candidate.name,
                         configuration,
                         TuningStatus.QUALITY_REJECTED,
                         quality=quality,
@@ -317,7 +320,7 @@ def tune_candidates(
             timing = timer(launch, warmup_ms, measurement_time_ms)
             records.append(
                 context.record(
-                    candidate,
+                    candidate.name,
                     configuration,
                     TuningStatus.MEASURED,
                     timing=timing,
@@ -327,7 +330,7 @@ def tune_candidates(
         except skipped_errors as error:
             records.append(
                 context.record(
-                    candidate,
+                    candidate.name,
                     configuration,
                     TuningStatus.SKIPPED,
                     reason=_reason(error),

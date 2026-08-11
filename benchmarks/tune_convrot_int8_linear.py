@@ -15,7 +15,6 @@ from lib.convrot import (
     ConvRotInputs,
     ConvRotShape,
     convrot_dtype,
-    parse_input_activation,
 )
 from lib.convrot_providers import (
     ConvRotWorkload,
@@ -34,8 +33,8 @@ from lib.tuning import (
     print_tuning_results,
     tune_candidates,
     tuning_axis,
-    tuning_candidate_count,
     validate_tuning_arguments,
+    validate_tuning_candidate_count,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -51,8 +50,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
-        type=parse_input_activation,
-        metavar="{none,swiglu}",
+        choices=("swiglu",),
         default=None,
     )
     parser.add_argument("--no-bias", action="store_true")
@@ -167,12 +165,7 @@ def _candidate_plans(
         tuning_axis(args.matmul_num_warps, production_plan.matmul_num_warps),
         tuning_axis(args.matmul_num_stages, production_plan.matmul_num_stages),
     )
-    candidate_count = tuning_candidate_count(axes)
-    if candidate_count > args.max_candidates:
-        raise SystemExit(
-            f"search expands to {candidate_count} candidates; narrow the axes or increase "
-            "--max-candidates"
-        )
+    validate_tuning_candidate_count(axes, args.max_candidates)
     return tuple(
         replace(
             production_plan,

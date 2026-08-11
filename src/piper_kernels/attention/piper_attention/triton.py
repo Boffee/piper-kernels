@@ -11,7 +11,7 @@ identical affine signed-INT8 formulation is retained as the portable control.
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -28,6 +28,8 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.attention.scheduling import select_query_block
+
+from . import _policy
 
 _BLOCK_N = 64
 _MEAN_CHUNK_N = 1024
@@ -878,100 +880,13 @@ def _make_descriptors(
     return key_descriptor, value_descriptor
 
 
-@dataclass(frozen=True, slots=True)
-class _PiperAttentionExecutionPlan:
-    """Host-side specialization and launch choices for one Piper invocation."""
-
-    block_m: int
-    grouped_qk: bool
-    native_uint8: bool
-    split_pv_head_dim: bool
-    scaled_fp16_numerator: bool
-    use_tensor_descriptors: bool
-    num_warps: int = 4
-    num_stages: int = 3
-    reverse_causal_blocks: bool = False
-    loop_num_stages: int | None = None
-    loop_licm: bool = False
-    use_packed_probability_conversion: bool = False
-
-    def __post_init__(self) -> None:
-        if self.block_m not in (32, 64, 128):
-            raise ValueError("Piper Attention block_m must be 32, 64, or 128")
-        if self.num_warps not in (2, 4, 8):
-            raise ValueError("Piper Attention num_warps must be 2, 4, or 8")
-        if self.num_stages not in (1, 2, 3, 4):
-            raise ValueError("Piper Attention num_stages must be 1, 2, 3, or 4")
-        if self.loop_num_stages not in (None, 1, 2, 3, 4):
-            raise ValueError("Piper Attention loop_num_stages must be None, 1, 2, 3, or 4")
-        if self.scaled_fp16_numerator and not self.split_pv_head_dim:
-            raise ValueError("scaled FP16 numerator recurrence requires split PV")
-        if self.use_packed_probability_conversion and not self.native_uint8:
-            raise ValueError("packed probability conversion requires native UINT8 MMA")
-
-    def as_dict(self) -> dict[str, object]:
-        """Return execution choices as serializable benchmark metadata."""
-        return asdict(self)
-
-
-def _select_piper_attention_execution_plan(
-    target: AcceleratorTarget,
-    *,
-    candidate_block_m: int,
-    query_length: int,
-    key_length: int,
-    head_dim: int,
-    is_causal: bool,
-) -> _PiperAttentionExecutionPlan:
-    """Select established policy without borrowing schedules from other kernels."""
-    grouped_qk = target.is_cuda_capability(12)
-    native_uint8 = target.supports_uint8_int8_mma
-    split_pv_head_dim = (
-        target.is_cuda_capability(12)
-        and not is_causal
-        and head_dim == 128
-        and query_length >= 1024
-        and key_length >= 1024
-    )
-    scaled_fp16_numerator = split_pv_head_dim and key_length <= 131072
-    # Paired SM120 measurements favor packed conversion for D64 and
-    # non-causal D128, while the D128 causal specialization is neutral to
-    # slightly slower and retains stock Triton lowering.
-    use_packed_probability_conversion = target.is_cuda_capability(12, 0) and not (
-        is_causal and head_dim == 128
-    )
-
-    block_m = (
-        64
-        if is_causal
-        else 128
-        if scaled_fp16_numerator and query_length >= 8192 and key_length >= 8192
-        else 64
-        if split_pv_head_dim
-        else candidate_block_m
-    )
-    use_tensor_descriptors = (
-        target.is_cuda_capability(12) and block_m == 128 and head_dim == 128
-    )
-    return _PiperAttentionExecutionPlan(
-        block_m=block_m,
-        grouped_qk=grouped_qk,
-        native_uint8=native_uint8,
-        split_pv_head_dim=split_pv_head_dim,
-        scaled_fp16_numerator=scaled_fp16_numerator,
-        use_tensor_descriptors=use_tensor_descriptors,
-        num_stages=2 if use_tensor_descriptors else 3,
-        use_packed_probability_conversion=use_packed_probability_conversion,
-    )
-
-
 def _default_piper_attention_execution_plan(
     query: torch.Tensor,
     key: torch.Tensor,
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
-) -> _PiperAttentionExecutionPlan:
+) -> _policy.PiperAttentionExecutionPlan:
     """Resolve production policy for preparation, benchmarks, and tuning."""
     batch, heads, query_length, head_dim = query.shape
     candidate_block_m = (
@@ -980,7 +895,7 @@ def _default_piper_attention_execution_plan(
         else 64
     )
     target = AcceleratorTarget.from_device(query.device) if target is None else target
-    return _select_piper_attention_execution_plan(
+    return _policy.select_execution_plan(
         target,
         candidate_block_m=candidate_block_m,
         query_length=query_length,
@@ -1005,7 +920,7 @@ class _PreparedPiperAttention:
     key_length: int
     storage_key_length: int
     is_causal: bool
-    plan: _PiperAttentionExecutionPlan
+    plan: _policy.PiperAttentionExecutionPlan
 
 
 def _prepare_piper_attention(
@@ -1015,7 +930,7 @@ def _prepare_piper_attention(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _PiperAttentionExecutionPlan,
+    execution_plan: _policy.PiperAttentionExecutionPlan,
 ) -> _PreparedPiperAttention:
     """Quantize Q/K/V and construct the selected launch specialization."""
     batch, heads, _query_length, head_dim = query.shape
@@ -1196,7 +1111,7 @@ def _run_piper_attention(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _PiperAttentionExecutionPlan | None = None,
+    execution_plan: _policy.PiperAttentionExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused recurrence."""
     plan = (

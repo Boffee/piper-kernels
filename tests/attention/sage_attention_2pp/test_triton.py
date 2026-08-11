@@ -12,6 +12,7 @@ from lib.triton_inspection import compiled_artifact
 import piper_kernels.attention.sage_attention_2pp.triton as sage_attention_2pp_backend
 from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp.reference import reference_sage_attention_2pp
 from piper_kernels.attention.sage_attention_2pp.triton import (
     _ptx_float32_to_e4m3x4,
@@ -144,8 +145,8 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
     is_causal: bool,
     threshold_name: str,
 ) -> None:
-    monkeypatch.setattr(sage_attention_2pp_backend, threshold_name, 0)
-    plan = sage_attention_2pp_backend._select_sage_attention_2pp_execution_plan(
+    monkeypatch.setattr(sage_attention_2pp_policy, threshold_name, 0)
+    plan = sage_attention_2pp_policy.select_execution_plan(
         AcceleratorTarget(backend="cuda", architecture="sm120"),
         candidate_block_m=64,
         query_length=193,

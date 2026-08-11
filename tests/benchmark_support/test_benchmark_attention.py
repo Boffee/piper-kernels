@@ -63,14 +63,13 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
             SAGE_ATTENTION_2PP,
             PYTORCH_SDPA,
         ),
-        config=AttentionConfig(dtype="float16"),
+        config=AttentionConfig(dtype=torch.float16),
         target=_SM120,
     )
 
     assert providers[PIPER_ATTENTION_AFFINE].configuration["native_uint8"] is False
-    assert not providers[PIPER_ATTENTION_AFFINE].configuration[
-        "use_packed_probability_conversion"
-    ]
+    assert providers[PIPER_ATTENTION].configuration["seed"] == 0
+    assert not providers[PIPER_ATTENTION_AFFINE].configuration["use_packed_probability_conversion"]
     assert "mixed_sign_mma" not in providers[PIPER_ATTENTION_AFFINE].configuration
     assert providers[PIPER_ATTENTION].configuration["use_packed_probability_conversion"]
     assert "attention" in providers[PIPER_ATTENTION].triton_jit_functions
@@ -92,7 +91,7 @@ def test_short_causal_sage_attention_2pp_provider_registers_query_quantization()
     providers = make_attention_providers(
         (tensor, tensor, tensor),
         provider_names=(SAGE_ATTENTION_2PP,),
-        config=AttentionConfig(dtype="float16", is_causal=True),
+        config=AttentionConfig(dtype=torch.float16, is_causal=True),
         target=_SM120,
     )
 
@@ -106,7 +105,7 @@ def test_long_causal_sage_attention_2pp_provider_omits_query_quantization() -> N
     providers = make_attention_providers(
         (tensor, tensor, tensor),
         provider_names=(SAGE_ATTENTION_2PP,),
-        config=AttentionConfig(dtype="float16", is_causal=True),
+        config=AttentionConfig(dtype=torch.float16, is_causal=True),
         target=_SM120,
     )
 
@@ -119,7 +118,7 @@ def test_other_sm12x_sage_attention_2pp_provider_uses_grouped_quantization() -> 
     providers = make_attention_providers(
         (tensor, tensor, tensor),
         provider_names=(SAGE_ATTENTION_2PP,),
-        config=AttentionConfig(dtype="float16"),
+        config=AttentionConfig(dtype=torch.float16),
         target=AcceleratorTarget(backend="cuda", architecture="sm121"),
     )
 
@@ -264,10 +263,10 @@ def test_benchmark_and_compiler_outputs_must_not_collide(
 
 def test_effective_tflops_accounts_for_causal_triangle() -> None:
     shape = AttentionShape(1, 2, 4, 4, 8)
-    noncausal = _effective_tflops(shape, AttentionConfig("float16"), 1.0)
+    noncausal = _effective_tflops(shape, AttentionConfig(torch.float16), 1.0)
     causal = _effective_tflops(
         shape,
-        AttentionConfig("float16", is_causal=True),
+        AttentionConfig(torch.float16, is_causal=True),
         1.0,
     )
 

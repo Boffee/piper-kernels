@@ -55,8 +55,8 @@ class ConvRotWorkload:
 
     def sampled_reference(self) -> torch.Tensor:
         """Evaluate the portable reference only on the declared quality rows."""
-        _activation, qdata, scale, bias = self.inputs
-        sampled_activation = self.inputs[0].index_select(0, self.quality_index)
+        activation, qdata, scale, bias = self.inputs
+        sampled_activation = activation.index_select(0, self.quality_index)
         return _run_convrot_reference(self, (sampled_activation, qdata, scale, bias))
 
     def measure_sampled_quality(

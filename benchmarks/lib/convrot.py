@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 
 import torch
@@ -91,16 +90,6 @@ def convrot_dtype(name: str) -> torch.dtype:
         return _DTYPES[name]
     except KeyError as error:
         raise ValueError(f"unsupported ConvRot workload dtype {name!r}") from error
-
-
-def parse_input_activation(value: str) -> str | None:
-    """Parse the common ConvRot CLI input-activation spelling."""
-    normalized = value.strip().lower()
-    if normalized == "none":
-        return None
-    if normalized == "swiglu":
-        return normalized
-    raise argparse.ArgumentTypeError("input activation must be 'none' or 'swiglu'")
 
 
 def raw_input_features(in_features: int, input_activation: str | None) -> int:

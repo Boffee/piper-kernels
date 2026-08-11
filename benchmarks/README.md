@@ -50,7 +50,8 @@ measurement = measure_provider(provider, warmup_ms=100, measurement_time_ms=500)
 
 `AttentionShape` records batch size, Q/KV head counts, Q/KV sequence lengths, and head
 dimension without assuming self-attention or MHA. `AttentionConfig` records dtype,
-causality, scale, and an explicit QKV layout such as `BHSD`.
+causality, scale, and seed. Generated benchmark inputs always use the recorded `BHSD` QKV
+layout and are independently reproducible from their shape and configuration.
 
 ## Offline configuration tuning
 
@@ -87,7 +88,8 @@ silently applying a SageAttention2++ schedule to Piper Attention:
 
 Boolean options use `argparse`'s standard optional-boolean form and match the execution-plan field
 names. `--option` selects true, `--no-option` selects false, and omitting the option retains the
-production value.
+production value. For `--loop-num-stages`, zero selects Triton's compiler-default loop staging;
+values one through four request an explicit stage count.
 
 ```shell
 uv run python benchmarks/tune_piper_attention.py \
@@ -96,7 +98,7 @@ uv run python benchmarks/tune_piper_attention.py \
   --block-m 64 128 \
   --num-stages 2 3 \
   --reverse-causal-blocks \
-  --loop-num-stages none 3 \
+  --loop-num-stages 0 3 \
   --loop-licm \
   --use-packed-probability-conversion \
   --json artifacts/piper_attention_execution_plan.json
@@ -240,7 +242,8 @@ Use `--help` to select activation rows, weight dimensions, group size, dtype,
 deterministic input seed, and timing windows. The existing custom-shape interface remains
 the default. Custom-shape options such as `--rows` and `--input-activation` cannot be mixed
 with a named preset, because the preset supplies those values. `--in-features` is linear and
-weight width `K`; a raw `[up | gate]` SwiGLU input has `2K` features. The script validates
+weight width `K`; omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw
+`[up | gate]` input with `2K` features. The script validates
 ordinary linears with the output dtype's standard tolerance; the SwiGLU path uses a declared
 relative-L2 bound. Quality is computed over at most 256 rows stratified across `M`, including
 the final row and rows around every first signed-32-bit input or output element-offset crossing.

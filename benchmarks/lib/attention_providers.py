@@ -13,9 +13,10 @@ from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_backend
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
+from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 
-from .attention import AttentionConfig, AttentionInputs
+from .attention import AttentionConfig, AttentionInputs, run_sdpa
 from .providers import BenchmarkProvider
 
 CANONICAL_VERSION = "2.2.0"
@@ -99,9 +100,7 @@ def validate_provider_support(
 ) -> None:
     """Reject selected providers that cannot run on the active accelerator."""
     needs_piper_attention = any(name in PIPER_ATTENTION_PROVIDERS for name in provider_names)
-    needs_sage_attention_fp8 = any(
-        name in SAGE_ATTENTION_FP8_PROVIDERS for name in provider_names
-    )
+    needs_sage_attention_fp8 = any(name in SAGE_ATTENTION_FP8_PROVIDERS for name in provider_names)
     if needs_piper_attention and not target.supports_uint8_int8_mma:
         raise SystemExit(
             "Piper Attention providers require NVIDIA SM8x or consumer Blackwell SM12x"
@@ -111,18 +110,6 @@ def validate_provider_support(
             "SageAttention 8+8 providers require NVIDIA FP8 tensor cores; "
             "the canonical RTX 30 fallback is a different FP16-PV algorithm"
         )
-
-
-def run_sdpa(inputs: AttentionInputs, config: AttentionConfig) -> torch.Tensor:
-    """Run the common full-precision quality reference."""
-    query, key, value = inputs
-    return torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        scale=config.scale,
-        is_causal=config.is_causal,
-    )
 
 
 def _load_canonical_sage_attention(capability: tuple[int, int]) -> CanonicalSageAttention:
@@ -151,7 +138,7 @@ def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
 
 
 def _sage_attention_2pp_jit_functions(
-    plan: sage_attention_2pp_backend._SageAttention2ppExecutionPlan,
+    plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
 ) -> dict[str, object]:
     if plan.fuse_kv_quantization:
         quantization_kernels = {
@@ -218,9 +205,7 @@ def _make_piper_attention_provider(
     plan = replace(
         plan,
         native_uint8=native_uint8,
-        use_packed_probability_conversion=(
-            native_uint8 and plan.use_packed_probability_conversion
-        ),
+        use_packed_probability_conversion=(native_uint8 and plan.use_packed_probability_conversion),
     )
 
     def prepare() -> object:
@@ -300,6 +285,97 @@ def _make_sage_attention_2pp_provider(
     )
 
 
+def _make_sdpa_provider(
+    inputs: AttentionInputs,
+    config: AttentionConfig,
+) -> AttentionProvider:
+    """Build the full-precision PyTorch reference provider."""
+
+    def prepare() -> object:
+        return inputs
+
+    return BenchmarkProvider(
+        name=PYTORCH_SDPA,
+        prepare=prepare,
+        run=lambda prepared: run_sdpa(cast(AttentionInputs, prepared), config),
+        synchronize=torch.cuda.synchronize,
+        configuration={
+            **config.as_dict(),
+            "implementation": "pytorch",
+            "algorithm": "scaled_dot_product_attention",
+        },
+    )
+
+
+def _make_canonical_sage_attention_providers(
+    inputs: AttentionInputs,
+    provider_names: Sequence[str],
+    *,
+    config: AttentionConfig,
+    target: AcceleratorTarget,
+) -> dict[str, AttentionProvider]:
+    """Build the requested revision-pinned canonical CUDA providers."""
+    requested = tuple(
+        specification
+        for specification in (
+            (CANONICAL_CUDA_SAGE_ATTENTION_2PP, "fp32+fp16", "sage_attention_2pp"),
+            (CANONICAL_CUDA_SAGE_ATTENTION_2, "fp32+fp32", "sage_attention_2"),
+        )
+        if specification[0] in provider_names
+    )
+    if not requested:
+        return {}
+    capability = target.cuda_capability
+    if capability is None:
+        raise SystemExit("canonical SageAttention providers require NVIDIA CUDA")
+    canonical_sage_attention = _load_canonical_sage_attention(capability)
+    qk_granularity = qk_quantization_granularity(target)
+    common_configuration = {
+        **config.as_dict(),
+        "implementation": "canonical_cuda",
+        "canonical_version": CANONICAL_VERSION,
+        "canonical_revision": CANONICAL_REVISION,
+        "qk_quantization": qk_granularity,
+    }
+
+    def prepare() -> object:
+        return inputs
+
+    def make_run(pv_accumulation: str) -> Callable[[object], torch.Tensor]:
+        def run(prepared: object) -> torch.Tensor:
+            query, key, value = cast(AttentionInputs, prepared)
+            return canonical_sage_attention(
+                query,
+                key,
+                value,
+                tensor_layout="HND",
+                is_causal=config.is_causal,
+                qk_quant_gran=qk_granularity,
+                sm_scale=config.scale,
+                pv_accum_dtype=pv_accumulation,
+                smooth_k=True,
+                smooth_v=False,
+                return_lse=False,
+            )
+
+        return run
+
+    return {
+        name: BenchmarkProvider(
+            name=name,
+            prepare=prepare,
+            run=make_run(pv_accumulation),
+            synchronize=torch.cuda.synchronize,
+            configuration={
+                **common_configuration,
+                "algorithm": algorithm,
+                "pv_accumulation": pv_accumulation,
+            },
+        )
+        for name, pv_accumulation, algorithm in requested
+    }
+
+
 def make_attention_providers(
     inputs: AttentionInputs,
     *,
@@ -308,7 +384,6 @@ def make_attention_providers(
     target: AcceleratorTarget,
 ) -> dict[str, AttentionProvider]:
     """Construct the selected providers in command-line order."""
-    qk_granularity = qk_quantization_granularity(target)
     providers: dict[str, AttentionProvider] = {}
     piper_attention_settings = {
         PIPER_ATTENTION: True,
@@ -324,9 +399,6 @@ def make_attention_providers(
                 native_uint8=native_uint8,
             )
 
-    def prepare_inputs() -> object:
-        return inputs
-
     if SAGE_ATTENTION_2PP in provider_names:
         providers[SAGE_ATTENTION_2PP] = _make_sage_attention_2pp_provider(
             SAGE_ATTENTION_2PP,
@@ -335,76 +407,15 @@ def make_attention_providers(
             target=target,
         )
     if PYTORCH_SDPA in provider_names:
-        providers[PYTORCH_SDPA] = BenchmarkProvider(
-            name=PYTORCH_SDPA,
-            prepare=prepare_inputs,
-            run=lambda prepared: run_sdpa(cast(AttentionInputs, prepared), config),
-            synchronize=torch.cuda.synchronize,
-            configuration={
-                **config.as_dict(),
-                "implementation": "pytorch",
-                "algorithm": "scaled_dot_product_attention",
-            },
+        providers[PYTORCH_SDPA] = _make_sdpa_provider(inputs, config)
+
+    providers.update(
+        _make_canonical_sage_attention_providers(
+            inputs,
+            provider_names,
+            config=config,
+            target=target,
         )
-
-    canonical_sage_attention_requested = (
-        CANONICAL_CUDA_SAGE_ATTENTION_2PP in provider_names
-        or CANONICAL_CUDA_SAGE_ATTENTION_2 in provider_names
     )
-    canonical_sage_attention_capability = target.cuda_capability
-    if canonical_sage_attention_requested and canonical_sage_attention_capability is None:
-        raise SystemExit("canonical SageAttention providers require NVIDIA CUDA")
-    canonical_sage_attention = (
-        _load_canonical_sage_attention(canonical_sage_attention_capability)
-        if canonical_sage_attention_capability is not None
-        and canonical_sage_attention_requested
-        else None
-    )
-    if canonical_sage_attention is not None:
-        common_configuration = {
-            **config.as_dict(),
-            "implementation": "canonical_cuda",
-            "canonical_version": CANONICAL_VERSION,
-            "canonical_revision": CANONICAL_REVISION,
-            "qk_quantization": qk_granularity,
-        }
-
-        def canonical_sage_attention_run(
-            pv_accumulation: str,
-        ) -> Callable[[object], torch.Tensor]:
-            def run(prepared: object) -> torch.Tensor:
-                query, key, value = cast(AttentionInputs, prepared)
-                return canonical_sage_attention(
-                    query,
-                    key,
-                    value,
-                    tensor_layout="HND",
-                    is_causal=config.is_causal,
-                    qk_quant_gran=qk_granularity,
-                    sm_scale=config.scale,
-                    pv_accum_dtype=pv_accumulation,
-                    smooth_k=True,
-                    smooth_v=False,
-                    return_lse=False,
-                )
-
-            return run
-
-        for name, pv_accumulation, algorithm in (
-            (CANONICAL_CUDA_SAGE_ATTENTION_2PP, "fp32+fp16", "sage_attention_2pp"),
-            (CANONICAL_CUDA_SAGE_ATTENTION_2, "fp32+fp32", "sage_attention_2"),
-        ):
-            if name in provider_names:
-                providers[name] = BenchmarkProvider(
-                    name=name,
-                    prepare=prepare_inputs,
-                    run=canonical_sage_attention_run(pv_accumulation),
-                    synchronize=torch.cuda.synchronize,
-                    configuration={
-                        **common_configuration,
-                        "algorithm": algorithm,
-                        "pv_accumulation": pv_accumulation,
-                    },
-                )
 
     return {name: providers[name] for name in provider_names}

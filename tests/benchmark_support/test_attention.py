@@ -47,26 +47,35 @@ def test_attention_shape_rejects_invalid_dimensions(shape) -> None:
 
 
 def test_attention_config_uses_stable_names() -> None:
-    config = AttentionConfig(dtype="float16", is_causal=True, scale=0.125)
+    config = AttentionConfig(dtype=torch.float16, is_causal=True, scale=0.125, seed=7)
 
     assert config.as_dict() == {
         "dtype": "float16",
         "is_causal": True,
         "scale": 0.125,
         "qkv_layout": "BHSD",
+        "seed": 7,
     }
+
+
+def test_attention_config_rejects_unsupported_dtype() -> None:
+    with pytest.raises(ValueError, match="unsupported attention workload dtype"):
+        AttentionConfig(dtype=torch.float32)
 
 
 def test_attention_inputs_follow_mha_and_gqa_shapes() -> None:
     shape = AttentionShape(2, 8, 5, 7, 64, num_key_value_heads=2)
+    config = AttentionConfig(torch.float16, seed=10)
 
     query, key, value = make_attention_inputs(
         shape,
-        dtype=torch.float16,
+        config=config,
         device=torch.device("cpu"),
-        generator=torch.Generator().manual_seed(10),
     )
+    repeated = make_attention_inputs(shape, config=config, device=torch.device("cpu"))
 
     assert query.shape == (2, 8, 5, 64)
     assert key.shape == value.shape == (2, 2, 7, 64)
     assert query.dtype is key.dtype is value.dtype is torch.float16
+    for actual, expected in zip((query, key, value), repeated, strict=True):
+        torch.testing.assert_close(actual, expected)

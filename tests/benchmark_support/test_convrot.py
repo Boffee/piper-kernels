@@ -157,11 +157,16 @@ def test_custom_shape_can_include_swiglu_without_bias() -> None:
     assert raw_input_features(shape.in_features, shape.input_activation) == 1024
 
 
-def test_cli_none_input_activation_is_python_none() -> None:
+def test_omitted_cli_input_activation_is_python_none() -> None:
     assert _parse_args([]).input_activation is None
-    assert _parse_args(["--input-activation", "none"]).input_activation is None
     assert _parse_preparation_args([]).input_activation is None
-    assert _parse_preparation_args(["--input-activation", "none"]).input_activation is None
+
+
+def test_cli_input_activation_rejects_none_spelling() -> None:
+    with pytest.raises(SystemExit):
+        _parse_args(["--input-activation", "none"])
+    with pytest.raises(SystemExit):
+        _parse_preparation_args(["--input-activation", "none"])
 
 
 def test_shared_shape_and_inputs_define_one_reproducible_workload() -> None:
@@ -225,7 +230,7 @@ def test_custom_shape_cli_rejects_nonpositive_dimensions(arguments: list[str]) -
         ["--rows", "1"],
         ["--out-features", "96"],
         ["--in-features", "512"],
-        ["--input-activation", "none"],
+        ["--input-activation", "swiglu"],
         ["--no-bias"],
     ],
 )

@@ -11,10 +11,10 @@ from lib.tuning import (
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
     meets_minimum_sqnr,
-    optional_integer_tuning_axis,
+    parse_optional_integer,
     tune_candidates,
     tuning_axis,
-    tuning_candidate_count,
+    validate_tuning_candidate_count,
 )
 from triton.runtime.errors import OutOfResources
 
@@ -80,9 +80,11 @@ def test_shared_tuning_axes_default_and_deduplicate_explicit_values() -> None:
     assert tuning_axis([32, 64, 32], 128) == (32, 64)
     assert boolean_tuning_axis(None, True) == (True,)
     assert boolean_tuning_axis(False, True) == (False,)
-    assert optional_integer_tuning_axis(None, 3) == (3,)
-    assert optional_integer_tuning_axis(["none", "2", "none"], 3) == (None, 2)
-    assert tuning_candidate_count(((32, 64), (True,), (1, 2, 3))) == 6
+    assert parse_optional_integer("0") is None
+    assert parse_optional_integer("2") == 2
+
+    with pytest.raises(SystemExit, match="search expands to 6 candidates"):
+        validate_tuning_candidate_count(((32, 64), (True,), (1, 2, 3)), 5)
 
 
 def test_shared_sqnr_gate_rejects_nonfinite_mismatches() -> None:
