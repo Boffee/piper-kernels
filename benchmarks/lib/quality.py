@@ -121,36 +121,41 @@ def _measure_finite_floating_quality(
     comparison_dtype: torch.dtype,
     saturation: Mapping[str, QuantizerSaturation] | None,
 ) -> QualityMetrics:
-    """Measure finite floating tensors without promoting full-sized copies."""
+    """Measure finite floating tensors with fused promoted norm reductions."""
     error = actual - reference
-    error.abs_()
-    absolute_error_sum = error.sum(dtype=comparison_dtype)
+    absolute_error_sum = torch.linalg.vector_norm(
+        error,
+        ord=1,
+        dtype=comparison_dtype,
+    )
+    error_l2 = torch.linalg.vector_norm(error, dtype=comparison_dtype)
     mean_absolute_error = absolute_error_sum / actual.numel()
+    error.abs_()
     max_absolute_error = error.max()
-
-    error.square_()
-    error_l2_squared = error.sum(dtype=comparison_dtype)
     del error
-    reference_l1 = reference.abs().sum(dtype=comparison_dtype)
-    reference_l2_squared = reference.square().sum(dtype=comparison_dtype)
-    actual_l2_squared = actual.square().sum(dtype=comparison_dtype)
-    dot = (actual * reference).sum(dtype=comparison_dtype)
+
+    reference_l1 = torch.linalg.vector_norm(
+        reference,
+        ord=1,
+        dtype=comparison_dtype,
+    )
+    reference_l2 = torch.linalg.vector_norm(reference, dtype=comparison_dtype)
+    actual_l2 = torch.linalg.vector_norm(actual, dtype=comparison_dtype)
 
     epsilon = torch.finfo(comparison_dtype).tiny
-    sqnr = 10 * torch.log10(reference_l2_squared / error_l2_squared)
-    if actual_l2_squared == 0 or reference_l2_squared == 0:
-        cosine_similarity = 1.0 if actual_l2_squared == 0 and reference_l2_squared == 0 else 0.0
+    sqnr = 20 * torch.log10(reference_l2 / error_l2)
+    if actual_l2 == 0 or reference_l2 == 0:
+        cosine_similarity = 1.0 if actual_l2 == 0 and reference_l2 == 0 else 0.0
     else:
-        cosine = dot / (torch.sqrt(actual_l2_squared) * torch.sqrt(reference_l2_squared))
+        dot = (actual_l2.square() + reference_l2.square() - error_l2.square()) / 2
+        cosine = dot / (actual_l2 * reference_l2)
         cosine_similarity = float(cosine.clamp(-1, 1))
 
     return QualityMetrics(
         mean_absolute_error=float(mean_absolute_error),
         max_absolute_error=float(max_absolute_error),
         relative_l1_error=float(absolute_error_sum / reference_l1.clamp_min(epsilon)),
-        relative_l2_error=float(
-            torch.sqrt(error_l2_squared) / torch.sqrt(reference_l2_squared).clamp_min(epsilon)
-        ),
+        relative_l2_error=float(error_l2 / reference_l2.clamp_min(epsilon)),
         sqnr_db=float(sqnr),
         cosine_similarity=cosine_similarity,
         actual_nonfinite_count=0,

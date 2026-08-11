@@ -134,9 +134,10 @@ keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed o
 all are paid on every public invocation. It ranks their device-stream work on fixed source
 tensors; `operator_end_to_end` selects synchronized wall timing when host dispatch and allocation
 overhead should also participate. Quality compares every low-precision output element and uses
-FP32 only for scalar reductions. The public benchmark and tuner construct the same deterministic
-ConvRot workload, full portable reference, common metadata, and provider adapters; the benchmark
-uses normal public dispatch while the tuner substitutes explicit execution-plan candidates.
+fused FP32 norm reductions without materializing full promoted copies. The public benchmark and
+tuner construct the same deterministic ConvRot workload, full portable reference, common
+metadata, and provider adapters; the benchmark uses normal public dispatch while the tuner
+substitutes explicit execution-plan candidates.
 
 ```shell
 uv run python benchmarks/tune_convrot_int8_linear.py \
@@ -244,8 +245,8 @@ the default. Custom-shape options such as `--rows` and `--input-activation` cann
 with a named preset, because the preset supplies those values. `--in-features` is linear and
 weight width `K`; omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw
 `[up | gate]` input with `2K` features. The script validates every low-precision output element
-against the portable reference. Elementwise error and energy terms retain the output dtype while
-their scalar reductions accumulate in FP32; the Piper provider must clear the declared SQNR and
+against the portable reference. Fused FP32 norm reductions avoid low-precision overflow without
+materializing full promoted copies; the Piper provider must clear the declared SQNR and
 non-finite gate.
 
 The Piper provider times the complete public entrypoint on fixed source tensors, so its

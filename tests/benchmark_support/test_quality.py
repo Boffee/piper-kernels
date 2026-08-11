@@ -52,7 +52,7 @@ def test_quality_preserves_float64_precision() -> None:
     assert math.isfinite(quality.sqnr_db)
 
 
-def test_quality_uses_low_precision_elements_with_fp32_reductions() -> None:
+def test_quality_uses_fp32_norms_without_promoting_full_inputs() -> None:
     generator = torch.Generator().manual_seed(0)
     reference = torch.randn((256, 128), dtype=torch.bfloat16, generator=generator)
     actual = (
@@ -62,9 +62,35 @@ def test_quality_uses_low_precision_elements_with_fp32_reductions() -> None:
 
     quality = measure_quality(actual, reference)
     fp32_error = actual.float() - reference.float()
-    fp32_sqnr = 10 * torch.log10(reference.float().square().sum() / fp32_error.square().sum())
+    fp32_sqnr = 20 * torch.log10(
+        torch.linalg.vector_norm(reference.float()) / torch.linalg.vector_norm(fp32_error)
+    )
 
     assert quality.sqnr_db == pytest.approx(float(fp32_sqnr), abs=0.01)
+
+
+def test_quality_fp16_norms_do_not_overflow() -> None:
+    reference = torch.full((1024,), 300.0, dtype=torch.float16)
+    actual = torch.full((1024,), 299.0, dtype=torch.float16)
+
+    quality = measure_quality(actual, reference)
+
+    assert quality.relative_l2_error == pytest.approx(1 / 300)
+    assert quality.sqnr_db == pytest.approx(20 * math.log10(300))
+
+
+def test_quality_fp16_error_norm_does_not_underflow() -> None:
+    reference = torch.tensor([0.1], dtype=torch.float16)
+    actual = torch.nextafter(reference, torch.zeros_like(reference))
+
+    quality = measure_quality(actual, reference)
+    expected_sqnr = 20 * torch.log10(
+        torch.linalg.vector_norm(reference.float())
+        / torch.linalg.vector_norm(actual.float() - reference.float())
+    )
+
+    assert math.isfinite(quality.sqnr_db)
+    assert quality.sqnr_db == pytest.approx(float(expected_sqnr))
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
