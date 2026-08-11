@@ -9,7 +9,7 @@ extensions. See the repository NOTICE for upstream attribution.
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass
 
 import torch
 import triton
@@ -22,6 +22,8 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 from piper_kernels.attention.scheduling import select_query_block
 
+from . import _policy
+
 # Triton 3.7 requires globals referenced inside JIT functions to be constexpr.
 _BLOCK_N = tl.constexpr(64)
 _QUERY_GROUP_SIZE = tl.constexpr(32)
@@ -32,11 +34,6 @@ _P_FP8_LOG2_MAX = tl.constexpr(8.807354922057604)
 _V_FP8_MAX = tl.constexpr(2.25)
 _SCALE_EPSILON = tl.constexpr(1e-7)
 _LOG2_E = tl.constexpr(1.4426950408889634)
-# Measured SM120 crossover policy, not an algorithmic requirement.
-_CAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH = 32 * 1024
-_NONCAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH = 128 * 1024
-
-
 @triton.jit
 def _ptx_float32_to_e4m3x4(values):
     """Use the native packed SM89+ conversion used by canonical SageAttention."""
@@ -810,174 +807,20 @@ def _make_attention_tensor_descriptors(
     return key_descriptor, value_descriptor
 
 
-@dataclass(frozen=True, slots=True)
-class _SageAttention2ppExecutionPlan:
-    """Host-side specialization choices for one SageAttention2++ invocation."""
-
-    block_m: int
-    grouped_qk: bool
-    fuse_kv_quantization: bool
-    fuse_query_quantization: bool
-    use_unscaled_score_recurrence: bool
-    use_tensor_descriptors: bool
-    use_packed_probability_conversion: bool = True
-    num_warps: int = 4
-    num_stages: int = 3
-    reverse_causal_blocks: bool = False
-    loop_num_stages: int | None = None
-    loop_licm: bool = False
-
-    def __post_init__(self) -> None:
-        if self.block_m not in (32, 64, 128):
-            raise ValueError("SageAttention2++ block_m must be 32, 64, or 128")
-        if self.num_warps not in (2, 4, 8):
-            raise ValueError("SageAttention2++ num_warps must be 2, 4, or 8")
-        if self.num_stages not in (1, 2, 3, 4):
-            raise ValueError("SageAttention2++ num_stages must be 1, 2, 3, or 4")
-        if self.loop_num_stages not in (None, 1, 2, 3, 4):
-            raise ValueError("SageAttention2++ loop_num_stages must be None, 1, 2, 3, or 4")
-        if self.fuse_kv_quantization and not self.grouped_qk:
-            raise ValueError("fused K/V quantization requires grouped Q/K scales")
-        if self.fuse_query_quantization and not self.grouped_qk:
-            raise ValueError("fused Q quantization requires grouped Q/K scales")
-        if self.use_unscaled_score_recurrence and not self.fuse_query_quantization:
-            raise ValueError("unscaled-score recurrence requires fused Q quantization")
-
-    def as_dict(self) -> dict[str, object]:
-        """Return the execution-plan fields as plain metadata."""
-        return asdict(self)
-
-
-def _generic_sage_attention_2pp_execution_plan(
-    target: AcceleratorTarget,
-    *,
-    candidate_block_m: int,
-    is_causal: bool,
-) -> _SageAttention2ppExecutionPlan:
-    """Build capability-based defaults before exact-target tuning is applied."""
-    return _SageAttention2ppExecutionPlan(
-        block_m=min(candidate_block_m, 64) if is_causal else candidate_block_m,
-        grouped_qk=target.is_cuda_capability(12),
-        fuse_kv_quantization=False,
-        fuse_query_quantization=False,
-        use_unscaled_score_recurrence=False,
-        use_tensor_descriptors=False,
-    )
-
-
-def _apply_sm89_sage_attention_2pp_policy(
-    plan: _SageAttention2ppExecutionPlan,
-    *,
-    candidate_block_m: int,
-    query_length: int,
-    head_dim: int,
-    is_causal: bool,
-) -> _SageAttention2ppExecutionPlan:
-    """Apply schedules measured on exact SM89 long-context D128 shapes."""
-    long_context_d128 = head_dim == 128 and query_length >= 8192
-    if is_causal and long_context_d128:
-        return replace(
-            plan,
-            block_m=candidate_block_m,
-            num_stages=2,
-            reverse_causal_blocks=True,
-        )
-    if not is_causal and long_context_d128:
-        return replace(
-            plan,
-            loop_num_stages=3,
-            loop_licm=True,
-        )
-    return plan
-
-
-def _apply_sm120_sage_attention_2pp_policy(
-    plan: _SageAttention2ppExecutionPlan,
-    *,
-    candidate_block_m: int,
-    query_length: int,
-    key_length: int,
-    head_dim: int,
-    is_causal: bool,
-) -> _SageAttention2ppExecutionPlan:
-    """Apply schedules and preprocessing choices measured on exact SM120."""
-    block_m = (
-        min(candidate_block_m, 64) if is_causal and query_length <= 4096 else candidate_block_m
-    )
-
-    minimum_key_length = (
-        _CAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH
-        if is_causal
-        else _NONCAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH
-    )
-    use_unscaled_score_recurrence = head_dim == 128 and key_length >= minimum_key_length
-    fuse_query_quantization = not is_causal or use_unscaled_score_recurrence
-    use_tensor_descriptors = block_m == 128 and head_dim == 128
-    # Packed probability conversion saves instructions on SM120, but increases
-    # spills in measured D128 causal specializations and regresses latency. Keep
-    # the stock lowering for that path.
-    use_packed_probability_conversion = not (is_causal and head_dim == 128)
-
-    return replace(
-        plan,
-        block_m=block_m,
-        fuse_kv_quantization=True,
-        fuse_query_quantization=fuse_query_quantization,
-        use_unscaled_score_recurrence=use_unscaled_score_recurrence,
-        use_tensor_descriptors=use_tensor_descriptors,
-        use_packed_probability_conversion=use_packed_probability_conversion,
-    )
-
-
-def _select_sage_attention_2pp_execution_plan(
-    target: AcceleratorTarget,
-    *,
-    candidate_block_m: int,
-    query_length: int,
-    key_length: int,
-    head_dim: int,
-    is_causal: bool,
-) -> _SageAttention2ppExecutionPlan:
-    """Combine portable capability defaults with exact-target measured policy."""
-    plan = _generic_sage_attention_2pp_execution_plan(
-        target,
-        candidate_block_m=candidate_block_m,
-        is_causal=is_causal,
-    )
-    if target.is_cuda_capability(8, 9):
-        return _apply_sm89_sage_attention_2pp_policy(
-            plan,
-            candidate_block_m=candidate_block_m,
-            query_length=query_length,
-            head_dim=head_dim,
-            is_causal=is_causal,
-        )
-    if target.is_cuda_capability(12, 0):
-        return _apply_sm120_sage_attention_2pp_policy(
-            plan,
-            candidate_block_m=candidate_block_m,
-            query_length=query_length,
-            key_length=key_length,
-            head_dim=head_dim,
-            is_causal=is_causal,
-        )
-    return plan
-
-
 def _default_sage_attention_2pp_execution_plan(
     query: torch.Tensor,
     key: torch.Tensor,
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
-) -> _SageAttention2ppExecutionPlan:
+) -> _policy.SageAttention2ppExecutionPlan:
     """Resolve the production plan used by both benchmark metadata and launch."""
     batch, heads, query_length, head_dim = query.shape
     candidate_block_m = (
         select_query_block(query, batch, heads, query_length) if query.device.type == "cuda" else 64
     )
     target = AcceleratorTarget.from_device(query.device) if target is None else target
-    return _select_sage_attention_2pp_execution_plan(
+    return _policy.select_execution_plan(
         target,
         candidate_block_m=candidate_block_m,
         query_length=query_length,
@@ -1001,7 +844,7 @@ class _PreparedSageAttention2pp:
     softmax_scale: float
     key_length: int
     is_causal: bool
-    plan: _SageAttention2ppExecutionPlan
+    plan: _policy.SageAttention2ppExecutionPlan
 
 
 def _compute_kv_statistics(
@@ -1057,7 +900,7 @@ def _quantize_key_value(
     key_mean: torch.Tensor,
     value_scale: torch.Tensor,
     storage_key_length: int,
-    plan: _SageAttention2ppExecutionPlan,
+    plan: _policy.SageAttention2ppExecutionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize K/V using the preprocessing schedule selected by ``plan``."""
     batch, heads, key_length, head_dim = key.shape
@@ -1172,7 +1015,7 @@ def _prepare_query(
     query: torch.Tensor,
     value_scale: torch.Tensor,
     softmax_scale: float,
-    plan: _SageAttention2ppExecutionPlan,
+    plan: _policy.SageAttention2ppExecutionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return Q and its scale argument for the selected attention specialization."""
     if plan.fuse_query_quantization:
@@ -1236,7 +1079,7 @@ def _prepare_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _SageAttention2ppExecutionPlan,
+    execution_plan: _policy.SageAttention2ppExecutionPlan,
 ) -> _PreparedSageAttention2pp:
     """Quantize inputs and construct the selected attention specialization."""
     key_length = key.shape[2]
@@ -1341,7 +1184,7 @@ def _run_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _SageAttention2ppExecutionPlan | None = None,
+    execution_plan: _policy.SageAttention2ppExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run SageAttention2++ preprocessing and its fused recurrence."""
     plan = (

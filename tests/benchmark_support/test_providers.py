@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from weakref import ReferenceType, ref
 
-from lib.providers import BenchmarkProvider, measure_provider
+from lib.providers import BenchmarkProvider, ProviderPhase, measure_provider, provider_phase_launch
 from lib.timing import ClockDomain, Timing
 
 
@@ -31,6 +31,24 @@ def _fake_wall_timer(
         p80_ms=2.2,
         clock=ClockDomain.SYNCHRONIZED_WALL,
     )
+
+
+def test_provider_phase_launch_centralizes_prepared_and_complete_boundaries() -> None:
+    events: list[str] = []
+    provider = BenchmarkProvider(
+        name="test",
+        prepare=lambda: events.append("prepare") or 3,
+        run=lambda value: events.append(f"run:{value}") or value,
+    )
+
+    prepared_launch = provider_phase_launch(provider, ProviderPhase.PREPARED_EXECUTION)
+    assert events == ["prepare"]
+    assert prepared_launch() == 3
+    assert events == ["prepare", "run:3"]
+
+    complete_launch = provider_phase_launch(provider, ProviderPhase.OPERATOR_END_TO_END)
+    assert complete_launch() == 3
+    assert events == ["prepare", "run:3", "prepare", "run:3"]
 
 
 def test_measure_provider_exercises_explicit_phases() -> None:

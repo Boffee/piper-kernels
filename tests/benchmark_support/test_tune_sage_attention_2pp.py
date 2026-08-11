@@ -8,15 +8,13 @@ from tune_sage_attention_2pp import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage_attention_2pp.triton import (
-    _select_sage_attention_2pp_execution_plan,
-)
+from piper_kernels.attention.sage_attention_2pp._policy import select_execution_plan
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 
 
 def _production_plan():
-    return _select_sage_attention_2pp_execution_plan(
+    return select_execution_plan(
         _SM120,
         candidate_block_m=128,
         query_length=8192,

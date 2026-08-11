@@ -166,13 +166,16 @@ def reference_linear(
         # Float32 represents each INT8 product exactly. Only very long reductions
         # can round the integer sum, which is preferable to rejecting the shape.
         accumulated = activation_qdata.float() @ qdata.T.float()
-    result = (
-        accumulated.to(torch.float32)
-        * activation_scale.to(torch.float32)
-        * scale.reshape(1, -1).to(torch.float32)
-    )
+    del rotated, activation_qdata
+
+    # Reuse the FP32 accumulator for the epilogue. Out-of-place broadcasts retain
+    # multiple full [rows, out_features] temporaries, which is prohibitive for
+    # large reference workloads even though the final BF16 output itself fits.
+    result = accumulated.to(torch.float32)
+    result.mul_(activation_scale.to(torch.float32))
+    result.mul_(scale.reshape(1, -1).to(torch.float32))
     if bias is not None:
-        result += bias.to(torch.float32)
+        result.add_(bias.to(torch.float32))
     return result.to(activation.dtype).reshape(*original_shape[:-1], qdata.shape[0])
 
 

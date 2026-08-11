@@ -1,6 +1,6 @@
 import pytest
-from lib.profiling import CudaProfilerController, ProfilePhase, profile_provider
-from lib.providers import BenchmarkProvider
+from lib.profiling import CudaProfilerController, profile_provider
+from lib.providers import BenchmarkProvider, ProviderPhase
 
 
 class FakeCapture:
@@ -92,7 +92,7 @@ def test_profile_excludes_compilation_and_warmup_by_default() -> None:
         "pop",
         "stop",
     ]
-    assert result.phase is ProfilePhase.OPERATOR_END_TO_END
+    assert result.phase is ProviderPhase.OPERATOR_END_TO_END
     assert not result.include_setup
 
 
@@ -134,14 +134,14 @@ def test_prepared_execution_prepares_once_outside_capture() -> None:
         _provider(events),
         iterations=2,
         warmup_iterations=0,
-        phase=ProfilePhase.PREPARED_EXECUTION,
+        phase=ProviderPhase.PREPARED_EXECUTION,
         controller=FakeCapture(events),
     )
 
     assert events.count("prepare") == 1
     assert events.count("run:3") == 3
     assert events.index("prepare") < events.index("start")
-    assert result.phase is ProfilePhase.PREPARED_EXECUTION
+    assert result.phase is ProviderPhase.PREPARED_EXECUTION
 
 
 def test_capture_is_stopped_when_measured_launch_fails() -> None:

@@ -1,6 +1,7 @@
 import pytest
 import torch
-from lib.tuning import TuningPhase
+from lib.attention import AttentionConfig
+from lib.providers import ProviderPhase
 from tune_piper_attention import (
     _candidate_plans,
     _make_candidate,
@@ -9,15 +10,13 @@ from tune_piper_attention import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention.triton import (
-    _select_piper_attention_execution_plan,
-)
+from piper_kernels.attention.piper_attention._policy import select_execution_plan
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 
 
 def _production_plan(*, is_causal: bool = False):
-    return _select_piper_attention_execution_plan(
+    return select_execution_plan(
         _SM120,
         candidate_block_m=128,
         query_length=8192,
@@ -31,7 +30,7 @@ def test_tuner_defaults_to_production_plan() -> None:
     arguments = _parse_args([])
 
     assert arguments.use_tensor_descriptors is None
-    assert arguments.phase is TuningPhase.PREPARED_EXECUTION
+    assert arguments.phase is ProviderPhase.PREPARED_EXECUTION
     assert arguments.minimum_sqnr_db == 20.0
     assert arguments.block_m is None
     assert arguments.num_warps is None
@@ -61,7 +60,7 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
             "2",
             "3",
             "--loop-num-stages",
-            "none",
+            "0",
             "2",
             "--use-packed-probability-conversion",
         ]
@@ -71,6 +70,7 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
 
     assert len(plans) == 16
     assert len({tuple(plan.as_dict().items()) for plan in plans}) == 16
+    assert {plan.loop_num_stages for plan in plans} == {None, 2}
 
 
 @pytest.mark.parametrize(
@@ -95,13 +95,12 @@ def test_candidate_configuration_uses_raw_execution_plan_fields() -> None:
     candidate = _make_candidate(
         plan,
         (tensor, tensor, tensor),
-        scale=128**-0.5,
-        is_causal=False,
+        config=AttentionConfig(dtype=torch.float16, scale=128**-0.5, seed=7),
         target=_SM120,
-        common_configuration={"dtype": "float16"},
     )
 
     assert plan.as_dict().items() <= candidate.configuration.items()
+    assert candidate.configuration["seed"] == 7
     assert "load_path" not in candidate.configuration
 
 

@@ -2,15 +2,19 @@ from collections.abc import Callable
 
 import pytest
 from lib.environment import EnvironmentInfo
-from lib.providers import BenchmarkProvider
+from lib.providers import BenchmarkProvider, ProviderPhase
 from lib.quality import QualityMetrics
 from lib.timing import ClockDomain, Timing
 from lib.tuning import (
     TuningCandidate,
-    TuningPhase,
     TuningStatus,
     UnsupportedTuningCandidateError,
+    boolean_tuning_axis,
+    meets_minimum_sqnr,
+    parse_optional_integer,
     tune_candidates,
+    tuning_axis,
+    validate_tuning_candidate_count,
 )
 from triton.runtime.errors import OutOfResources
 
@@ -33,7 +37,7 @@ def _environment() -> EnvironmentInfo:
     )
 
 
-def _quality(sqnr_db: float) -> QualityMetrics:
+def _quality(sqnr_db: float, *, nonfinite_mismatch_count: int = 0) -> QualityMetrics:
     return QualityMetrics(
         mean_absolute_error=0.0,
         max_absolute_error=0.0,
@@ -43,7 +47,7 @@ def _quality(sqnr_db: float) -> QualityMetrics:
         cosine_similarity=1.0,
         actual_nonfinite_count=0,
         reference_nonfinite_count=0,
-        nonfinite_mismatch_count=0,
+        nonfinite_mismatch_count=nonfinite_mismatch_count,
     )
 
 
@@ -69,6 +73,23 @@ def _candidate(name: str, latency: int) -> TuningCandidate[int, int]:
             configuration={"resolved": True},
         ),
     )
+
+
+def test_shared_tuning_axes_default_and_deduplicate_explicit_values() -> None:
+    assert tuning_axis(None, 64) == (64,)
+    assert tuning_axis([32, 64, 32], 128) == (32, 64)
+    assert boolean_tuning_axis(None, True) == (True,)
+    assert boolean_tuning_axis(False, True) == (False,)
+    assert parse_optional_integer("0") is None
+    assert parse_optional_integer("2") == 2
+
+    with pytest.raises(SystemExit, match="search expands to 6 candidates"):
+        validate_tuning_candidate_count(((32, 64), (True,), (1, 2, 3)), 5)
+
+
+def test_shared_sqnr_gate_rejects_nonfinite_mismatches() -> None:
+    assert meets_minimum_sqnr(_quality(20.0), 20.0)
+    assert not meets_minimum_sqnr(_quality(100.0, nonfinite_mismatch_count=1), 20.0)
 
 
 def test_tuning_selects_fastest_candidate_and_records_every_result() -> None:
@@ -189,7 +210,7 @@ def test_end_to_end_phase_uses_wall_timer(monkeypatch: pytest.MonkeyPatch) -> No
         tuning="attention",
         shape={},
         environment=_environment(),
-        phase=TuningPhase.OPERATOR_END_TO_END,
+        phase=ProviderPhase.OPERATOR_END_TO_END,
         warmup_ms=2,
         measurement_time_ms=5,
     )

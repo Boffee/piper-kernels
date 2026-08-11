@@ -7,25 +7,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
-from lib import (
+from lib.attention import (
+    ATTENTION_DTYPE_NAMES,
     AttentionConfig,
     AttentionShape,
-    BenchmarkRecord,
-    EnvironmentInfo,
-    OutputTarget,
-    TritonCompilerRecord,
-    add_compiler_inspection_arguments,
-    add_output_arguments,
-    add_profile_arguments,
-    capture_environment,
-    format_compiler_report,
-    inspect_provider,
+    attention_dtype,
     make_attention_inputs,
-    measure_provider,
-    measure_quality,
-    output_target,
-    profile_provider,
-    write_records,
+    run_sdpa,
 )
 from lib.attention_providers import (
     PROVIDER_NAMES,
@@ -33,8 +21,24 @@ from lib.attention_providers import (
     AttentionProvider,
     make_attention_providers,
     resolve_provider_names,
-    run_sdpa,
     validate_provider_support,
+)
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.profiling import add_profile_arguments, profile_provider
+from lib.providers import measure_provider
+from lib.quality import measure_quality
+from lib.reporting import (
+    BenchmarkRecord,
+    OutputTarget,
+    add_output_arguments,
+    output_target,
+    write_records,
+)
+from lib.triton_inspection import (
+    TritonCompilerRecord,
+    add_compiler_inspection_arguments,
+    format_compiler_report,
+    inspect_provider,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -72,7 +76,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
-    parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
+    parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--scale", type=float)
     parser.add_argument("--warmup-ms", type=int, default=100)
@@ -100,7 +104,7 @@ def _compiler_requested(args: argparse.Namespace) -> bool:
     return args.compiler_report or args.compiler_json is not None or args.compiler_jsonl is not None
 
 
-def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> None:
+def _validate_problem_args(args: argparse.Namespace) -> None:
     if any(length <= 0 for length in args.sequence):
         raise SystemExit("query sequence lengths must be positive")
     if args.kv_sequence is not None and args.kv_sequence <= 0:
@@ -115,6 +119,9 @@ def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> N
         and any(length != args.kv_sequence for length in args.sequence)
     ):
         raise SystemExit("causal attention requires equal query and key/value lengths")
+
+
+def _validate_mode_args(args: argparse.Namespace, provider_names: Sequence[str]) -> None:
     if (args.profile or _compiler_requested(args)) and len(args.sequence) != 1:
         raise SystemExit("profiling and compiler inspection require exactly one query length")
     if args.profile_provider is not None and args.profile_provider not in provider_names:
@@ -125,6 +132,11 @@ def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> N
         raise SystemExit("--compiler-provider requires a compiler report output option")
     if args.compiler_provider is not None and args.compiler_provider not in provider_names:
         raise SystemExit("--compiler-provider must also be selected by --providers")
+
+
+def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> None:
+    _validate_problem_args(args)
+    _validate_mode_args(args, provider_names)
 
 
 def _profile_provider_name(
@@ -167,10 +179,6 @@ def _output_targets(args: argparse.Namespace) -> tuple[OutputTarget | None, Outp
     ):
         raise SystemExit("benchmark and compiler output paths must be different")
     return benchmark_target, compiler_target
-
-
-def _dtype(name: str) -> torch.dtype:
-    return {"bfloat16": torch.bfloat16, "float16": torch.float16}[name]
 
 
 def _effective_tflops(
@@ -294,13 +302,13 @@ def _main(argv: Sequence[str] | None = None) -> None:
     benchmark_target, compiler_target = _output_targets(args)
 
     environment = capture_environment(Path(__file__).resolve().parents[1])
+    dtype = attention_dtype(args.dtype)
     config = AttentionConfig(
-        dtype=args.dtype,
+        dtype=dtype,
         is_causal=args.causal,
         scale=args.scale,
-        qkv_layout="BHSD",
+        seed=args.seed,
     )
-    generator = torch.Generator(device=device).manual_seed(args.seed)
     records: list[BenchmarkRecord] = []
     compiler_report: TritonCompilerRecord | None = None
 
@@ -318,9 +326,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
         )
         inputs = make_attention_inputs(
             shape,
-            dtype=_dtype(args.dtype),
+            config=config,
             device=device,
-            generator=generator,
         )
         providers = make_attention_providers(
             inputs,

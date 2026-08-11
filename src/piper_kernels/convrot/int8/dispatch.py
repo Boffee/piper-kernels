@@ -7,7 +7,6 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from .._torch_compat import is_fake_mode_active
-from ._policy import select_preparation_plan
 from .reference import (
     reference_addmm_,
     reference_linear,
@@ -66,10 +65,9 @@ def _needs_fake_cuda_kernel(tensor: torch.Tensor) -> bool:
     return is_fake_mode_active() and _accelerator_target(tensor.device) is None
 
 
-def _can_use_triton_linear(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
+def _supports_triton_linear_tensors(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
     if (
-        _triton_linear is None
-        or activation.device.type != "cuda"
+        activation.device.type != "cuda"
         or activation.device != qdata.device
         or activation.dtype not in (torch.float16, torch.bfloat16, torch.float32)
     ):
@@ -78,30 +76,15 @@ def _can_use_triton_linear(activation: torch.Tensor, qdata: torch.Tensor) -> boo
     return target is not None and target.cuda_capability_at_least(7, 5)
 
 
-def _can_use_triton_swiglu(
-    activation: torch.Tensor,
-    qdata: torch.Tensor,
-    group_size: int,
-) -> bool:
-    if (
-        _triton_swiglu_linear is None
-        or activation.device != qdata.device
-        or activation.ndim == 0
-        or activation.shape[-1] == 0
-    ):
-        return False
-    rows = activation.numel() // activation.shape[-1]
-    target = _accelerator_target(activation.device)
-    if target is None:
-        return False
-    return select_preparation_plan(
-        target,
-        rows=rows,
-        in_features=int(qdata.shape[1]),
-        group_size=group_size,
-        dtype=activation.dtype,
-        swiglu=True,
-    ).fuse_rotation_quantization
+def _can_use_triton_linear(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
+    return _triton_linear is not None and _supports_triton_linear_tensors(activation, qdata)
+
+
+def _can_use_triton_swiglu(activation: torch.Tensor, qdata: torch.Tensor) -> bool:
+    return _triton_swiglu_linear is not None and _supports_triton_linear_tensors(
+        activation,
+        qdata,
+    )
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_linear", mutates_args=())
@@ -162,8 +145,8 @@ def _convrot_int8_swiglu_linear_cuda(
     bias: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Select fused CUDA SwiGLU only in its measured eligibility region."""
-    if _can_use_triton_swiglu(activation, qdata, group_size):
+    """Run supported CUDA SwiGLU under the selected fused or split execution plan."""
+    if _can_use_triton_swiglu(activation, qdata):
         assert _triton_swiglu_linear is not None
         return _triton_swiglu_linear(activation, qdata, scale, bias, group_size)
     return reference_swiglu_linear(activation, qdata, scale, group_size, bias)
@@ -493,13 +476,9 @@ def _linear_with_input_activation_from_storage(
         if bias is not None:
             result += bias.to(torch.float32)
         return result.to(activation.dtype)
-    # As above, unsupported SwiGLU remains visible as portable PyTorch ops to
-    # compilers instead of being hidden behind the semantic custom op.
-    if _needs_fake_cuda_kernel(activation) or _can_use_triton_swiglu(
-        activation,
-        qdata,
-        group_size,
-    ):
+    # Unsupported backends remain visible as portable PyTorch ops to compilers
+    # instead of being hidden behind the semantic custom op.
+    if _needs_fake_cuda_kernel(activation) or _can_use_triton_swiglu(activation, qdata):
         return _convrot_int8_swiglu_linear_op(
             activation,
             qdata,
