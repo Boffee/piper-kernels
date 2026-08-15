@@ -20,7 +20,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
-from piper_kernels.attention.scheduling import select_query_block
 
 from . import _policy
 
@@ -75,9 +74,9 @@ def _kv_statistics_partial_kernel(
     block_n: tl.constexpr,
 ):
     partial = tl.program_id(0)
-    batch_head = tl.program_id(1)
-    batch = batch_head // heads
-    head = batch_head % heads
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    batch_head = batch * heads + head
     offsets_n = partial * block_n + tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
     mask = offsets_n[:, None] < key_length
@@ -192,99 +191,6 @@ def _quantize_value_kernel(
         quantized,
         mask=mask,
     )
-
-
-@triton.jit
-def _quantize_kv_per_block_kernel(
-    key_ptr,
-    value_ptr,
-    key_mean_ptr,
-    value_scale_ptr,
-    key_output_ptr,
-    value_output_ptr,
-    key_scale_ptr,
-    key_length,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_kob,
-    stride_koh,
-    stride_kon,
-    stride_vob,
-    stride_voh,
-    stride_vod,
-    stride_ksb,
-    stride_ksh,
-    heads: tl.constexpr,
-    head_dim: tl.constexpr,
-):
-    """Quantize one K or V block selected from a shared role grid."""
-    role = tl.program_id(0)
-    num_key_blocks = tl.num_programs(0) // 2
-    batch_head = tl.program_id(1)
-    batch = batch_head // heads
-    head = batch_head % heads
-    offsets_d = tl.arange(0, head_dim)
-
-    if role < num_key_blocks:
-        key_offsets_n = role * _BLOCK_N + tl.arange(0, _BLOCK_N)
-        key_mask = key_offsets_n[:, None] < key_length
-        key_mean = tl.load(key_mean_ptr + batch_head * head_dim + offsets_d)
-        key_values = tl.load(
-            key_ptr
-            + batch * stride_kb
-            + head * stride_kh
-            + key_offsets_n[:, None] * stride_kn
-            + offsets_d[None, :],
-            mask=key_mask,
-            other=0.0,
-        ).to(tl.float32)
-        key_values = tl.where(key_mask, key_values - key_mean[None, :], 0.0)
-        key_maximum = tl.max(tl.max(tl.abs(key_values), axis=1), axis=0)
-        key_scale = key_maximum / _INT8_MAX + _SCALE_EPSILON
-        key_quantized = qk_quantization.round_to_int8(key_values / key_scale)
-        tl.store(
-            key_output_ptr
-            + batch * stride_kob
-            + head * stride_koh
-            + key_offsets_n[:, None] * stride_kon
-            + offsets_d[None, :],
-            key_quantized,
-            mask=key_mask,
-        )
-        tl.store(
-            key_scale_ptr + batch * stride_ksb + head * stride_ksh + role,
-            key_scale,
-        )
-    else:
-        value_block = role - num_key_blocks
-        value_offsets_n = value_block * _BLOCK_N + tl.arange(0, _BLOCK_N)
-        value_mask = value_offsets_n[:, None] < key_length
-        value_values = tl.load(
-            value_ptr
-            + batch * stride_vb
-            + head * stride_vh
-            + value_offsets_n[:, None] * stride_vn
-            + offsets_d[None, :],
-            mask=value_mask,
-            other=0.0,
-        ).to(tl.float32)
-        value_scale = tl.load(value_scale_ptr + batch_head * head_dim + offsets_d)
-        # This fused quantizer is selected only by the SM120 plan, where the
-        # stock lowering emitted fewer SASS instructions than packed inline PTX.
-        value_quantized = (value_values / value_scale[None, :]).to(tl.float8e4nv)
-        tl.store(
-            value_output_ptr
-            + batch * stride_vob
-            + head * stride_voh
-            + offsets_d[None, :] * stride_vod
-            + value_offsets_n[:, None],
-            value_quantized,
-            mask=value_mask,
-        )
 
 
 @triton.jit
@@ -408,7 +314,6 @@ def _causal_attention_tile(
     diagonal_or_tail: tl.constexpr,
     grouped_qk: tl.constexpr,
     fuse_query_quantization: tl.constexpr,
-    use_unscaled_score_recurrence: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -417,10 +322,6 @@ def _causal_attention_tile(
     use_tensor_descriptors: tl.constexpr,
 ):
     """Advance causal online-softmax state by one prefix or boundary tile."""
-    tl.static_assert(
-        not use_unscaled_score_recurrence or not diagonal_or_tail,
-        "unscaled-score recurrence requires a fully valid causal prefix tile",
-    )
     current_n = start_n + offsets_n
     key = _load_attention_key_tile(
         key_ptr,
@@ -435,18 +336,18 @@ def _causal_attention_tile(
     )
     integer_scores = tl.dot(query, key)
     if grouped_qk:
+        groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
         key_scale = tl.load(
             key_scale_ptr
             + (batch * heads + head) * tl.cdiv(key_length, block_n)
             + start_n // block_n
         )
+        raw_scores = integer_scores.to(tl.float32).reshape((groups, _QUERY_GROUP_SIZE, block_n))
         if fuse_query_quantization:
-            groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
-            score_scale = query_scale * key_scale
-            raw_scores = integer_scores.to(tl.float32).reshape((groups, _QUERY_GROUP_SIZE, block_n))
-            scores = (raw_scores * score_scale[:, None, None]).reshape((block_m, block_n))
+            score_scale = (query_scale * key_scale)[:, None]
         else:
-            scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale
+            score_scale = (query_scale * key_scale).reshape((groups, _QUERY_GROUP_SIZE))
+        scores = (raw_scores * score_scale[:, :, None]).reshape((block_m, block_n))
     else:
         key_scale = tl.load(
             key_scale_ptr + (batch * heads + head) * key_length + current_n,
@@ -458,21 +359,23 @@ def _causal_attention_tile(
         valid_keys = (current_n[None, :] < key_length) & (current_n[None, :] <= offsets_m[:, None])
         scores = tl.where(valid_keys, scores, -float("inf"))
 
-    if fuse_query_quantization and use_unscaled_score_recurrence:
+    # A grouped Q scale and this tile's K scale form one positive multiplier
+    # for each score row, so complete causal-prefix tiles can reduce first.
+    if grouped_qk and not diagonal_or_tail:
         raw_block_max = tl.max(raw_scores, axis=2)
         block_max = tl.fma(
             raw_block_max,
-            score_scale[:, None],
+            score_scale,
             -_P_FP8_LOG2_MAX,
         ).reshape((block_m,))
     else:
         block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_MAX
     next_max = tl.maximum(running_max, block_max)
     old_weight = tl.exp2(running_max - next_max)
-    if fuse_query_quantization and use_unscaled_score_recurrence:
+    if grouped_qk and not diagonal_or_tail:
         probability_log2 = tl.fma(
             raw_scores,
-            score_scale[:, None, None],
+            score_scale[:, :, None],
             -next_max.reshape((groups, _QUERY_GROUP_SIZE, 1)),
         ).reshape((block_m, block_n))
         probabilities = tl.exp2(probability_log2)
@@ -527,7 +430,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
     fuse_query_quantization: tl.constexpr,
-    use_unscaled_score_recurrence: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     reverse_causal_blocks: tl.constexpr,
     loop_num_stages: tl.constexpr,
@@ -541,10 +443,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
     tl.static_assert(
         not fuse_query_quantization or grouped_qk,
         "fused Q quantization requires grouped Q/K scales",
-    )
-    tl.static_assert(
-        not use_unscaled_score_recurrence or fuse_query_quantization,
-        "unscaled-score recurrence requires fused Q quantization",
     )
     tl.static_assert(block_n == _BLOCK_N, "SageAttention2++ requires 64-key tiles")
     query_block = tl.program_id(0)
@@ -565,8 +463,9 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
         mask=offsets_m[:, None] < query_length,
         other=0,
     )
-    if fuse_query_quantization:
+    if grouped_qk:
         groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
+    if fuse_query_quantization:
         query, query_scale = _quantize_query_tile(  # pyright: ignore[reportGeneralTypeIssues]
             query_values,
             softmax_scale,
@@ -630,7 +529,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 diagonal_or_tail=False,
                 grouped_qk=grouped_qk,
                 fuse_query_quantization=fuse_query_quantization,
-                use_unscaled_score_recurrence=use_unscaled_score_recurrence,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 heads=heads,
                 head_dim=head_dim,
@@ -665,7 +563,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 diagonal_or_tail=True,
                 grouped_qk=grouped_qk,
                 fuse_query_quantization=fuse_query_quantization,
-                use_unscaled_score_recurrence=False,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 heads=heads,
                 head_dim=head_dim,
@@ -701,14 +598,13 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                     + (batch * heads + head) * tl.cdiv(key_length, block_n)
                     + start_n // block_n
                 )
+                raw_scores = integer_scores.to(tl.float32).reshape(
+                    (groups, _QUERY_GROUP_SIZE, block_n)
+                )
                 if fuse_query_quantization:
-                    score_scale = query_scale * key_scale
-                    raw_scores = integer_scores.to(tl.float32).reshape(
-                        (groups, _QUERY_GROUP_SIZE, block_n)
-                    )
-                    scores = (raw_scores * score_scale[:, None, None]).reshape((block_m, block_n))
+                    score_scale = (query_scale * key_scale)[:, None]
                 else:
-                    scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale
+                    score_scale = (query_scale * key_scale).reshape((groups, _QUERY_GROUP_SIZE))
             else:
                 key_scale = tl.load(
                     key_scale_ptr + (batch * heads + head) * key_length + current_n,
@@ -717,11 +613,8 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 )
                 scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
             valid_keys = current_n[None, :] < key_length
-            if fuse_query_quantization and use_unscaled_score_recurrence:
+            if grouped_qk:
                 valid_keys = tl.broadcast_to(valid_keys, (block_m, block_n))
-            scores = tl.where(valid_keys, scores, -float("inf"))
-
-            if fuse_query_quantization and use_unscaled_score_recurrence:
                 raw_scores = tl.where(
                     valid_keys.reshape((groups, _QUERY_GROUP_SIZE, block_n)),
                     raw_scores,
@@ -730,17 +623,18 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 raw_block_max = tl.max(raw_scores, axis=2)
                 block_max = tl.fma(
                     raw_block_max,
-                    score_scale[:, None],
+                    score_scale,
                     -_P_FP8_LOG2_MAX,
                 ).reshape((block_m,))
             else:
+                scores = tl.where(valid_keys, scores, -float("inf"))
                 block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_MAX
             next_max = tl.maximum(running_max, block_max)
             old_weight = tl.exp2(running_max - next_max)
-            if fuse_query_quantization and use_unscaled_score_recurrence:
+            if grouped_qk:
                 probability_log2 = tl.fma(
                     raw_scores,
-                    score_scale[:, None, None],
+                    score_scale[:, :, None],
                     -next_max.reshape((groups, _QUERY_GROUP_SIZE, 1)),
                 ).reshape((block_m, block_n))
                 probabilities = tl.exp2(probability_log2)
@@ -811,22 +705,16 @@ def _make_attention_tensor_descriptors(
 
 def _default_sage_attention_2pp_execution_plan(
     query: torch.Tensor,
-    key: torch.Tensor,
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
 ) -> _policy.SageAttention2ppExecutionPlan:
     """Resolve the production plan used by both benchmark metadata and launch."""
-    batch, heads, query_length, head_dim = query.shape
-    candidate_block_m = (
-        select_query_block(query, batch, heads, query_length) if query.device.type == "cuda" else 64
-    )
+    head_dim = query.shape[3]
     target = AcceleratorTarget.from_device(query.device) if target is None else target
     return _policy.select_execution_plan(
         target,
-        candidate_block_m=candidate_block_m,
-        query_length=query_length,
-        key_length=key.shape[2],
+        candidate_block_m=128,
         head_dim=head_dim,
         is_causal=is_causal,
     )
@@ -860,7 +748,7 @@ def _compute_kv_statistics(
     partial_shape = (batch, heads, num_partials, head_dim)
     key_sum_partial = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
     value_max_partial = torch.empty_like(key_sum_partial)
-    _kv_statistics_partial_kernel[(num_partials, batch * heads)](
+    _kv_statistics_partial_kernel[(num_partials, heads, batch)](
         key,
         value,
         key_sum_partial,
@@ -904,7 +792,7 @@ def _quantize_key_value(
     storage_key_length: int,
     plan: _policy.SageAttention2ppExecutionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize K/V using the preprocessing schedule selected by ``plan``."""
+    """Quantize K and V into the attention kernel's storage layouts."""
     batch, heads, key_length, head_dim = key.shape
     value_shape = (batch, heads, head_dim, storage_key_length)
     value_fp8 = (
@@ -914,47 +802,6 @@ def _quantize_key_value(
     )
 
     num_key_blocks = int(triton.cdiv(key_length, _BLOCK_N))
-    if plan.fuse_kv_quantization:
-        key_shape = (batch, heads, storage_key_length, head_dim)
-        key_int8 = (
-            torch.zeros(key_shape, device=key.device, dtype=torch.int8)
-            if storage_key_length != key_length
-            else torch.empty(key_shape, device=key.device, dtype=torch.int8)
-        )
-        key_scale = torch.empty(
-            (batch, heads, num_key_blocks),
-            device=key.device,
-            dtype=torch.float32,
-        )
-        _quantize_kv_per_block_kernel[(num_key_blocks * 2, batch * heads)](
-            key,
-            value,
-            key_mean,
-            value_scale,
-            key_int8,
-            value_fp8,
-            key_scale,
-            key_length,
-            key.stride(0),
-            key.stride(1),
-            key.stride(2),
-            value.stride(0),
-            value.stride(1),
-            value.stride(2),
-            key_int8.stride(0),
-            key_int8.stride(1),
-            key_int8.stride(2),
-            value_fp8.stride(0),
-            value_fp8.stride(1),
-            value_fp8.stride(2),
-            key_scale.stride(0),
-            key_scale.stride(1),
-            heads=heads,
-            head_dim=head_dim,
-            num_warps=4,
-        )
-        return key_int8, value_fp8, key_scale
-
     key_int8, key_scale = qk_quantization.prepare_key(
         key,
         key_mean,
@@ -1019,27 +866,15 @@ def _prepare_sage_attention_2pp(
         else key_length
     )
     key_mean, value_scale = _compute_kv_statistics(key, value)
-    if plan.fuse_kv_quantization:
-        key_int8, value_fp8, key_scale = _quantize_key_value(
-            key,
-            value,
-            key_mean,
-            value_scale,
-            storage_key_length,
-            plan,
-        )
-        query_argument, query_scale = _prepare_query(query, value_scale, scale, plan)
-    else:
-        # Preserve the portable path's established Q -> K -> V launch order.
-        query_argument, query_scale = _prepare_query(query, value_scale, scale, plan)
-        key_int8, value_fp8, key_scale = _quantize_key_value(
-            key,
-            value,
-            key_mean,
-            value_scale,
-            storage_key_length,
-            plan,
-        )
+    query_argument, query_scale = _prepare_query(query, value_scale, scale, plan)
+    key_int8, value_fp8, key_scale = _quantize_key_value(
+        key,
+        value,
+        key_mean,
+        value_scale,
+        storage_key_length,
+        plan,
+    )
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     key_argument: torch.Tensor | TensorDescriptor = key_int8
     value_argument: torch.Tensor | TensorDescriptor = value_fp8
@@ -1084,9 +919,6 @@ def _launch_sage_attention_2pp(prepared: _PreparedSageAttention2pp) -> torch.Ten
         is_causal=prepared.is_causal,
         grouped_qk=plan.grouped_qk,
         fuse_query_quantization=plan.fuse_query_quantization,
-        # Reducing before applying the positive row scale cuts spill traffic in
-        # very long loops, but the alternate schedule loses at shorter lengths.
-        use_unscaled_score_recurrence=plan.use_unscaled_score_recurrence,
         use_packed_probability_conversion=plan.use_packed_probability_conversion,
         reverse_causal_blocks=plan.reverse_causal_blocks,
         loop_num_stages=plan.loop_num_stages,
@@ -1117,7 +949,6 @@ def _run_sage_attention_2pp(
         if execution_plan is not None
         else _default_sage_attention_2pp_execution_plan(
             query,
-            key,
             is_causal,
         )
     )

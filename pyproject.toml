@@ -82,6 +82,9 @@ ignore = [
 "benchmarks/*.py" = ["T201"]
 "src/piper_kernels/_triton/*.py" = ["ANN"]
 "src/piper_kernels/**/triton.py" = ["ANN", "PLR0913", "PLR0917"]
+"src/piper_kernels/attention/piper_attention/_quantization.py" = [
+    "ANN", "PLR0913", "PLR0917",
+]
 "tests/**/*.py" = ["ANN", "ARG", "PLR2004", "S101"]
 
 [tool.ruff.lint.pylint]

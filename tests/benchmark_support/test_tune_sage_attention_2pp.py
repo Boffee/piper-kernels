@@ -17,8 +17,6 @@ def _production_plan():
     return select_execution_plan(
         _SM120,
         candidate_block_m=128,
-        query_length=8192,
-        key_length=8192,
         head_dim=128,
         is_causal=False,
     )
@@ -33,9 +31,8 @@ def test_omitted_axes_measure_only_the_production_plan() -> None:
     assert choice.num_warps == 4
     assert choice.num_stages == 3
     assert choice.use_tensor_descriptors
-    assert choice.fuse_kv_quantization
     assert choice.fuse_query_quantization
-    assert choice.use_packed_probability_conversion
+    assert not choice.use_packed_probability_conversion
 
 
 def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
@@ -65,9 +62,7 @@ def test_boolean_axes_use_execution_plan_field_names_directly() -> None:
     arguments = _parse_args(
         [
             "--no-use-tensor-descriptors",
-            "--no-fuse-kv-quantization",
             "--no-fuse-query-quantization",
-            "--no-use-unscaled-score-recurrence",
             "--no-reverse-causal-blocks",
             "--no-loop-licm",
             "--no-use-packed-probability-conversion",
@@ -77,9 +72,7 @@ def test_boolean_axes_use_execution_plan_field_names_directly() -> None:
     choice = _candidate_choices(arguments, _production_plan())[0]
 
     assert not choice.use_tensor_descriptors
-    assert not choice.fuse_kv_quantization
     assert not choice.fuse_query_quantization
-    assert not choice.use_unscaled_score_recurrence
     assert not choice.reverse_causal_blocks
     assert not choice.loop_licm
     assert not choice.use_packed_probability_conversion

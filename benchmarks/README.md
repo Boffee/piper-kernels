@@ -66,6 +66,95 @@ This tooling never changes production dispatch or autotunes in a user's hot path
 is available as a versioned record accepted by the common JSON/JSONL writer, and the winner is
 marked with `selected: true`.
 
+### Attention tuning workload anchors
+
+Use these shared shapes when selecting attention execution plans. They are sampling anchors for
+the surrounding workload, not exact production shapes or dispatch keys.
+
+| Axis | Anchors | Scope |
+|:---|:---|:---|
+| Batch and dtype | `B1`, BF16 | Use FP16 as a secondary check when the path supports it. |
+| Local heads | `H16`, `H48` | `H` is the local query/output head count presented to one device after at most two-way attention sharding. `H16` samples the lower-parallelism/sharded regime and `H48` the high-parallelism/unsharded regime. Do not dispatch on these sampled head counts. |
+| Head dimension | `D64`, `D128` | Measure both unless an implementation has a structural dimension restriction. |
+| Short square guard | `Q=KV=2048` | Check affected dimensions and causal modes for compilation, quality, occupancy, or major latency cliffs. This is a sanity guard, not a performance anchor or dispatch key. |
+| Square sequence | `Q=KV=8192`, `32768`, `131072` | Measure causal and non-causal execution. Causal attention is square-only in the current API. |
+| Rectangular sequence | `Q=8192, KV=32768` and the reverse | Measure non-causal execution when query and key/value work may behave differently. |
+
+The current benchmark requires `Hq=Hkv=H`. For GQA or MQA, these anchors describe query-head
+parallelism only; they do not reproduce the reduced KV-head memory and preparation costs, which
+need separate coverage.
+
+The exact SM120 SageAttention2++ production plan uses 128-row query tiles at every supported
+sequence length, matching the pinned canonical CUDA implementation. Its D128 path fuses query
+quantization at every length, while D64 quantizes Q separately. Grouped-Q/K tiles reduce raw score
+maxima before applying their positive grouped scale regardless of where Q is quantized; causal
+diagonal/tail tiles and portable per-thread-scale paths retain scale-before-max. K and V use
+separate quantization launches on every target. These choices have no sequence-length crossover,
+while smaller query tiles remain available as explicit M64 tuning candidates. Stock probability
+conversion is uniform across SM120 shapes. The D64 paths were confirmed at H16/H48 across all
+three performance anchors, with 2K and 8193 as short and ragged guards. A fixed-plan H16 screen
+rejected uniform tensor descriptors: D64 descriptors were 2–14% slower than pointer loads from 2K
+through 128K, with identical quality, so the D64-pointer/D128-descriptor distinction remains
+explicit.
+
+Exact-SM120 Piper policy likewise avoids short-context tuning thresholds: D128 always uses split
+PV, all non-causal attention derives its V log-scale bound, and non-causal D64 uses 128-row query
+tiles. Causal and non-causal D128 keep two FP32 D64 accumulators at every length;
+across H16/H48 and the three performance anchors, splitting causal D128 was 14.8–17.2% faster end
+to end than one FP32 D128 accumulator, with no measurable quality change. Earlier synthetic
+measurements found scaled FP16 10–14% faster than FP32 at 8K/32K/64K for only
+0.04/0.15/0.29 dB lower SQNR, and 8–9% faster at 128K with a 0.55 dB loss. Real MiniMax-H3
+activations at H56/D128 and 104K exposed a less stable quality tradeoff: FP16 lost 3.21 dB and
+3.90 dB versus FP32 in early and middle sampled layers, and changed the complete transformer
+output by 27.26 dB SQNR / 4.33% relative L2. Quality therefore takes precedence over those
+synthetic latency wins, and the scaled-FP16 recurrence and its 128K policy boundary have been
+removed. Non-causal D128 uniformly uses M128 tensor descriptors; above 128K, that schedule was
+6–9% faster on aligned square inputs and 55–59% faster on the long ragged and rectangular guards
+than M64 pointer loads. The shared FP32 numerator recurrence keeps numerators in UINT8
+probability-code units for D64 and D128 in both causal and non-causal attention, and removes the
+common factor of 255 once in the output epilogue, before non-causal value-mean restoration. On
+SM120 across H16/H48, D64/D128, and all three performance anchors, that scaling change reduced
+end-to-end latency by a per-cell median 0.47–2.00% over three fresh processes without a measurable
+quality change.
+
+An H16/H48 fixed-plan screen retained M64 for causal attention. D128 M128 was roughly 1.9–2.1x
+slower at 8K–128K and compiled with 112 spills versus 16 for M64. D64 M128 was 4.8–6.4% slower at
+8K and ranged from 3.6% slower to effectively tied at 32K; although it became 5.8–7.2% faster at
+128K, adding a D64-only length crossover was rejected in favor of one causal M64 policy. Portable
+targets retain conservative explicit fallbacks.
+
+Production attention planning starts from a 128-row query tile. Target policies explicitly select
+smaller tiles where kernel resource use requires them; head count and sequence length do not feed a
+separate CTA-count heuristic. Default production plan selection depends only on accelerator target,
+head dimension, and causal mode—not query or key length. Smaller tiles and alternate metadata paths
+remain available to the offline tuners.
+
+Treat 8K, 32K, and 128K as evidence for one continuous plan rather than dispatch keys. Prefer a
+length-invariant policy whenever the algorithm is valid across the range; sampled anchors alone do
+not justify a threshold or a square-only specialization. If a future implementation has an
+unavoidable applicability or material performance boundary, probe immediately below and above it
+plus an irregular interior length. Performance selection starts at 8K; use the 2K guard only to
+reject pathological short-context behavior, not to create another crossover.
+
+Tail correctness and long-context performance need different coverage. Exercise tile boundaries
+cheaply with small square lengths such as `63`, `64`, `65`, `127`, `128`, `129`, and `193`.
+For realistic ragged performance guards, use `Q=KV=8193` and, for non-causal attention,
+`Q=8193, KV=8192` plus the reverse. The directional 8K/32K pair remains an aspect-ratio stress
+test; it is not a substitute for these near-square tail guards.
+
+Small ragged tests establish the tile-local masking contract, but they do not replace the aligned
+128K performance and quality anchor. Add one long ragged smoke at `Q=KV=131073`, using H16 with
+D64 and D128; it need not repeat the full H16/H48 matrix unless its result is unexpected. Test both
+`131072` and `131073` explicitly even though current production plans have no 128K transition:
+numerator precision, tile size, loading strategy, and score-reduction choices remain uniform across
+sequence lengths.
+
+Screen against the current production plan, then confirm a proposed winner in at least three fresh
+processes with alternating candidate/baseline order and an otherwise idle accelerator. Record
+quality and both `prepared_execution` and `operator_end_to_end`; use end-to-end timing for the
+production decision. Freeze only the smallest explainable boundary, and validate each accelerator
+architecture independently.
+
 The executable Piper Attention tuner consumes the same immutable execution plan as production.
 Omitted axes retain their production values, so the default invocation measures exactly the
 production plan:
@@ -97,7 +186,7 @@ uv run python benchmarks/tune_piper_attention.py \
   --use-tensor-descriptors \
   --block-m 64 128 \
   --num-stages 2 3 \
-  --reverse-causal-blocks \
+  --optimize-causal-traversal \
   --loop-num-stages 0 3 \
   --loop-licm \
   --use-packed-probability-conversion \
@@ -334,9 +423,10 @@ Native mixed-sign lowering currently requires NVIDIA SM8x or consumer Blackwell 
 `m16n8k32` MMAv2 path. Turing, Hopper WGMMA, datacenter Blackwell, and ROCm mixed-sign lowering
 are not supported by this extension. The native benchmark installs the hook automatically before
 JIT compilation; production native-UINT8 launchers use the same selection-time installation.
-Unsupported targets should select the exact affine signed-INT8 proxy instead. The benchmark
-records the LHS, RHS, and accumulator dtypes explicitly, checks exact INT32 output including
-UINT8 values above 127, and records operand saturation.
+On unsupported targets, use the exact affine signed-INT8 proxy as a benchmark control; the
+production operator uses its portable quantized reference. The benchmark records the LHS, RHS,
+and accumulator dtypes explicitly, checks exact INT32 output including UINT8 values above 127,
+and records operand saturation.
 
 Inspect the generated mixed-sign MMA while verifying exact output with:
 
@@ -364,8 +454,7 @@ names. For example:
 ```shell
 uv run python benchmarks/benchmark_attention.py \
   --sequence 8192 \
-  --providers piper_attention piper_attention_affine \
-              sage_attention_2pp pytorch-sdpa
+  --providers piper_attention sage_attention_2pp pytorch-sdpa
 ```
 
 Add the revision-pinned official CUDA SageAttention2++ and SageAttention2 providers
@@ -393,12 +482,12 @@ packed-probability-conversion choices.
 Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA operators:
 
 - `preparation` includes compact K mean reduction, non-causal V mean reduction, Q/K/V
-  quantization, scale metadata, and affine correction metadata when requested;
+  quantization, and scale metadata;
 - `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
   plus the centered-mean epilogue for non-causal calls;
 - `operator_end_to_end` runs preparation and the fused kernel as one complete call.
 
-Machine records also identify Q/K granularity and native versus affine mixed-sign execution.
+Machine records also identify Q/K granularity.
 Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research controls remain
 reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`; they are not copied
 into the installed package.
@@ -475,12 +564,14 @@ and Triton 3.7.1.post27. BF16 B1/H8/D128 warmed device-event medians measured:
 | 131,072 | causal | 164.773 | 157.340 | +4.7% |
 
 Negative gaps mean Triton was faster. The retained D128 causal schedule uses 128
-query rows, four warps, two launch stages, and reverse CTA ordering from 8K onward.
-The long non-causal path uses 128 query rows, four warps, 64-key tiles,
-loop-invariant-code motion, and a three-stage loop pipeline. Packed native
+query rows, four warps, two launch stages, and reverse CTA ordering. The non-causal D128 path uses
+128 query rows, four warps, 64-key tiles, loop-invariant-code motion, and a three-stage loop
+pipeline. Current production applies these measured schedules uniformly rather than retaining an
+8K dispatch boundary. Packed native
 `cvt.rn.satfinite.e4m3x2.f32` replaces stock Triton's software E4M3 conversion
 on the SM89 probability and V paths. These imported measurements establish a 5%
-non-inferiority checkpoint; they were not reproduced locally without SM89 hardware.
+non-inferiority checkpoint at 8K and above; sub-8K performance was not reproduced locally without
+SM89 hardware.
 
 ### Packed E4M3 conversion SM120 portability check
 
@@ -501,12 +592,14 @@ packed worktrees; the 128K runs rotated clean, ungated, and selective worktrees:
 
 Compiler inspection showed the packed D128 causal attention kernel increasing from
 22 to 24 spills, while the packed fused-V quantizer added eight SASS instructions.
-Production therefore keeps stock conversion for SM120 fused V and D128 causal
-probabilities, while retaining packed probabilities on the beneficial paths. A final
-three-round comparison of this selective policy measured +0.02% / -0.05% hot deltas
-at causal D128 8K / 32K. At 128K, the selective policy retained a -1.19% non-causal
-gain and measured -0.07% causal versus clean; the corresponding ungated attention
-kernel raised causal spills from 18 to 20. Quality metrics were unchanged.
+The earlier selective policy kept stock conversion for that path: a final three-round
+comparison measured +0.02% / -0.05% hot deltas at causal D128 8K / 32K. At 128K, it
+retained a -1.19% non-causal gain and measured -0.07% causal versus clean; the
+corresponding ungated attention kernel raised causal spills from 18 to 20. A later H16/H48
+screen found stock conversion faster in five of six causal D128 anchor cells: packed
+conversion was about 1.5–2.8% slower except for a 0.6% H16/32K win. The current cleanup
+therefore uses stock conversion uniformly on exact SM120 rather than retaining a
+shape-specific branch. Quality metrics were unchanged.
 
 ### Piper Attention regression baseline
 

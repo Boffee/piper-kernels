@@ -131,32 +131,62 @@ def test_triton_matches_quantized_reference(
 
 @pytest.mark.skipif(
     not _sm120_available(),
-    reason="unscaled-score recurrence is tuned for SM120",
+    reason="raw-score reduction before scaling is tuned for SM120",
 )
 @pytest.mark.parametrize(
-    ("is_causal", "threshold_name"),
-    [
-        (False, "_NONCAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH"),
-        (True, "_CAUSAL_UNSCALED_SCORE_MIN_KEY_LENGTH"),
-    ],
+    ("head_dim", "is_causal", "fuse_query"),
+    [(64, False, False), (64, True, False), (128, False, True), (128, True, True)],
 )
-def test_unscaled_score_recurrence_matches_quantized_reference(
-    monkeypatch: pytest.MonkeyPatch,
+def test_intrinsic_grouped_raw_score_reduction_matches_quantized_reference(
+    head_dim: int,
     is_causal: bool,
-    threshold_name: str,
+    fuse_query: bool,
 ) -> None:
-    monkeypatch.setattr(sage_attention_2pp_policy, threshold_name, 0)
     plan = sage_attention_2pp_policy.select_execution_plan(
         AcceleratorTarget(backend="cuda", architecture="sm120"),
         candidate_block_m=64,
-        query_length=193,
-        key_length=193,
+        head_dim=head_dim,
+        is_causal=is_causal,
+    )
+    assert plan.grouped_qk
+    assert plan.fuse_query_quantization is fuse_query
+    torch.manual_seed(432)
+    query = torch.randn(1, 2, 193, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    with torch.no_grad():
+        actual = _run_sage_attention_2pp(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            is_causal,
+        )
+        expected = reference_sage_attention_2pp(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            is_causal,
+            qk_quantization="per_warp",
+        )
+    error = (actual.float() - expected.float()).abs()
+
+    assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_sm89_d128_schedule_runs_at_short_sequence(is_causal: bool) -> None:
+    plan = sage_attention_2pp_policy.select_execution_plan(
+        AcceleratorTarget(backend="cuda", architecture="sm89"),
+        candidate_block_m=128,
         head_dim=128,
         is_causal=is_causal,
     )
-    assert plan.fuse_query_quantization
-    assert plan.use_unscaled_score_recurrence
-    torch.manual_seed(432)
+    torch.manual_seed(433 + is_causal)
     query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
@@ -168,6 +198,7 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
             value,
             128**-0.5,
             is_causal,
+            execution_plan=plan,
         )
         expected = reference_sage_attention_2pp(
             query,
@@ -175,7 +206,7 @@ def test_unscaled_score_recurrence_matches_quantized_reference(
             value,
             128**-0.5,
             is_causal,
-            qk_quantization="per_warp",
+            qk_quantization="per_thread",
         )
     error = (actual.float() - expected.float()).abs()
 
@@ -194,16 +225,14 @@ def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
-        query, key, False
+        query, False
     )
     alternate_plan = replace(
         production_plan,
         block_m=64,
         num_stages=2,
         use_tensor_descriptors=False,
-        fuse_kv_quantization=False,
         fuse_query_quantization=False,
-        use_unscaled_score_recurrence=False,
         loop_num_stages=3,
         loop_licm=True,
     )
@@ -291,7 +320,6 @@ def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
     pointer_plan = replace(
         sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
             query,
-            key,
             False,
         ),
         use_tensor_descriptors=False,
@@ -309,36 +337,6 @@ def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
         )
 
     assert torch.equal(actual, expected)
-
-
-@pytest.mark.skipif(
-    not _sm120_available(),
-    reason="128-row long-causal schedule is tuned for SM120",
-)
-def test_long_causal_schedule_runs_with_128_row_tiles() -> None:
-    torch.manual_seed(442)
-    query = torch.randn(1, 8, 4224, 128, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-    plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
-        query,
-        key,
-        True,
-    )
-
-    with torch.no_grad():
-        prepared = sage_attention_2pp_backend._prepare_sage_attention_2pp(
-            query,
-            key,
-            value,
-            128**-0.5,
-            True,
-            execution_plan=plan,
-        )
-        assert prepared.plan.block_m == 128
-        actual = sage_attention_2pp_backend._launch_sage_attention_2pp(prepared)
-
-    assert torch.isfinite(actual).all()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

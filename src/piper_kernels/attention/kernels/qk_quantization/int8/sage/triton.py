@@ -22,10 +22,13 @@ def round_to_int8(values):
 
 
 @triton.jit
-def quantize_query_per_thread_kernel(
+def quantize_query_per_thread_group(
     query_ptr,
     output_ptr,
     scale_ptr,
+    scale_group,
+    head,
+    batch,
     query_length,
     softmax_scale,
     stride_qb,
@@ -38,9 +41,7 @@ def quantize_query_per_thread_kernel(
     stride_sh,
     head_dim: tl.constexpr,
 ):
-    scale_group = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
+    """Quantize one per-thread Q scale group for standalone or fused launchers."""
     query_block = scale_group // 8
     thread = scale_group % 8
     offsets_n = query_block * 32 + tl.arange(0, 4) * 8 + thread
@@ -71,6 +72,45 @@ def quantize_query_per_thread_kernel(
         scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
         scale * (softmax_scale * _LOG2_E),
         mask=offsets_n < query_length,
+    )
+
+
+@triton.jit
+def quantize_query_per_thread_kernel(
+    query_ptr,
+    output_ptr,
+    scale_ptr,
+    query_length,
+    softmax_scale,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    head_dim: tl.constexpr,
+):
+    """Standalone launcher for the shared per-thread Q component."""
+    quantize_query_per_thread_group(
+        query_ptr,
+        output_ptr,
+        scale_ptr,
+        tl.program_id(0),
+        tl.program_id(1),
+        tl.program_id(2),
+        query_length,
+        softmax_scale,
+        stride_qb,
+        stride_qh,
+        stride_qn,
+        stride_ob,
+        stride_oh,
+        stride_on,
+        stride_sb,
+        stride_sh,
+        head_dim,
     )
 
 
@@ -125,11 +165,14 @@ def quantize_query_per_warp_kernel(
 
 
 @triton.jit
-def quantize_key_per_thread_kernel(
+def quantize_key_per_thread_group(
     key_ptr,
     mean_ptr,
     output_ptr,
     scale_ptr,
+    scale_group,
+    head,
+    batch,
     key_length,
     stride_kb,
     stride_kh,
@@ -142,9 +185,7 @@ def quantize_key_per_thread_kernel(
     heads: tl.constexpr,
     head_dim: tl.constexpr,
 ):
-    scale_group = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
+    """Quantize one per-thread K scale group for standalone or fused launchers."""
     key_block = scale_group // 4
     thread = scale_group % 4
     group_offsets = tl.arange(0, 16)
@@ -178,6 +219,47 @@ def quantize_key_per_thread_kernel(
         scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
         scale,
         mask=offsets_n < key_length,
+    )
+
+
+@triton.jit
+def quantize_key_per_thread_kernel(
+    key_ptr,
+    mean_ptr,
+    output_ptr,
+    scale_ptr,
+    key_length,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Standalone launcher for the shared per-thread K component."""
+    quantize_key_per_thread_group(
+        key_ptr,
+        mean_ptr,
+        output_ptr,
+        scale_ptr,
+        tl.program_id(0),
+        tl.program_id(1),
+        tl.program_id(2),
+        key_length,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_ob,
+        stride_oh,
+        stride_on,
+        stride_sb,
+        stride_sh,
+        heads,
+        head_dim,
     )
 
 

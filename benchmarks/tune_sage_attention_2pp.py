@@ -52,9 +52,7 @@ class _SageAttention2ppTuningChoice:
     num_warps: int
     num_stages: int
     use_tensor_descriptors: bool
-    fuse_kv_quantization: bool
     fuse_query_quantization: bool
-    use_unscaled_score_recurrence: bool
     reverse_causal_blocks: bool
     loop_num_stages: int | None
     loop_licm: bool
@@ -68,9 +66,7 @@ class _SageAttention2ppTuningChoice:
             f"w{self.num_warps}",
             f"s{self.num_stages}",
             "descriptor" if self.use_tensor_descriptors else "pointer",
-            "fused-kv" if self.fuse_kv_quantization else "separate-kv",
             "fused-q" if self.fuse_query_quantization else "separate-q",
-            "unscaled-score" if self.use_unscaled_score_recurrence else "scaled-score",
             "reverse" if self.reverse_causal_blocks else "forward",
             f"loop{self.loop_num_stages or 'default'}",
             "licm" if self.loop_licm else "no-licm",
@@ -87,17 +83,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_attention_tuning_arguments(parser)
     parser.add_argument(
-        "--fuse-kv-quantization",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
         "--fuse-query-quantization",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--use-unscaled-score-recurrence",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
@@ -118,16 +104,8 @@ def _candidate_choices(
             production_plan.use_tensor_descriptors,
         ),
         boolean_tuning_axis(
-            args.fuse_kv_quantization,
-            production_plan.fuse_kv_quantization,
-        ),
-        boolean_tuning_axis(
             args.fuse_query_quantization,
             production_plan.fuse_query_quantization,
-        ),
-        boolean_tuning_axis(
-            args.use_unscaled_score_recurrence,
-            production_plan.use_unscaled_score_recurrence,
         ),
         boolean_tuning_axis(
             args.reverse_causal_blocks,
@@ -167,9 +145,7 @@ def _resolve_plan(
             num_warps=choice.num_warps,
             num_stages=choice.num_stages,
             use_tensor_descriptors=choice.use_tensor_descriptors,
-            fuse_kv_quantization=choice.fuse_kv_quantization,
             fuse_query_quantization=choice.fuse_query_quantization,
-            use_unscaled_score_recurrence=choice.use_unscaled_score_recurrence,
             reverse_causal_blocks=choice.reverse_causal_blocks,
             loop_num_stages=choice.loop_num_stages,
             loop_licm=choice.loop_licm,
@@ -275,10 +251,9 @@ def _main(argv: Sequence[str] | None = None) -> None:
         seed=args.seed,
     )
     inputs = make_attention_inputs(shape, config=config, device=device)
-    query, key, _ = inputs
+    query, _, _ = inputs
     production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
         query,
-        key,
         args.causal,
         target=target,
     )

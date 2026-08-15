@@ -15,12 +15,16 @@ from .attention import ATTENTION_DTYPE_NAMES
 from .tuning import add_tuning_arguments, parse_optional_integer, validate_tuning_arguments
 
 
-def add_attention_tuning_arguments(parser: argparse.ArgumentParser) -> None:
+def add_attention_tuning_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_reverse_causal_blocks: bool = True,
+) -> None:
     """Add workload and shared launch-plan axes for an attention tuner."""
     parser.add_argument("--sequence", type=int, default=8192)
     parser.add_argument("--kv-sequence", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
     parser.add_argument("--causal", action="store_true")
@@ -32,11 +36,12 @@ def add_attention_tuning_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument(
-        "--reverse-causal-blocks",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
+    if include_reverse_causal_blocks:
+        parser.add_argument(
+            "--reverse-causal-blocks",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+        )
     parser.add_argument(
         "--loop-num-stages",
         type=parse_optional_integer,
@@ -67,6 +72,6 @@ def validate_attention_tuning_arguments(arguments: argparse.Namespace) -> None:
         raise SystemExit("batch size and heads must be positive")
     if arguments.causal and lengths[0] != lengths[1]:
         raise SystemExit("causal attention requires equal query and key/value lengths")
-    if not arguments.causal and arguments.reverse_causal_blocks is True:
+    if not arguments.causal and getattr(arguments, "reverse_causal_blocks", None) is True:
         raise SystemExit("reverse causal-block order requires causal attention")
     validate_tuning_arguments(arguments)

@@ -41,12 +41,29 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _policy as piper_attention_policy
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
 
-_validate_args = validate_attention_tuning_arguments
+
+def _validate_args(arguments: argparse.Namespace) -> None:
+    """Validate shared attention controls and Piper-only causal traversal."""
+    validate_attention_tuning_arguments(arguments)
+    if not arguments.causal and arguments.optimize_causal_traversal is True:
+        raise SystemExit("optimized causal traversal requires causal attention")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_attention_tuning_arguments(parser)
+    add_attention_tuning_arguments(parser, include_reverse_causal_blocks=False)
+    parser.add_argument(
+        "--derive-value-log-bound",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="derive the V log-scale bound from its FP32 multiplier; omitted retains production",
+    )
+    parser.add_argument(
+        "--optimize-causal-traversal",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="use reverse CTA order with an unmasked prefix and masked boundary",
+    )
     return parser.parse_args(argv)
 
 
@@ -63,15 +80,19 @@ def _candidate_plans(
             args.use_tensor_descriptors,
             production_plan.use_tensor_descriptors,
         ),
-        boolean_tuning_axis(
-            args.reverse_causal_blocks,
-            production_plan.reverse_causal_blocks,
-        ),
         tuning_axis(args.loop_num_stages, production_plan.loop_num_stages),
         boolean_tuning_axis(args.loop_licm, production_plan.loop_licm),
         boolean_tuning_axis(
             args.use_packed_probability_conversion,
             production_plan.use_packed_probability_conversion,
+        ),
+        boolean_tuning_axis(
+            args.derive_value_log_bound,
+            production_plan.derive_value_log_bound,
+        ),
+        boolean_tuning_axis(
+            args.optimize_causal_traversal,
+            production_plan.optimize_causal_traversal,
         ),
     )
     validate_tuning_candidate_count(axes, args.max_candidates)
@@ -82,20 +103,22 @@ def _candidate_plans(
             num_warps=num_warps,
             num_stages=num_stages,
             use_tensor_descriptors=use_tensor_descriptors,
-            reverse_causal_blocks=reverse_causal_blocks,
             loop_num_stages=loop_num_stages,
             loop_licm=loop_licm,
             use_packed_probability_conversion=use_packed_probability_conversion,
+            derive_value_log_bound=derive_value_log_bound,
+            optimize_causal_traversal=optimize_causal_traversal,
         )
         for (
             block_m,
             num_warps,
             num_stages,
             use_tensor_descriptors,
-            reverse_causal_blocks,
             loop_num_stages,
             loop_licm,
             use_packed_probability_conversion,
+            derive_value_log_bound,
+            optimize_causal_traversal,
         ) in product(*axes)
     )
     return plans
@@ -104,12 +127,14 @@ def _candidate_plans(
 def _plan_name(plan: piper_attention_policy.PiperAttentionExecutionPlan) -> str:
     load_path = "descriptor" if plan.use_tensor_descriptors else "pointer"
     loop_stages = plan.loop_num_stages if plan.loop_num_stages is not None else "default"
-    block_order = "reverse" if plan.reverse_causal_blocks else "forward"
     licm = "licm" if plan.loop_licm else "no-licm"
     probability_conversion = "packed-p" if plan.use_packed_probability_conversion else "stock-p"
+    value_metadata = "derived-vlog" if plan.derive_value_log_bound else "stored-vlog"
+    causal_traversal = "optimized-causal" if plan.optimize_causal_traversal else "monolithic"
     return (
         f"{load_path}-m{plan.block_m}-w{plan.num_warps}-s{plan.num_stages}-"
-        f"{block_order}-loop{loop_stages}-{licm}-{probability_conversion}"
+        f"loop{loop_stages}-{licm}-{probability_conversion}-{value_metadata}-"
+        f"{causal_traversal}"
     )
 
 
@@ -190,10 +215,9 @@ def _main(argv: Sequence[str] | None = None) -> None:
         seed=args.seed,
     )
     inputs = make_attention_inputs(shape, config=config, device=device)
-    query, key, _ = inputs
+    query, _, _ = inputs
     production_plan = piper_attention_backend._default_piper_attention_execution_plan(
         query,
-        key,
         args.causal,
         target=target,
     )

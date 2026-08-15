@@ -74,7 +74,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="fixed key/value length; defaults to each query length",
     )
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
     parser.add_argument("--causal", action="store_true")
