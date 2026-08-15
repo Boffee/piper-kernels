@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 type ConvRotInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 

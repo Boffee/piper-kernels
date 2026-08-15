@@ -7,10 +7,10 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
-from piper_kernels.convrot.int8 import _policy as convrot_policy
-from piper_kernels.convrot.int8 import triton as convrot_backend
-from piper_kernels.convrot.int8.reference import reference_linear, reference_swiglu_linear
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
+from piper_kernels.linear.convrot.int8 import triton as convrot_backend
+from piper_kernels.linear.convrot.int8.reference import reference_linear, reference_swiglu_linear
 
 from .convrot import ConvRotConfig, ConvRotInputs, ConvRotShape, make_convrot_inputs
 from .providers import BenchmarkProvider
@@ -130,7 +130,7 @@ def make_public_convrot_provider(
         configuration={
             **workload.common_configuration(),
             "operation_entrypoint": (
-                "piper_kernels.convrot.convrot_linear"
+                "piper_kernels.linear.convrot.convrot_linear"
                 if shape.input_activation == "swiglu"
                 else "torch.nn.functional.linear"
             ),

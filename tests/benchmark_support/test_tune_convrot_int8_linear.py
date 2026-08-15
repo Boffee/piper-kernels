@@ -13,8 +13,8 @@ from tune_convrot_int8_linear import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot.int8 import triton as convrot_backend
-from piper_kernels.convrot.int8._policy import select_execution_plan
+from piper_kernels.linear.convrot.int8 import triton as convrot_backend
+from piper_kernels.linear.convrot.int8._policy import select_execution_plan
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 

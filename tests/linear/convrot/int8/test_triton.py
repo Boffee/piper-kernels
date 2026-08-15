@@ -8,11 +8,11 @@ from torch import nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
-from piper_kernels.convrot._rotation import rotate_groups
-from piper_kernels.convrot.int8 import dispatch as convrot_dispatch
-from piper_kernels.convrot.int8 import triton as triton_backend
-from piper_kernels.convrot.int8.reference import (
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot._rotation import rotate_groups
+from piper_kernels.linear.convrot.int8 import dispatch as convrot_dispatch
+from piper_kernels.linear.convrot.int8 import triton as triton_backend
+from piper_kernels.linear.convrot.int8.reference import (
     reference_addmm_,
     reference_linear,
     reference_swiglu_linear,

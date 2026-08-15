@@ -39,7 +39,7 @@ from lib.reporting import (
     write_records,
 )
 
-from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 _MIN_PIPER_SQNR_DB = 20.0
 _MAX_COMFY_RELATIVE_L2_ERROR = 0.02

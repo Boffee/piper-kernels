@@ -6,8 +6,8 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels.convrot._rotation import build_hadamard, rotate_groups
-from piper_kernels.convrot._torch_compat import is_fake_mode_active
+from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.linear.convrot._torch_compat import is_fake_mode_active
 
 
 @pytest.mark.parametrize(

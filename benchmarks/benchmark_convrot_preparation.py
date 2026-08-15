@@ -37,8 +37,8 @@ from lib.triton_inspection import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot.int8 import _policy as convrot_policy
-from piper_kernels.convrot.int8 import triton as triton_backend
+from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
+from piper_kernels.linear.convrot.int8 import triton as triton_backend
 
 COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
 PIPER_TRITON_PROVIDER = "piper-triton"
@@ -69,10 +69,10 @@ class PreparationPhaseResult:
 
 
 _PHASE_PROVENANCE = {
-    "rotate": "piper_kernels.convrot.int8.triton._rotate_activations",
-    "quantize": "piper_kernels.convrot.int8.triton._quantize_activations",
+    "rotate": "piper_kernels.linear.convrot.int8.triton._rotate_activations",
+    "quantize": "piper_kernels.linear.convrot.int8.triton._quantize_activations",
     "split": "Piper _rotate_activations followed by _quantize_activations",
-    "fused": "piper_kernels.convrot.int8.triton._fused_rotate_quantize_activations",
+    "fused": "piper_kernels.linear.convrot.int8.triton._fused_rotate_quantize_activations",
     "comfy-kitchen": "comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64",
 }
 

@@ -14,8 +14,9 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 | Package | Role |
 |---|---|
 | `piper_kernels` | Public Piper Attention and SageAttention2++ forward operators |
-| `piper_kernels.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
 | `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
+| `piper_kernels.linear` | Linear operators, tensor formats, and optimized backends |
+| `piper_kernels.linear.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
 
 ## Triton setup
 
@@ -38,7 +39,7 @@ then use the resulting tensor as a normal linear weight:
 ```python
 import torch
 
-from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
 
 weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=256)
 checkpoint_weight = ConvRotInt8Tensor.from_quantized(

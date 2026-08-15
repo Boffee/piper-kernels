@@ -12,9 +12,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- Large-M dense forward-linear tuning guidance now standardizes a BF16, bias-free Cartesian matrix over
-  `M=8K/32K`, `N=4K/16K`, and non-power-of-two `K=6144/14336` as model-neutral measurement
-  anchors rather than dispatch keys. ConvRot INT8 applies group size 256 to this matrix.
+- ConvRot tensors and linear operators now live under `piper_kernels.linear.convrot`, mirroring
+  the `piper_kernels.attention` package hierarchy. The former `piper_kernels.convrot` import path
+  has been removed.
+- Large-M dense forward-linear tuning guidance now standardizes a BF16, bias-free Cartesian
+  matrix over `M=8K/32K`, `N=4K/16K`, and non-power-of-two `K=6144/14336` as model-neutral
+  measurement anchors rather than dispatch keys. ConvRot INT8 applies group size 256 to this matrix.
   Its benchmark accepts Cartesian M/N/K axes, and its benchmark and tuner defaults now start from
   the lower-width anchor instead of power-of-two toy dimensions. `M=131073` is reserved for final
   long, ragged, and 64-bit-indexing validation.

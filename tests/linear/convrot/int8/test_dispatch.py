@@ -9,8 +9,8 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
-from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
-from piper_kernels.convrot.int8 import dispatch as convrot_dispatch
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot.int8 import dispatch as convrot_dispatch
 
 
 def test_semantic_operator_schemas_and_fake_kernels_exist_without_triton() -> None:
@@ -21,7 +21,7 @@ def test_semantic_operator_schemas_and_fake_kernels_exist_without_triton() -> No
         sys.modules["triton"] = None
 
         import torch
-        from piper_kernels.convrot.int8 import dispatch
+        from piper_kernels.linear.convrot.int8 import dispatch
 
         assert dispatch._triton_addmm_ is None
         assert dispatch._triton_linear is None

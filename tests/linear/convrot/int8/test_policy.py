@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot.int8._policy import (
+from piper_kernels.linear.convrot.int8._policy import (
     ConvRotInt8LinearExecutionPlan,
     select_execution_plan,
 )

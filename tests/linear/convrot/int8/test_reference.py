@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
-from piper_kernels.convrot import ConvRotInt8Tensor, convrot_linear
-from piper_kernels.convrot._rotation import build_hadamard, rotate_groups
-from piper_kernels.convrot.int8.reference import (
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.linear.convrot.int8.reference import (
     dynamic_quantize_rows,
     reference_swiglu_linear,
 )
