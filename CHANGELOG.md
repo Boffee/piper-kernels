@@ -12,6 +12,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Large-M dense forward-linear tuning guidance now standardizes a BF16, bias-free Cartesian matrix over
+  `M=8K/32K`, `N=4K/16K`, and non-power-of-two `K=6144/14336` as model-neutral measurement
+  anchors rather than dispatch keys. ConvRot INT8 applies group size 256 to this matrix.
+  Its benchmark accepts Cartesian M/N/K axes, and its benchmark and tuner defaults now start from
+  the lower-width anchor instead of power-of-two toy dimensions. `M=131073` is reserved for final
+  long, ragged, and 64-bit-indexing validation.
 - SM120 Piper causal attention now traverses its mask-free prefix separately from the masked
   diagonal boundary and launches query blocks in reverse order. D128 uniformly uses split PV,
   with two FP32 accumulators for causal and non-causal attention at every sequence length. The

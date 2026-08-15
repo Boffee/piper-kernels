@@ -217,6 +217,48 @@ SM120. It can search a future CUDA target once that target is supported by the k
 does not enable a new backend. In particular, AMD `gfx1200`/`gfx1201` remain unsupported until
 the inline PTX FP8 conversion and NVIDIA FP8-MMA path have HIP equivalents.
 
+### Large-M dense forward-linear tuning workload anchors
+
+Use these shared model-neutral shapes when selecting execution plans for large-M dense
+forward-linear implementations. They sample large transformer and diffusion-model projections;
+they are not exact production shapes or dispatch keys. For a flattened linear, the input is
+`[M, K]`, the weight is `[N, K]`, and the output is `[M, N]`. Small-M decode/GEMV, sparse,
+expert-routed, backward, and fused graph operations require separate workload coverage.
+
+| Axis | Anchors | Scope |
+|:---|:---|:---|
+| Accelerator and activation dtype | One accelerator architecture at a time, BF16 | Use FP16 as a secondary quality and code-generation check. Do not transfer a measured schedule between architectures without validating it there. |
+| Base operator | Bias-free ordinary linear | Keep the primary matrix comparable across implementations. Bias and fused activations remain correctness or integration checks. |
+| Activation rows `M` | `8192`, `32768` | These are the primary performance anchors. They sample two already-parallel large-row regimes without making routine searches pay the memory and runtime cost of 128K rows. |
+| Output features `N` | `4096`, `16384` | The Cartesian pair samples narrower and wider output grids, including contraction and expansion workloads. |
+| Input features `K` | `6144`, `14336` | Neither is a power of two, while both preserve regular 256-wide grouping and common GEMM K-tile alignment. This avoids using power-of-two widths as the only evidence. |
+| Final long/ragged guard | `M=131073` | Run only after selecting a winner and only on an accelerator with sufficient memory. This checks 128K-scale behavior, a partial final M tile, and—at `N=16384`—64-bit output indexing beyond `2^31` elements. It is not a routine performance anchor or dispatch key. |
+
+For ConvRot INT8, hold group size 256 and include rotation, row quantization, GEMM, and scale
+epilogue in the measured operator. Rowwise preparation uses power-of-two program extents, so the
+two K anchors exercise masked extents of 8192 and 16384. Other linear implementations should
+retain their native storage and quantization contract and report any implementation-specific
+packing or padding; ConvRot's group size and preparation extent are not general linear rules.
+
+The primary matrix is the Cartesian product of the two `M`, `N`, and `K` values: eight cells.
+Run ordinary dense linears throughout that matrix. At `M=32768`, separately check graph forms
+that change the operator boundary when an integration uses them:
+
+- raw `[up | gate]` SwiGLU with `N=4096`, linear `K=14336`, and raw input width 28672;
+- one fused QKV projection with `K=6144`, `N=12288` versus three `N=4096` projections over the
+  same input. This graph-level fusion is distinct from fusing ConvRot rotation and quantization.
+
+These integration guards use concrete dimensions to make the comparison exact; they are not
+production policy predicates.
+
+Treat 8K and 32K as evidence for one continuous large-M plan. Screen against the current
+production plan, then confirm a proposed winner in at least three fresh processes with alternating
+candidate/baseline order and an otherwise idle accelerator. Record quality and both
+`prepared_execution` and `operator_end_to_end`; use end-to-end timing for the production decision.
+Validate the selected plan at `M=131073` on `(N, K)=(16384, 6144)` for expansion and 64-bit
+indexing, and `(N, K)=(4096, 14336)` for contraction. Expand to the full N/K matrix only if those
+results are unexpected.
+
 The ConvRot INT8 forward-linear tuner searches the immutable production execution plan shared
 by ordinary and explicit SwiGLU linears. Its default `prepared_execution` boundary deliberately
 keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed operator because
@@ -226,15 +268,16 @@ overhead should also participate. Quality compares every low-precision output el
 fused FP32 norm reductions without materializing full promoted copies. The public benchmark and
 tuner construct the same deterministic ConvRot workload, full portable reference, common
 metadata, and provider adapters; the benchmark uses normal public dispatch while the tuner
-substitutes explicit execution-plan candidates.
+substitutes explicit execution-plan candidates. Its default workload is the lower ordinary-linear
+anchor: BF16, group 256, no bias, `M=8192`, `N=4096`, and `K=6144`.
 
 ```shell
 uv run python benchmarks/tune_convrot_int8_linear.py \
-  --rows 37710 --out-features 5376 --in-features 14336 \
-  --input-activation swiglu --no-bias \
-  --fuse-rotation-quantization --fused-num-warps 8 16 \
-  --matmul-block-m 32 64 128 --matmul-block-n 64 128 \
-  --matmul-block-k 32 64 --matmul-num-warps 4 8 \
+  --rows 8192 --out-features 4096 --in-features 6144 --no-bias \
+  --fuse-rotation-quantization --fused-num-warps 4 8 \
+  --matmul-block-m 64 128 --matmul-block-n 128 256 \
+  --matmul-block-k 32 64 128 --matmul-num-warps 4 8 \
+  --phase operator_end_to_end \
   --json artifacts/convrot_int8_linear_sm120_tuning.json
 ```
 
@@ -328,6 +371,21 @@ Run the ConvRot provider comparison with:
 uv run python benchmarks/benchmark_convrot.py
 ```
 
+The default comparison samples both primary M anchors at the lower-width corner: BF16, group 256,
+no bias, `M=8192/32768`, `N=4096`, and `K=6144`. The three dimension options accept lists and form
+a Cartesian product. Run the complete eight-cell primary matrix with:
+
+```shell
+uv run python benchmarks/benchmark_convrot.py \
+  --rows 8192 32768 \
+  --out-features 4096 16384 \
+  --in-features 6144 14336 \
+  --no-bias
+```
+
+Use explicit smaller rows for a cheap correctness or launch-latency smoke; they are not tuning
+evidence for the large-M production plan.
+
 Use `--help` to select activation rows, weight dimensions, group size, dtype,
 deterministic input seed, and timing windows. `--in-features` is linear and weight width `K`;
 omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw `[up | gate]` input
@@ -352,7 +410,7 @@ Compare against the optional Comfy Kitchen CUDA provider with:
 ```shell
 uv run --with comfy-kitchen==0.2.28 \
   python benchmarks/benchmark_convrot.py \
-  --rows 256 --out-features 4096 --in-features 4096 \
+  --rows 8192 --out-features 4096 --in-features 6144 \
   --compare-comfy-kitchen
 ```
 
@@ -367,11 +425,11 @@ Diagnose activation preparation independently, using preallocated outputs, with:
 uv run python benchmarks/benchmark_convrot_preparation.py
 
 uv run python benchmarks/benchmark_convrot_preparation.py \
-  --rows 32768 --in-features 4096 --input-activation swiglu
+  --rows 32768 --in-features 6144 --input-activation swiglu
 
 uv run --with comfy-kitchen==0.2.28 \
   python benchmarks/benchmark_convrot_preparation.py \
-  --rows 32768 --in-features 4096 --compare-comfy-kitchen
+  --rows 32768 --in-features 6144 --compare-comfy-kitchen
 ```
 
 The preparation benchmark reports rotation, rowwise quantization, their two-launch split,
@@ -396,9 +454,9 @@ The common compiler-report adapter can inspect one width per fresh process:
 
 ```shell
 uv run python benchmarks/benchmark_convrot_preparation.py \
-  --rows 37710 --in-features 5376 \
+  --rows 32768 --in-features 6144 \
   --compiler-report --no-sass \
-  --compiler-json artifacts/convrot-preparation-5376.json
+  --compiler-json artifacts/convrot-preparation-6144.json
 ```
 
 Compiler records include specialization fingerprints, registers, spills, shared memory,

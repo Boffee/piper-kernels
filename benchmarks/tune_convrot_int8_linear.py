@@ -11,6 +11,9 @@ from pathlib import Path
 import torch
 from lib.convrot import (
     CONVROT_DTYPE_NAMES,
+    DENSE_LINEAR_ANCHOR_IN_FEATURES,
+    DENSE_LINEAR_ANCHOR_OUT_FEATURES,
+    DENSE_LINEAR_ANCHOR_ROWS,
     ConvRotConfig,
     ConvRotInputs,
     ConvRotShape,
@@ -45,16 +48,36 @@ from piper_kernels.convrot.int8 import _policy as convrot_policy
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=256)
-    parser.add_argument("--out-features", type=int, default=4096)
-    parser.add_argument("--in-features", type=int, default=4096)
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=DENSE_LINEAR_ANCHOR_ROWS[0],
+        help="activation rows M (default: 8192)",
+    )
+    parser.add_argument(
+        "--out-features",
+        type=int,
+        default=DENSE_LINEAR_ANCHOR_OUT_FEATURES[0],
+        help="linear output width N (default: 4096)",
+    )
+    parser.add_argument(
+        "--in-features",
+        type=int,
+        default=DENSE_LINEAR_ANCHOR_IN_FEATURES[0],
+        help="linear/weight width K (default: 6144)",
+    )
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
         choices=("swiglu",),
         default=None,
     )
-    parser.add_argument("--no-bias", action="store_true")
+    parser.add_argument(
+        "--bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="include bias (default: disabled)",
+    )
     parser.add_argument(
         "--dtype",
         choices=CONVROT_DTYPE_NAMES,
@@ -243,7 +266,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         args.out_features,
         args.in_features,
         args.input_activation,
-        not args.no_bias,
+        args.bias,
     )
     config = ConvRotConfig(
         dtype=convrot_dtype(args.dtype),

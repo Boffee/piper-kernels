@@ -16,6 +16,9 @@ _DTYPES = {
     "float32": torch.float32,
 }
 CONVROT_DTYPE_NAMES = tuple(_DTYPES)
+DENSE_LINEAR_ANCHOR_ROWS = (8192, 32768)
+DENSE_LINEAR_ANCHOR_OUT_FEATURES = (4096, 16384)
+DENSE_LINEAR_ANCHOR_IN_FEATURES = (6144, 14336)
 
 
 @dataclass(slots=True, frozen=True)
@@ -27,7 +30,7 @@ class ConvRotShape:
     out_features: int
     in_features: int
     input_activation: str | None = None
-    has_bias: bool = True
+    has_bias: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:

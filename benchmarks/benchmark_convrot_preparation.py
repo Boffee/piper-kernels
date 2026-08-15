@@ -13,6 +13,8 @@ from typing import TypedDict
 
 import torch
 from lib.convrot import (
+    DENSE_LINEAR_ANCHOR_IN_FEATURES,
+    DENSE_LINEAR_ANCHOR_ROWS,
     apply_input_activation,
     comfy_convrot_input,
     convrot_dtype,
@@ -115,15 +117,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rows",
         type=int,
-        default=256,
-        help="activation rows M (default: 256)",
+        default=DENSE_LINEAR_ANCHOR_ROWS[0],
+        help="activation rows M (default: 8192)",
     )
     parser.add_argument(
         "--in-features",
         type=int,
         nargs="+",
-        default=[4096],
-        help="linear/weight widths K (default: 4096); raw SwiGLU input width is 2K",
+        default=[DENSE_LINEAR_ANCHOR_IN_FEATURES[0]],
+        help="linear/weight widths K (default: 6144); raw SwiGLU input width is 2K",
     )
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument(

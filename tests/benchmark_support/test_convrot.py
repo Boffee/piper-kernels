@@ -89,33 +89,48 @@ def _phase_timings() -> PhaseTimings:
     )
 
 
-def test_shapes_expand_requested_rows() -> None:
-    arguments = _parse_args(["--rows", "3", "7", "--out-features", "96", "--in-features", "512"])
+def test_shapes_expand_requested_dimension_product() -> None:
+    arguments = _parse_args(
+        [
+            "--rows",
+            "3",
+            "7",
+            "--out-features",
+            "96",
+            "128",
+            "--in-features",
+            "512",
+            "768",
+        ]
+    )
 
     shapes = _benchmark_shapes(arguments)
 
     actual = [(shape.name, shape.rows, shape.out_features, shape.in_features) for shape in shapes]
     assert actual == [
         ("linear", 3, 96, 512),
+        ("linear", 3, 96, 768),
+        ("linear", 3, 128, 512),
+        ("linear", 3, 128, 768),
         ("linear", 7, 96, 512),
+        ("linear", 7, 96, 768),
+        ("linear", 7, 128, 512),
+        ("linear", 7, 128, 768),
     ]
 
 
-def test_default_shapes_use_generic_power_of_two_dimensions() -> None:
+def test_default_shapes_use_lower_width_linear_anchors() -> None:
     arguments = _parse_args([])
     preparation_arguments = _parse_preparation_args([])
 
-    assert [
-        (shape.rows, shape.out_features, shape.in_features)
-        for shape in _benchmark_shapes(arguments)
-    ] == [
-        (1, 4096, 4096),
-        (16, 4096, 4096),
-        (64, 4096, 4096),
-        (256, 4096, 4096),
+    shapes = _benchmark_shapes(arguments)
+    assert [(shape.rows, shape.out_features, shape.in_features) for shape in shapes] == [
+        (8192, 4096, 6144),
+        (32768, 4096, 6144),
     ]
-    assert preparation_arguments.rows == 256
-    assert preparation_arguments.in_features == [4096]
+    assert all(not shape.has_bias for shape in shapes)
+    assert preparation_arguments.rows == 8192
+    assert preparation_arguments.in_features == [6144]
 
 
 def test_shape_can_include_swiglu_without_bias() -> None:
@@ -138,6 +153,13 @@ def test_shape_can_include_swiglu_without_bias() -> None:
     assert shape.input_activation == "swiglu"
     assert not shape.has_bias
     assert raw_input_features(shape.in_features, shape.input_activation) == 1024
+
+
+def test_bias_is_enabled_only_explicitly() -> None:
+    assert not ConvRotShape("linear", 3, 96, 512).has_bias
+    assert not _benchmark_shapes(_parse_args([]))[0].has_bias
+    assert _benchmark_shapes(_parse_args(["--bias"]))[0].has_bias
+    assert not _benchmark_shapes(_parse_args(["--no-bias"]))[0].has_bias
 
 
 def test_omitted_cli_input_activation_is_python_none() -> None:
@@ -195,14 +217,21 @@ def test_shared_public_provider_and_reference_use_the_same_workload() -> None:
     "arguments",
     [
         ["--rows", "0"],
-        ["--out-features", "0"],
-        ["--in-features", "0"],
+        ["--out-features", "96", "0"],
+        ["--in-features", "512", "0"],
     ],
 )
 def test_shape_cli_rejects_nonpositive_dimensions(arguments: list[str]) -> None:
     parsed = _parse_args(arguments)
 
     with pytest.raises(SystemExit, match="must all be positive"):
+        _validate_args(parsed)
+
+
+def test_shape_cli_validates_every_input_width_group() -> None:
+    parsed = _parse_args(["--in-features", "512", "640"])
+
+    with pytest.raises(SystemExit, match="every in_features value"):
         _validate_args(parsed)
 
 

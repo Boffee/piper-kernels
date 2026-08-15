@@ -42,6 +42,13 @@ def _workload(*, rows: int = 2, out_features: int = 96, in_features: int = 512):
 def test_tuner_defaults_to_complete_production_device_path() -> None:
     arguments = _parse_args([])
 
+    assert arguments.rows == 8192
+    assert arguments.out_features == 4096
+    assert arguments.in_features == 6144
+    assert arguments.group_size == 256
+    assert arguments.dtype == "bfloat16"
+    assert arguments.input_activation is None
+    assert not arguments.bias
     assert arguments.phase is ProviderPhase.PREPARED_EXECUTION
     assert arguments.fuse_rotation_quantization is None
     assert arguments.fused_num_warps is None
@@ -60,6 +67,12 @@ def test_tuner_input_activation_is_enabled_only_explicitly() -> None:
     assert _parse_args(["--input-activation", "swiglu"]).input_activation == "swiglu"
     with pytest.raises(SystemExit):
         _parse_args(["--input-activation", "none"])
+
+
+def test_tuner_bias_is_enabled_only_explicitly() -> None:
+    assert not _parse_args([]).bias
+    assert _parse_args(["--bias"]).bias
+    assert not _parse_args(["--no-bias"]).bias
 
 
 def test_omitted_axes_measure_only_the_production_plan() -> None:
