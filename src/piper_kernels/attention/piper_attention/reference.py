@@ -22,12 +22,10 @@ _SCALE_EPSILON = 1e-7
 def _quantize_value_per_key(
     value: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = value.float().abs().amax(dim=-1) / _V_INT8_RANGE + _SCALE_EPSILON
+    value_float = value.float()
+    scale = value_float.abs().amax(dim=-1) / _V_INT8_RANGE + _SCALE_EPSILON
     quantized = (
-        (value.float() / scale[..., None])
-        .round()
-        .clamp(-_V_INT8_RANGE, _V_INT8_RANGE)
-        .to(torch.int8)
+        (value_float / scale[..., None]).round().clamp(-_V_INT8_RANGE, _V_INT8_RANGE).to(torch.int8)
     )
     return quantized, scale
 
@@ -101,18 +99,18 @@ def reference_piper_attention(
 
         numerator *= old_weight[..., None]
         denominator = denominator * old_weight + probabilities.sum(dim=-1) * current_weight
-        probability_uint8 = (
+        probability_codes = (
             (probabilities * block_value_scale[:, :, None, :] * _P_UINT8_RANGE)
             .round()
             .clamp(0, _P_UINT8_RANGE)
         )
         partial = torch.matmul(
-            probability_uint8,
+            probability_codes,
             value_int8[:, :, start:stop].float(),
         )
-        numerator += partial * (current_weight[..., None] / _P_UINT8_RANGE)
+        numerator += partial * current_weight[..., None]
         running_max = next_max
 
-    output = numerator / denominator.clamp_min(1e-30)[..., None]
+    output = numerator / (denominator.clamp_min(1e-30)[..., None] * _P_UINT8_RANGE)
     output += value_mean
     return output.to(output_dtype)

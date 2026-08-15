@@ -6,7 +6,6 @@ import importlib
 import importlib.metadata
 import json
 from collections.abc import Callable, Sequence
-from dataclasses import replace
 from typing import cast
 
 import torch
@@ -25,7 +24,6 @@ CANONICAL_VERSION = "2.2.0"
 CANONICAL_REVISION = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
 
 PIPER_ATTENTION = "piper_attention"
-PIPER_ATTENTION_AFFINE = "piper_attention_affine"
 SAGE_ATTENTION_2PP = "sage_attention_2pp"
 PYTORCH_SDPA = "pytorch-sdpa"
 CANONICAL_CUDA_SAGE_ATTENTION_2PP = "canonical_cuda_sage_attention_2pp"
@@ -33,22 +31,17 @@ CANONICAL_CUDA_SAGE_ATTENTION_2 = "canonical_cuda_sage_attention_2"
 
 PROVIDER_NAMES = (
     PIPER_ATTENTION,
-    PIPER_ATTENTION_AFFINE,
     SAGE_ATTENTION_2PP,
     PYTORCH_SDPA,
     CANONICAL_CUDA_SAGE_ATTENTION_2PP,
     CANONICAL_CUDA_SAGE_ATTENTION_2,
-)
-PIPER_ATTENTION_PROVIDERS = (
-    PIPER_ATTENTION,
-    PIPER_ATTENTION_AFFINE,
 )
 SAGE_ATTENTION_FP8_PROVIDERS = (
     SAGE_ATTENTION_2PP,
     CANONICAL_CUDA_SAGE_ATTENTION_2PP,
     CANONICAL_CUDA_SAGE_ATTENTION_2,
 )
-TRITON_PROVIDERS = (*PIPER_ATTENTION_PROVIDERS, SAGE_ATTENTION_2PP)
+TRITON_PROVIDERS = (PIPER_ATTENTION, SAGE_ATTENTION_2PP)
 
 type AttentionProvider = BenchmarkProvider[object, torch.Tensor]
 type CanonicalSageAttention = Callable[..., torch.Tensor]
@@ -101,7 +94,7 @@ def validate_provider_support(
     target: AcceleratorTarget,
 ) -> None:
     """Reject selected providers that cannot run on the active accelerator."""
-    needs_piper_attention = any(name in PIPER_ATTENTION_PROVIDERS for name in provider_names)
+    needs_piper_attention = PIPER_ATTENTION in provider_names
     needs_sage_attention_fp8 = any(name in SAGE_ATTENTION_FP8_PROVIDERS for name in provider_names)
     if needs_piper_attention and not target.supports_uint8_int8_mma:
         raise SystemExit(
@@ -172,23 +165,15 @@ def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
 def _sage_attention_2pp_jit_functions(
     plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
 ) -> dict[str, object]:
-    quantization_kernels: dict[str, object]
-    if plan.fuse_kv_quantization:
-        quantization_kernels = {
-            "quantize-key-value-per-block": (
-                sage_attention_2pp_backend._quantize_kv_per_block_kernel
-            ),
-        }
-    else:
-        key_name, key_kernel = (
-            ("quantize-key-per-block", qk_backend.quantize_key_per_block_kernel)
-            if plan.grouped_qk
-            else ("quantize-key-per-thread", qk_backend.quantize_key_per_thread_kernel)
-        )
-        quantization_kernels = {
-            key_name: key_kernel,
-            "quantize-value-per-channel": sage_attention_2pp_backend._quantize_value_kernel,
-        }
+    key_name, key_kernel = (
+        ("quantize-key-per-block", qk_backend.quantize_key_per_block_kernel)
+        if plan.grouped_qk
+        else ("quantize-key-per-thread", qk_backend.quantize_key_per_thread_kernel)
+    )
+    quantization_kernels: dict[str, object] = {
+        key_name: key_kernel,
+        "quantize-value-per-channel": sage_attention_2pp_backend._quantize_value_kernel,
+    }
     if not plan.fuse_query_quantization:
         query_kernel = (
             qk_backend.quantize_query_per_warp_kernel
@@ -209,36 +194,27 @@ def _sage_attention_2pp_jit_functions(
 def _piper_attention_jit_functions(
     target: AcceleratorTarget,
 ) -> dict[str, object]:
-    qk_kernels = _qk_jit_functions(target)
     return {
         "kv-mean-partial": piper_attention_backend._kv_mean_partial_kernel,
         "kv-mean-finish": piper_attention_backend._kv_mean_finalize_kernel,
-        **qk_kernels,
+        **_qk_jit_functions(target),
         "quantize-value-per-key": piper_attention_backend._quantize_value_per_key_kernel,
         "attention": piper_attention_backend._piper_attention_kernel,
     }
 
 
 def _make_piper_attention_provider(
-    name: str,
     inputs: AttentionInputs,
     *,
     config: AttentionConfig,
     target: AcceleratorTarget,
-    native_uint8: bool,
 ) -> AttentionProvider:
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
     plan = piper_attention_backend._default_piper_attention_execution_plan(
         query,
-        key,
         config.is_causal,
         target=target,
-    )
-    plan = replace(
-        plan,
-        native_uint8=native_uint8,
-        use_packed_probability_conversion=(native_uint8 and plan.use_packed_probability_conversion),
     )
 
     def prepare() -> object:
@@ -257,7 +233,7 @@ def _make_piper_attention_provider(
         )
 
     return BenchmarkProvider(
-        name=name,
+        name=PIPER_ATTENTION,
         prepare=prepare,
         run=run,
         synchronize=torch.cuda.synchronize,
@@ -282,10 +258,9 @@ def _make_sage_attention_2pp_provider(
     config: AttentionConfig,
     target: AcceleratorTarget,
 ) -> AttentionProvider:
-    query, key, _ = inputs
+    query, _, _ = inputs
     plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
         query,
-        key,
         config.is_causal,
         target=target,
     )
@@ -418,19 +393,12 @@ def make_attention_providers(
 ) -> dict[str, AttentionProvider]:
     """Construct the selected providers in command-line order."""
     providers: dict[str, AttentionProvider] = {}
-    piper_attention_settings = {
-        PIPER_ATTENTION: True,
-        PIPER_ATTENTION_AFFINE: False,
-    }
-    for name, native_uint8 in piper_attention_settings.items():
-        if name in provider_names:
-            providers[name] = _make_piper_attention_provider(
-                name,
-                inputs,
-                config=config,
-                target=target,
-                native_uint8=native_uint8,
-            )
+    if PIPER_ATTENTION in provider_names:
+        providers[PIPER_ATTENTION] = _make_piper_attention_provider(
+            inputs,
+            config=config,
+            target=target,
+        )
 
     if SAGE_ATTENTION_2PP in provider_names:
         providers[SAGE_ATTENTION_2PP] = _make_sage_attention_2pp_provider(

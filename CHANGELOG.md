@@ -12,6 +12,40 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- SM120 Piper causal attention now traverses its mask-free prefix separately from the masked
+  diagonal boundary and launches query blocks in reverse order. D128 uniformly uses split PV,
+  with two FP32 accumulators for causal and non-causal attention at every sequence length. The
+  scaled-FP16 outer recurrence and its 128K precision boundary have been removed after real
+  MiniMax-H3 activations showed strongly layer-dependent quality loss. Non-causal D128 keeps
+  uniform M128 tensor-descriptor tiling. All non-causal SM120 shapes derive the V-log bound, so the
+  policy has no short-context or square/rectangular metadata boundary. The shared FP32 numerator
+  recurrence keeps numerators in UINT8 probability-code units for D64 and D128 in both causal and
+  non-causal attention,
+  deferring the common normalization to the output epilogue. Aligned rectangular key tiles also
+  use mask-free traversal without requiring square attention.
+  Production attention plans now start from 128-row query tiles and use explicit target policy for
+  the few smaller-tile paths instead of a runtime CTA-count heuristic. Attention tuning guidance
+  standardizes H16/H48 and 8K/32K/128K as measurement anchors rather than exact dispatch shapes.
+  Piper's never-selected fused Q/K/V preparation candidate has been removed, and its coupled causal
+  prefix partition and reverse launch order are now represented by one traversal choice. Causal and
+  non-causal key tiles now share one online-softmax recurrence implementation without changing
+  generated kernel resources or instructions. Exact SM89 and SM120 execution plans are now
+  constructed directly instead of first building and then mostly overwriting a generic plan. The
+  measured SM89 non-causal D128 schedule is applied uniformly instead of retaining an 8K policy
+  threshold. The ragged-tail launch also derives its block offset at runtime rather than compiling
+  a distinct specialization for every query length. The unreachable unsplit-FP16 recurrence,
+  scaled-FP16 recurrence, and benchmark-only affine Triton
+  attention mode have been removed; unsupported accelerators continue to use the portable
+  reference implementation.
+- SM120 SageAttention2++ now uses uniform 128-row query tiles, matching the pinned canonical CUDA
+  implementation at every sequence length. Grouped-scale tiles now make raw-score reduction
+  intrinsic across D64 and D128, eliminating causal and non-causal sequence-length crossovers.
+  D64 uses separate query quantization while D128 retains fused Q; K and V use one uniform pair of
+  standalone quantizers instead of a neutral role-dispatch specialization. Stock probability
+  conversion is uniform across SM120 shapes, and the unused M32 execution-plan specialization has
+  been removed; attention tuning uses 2K only as a short-context sanity guard below the
+  8K/32K/128K performance anchors. The measured SM89 D128 schedules are likewise applied uniformly
+  rather than selected by an 8K query-length threshold.
 - Shared Sage-style Q/K reference and Triton preparation now have one implementation across
   Piper Attention and SageAttention2++. Benchmark tooling now verifies the pinned canonical
   SageAttention installation before recording provenance, participates in the standard type and
@@ -94,7 +128,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   from `piper_kernels`.
 - Optimized SageAttention2++ recurrence and causal scheduling across supported GPUs,
   with measured SM120 specializations for fused K/V quantization, fused query
-  quantization, and long-sequence unscaled-score recurrence.
+  quantization, and long-sequence raw-score reduction before scaling.
 - Reduced ConvRot H4 rotation work through factorized quartets, added 64-bit-safe tensor
   addressing, and fused H256 rotation with rowwise INT8 quantization on measured SM120
   shapes while retaining the split preparation fallback everywhere else.

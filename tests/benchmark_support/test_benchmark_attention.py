@@ -23,7 +23,6 @@ from lib.attention_providers import (
     CANONICAL_REVISION,
     CANONICAL_VERSION,
     PIPER_ATTENTION,
-    PIPER_ATTENTION_AFFINE,
     PYTORCH_SDPA,
     SAGE_ATTENTION_2PP,
     _load_canonical_sage_attention,
@@ -36,6 +35,7 @@ from lib.attention_providers import (
 from piper_kernels._triton.targets import AcceleratorTarget
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
+_SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")
 
 
 def _canonical_distribution(
@@ -52,9 +52,15 @@ def _canonical_distribution(
 
 def test_provider_ids_use_canonical_attention_names() -> None:
     assert PIPER_ATTENTION == "piper_attention"
-    assert PIPER_ATTENTION_AFFINE == "piper_attention_affine"
     assert SAGE_ATTENTION_2PP == "sage_attention_2pp"
     assert CANONICAL_CUDA_SAGE_ATTENTION_2PP == "canonical_cuda_sage_attention_2pp"
+
+
+def test_default_workload_uses_lower_head_anchor_and_short_sequence_guard() -> None:
+    arguments = _parse_args([])
+
+    assert arguments.heads == 16
+    assert 2 * 1024 in arguments.sequence
 
 
 @pytest.mark.parametrize(
@@ -78,7 +84,6 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
         (tensor, tensor, tensor),
         provider_names=(
             PIPER_ATTENTION,
-            PIPER_ATTENTION_AFFINE,
             SAGE_ATTENTION_2PP,
             PYTORCH_SDPA,
         ),
@@ -86,27 +91,48 @@ def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
         target=_SM120,
     )
 
-    assert providers[PIPER_ATTENTION_AFFINE].configuration["native_uint8"] is False
     assert providers[PIPER_ATTENTION].configuration["seed"] == 0
-    assert not providers[PIPER_ATTENTION_AFFINE].configuration["use_packed_probability_conversion"]
-    assert "mixed_sign_mma" not in providers[PIPER_ATTENTION_AFFINE].configuration
     assert providers[PIPER_ATTENTION].configuration["use_packed_probability_conversion"]
     assert "attention" in providers[PIPER_ATTENTION].triton_jit_functions
     assert providers[SAGE_ATTENTION_2PP].configuration["algorithm"] == ("sage_attention_2pp")
     assert providers[SAGE_ATTENTION_2PP].configuration["block_n"] == 64
-    assert providers[SAGE_ATTENTION_2PP].configuration["use_packed_probability_conversion"]
-    assert providers[SAGE_ATTENTION_2PP].configuration["fuse_kv_quantization"]
+    assert not providers[SAGE_ATTENTION_2PP].configuration["use_packed_probability_conversion"]
     assert "attention" in providers[SAGE_ATTENTION_2PP].triton_jit_functions
-    assert "quantize-key-value-per-block" in providers[SAGE_ATTENTION_2PP].triton_jit_functions
-    assert "quantize-query-per-warp" not in providers[SAGE_ATTENTION_2PP].triton_jit_functions
+    assert "quantize-key-per-block" in providers[SAGE_ATTENTION_2PP].triton_jit_functions
+    assert "quantize-value-per-channel" in providers[SAGE_ATTENTION_2PP].triton_jit_functions
+    assert "quantize-query-per-warp" in providers[SAGE_ATTENTION_2PP].triton_jit_functions
     assert providers[PYTORCH_SDPA].configuration["algorithm"] == ("scaled_dot_product_attention")
     assert not providers[PYTORCH_SDPA].triton_jit_functions
 
 
-def test_short_causal_sage_attention_2pp_provider_registers_query_quantization() -> None:
-    # D128 isolates the short-sequence policy: causal D64 always uses external
-    # Q quantization regardless of sequence length.
-    tensor = torch.empty((1, 1, 8, 128), dtype=torch.float16)
+def test_sm89_piper_provider_registers_separate_quantization_kernels() -> None:
+    tensor = torch.empty((1, 1, 8192, 128), device="meta", dtype=torch.float16)
+    providers = make_attention_providers(
+        (tensor, tensor, tensor),
+        provider_names=(PIPER_ATTENTION,),
+        config=AttentionConfig(dtype=torch.float16),
+        target=_SM89,
+    )
+
+    assert set(providers[PIPER_ATTENTION].triton_jit_functions) == {
+        "kv-mean-partial",
+        "kv-mean-finish",
+        "quantize-query-per-thread",
+        "quantize-key-per-thread",
+        "quantize-value-per-key",
+        "attention",
+    }
+
+
+@pytest.mark.parametrize("sequence_length", [2 * 1024, 32 * 1024])
+def test_sm120_causal_d128_provider_fuses_query_quantization_at_all_lengths(
+    sequence_length: int,
+) -> None:
+    tensor = torch.empty(
+        (1, 1, sequence_length, 128),
+        device="meta",
+        dtype=torch.float16,
+    )
     providers = make_attention_providers(
         (tensor, tensor, tensor),
         provider_names=(SAGE_ATTENTION_2PP,),
@@ -114,22 +140,12 @@ def test_short_causal_sage_attention_2pp_provider_registers_query_quantization()
         target=_SM120,
     )
 
-    jit_functions = providers[SAGE_ATTENTION_2PP].triton_jit_functions
-    assert "quantize-query-per-warp" in jit_functions
-    assert "quantize-key-value-per-block" in jit_functions
-
-
-def test_long_causal_sage_attention_2pp_provider_omits_query_quantization() -> None:
-    tensor = torch.empty((1, 1, 32 * 1024, 128), device="meta", dtype=torch.float16)
-    providers = make_attention_providers(
-        (tensor, tensor, tensor),
-        provider_names=(SAGE_ATTENTION_2PP,),
-        config=AttentionConfig(dtype=torch.float16, is_causal=True),
-        target=_SM120,
-    )
-
-    jit_functions = providers[SAGE_ATTENTION_2PP].triton_jit_functions
+    provider = providers[SAGE_ATTENTION_2PP]
+    jit_functions = provider.triton_jit_functions
     assert "quantize-query-per-warp" not in jit_functions
+    assert "quantize-key-per-block" in jit_functions
+    assert "quantize-value-per-channel" in jit_functions
+    assert provider.configuration["fuse_query_quantization"] is True
 
 
 def test_other_sm12x_sage_attention_2pp_provider_uses_grouped_quantization() -> None:

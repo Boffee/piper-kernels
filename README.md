@@ -102,8 +102,9 @@ smoothing plus INT8 QK quantization. Its distinct PV path quantizes each V key r
 with one signed-INT8 scale, folds those scales into nonnegative probabilities, and
 uses `UINT8 x INT8 -> INT32` tensor-core products. The probability multiplier remains
 FP32 so every finite FP16 input scale is representable without a conversion in the hot
-loop. FP32 also remains the softmax and denominator coordinate; the selected long SM12x
-D128 schedule buffers a bounded PV numerator in FP16.
+loop. The online-softmax state, denominator, and PV numerator also remain FP32. The
+numerator stays in UINT8 probability-code units during the recurrence, and the common
+factor of 255 is removed once in the output epilogue.
 
 For centered V, Piper Attention uses the exact identity
 
@@ -119,15 +120,17 @@ rounding cannot make an earlier output depend on future V rows. Both paths prese
 original K/V sequence order.
 
 Native mixed-sign MMA is selected on the supported NVIDIA backend through the packaged
-stock-Triton extension. The backend retains the exact affine identity
-`u @ v = (u - 128) @ v + 128 * sum(v)` as its signed-INT8 correctness and portability
-control. The public optimized dispatch supports NVIDIA SM8x and consumer Blackwell
-SM12x, whose Triton lowering uses the MMAv2 instruction rewritten by the packaged
-extension. Exact SM120 uses packed four-code probability conversion for D64 and
-non-causal D128, while causal D128 retains the faster stock conversion. SM89 and SM12x
-have measured schedules; Ampere currently uses the generic schedule. Hopper lowers the
-operation through unsupported WGMMA and therefore uses the slow portable quantized
-reference. Native ROCm mixed-sign lowering remains future work.
+stock-Triton extension. The integer-PV benchmark retains the exact affine identity
+`u @ v = (u - 128) @ v + 128 * sum(v)` as a signed-INT8 correctness control; unsupported
+production targets use the portable quantized reference instead. The public optimized
+dispatch supports NVIDIA SM8x and consumer Blackwell SM12x, whose Triton lowering uses
+the MMAv2 instruction rewritten by the packaged extension. Exact SM120 uses packed
+four-code probability conversion for D64 and non-causal D128, while causal D128 retains
+the faster stock conversion. SM89 and exact SM120 have measured schedules; other
+supported targets use the generic schedule. Production plan selection depends on target, head
+dimension, and causal mode, not sequence length. Hopper lowers the operation through
+unsupported WGMMA and therefore uses the slow portable quantized reference. Native ROCm
+mixed-sign lowering remains future work.
 
 Piper Attention is an independently developed Sage-derived design. The per-key
 quantizer, centering identity, and online-softmax lineage are not claimed as novel in
@@ -150,7 +153,8 @@ newer); measured schedules currently cover consumer SM89 and SM120 GPUs, while o
 SM12x targets retain grouped Q/K quantization with generic scheduling. It supports head
 dimensions 64 and 128, equal query/KV head counts, arbitrary positive sequence lengths,
 rectangular non-causal attention, strided sequence dimensions, and `torch.compile`. It
-is inference-only and does not support autograd.
+is inference-only and does not support autograd. Its production execution plans are also
+sequence-length invariant.
 
 This is SageAttention2++, not a Piper Attention-specific algorithm: K is smoothed, Q/K
 are quantized to INT8 with the canonical architecture-specific granularity, V and the

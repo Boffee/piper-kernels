@@ -1,7 +1,5 @@
 """Public API and validation tests for Piper Attention."""
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -73,13 +71,9 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         stop_at_preprocessing,
     )
     query, key, value = _inputs()
-    plan = replace(
-        piper_attention_backend._default_piper_attention_execution_plan(
-            query,
-            key,
-            True,
-        ),
-        native_uint8=True,
+    plan = piper_attention_backend._default_piper_attention_execution_plan(
+        query,
+        True,
     )
 
     with pytest.raises(PreprocessingReachedError):
