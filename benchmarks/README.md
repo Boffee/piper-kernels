@@ -259,6 +259,21 @@ Validate the selected plan at `M=131073` on `(N, K)=(16384, 6144)` for expansion
 indexing, and `(N, K)=(4096, 14336)` for contraction. Expand to the full N/K matrix only if those
 results are unexpected.
 
+The selected exact-SM120 production schedule uses `128x256x128` GEMM tiles, eight warps, three
+stages, and fixed `GROUP_M=16` ordering (groups of up to 16 M tiles) for every `M>=512`;
+smaller-row workloads and other accelerators retain the generic schedule. This reuses the
+existing broad large-row policy boundary; 512 is neither a measured exact crossover nor tied to a
+model or benchmark anchor. The execution-plan selector has no N- or K-specific schedule branches.
+Complete M tiles use a separate launch, which elides all tile masks when N and K are also aligned;
+one masked launch handles a final partial M tile. M, N, K, and the tail offset remain runtime
+values, so arbitrary row counts do not create exact-length JIT specializations.
+
+On an RTX 5090 (SM120) with Torch 2.13.0+cu130 and Triton 3.7.1, three fresh processes per variant
+confirmed median per-cell end-to-end speedups of 2.20-2.61x at M=8192 and 4.55-5.56x at M=32768
+across the full eight-cell matrix. Every same-seed candidate quality record exactly matched the
+former schedule's record. The two M=131073 expansion and contraction guards also passed,
+including the ragged M tail and the expansion output beyond 2^31 elements.
+
 The ConvRot INT8 forward-linear tuner searches the immutable production execution plan shared
 by ordinary and explicit SwiGLU linears. Its default `prepared_execution` boundary deliberately
 keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed operator because

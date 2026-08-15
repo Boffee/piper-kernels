@@ -194,8 +194,8 @@ def test_default_linear_execution_plan_supports_meta_with_resolved_target() -> N
     )
 
     assert plan.fuse_rotation_quantization
-    assert plan.matmul_block_m == 64
-    assert plan.matmul_block_n == 64
+    assert plan.matmul_block_m == 128
+    assert plan.matmul_block_n == 256
 
 
 @pytest.mark.gpu
@@ -251,6 +251,85 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
     )
 
     assert torch.equal(actual, expected)
+
+
+def _exact_sm120_available() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="exact SM120 is not available")
+@pytest.mark.parametrize(
+    ("rows", "out_features", "in_features", "group_size", "dtype"),
+    [
+        (512, 256, 256, 256, torch.bfloat16),
+        (513, 256, 256, 256, torch.bfloat16),
+        (513, 257, 256, 256, torch.bfloat16),
+        (513, 257, 272, 16, torch.bfloat16),
+        (2177, 257, 272, 16, torch.bfloat16),
+        (513, 257, 64, 64, torch.bfloat16),
+        (512, 256, 256, 256, torch.float32),
+    ],
+    ids=[
+        "aligned",
+        "ragged-m",
+        "ragged-mn",
+        "ragged-mnk",
+        "second-m-group",
+        "short-k",
+        "float32",
+    ],
+)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+def test_sm120_large_matmul_matches_reference(
+    rows: int,
+    out_features: int,
+    in_features: int,
+    group_size: int,
+    dtype: torch.dtype,
+    with_bias: bool,
+) -> None:
+    torch.manual_seed(139)
+    activation = torch.randn(rows, in_features, dtype=dtype, device="cuda")
+    qdata = torch.randint(
+        -127,
+        128,
+        (out_features, in_features),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
+    bias = torch.randn(out_features, dtype=dtype, device="cuda") if with_bias else None
+
+    plan = triton_backend._default_convrot_int8_execution_plan(
+        activation,
+        qdata,
+        group_size,
+    )
+    assert (
+        plan.matmul_block_m,
+        plan.matmul_block_n,
+        plan.matmul_block_k,
+        plan.matmul_num_warps,
+    ) == (128, 256, 128, 8)
+
+    actual = triton_backend._run_convrot_int8_linear(
+        activation,
+        qdata,
+        scale,
+        bias,
+        group_size,
+        execution_plan=plan,
+    )
+    expected = reference_linear(activation, qdata, scale, group_size, bias)
+
+    if dtype is torch.bfloat16:
+        if bias is None:
+            assert torch.equal(actual, expected)
+        else:
+            torch.testing.assert_close(actual, expected)
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.04)
 
 
 @pytest.mark.parametrize("apply_swiglu", [False, True], ids=["plain", "swiglu"])

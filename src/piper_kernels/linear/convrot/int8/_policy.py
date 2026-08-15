@@ -11,6 +11,7 @@ _FUSED_MIN_ROWS = 512
 _FUSED_MAX_BLOCK_SIZE = 16_384
 _FUSED_DTYPES = (torch.float16, torch.bfloat16)
 _LARGE_SWIGLU_MIN_ROWS = 8192
+_SM120_LARGE_MATMUL_MIN_ROWS = 512
 _FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
 _QUANTIZATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
@@ -110,6 +111,7 @@ def select_execution_plan(
     swiglu: bool = False,
 ) -> ConvRotInt8LinearExecutionPlan:
     """Select the production preparation and GEMM schedule for one linear."""
+    large_sm120 = target.is_cuda_capability(12, 0) and rows >= _SM120_LARGE_MATMUL_MIN_ROWS
     return ConvRotInt8LinearExecutionPlan(
         fuse_rotation_quantization=_select_fuse_rotation_quantization(
             target,
@@ -126,7 +128,8 @@ def select_execution_plan(
         ),
         rotation_num_warps=_DEFAULT_ROTATION_NUM_WARPS,
         quantization_num_warps=_DEFAULT_QUANTIZATION_NUM_WARPS,
-        matmul_block_m=32 if rows < 64 else 64,
-        matmul_block_n=64 if out_features < 128 else 128,
-        matmul_block_k=32,
+        matmul_block_m=128 if large_sm120 else (32 if rows < 64 else 64),
+        matmul_block_n=256 if large_sm120 else (64 if out_features < 128 else 128),
+        matmul_block_k=128 if large_sm120 else 32,
+        matmul_num_warps=8 if large_sm120 else 4,
     )

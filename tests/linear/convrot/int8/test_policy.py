@@ -113,22 +113,37 @@ def test_execution_plan_centralizes_fused_launch_schedule(
 
 
 @pytest.mark.parametrize(
-    ("rows", "out_features", "expected_block_m", "expected_block_n"),
+    (
+        "target",
+        "rows",
+        "out_features",
+        "expected_block_m",
+        "expected_block_n",
+        "expected_block_k",
+        "expected_warps",
+    ),
     [
-        (1, 96, 32, 64),
-        (63, 127, 32, 64),
-        (64, 128, 64, 128),
-        (37_710, 21_504, 64, 128),
+        (_SM120, 1, 96, 32, 64, 32, 4),
+        (_SM120, 63, 127, 32, 64, 32, 4),
+        (_SM120, 64, 128, 64, 128, 32, 4),
+        (_SM120, 511, 21_504, 64, 128, 32, 4),
+        (_SM120, 512, 96, 128, 256, 128, 8),
+        (_SM120, 37_710, 21_504, 128, 256, 128, 8),
+        (_SM121, 37_710, 21_504, 64, 128, 32, 4),
+        (_SM89, 37_710, 21_504, 64, 128, 32, 4),
     ],
 )
-def test_execution_plan_preserves_existing_matmul_schedule(
+def test_execution_plan_selects_exact_sm120_large_matmul_schedule(
+    target: AcceleratorTarget,
     rows: int,
     out_features: int,
     expected_block_m: int,
     expected_block_n: int,
+    expected_block_k: int,
+    expected_warps: int,
 ) -> None:
     plan = select_execution_plan(
-        _SM120,
+        target,
         rows=rows,
         out_features=out_features,
         in_features=512,
@@ -138,8 +153,8 @@ def test_execution_plan_preserves_existing_matmul_schedule(
 
     assert plan.matmul_block_m == expected_block_m
     assert plan.matmul_block_n == expected_block_n
-    assert plan.matmul_block_k == 32
-    assert plan.matmul_num_warps == 4
+    assert plan.matmul_block_k == expected_block_k
+    assert plan.matmul_num_warps == expected_warps
     assert plan.matmul_num_stages == 3
 
 
@@ -158,10 +173,10 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
         "fused_num_warps": 4,
         "rotation_num_warps": 4,
         "quantization_num_warps": 8,
-        "matmul_block_m": 64,
-        "matmul_block_n": 64,
-        "matmul_block_k": 32,
-        "matmul_num_warps": 4,
+        "matmul_block_m": 128,
+        "matmul_block_n": 256,
+        "matmul_block_k": 128,
+        "matmul_num_warps": 8,
         "matmul_num_stages": 3,
     }
 

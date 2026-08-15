@@ -21,6 +21,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   Its benchmark accepts Cartesian M/N/K axes, and its benchmark and tuner defaults now start from
   the lower-width anchor instead of power-of-two toy dimensions. `M=131073` is reserved for final
   long, ragged, and 64-bit-indexing validation.
+- Exact SM120 ConvRot INT8 linears use one broadly selected large-M GEMM schedule with
+  `128x256x128` tiles, eight warps, fixed `GROUP_M=16` launch ordering, and separate full-M and
+  ragged-M-tail launches. Across the full BF16 `M=8K/32K`, `N=4K/16K`, `K=6144/14336` matrix,
+  this delivered a 2.20-5.56x complete-operator speedup over the former generic schedule without
+  a quality change; both `M=131073` expansion and contraction guards pass the same quality checks.
 - SM120 Piper causal attention now traverses its mask-free prefix separately from the masked
   diagonal boundary and launches query blocks in reverse order. D128 uniformly uses split PV,
   with two FP32 accumulators for causal and non-causal attention at every sequence length. The
