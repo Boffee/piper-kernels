@@ -66,8 +66,6 @@ def rotate_groups(value: torch.Tensor, group_size: int) -> torch.Tensor:
         raise ValueError(
             f"ConvRot feature dimension {features} is not divisible by group size {group_size}"
         )
-    if features == 0:
-        return value.clone()
     matrix = build_hadamard(group_size, value.device, value.dtype)
     grouped = value.reshape(-1, features // group_size, group_size)
     return torch.matmul(grouped, matrix).reshape(value.shape)

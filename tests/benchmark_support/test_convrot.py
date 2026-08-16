@@ -485,7 +485,7 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
         phase="fused",
         provider=PIPER_TRITON_PROVIDER,
         operation_provenance=(
-            "piper_kernels.linear.convrot.int8.triton._fused_rotate_quantize_activations"
+            "piper_kernels.linear.convrot.int8.triton.fused_rotate_quantize_input"
         ),
         timing=Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT),
         minimum_global_bytes=1024,

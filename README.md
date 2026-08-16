@@ -39,7 +39,11 @@ then use the resulting tensor as a normal linear weight:
 ```python
 import torch
 
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot import (
+    ConvRotInt8Tensor,
+    convrot_compile_options,
+    convrot_linear,
+)
 
 weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=256)
 checkpoint_weight = ConvRotInt8Tensor.from_quantized(
@@ -49,6 +53,9 @@ checkpoint_weight = ConvRotInt8Tensor.from_quantized(
     logical_dtype=torch.bfloat16,
 )
 output = torch.nn.functional.linear(activation, weight, bias)
+
+# Let Inductor find repeated same-input ConvRot linears in an inference graph.
+compiled_block = torch.compile(block, options=convrot_compile_options())
 
 # Optionally fuse a raw [up | gate] SwiGLU input with ConvRot preparation.
 mlp_output = convrot_linear(up_gate, weight, bias, input_activation="swiglu")
@@ -60,8 +67,7 @@ weight.addmm_(lora_b, lora_a, alpha=lora_strength)
 weight.addmm_(lora_b, lora_a, alpha=lora_strength, rounding_seed=seed)
 ```
 
-`from_quantized(..., logical_dtype=...)` is the preferred checkpoint-storage factory.
-`from_packed(..., dtype=...)` remains available for compatibility with the 0.1 API.
+Use `from_quantized(..., logical_dtype=...)` to construct a weight from checkpoint storage.
 
 For a weight with shape `[out_features, in_features]`, the SwiGLU input has shape
 `[..., 2 * in_features]` and the output has shape `[..., out_features]`.
@@ -70,7 +76,15 @@ linear. Its optimized preparation fusion is selected only for measured SM120
 configurations with group size 256. Other supported configurations materialize SwiGLU,
 then dispatch through the ordinary ConvRot linear path, which may still use an optimized
 backend. Ordinary `torch.nn.functional.linear` calls remain unchanged and do not apply an
-activation. Both linear entry points are inference-only and reject autograd inputs.
+activation. Both single-linear entry points are inference-only and reject autograd inputs.
+
+For compiled inference, `convrot_compile_options()` installs a deterministic post-AOT Inductor
+rewrite. Two or more ConvRot linears fed by the same graph value become one explicit input
+preparation followed by independent prepared GEMMs at the original operation positions. The
+prepared tensors are ordinary graph values—there is no hidden runtime cache—and singleton,
+incompatible, eager, and training paths remain unchanged. Existing post-grad compiler passes in
+the supplied options mapping are preserved. Pass the result through `torch.compile(options=...)`;
+PyTorch treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
 the result. It preserves the ConvRot tensor and quantized storage identities, allowing

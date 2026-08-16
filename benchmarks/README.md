@@ -245,11 +245,19 @@ Run ordinary dense linears throughout that matrix. At `M=32768`, separately chec
 that change the operator boundary when an integration uses them:
 
 - raw `[up | gate]` SwiGLU with `N=4096`, linear `K=14336`, and raw input width 28672;
-- one fused QKV projection with `K=6144`, `N=12288` versus three `N=4096` projections over the
-  same input. This graph-level fusion is distinct from fusing ConvRot rotation and quantization.
+- three projections with `K=6144` and `N=4096` each: compare separate public linear calls,
+  the compiled preparation-sharing rewrite, and—when the integration can retain a packed
+  weight—one fused `N=12288` projection. This graph-level reuse is distinct from fusing ConvRot
+  rotation and quantization inside one preparation kernel.
 
 These integration guards use concrete dimensions to make the comparison exact; they are not
 production policy predicates.
+
+Compiled inference integrations can pass `convrot_compile_options()` to
+`torch.compile`. Its post-AOT graph rewrite recognizes two or more compatible ConvRot linears
+fed by the exact same FX value, emits one explicit preparation node, and leaves every prepared
+GEMM at the corresponding original node position. This is automatic across architectures within
+each compiled graph and does not require packed projection weights or attention-specific code.
 
 Treat 8K and 32K as evidence for one continuous large-M plan. Screen against the current
 production plan, then confirm a proposed winner in at least three fresh processes with alternating

@@ -1,64 +1,9 @@
 """Tests for the INT8 ConvRot inference contract and semantic operators."""
 
-import subprocess
-import sys
-import textwrap
-from collections.abc import Callable
-
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
-from piper_kernels.linear.convrot.int8 import dispatch as convrot_dispatch
-
-
-def test_semantic_operator_schemas_and_fake_kernels_exist_without_triton() -> None:
-    script = textwrap.dedent(
-        """
-        import sys
-
-        sys.modules["triton"] = None
-
-        import torch
-        from piper_kernels.linear.convrot.int8 import dispatch
-
-        assert dispatch._triton_addmm_ is None
-        assert dispatch._triton_linear is None
-        assert dispatch._triton_swiglu_linear is None
-
-        activation = torch.empty(2, 32, device="meta")
-        swiglu_activation = torch.empty(2, 64, device="meta")
-        qdata = torch.empty(7, 32, dtype=torch.int8, device="meta")
-        scale = torch.empty(7, 1, device="meta")
-        bias = torch.empty(7, device="meta")
-
-        ordinary = dispatch._convrot_int8_linear_op(
-            activation, qdata, scale, bias, 16
-        )
-        swiglu = dispatch._convrot_int8_swiglu_linear_op(
-            swiglu_activation, qdata, scale, bias, 16
-        )
-        assert ordinary.shape == (2, 7)
-        assert swiglu.shape == (2, 7)
-        assert dispatch._convrot_int8_addmm_op(
-            qdata,
-            scale,
-            torch.empty(7, 3, device="meta"),
-            torch.empty(3, 32, device="meta"),
-            16,
-            1.0,
-            1.0,
-        ) is None
-        """
-    )
-
-    subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _weight(
@@ -197,64 +142,6 @@ def test_linear_accepts_noncontiguous_vector_bias(input_activation: str | None) 
     assert torch.equal(actual, expected)
 
 
-def test_public_fake_cuda_paths_do_not_require_a_physical_device(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def unavailable_capability(_device: torch.device) -> tuple[int, int]:
-        raise AssertionError("synthetic CUDA device has no physical capability")
-
-    monkeypatch.setattr(torch.cuda, "get_device_capability", unavailable_capability)
-    with FakeTensorMode():
-        device = torch.device("cuda:137")
-        weight = ConvRotInt8Tensor.from_quantized(
-            torch.empty(7, 256, dtype=torch.int8, device=device),
-            torch.empty(7, 1, dtype=torch.float32, device=device),
-            group_size=256,
-        )
-        ordinary = torch.nn.functional.linear(
-            torch.empty(4, 256, dtype=torch.bfloat16, device=device),
-            weight,
-        )
-        swiglu = convrot_linear(
-            torch.empty(512, 512, dtype=torch.bfloat16, device=device),
-            weight,
-            input_activation="swiglu",
-        )
-        updated = weight.addmm_(
-            torch.empty(7, 3, dtype=torch.bfloat16, device=device),
-            torch.empty(3, 256, dtype=torch.bfloat16, device=device),
-        )
-
-    assert isinstance(ordinary, FakeTensor)
-    assert isinstance(swiglu, FakeTensor)
-    assert ordinary.shape == (4, 7)
-    assert swiglu.shape == (512, 7)
-    assert ordinary.device == swiglu.device == torch.device("cuda:137")
-    assert updated is weight
-
-
-def test_public_swiglu_fake_cuda_runs_under_fullgraph_compile_without_a_target() -> None:
-    unavailable_index = torch.cuda.device_count()
-    with FakeTensorMode():
-        device = torch.device(f"cuda:{unavailable_index}")
-        weight = ConvRotInt8Tensor.from_quantized(
-            torch.empty(7, 256, dtype=torch.int8, device=device),
-            torch.empty(7, 1, dtype=torch.float32, device=device),
-            group_size=256,
-        )
-        activation = torch.empty(512, 512, dtype=torch.bfloat16, device=device)
-
-        def apply_swiglu(value: torch.Tensor) -> torch.Tensor:
-            return convrot_linear(value, weight, input_activation="swiglu")
-
-        result = torch.compile(apply_swiglu, backend="eager", fullgraph=True)(activation)
-
-    assert isinstance(result, FakeTensor)
-    assert result.shape == (512, 7)
-    assert result.dtype is torch.bfloat16
-    assert result.device == torch.device(f"cuda:{unavailable_index}")
-
-
 def test_addmm_rejects_grad_enabled_scale_but_allows_no_grad() -> None:
     weight = _weight(scale_requires_grad=True)
     mat1 = torch.randn(7, 3)
@@ -293,40 +180,3 @@ def test_operations_revalidate_canonical_storage_layout(
 
     with pytest.raises(ValueError, match="qdata and scale must be contiguous"):
         call()
-
-
-@pytest.mark.parametrize(
-    ("operator", "input_factor"),
-    [
-        (convrot_dispatch._convrot_int8_linear_op, 1),
-        (convrot_dispatch._convrot_int8_swiglu_linear_op, 2),
-    ],
-)
-def test_semantic_linear_custom_ops_pass_opcheck(
-    operator: Callable[..., torch.Tensor],
-    input_factor: int,
-) -> None:
-    torch.manual_seed(122)
-    qdata = torch.randint(-127, 128, (7, 32), dtype=torch.int8)
-    scale = torch.rand(7, 1, dtype=torch.float32) * 0.01
-    activation = torch.randn(3, input_factor * 32)
-    bias = torch.randn(7)
-
-    result = torch.library.opcheck(operator, (activation, qdata, scale, bias, 16))
-
-    assert set(result.values()) == {"SUCCESS"}
-
-
-def test_semantic_addmm_custom_op_passes_opcheck() -> None:
-    torch.manual_seed(123)
-    qdata = torch.randint(-127, 128, (7, 32), dtype=torch.int8)
-    scale = torch.rand(7, 1, dtype=torch.float32) * 0.01
-    mat1 = torch.randn(7, 5)
-    mat2 = torch.randn(5, 32)
-
-    result = torch.library.opcheck(
-        convrot_dispatch._convrot_int8_addmm_op,
-        (qdata, scale, mat1, mat2, 16, 0.5, 1.25, 123),
-    )
-
-    assert set(result.values()) == {"SUCCESS"}

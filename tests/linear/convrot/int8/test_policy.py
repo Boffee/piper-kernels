@@ -55,7 +55,6 @@ def test_execution_plan_keeps_sm120_tuning_target_exact(
         (512, 512, 256, torch.float16, True),
         (512, 14_336, 256, torch.bfloat16, True),
         (511, 512, 256, torch.float16, False),
-        (512, 0, 256, torch.float16, False),
         (512, 512, 64, torch.float16, False),
         (512, 512, 256, torch.float32, False),
         (512, 16_640, 256, torch.bfloat16, False),
@@ -110,6 +109,31 @@ def test_execution_plan_centralizes_fused_launch_schedule(
     )
 
     assert plan.fused_num_warps == expected_warps
+
+
+def test_preparation_schedule_is_independent_of_output_width() -> None:
+    plans = [
+        select_execution_plan(
+            _SM120,
+            rows=8192,
+            out_features=out_features,
+            in_features=6144,
+            group_size=256,
+            dtype=torch.bfloat16,
+        )
+        for out_features in (0, 1, 4096, 16_384)
+    ]
+
+    preparation_schedules = {
+        (
+            plan.fuse_rotation_quantization,
+            plan.fused_num_warps,
+            plan.rotation_num_warps,
+            plan.quantization_num_warps,
+        )
+        for plan in plans
+    }
+    assert len(preparation_schedules) == 1
 
 
 @pytest.mark.parametrize(

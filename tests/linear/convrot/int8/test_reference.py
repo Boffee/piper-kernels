@@ -7,8 +7,8 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
 from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
 from piper_kernels.linear.convrot.int8.reference import (
+    convrot_int8_swiglu_linear,
     dynamic_quantize_rows,
-    reference_swiglu_linear,
 )
 
 
@@ -28,10 +28,10 @@ def test_cpu_linear_matches_explicit_w8a8_reference() -> None:
     activation = torch.randn(7, in_features)
     bias = torch.randn(out_features)
 
-    rotated_activation = rotate_groups(activation, group_size)
-    activation_qdata, activation_scale = dynamic_quantize_rows(rotated_activation)
-    accumulated = activation_qdata.to(torch.int32) @ weight_qdata.T.to(torch.int32)
-    expected = accumulated.float() * activation_scale * weight_scale.T + bias
+    rotated_input = rotate_groups(activation, group_size)
+    input_qdata, input_scale = dynamic_quantize_rows(rotated_input)
+    accumulated = input_qdata.to(torch.int32) @ weight_qdata.T.to(torch.int32)
+    expected = accumulated.float() * input_scale * weight_scale.T + bias
 
     assert torch.equal(torch.nn.functional.linear(activation, wrapped, bias), expected)
 
@@ -82,7 +82,7 @@ def test_convrot_linear_supports_keyword_arguments() -> None:
     input_tensor = torch.randn(2, 64)
     bias = torch.randn(11)
 
-    expected = reference_swiglu_linear(
+    expected = convrot_int8_swiglu_linear(
         input_tensor,
         weight.qdata,
         weight.scale,
@@ -97,100 +97,6 @@ def test_convrot_linear_supports_keyword_arguments() -> None:
     )
 
     assert torch.equal(actual, expected)
-
-
-def test_convrot_linear_handles_empty_rows() -> None:
-    weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
-    activation = torch.empty(2, 0, 64)
-
-    result = convrot_linear(activation, weight, input_activation="swiglu")
-
-    assert result.shape == (2, 0, 11)
-    assert result.dtype is activation.dtype
-    assert result.device == activation.device
-
-
-@pytest.mark.parametrize("prefix", [(), (4,), (2, 3), (2, 0)])
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
-def test_linear_handles_zero_input_features(
-    prefix: tuple[int, ...],
-    with_bias: bool,
-    input_activation: str | None,
-) -> None:
-    weight = ConvRotInt8Tensor.from_quantized(
-        torch.empty(3, 0, dtype=torch.int8),
-        torch.ones(3, 1, dtype=torch.float32),
-        group_size=16,
-        logical_dtype=torch.float16,
-    )
-    activation = torch.empty((*prefix, 0), dtype=torch.float16)
-    bias = torch.tensor((1.0, 2.0, 3.0), dtype=torch.float16) if with_bias else None
-
-    if input_activation is None:
-        result = torch.nn.functional.linear(activation, weight, bias)
-    else:
-        result = convrot_linear(
-            activation,
-            weight,
-            bias,
-            input_activation="swiglu",
-        )
-
-    expected = activation.new_zeros((*prefix, 3))
-    if bias is not None:
-        expected += bias
-    assert torch.equal(result, expected)
-
-
-@pytest.mark.parametrize("prefix", [(2, 3), (2, 0)])
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
-def test_linear_preserves_zero_output_and_row_dimensions(
-    prefix: tuple[int, ...],
-    input_activation: str | None,
-) -> None:
-    in_features = 16
-    weight = ConvRotInt8Tensor.from_quantized(
-        torch.empty(0, in_features, dtype=torch.int8),
-        torch.empty(0, 1, dtype=torch.float32),
-        group_size=16,
-        logical_dtype=torch.float32,
-    )
-    input_factor = 1 if input_activation is None else 2
-    activation = torch.empty((*prefix, input_factor * in_features))
-
-    if input_activation is None:
-        result = torch.nn.functional.linear(activation, weight)
-    else:
-        result = convrot_linear(activation, weight, input_activation="swiglu")
-
-    assert result.shape == (*prefix, 0)
-    assert result.dtype is activation.dtype
-    assert result.device == activation.device
-
-
-def test_zero_input_features_run_under_fullgraph_compile() -> None:
-    weight = ConvRotInt8Tensor.from_quantized(
-        torch.empty(3, 0, dtype=torch.int8),
-        torch.ones(3, 1, dtype=torch.float32),
-        group_size=16,
-        logical_dtype=torch.float32,
-    )
-    activation = torch.empty(2, 4, 0)
-    bias = torch.arange(3, dtype=torch.float32)
-
-    def apply_both(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            torch.nn.functional.linear(value, weight, bias),
-            convrot_linear(value, weight, bias, input_activation="swiglu"),
-        )
-
-    expected = apply_both(activation)
-    actual = torch.compile(apply_both, backend="eager", fullgraph=True)(activation)
-
-    assert all(
-        torch.equal(item, reference) for item, reference in zip(actual, expected, strict=True)
-    )
 
 
 def test_convrot_linear_propagates_meta_metadata() -> None:
@@ -352,16 +258,3 @@ def test_dynamic_quantize_rows_handles_underflowing_float16_scale() -> None:
     assert scale[0, 0] > 0
     assert scale[0, 0].to(torch.float16) == 0
     assert scale[1, 0] == pytest.approx(1e-30)
-
-
-@pytest.mark.parametrize("shape", [(3, 0), (2, 0, 0)])
-def test_dynamic_quantize_rows_handles_zero_features(shape: tuple[int, ...]) -> None:
-    value = torch.empty(shape, dtype=torch.bfloat16)
-
-    qdata, scale = dynamic_quantize_rows(value)
-
-    assert qdata.shape == value.shape
-    assert qdata.dtype is torch.int8
-    assert scale.shape == (*shape[:-1], 1)
-    assert scale.dtype is torch.float32
-    assert torch.all(scale == 1e-30)

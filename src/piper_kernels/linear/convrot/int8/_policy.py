@@ -25,7 +25,7 @@ _DEFAULT_QUANTIZATION_NUM_WARPS = 8
 
 
 def _preparation_block_size(in_features: int) -> int:
-    return 128 if in_features <= 0 else max(128, 1 << (in_features - 1).bit_length())
+    return max(128, 1 << (in_features - 1).bit_length())
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +73,10 @@ def _select_fuse_rotation_quantization(
     group_size: int,
     dtype: torch.dtype,
 ) -> bool:
-    """Select whether production fuses activation rotation and quantization."""
+    """Select whether production fuses input rotation and quantization."""
     block_size = _preparation_block_size(in_features)
     return (
-        in_features > 0
-        and group_size == _FUSED_GROUP_SIZE
+        group_size == _FUSED_GROUP_SIZE
         and target.is_cuda_capability(12, 0)
         and dtype in _FUSED_DTYPES
         and rows >= _FUSED_MIN_ROWS
@@ -113,6 +112,9 @@ def select_execution_plan(
     """Select the production preparation and GEMM schedule for one linear."""
     large_sm120 = target.is_cuda_capability(12, 0) and rows >= _SM120_LARGE_MATMUL_MIN_ROWS
     return ConvRotInt8LinearExecutionPlan(
+        # Prepared inputs may feed weights with different output widths.
+        # Keep every preparation choice independent of out_features; only the
+        # GEMM schedule below may use N.
         fuse_rotation_quantization=_select_fuse_rotation_quantization(
             target,
             rows=rows,

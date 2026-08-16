@@ -1,17 +1,13 @@
 """Rotated INT8 W8A8 tensor subclass."""
 
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import torch
 from torchao.utils import TorchAOBaseTensor
 
 from .._rotation import rotate_groups
-from .dispatch import (
-    _addmm_,
-    _linear_from_storage,
-    _linear_with_input_activation_from_storage,
-)
+from . import dispatch
 from .reference import quantize_weight, validate_storage
 
 
@@ -87,28 +83,6 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
 
     @classmethod
-    def from_packed(
-        cls,
-        qdata: torch.Tensor,
-        scale: torch.Tensor,
-        *,
-        group_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-    ) -> "ConvRotInt8Tensor":
-        """Build from packed storage using the original ``dtype`` keyword.
-
-        This compatibility factory preserves the original scale-reshaping
-        behavior and ``dtype`` keyword. New code should prefer
-        :meth:`from_quantized` and its clearer ``logical_dtype`` spelling.
-        """
-        return cls(
-            qdata.contiguous(),
-            scale.reshape(-1, 1).contiguous(),
-            group_size,
-            dtype,
-        )
-
-    @classmethod
     def from_hp(
         cls,
         hp_tensor: torch.Tensor,
@@ -143,7 +117,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         """
         if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
             raise TypeError("ConvRot addmm_ matrices must be tensors")
-        _addmm_(
+        dispatch.convrot_int8_addmm_(
             self.qdata,
             self.scale,
             self.dtype,
@@ -174,15 +148,22 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
 
 
-def _convrot_int8_input_activation_linear(
-    activation: torch.Tensor,
+def convrot_linear(
+    input: torch.Tensor,  # noqa: A002
     weight: ConvRotInt8Tensor,
-    bias: torch.Tensor | None,
-    input_activation: str,
+    bias: torch.Tensor | None = None,
+    *,
+    input_activation: Literal["swiglu"],
 ) -> torch.Tensor:
-    """Apply an input activation through the INT8 storage-level implementation."""
-    return _linear_with_input_activation_from_storage(
-        activation,
+    """Apply explicit ``[up | gate]`` SwiGLU followed by a ConvRot linear."""
+    if not isinstance(input, torch.Tensor):
+        raise TypeError(f"ConvRot input must be a tensor, got {type(input).__name__}")
+    if not isinstance(weight, ConvRotInt8Tensor):
+        raise TypeError(f"ConvRot weight must be ConvRotInt8Tensor, got {type(weight).__name__}")
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
+    return dispatch.convrot_int8_swiglu_linear(
+        input,
         weight.qdata,
         weight.scale,
         weight.dtype,
@@ -224,15 +205,15 @@ def _convrot_linear_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    activation, weight, bias = _bind_linear_arguments(args, kwargs)
-    if not isinstance(activation, torch.Tensor) or not isinstance(weight, ConvRotInt8Tensor):
+    linear_input, weight, bias = _bind_linear_arguments(args, kwargs)
+    if not isinstance(linear_input, torch.Tensor) or not isinstance(weight, ConvRotInt8Tensor):
         raise TypeError(
             "ConvRot linear dispatch requires a tensor input and ConvRotInt8Tensor weight"
         )
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
-    return _linear_from_storage(
-        activation,
+    return dispatch.convrot_int8_linear(
+        linear_input,
         weight.qdata,
         weight.scale,
         weight.dtype,
@@ -253,7 +234,7 @@ def _convrot_addmm_dispatch(
         raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
     if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
         raise TypeError("ConvRot addmm_ matrices must be tensors")
-    _addmm_(
+    dispatch.convrot_int8_addmm_(
         weight.qdata,
         weight.scale,
         weight.dtype,

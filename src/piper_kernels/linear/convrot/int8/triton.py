@@ -4,7 +4,7 @@
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from dataclasses import dataclass
+import math
 
 import torch
 import triton
@@ -12,13 +12,12 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from piper_kernels._triton.stochastic_quantization import (
-    _seed_argument,
-    _stochastic_round_to_int,
+    seed_argument,
+    stochastic_round_to_int,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from . import _policy
-from .reference import _empty_inner_linear
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
 
@@ -83,7 +82,7 @@ def _normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
 
 
 @triton.jit
-def _rotate_groups_kernel(
+def rotate_groups_kernel(
     x_ptr,
     out_ptr,
     row_width,
@@ -105,7 +104,7 @@ def _rotate_groups_kernel(
 
 
 @triton.jit
-def _rotate_quantize_rows_kernel(
+def rotate_quantize_rows_kernel(
     x_ptr,
     q_ptr,
     scale_ptr,
@@ -166,7 +165,7 @@ def _rotate_quantize_rows_kernel(
 
 
 @triton.jit
-def _quantize_rows_kernel(
+def quantize_rows_kernel(
     x_ptr,
     q_ptr,
     scale_ptr,
@@ -239,7 +238,7 @@ def _requantize_addmm_rows_kernel(
     if stochastic:
         stochastic_scaled = values.to(tl.float32) / scale
         logical_offsets = row_i64 * row_width + offsets_i64
-        quantized = _stochastic_round_to_int(
+        quantized = stochastic_round_to_int(
             stochastic_scaled,
             quantized,
             rounding_seed,
@@ -257,10 +256,10 @@ def _requantize_addmm_rows_kernel(
 
 @triton.jit
 def _int8_matmul_kernel(
-    activation_ptr,
+    input_ptr,
     weight_ptr,
     output_ptr,
-    activation_scale_ptr,
+    input_scale_ptr,
     weight_scale_ptr,
     bias_ptr,
     m,
@@ -295,17 +294,17 @@ def _int8_matmul_kernel(
     offsets_n_i64 = offsets_n.to(tl.int64)
     offsets_k_i64 = offsets_k.to(tl.int64)
 
-    activation_pointers = activation_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
+    input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
     weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
     accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
 
     for k_offset in range(tl.cdiv(k, block_k)):
         if aligned_tiles:
-            activation = tl.load(activation_pointers)
+            input_values = tl.load(input_pointers)
             weight = tl.load(weight_pointers)
         else:
-            activation = tl.load(
-                activation_pointers,
+            input_values = tl.load(
+                input_pointers,
                 mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < k - k_offset * block_k),
                 other=0,
             )
@@ -314,16 +313,16 @@ def _int8_matmul_kernel(
                 mask=(offsets_n[None, :] < n) & (offsets_k[:, None] < k - k_offset * block_k),
                 other=0,
             )
-        accumulator += tl.dot(activation, weight)
-        activation_pointers += block_k
+        accumulator += tl.dot(input_values, weight)
+        input_pointers += block_k
         weight_pointers += block_k
 
     if aligned_tiles:
-        activation_scale = tl.load(activation_scale_ptr + offsets_m)
+        input_scale = tl.load(input_scale_ptr + offsets_m)
         weight_scale = tl.load(weight_scale_ptr + offsets_n)
     else:
-        activation_scale = tl.load(
-            activation_scale_ptr + offsets_m,
+        input_scale = tl.load(
+            input_scale_ptr + offsets_m,
             mask=offsets_m < m,
             other=0.0,
         )
@@ -332,7 +331,7 @@ def _int8_matmul_kernel(
             mask=offsets_n < n,
             other=0.0,
         )
-    result = accumulator.to(tl.float32) * activation_scale[:, None] * weight_scale[None, :]
+    result = accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
     if has_bias:
         if aligned_tiles:
             bias = tl.load(bias_ptr + offsets_n)
@@ -351,8 +350,7 @@ def _int8_matmul_kernel(
         )
 
 
-def _logical_dtype_code(dtype: torch.dtype) -> int:
-    """Encode the logical floating-point dtype used while requantizing."""
+def dtype_code(dtype: torch.dtype) -> int:
     if dtype is torch.float16:
         return 1
     if dtype is torch.bfloat16:
@@ -360,18 +358,18 @@ def _logical_dtype_code(dtype: torch.dtype) -> int:
     return 0
 
 
-def _rotate_activations(
-    activation: torch.Tensor,
+def rotate_input(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
     rotated: torch.Tensor,
     group_size: int,
     *,
     num_warps: int,
 ) -> None:
-    """Apply the portable split-path activation rotation."""
-    m, k = activation.shape
+    """Apply the split-path input rotation."""
+    m, k = input.shape
     groups_per_row = k // group_size
-    _rotate_groups_kernel[(m * groups_per_row,)](
-        activation,
+    rotate_groups_kernel[(m * groups_per_row,)](
+        input,
         rotated,
         k,
         groups_per_row,
@@ -381,20 +379,20 @@ def _rotate_activations(
     )
 
 
-def _quantize_activations(
+def quantize_input(
     rotated: torch.Tensor,
-    activation_qdata: torch.Tensor,
-    activation_scale: torch.Tensor,
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
     logical_dtype_code: int,
     *,
     num_warps: int,
 ) -> None:
     """Apply the portable split-path rowwise quantization."""
     m, k = rotated.shape
-    _quantize_rows_kernel[(m,)](
+    quantize_rows_kernel[(m,)](
         rotated,
-        activation_qdata,
-        activation_scale,
+        input_qdata,
+        input_scale,
         k,
         block_size=max(128, triton.next_power_of_2(k)),
         logical_dtype_code=logical_dtype_code,
@@ -402,38 +400,38 @@ def _quantize_activations(
     )
 
 
-def _fused_rotate_quantize_activations(
-    activation: torch.Tensor,
-    activation_qdata: torch.Tensor,
-    activation_scale: torch.Tensor,
+def fused_rotate_quantize_input(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
     group_size: int,
     logical_dtype_code: int,
     *,
     apply_swiglu: bool = False,
     num_warps: int,
 ) -> None:
-    """Rotate and quantize to ``activation_qdata`` without a rotated intermediate.
+    """Rotate and quantize to ``input_qdata`` without a rotated intermediate.
 
-    ``activation_qdata`` defines the logical row width. ``apply_swiglu`` requires
+    ``input_qdata`` defines the logical row width. ``apply_swiglu`` requires
     a raw ``[up | gate]`` input with twice that width.
     """
-    if activation.ndim != 2 or activation_qdata.ndim != 2:
+    if input.ndim != 2 or input_qdata.ndim != 2:
         raise ValueError(
             "fused preparation tensors must be 2-D, "
-            f"got shapes {tuple(activation.shape)} and {tuple(activation_qdata.shape)}"
+            f"got shapes {tuple(input.shape)} and {tuple(input_qdata.shape)}"
         )
-    m, k = activation_qdata.shape
+    m, k = input_qdata.shape
     expected_input_shape = (m, k * (2 if apply_swiglu else 1))
-    if tuple(activation.shape) != expected_input_shape:
+    if tuple(input.shape) != expected_input_shape:
         raise ValueError(
             f"fused preparation input must have shape {expected_input_shape}, "
-            f"got {tuple(activation.shape)}"
+            f"got {tuple(input.shape)}"
         )
     block_size = max(128, triton.next_power_of_2(k))
-    _rotate_quantize_rows_kernel[(m,)](
-        activation,
-        activation_qdata,
-        activation_scale,
+    rotate_quantize_rows_kernel[(m,)](
+        input,
+        input_qdata,
+        input_scale,
         k,
         block_size=block_size,
         group_size=group_size,
@@ -444,8 +442,8 @@ def _fused_rotate_quantize_activations(
     )
 
 
-def _default_convrot_int8_execution_plan(
-    activation: torch.Tensor,
+def default_convrot_int8_execution_plan(
+    input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     group_size: int,
     *,
@@ -453,98 +451,94 @@ def _default_convrot_int8_execution_plan(
     target: AcceleratorTarget | None = None,
 ) -> _policy.ConvRotInt8LinearExecutionPlan:
     """Resolve production policy for execution, benchmarks, and offline tuning."""
-    input_width = activation.shape[-1]
-    rows = activation.numel() // input_width if input_width else 0
-    target = AcceleratorTarget.from_device(activation.device) if target is None else target
+    rows = math.prod(input.shape[:-1])
+    target = AcceleratorTarget.from_device(input.device) if target is None else target
     return _policy.select_execution_plan(
         target,
         rows=rows,
         out_features=weight_qdata.shape[0],
         in_features=weight_qdata.shape[1],
         group_size=group_size,
-        dtype=activation.dtype,
+        dtype=input.dtype,
         swiglu=apply_swiglu,
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedConvRotInt8Linear:
-    """Prepared activation storage and metadata required by the INT8 GEMM."""
-
-    source_activation: torch.Tensor
-    activation_qdata: torch.Tensor
-    activation_scale: torch.Tensor
-    weight_qdata: torch.Tensor
-    weight_scale: torch.Tensor
-    output: torch.Tensor
-    bias: torch.Tensor | None
-    plan: _policy.ConvRotInt8LinearExecutionPlan
-
-
-def _prepare_convrot_int8_linear(
-    activation: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
+def _prepare_input(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    in_features: int,
     group_size: int,
     *,
     apply_swiglu: bool,
     execution_plan: _policy.ConvRotInt8LinearExecutionPlan,
-) -> _PreparedConvRotInt8Linear:
-    """Apply dynamic activation preparation and allocate the GEMM output."""
-    n, k = weight_qdata.shape
-    activation_2d = activation.reshape(-1, activation.shape[-1]).contiguous()
-    m = activation_2d.shape[0]
-    activation_qdata = torch.empty((m, k), device=activation.device, dtype=torch.int8)
-    activation_scale = torch.empty(m, device=activation.device, dtype=torch.float32)
-    logical_dtype_code = _logical_dtype_code(activation.dtype)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate and dynamically quantize a linear input for one or more weights."""
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    m = input_2d.shape[0]
+    input_qdata = torch.empty(
+        (m, in_features),
+        device=input.device,
+        dtype=torch.int8,
+    )
+    input_scale = torch.empty(m, device=input.device, dtype=torch.float32)
+    logical_dtype_code = dtype_code(input.dtype)
     if execution_plan.fuse_rotation_quantization:
-        _fused_rotate_quantize_activations(
-            activation_2d,
-            activation_qdata,
-            activation_scale,
+        fused_rotate_quantize_input(
+            input_2d,
+            input_qdata,
+            input_scale,
             group_size,
             logical_dtype_code,
             apply_swiglu=apply_swiglu,
             num_warps=execution_plan.fused_num_warps,
         )
     else:
-        prepared_activation = activation_2d
+        transformed_input = input_2d
         if apply_swiglu:
-            up, gate = activation_2d.chunk(2, dim=-1)
-            prepared_activation = up * torch.nn.functional.silu(gate)
-        rotated = torch.empty_like(prepared_activation)
-        _rotate_activations(
-            prepared_activation,
+            up, gate = input_2d.chunk(2, dim=-1)
+            transformed_input = up * torch.nn.functional.silu(gate)
+        rotated = torch.empty_like(transformed_input)
+        rotate_input(
+            transformed_input,
             rotated,
             group_size,
             num_warps=execution_plan.rotation_num_warps,
         )
-        _quantize_activations(
+        quantize_input(
             rotated,
-            activation_qdata,
-            activation_scale,
+            input_qdata,
+            input_scale,
             logical_dtype_code,
             num_warps=execution_plan.quantization_num_warps,
         )
-    output = torch.empty((m, n), device=activation.device, dtype=activation.dtype)
-    return _PreparedConvRotInt8Linear(
-        source_activation=activation,
-        activation_qdata=activation_qdata,
-        activation_scale=activation_scale,
-        weight_qdata=weight_qdata,
-        weight_scale=weight_scale,
-        output=output,
-        bias=bias,
-        plan=execution_plan,
+    return (
+        input_qdata.reshape(*input.shape[:-1], in_features),
+        input_scale.reshape(input.shape[:-1]),
     )
 
 
-def _launch_convrot_int8_linear(prepared: _PreparedConvRotInt8Linear) -> torch.Tensor:
-    """Launch only the INT8 GEMM on prepared quantized activations."""
-    m, k = prepared.activation_qdata.shape
-    n = prepared.weight_qdata.shape[0]
-    plan = prepared.plan
+def _convrot_int8_linear_prepared(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    logical_dtype: torch.dtype,
+    execution_plan: _policy.ConvRotInt8LinearExecutionPlan,
+) -> torch.Tensor:
+    """Allocate and run one INT8 GEMM from a rotated and quantized input."""
+    leading_shape = input_qdata.shape[:-1]
+    m = math.prod(leading_shape)
+    k = input_qdata.shape[-1]
+    n = weight_qdata.shape[0]
+    output = torch.empty(
+        (m, n),
+        device=input_qdata.device,
+        dtype=logical_dtype,
+    )
+    input_qdata_2d = input_qdata.reshape(m, k)
+    input_scale_1d = input_scale.reshape(m)
+    plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n)
     # Cache grouping and the M-tail split are intrinsic to the selected large-tile family,
     # rather than additional execution-plan axes.
@@ -553,16 +547,16 @@ def _launch_convrot_int8_linear(prepared: _PreparedConvRotInt8Linear) -> torch.T
         if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
         else 0
     )
-    bias_pointer = prepared.bias if prepared.bias is not None else prepared.source_activation
+    bias_pointer = bias if bias is not None else output
 
-    def launch(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
+    def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
         grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
         _int8_matmul_kernel[grid](
-            prepared.activation_qdata,
-            prepared.weight_qdata,
-            prepared.output,
-            prepared.activation_scale,
-            prepared.weight_scale,
+            input_qdata_2d,
+            weight_qdata,
+            output,
+            input_scale_1d,
+            weight_scale,
             bias_pointer,
             m,
             n,
@@ -572,7 +566,7 @@ def _launch_convrot_int8_linear(prepared: _PreparedConvRotInt8Linear) -> torch.T
             block_m=plan.matmul_block_m,
             block_n=plan.matmul_block_n,
             block_k=plan.matmul_block_k,
-            has_bias=prepared.bias is not None,
+            has_bias=bias is not None,
             aligned_tiles=aligned_m
             and (n % plan.matmul_block_n == 0)
             and (k % plan.matmul_block_k == 0),
@@ -584,20 +578,20 @@ def _launch_convrot_int8_linear(prepared: _PreparedConvRotInt8Linear) -> torch.T
     full_row_blocks = m // plan.matmul_block_m
     if group_m:
         if full_row_blocks:
-            launch(full_row_blocks, 0, aligned_m=True)
+            launch_tiles(full_row_blocks, 0, aligned_m=True)
         if m % plan.matmul_block_m:
-            launch(1, full_row_blocks, aligned_m=False)
+            launch_tiles(1, full_row_blocks, aligned_m=False)
     else:
-        launch(
+        launch_tiles(
             (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
             0,
             aligned_m=False,
         )
-    return prepared.output.reshape(*prepared.source_activation.shape[:-1], n)
+    return output.reshape(*leading_shape, n)
 
 
-def _run_convrot_int8_linear(
-    activation: torch.Tensor,
+def run_convrot_int8_linear(
+    input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
@@ -606,78 +600,193 @@ def _run_convrot_int8_linear(
     apply_swiglu: bool = False,
     execution_plan: _policy.ConvRotInt8LinearExecutionPlan | None = None,
 ) -> torch.Tensor:
-    """Run ConvRot activation preparation and INT8 GEMM under one plan."""
-    original_shape = activation.shape
-    n, k = weight_qdata.shape
+    """Run ConvRot input preparation and INT8 GEMM under one plan."""
+    original_shape = input.shape
+    k = weight_qdata.shape[1]
     expected_width = k * (2 if apply_swiglu else 1)
     if original_shape[-1] != expected_width:
         operation = "fused SwiGLU input" if apply_swiglu else "linear input"
         raise ValueError(
             f"{operation} has {original_shape[-1]} features, expected {expected_width}"
         )
-    if k == 0:
-        return _empty_inner_linear(activation, n, bias)
-    m = activation.numel() // original_shape[-1]
-    if m == 0 or n == 0:
-        return activation.new_empty((*original_shape[:-1], n))
     plan = (
         execution_plan
         if execution_plan is not None
-        else _default_convrot_int8_execution_plan(
-            activation,
+        else default_convrot_int8_execution_plan(
+            input,
             weight_qdata,
             group_size,
             apply_swiglu=apply_swiglu,
         )
     )
-    prepared = _prepare_convrot_int8_linear(
-        activation,
-        weight_qdata,
-        weight_scale,
-        bias,
+    input_qdata, input_scale = _prepare_input(
+        input,
+        k,
         group_size,
         apply_swiglu=apply_swiglu,
         execution_plan=plan,
     )
-    return _launch_convrot_int8_linear(prepared)
+    return _convrot_int8_linear_prepared(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        input.dtype,
+        plan,
+    )
 
 
-def triton_convrot_int8_linear(
-    activation: torch.Tensor,
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
+@torch.library.custom_op("piper_kernels::convrot_int8_linear", mutates_args=())
+def convrot_int8_linear(
+    input: torch.Tensor,  # noqa: A002
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Run ConvRot activation rotation, dynamic quantization, and INT8 GEMM."""
-    return _run_convrot_int8_linear(
-        activation,
-        qdata,
-        scale,
+    """Run ConvRot input rotation, dynamic quantization, and INT8 GEMM."""
+    return run_convrot_int8_linear(
+        input,
+        weight_qdata,
+        weight_scale,
         bias,
         group_size,
     )
 
 
-def triton_convrot_int8_swiglu_linear(
-    activation: torch.Tensor,
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
+@convrot_int8_linear.register_fake
+def _convrot_int8_linear_fake(
+    input: torch.Tensor,  # noqa: A002
+    weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _bias: torch.Tensor | None,
+    _group_size: int,
+) -> torch.Tensor:
+    return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
+
+
+@torch.library.custom_op("piper_kernels::convrot_int8_prepare_input", mutates_args=())
+def convrot_int8_prepare_input(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate and dynamically quantize a linear input without binding a weight."""
+    original_shape = input.shape
+    in_features = original_shape[-1]
+    rows = math.prod(original_shape[:-1])
+    plan = _policy.select_execution_plan(
+        AcceleratorTarget.from_device(input.device),
+        rows=rows,
+        out_features=0,
+        in_features=in_features,
+        group_size=group_size,
+        dtype=input.dtype,
+    )
+    return _prepare_input(
+        input,
+        in_features,
+        group_size,
+        apply_swiglu=False,
+        execution_plan=plan,
+    )
+
+
+@convrot_int8_prepare_input.register_fake
+def _convrot_int8_prepare_input_fake(
+    input: torch.Tensor,  # noqa: A002
+    _group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        input.new_empty(input.shape, dtype=torch.int8),
+        input.new_empty(input.shape[:-1], dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op("piper_kernels::convrot_int8_linear_prepared", mutates_args=())
+def convrot_int8_linear_prepared(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+    logical_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply one weight to an input prepared by the matching operator."""
+    leading_shape = input_qdata.shape[:-1]
+    out_features, in_features = weight_qdata.shape
+    rows = math.prod(leading_shape)
+    plan = _policy.select_execution_plan(
+        AcceleratorTarget.from_device(input_qdata.device),
+        rows=rows,
+        out_features=out_features,
+        in_features=in_features,
+        group_size=group_size,
+        dtype=logical_dtype,
+    )
+    return _convrot_int8_linear_prepared(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        logical_dtype,
+        plan,
+    )
+
+
+@convrot_int8_linear_prepared.register_fake
+def _convrot_int8_linear_prepared_fake(
+    input_qdata: torch.Tensor,
+    _input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _bias: torch.Tensor | None,
+    _group_size: int,
+    logical_dtype: torch.dtype,
+) -> torch.Tensor:
+    return input_qdata.new_empty(
+        (*input_qdata.shape[:-1], weight_qdata.shape[0]),
+        dtype=logical_dtype,
+    )
+
+
+@torch.library.custom_op("piper_kernels::convrot_int8_swiglu_linear", mutates_args=())
+def convrot_int8_swiglu_linear(
+    input: torch.Tensor,  # noqa: A002
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
     """Fuse ``[up | gate]`` SwiGLU with ConvRot preparation and INT8 GEMM."""
-    return _run_convrot_int8_linear(
-        activation,
-        qdata,
-        scale,
+    return run_convrot_int8_linear(
+        input,
+        weight_qdata,
+        weight_scale,
         bias,
         group_size,
         apply_swiglu=True,
     )
 
 
-def triton_convrot_int8_addmm_(
+@convrot_int8_swiglu_linear.register_fake
+def _convrot_int8_swiglu_linear_fake(
+    input: torch.Tensor,  # noqa: A002
+    weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _bias: torch.Tensor | None,
+    _group_size: int,
+) -> torch.Tensor:
+    return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_addmm_",
+    mutates_args=("qdata", "scale"),
+)
+def convrot_int8_addmm_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     mat1: torch.Tensor,
@@ -689,16 +798,11 @@ def triton_convrot_int8_addmm_(
 ) -> None:
     """Apply an addmm update in the rotated basis and requantize the weight in place."""
     out_features, in_features = qdata.shape
-    if in_features == 0:
-        scale.fill_(1e-30)
-        return
-    if out_features == 0:
-        return
     has_update = alpha != 0 and mat1.shape[1] != 0
     if has_update:
         mat2_contiguous = mat2.contiguous()
         rotated_mat2 = torch.empty_like(mat2_contiguous)
-        _rotate_activations(
+        rotate_input(
             mat2_contiguous,
             rotated_mat2,
             group_size,
@@ -708,7 +812,7 @@ def triton_convrot_int8_addmm_(
     else:
         update = qdata
 
-    logical_dtype_code = _logical_dtype_code(mat1.dtype)
+    logical_dtype_code = dtype_code(mat1.dtype)
     requant_block = max(128, triton.next_power_of_2(in_features))
     _requantize_addmm_rows_kernel[(out_features,)](
         qdata,
@@ -722,7 +826,7 @@ def triton_convrot_int8_addmm_(
         update.stride(1),
         beta,
         alpha,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         block_size=requant_block,
         logical_dtype_code=logical_dtype_code,
         has_base=beta != 0,
@@ -730,3 +834,17 @@ def triton_convrot_int8_addmm_(
         stochastic=rounding_seed is not None,
         num_warps=8,
     )
+
+
+@convrot_int8_addmm_.register_fake
+def _convrot_int8_addmm_fake(
+    _qdata: torch.Tensor,
+    _scale: torch.Tensor,
+    _mat1: torch.Tensor,
+    _mat2: torch.Tensor,
+    _group_size: int,
+    _beta: float,
+    _alpha: float,
+    _rounding_seed: int | None = None,
+) -> None:
+    return None

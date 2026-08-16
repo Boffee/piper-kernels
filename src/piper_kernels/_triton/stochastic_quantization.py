@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 
-def _seed_argument(seed: int | None) -> int:
+def seed_argument(seed: int | None) -> int:
     """Return a launch-safe signed scalar with the seed's uint64 bit pattern."""
     if seed is None:
         return 0
@@ -22,7 +22,7 @@ def _random(seed, offsets):
 
 
 @triton.jit
-def _stochastic_round_to_int(
+def stochastic_round_to_int(
     values,
     deterministic,
     seed,
@@ -39,4 +39,4 @@ def _stochastic_round_to_int(
     return tl.where(interior & (probability > 0.0), rounded, deterministic)
 
 
-__all__: list[str] = []
+__all__ = ["seed_argument", "stochastic_round_to_int"]

@@ -1,4 +1,4 @@
-"""Measure ConvRot activation rotation and rowwise INT8 preparation phases."""
+"""Measure ConvRot input rotation and rowwise INT8 preparation phases."""
 
 from __future__ import annotations
 
@@ -69,10 +69,10 @@ class PreparationPhaseResult:
 
 
 _PHASE_PROVENANCE = {
-    "rotate": "piper_kernels.linear.convrot.int8.triton._rotate_activations",
-    "quantize": "piper_kernels.linear.convrot.int8.triton._quantize_activations",
-    "split": "Piper _rotate_activations followed by _quantize_activations",
-    "fused": "piper_kernels.linear.convrot.int8.triton._fused_rotate_quantize_activations",
+    "rotate": "piper_kernels.linear.convrot.int8.triton.rotate_input",
+    "quantize": "piper_kernels.linear.convrot.int8.triton.quantize_input",
+    "split": "Piper rotate_input followed by quantize_input",
+    "fused": "piper_kernels.linear.convrot.int8.triton.fused_rotate_quantize_input",
     "comfy-kitchen": "comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64",
 }
 
@@ -245,23 +245,21 @@ def _select_preparation_configuration(
     dtype: torch.dtype,
     input_activation: str | None,
 ) -> _PreparationConfiguration:
-    """Select preparation scalars without fabricating an irrelevant GEMM shape."""
+    """Project preparation choices from the production execution plan."""
+    plan = convrot_policy.select_execution_plan(
+        target,
+        rows=rows,
+        out_features=0,
+        in_features=in_features,
+        group_size=256,
+        dtype=dtype,
+        swiglu=input_activation == "swiglu",
+    )
     return {
-        "fuse_rotation_quantization": convrot_policy._select_fuse_rotation_quantization(
-            target,
-            rows=rows,
-            in_features=in_features,
-            group_size=256,
-            dtype=dtype,
-        ),
-        "fused_num_warps": convrot_policy._select_fused_num_warps(
-            target,
-            rows=rows,
-            in_features=in_features,
-            swiglu=input_activation == "swiglu",
-        ),
-        "rotation_num_warps": convrot_policy._DEFAULT_ROTATION_NUM_WARPS,
-        "quantization_num_warps": convrot_policy._DEFAULT_QUANTIZATION_NUM_WARPS,
+        "fuse_rotation_quantization": plan.fuse_rotation_quantization,
+        "fused_num_warps": plan.fused_num_warps,
+        "rotation_num_warps": plan.rotation_num_warps,
+        "quantization_num_warps": plan.quantization_num_warps,
     }
 
 
@@ -290,10 +288,10 @@ def _benchmark_width(
     split_scale = torch.empty(rows, device="cuda", dtype=torch.float32)
     fused_qdata = torch.empty_like(split_qdata)
     fused_scale = torch.empty_like(split_scale)
-    dtype_code = triton_backend._logical_dtype_code(dtype)
+    dtype_code = triton_backend.dtype_code(dtype)
 
     def rotate() -> None:
-        triton_backend._rotate_activations(
+        triton_backend.rotate_input(
             activation,
             rotated,
             256,
@@ -301,7 +299,7 @@ def _benchmark_width(
         )
 
     def quantize() -> None:
-        triton_backend._quantize_activations(
+        triton_backend.quantize_input(
             rotated,
             split_qdata,
             split_scale,
@@ -314,7 +312,7 @@ def _benchmark_width(
         quantize()
 
     def fused() -> None:
-        triton_backend._fused_rotate_quantize_activations(
+        triton_backend.fused_rotate_quantize_input(
             raw_activation,
             fused_qdata,
             fused_scale,
@@ -494,11 +492,11 @@ def _inspection_provider(
     args: argparse.Namespace,
     preparation_configuration: _PreparationConfiguration,
 ) -> BenchmarkProvider[None, None]:
-    jit_functions = {"fused": triton_backend._rotate_quantize_rows_kernel}
+    jit_functions = {"fused": triton_backend.rotate_quantize_rows_kernel}
     if args.input_activation is None:
         jit_functions = {
-            "rotate": triton_backend._rotate_groups_kernel,
-            "quantize": triton_backend._quantize_rows_kernel,
+            "rotate": triton_backend.rotate_groups_kernel,
+            "quantize": triton_backend.quantize_rows_kernel,
             **jit_functions,
         }
     return BenchmarkProvider(

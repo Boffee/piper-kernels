@@ -9,12 +9,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Quality-gated offline ConvRot INT8 forward-linear execution-plan tuning across dynamic
   preparation and GEMM schedules, with stratified large-shape output validation.
+- `convrot_compile_options` for automatically sharing input preparation in compiled
+  inference graphs. The inference-only post-AOT rewrite preserves independent projection order
+  and emits explicit prepared tensors instead of relying on an identity-based runtime cache.
 
 ### Changed
 
 - ConvRot tensors and linear operators now live under `piper_kernels.linear.convrot`, mirroring
   the `piper_kernels.attention` package hierarchy. The former `piper_kernels.convrot` import path
-  has been removed.
+  and `ConvRotInt8Tensor.from_packed` compatibility factory have been removed.
 - Large-M dense forward-linear tuning guidance now standardizes a BF16, bias-free Cartesian
   matrix over `M=8K/32K`, `N=4K/16K`, and non-power-of-two `K=6144/14336` as model-neutral
   measurement anchors rather than dispatch keys. ConvRot INT8 applies group size 256 to this matrix.
@@ -63,9 +66,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Shared Sage-style Q/K reference and Triton preparation now have one implementation across
   Piper Attention and SageAttention2++. Benchmark tooling now verifies the pinned canonical
   SageAttention installation before recording provenance, participates in the standard type and
-  formatting checks, and shares common attention-tuner CLI and result-reporting paths. General
-  ConvRot tests use the preferred `from_quantized` factory while focused compatibility coverage
-  retains `from_packed`.
+  formatting checks, and shares common attention-tuner CLI and result-reporting paths.
 - Centralized ConvRot INT8 preparation and GEMM launch policy in one flat immutable execution
   plan shared by production, benchmark metadata, and offline tuning, with injectable preparation
   and launch boundaries for development measurements. Supported CUDA SwiGLU dispatch now leaves
