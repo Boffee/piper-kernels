@@ -1,4 +1,4 @@
-"""ConvRot rule for automatic preparation sharing under Inductor."""
+"""ConvRot inference graph optimizations for Inductor."""
 
 from __future__ import annotations
 
@@ -6,6 +6,17 @@ import operator
 from collections.abc import Hashable, Mapping
 
 import torch
+from torch._inductor.custom_graph_pass import (
+    CustomInferenceAwareGraphPass,
+    get_hash_for_files,
+)
+from torch._inductor.pattern_matcher import (
+    CallFunction,
+    KeywordArg,
+    Match,
+    PatternMatcherPass,
+    register_graph_pattern,
+)
 
 from piper_kernels.linear._preparation_sharing import (
     PreparationSharingPass,
@@ -14,7 +25,8 @@ from piper_kernels.linear._preparation_sharing import (
     tensor_metadata,
 )
 
-_PASS_VERSION = "convrot-shared-input-preparation-v4"
+_PREPARATION_PASS_VERSION = "convrot-shared-input-preparation-v4"
+_COMPILE_PASS_VERSION = "convrot-compile-v1"
 
 type _PreparedInputNodes = tuple[torch.fx.Node, torch.fx.Node, torch.dtype]
 
@@ -104,22 +116,189 @@ class _ConvRotPreparationRule:
 
 share_preparation_pass = PreparationSharingPass(
     (_ConvRotPreparationRule(),),
-    version=_PASS_VERSION,
+    version=_PREPARATION_PASS_VERSION,
     source_files=(__file__,),
 )
+
+
+_packed_swiglu_patterns = PatternMatcherPass("convrot_packed_swiglu")
+
+
+def _packed_swiglu_pattern(
+    *,
+    promote_gate: bool | None,
+    reverse_multiply: bool,
+) -> CallFunction:
+    """Build one exclusive packed-SwiGLU pattern in Inductor's normalized IR."""
+    split = CallFunction(
+        torch.ops.aten.split.Tensor,
+        KeywordArg("packed"),
+        KeywordArg("split_size"),
+        -1,
+        _users=2,
+    )
+    up = CallFunction(operator.getitem, split, 0, _users=1)
+    gate_users = 2 if promote_gate is False else 1
+    gate = CallFunction(operator.getitem, split, 1, _users=gate_users)
+    if promote_gate is None:
+        silu = CallFunction(torch.ops.aten.silu.default, gate, _users=1)
+    else:
+        gate_value = (
+            CallFunction(
+                torch.ops.prims.convert_element_type.default,
+                gate,
+                torch.float32,
+                _users=2,
+            )
+            if promote_gate
+            else gate
+        )
+        silu = CallFunction(
+            torch.ops.aten.div.Tensor,
+            gate_value,
+            CallFunction(
+                torch.ops.aten.add.Tensor,
+                CallFunction(
+                    torch.ops.aten.exp.default,
+                    CallFunction(torch.ops.aten.neg.default, gate_value, _users=1),
+                    _users=1,
+                ),
+                1,
+                _users=1,
+            ),
+            _users=1,
+        )
+        if promote_gate:
+            silu = CallFunction(
+                torch.ops.prims.convert_element_type.default,
+                silu,
+                KeywordArg("logical_dtype"),
+                _users=1,
+            )
+    multiply_args = (silu, up) if reverse_multiply else (up, silu)
+    return CallFunction(
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        CallFunction(torch.ops.aten.mul.Tensor, *multiply_args, _users=1),
+        KeywordArg("weight_qdata"),
+        KeywordArg("weight_scale"),
+        KeywordArg("bias"),
+        KeywordArg("group_size"),
+    )
+
+
+def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
+    packed = match.kwargs["packed"]
+    weight_qdata = match.kwargs["weight_qdata"]
+    split_size = match.kwargs["split_size"]
+    if not isinstance(packed, torch.fx.Node) or not isinstance(weight_qdata, torch.fx.Node):
+        return False
+    packed_value = tensor_metadata(packed)
+    weight_value = tensor_metadata(weight_qdata)
+    if (
+        packed_value is None
+        or packed_value.ndim == 0
+        or weight_value is None
+        or weight_value.ndim != 2
+        or isinstance(split_size, bool)
+        or not isinstance(split_size, (int, torch.SymInt))
+    ):
+        return False
+    in_features = weight_value.shape[1]
+    dimensions_match = dimension_key(split_size) == dimension_key(in_features) and dimension_key(
+        packed_value.shape[-1]
+    ) == dimension_key(2 * in_features)
+    if promote_gate is True:
+        return dimensions_match and match.kwargs["logical_dtype"] is packed_value.dtype
+    if promote_gate is False:
+        return dimensions_match and packed_value.dtype is torch.float32
+    return dimensions_match
+
+
+def _replace_packed_swiglu(
+    match: Match,
+    packed: torch.fx.Node,
+    weight_qdata: torch.fx.Node,
+    weight_scale: torch.fx.Node,
+    bias: torch.fx.Node | None,
+    group_size: int,
+    **_unused: object,
+) -> None:
+    original = match.output_node()
+    graph = match.graph
+    with graph.inserting_before(original):
+        replacement = graph.call_function(
+            torch.ops.piper_kernels.convrot_int8_swiglu_linear.default,
+            args=(
+                packed,
+                weight_qdata,
+                weight_scale,
+                bias,
+                group_size,
+            ),
+        )
+    replacement.meta = original.meta.copy()
+    replacement.meta.pop("eager_input_vals", None)
+    original.replace_all_uses_with(replacement)
+    match.erase_nodes()
+
+
+# SiLU may remain direct, lower without casts for FP32, or lower through FP32
+# for FP16/BF16. Multiplication is commutative, so accept either operand order.
+for _promote_gate in (None, False, True):
+    for _reverse_multiply in (False, True):
+        register_graph_pattern(
+            _packed_swiglu_pattern(
+                promote_gate=_promote_gate,
+                reverse_multiply=_reverse_multiply,
+            ),
+            extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
+                match,
+                promote_gate=promote_gate,
+            ),
+            # PyTorch's concrete pass has a parameter-name-only protocol mismatch.
+            pass_dict=_packed_swiglu_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_packed_swiglu)
+
+
+def _fold_packed_swiglu(graph: torch.fx.Graph) -> bool:
+    changed = _packed_swiglu_patterns.apply(graph) > 0
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+    return changed
+
+
+class _ConvRotCompilePass(CustomInferenceAwareGraphPass):
+    """Apply ConvRot graph folds before sharing ordinary input preparation."""
+
+    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
+        if not is_inference:
+            return
+        _fold_packed_swiglu(graph)
+        share_preparation_pass(graph, is_inference=True)
+
+    def uuid(self) -> bytes:
+        preparation_uuid = share_preparation_pass.uuid().hex()
+        return get_hash_for_files(
+            (__file__,),
+            extra=f"{_COMPILE_PASS_VERSION}:{preparation_uuid}",
+        )
+
+
+convrot_compile_pass = _ConvRotCompilePass()
 
 
 def convrot_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Return Inductor options with automatic ConvRot preparation reuse.
+    """Return Inductor options for packed SwiGLU folding and preparation reuse.
 
     Existing post-grad pre-passes run first and are preserved. Reapplying this
     helper is idempotent, and the input mapping and any contained list remain
     unchanged. Pass these options to ``torch.compile`` without also supplying
     its mutually exclusive ``mode`` argument.
     """
-    return add_post_grad_pass(options, share_preparation_pass)
+    return add_post_grad_pass(options, convrot_compile_pass)
 
 
 __all__ = ["convrot_compile_options"]

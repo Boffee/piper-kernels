@@ -387,7 +387,7 @@ def test_fused_up_gate_swiglu_linear_matches_materialized_path(
         256,
         bias,
     )
-    actual = convrot_linear(raw_activation, weight, bias, input_activation="swiglu")
+    actual = convrot_linear(raw_activation, weight, bias, activation_fn="swiglu")
 
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
@@ -529,13 +529,13 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
             activation,
             weight,
             bias.contiguous(),
-            input_activation="swiglu",
+            activation_fn="swiglu",
         )
         actual = convrot_linear(
             activation,
             weight,
             bias,
-            input_activation="swiglu",
+            activation_fn="swiglu",
         )
 
     assert torch.equal(actual, expected)
@@ -590,7 +590,7 @@ def test_swiglu_linear_runs_under_fullgraph_compile_with_noncontiguous_input(row
     assert not raw_activation.is_contiguous()
 
     def call(value: torch.Tensor) -> torch.Tensor:
-        return convrot_linear(value, weight, input_activation="swiglu")
+        return convrot_linear(value, weight, activation_fn="swiglu")
 
     expected = call(raw_activation)
     actual = torch.compile(call, fullgraph=True)(raw_activation)

@@ -71,7 +71,7 @@ def test_cpu_convrot_linear_matches_materialized_up_gate_swiglu(with_bias: bool)
     bias = torch.randn(out_features) if with_bias else None
 
     expected = torch.nn.functional.linear(up * torch.nn.functional.silu(gate), weight, bias)
-    actual = convrot_linear(activation, weight, bias, input_activation="swiglu")
+    actual = convrot_linear(activation, weight, bias, activation_fn="swiglu")
 
     assert torch.equal(actual, expected)
 
@@ -93,7 +93,7 @@ def test_convrot_linear_supports_keyword_arguments() -> None:
         input=input_tensor,
         weight=weight,
         bias=bias,
-        input_activation="swiglu",
+        activation_fn="swiglu",
     )
 
     assert torch.equal(actual, expected)
@@ -109,7 +109,7 @@ def test_convrot_linear_propagates_meta_metadata() -> None:
     activation = torch.empty(2, 7, 64, dtype=torch.bfloat16, device="meta")
     bias = torch.empty(11, dtype=torch.bfloat16, device="meta")
 
-    result = convrot_linear(activation, weight, bias, input_activation="swiglu")
+    result = convrot_linear(activation, weight, bias, activation_fn="swiglu")
 
     assert result.shape == (2, 7, 11)
     assert result.dtype is torch.bfloat16
@@ -126,7 +126,7 @@ def test_convrot_linear_supports_fake_tensors() -> None:
             logical_dtype=torch.float32,
         )
         activation = torch.empty(2, 7, 64)
-        result = convrot_linear(activation, weight, input_activation="swiglu")
+        result = convrot_linear(activation, weight, activation_fn="swiglu")
 
     assert isinstance(result, FakeTensor)
     assert result.shape == (2, 7, 11)
@@ -153,7 +153,7 @@ def test_meta_linear_and_input_activation_run_under_torch_compile() -> None:
             value,
             convrot_weight,
             linear_bias,
-            input_activation="swiglu",
+            activation_fn="swiglu",
         )
         return regular, fused
 
@@ -183,7 +183,7 @@ def test_cpu_convrot_linear_runs_under_torch_compile() -> None:
             value,
             convrot_weight,
             linear_bias,
-            input_activation="swiglu",
+            activation_fn="swiglu",
         )
 
     expected = apply_swiglu(activation, weight, bias)
@@ -199,18 +199,18 @@ def test_cpu_convrot_linear_runs_under_torch_compile() -> None:
 def test_convrot_linear_rejects_unknown_activation() -> None:
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
 
-    with pytest.raises(ValueError, match="input_activation must be 'swiglu'"):
+    with pytest.raises(ValueError, match="activation_fn must be 'swiglu'"):
         convrot_linear(
             torch.randn(7, 64),
             weight,
-            input_activation="gelu",  # type: ignore[arg-type]
+            activation_fn="gelu",  # type: ignore[arg-type]
         )
 
 
-def test_convrot_linear_requires_explicit_input_activation() -> None:
+def test_convrot_linear_requires_explicit_activation_fn() -> None:
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
 
-    with pytest.raises(TypeError, match="required keyword-only argument: 'input_activation'"):
+    with pytest.raises(TypeError, match="required keyword-only argument: 'activation_fn'"):
         convrot_linear(torch.randn(7, 64), weight)  # type: ignore[call-arg]
 
 
@@ -222,7 +222,7 @@ def test_convrot_linear_rejects_wrong_raw_width(activation: torch.Tensor) -> Non
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
 
     with pytest.raises(ValueError, match=r"input has .* features, expected 64"):
-        convrot_linear(activation, weight, input_activation="swiglu")
+        convrot_linear(activation, weight, activation_fn="swiglu")
 
 
 def test_convrot_linear_rejects_invalid_argument_types() -> None:
@@ -230,19 +230,19 @@ def test_convrot_linear_rejects_invalid_argument_types() -> None:
     activation = torch.randn(7, 64)
 
     with pytest.raises(TypeError, match="input must be a tensor"):
-        convrot_linear(None, weight, input_activation="swiglu")  # type: ignore[arg-type]
+        convrot_linear(None, weight, activation_fn="swiglu")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="weight must be ConvRotInt8Tensor"):
         convrot_linear(
             activation,
             torch.randn(11, 32),  # type: ignore[arg-type]
-            input_activation="swiglu",
+            activation_fn="swiglu",
         )
     with pytest.raises(TypeError, match="bias must be a tensor or None"):
         convrot_linear(
             activation,
             weight,
             1.0,  # type: ignore[arg-type]
-            input_activation="swiglu",
+            activation_fn="swiglu",
         )
 
 

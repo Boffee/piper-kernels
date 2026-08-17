@@ -9,7 +9,7 @@ from .int8.tensor import convrot_linear
 def convrot_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Lazily load Inductor options for automatic preparation sharing."""
+    """Lazily load Inductor options for ConvRot inference graph optimization."""
     try:
         from ._compile import convrot_compile_options as compile_options  # noqa: PLC0415
     except ImportError as error:

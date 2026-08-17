@@ -237,12 +237,8 @@ def convrot_int8_swiglu_linear(
     dtype: torch.dtype,
     group_size: int,
     bias: torch.Tensor | None,
-    input_activation: str,
 ) -> torch.Tensor:
-    """Apply an explicit input activation immediately before a ConvRot linear."""
-    if input_activation != "swiglu":
-        raise ValueError(f"ConvRot input_activation must be 'swiglu', got {input_activation!r}")
-
+    """Apply packed ``[up | gate]`` SwiGLU immediately before a ConvRot linear."""
     in_features = qdata.shape[1]
     bias = _validate_linear(
         input,

@@ -121,7 +121,7 @@ def make_public_convrot_provider(
                 prepared_activation,
                 weight,
                 bias,
-                input_activation="swiglu",
+                activation_fn="swiglu",
             )
         return torch.nn.functional.linear(prepared_activation, weight, bias)
 

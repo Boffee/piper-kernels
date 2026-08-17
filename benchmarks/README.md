@@ -254,10 +254,11 @@ These integration guards use concrete dimensions to make the comparison exact; t
 production policy predicates.
 
 Compiled inference integrations can pass `convrot_compile_options()` to
-`torch.compile`. Its post-AOT graph rewrite recognizes two or more compatible ConvRot linears
-fed by the exact same FX value, emits one explicit preparation node, and leaves every prepared
-GEMM at the corresponding original node position. This is automatic across architectures within
-each compiled graph and does not require packed projection weights or attention-specific code.
+`torch.compile`. Its post-AOT graph rewrites fold an exclusive packed `[up | gate]` SwiGLU chain
+into the existing activated ConvRot operator and recognize two or more compatible ordinary
+ConvRot linears fed by the exact same FX value. The latter emits one explicit preparation node
+and leaves every prepared GEMM at the corresponding original node position. Both are automatic
+across architectures within each compiled graph and require no attention-specific code.
 
 Treat 8K and 32K as evidence for one continuous large-M plan. Screen against the current
 production plan, then confirm a proposed winner in at least three fresh processes with alternating

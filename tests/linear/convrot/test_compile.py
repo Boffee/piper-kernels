@@ -6,7 +6,10 @@ import pytest
 import torch
 
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_compile_options
-from piper_kernels.linear.convrot._compile import share_preparation_pass
+from piper_kernels.linear.convrot._compile import (
+    convrot_compile_pass,
+    share_preparation_pass,
+)
 
 
 def _placeholder(
@@ -17,6 +20,11 @@ def _placeholder(
     node = graph.placeholder(name)
     node.meta["val"] = value
     return node
+
+
+def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool) -> None:
+    torch.fx.GraphModule({}, graph)
+    convrot_compile_pass(graph, is_inference=is_inference)
 
 
 def _linear(
@@ -38,6 +46,35 @@ def _linear(
     )
     node.meta["eager_input_vals"] = (activation_value, qdata_value)
     return node
+
+
+def _packed_swiglu_linear(
+    graph: torch.fx.Graph,
+    packed: torch.fx.Node,
+    qdata: torch.fx.Node,
+    scale: torch.fx.Node,
+    *,
+    reverse_multiply: bool = False,
+    reverse_parts: bool = False,
+) -> tuple[torch.fx.Node, torch.fx.Node]:
+    packed_value = packed.meta["val"]
+    in_features = qdata.meta["val"].shape[1]
+    part_value = packed_value.new_empty((*packed_value.shape[:-1], in_features))
+    split = graph.call_function(
+        torch.ops.aten.split.Tensor,
+        args=(packed, in_features, -1),
+    )
+    split.meta["val"] = (part_value, part_value)
+    up = graph.call_function(operator.getitem, args=(split, 1 if reverse_parts else 0))
+    up.meta["val"] = part_value
+    gate = graph.call_function(operator.getitem, args=(split, 0 if reverse_parts else 1))
+    gate.meta["val"] = part_value
+    silu = graph.call_function(torch.ops.aten.silu.default, args=(gate,))
+    silu.meta["val"] = part_value
+    multiply_args = (silu, up) if reverse_multiply else (up, silu)
+    activated = graph.call_function(torch.ops.aten.mul.Tensor, args=multiply_args)
+    activated.meta["val"] = part_value
+    return _linear(graph, activated, qdata, scale, None, 16), activated
 
 
 def test_pass_rewrites_only_compatible_shared_activation_groups() -> None:
@@ -113,20 +150,136 @@ def test_pass_fails_closed_without_post_aot_tensor_metadata() -> None:
     assert str(graph) == original
 
 
+@pytest.mark.parametrize("reverse_multiply", [False, True])
+def test_pass_folds_exclusive_packed_swiglu(reverse_multiply: bool) -> None:
+    graph = torch.fx.Graph()
+    packed = _placeholder(graph, "packed", torch.empty(2, 17, 128, device="meta"))
+    qdata = _placeholder(graph, "qdata", torch.empty(33, 64, dtype=torch.int8))
+    scale = _placeholder(graph, "scale", torch.empty(33, 1))
+    result, _activated = _packed_swiglu_linear(
+        graph,
+        packed,
+        qdata,
+        scale,
+        reverse_multiply=reverse_multiply,
+    )
+    graph.output(result)
+
+    _run_compile_pass(graph, is_inference=True)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    fused_target = torch.ops.piper_kernels.convrot_int8_swiglu_linear.default
+    assert targets.count(fused_target) == 1
+    assert torch.ops.piper_kernels.convrot_int8_linear.default not in targets
+    assert torch.ops.aten.split.Tensor not in targets
+    assert torch.ops.aten.silu.default not in targets
+    fused = next(node for node in graph.nodes if node.target == fused_target)
+    assert fused.args[0] is packed
+    assert "eager_input_vals" not in fused.meta
+    assert fused.meta["val"].shape == (2, 17, 33)
+    graph.lint()
+
+
+@pytest.mark.parametrize("case", ["extra-user", "reversed-parts", "wrong-width"])
+def test_pass_rejects_noncanonical_packed_swiglu(case: str) -> None:
+    graph = torch.fx.Graph()
+    packed_width = 130 if case == "wrong-width" else 128
+    packed = _placeholder(graph, "packed", torch.empty(17, packed_width, device="meta"))
+    qdata = _placeholder(graph, "qdata", torch.empty(33, 64, dtype=torch.int8))
+    scale = _placeholder(graph, "scale", torch.empty(33, 1))
+    result, activated = _packed_swiglu_linear(
+        graph,
+        packed,
+        qdata,
+        scale,
+        reverse_parts=case == "reversed-parts",
+    )
+    if case == "extra-user":
+        extra = graph.call_function(torch.ops.aten.neg.default, args=(activated,))
+        extra.meta["val"] = activated.meta["val"]
+        graph.output((result, extra))
+    else:
+        graph.output(result)
+    original = str(graph)
+
+    _run_compile_pass(graph, is_inference=True)
+
+    assert str(graph) == original
+
+
+def test_pass_keeps_packed_swiglu_in_training_graphs() -> None:
+    graph = torch.fx.Graph()
+    packed = _placeholder(graph, "packed", torch.empty(17, 128, device="meta"))
+    qdata = _placeholder(graph, "qdata", torch.empty(33, 64, dtype=torch.int8))
+    scale = _placeholder(graph, "scale", torch.empty(33, 1))
+    result, _activated = _packed_swiglu_linear(graph, packed, qdata, scale)
+    graph.output(result)
+    original = str(graph)
+
+    _run_compile_pass(graph, is_inference=False)
+
+    assert str(graph) == original
+
+
 def test_compile_options_install_the_convrot_pass() -> None:
     options = convrot_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options["post_grad_custom_pre_pass"] is share_preparation_pass
+    assert options["post_grad_custom_pre_pass"] is convrot_compile_pass
 
 
 def test_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    first = share_preparation_pass.uuid()
-    second = share_preparation_pass.uuid()
+    first = convrot_compile_pass.uuid()
+    second = convrot_compile_pass.uuid()
 
     assert isinstance(first, bytes)
     assert first
     assert first == second
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_compile_options_fold_packed_swiglu() -> None:
+    class PackedSwiGLUProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            qdata = torch.randint(
+                -127,
+                128,
+                (96, 512),
+                device="cuda",
+                dtype=torch.int8,
+            )
+            scale = torch.rand(96, 1, device="cuda", dtype=torch.float32) * 0.01
+            weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
+            self.projection = torch.nn.Linear(
+                512,
+                96,
+                bias=True,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            self.projection.weight = torch.nn.Parameter(weight, requires_grad=False)
+            assert self.projection.bias is not None
+            self.projection.bias.requires_grad_(False)
+
+        def forward(self, packed: torch.Tensor) -> torch.Tensor:
+            up, gate = packed.chunk(2, dim=-1)
+            return self.projection(up * torch.nn.functional.silu(gate))
+
+    torch.manual_seed(381)
+    model = PackedSwiGLUProjection().eval()
+    packed = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = model(packed)
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=convrot_compile_options(),
+        )(packed)
+
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
 
 @pytest.mark.gpu

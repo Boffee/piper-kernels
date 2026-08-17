@@ -38,7 +38,7 @@ def _call_linear(
         activation,
         weight,
         bias,
-        input_activation=input_activation,  # type: ignore[arg-type]
+        activation_fn=input_activation,  # type: ignore[arg-type]
     )
 
 
@@ -174,7 +174,7 @@ def test_operations_revalidate_canonical_storage_layout(
             return convrot_linear(
                 torch.empty(3, 64),
                 weight,
-                input_activation="swiglu",
+                activation_fn="swiglu",
             )
         return weight.addmm_(torch.empty(7, 3), torch.empty(3, 32))
 
