@@ -117,7 +117,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         """
         if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
             raise TypeError("ConvRot addmm_ matrices must be tensors")
-        dispatch.convrot_int8_addmm_(
+        dispatch.addmm_(
             self.qdata,
             self.scale,
             self.dtype,
@@ -148,15 +148,15 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
 
 
-def convrot_linear(
+def convrot_int8_linear(
     input: torch.Tensor,  # noqa: A002
     weight: ConvRotInt8Tensor,
     bias: torch.Tensor | None = None,
     *,
     activation_fn: Literal["swiglu"] | None = None,
 ) -> torch.Tensor:
-    """Apply an optional input activation followed by a ConvRot linear."""
-    return dispatch.convrot_int8_linear(
+    """Apply an optional input activation followed by a ConvRot INT8 linear."""
+    return dispatch.linear(
         input,
         weight.qdata,
         weight.scale,
@@ -206,7 +206,7 @@ def _convrot_linear_dispatch(
         )
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
-    return dispatch.convrot_int8_linear(
+    return dispatch.linear(
         linear_input,
         weight.qdata,
         weight.scale,
@@ -228,7 +228,7 @@ def _convrot_addmm_dispatch(
         raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
     if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
         raise TypeError("ConvRot addmm_ matrices must be tensors")
-    dispatch.convrot_int8_addmm_(
+    dispatch.addmm_(
         weight.qdata,
         weight.scale,
         weight.dtype,

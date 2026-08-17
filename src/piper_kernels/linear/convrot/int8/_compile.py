@@ -1,4 +1,4 @@
-"""ConvRot inference graph optimizations for Inductor."""
+"""ConvRot INT8 inference graph optimizations for Inductor."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _emit_linear_prepared(
     )
 
 
-class _ConvRotPreparationRule:
+class _PreparationRule:
     """Describe how semantic ConvRot linears share prepared inputs."""
 
     linear_target = torch.ops.piper_kernels.convrot_int8_linear.default
@@ -151,7 +151,7 @@ class _ConvRotPreparationRule:
         )
 
 
-_PREPARATION_RULES = (_ConvRotPreparationRule(),)
+_PREPARATION_RULES = (_PreparationRule(),)
 
 
 _packed_swiglu_patterns = PatternMatcherPass("convrot_packed_swiglu")
@@ -311,7 +311,7 @@ def _fold_packed_swiglu(graph: torch.fx.Graph) -> bool:
     return changed
 
 
-class _ConvRotCompilePass(CustomInferenceAwareGraphPass):
+class _CompilePass(CustomInferenceAwareGraphPass):
     """Apply ConvRot graph folds before sharing ordinary input preparation."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
@@ -327,10 +327,10 @@ class _ConvRotCompilePass(CustomInferenceAwareGraphPass):
         )
 
 
-convrot_compile_pass = _ConvRotCompilePass()
+compile_pass = _CompilePass()
 
 
-def convrot_compile_options(
+def convrot_int8_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Return Inductor options for packed SwiGLU folding and preparation reuse.
@@ -340,7 +340,7 @@ def convrot_compile_options(
     unchanged. Pass these options to ``torch.compile`` without also supplying
     its mutually exclusive ``mode`` argument.
     """
-    return preparation_sharing.add_post_grad_pass(options, convrot_compile_pass)
+    return preparation_sharing.add_post_grad_pass(options, compile_pass)
 
 
-__all__ = ["convrot_compile_options"]
+__all__ = ["convrot_int8_compile_options"]

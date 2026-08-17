@@ -75,7 +75,7 @@ def _validate_addmm(
         )
 
 
-def convrot_int8_addmm_(
+def addmm_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     dtype: torch.dtype,
@@ -105,7 +105,7 @@ def convrot_int8_addmm_(
     )
     if _supports_triton(qdata):
         assert triton_backend is not None
-        triton_backend.convrot_int8_addmm_(
+        triton_backend.addmm_(
             qdata,
             scale,
             mat1,
@@ -116,7 +116,7 @@ def convrot_int8_addmm_(
             seed_argument,
         )
     else:
-        reference.convrot_int8_addmm_(
+        reference.addmm_(
             qdata,
             scale,
             mat1,
@@ -198,7 +198,7 @@ def _run_linear(
     """Run a validated ConvRot linear through the selected backend."""
     if _supports_triton(input):
         assert triton_backend is not None
-        return triton_backend.convrot_int8_linear(
+        return triton_backend.linear(
             input,
             qdata,
             scale,
@@ -206,7 +206,7 @@ def _run_linear(
             group_size,
             activation_fn,
         )
-    return reference.convrot_int8_linear(
+    return reference.linear(
         input,
         qdata,
         scale,
@@ -216,7 +216,7 @@ def _run_linear(
     )
 
 
-def convrot_int8_linear(
+def linear(
     input: torch.Tensor,  # noqa: A002
     qdata: torch.Tensor,
     scale: torch.Tensor,

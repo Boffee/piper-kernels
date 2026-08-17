@@ -253,7 +253,7 @@ that change the operator boundary when an integration uses them:
 These integration guards use concrete dimensions to make the comparison exact; they are not
 production policy predicates.
 
-Compiled inference integrations can pass `convrot_compile_options()` to
+Compiled inference integrations can pass `convrot_int8_compile_options()` to
 `torch.compile`. Its post-AOT graph rewrites fold an exclusive packed `[up | gate]` SwiGLU chain
 into activated input preparation followed by a prepared linear, so the packed input can die before
 the linear output allocation. They also recognize two or more compatible ordinary ConvRot linears

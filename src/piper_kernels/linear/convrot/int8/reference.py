@@ -105,7 +105,7 @@ def dynamic_quantize_rows(
     return qdata, scale
 
 
-def convrot_int8_addmm_(
+def addmm_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     mat1: torch.Tensor,
@@ -130,7 +130,7 @@ def convrot_int8_addmm_(
     scale.copy_(merged_scale)
 
 
-def convrot_int8_prepare_input(
+def prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -143,7 +143,7 @@ def convrot_int8_prepare_input(
     )
 
 
-def convrot_int8_linear_prepared(
+def linear_prepared(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -174,7 +174,7 @@ def convrot_int8_linear_prepared(
     return result.to(logical_dtype).reshape(*leading_shape, weight_qdata.shape[0])
 
 
-def convrot_int8_linear(
+def linear(
     input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -193,11 +193,11 @@ def convrot_int8_linear(
         raise ValueError(
             f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
         )
-    input_qdata, input_scale = convrot_int8_prepare_input(
+    input_qdata, input_scale = prepare_input(
         prepared_input,
         group_size,
     )
-    return convrot_int8_linear_prepared(
+    return linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,

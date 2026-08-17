@@ -280,7 +280,7 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
     )
     configuration = {
         **workload.common_configuration(),
-        "operation_entrypoint": "piper_kernels.linear.convrot.convrot_linear",
+        "operation_entrypoint": "piper_kernels.linear.convrot.convrot_int8_linear",
         "input_preparation": "fused",
     }
     measurement = ProviderMeasurement(
@@ -327,7 +327,7 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
         timings=_phase_timings(),
         configuration={
             **common,
-            "operation_entrypoint": "piper_kernels.linear.convrot.convrot_linear",
+            "operation_entrypoint": "piper_kernels.linear.convrot.convrot_int8_linear",
             "input_preparation": "fused",
         },
     )

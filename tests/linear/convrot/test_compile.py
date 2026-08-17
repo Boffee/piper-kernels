@@ -7,11 +7,11 @@ import torch
 
 from piper_kernels.linear.convrot import (
     ConvRotInt8Tensor,
-    convrot_compile_options,
-    convrot_linear,
+    convrot_int8_compile_options,
+    convrot_int8_linear,
 )
-from piper_kernels.linear.convrot._compile import (
-    convrot_compile_pass,
+from piper_kernels.linear.convrot.int8._compile import (
+    compile_pass,
 )
 
 
@@ -27,7 +27,7 @@ def _placeholder(
 
 def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool) -> None:
     torch.fx.GraphModule({}, graph)
-    convrot_compile_pass(graph, is_inference=is_inference)
+    compile_pass(graph, is_inference=is_inference)
 
 
 def _linear(
@@ -230,15 +230,15 @@ def test_pass_keeps_packed_swiglu_in_training_graphs() -> None:
 
 
 def test_compile_options_install_the_convrot_pass() -> None:
-    options = convrot_compile_options({"max_autotune": True})
+    options = convrot_int8_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options["post_grad_custom_pre_pass"] is convrot_compile_pass
+    assert options["post_grad_custom_pre_pass"] is compile_pass
 
 
 def test_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    first = convrot_compile_pass.uuid()
-    second = convrot_compile_pass.uuid()
+    first = compile_pass.uuid()
+    second = compile_pass.uuid()
 
     assert isinstance(first, bytes)
     assert first
@@ -281,7 +281,7 @@ def test_cuda_compile_options_fold_packed_swiglu() -> None:
     with torch.no_grad():
         weight = model.projection.weight
         assert isinstance(weight, ConvRotInt8Tensor)
-        expected = convrot_linear(
+        expected = convrot_int8_linear(
             packed,
             weight,
             model.projection.bias,
@@ -291,7 +291,7 @@ def test_cuda_compile_options_fold_packed_swiglu() -> None:
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=convrot_compile_options(),
+            options=convrot_int8_compile_options(),
         )(packed)
 
     assert torch.equal(actual, expected)
@@ -346,7 +346,7 @@ def test_cuda_compile_options_match_unmodified_compiled_linears() -> None:
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=convrot_compile_options(),
+            options=convrot_int8_compile_options(),
         )(activation)
 
     assert all(

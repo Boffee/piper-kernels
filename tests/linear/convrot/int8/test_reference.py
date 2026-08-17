@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
-from piper_kernels.linear.convrot.int8.reference import convrot_int8_linear, dynamic_quantize_rows
+from piper_kernels.linear.convrot.int8.reference import dynamic_quantize_rows, linear
 
 
 def test_cpu_linear_matches_explicit_w8a8_reference() -> None:
@@ -55,7 +55,7 @@ def test_cpu_linear_supports_pytorch_keyword_and_mixed_argument_forms() -> None:
 
 
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_cpu_convrot_linear_matches_materialized_up_gate_swiglu(with_bias: bool) -> None:
+def test_cpu_public_linear_matches_materialized_up_gate_swiglu(with_bias: bool) -> None:
     torch.manual_seed(45)
     in_features, out_features = 32, 11
     weight = ConvRotInt8Tensor.from_hp(
@@ -68,18 +68,18 @@ def test_cpu_convrot_linear_matches_materialized_up_gate_swiglu(with_bias: bool)
     bias = torch.randn(out_features) if with_bias else None
 
     expected = torch.nn.functional.linear(up * torch.nn.functional.silu(gate), weight, bias)
-    actual = convrot_linear(activation, weight, bias, activation_fn="swiglu")
+    actual = convrot_int8_linear(activation, weight, bias, activation_fn="swiglu")
 
     assert torch.equal(actual, expected)
 
 
-def test_convrot_linear_supports_keyword_arguments() -> None:
+def test_public_linear_supports_keyword_arguments() -> None:
     torch.manual_seed(124)
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
     input_tensor = torch.randn(2, 64)
     bias = torch.randn(11)
 
-    expected = convrot_int8_linear(
+    expected = linear(
         input_tensor,
         weight.qdata,
         weight.scale,
@@ -87,7 +87,7 @@ def test_convrot_linear_supports_keyword_arguments() -> None:
         bias,
         activation_fn="swiglu",
     )
-    actual = convrot_linear(
+    actual = convrot_int8_linear(
         input=input_tensor,
         weight=weight,
         bias=bias,
@@ -97,7 +97,7 @@ def test_convrot_linear_supports_keyword_arguments() -> None:
     assert torch.equal(actual, expected)
 
 
-def test_convrot_linear_propagates_meta_metadata() -> None:
+def test_public_linear_propagates_meta_metadata() -> None:
     weight = ConvRotInt8Tensor.from_quantized(
         torch.empty(11, 32, dtype=torch.int8, device="meta"),
         torch.empty(11, 1, dtype=torch.float32, device="meta"),
@@ -107,14 +107,14 @@ def test_convrot_linear_propagates_meta_metadata() -> None:
     activation = torch.empty(2, 7, 64, dtype=torch.bfloat16, device="meta")
     bias = torch.empty(11, dtype=torch.bfloat16, device="meta")
 
-    result = convrot_linear(activation, weight, bias, activation_fn="swiglu")
+    result = convrot_int8_linear(activation, weight, bias, activation_fn="swiglu")
 
     assert result.shape == (2, 7, 11)
     assert result.dtype is torch.bfloat16
     assert result.device.type == "meta"
 
 
-def test_convrot_linear_supports_fake_tensors() -> None:
+def test_public_linear_supports_fake_tensors() -> None:
     build_hadamard(16)
     with FakeTensorMode():
         weight = ConvRotInt8Tensor.from_quantized(
@@ -124,7 +124,7 @@ def test_convrot_linear_supports_fake_tensors() -> None:
             logical_dtype=torch.float32,
         )
         activation = torch.empty(2, 7, 64)
-        result = convrot_linear(activation, weight, activation_fn="swiglu")
+        result = convrot_int8_linear(activation, weight, activation_fn="swiglu")
 
     assert isinstance(result, FakeTensor)
     assert result.shape == (2, 7, 11)
@@ -147,7 +147,7 @@ def test_meta_linear_and_input_activation_run_under_torch_compile() -> None:
         linear_bias: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         regular = torch.nn.functional.linear(value[..., :32], convrot_weight, linear_bias)
-        fused = convrot_linear(
+        fused = convrot_int8_linear(
             value,
             convrot_weight,
             linear_bias,
@@ -166,7 +166,7 @@ def test_meta_linear_and_input_activation_run_under_torch_compile() -> None:
     assert regular.device.type == fused.device.type == "meta"
 
 
-def test_cpu_convrot_linear_runs_under_torch_compile() -> None:
+def test_cpu_public_linear_runs_under_torch_compile() -> None:
     torch.manual_seed(46)
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
     activation = torch.randn(7, 64)
@@ -177,7 +177,7 @@ def test_cpu_convrot_linear_runs_under_torch_compile() -> None:
         convrot_weight: ConvRotInt8Tensor,
         linear_bias: torch.Tensor,
     ) -> torch.Tensor:
-        return convrot_linear(
+        return convrot_int8_linear(
             value,
             convrot_weight,
             linear_bias,
@@ -194,24 +194,24 @@ def test_cpu_convrot_linear_runs_under_torch_compile() -> None:
     assert torch.equal(actual, expected)
 
 
-def test_convrot_linear_rejects_unknown_activation() -> None:
+def test_public_linear_rejects_unknown_activation() -> None:
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
 
     with pytest.raises(ValueError, match="input activation must be 'swiglu' or None"):
-        convrot_linear(
+        convrot_int8_linear(
             torch.randn(7, 64),
             weight,
             activation_fn="gelu",  # type: ignore[arg-type]
         )
 
 
-def test_convrot_linear_defaults_to_ordinary_linear() -> None:
+def test_public_linear_defaults_to_ordinary_linear() -> None:
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
     activation = torch.randn(7, 32)
     bias = torch.randn(11)
 
     expected = torch.nn.functional.linear(activation, weight, bias)
-    actual = convrot_linear(activation, weight, bias)
+    actual = convrot_int8_linear(activation, weight, bias)
 
     assert torch.equal(actual, expected)
 
@@ -220,11 +220,11 @@ def test_convrot_linear_defaults_to_ordinary_linear() -> None:
     "activation",
     [torch.tensor(1.0), torch.empty(7, 63)],
 )
-def test_convrot_linear_rejects_wrong_raw_width(activation: torch.Tensor) -> None:
+def test_public_linear_rejects_wrong_raw_width(activation: torch.Tensor) -> None:
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
 
     with pytest.raises(ValueError, match=r"input has .* features, expected 64"):
-        convrot_linear(activation, weight, activation_fn="swiglu")
+        convrot_int8_linear(activation, weight, activation_fn="swiglu")
 
 
 def test_dynamic_quantize_rows_handles_underflowing_float16_scale() -> None:

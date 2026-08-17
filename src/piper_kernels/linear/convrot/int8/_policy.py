@@ -29,7 +29,7 @@ def _preparation_block_size(in_features: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class ConvRotInt8LinearExecutionPlan:
+class LinearExecutionPlan:
     """Host-side preparation and GEMM choices for one ConvRot INT8 invocation."""
 
     fuse_rotation_quantization: bool
@@ -108,10 +108,10 @@ def select_execution_plan(
     group_size: int,
     dtype: torch.dtype,
     swiglu: bool = False,
-) -> ConvRotInt8LinearExecutionPlan:
+) -> LinearExecutionPlan:
     """Select the production preparation and GEMM schedule for one linear."""
     large_sm120 = target.is_cuda_capability(12, 0) and rows >= _SM120_LARGE_MATMUL_MIN_ROWS
-    return ConvRotInt8LinearExecutionPlan(
+    return LinearExecutionPlan(
         # Prepared inputs may feed weights with different output widths.
         # Keep every preparation choice independent of out_features; only the
         # GEMM schedule below may use N.

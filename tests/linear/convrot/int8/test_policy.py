@@ -7,7 +7,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._policy import (
-    ConvRotInt8LinearExecutionPlan,
+    LinearExecutionPlan,
     select_execution_plan,
 )
 
@@ -218,7 +218,7 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
 def test_execution_plan_rejects_invalid_matmul_launch_choices(
     changes: dict[str, int],
 ) -> None:
-    plan = ConvRotInt8LinearExecutionPlan(
+    plan = LinearExecutionPlan(
         fuse_rotation_quantization=True,
         fused_num_warps=4,
         rotation_num_warps=4,

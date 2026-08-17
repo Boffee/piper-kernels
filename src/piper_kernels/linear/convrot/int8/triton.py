@@ -450,14 +450,14 @@ def fused_rotate_quantize_input(
     )
 
 
-def default_convrot_int8_execution_plan(
+def default_execution_plan(
     input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     group_size: int,
     *,
     activation_fn: str | None = None,
     target: AcceleratorTarget | None = None,
-) -> _policy.ConvRotInt8LinearExecutionPlan:
+) -> _policy.LinearExecutionPlan:
     """Resolve production policy for execution, benchmarks, and offline tuning."""
     rows = math.prod(input.shape[:-1])
     apply_swiglu = _uses_swiglu(activation_fn)
@@ -479,7 +479,7 @@ def _prepare_input(
     group_size: int,
     *,
     apply_swiglu: bool,
-    execution_plan: _policy.ConvRotInt8LinearExecutionPlan,
+    execution_plan: _policy.LinearExecutionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate and dynamically quantize a linear input for one or more weights."""
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
@@ -553,14 +553,14 @@ def _prepare_input_with_production_plan(
     )
 
 
-def _convrot_int8_linear_prepared(
+def _execute_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     logical_dtype: torch.dtype,
-    execution_plan: _policy.ConvRotInt8LinearExecutionPlan,
+    execution_plan: _policy.LinearExecutionPlan,
 ) -> torch.Tensor:
     """Allocate and run one INT8 GEMM from a rotated and quantized input."""
     leading_shape = input_qdata.shape[:-1]
@@ -626,7 +626,7 @@ def _convrot_int8_linear_prepared(
     return output.reshape(*leading_shape, n)
 
 
-def run_convrot_int8_linear(
+def run_linear(
     input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -634,7 +634,7 @@ def run_convrot_int8_linear(
     group_size: int,
     *,
     activation_fn: str | None = None,
-    execution_plan: _policy.ConvRotInt8LinearExecutionPlan | None = None,
+    execution_plan: _policy.LinearExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input preparation and INT8 GEMM under one plan."""
     original_shape = input.shape
@@ -649,7 +649,7 @@ def run_convrot_int8_linear(
     plan = (
         execution_plan
         if execution_plan is not None
-        else default_convrot_int8_execution_plan(
+        else default_execution_plan(
             input,
             weight_qdata,
             group_size,
@@ -663,7 +663,7 @@ def run_convrot_int8_linear(
         apply_swiglu=apply_swiglu,
         execution_plan=plan,
     )
-    return _convrot_int8_linear_prepared(
+    return _execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -675,7 +675,7 @@ def run_convrot_int8_linear(
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_linear", mutates_args=())
-def convrot_int8_linear(
+def linear(
     input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -684,7 +684,7 @@ def convrot_int8_linear(
     activation_fn: str | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input rotation, dynamic quantization, and INT8 GEMM."""
-    return run_convrot_int8_linear(
+    return run_linear(
         input,
         weight_qdata,
         weight_scale,
@@ -694,8 +694,8 @@ def convrot_int8_linear(
     )
 
 
-@convrot_int8_linear.register_fake
-def _convrot_int8_linear_fake(
+@linear.register_fake
+def _linear_fake(
     input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
@@ -707,7 +707,7 @@ def _convrot_int8_linear_fake(
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_prepare_input", mutates_args=())
-def convrot_int8_prepare_input(
+def prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
     activation_fn: str | None = None,
@@ -720,8 +720,8 @@ def convrot_int8_prepare_input(
     )
 
 
-@convrot_int8_prepare_input.register_fake
-def _convrot_int8_prepare_input_fake(
+@prepare_input.register_fake
+def _prepare_input_fake(
     input: torch.Tensor,  # noqa: A002
     _group_size: int,
     activation_fn: str | None = None,
@@ -734,7 +734,7 @@ def _convrot_int8_prepare_input_fake(
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_linear_prepared", mutates_args=())
-def convrot_int8_linear_prepared(
+def linear_prepared(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -755,7 +755,7 @@ def convrot_int8_linear_prepared(
         group_size=group_size,
         dtype=logical_dtype,
     )
-    return _convrot_int8_linear_prepared(
+    return _execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -766,8 +766,8 @@ def convrot_int8_linear_prepared(
     )
 
 
-@convrot_int8_linear_prepared.register_fake
-def _convrot_int8_linear_prepared_fake(
+@linear_prepared.register_fake
+def _linear_prepared_fake(
     input_qdata: torch.Tensor,
     _input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -786,7 +786,7 @@ def _convrot_int8_linear_prepared_fake(
     "piper_kernels::convrot_int8_addmm_",
     mutates_args=("qdata", "scale"),
 )
-def convrot_int8_addmm_(
+def addmm_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     mat1: torch.Tensor,
@@ -836,8 +836,8 @@ def convrot_int8_addmm_(
     )
 
 
-@convrot_int8_addmm_.register_fake
-def _convrot_int8_addmm_fake(
+@addmm_.register_fake
+def _addmm_fake(
     _qdata: torch.Tensor,
     _scale: torch.Tensor,
     _mat1: torch.Tensor,

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 
 
 def _weight(
@@ -34,7 +34,7 @@ def _call_linear(
 ) -> torch.Tensor:
     if input_activation is None:
         return torch.nn.functional.linear(activation, weight, bias)
-    return convrot_linear(
+    return convrot_int8_linear(
         activation,
         weight,
         bias,
@@ -171,7 +171,7 @@ def test_operations_revalidate_canonical_storage_layout(
         if operation == "linear":
             return torch.nn.functional.linear(torch.empty(3, 32), weight)
         if operation == "swiglu":
-            return convrot_linear(
+            return convrot_int8_linear(
                 torch.empty(3, 64),
                 weight,
                 activation_fn="swiglu",

@@ -7,10 +7,10 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
-from piper_kernels.linear.convrot.int8.reference import convrot_int8_linear
+from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
 
 from .convrot import ConvRotConfig, ConvRotInputs, ConvRotShape, make_convrot_inputs
 from .providers import BenchmarkProvider
@@ -23,7 +23,7 @@ class ConvRotWorkload:
     shape: ConvRotShape
     config: ConvRotConfig
     inputs: ConvRotInputs
-    production_plan: convrot_policy.ConvRotInt8LinearExecutionPlan
+    production_plan: convrot_policy.LinearExecutionPlan
 
     @property
     def input_preparation(self) -> str | None:
@@ -59,7 +59,7 @@ def make_convrot_workload(
     """Create shared tensors and resolve the production execution plan."""
     inputs = make_convrot_inputs(shape, config, device=device)
     activation, qdata, _scale, _bias = inputs
-    production_plan = convrot_backend.default_convrot_int8_execution_plan(
+    production_plan = convrot_backend.default_execution_plan(
         activation,
         qdata,
         config.group_size,
@@ -80,7 +80,7 @@ def _run_convrot_reference(
 ) -> torch.Tensor:
     """Run the matching portable reference on the supplied workload inputs."""
     activation, qdata, scale, bias = inputs
-    return convrot_int8_linear(
+    return reference_linear(
         activation,
         qdata,
         scale,
@@ -107,7 +107,7 @@ def make_public_convrot_provider(
     def run(prepared: ConvRotInputs) -> torch.Tensor:
         prepared_activation = prepared[0]
         if shape.input_activation == "swiglu":
-            return convrot_linear(
+            return convrot_int8_linear(
                 prepared_activation,
                 weight,
                 bias,
@@ -123,7 +123,7 @@ def make_public_convrot_provider(
         configuration={
             **workload.common_configuration(),
             "operation_entrypoint": (
-                "piper_kernels.linear.convrot.convrot_linear"
+                "piper_kernels.linear.convrot.convrot_int8_linear"
                 if shape.input_activation == "swiglu"
                 else "torch.nn.functional.linear"
             ),
@@ -135,7 +135,7 @@ def make_public_convrot_provider(
 
 def planned_convrot_configuration(
     workload: ConvRotWorkload,
-    plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
+    plan: convrot_policy.LinearExecutionPlan,
 ) -> dict[str, object]:
     """Return complete metadata for one explicitly injected execution plan."""
     return {
@@ -147,7 +147,7 @@ def planned_convrot_configuration(
 
 def make_planned_convrot_provider(
     workload: ConvRotWorkload,
-    plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
+    plan: convrot_policy.LinearExecutionPlan,
     *,
     name: str,
 ) -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:
@@ -155,7 +155,7 @@ def make_planned_convrot_provider(
 
     def run(prepared: ConvRotInputs) -> torch.Tensor:
         activation, qdata, scale, bias = prepared
-        return convrot_backend.run_convrot_int8_linear(
+        return convrot_backend.run_linear(
             activation,
             qdata,
             scale,

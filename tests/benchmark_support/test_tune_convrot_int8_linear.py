@@ -210,7 +210,7 @@ def test_candidate_provider_injects_plan_into_complete_operator(
         calls.append((args, kwargs))
         return torch.empty((2, 96), device="meta")
 
-    monkeypatch.setattr(convrot_backend, "run_convrot_int8_linear", fake_run)
+    monkeypatch.setattr(convrot_backend, "run_linear", fake_run)
     provider = _make_candidate(plan, workload).make_provider()
 
     prepared = provider.prepare()

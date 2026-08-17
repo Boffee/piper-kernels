@@ -150,8 +150,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
-) -> tuple[convrot_policy.ConvRotInt8LinearExecutionPlan, ...]:
+    production_plan: convrot_policy.LinearExecutionPlan,
+) -> tuple[convrot_policy.LinearExecutionPlan, ...]:
     """Build a bounded explicit search around the production execution plan."""
     fusion_axis = boolean_tuning_axis(
         args.fuse_rotation_quantization,
@@ -214,7 +214,7 @@ def _candidate_plans(
     )
 
 
-def _plan_name(plan: convrot_policy.ConvRotInt8LinearExecutionPlan) -> str:
+def _plan_name(plan: convrot_policy.LinearExecutionPlan) -> str:
     preparation = (
         f"fused-pw{plan.fused_num_warps}"
         if plan.fuse_rotation_quantization
@@ -228,7 +228,7 @@ def _plan_name(plan: convrot_policy.ConvRotInt8LinearExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
+    plan: convrot_policy.LinearExecutionPlan,
     workload: ConvRotWorkload,
 ) -> TuningCandidate[ConvRotInputs, torch.Tensor]:
     """Wrap one plan around the complete production-paid ConvRot device path."""

@@ -7,12 +7,12 @@ import torch
 from torch import nn
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
+from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import triton as triton_backend
 from piper_kernels.linear.convrot.int8.reference import (
-    convrot_int8_addmm_,
-    convrot_int8_linear,
+    addmm_,
+    linear,
 )
 
 
@@ -28,7 +28,7 @@ def test_triton_linear_matches_gpu_reference(group_size: int) -> None:
     activation = torch.randn(37, in_features, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(96, dtype=torch.bfloat16, device="cuda")
 
-    expected = convrot_int8_linear(activation, qdata, scale, group_size, bias)
+    expected = linear(activation, qdata, scale, group_size, bias)
     actual = torch.nn.functional.linear(activation, wrapped, bias)
     assert torch.equal(actual, expected)
 
@@ -183,7 +183,7 @@ def test_default_linear_execution_plan_supports_meta_with_resolved_target() -> N
     activation = torch.empty((512, 512), dtype=torch.bfloat16, device="meta")
     qdata = torch.empty((96, 512), dtype=torch.int8, device="meta")
 
-    plan = triton_backend.default_convrot_int8_execution_plan(
+    plan = triton_backend.default_execution_plan(
         activation,
         qdata,
         256,
@@ -217,7 +217,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
-    production = triton_backend.default_convrot_int8_execution_plan(
+    production = triton_backend.default_execution_plan(
         activation,
         qdata,
         256,
@@ -232,7 +232,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         matmul_num_stages=2,
     )
 
-    actual = triton_backend.run_convrot_int8_linear(
+    actual = triton_backend.run_linear(
         activation,
         qdata,
         scale,
@@ -241,7 +241,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         activation_fn="swiglu" if apply_swiglu else None,
         execution_plan=candidate,
     )
-    expected = convrot_int8_linear(
+    expected = linear(
         activation,
         qdata,
         scale,
@@ -301,7 +301,7 @@ def test_sm120_large_matmul_matches_reference(
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=dtype, device="cuda") if with_bias else None
 
-    plan = triton_backend.default_convrot_int8_execution_plan(
+    plan = triton_backend.default_execution_plan(
         activation,
         qdata,
         group_size,
@@ -313,7 +313,7 @@ def test_sm120_large_matmul_matches_reference(
         plan.matmul_num_warps,
     ) == (128, 256, 128, 8)
 
-    actual = triton_backend.run_convrot_int8_linear(
+    actual = triton_backend.run_linear(
         activation,
         qdata,
         scale,
@@ -321,7 +321,7 @@ def test_sm120_large_matmul_matches_reference(
         group_size,
         execution_plan=plan,
     )
-    expected = convrot_int8_linear(activation, qdata, scale, group_size, bias)
+    expected = linear(activation, qdata, scale, group_size, bias)
 
     if dtype is torch.bfloat16:
         if bias is None:
@@ -382,14 +382,14 @@ def test_fused_up_gate_swiglu_linear_matches_materialized_path(
     bias = torch.randn(out_features, dtype=dtype, device="cuda") if with_bias else None
     up, gate = raw_activation.chunk(2, dim=-1)
 
-    expected = convrot_int8_linear(
+    expected = linear(
         up * torch.nn.functional.silu(gate),
         qdata,
         scale,
         256,
         bias,
     )
-    actual = convrot_linear(raw_activation, weight, bias, activation_fn="swiglu")
+    actual = convrot_int8_linear(raw_activation, weight, bias, activation_fn="swiglu")
 
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
 
@@ -423,7 +423,7 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
         weight_scale: torch.Tensor,
         linear_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        return triton_backend.convrot_int8_linear(
+        return triton_backend.linear(
             value,
             packed,
             weight_scale,
@@ -479,7 +479,7 @@ def test_cuda_semantic_linear_custom_ops_pass_opcheck(
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
     result = torch.library.opcheck(
-        triton_backend.convrot_int8_linear,
+        triton_backend.linear,
         (activation, qdata, scale, bias, group_size, activation_fn),
     )
 
@@ -496,7 +496,7 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
     mat2 = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
 
     result = torch.library.opcheck(
-        triton_backend.convrot_int8_addmm_,
+        triton_backend.addmm_,
         (qdata, scale, mat1, mat2, 64, 0.5, 1.25, 123),
     )
 
@@ -534,13 +534,13 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
         expected = torch.nn.functional.linear(activation, weight, bias.contiguous())
         actual = torch.nn.functional.linear(activation, weight, bias)
     else:
-        expected = convrot_linear(
+        expected = convrot_int8_linear(
             activation,
             weight,
             bias.contiguous(),
             activation_fn="swiglu",
         )
-        actual = convrot_linear(
+        actual = convrot_int8_linear(
             activation,
             weight,
             bias,
@@ -599,7 +599,7 @@ def test_swiglu_linear_runs_under_fullgraph_compile_with_noncontiguous_input(row
     assert not raw_activation.is_contiguous()
 
     def call(value: torch.Tensor) -> torch.Tensor:
-        return convrot_linear(value, weight, activation_fn="swiglu")
+        return convrot_int8_linear(value, weight, activation_fn="swiglu")
 
     expected = call(raw_activation)
     actual = torch.compile(call, fullgraph=True)(raw_activation)
@@ -623,7 +623,7 @@ def test_triton_addmm_matches_gpu_reference(
     actual = ConvRotInt8Tensor.from_hp(weight, group_size=64)
     expected = actual.clone()
 
-    convrot_int8_addmm_(expected.qdata, expected.scale, mat1, mat2, 64, beta, alpha)
+    addmm_(expected.qdata, expected.scale, mat1, mat2, 64, beta, alpha)
     result = actual.addmm_(mat1, mat2, beta=beta, alpha=alpha)
 
     assert result is actual
@@ -719,7 +719,7 @@ def test_triton_addmm_handles_underflowing_float16_scale() -> None:
     )
     expected = actual.clone()
 
-    convrot_int8_addmm_(expected.qdata, expected.scale, mat1, mat2, 16, 0, 1)
+    addmm_(expected.qdata, expected.scale, mat1, mat2, 16, 0, 1)
     actual.addmm_(mat1, mat2, beta=0)
 
     assert torch.equal(actual.qdata, expected.qdata)
@@ -743,7 +743,7 @@ def test_triton_linear_handles_underflowing_float16_input_scale() -> None:
         logical_dtype=torch.float16,
     )
 
-    expected = convrot_int8_linear(activation, qdata, scale, 16)
+    expected = linear(activation, qdata, scale, 16)
     actual = torch.nn.functional.linear(activation, weight)
 
     assert torch.equal(actual, expected)
