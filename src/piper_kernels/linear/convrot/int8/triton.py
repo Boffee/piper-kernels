@@ -16,10 +16,19 @@ from piper_kernels._triton.stochastic_quantization import (
     stochastic_round_to_int,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear._input_activations import (
+    GELU_TANH_CUBIC_COEFFICIENT,
+    GELU_TANH_SCALE_COEFFICIENT,
+    apply_input_activation,
+    input_activation_width,
+    validate_input_activation,
+)
 
 from . import _policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
+_GELU_TANH_CUBIC_COEFFICIENT = tl.constexpr(GELU_TANH_CUBIC_COEFFICIENT)
+_GELU_TANH_SCALE_COEFFICIENT = tl.constexpr(GELU_TANH_SCALE_COEFFICIENT)
 
 
 @triton.jit
@@ -113,18 +122,18 @@ def rotate_quantize_rows_kernel(
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
-    apply_swiglu: tl.constexpr,
+    activation_fn: tl.constexpr,
 ):
     """Rotate and quantize one complete row without a global-memory intermediate."""
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
     offsets = tl.arange(0, block_size)
     mask = offsets < row_width
-    input_row_width = row_width * (2 if apply_swiglu else 1)
+    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
     input_row_offset = row_i64 * input_row_width
     output_row_offset = row_i64 * row_width
 
-    if apply_swiglu:
+    if activation_fn == "swiglu":
         up = tl.load(
             x_ptr + input_row_offset + offsets,
             mask=mask,
@@ -150,6 +159,15 @@ def rotate_quantize_rows_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+        if activation_fn == "gelu_tanh":
+            inner = _GELU_TANH_SCALE_COEFFICIENT * (
+                values + _GELU_TANH_CUBIC_COEFFICIENT * values * values * values
+            )
+            values = 0.5 * values * (1.0 + libdevice.tanh(inner))  # pyright: ignore[reportOperatorIssue]
+            if logical_dtype_code == 1:
+                values = values.to(tl.float16).to(tl.float32)
+            elif logical_dtype_code == 2:
+                values = values.to(tl.bfloat16).to(tl.float32)
 
     values = _rotate_hadamard_groups(values, block_size, group_size)
     values *= inverse_sqrt_group
@@ -358,14 +376,6 @@ def dtype_code(dtype: torch.dtype) -> int:
     return 0
 
 
-def _uses_swiglu(activation_fn: str | None) -> bool:
-    if activation_fn not in (None, "swiglu"):
-        raise ValueError(
-            f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
-        )
-    return activation_fn == "swiglu"
-
-
 def rotate_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     rotated: torch.Tensor,
@@ -415,13 +425,13 @@ def fused_rotate_quantize_input(
     group_size: int,
     logical_dtype_code: int,
     *,
-    apply_swiglu: bool = False,
+    activation_fn: str | None = None,
     num_warps: int,
 ) -> None:
     """Rotate and quantize to ``input_qdata`` without a rotated intermediate.
 
-    ``input_qdata`` defines the logical row width. ``apply_swiglu`` requires
-    a raw ``[up | gate]`` input with twice that width.
+    ``input_qdata`` defines the activated row width. SwiGLU requires a raw
+    ``[up | gate]`` input with twice that width.
     """
     if input.ndim != 2 or input_qdata.ndim != 2:
         raise ValueError(
@@ -429,7 +439,7 @@ def fused_rotate_quantize_input(
             f"got shapes {tuple(input.shape)} and {tuple(input_qdata.shape)}"
         )
     m, k = input_qdata.shape
-    expected_input_shape = (m, k * (2 if apply_swiglu else 1))
+    expected_input_shape = (m, k * input_activation_width(activation_fn))
     if tuple(input.shape) != expected_input_shape:
         raise ValueError(
             f"fused preparation input must have shape {expected_input_shape}, "
@@ -445,7 +455,7 @@ def fused_rotate_quantize_input(
         group_size=group_size,
         inverse_sqrt_group=group_size**-0.5,
         logical_dtype_code=logical_dtype_code,
-        apply_swiglu=apply_swiglu,
+        activation_fn=activation_fn,
         num_warps=num_warps,
     )
 
@@ -460,7 +470,7 @@ def default_execution_plan(
 ) -> _policy.LinearExecutionPlan:
     """Resolve production policy for execution, benchmarks, and offline tuning."""
     rows = math.prod(input.shape[:-1])
-    apply_swiglu = _uses_swiglu(activation_fn)
+    validate_input_activation(activation_fn)
     target = AcceleratorTarget.from_device(input.device) if target is None else target
     return _policy.select_execution_plan(
         target,
@@ -469,7 +479,7 @@ def default_execution_plan(
         in_features=weight_qdata.shape[1],
         group_size=group_size,
         dtype=input.dtype,
-        swiglu=apply_swiglu,
+        activation_fn=activation_fn,
     )
 
 
@@ -478,7 +488,7 @@ def _prepare_input(
     in_features: int,
     group_size: int,
     *,
-    apply_swiglu: bool,
+    activation_fn: str | None,
     execution_plan: _policy.LinearExecutionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate and dynamically quantize a linear input for one or more weights."""
@@ -498,14 +508,11 @@ def _prepare_input(
             input_scale,
             group_size,
             logical_dtype_code,
-            apply_swiglu=apply_swiglu,
+            activation_fn=activation_fn,
             num_warps=execution_plan.fused_num_warps,
         )
     else:
-        transformed_input = input_2d
-        if apply_swiglu:
-            up, gate = input_2d.chunk(2, dim=-1)
-            transformed_input = up * torch.nn.functional.silu(gate)
+        transformed_input = apply_input_activation(input_2d, activation_fn)
         rotated = torch.empty_like(transformed_input)
         rotate_input(
             transformed_input,
@@ -532,9 +539,8 @@ def _prepare_input_with_production_plan(
     *,
     activation_fn: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepare an ordinary or packed-SwiGLU input under production policy."""
-    apply_swiglu = _uses_swiglu(activation_fn)
-    in_features = input.shape[-1] // (2 if apply_swiglu else 1)
+    """Prepare an ordinary or activated input under production policy."""
+    in_features = input.shape[-1] // input_activation_width(activation_fn)
     plan = _policy.select_execution_plan(
         AcceleratorTarget.from_device(input.device),
         rows=math.prod(input.shape[:-1]),
@@ -542,13 +548,13 @@ def _prepare_input_with_production_plan(
         in_features=in_features,
         group_size=group_size,
         dtype=input.dtype,
-        swiglu=apply_swiglu,
+        activation_fn=activation_fn,
     )
     return _prepare_input(
         input,
         in_features,
         group_size,
-        apply_swiglu=apply_swiglu,
+        activation_fn=activation_fn,
         execution_plan=plan,
     )
 
@@ -639,10 +645,9 @@ def run_linear(
     """Run ConvRot input preparation and INT8 GEMM under one plan."""
     original_shape = input.shape
     k = weight_qdata.shape[1]
-    apply_swiglu = _uses_swiglu(activation_fn)
-    expected_width = k * (2 if apply_swiglu else 1)
+    expected_width = k * input_activation_width(activation_fn)
     if original_shape[-1] != expected_width:
-        operation = "fused SwiGLU input" if apply_swiglu else "linear input"
+        operation = "activated linear input" if activation_fn is not None else "linear input"
         raise ValueError(
             f"{operation} has {original_shape[-1]} features, expected {expected_width}"
         )
@@ -660,7 +665,7 @@ def run_linear(
         input,
         k,
         group_size,
-        apply_swiglu=apply_swiglu,
+        activation_fn=activation_fn,
         execution_plan=plan,
     )
     return _execute_prepared_linear(
@@ -726,7 +731,7 @@ def _prepare_input_fake(
     _group_size: int,
     activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    input_width = input.shape[-1] // (2 if _uses_swiglu(activation_fn) else 1)
+    input_width = input.shape[-1] // input_activation_width(activation_fn)
     return (
         input.new_empty((*input.shape[:-1], input_width), dtype=torch.int8),
         input.new_empty(input.shape[:-1], dtype=torch.float32),

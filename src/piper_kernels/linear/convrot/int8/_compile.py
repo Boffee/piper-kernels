@@ -18,9 +18,10 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-_COMPILE_PASS_VERSION = "convrot-compile-v2"
+_COMPILE_PASS_VERSION = "convrot-compile-v3"
 
 type _PreparedInputNodes = tuple[torch.fx.Node, torch.fx.Node, torch.dtype]
 
@@ -154,7 +155,7 @@ class _PreparationRule:
 _PREPARATION_RULES = (_PreparationRule(),)
 
 
-_packed_swiglu_patterns = PatternMatcherPass("convrot_packed_swiglu")
+_input_activation_patterns = PatternMatcherPass("convrot_input_activations")
 
 
 def _packed_swiglu_pattern(
@@ -249,26 +250,30 @@ def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
     return dimensions_match
 
 
-def _replace_packed_swiglu(
+def _replace_input_activation_and_linear(
     match: Match,
-    packed: torch.fx.Node,
+    input_node: torch.fx.Node,
     weight_qdata: torch.fx.Node,
     weight_scale: torch.fx.Node,
     bias: torch.fx.Node | None,
     group_size: int,
-    **_unused: object,
+    activation_fn: str,
 ) -> None:
+    """Replace an input activation plus linear with activated preparation."""
     original = match.output_node()
     graph = match.graph
-    packed_value = preparation_sharing.tensor_metadata(packed)
-    assert packed_value is not None
-    input_shape = (*packed_value.shape[:-1], packed_value.shape[-1] // 2)
+    input_value = preparation_sharing.tensor_metadata(input_node)
+    assert input_value is not None
+    input_shape = (
+        *input_value.shape[:-1],
+        input_value.shape[-1] // input_activations.input_activation_width(activation_fn),
+    )
     with graph.inserting_before(original):
         prepared = _emit_prepared_input(
             graph,
-            packed,
+            input_node,
             group_size,
-            "swiglu",
+            activation_fn,
             input_shape,
         )
         replacement = _emit_linear_prepared(
@@ -285,6 +290,26 @@ def _replace_packed_swiglu(
     match.erase_nodes()
 
 
+def _replace_packed_swiglu(
+    match: Match,
+    packed: torch.fx.Node,
+    weight_qdata: torch.fx.Node,
+    weight_scale: torch.fx.Node,
+    bias: torch.fx.Node | None,
+    group_size: int,
+    **_unused: object,
+) -> None:
+    _replace_input_activation_and_linear(
+        match,
+        packed,
+        weight_qdata,
+        weight_scale,
+        bias,
+        group_size,
+        "swiglu",
+    )
+
+
 # SiLU may remain direct, lower without casts for FP32, or lower through FP32
 # for FP16/BF16. Multiplication is commutative, so accept either operand order.
 for _promote_gate in (None, False, True):
@@ -299,12 +324,113 @@ for _promote_gate in (None, False, True):
                 promote_gate=promote_gate,
             ),
             # PyTorch's concrete pass has a parameter-name-only protocol mismatch.
-            pass_dict=_packed_swiglu_patterns,  # pyright: ignore[reportArgumentType]
+            pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
         )(_replace_packed_swiglu)
 
 
-def _fold_packed_swiglu(graph: torch.fx.Graph) -> bool:
-    changed = _packed_swiglu_patterns.apply(graph) > 0
+def _gelu_tanh_pattern(*, promote_input: bool) -> CallFunction:
+    """Build PyTorch's normalized GELU-tanh decomposition feeding one linear."""
+    input_node = KeywordArg("input")
+    value = (
+        CallFunction(
+            torch.ops.prims.convert_element_type.default,
+            input_node,
+            torch.float32,
+            _users=4,
+        )
+        if promote_input
+        else input_node
+    )
+    half = CallFunction(torch.ops.aten.mul.Tensor, value, 0.5, _users=1)
+    square = CallFunction(torch.ops.aten.mul.Tensor, value, value, _users=1)
+    cube = CallFunction(torch.ops.aten.mul.Tensor, square, value, _users=1)
+    cubic_term = CallFunction(
+        torch.ops.aten.mul.Tensor,
+        cube,
+        input_activations.GELU_TANH_CUBIC_COEFFICIENT,
+        _users=1,
+    )
+    inner = CallFunction(torch.ops.aten.add.Tensor, value, cubic_term, _users=1)
+    scaled = CallFunction(
+        torch.ops.aten.mul.Tensor,
+        inner,
+        input_activations.GELU_TANH_SCALE_COEFFICIENT,
+        _users=1,
+    )
+    tanh = CallFunction(torch.ops.aten.tanh.default, scaled, _users=1)
+    shifted = CallFunction(torch.ops.aten.add.Tensor, tanh, 1, _users=1)
+    activated = CallFunction(torch.ops.aten.mul.Tensor, half, shifted, _users=1)
+    if promote_input:
+        activated = CallFunction(
+            torch.ops.prims.convert_element_type.default,
+            activated,
+            KeywordArg("logical_dtype"),
+            _users=1,
+        )
+    return CallFunction(
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        activated,
+        KeywordArg("weight_qdata"),
+        KeywordArg("weight_scale"),
+        KeywordArg("bias"),
+        KeywordArg("group_size"),
+    )
+
+
+def _valid_gelu_tanh(match: Match, *, promote_input: bool) -> bool:
+    input_node = match.kwargs["input"]
+    weight_qdata = match.kwargs["weight_qdata"]
+    if not isinstance(input_node, torch.fx.Node) or not isinstance(weight_qdata, torch.fx.Node):
+        return False
+    input_value = preparation_sharing.tensor_metadata(input_node)
+    weight_value = preparation_sharing.tensor_metadata(weight_qdata)
+    if (
+        input_value is None
+        or input_value.ndim == 0
+        or weight_value is None
+        or weight_value.ndim != 2
+        or preparation_sharing.dimension_key(input_value.shape[-1])
+        != preparation_sharing.dimension_key(weight_value.shape[1])
+    ):
+        return False
+    if promote_input:
+        return match.kwargs["logical_dtype"] is input_value.dtype
+    return input_value.dtype is torch.float32
+
+
+def _replace_gelu_tanh(
+    match: Match,
+    input: torch.fx.Node,  # noqa: A002 - pattern keyword
+    weight_qdata: torch.fx.Node,
+    weight_scale: torch.fx.Node,
+    bias: torch.fx.Node | None,
+    group_size: int,
+    **_unused: object,
+) -> None:
+    _replace_input_activation_and_linear(
+        match,
+        input,
+        weight_qdata,
+        weight_scale,
+        bias,
+        group_size,
+        "gelu_tanh",
+    )
+
+
+for _promote_input in (False, True):
+    register_graph_pattern(
+        _gelu_tanh_pattern(promote_input=_promote_input),
+        extra_check=lambda match, promote_input=_promote_input: _valid_gelu_tanh(
+            match,
+            promote_input=promote_input,
+        ),
+        pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+    )(_replace_gelu_tanh)
+
+
+def _fold_input_activations(graph: torch.fx.Graph) -> bool:
+    changed = _input_activation_patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()
@@ -312,17 +438,17 @@ def _fold_packed_swiglu(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Apply ConvRot graph folds before sharing ordinary input preparation."""
+    """Fold input activations before sharing ordinary input preparation."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
-        _fold_packed_swiglu(graph)
+        _fold_input_activations(graph)
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
         return get_hash_for_files(
-            (__file__, preparation_sharing.__file__),
+            (__file__, input_activations.__file__, preparation_sharing.__file__),
             extra=_COMPILE_PASS_VERSION,
         )
 
@@ -333,7 +459,7 @@ compile_pass = _CompilePass()
 def convrot_int8_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Return Inductor options for packed SwiGLU folding and preparation reuse.
+    """Return Inductor options for input-activation folding and preparation reuse.
 
     Existing post-grad pre-passes run first and are preserved. Reapplying this
     helper is idempotent, and the input mapping and any contained list remain

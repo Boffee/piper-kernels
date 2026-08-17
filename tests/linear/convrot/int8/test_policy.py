@@ -80,22 +80,23 @@ def test_execution_plan_centralizes_fusion_boundaries(
 
 
 @pytest.mark.parametrize(
-    ("target", "rows", "in_features", "swiglu", "expected_warps"),
+    ("target", "rows", "in_features", "activation_fn", "expected_warps"),
     [
-        (_SM120, 511, 14_336, True, 8),
-        (_SM120, 8191, 14_336, True, 8),
-        (_SM120, 8192, 14_336, True, 16),
-        (_SM120, 8192, 14_336, False, 4),
-        (_SM120, 8192, 7168, True, 4),
-        (_SM121, 8192, 14_336, True, 4),
-        (_HIP, 8192, 14_336, True, 4),
+        (_SM120, 511, 14_336, "swiglu", 8),
+        (_SM120, 8191, 14_336, "swiglu", 8),
+        (_SM120, 8192, 14_336, "swiglu", 16),
+        (_SM120, 8192, 14_336, "gelu_tanh", 4),
+        (_SM120, 8192, 14_336, None, 4),
+        (_SM120, 8192, 7168, "swiglu", 4),
+        (_SM121, 8192, 14_336, "swiglu", 4),
+        (_HIP, 8192, 14_336, "swiglu", 4),
     ],
 )
 def test_execution_plan_centralizes_fused_launch_schedule(
     target: AcceleratorTarget,
     rows: int,
     in_features: int,
-    swiglu: bool,
+    activation_fn: str | None,
     expected_warps: int,
 ) -> None:
     plan = select_execution_plan(
@@ -105,7 +106,7 @@ def test_execution_plan_centralizes_fused_launch_schedule(
         in_features=in_features,
         group_size=256,
         dtype=torch.bfloat16,
-        swiglu=swiglu,
+        activation_fn=activation_fn,
     )
 
     assert plan.fused_num_warps == expected_warps

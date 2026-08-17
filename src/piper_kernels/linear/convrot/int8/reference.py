@@ -5,6 +5,7 @@ import math
 import torch
 
 from piper_kernels._stochastic_quantization import stochastic_round_to_int
+from piper_kernels.linear._input_activations import apply_input_activation
 
 from .._rotation import rotate_groups, validate_group_size
 
@@ -184,15 +185,7 @@ def linear(
     activation_fn: str | None = None,
 ) -> torch.Tensor:
     """Run the portable PyTorch ConvRot W8A8 linear implementation."""
-    prepared_input = input
-    if activation_fn == "swiglu":
-        in_features = weight_qdata.shape[1]
-        up, gate = torch.split(input, [in_features, in_features], dim=-1)
-        prepared_input = up * torch.nn.functional.silu(gate)
-    elif activation_fn is not None:
-        raise ValueError(
-            f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
-        )
+    prepared_input = apply_input_activation(input, activation_fn)
     input_qdata, input_scale = prepare_input(
         prepared_input,
         group_size,

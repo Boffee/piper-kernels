@@ -73,6 +73,27 @@ def test_cpu_public_linear_matches_materialized_up_gate_swiglu(with_bias: bool) 
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_cpu_public_linear_matches_materialized_gelu_tanh(with_bias: bool) -> None:
+    torch.manual_seed(47)
+    in_features, out_features = 32, 11
+    weight = ConvRotInt8Tensor.from_hp(
+        torch.randn(out_features, in_features),
+        group_size=16,
+    )
+    activation = torch.randn(2, 7, in_features)
+    bias = torch.randn(out_features) if with_bias else None
+
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.gelu(activation, approximate="tanh"),
+        weight,
+        bias,
+    )
+    actual = convrot_int8_linear(activation, weight, bias, activation_fn="gelu_tanh")
+
+    assert torch.equal(actual, expected)
+
+
 def test_public_linear_supports_keyword_arguments() -> None:
     torch.manual_seed(124)
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
@@ -166,13 +187,14 @@ def test_meta_linear_and_input_activation_run_under_torch_compile() -> None:
     assert regular.device.type == fused.device.type == "meta"
 
 
-def test_cpu_public_linear_runs_under_torch_compile() -> None:
+@pytest.mark.parametrize("activation_fn", ["gelu_tanh", "swiglu"])
+def test_cpu_public_linear_runs_under_torch_compile(activation_fn: str) -> None:
     torch.manual_seed(46)
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
-    activation = torch.randn(7, 64)
+    activation = torch.randn(7, 64 if activation_fn == "swiglu" else 32)
     bias = torch.randn(11)
 
-    def apply_swiglu(
+    def apply_activation(
         value: torch.Tensor,
         convrot_weight: ConvRotInt8Tensor,
         linear_bias: torch.Tensor,
@@ -181,11 +203,11 @@ def test_cpu_public_linear_runs_under_torch_compile() -> None:
             value,
             convrot_weight,
             linear_bias,
-            activation_fn="swiglu",
+            activation_fn=activation_fn,  # type: ignore[arg-type]
         )
 
-    expected = apply_swiglu(activation, weight, bias)
-    actual = torch.compile(apply_swiglu, backend="eager", fullgraph=True)(
+    expected = apply_activation(activation, weight, bias)
+    actual = torch.compile(apply_activation, backend="eager", fullgraph=True)(
         activation,
         weight,
         bias,
@@ -197,7 +219,7 @@ def test_cpu_public_linear_runs_under_torch_compile() -> None:
 def test_public_linear_rejects_unknown_activation() -> None:
     weight = ConvRotInt8Tensor.from_hp(torch.randn(11, 32), group_size=16)
 
-    with pytest.raises(ValueError, match="input activation must be 'swiglu' or None"):
+    with pytest.raises(ValueError, match="expected 'gelu_tanh', 'swiglu', or None"):
         convrot_int8_linear(
             torch.randn(7, 64),
             weight,

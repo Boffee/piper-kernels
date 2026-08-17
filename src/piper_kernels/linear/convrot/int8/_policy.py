@@ -89,12 +89,14 @@ def _select_fused_num_warps(
     *,
     rows: int,
     in_features: int,
-    swiglu: bool,
+    activation_fn: str | None,
 ) -> int:
     """Select the fused candidate's launch width, including forced tuning runs."""
     block_size = _preparation_block_size(in_features)
     large_swiglu = (
-        target.is_cuda_capability(12, 0) and swiglu and block_size == _FUSED_MAX_BLOCK_SIZE
+        target.is_cuda_capability(12, 0)
+        and activation_fn == "swiglu"
+        and block_size == _FUSED_MAX_BLOCK_SIZE
     )
     return 16 if large_swiglu and rows >= _LARGE_SWIGLU_MIN_ROWS else 8 if large_swiglu else 4
 
@@ -107,7 +109,7 @@ def select_execution_plan(
     in_features: int,
     group_size: int,
     dtype: torch.dtype,
-    swiglu: bool = False,
+    activation_fn: str | None = None,
 ) -> LinearExecutionPlan:
     """Select the production preparation and GEMM schedule for one linear."""
     large_sm120 = target.is_cuda_capability(12, 0) and rows >= _SM120_LARGE_MATMUL_MIN_ROWS
@@ -126,7 +128,7 @@ def select_execution_plan(
             target,
             rows=rows,
             in_features=in_features,
-            swiglu=swiglu,
+            activation_fn=activation_fn,
         ),
         rotation_num_warps=_DEFAULT_ROTATION_NUM_WARPS,
         quantization_num_warps=_DEFAULT_QUANTIZATION_NUM_WARPS,

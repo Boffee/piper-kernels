@@ -42,19 +42,19 @@ def _call_linear(
     )
 
 
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_linear_rejects_activation_weight_dtype_mismatch(
     input_activation: str | None,
 ) -> None:
     weight = _weight(dtype=torch.bfloat16)
-    input_factor = 1 if input_activation is None else 2
+    input_factor = 2 if input_activation == "swiglu" else 1
     activation = torch.empty(3, input_factor * 32, dtype=torch.float16)
 
     with pytest.raises(ValueError, match="logical dtype"):
         _call_linear(input_activation, activation, weight, None)
 
 
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.parametrize(
     ("violation", "message"),
     [
@@ -70,7 +70,7 @@ def test_linear_rejects_invalid_bias_contract(
     message: str,
 ) -> None:
     weight = _weight()
-    input_factor = 1 if input_activation is None else 2
+    input_factor = 2 if input_activation == "swiglu" else 1
     activation = torch.empty(3, input_factor * 32)
     if violation == "shape":
         bias = torch.empty(7, 1)
@@ -85,12 +85,12 @@ def test_linear_rejects_invalid_bias_contract(
         _call_linear(input_activation, activation, weight, bias)
 
 
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_meta_linear_validates_before_propagating_metadata(
     input_activation: str | None,
 ) -> None:
     weight = _weight(device="meta", dtype=torch.bfloat16)
-    input_factor = 1 if input_activation is None else 2
+    input_factor = 2 if input_activation == "swiglu" else 1
     activation = torch.empty(
         3,
         input_factor * 32,
@@ -103,14 +103,14 @@ def test_meta_linear_validates_before_propagating_metadata(
         _call_linear(input_activation, activation, weight, malformed_bias)
 
 
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("grad_input", ["activation", "bias", "scale"])
 def test_linear_rejects_autograd_inputs_but_allows_no_grad(
     input_activation: str | None,
     grad_input: str,
 ) -> None:
     weight = _weight(scale_requires_grad=grad_input == "scale")
-    input_factor = 1 if input_activation is None else 2
+    input_factor = 2 if input_activation == "swiglu" else 1
     activation = torch.randn(
         3,
         input_factor * 32,
@@ -127,11 +127,11 @@ def test_linear_rejects_autograd_inputs_but_allows_no_grad(
     assert result.shape == (3, 7)
 
 
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_linear_accepts_noncontiguous_vector_bias(input_activation: str | None) -> None:
     torch.manual_seed(121)
     weight = _weight()
-    input_factor = 1 if input_activation is None else 2
+    input_factor = 2 if input_activation == "swiglu" else 1
     activation = torch.randn(3, input_factor * 32)
     bias = torch.randn(14)[::2]
     assert not bias.is_contiguous()

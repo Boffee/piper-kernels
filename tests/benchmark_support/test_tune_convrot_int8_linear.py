@@ -64,6 +64,7 @@ def test_tuner_defaults_to_complete_production_device_path() -> None:
 
 def test_tuner_input_activation_is_enabled_only_explicitly() -> None:
     assert _parse_args([]).input_activation is None
+    assert _parse_args(["--input-activation", "gelu_tanh"]).input_activation == "gelu_tanh"
     assert _parse_args(["--input-activation", "swiglu"]).input_activation == "swiglu"
     with pytest.raises(SystemExit):
         _parse_args(["--input-activation", "none"])

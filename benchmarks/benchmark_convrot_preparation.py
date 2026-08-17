@@ -15,7 +15,6 @@ import torch
 from lib.convrot import (
     DENSE_LINEAR_ANCHOR_IN_FEATURES,
     DENSE_LINEAR_ANCHOR_ROWS,
-    apply_input_activation,
     comfy_convrot_input,
     convrot_dtype,
     raw_input_features,
@@ -37,11 +36,15 @@ from lib.triton_inspection import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear._input_activations import (
+    apply_input_activation,
+)
 from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
 from piper_kernels.linear.convrot.int8 import triton as triton_backend
 
 COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
 PIPER_TRITON_PROVIDER = "piper-triton"
+_COMFY_INPUT_ACTIVATION_CODES = {None: 0, "gelu_tanh": 1, "swiglu": 2}
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +82,7 @@ _PHASE_PROVENANCE = {
 
 def _baseline_phase(input_activation: str | None) -> str:
     """Return the Piper phase used as the relative-speed baseline."""
-    return "fused" if input_activation == "swiglu" else "split"
+    return "fused" if input_activation is not None else "split"
 
 
 def _minimum_global_bytes(
@@ -130,9 +133,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument(
         "--input-activation",
-        choices=("swiglu",),
+        choices=("gelu_tanh", "swiglu"),
         default=None,
-        help="raw-input activation; SwiGLU expects [up | gate] with width 2K",
+        help="input activation; SwiGLU expects [up | gate] with width 2K",
     )
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measurement-time-ms", type=int, default=300)
@@ -220,7 +223,9 @@ def _assert_fused_quality(
 
     qdata_error = (split_qdata.to(torch.int16) - fused_qdata.to(torch.int16)).abs().max().item()
     if qdata_error > 1:
-        raise AssertionError(f"fused SwiGLU qdata differs from split path by {qdata_error}")
+        raise AssertionError(
+            f"fused {input_activation} qdata differs from split path by {qdata_error}"
+        )
     torch.testing.assert_close(
         fused_scale,
         split_scale,
@@ -253,7 +258,7 @@ def _select_preparation_configuration(
         in_features=in_features,
         group_size=256,
         dtype=dtype,
-        swiglu=input_activation == "swiglu",
+        activation_fn=input_activation,
     )
     return {
         "fuse_rotation_quantization": plan.fuse_rotation_quantization,
@@ -318,7 +323,7 @@ def _benchmark_width(
             fused_scale,
             256,
             dtype_code,
-            apply_swiglu=input_activation == "swiglu",
+            activation_fn=input_activation,  # type: ignore[arg-type]
             num_warps=preparation_configuration["fused_num_warps"],
         )
 
@@ -352,7 +357,7 @@ def _benchmark_width(
             comfy_activation,
             comfy_qdata,
             comfy_scale,
-            2 if input_activation == "swiglu" else 0,
+            _COMFY_INPUT_ACTIVATION_CODES[input_activation],
         )
         comfy_launch()
         comfy_qdata_error = (

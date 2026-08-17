@@ -5,6 +5,7 @@ import math
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear._input_activations import input_activation_width
 
 from . import reference
 
@@ -233,10 +234,6 @@ def linear(
     internal storage-level ABI. Consumers should call
     :func:`torch.nn.functional.linear` with a ``ConvRotInt8Tensor`` weight.
     """
-    if activation_fn not in (None, "swiglu"):
-        raise ValueError(
-            f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
-        )
     in_features = qdata.shape[1]
     bias = _validate_linear(
         input,
@@ -245,7 +242,7 @@ def linear(
         dtype,
         group_size,
         bias,
-        in_features * (2 if activation_fn == "swiglu" else 1),
+        in_features * input_activation_width(activation_fn),
     )
     if input.device.type == "meta":
         return input.new_empty((*input.shape[:-1], qdata.shape[0]))

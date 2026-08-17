@@ -35,7 +35,6 @@ from benchmark_convrot_preparation import (
 from lib.convrot import (
     ConvRotConfig,
     ConvRotShape,
-    apply_input_activation,
     comfy_convrot_input,
     make_convrot_inputs,
     raw_input_features,
@@ -49,6 +48,8 @@ from lib.providers import ProviderMeasurement
 from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
 from lib.timing import ClockDomain, PhaseTimings, Timing
+
+from piper_kernels.linear._input_activations import apply_input_activation
 
 
 def _environment() -> EnvironmentInfo:
@@ -165,6 +166,12 @@ def test_bias_is_enabled_only_explicitly() -> None:
 def test_omitted_cli_input_activation_is_python_none() -> None:
     assert _parse_args([]).input_activation is None
     assert _parse_preparation_args([]).input_activation is None
+
+
+def test_cli_accepts_gelu_tanh_input_activation() -> None:
+    arguments = ["--input-activation", "gelu_tanh"]
+    assert _parse_args(arguments).input_activation == "gelu_tanh"
+    assert _parse_preparation_args(arguments).input_activation == "gelu_tanh"
 
 
 def test_cli_input_activation_rejects_none_spelling() -> None:

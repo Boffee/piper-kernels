@@ -245,6 +245,7 @@ Run ordinary dense linears throughout that matrix. At `M=32768`, separately chec
 that change the operator boundary when an integration uses them:
 
 - raw `[up | gate]` SwiGLU with `N=4096`, linear `K=14336`, and raw input width 28672;
+- tanh-approximate GELU with `N=4096` and `K=14336` as a one-input activation-folding guard;
 - three projections with `K=6144` and `N=4096` each: compare separate public linear calls,
   the compiled preparation-sharing rewrite, and—when the integration can retain a packed
   weight—one fused `N=12288` projection. This graph-level reuse is distinct from fusing ConvRot
@@ -254,12 +255,13 @@ These integration guards use concrete dimensions to make the comparison exact; t
 production policy predicates.
 
 Compiled inference integrations can pass `convrot_int8_compile_options()` to
-`torch.compile`. Its post-AOT graph rewrites fold an exclusive packed `[up | gate]` SwiGLU chain
-into activated input preparation followed by a prepared linear, so the packed input can die before
-the linear output allocation. They also recognize two or more compatible ordinary ConvRot linears
-fed by the exact same FX value. The latter emits one explicit preparation node
-and leaves every prepared GEMM at the corresponding original node position. Both are automatic
-across architectures within each compiled graph and require no attention-specific code.
+`torch.compile`. Its post-AOT graph rewrites fold an exclusive tanh-approximate GELU or packed
+`[up | gate]` SwiGLU chain into activated input preparation followed by a prepared linear, so the
+source input can die before the linear output allocation. They also recognize two or more
+compatible ordinary ConvRot linears fed by the exact same FX value. The latter emits one explicit
+preparation node and leaves every prepared GEMM at the corresponding original node position. Both
+are automatic across architectures within each compiled graph and require no attention-specific
+code.
 
 Treat 8K and 32K as evidence for one continuous large-M plan. Screen against the current
 production plan, then confirm a proposed winner in at least three fresh processes with alternating
@@ -285,7 +287,7 @@ former schedule's record. The two M=131073 expansion and contraction guards also
 including the ragged M tail and the expansion output beyond 2^31 elements.
 
 The ConvRot INT8 forward-linear tuner searches the immutable production execution plan shared
-by ordinary and explicit SwiGLU linears. Its default `prepared_execution` boundary deliberately
+by ordinary and activation-aware linears. Its default `prepared_execution` boundary deliberately
 keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed operator because
 all are paid on every public invocation. It ranks their device-stream work on fixed source
 tensors; `operator_end_to_end` selects synchronized wall timing when host dispatch and allocation
@@ -413,15 +415,16 @@ evidence for the large-M production plan.
 
 Use `--help` to select activation rows, weight dimensions, group size, dtype,
 deterministic input seed, and timing windows. `--in-features` is linear and weight width `K`;
-omit `--input-activation` for an ordinary linear or pass `swiglu` for a raw `[up | gate]` input
-with `2K` features. The script validates the complete low-precision output against the portable
-reference. Fused FP32 norm reductions avoid low-precision overflow without materializing full
-promoted copies; the Piper provider must clear the declared SQNR and non-finite gate.
+omit `--input-activation` for an ordinary linear, pass `gelu_tanh` for a `K`-wide input, or pass
+`swiglu` for a raw `[up | gate]` input with `2K` features. The script validates the complete
+low-precision output against the portable reference. Fused FP32 norm reductions avoid
+low-precision overflow without materializing full promoted copies; the Piper provider must clear
+the declared SQNR and non-finite gate.
 
 The Piper provider times the complete public entrypoint on fixed source tensors, so its
 `prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
 configuration records the public entrypoint and whether the production execution plan selected
-fused or materialized SwiGLU preparation, plus its exact preparation and GEMM fields. Record
+fused or materialized activation preparation, plus its exact preparation and GEMM fields. Record
 shapes contain only the case name and logical dimensions;
 provider configuration distinguishes the logical input layout from the layout passed to that
 provider. The optional provider is recorded as provider-managed when its internal choice is not
@@ -452,6 +455,9 @@ uv run python benchmarks/benchmark_convrot_preparation.py
 uv run python benchmarks/benchmark_convrot_preparation.py \
   --rows 32768 --in-features 6144 --input-activation swiglu
 
+uv run python benchmarks/benchmark_convrot_preparation.py \
+  --rows 32768 --in-features 6144 --input-activation gelu_tanh
+
 uv run --with comfy-kitchen==0.2.28 \
   python benchmarks/benchmark_convrot_preparation.py \
   --rows 32768 --in-features 6144 --compare-comfy-kitchen
@@ -463,7 +469,7 @@ minimum, not a measured DRAM-transaction count. Unlike the permissive public com
 the preparation adapter calls a private native entrypoint and accepts exactly
 `comfy-kitchen==0.2.28`. Its records include both the installed package version and the private
 adapter-contract version. The final column names its Piper baseline explicitly: split
-preparation without an input activation and fused preparation for SwiGLU.
+preparation without an input activation and fused preparation for activated inputs.
 
 Add `--json PATH` or `--jsonl PATH` to serialize one common `BenchmarkRecord` per width and
 phase. Each record distinguishes linear `K` from raw input width and includes the phase,

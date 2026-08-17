@@ -1,10 +1,12 @@
 """Rotated INT8 W8A8 tensor subclass."""
 
 from collections.abc import Callable
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 import torch
 from torchao.utils import TorchAOBaseTensor
+
+from piper_kernels.linear._input_activations import InputActivation
 
 from .._rotation import rotate_groups
 from . import dispatch
@@ -153,7 +155,7 @@ def convrot_int8_linear(
     weight: ConvRotInt8Tensor,
     bias: torch.Tensor | None = None,
     *,
-    activation_fn: Literal["swiglu"] | None = None,
+    activation_fn: InputActivation | None = None,
 ) -> torch.Tensor:
     """Apply an optional input activation followed by a ConvRot INT8 linear."""
     return dispatch.linear(

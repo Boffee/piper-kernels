@@ -1,9 +1,11 @@
 """Tests for automatic ConvRot preparation sharing during compilation."""
 
 import operator
+import uuid
 
 import pytest
 import torch
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
 from piper_kernels.linear.convrot import (
     ConvRotInt8Tensor,
@@ -295,6 +297,69 @@ def test_cuda_compile_options_fold_packed_swiglu() -> None:
         )(packed)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_compile_options_fold_gelu_tanh() -> None:
+    class CapturePass(CustomInferenceAwareGraphPass):
+        def __init__(self) -> None:
+            self.targets: list[object] = []
+            self._uuid = uuid.uuid4().bytes
+
+        def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
+            self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
+
+        def uuid(self) -> bytes:
+            return self._uuid
+
+    class GeluProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            weight = ConvRotInt8Tensor.from_quantized(
+                torch.randint(-127, 128, (96, 512), device="cuda", dtype=torch.int8),
+                torch.rand(96, 1, device="cuda", dtype=torch.float32) * 0.01,
+                group_size=256,
+            )
+            self.projection = torch.nn.Linear(
+                512,
+                96,
+                bias=True,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            self.projection.weight = torch.nn.Parameter(weight, requires_grad=False)
+            assert self.projection.bias is not None
+            self.projection.bias.requires_grad_(False)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.projection(torch.nn.functional.gelu(value, approximate="tanh"))
+
+    torch.manual_seed(382)
+    model = GeluProjection().eval()
+    value = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    capture = CapturePass()
+    options = convrot_int8_compile_options()
+    options["post_grad_custom_pre_pass"] = (
+        options["post_grad_custom_pre_pass"],
+        capture,
+    )
+    with torch.no_grad():
+        weight = model.projection.weight
+        assert isinstance(weight, ConvRotInt8Tensor)
+        expected = convrot_int8_linear(
+            value,
+            weight,
+            model.projection.bias,
+            activation_fn="gelu_tanh",
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=options)(value)
+
+    assert torch.equal(actual, expected)
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_linear_prepared.default) == 1
+    assert torch.ops.aten.tanh.default not in capture.targets
 
 
 @pytest.mark.gpu

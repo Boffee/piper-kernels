@@ -153,12 +153,65 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
         actual_scale,
         256,
         dtype_code,
-        apply_swiglu=True,
+        activation_fn="swiglu",
         num_warps=4,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
     assert qdata_error.max().item() <= 1
+    torch.testing.assert_close(
+        actual_scale,
+        expected_scale,
+        rtol=2 * torch.finfo(dtype).eps,
+        atol=0,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("in_features", [512, 5_376, 14_336])
+@pytest.mark.parametrize(
+    ("dtype", "dtype_code"),
+    [(torch.float16, 1), (torch.bfloat16, 2), (torch.float32, 0)],
+)
+def test_fused_gelu_tanh_preparation_matches_materialized_path(
+    in_features: int,
+    dtype: torch.dtype,
+    dtype_code: int,
+) -> None:
+    torch.manual_seed(76)
+    rows = 7
+    raw_input = torch.randn(rows, in_features, dtype=dtype, device="cuda")
+    activated_input = torch.nn.functional.gelu(raw_input, approximate="tanh")
+    rotated = torch.empty_like(activated_input)
+    expected_qdata = torch.empty_like(activated_input, dtype=torch.int8)
+    expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
+    triton_backend.rotate_input(activated_input, rotated, 256, num_warps=4)
+    triton_backend.quantize_input(
+        rotated,
+        expected_qdata,
+        expected_scale,
+        dtype_code,
+        num_warps=8,
+    )
+
+    actual_qdata = torch.empty_like(expected_qdata)
+    actual_scale = torch.empty_like(expected_scale)
+    triton_backend.fused_rotate_quantize_input(
+        raw_input,
+        actual_qdata,
+        actual_scale,
+        256,
+        dtype_code,
+        activation_fn="gelu_tanh",
+        num_warps=4,
+    )
+
+    qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
+    if dtype is torch.float32:
+        assert qdata_error.max().item() <= 1
+    else:
+        assert qdata_error.max().item() == 0
     torch.testing.assert_close(
         actual_scale,
         expected_scale,
@@ -197,11 +250,11 @@ def test_default_linear_execution_plan_supports_meta_with_resolved_target() -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("apply_swiglu", [False, True], ids=["plain", "swiglu"])
-def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) -> None:
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+def test_injected_linear_execution_plan_matches_reference(activation_fn: str | None) -> None:
     torch.manual_seed(129)
     rows, in_features, out_features = 17, 256, 96
-    input_factor = 2 if apply_swiglu else 1
+    input_factor = 2 if activation_fn == "swiglu" else 1
     activation = torch.randn(
         rows,
         input_factor * in_features,
@@ -221,7 +274,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         activation,
         qdata,
         256,
-        activation_fn="swiglu" if apply_swiglu else None,
+        activation_fn=activation_fn,
     )
     candidate = replace(
         production,
@@ -238,7 +291,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         scale,
         bias,
         256,
-        activation_fn="swiglu" if apply_swiglu else None,
+        activation_fn=activation_fn,
         execution_plan=candidate,
     )
     expected = linear(
@@ -247,7 +300,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         scale,
         256,
         bias,
-        activation_fn="swiglu" if apply_swiglu else None,
+        activation_fn=activation_fn,
     )
 
     assert torch.equal(actual, expected)
@@ -332,12 +385,12 @@ def test_sm120_large_matmul_matches_reference(
         torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.04)
 
 
-@pytest.mark.parametrize("apply_swiglu", [False, True], ids=["plain", "swiglu"])
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 def test_fused_preparation_validates_input_width_from_qdata(
-    apply_swiglu: bool,
+    activation_fn: str | None,
 ) -> None:
     rows, in_features = 2, 16
-    expected_width = in_features * (2 if apply_swiglu else 1)
+    expected_width = in_features * (2 if activation_fn == "swiglu" else 1)
     activation = torch.empty(rows, expected_width + 1)
     input_qdata = torch.empty(rows, in_features, dtype=torch.int8)
     input_scale = torch.empty(rows, dtype=torch.float32)
@@ -349,7 +402,7 @@ def test_fused_preparation_validates_input_width_from_qdata(
             input_scale,
             16,
             triton_backend.dtype_code(activation.dtype),
-            apply_swiglu=apply_swiglu,
+            activation_fn=activation_fn,  # type: ignore[arg-type]
             num_warps=4,
         )
 
@@ -398,6 +451,7 @@ def test_fused_up_gate_swiglu_linear_matches_materialized_path(
     ("activation_fn", "input_factor", "with_bias"),
     [
         (None, 1, False),
+        ("gelu_tanh", 1, True),
         ("swiglu", 2, True),
     ],
 )
@@ -451,6 +505,7 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
     ("activation_fn", "rows", "in_features", "group_size", "input_factor"),
     [
         (None, 17, 64, 64, 1),
+        ("gelu_tanh", 512, 512, 256, 1),
         ("swiglu", 512, 512, 256, 2),
     ],
 )
@@ -505,7 +560,7 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("input_activation", [None, "swiglu"], ids=["ordinary", "swiglu"])
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_cuda_linear_accepts_noncontiguous_vector_bias(
     input_activation: str | None,
 ) -> None:
@@ -520,7 +575,7 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
-    input_factor = 1 if input_activation is None else 2
+    input_factor = 2 if input_activation == "swiglu" else 1
     activation = torch.randn(
         rows,
         input_factor * in_features,
@@ -538,13 +593,13 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
             activation,
             weight,
             bias.contiguous(),
-            activation_fn="swiglu",
+            activation_fn=input_activation,
         )
         actual = convrot_int8_linear(
             activation,
             weight,
             bias,
-            activation_fn="swiglu",
+            activation_fn=input_activation,
         )
 
     assert torch.equal(actual, expected)

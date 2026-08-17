@@ -27,7 +27,7 @@ class ConvRotWorkload:
 
     @property
     def input_preparation(self) -> str | None:
-        """Return the selected public SwiGLU preparation description."""
+        """Return the selected public input-preparation description."""
         if self.shape.input_activation is None:
             return None
         return "fused" if self.production_plan.fuse_rotation_quantization else "materialized"
@@ -106,12 +106,12 @@ def make_public_convrot_provider(
 
     def run(prepared: ConvRotInputs) -> torch.Tensor:
         prepared_activation = prepared[0]
-        if shape.input_activation == "swiglu":
+        if shape.input_activation is not None:
             return convrot_int8_linear(
                 prepared_activation,
                 weight,
                 bias,
-                activation_fn="swiglu",
+                activation_fn=shape.input_activation,
             )
         return torch.nn.functional.linear(prepared_activation, weight, bias)
 
@@ -124,7 +124,7 @@ def make_public_convrot_provider(
             **workload.common_configuration(),
             "operation_entrypoint": (
                 "piper_kernels.linear.convrot.convrot_int8_linear"
-                if shape.input_activation == "swiglu"
+                if shape.input_activation is not None
                 else "torch.nn.functional.linear"
             ),
             "input_preparation": workload.input_preparation or "none",

@@ -253,9 +253,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
-        choices=("swiglu",),
+        choices=("gelu_tanh", "swiglu"),
         default=None,
-        help="raw-input activation; SwiGLU expects [up | gate] with width 2K",
+        help="input activation; SwiGLU expects [up | gate] with width 2K",
     )
     parser.add_argument(
         "--bias",

@@ -54,11 +54,14 @@ checkpoint_weight = ConvRotInt8Tensor.from_quantized(
 )
 output = torch.nn.functional.linear(activation, weight, bias)
 
-# Let Inductor optimize repeated inputs and packed SwiGLU in an inference graph.
+# Let Inductor optimize repeated inputs and absorb supported input activations.
 compiled_block = torch.compile(block, options=convrot_int8_compile_options())
 
 # Optionally fuse a raw [up | gate] SwiGLU input with ConvRot preparation.
 mlp_output = convrot_int8_linear(up_gate, weight, bias, activation_fn="swiglu")
+
+# GELU with tanh approximation uses the same activation/preparation boundary.
+mlp_output = convrot_int8_linear(activation, weight, bias, activation_fn="gelu_tanh")
 
 # The explicit API also supports an ordinary linear.
 output = convrot_int8_linear(activation, weight, bias)
@@ -72,20 +75,22 @@ weight.addmm_(lora_b, lora_a, alpha=lora_strength, rounding_seed=seed)
 
 Use `from_quantized(..., logical_dtype=...)` to construct a weight from checkpoint storage.
 
-For a weight with shape `[out_features, in_features]`, the SwiGLU input has shape
-`[..., 2 * in_features]` and the output has shape `[..., out_features]`.
+For a weight with shape `[out_features, in_features]`, ordinary and GELU-tanh inputs have
+shape `[..., in_features]`; the SwiGLU input has shape `[..., 2 * in_features]`. The output
+always has shape `[..., out_features]`.
 `convrot_int8_linear(...)` applies an ordinary linear when `activation_fn` is omitted, matching
-`torch.nn.functional.linear`. Passing `activation_fn="swiglu"` computes `up * silu(gate)`
-before the linear. Its optimized preparation fusion is selected only for measured SM120
-configurations with group size 256. Other supported configurations materialize SwiGLU,
-then dispatch through the ordinary ConvRot linear path, which may still use an optimized
-backend. Both `F.linear` with a ConvRot INT8 weight and the explicit INT8 entry point are
-inference-only and reject autograd inputs.
+`torch.nn.functional.linear`. `activation_fn="gelu_tanh"` applies PyTorch's tanh-approximate
+GELU, while `activation_fn="swiglu"` computes `up * silu(gate)` from `[up | gate]`. Measured
+SM120 configurations with group size 256 absorb these activations into input preparation;
+other supported configurations materialize the activation and retain the same semantics. Both
+`F.linear` with a ConvRot INT8 weight and the explicit INT8 entry point are inference-only and
+reject autograd inputs.
 
 For compiled inference, `convrot_int8_compile_options()` installs deterministic post-AOT Inductor
-rewrites. An exclusive `chunk(2, dim=-1)` `[up | gate]` SwiGLU chain feeding a ConvRot linear
-becomes an activated input-preparation node followed by a prepared linear. This avoids the
-materialized activated input and lets the packed input die before the linear output is allocated.
+rewrites. An exclusive tanh-approximate GELU or `chunk(2, dim=-1)` `[up | gate]` SwiGLU chain
+feeding a ConvRot linear becomes an activated input-preparation node followed by a prepared
+linear. This avoids the materialized activated input and lets its source die before the linear
+output is allocated.
 Separately, two or more ordinary ConvRot linears fed by the same graph value become one explicit
 input preparation followed by independent prepared GEMMs at the original operation positions.
 Prepared tensors are ordinary graph values—there is no hidden runtime cache—and unmatched,
