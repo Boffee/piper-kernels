@@ -4,6 +4,8 @@ from typing import Literal
 
 import torch
 
+from ._rotation import rotate_signed_hadamard_heads
+
 QUERY_BLOCK = 32
 KEY_BLOCK = 64
 SCALE_EPSILON = 1e-7
@@ -84,12 +86,14 @@ def quantize_query_key(
     granularity: QKQuantizationGranularity,
     quantization_range: int = 127,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Center K and quantize Q/K with the selected SageAttention granularity."""
+    """Center and smooth K, then quantize signed-Hadamard Q/K."""
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
+    query_float = rotate_signed_hadamard_heads(query.float())
+    key_centered = rotate_signed_hadamard_heads(key_centered)
     if granularity == "per_warp":
         query_int8, query_scale = quantize_per_group(
-            query,
+            query_float,
             QUERY_BLOCK,
             quantization_range,
         )
@@ -101,7 +105,7 @@ def quantize_query_key(
         query_scale = query_scale.repeat_interleave(QUERY_BLOCK, dim=2)[:, :, : query.shape[2]]
         key_scale = key_scale.repeat_interleave(KEY_BLOCK, dim=2)[:, :, : key.shape[2]]
     elif granularity == "per_thread":
-        query_int8, query_scale = quantize_query_per_thread(query, quantization_range)
+        query_int8, query_scale = quantize_query_per_thread(query_float, quantization_range)
         key_int8, key_scale = quantize_key_per_thread(key_centered, quantization_range)
     else:
         raise ValueError(f"unknown Q/K quantization granularity: {granularity}")

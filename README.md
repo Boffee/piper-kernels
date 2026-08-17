@@ -130,13 +130,16 @@ output = piper_attention(query, key, value, is_causal=False)
 ```
 
 It follows FlashAttention's fused online-softmax structure and SageAttention's K
-smoothing plus INT8 QK quantization. Its distinct PV path quantizes each V key row
-with one signed-INT8 scale, folds those scales into nonnegative probabilities, and
-uses `UINT8 x INT8 -> INT32` tensor-core products. The probability multiplier remains
-FP32 so every finite FP16 input scale is representable without a conversion in the hot
-loop. The online-softmax state, denominator, and PV numerator also remain FP32. The
-numerator stays in UINT8 probability-code units during the recurrence, and the common
-factor of 255 is removed once in the output epilogue.
+smoothing plus INT8 QK quantization. Before quantization, it applies the same fixed
+signed, normalized Hadamard transform across each Q head and centered K head. This
+orthogonal change of basis preserves their exact dot products while smoothing outliers
+for the subsequent integer quantizers. Its distinct PV path quantizes each V key row
+with one signed-INT8 scale, folds those scales into nonnegative probabilities, and uses
+`UINT8 x INT8 -> INT32` tensor-core products. The probability multiplier remains FP32
+so every finite FP16 input scale is representable without a conversion in the hot loop.
+The online-softmax state, denominator, and PV numerator also remain FP32. The numerator
+stays in UINT8 probability-code units during the recurrence, and the common factor of
+255 is removed once in the output epilogue.
 
 For centered V, Piper Attention uses the exact identity
 
@@ -188,12 +191,13 @@ rectangular non-causal attention, strided sequence dimensions, and `torch.compil
 is inference-only and does not support autograd. Its production execution plans are also
 sequence-length invariant.
 
-This is SageAttention2++, not a Piper Attention-specific algorithm: K is smoothed, Q/K
-are quantized to INT8 with the canonical architecture-specific granularity, V and the
+This is SageAttention2++, not a Piper Attention-specific algorithm: K is smoothed, the
+same fixed signed, normalized Hadamard transform is applied to Q and centered K, Q/K are
+quantized to INT8 with the canonical architecture-specific granularity, V and the
 online-softmax probabilities are quantized to E4M3, each 64-key P x V tile accumulates
-in FP16, and tile results are buffered in FP32. All optimized device code is Triton;
-the package contains no CUDA extension. Unsupported devices use the slow
-portable quantized reference.
+in FP16, and tile results are buffered in FP32. All optimized device code is Triton; the
+package contains no CUDA extension. Unsupported devices use the slow portable quantized
+reference.
 
 Install either optimized attention backend with `piper-kernels[triton]`. The official CUDA
 SageAttention package is a revision-pinned, optional benchmark dependency only; it is

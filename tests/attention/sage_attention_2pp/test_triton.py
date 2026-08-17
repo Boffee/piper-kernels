@@ -135,7 +135,7 @@ def test_triton_matches_quantized_reference(
 )
 @pytest.mark.parametrize(
     ("head_dim", "is_causal", "fuse_query"),
-    [(64, False, False), (64, True, False), (128, False, True), (128, True, True)],
+    [(64, False, False), (64, True, False), (128, False, False), (128, True, False)],
 )
 def test_intrinsic_grouped_raw_score_reduction_matches_quantized_reference(
     head_dim: int,

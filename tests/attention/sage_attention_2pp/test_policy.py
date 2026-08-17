@@ -54,7 +54,7 @@ def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> N
             SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=True,
-                fuse_query_quantization=True,
+                fuse_query_quantization=False,
                 use_tensor_descriptors=True,
                 use_packed_probability_conversion=False,
             ),
@@ -152,18 +152,17 @@ def test_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> None:
 
 
 @pytest.mark.parametrize(
-    ("head_dim", "is_causal", "fuse_query"),
+    ("head_dim", "is_causal"),
     [
-        (64, False, False),
-        (64, True, False),
-        (128, False, True),
-        (128, True, True),
+        (64, False),
+        (64, True),
+        (128, False),
+        (128, True),
     ],
 )
-def test_sm120_query_fusion_is_dimension_and_mode_specific(
+def test_sm120_uses_standalone_query_quantization(
     head_dim: int,
     is_causal: bool,
-    fuse_query: bool,
 ) -> None:
     plan = select_execution_plan(
         _SM120,
@@ -173,7 +172,7 @@ def test_sm120_query_fusion_is_dimension_and_mode_specific(
     )
 
     assert plan.grouped_qk
-    assert plan.fuse_query_quantization is fuse_query
+    assert not plan.fuse_query_quantization
 
 
 @pytest.mark.parametrize(

@@ -31,7 +31,7 @@ def test_omitted_axes_measure_only_the_production_plan() -> None:
     assert choice.num_warps == 4
     assert choice.num_stages == 3
     assert choice.use_tensor_descriptors
-    assert choice.fuse_query_quantization
+    assert not choice.fuse_query_quantization
     assert not choice.use_packed_probability_conversion
 
 

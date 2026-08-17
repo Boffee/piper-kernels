@@ -85,8 +85,9 @@ parallelism only; they do not reproduce the reduced KV-head memory and preparati
 need separate coverage.
 
 The exact SM120 SageAttention2++ production plan uses 128-row query tiles at every supported
-sequence length, matching the pinned canonical CUDA implementation. Its D128 path fuses query
-quantization at every length, while D64 quantizes Q separately. Grouped-Q/K tiles reduce raw score
+sequence length, matching the pinned canonical CUDA implementation. D64 and D128 use the
+standalone query quantizer so the fixed signed-Hadamard Q/K smoother does not inflate the
+register-heavy attention recurrence. Grouped-Q/K tiles reduce raw score
 maxima before applying their positive grouped scale regardless of where Q is quantized; causal
 diagonal/tail tiles and portable per-thread-scale paths retain scale-before-max. K and V use
 separate quantization launches on every target. These choices have no sequence-length crossover,

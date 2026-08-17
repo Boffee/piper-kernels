@@ -88,12 +88,11 @@ def _apply_sm120_policy(
     head_dim: int,
 ) -> SageAttention2ppExecutionPlan:
     """Apply schedules and preprocessing choices measured on exact SM120."""
-    fuse_query_quantization = head_dim == 128
     use_tensor_descriptors = head_dim == 128
     return replace(
         plan,
         block_m=128,
-        fuse_query_quantization=fuse_query_quantization,
+        fuse_query_quantization=False,
         use_tensor_descriptors=use_tensor_descriptors,
         use_packed_probability_conversion=False,
     )

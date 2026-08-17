@@ -5,6 +5,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Piper Attention and SageAttention2++ now apply a fixed signed, normalized Hadamard transform
+  across D64 and D128 Q/K heads before INT8 quantization. Applying the same orthogonal transform
+  to Q and centered K preserves their exact dot products before quantization while smoothing
+  outliers. On a real BF16 LTX-2.3 D128 attention capture, SageAttention2++ improved from 32.44
+  to 33.01 dB global SQNR and from 28.18 to 29.04 dB on the worst head. SM120 D128 uses the
+  standalone query quantizer so the transform does not inflate the already register-heavy
+  attention recurrence; at the 8K anchor this added 1.8% complete-operator latency and was
+  neutral within measurement noise at 32K and 128K.
+
 ## [0.3.0rc1] - 2026-08-17
 
 ### Added

@@ -8,10 +8,64 @@ import torch
 import triton
 import triton.language as tl
 
+from ._rotation import SIGNED_HADAMARD_MASK
+
 _LOG2_E = tl.constexpr(1.4426950408889634)
 _SCALE_EPSILON = tl.constexpr(1e-7)
 _QUERY_BLOCK = 32
 _KEY_BLOCK = 64
+_SIGNED_HADAMARD_WORD_0 = tl.constexpr(SIGNED_HADAMARD_MASK[0])
+_SIGNED_HADAMARD_WORD_1 = tl.constexpr(SIGNED_HADAMARD_MASK[1])
+_SIGNED_HADAMARD_WORD_2 = tl.constexpr(SIGNED_HADAMARD_MASK[2])
+_SIGNED_HADAMARD_WORD_3 = tl.constexpr(SIGNED_HADAMARD_MASK[3])
+
+
+@triton.jit
+def _hadamard_stage(
+    values,
+    head_dim: tl.constexpr,
+    butterfly_distance: tl.constexpr,
+):
+    rows: tl.constexpr = values.shape[0]  # pyright: ignore[reportAssignmentType]
+    outer: tl.constexpr = head_dim // (2 * butterfly_distance)
+    grouped = tl.reshape(values, (rows, outer, 2, butterfly_distance))
+    pairs = tl.permute(grouped, (0, 1, 3, 2))
+    low, high = tl.split(pairs)
+    transformed = tl.join(low + high, low - high)
+    return tl.reshape(tl.permute(transformed, (0, 1, 3, 2)), (rows, head_dim))
+
+
+@triton.jit
+def rotate_signed_hadamard_heads(values, head_dim: tl.constexpr):
+    """Apply a fixed signed, normalized Hadamard to D64 or D128 heads."""
+    offsets = tl.arange(0, head_dim)
+    word_group = offsets // 32
+    words = tl.where(
+        word_group == 0,
+        _SIGNED_HADAMARD_WORD_0,
+        tl.where(
+            word_group == 1,
+            _SIGNED_HADAMARD_WORD_1,
+            tl.where(
+                word_group == 2,
+                _SIGNED_HADAMARD_WORD_2,
+                _SIGNED_HADAMARD_WORD_3,
+            ),
+        ),
+    ).to(tl.uint32)
+    signs = tl.where(((words >> (offsets % 32)) & 1) != 0, 1.0, -1.0)
+    values *= signs[None, :]
+
+    values = _hadamard_stage(values, head_dim, 1)
+    values = _hadamard_stage(values, head_dim, 2)
+    values = _hadamard_stage(values, head_dim, 4)
+    values = _hadamard_stage(values, head_dim, 8)
+    values = _hadamard_stage(values, head_dim, 16)
+    values = _hadamard_stage(values, head_dim, 32)
+    if head_dim == 128:
+        values = _hadamard_stage(values, head_dim, 64)
+        return values * 0.08838834764831845
+    return values * 0.125
 
 
 @triton.jit
@@ -56,6 +110,7 @@ def quantize_query_per_thread_group(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
+    values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
     scale = maximum / 127.0 + _SCALE_EPSILON
     quantized = round_to_int8(values / scale)
@@ -146,6 +201,7 @@ def quantize_query_per_warp_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
+    values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
     scale = maximum / 127.0 + _SCALE_EPSILON
     quantized = round_to_int8(values / scale)
@@ -203,6 +259,7 @@ def quantize_key_per_thread_group(
         other=0.0,
     ).to(tl.float32)
     values = tl.where(mask, values - mean[None, :], 0.0)
+    values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
     scale = maximum / 127.0 + _SCALE_EPSILON
     quantized = round_to_int8(values / scale)
@@ -299,6 +356,7 @@ def quantize_key_per_block_kernel(
         other=0.0,
     ).to(tl.float32)
     values = tl.where(mask, values - mean[None, :], 0.0)
+    values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
     scale = maximum / 127.0 + _SCALE_EPSILON
     quantized = round_to_int8(values / scale)
