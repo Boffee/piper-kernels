@@ -125,7 +125,7 @@ def test_sm89_piper_provider_registers_separate_quantization_kernels() -> None:
 
 
 @pytest.mark.parametrize("sequence_length", [2 * 1024, 32 * 1024])
-def test_sm120_causal_d128_provider_fuses_query_quantization_at_all_lengths(
+def test_sm120_causal_d128_provider_quantizes_query_separately_at_all_lengths(
     sequence_length: int,
 ) -> None:
     tensor = torch.empty(
@@ -142,10 +142,9 @@ def test_sm120_causal_d128_provider_fuses_query_quantization_at_all_lengths(
 
     provider = providers[SAGE_ATTENTION_2PP]
     jit_functions = provider.triton_jit_functions
-    assert "quantize-query-per-warp" not in jit_functions
+    assert "quantize-query-per-warp" in jit_functions
     assert "quantize-key-per-block" in jit_functions
     assert "quantize-value-per-channel" in jit_functions
-    assert provider.configuration["fuse_query_quantization"] is True
 
 
 def test_other_sm12x_sage_attention_2pp_provider_uses_grouped_quantization() -> None:

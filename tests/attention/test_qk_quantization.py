@@ -3,13 +3,58 @@
 import pytest
 import torch
 
+from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
+    SIGNED_HADAMARD_MASK,
+    rotate_signed_hadamard_heads,
+)
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     quantize_query_key,
 )
 
 
+def _signed_hadamard(head_dim: int) -> torch.Tensor:
+    signs = torch.tensor(
+        [
+            1.0 if SIGNED_HADAMARD_MASK[index // 32] & (1 << (index % 32)) else -1.0
+            for index in range(head_dim)
+        ]
+    )
+    hadamard = torch.tensor([[1.0]])
+    while hadamard.shape[0] < head_dim:
+        hadamard = torch.cat(
+            (
+                torch.cat((hadamard, hadamard), dim=1),
+                torch.cat((hadamard, -hadamard), dim=1),
+            ),
+            dim=0,
+        )
+    return signs[:, None] * hadamard / head_dim**0.5
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_signed_hadamard_heads_match_fixed_orthogonal_matrix(head_dim: int) -> None:
+    torch.manual_seed(71)
+    value = torch.randn(2, 3, 5, head_dim)
+
+    actual = rotate_signed_hadamard_heads(value)
+    expected = value @ _signed_hadamard(head_dim)
+
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(
+        actual @ actual.transpose(-1, -2),
+        value @ value.transpose(-1, -2),
+        atol=3e-5,
+        rtol=3e-5,
+    )
+
+
+def test_signed_hadamard_heads_reject_other_widths() -> None:
+    with pytest.raises(ValueError, match="must be one of 64, 128"):
+        rotate_signed_hadamard_heads(torch.empty(2, 32))
+
+
 @pytest.mark.parametrize("granularity", ["per_thread", "per_warp"])
-def test_quantize_query_key_centers_key_and_returns_per_row_scales(
+def test_quantize_query_key_centers_and_smooths_before_quantization(
     granularity: str,
 ) -> None:
     torch.manual_seed(70)
@@ -22,8 +67,10 @@ def test_quantize_query_key_centers_key_and_returns_per_row_scales(
         granularity=granularity,  # type: ignore[arg-type]
     )
 
+    query_rotated = rotate_signed_hadamard_heads(query.float())
     key_centered = key.float() - key.float().mean(dim=2, keepdim=True)
-    query_error = (query_int8.float() * query_scale[..., None] - query.float()).abs()
+    key_centered = rotate_signed_hadamard_heads(key_centered)
+    query_error = (query_int8.float() * query_scale[..., None] - query_rotated).abs()
     key_error = (key_int8.float() * key_scale[..., None] - key_centered).abs()
     assert query_int8.shape == query.shape
     assert key_int8.shape == key.shape

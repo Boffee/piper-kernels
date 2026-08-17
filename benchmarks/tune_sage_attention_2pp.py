@@ -52,7 +52,6 @@ class _SageAttention2ppTuningChoice:
     num_warps: int
     num_stages: int
     use_tensor_descriptors: bool
-    fuse_query_quantization: bool
     reverse_causal_blocks: bool
     loop_num_stages: int | None
     loop_licm: bool
@@ -66,7 +65,6 @@ class _SageAttention2ppTuningChoice:
             f"w{self.num_warps}",
             f"s{self.num_stages}",
             "descriptor" if self.use_tensor_descriptors else "pointer",
-            "fused-q" if self.fuse_query_quantization else "separate-q",
             "reverse" if self.reverse_causal_blocks else "forward",
             f"loop{self.loop_num_stages or 'default'}",
             "licm" if self.loop_licm else "no-licm",
@@ -82,11 +80,6 @@ class _SageAttention2ppTuningChoice:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_attention_tuning_arguments(parser)
-    parser.add_argument(
-        "--fuse-query-quantization",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
     return parser.parse_args(argv)
 
 
@@ -102,10 +95,6 @@ def _candidate_choices(
         boolean_tuning_axis(
             args.use_tensor_descriptors,
             production_plan.use_tensor_descriptors,
-        ),
-        boolean_tuning_axis(
-            args.fuse_query_quantization,
-            production_plan.fuse_query_quantization,
         ),
         boolean_tuning_axis(
             args.reverse_causal_blocks,
@@ -145,7 +134,6 @@ def _resolve_plan(
             num_warps=choice.num_warps,
             num_stages=choice.num_stages,
             use_tensor_descriptors=choice.use_tensor_descriptors,
-            fuse_query_quantization=choice.fuse_query_quantization,
             reverse_causal_blocks=choice.reverse_causal_blocks,
             loop_num_stages=choice.loop_num_stages,
             loop_licm=choice.loop_licm,

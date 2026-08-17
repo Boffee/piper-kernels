@@ -274,7 +274,8 @@ def test_optimized_causal_traversal_matches_fully_masked_loop(
             execution_plan=replace(base_plan, optimize_causal_traversal=True),
         )
 
-    torch.testing.assert_close(partitioned, masked, atol=2**-20, rtol=0.0)
+    # The two traversal orders can straddle one final BF16 rounding boundary.
+    torch.testing.assert_close(partitioned, masked, atol=2**-9, rtol=0.0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
