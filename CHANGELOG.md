@@ -9,9 +9,36 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Quality-gated offline ConvRot INT8 forward-linear execution-plan tuning across dynamic
   preparation and GEMM schedules, with stratified large-shape output validation.
+- `convrot_int8_compile_options` for automatically sharing input preparation and folding
+  tanh-approximate GELU or packed `[up | gate]` SwiGLU into activated input preparation plus a
+  prepared ConvRot linear in compiled inference graphs. This lets the source input die before
+  output allocation. The inference-only post-AOT rewrites preserve operation order and use
+  explicit graph values and operators instead of an identity-based runtime cache.
 
 ### Changed
 
+- The explicit `convrot_int8_linear` now defaults to an ordinary linear and accepts
+  `activation_fn="gelu_tanh"` or `"swiglu"` for activation-aware input preparation. Portable
+  activation semantics and optimized Triton activation primitives are shared independently of
+  the ConvRot backend. The NVIDIA GELU path uses native approximate tanh. Optimized Triton targets
+  select fused preparation across every supported ConvRot group size, logical dtype, and row count
+  while retaining the 16,384 power-of-two preparation-extent cap; this is measured on exact SM120
+  and selected optimistically elsewhere.
+- ConvRot tensors and linear operators now live under `piper_kernels.linear.convrot`, mirroring
+  the `piper_kernels.attention` package hierarchy. The former `piper_kernels.convrot` import path
+  and `ConvRotInt8Tensor.from_packed` compatibility factory have been removed.
+- Large-M dense forward-linear tuning guidance now standardizes a BF16, bias-free Cartesian
+  matrix over `M=8K/32K`, `N=4K/16K`, and non-power-of-two `K=6144/14336` as model-neutral
+  measurement anchors rather than dispatch keys. ConvRot INT8 applies group size 256 to this matrix.
+  Its benchmark accepts Cartesian M/N/K axes, and its benchmark and tuner defaults now start from
+  the lower-width anchor instead of power-of-two toy dimensions. `M=131073` is reserved for final
+  long, ragged, and 64-bit-indexing validation.
+- ConvRot INT8 linears use one target- and shape-independent GEMM schedule with
+  `128x256x128` tiles, eight warps, fixed `GROUP_M=16` launch ordering, and separate full-M and
+  ragged-M-tail launches. Across the full BF16 `M=8K/32K`, `N=4K/16K`, `K=6144/14336` matrix,
+  this delivered a 2.20-5.56x complete-operator speedup on exact SM120 over the former generic
+  schedule without a quality change and is selected optimistically on other targets; both
+  `M=131073` expansion and contraction guards pass the same quality checks.
 - SM120 Piper causal attention now traverses its mask-free prefix separately from the masked
   diagonal boundary and launches query blocks in reverse order. D128 uniformly uses split PV,
   with two FP32 accumulators for causal and non-causal attention at every sequence length. The
@@ -49,9 +76,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Shared Sage-style Q/K reference and Triton preparation now have one implementation across
   Piper Attention and SageAttention2++. Benchmark tooling now verifies the pinned canonical
   SageAttention installation before recording provenance, participates in the standard type and
-  formatting checks, and shares common attention-tuner CLI and result-reporting paths. General
-  ConvRot tests use the preferred `from_quantized` factory while focused compatibility coverage
-  retains `from_packed`.
+  formatting checks, and shares common attention-tuner CLI and result-reporting paths.
 - Centralized ConvRot INT8 preparation and GEMM launch policy in one flat immutable execution
   plan shared by production, benchmark metadata, and offline tuning, with injectable preparation
   and launch boundaries for development measurements. Supported CUDA SwiGLU dispatch now leaves

@@ -8,6 +8,7 @@ import importlib.metadata
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from types import ModuleType
 from typing import cast
@@ -15,6 +16,9 @@ from typing import cast
 import torch
 from lib.convrot import (
     CONVROT_DTYPE_NAMES,
+    DENSE_LINEAR_ANCHOR_IN_FEATURES,
+    DENSE_LINEAR_ANCHOR_OUT_FEATURES,
+    DENSE_LINEAR_ANCHOR_ROWS,
     ConvRotConfig,
     ConvRotShape,
     comfy_convrot_input,
@@ -35,7 +39,7 @@ from lib.reporting import (
     write_records,
 )
 
-from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 _MIN_PIPER_SQNR_DB = 20.0
 _MAX_COMFY_RELATIVE_L2_ERROR = 0.02
@@ -229,32 +233,35 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--rows",
         type=int,
         nargs="+",
-        default=[1, 16, 64, 256],
-        help="activation rows M (default: 1 16 64 256)",
+        default=list(DENSE_LINEAR_ANCHOR_ROWS),
+        help="activation rows M (default: 8192 32768)",
     )
     parser.add_argument(
         "--out-features",
         type=int,
-        default=4096,
-        help="linear output width N (default: 4096)",
+        nargs="+",
+        default=[DENSE_LINEAR_ANCHOR_OUT_FEATURES[0]],
+        help="linear output widths N (default: 4096)",
     )
     parser.add_argument(
         "--in-features",
         type=int,
-        default=4096,
-        help="linear/weight width K; raw SwiGLU input width is 2K (default: 4096)",
+        nargs="+",
+        default=[DENSE_LINEAR_ANCHOR_IN_FEATURES[0]],
+        help="linear/weight widths K; raw SwiGLU input width is 2K (default: 6144)",
     )
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
-        choices=("swiglu",),
+        choices=("gelu_tanh", "swiglu"),
         default=None,
-        help="raw-input activation; SwiGLU expects [up | gate] with width 2K",
+        help="input activation; SwiGLU expects [up | gate] with width 2K",
     )
     parser.add_argument(
-        "--no-bias",
-        action="store_true",
-        help="omit bias",
+        "--bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="include bias (default: disabled)",
     )
     parser.add_argument(
         "--dtype",
@@ -278,21 +285,29 @@ def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
         ConvRotShape(
             "linear",
             rows,
+            out_features,
+            in_features,
+            input_activation=args.input_activation,
+            has_bias=args.bias,
+        )
+        for rows, out_features, in_features in product(
+            args.rows,
             args.out_features,
             args.in_features,
-            input_activation=args.input_activation,
-            has_bias=not args.no_bias,
         )
-        for rows in args.rows
     )
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if any(rows <= 0 for rows in args.rows) or args.out_features <= 0 or args.in_features <= 0:
+    if (
+        any(rows <= 0 for rows in args.rows)
+        or any(out_features <= 0 for out_features in args.out_features)
+        or any(in_features <= 0 for in_features in args.in_features)
+    ):
         raise SystemExit("rows, out_features, and in_features must all be positive")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
-    if args.in_features % args.group_size:
+    if any(in_features % args.group_size for in_features in args.in_features):
         raise SystemExit("every in_features value must be divisible by --group-size")
     if args.compare_comfy_kitchen and args.dtype == "float32":
         raise SystemExit("comfy-kitchen comparison supports float16 and bfloat16")

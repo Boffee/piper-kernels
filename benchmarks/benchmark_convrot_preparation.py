@@ -1,4 +1,4 @@
-"""Measure ConvRot activation rotation and rowwise INT8 preparation phases."""
+"""Measure ConvRot input rotation and rowwise INT8 preparation phases."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from typing import TypedDict
 
 import torch
 from lib.convrot import (
-    apply_input_activation,
+    DENSE_LINEAR_ANCHOR_IN_FEATURES,
+    DENSE_LINEAR_ANCHOR_ROWS,
     comfy_convrot_input,
     convrot_dtype,
     raw_input_features,
@@ -34,12 +35,15 @@ from lib.triton_inspection import (
     inspect_provider,
 )
 
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot.int8 import _policy as convrot_policy
-from piper_kernels.convrot.int8 import triton as triton_backend
+from piper_kernels.linear._input_activations import (
+    apply_input_activation,
+)
+from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
+from piper_kernels.linear.convrot.int8 import triton as triton_backend
 
 COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
 PIPER_TRITON_PROVIDER = "piper-triton"
+_COMFY_INPUT_ACTIVATION_CODES = {None: 0, "gelu_tanh": 1, "swiglu": 2}
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,17 +71,17 @@ class PreparationPhaseResult:
 
 
 _PHASE_PROVENANCE = {
-    "rotate": "piper_kernels.convrot.int8.triton._rotate_activations",
-    "quantize": "piper_kernels.convrot.int8.triton._quantize_activations",
-    "split": "Piper _rotate_activations followed by _quantize_activations",
-    "fused": "piper_kernels.convrot.int8.triton._fused_rotate_quantize_activations",
+    "rotate": "piper_kernels.linear.convrot.int8.triton.rotate_input",
+    "quantize": "piper_kernels.linear.convrot.int8.triton.quantize_input",
+    "split": "Piper rotate_input followed by quantize_input",
+    "fused": "piper_kernels.linear.convrot.int8.triton.fused_rotate_quantize_input",
     "comfy-kitchen": "comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64",
 }
 
 
 def _baseline_phase(input_activation: str | None) -> str:
     """Return the Piper phase used as the relative-speed baseline."""
-    return "fused" if input_activation == "swiglu" else "split"
+    return "fused" if input_activation is not None else "split"
 
 
 def _minimum_global_bytes(
@@ -115,22 +119,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rows",
         type=int,
-        default=256,
-        help="activation rows M (default: 256)",
+        default=DENSE_LINEAR_ANCHOR_ROWS[0],
+        help="activation rows M (default: 8192)",
     )
     parser.add_argument(
         "--in-features",
         type=int,
         nargs="+",
-        default=[4096],
-        help="linear/weight widths K (default: 4096); raw SwiGLU input width is 2K",
+        default=[DENSE_LINEAR_ANCHOR_IN_FEATURES[0]],
+        help="linear/weight widths K (default: 6144); raw SwiGLU input width is 2K",
     )
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument(
         "--input-activation",
-        choices=("swiglu",),
+        choices=("gelu_tanh", "swiglu"),
         default=None,
-        help="raw-input activation; SwiGLU expects [up | gate] with width 2K",
+        help="input activation; SwiGLU expects [up | gate] with width 2K",
     )
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measurement-time-ms", type=int, default=300)
@@ -218,7 +222,9 @@ def _assert_fused_quality(
 
     qdata_error = (split_qdata.to(torch.int16) - fused_qdata.to(torch.int16)).abs().max().item()
     if qdata_error > 1:
-        raise AssertionError(f"fused SwiGLU qdata differs from split path by {qdata_error}")
+        raise AssertionError(
+            f"fused {input_activation} qdata differs from split path by {qdata_error}"
+        )
     torch.testing.assert_close(
         fused_scale,
         split_scale,
@@ -237,29 +243,17 @@ class _PreparationConfiguration(TypedDict):
 
 
 def _select_preparation_configuration(
-    target: AcceleratorTarget,
-    rows: int,
     in_features: int,
-    dtype: torch.dtype,
-    input_activation: str | None,
 ) -> _PreparationConfiguration:
-    """Select preparation scalars without fabricating an irrelevant GEMM shape."""
+    """Project preparation choices from the production execution plan."""
+    plan = convrot_policy.select_execution_plan(
+        in_features=in_features,
+    )
     return {
-        "fuse_rotation_quantization": convrot_policy._select_fuse_rotation_quantization(
-            target,
-            rows=rows,
-            in_features=in_features,
-            group_size=256,
-            dtype=dtype,
-        ),
-        "fused_num_warps": convrot_policy._select_fused_num_warps(
-            target,
-            rows=rows,
-            in_features=in_features,
-            swiglu=input_activation == "swiglu",
-        ),
-        "rotation_num_warps": convrot_policy._DEFAULT_ROTATION_NUM_WARPS,
-        "quantization_num_warps": convrot_policy._DEFAULT_QUANTIZATION_NUM_WARPS,
+        "fuse_rotation_quantization": plan.fuse_rotation_quantization,
+        "fused_num_warps": plan.fused_num_warps,
+        "rotation_num_warps": plan.rotation_num_warps,
+        "quantization_num_warps": plan.quantization_num_warps,
     }
 
 
@@ -288,10 +282,10 @@ def _benchmark_width(
     split_scale = torch.empty(rows, device="cuda", dtype=torch.float32)
     fused_qdata = torch.empty_like(split_qdata)
     fused_scale = torch.empty_like(split_scale)
-    dtype_code = triton_backend._logical_dtype_code(dtype)
+    dtype_code = triton_backend.dtype_code(dtype)
 
     def rotate() -> None:
-        triton_backend._rotate_activations(
+        triton_backend.rotate_input(
             activation,
             rotated,
             256,
@@ -299,7 +293,7 @@ def _benchmark_width(
         )
 
     def quantize() -> None:
-        triton_backend._quantize_activations(
+        triton_backend.quantize_input(
             rotated,
             split_qdata,
             split_scale,
@@ -312,13 +306,13 @@ def _benchmark_width(
         quantize()
 
     def fused() -> None:
-        triton_backend._fused_rotate_quantize_activations(
+        triton_backend.fused_rotate_quantize_input(
             raw_activation,
             fused_qdata,
             fused_scale,
             256,
             dtype_code,
-            apply_swiglu=input_activation == "swiglu",
+            activation_fn=input_activation,  # type: ignore[arg-type]
             num_warps=preparation_configuration["fused_num_warps"],
         )
 
@@ -352,7 +346,7 @@ def _benchmark_width(
             comfy_activation,
             comfy_qdata,
             comfy_scale,
-            2 if input_activation == "swiglu" else 0,
+            _COMFY_INPUT_ACTIVATION_CODES[input_activation],
         )
         comfy_launch()
         comfy_qdata_error = (
@@ -492,11 +486,11 @@ def _inspection_provider(
     args: argparse.Namespace,
     preparation_configuration: _PreparationConfiguration,
 ) -> BenchmarkProvider[None, None]:
-    jit_functions = {"fused": triton_backend._rotate_quantize_rows_kernel}
+    jit_functions = {"fused": triton_backend.rotate_quantize_rows_kernel}
     if args.input_activation is None:
         jit_functions = {
-            "rotate": triton_backend._rotate_groups_kernel,
-            "quantize": triton_backend._quantize_rows_kernel,
+            "rotate": triton_backend.rotate_groups_kernel,
+            "quantize": triton_backend.quantize_rows_kernel,
             **jit_functions,
         }
     return BenchmarkProvider(
@@ -554,14 +548,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     _validate_args(args)
     dtype = convrot_dtype(args.dtype)
     comfy_kitchen = _load_comfy_kitchen_cuda() if args.compare_comfy_kitchen else None
-    target = AcceleratorTarget.from_device(torch.device("cuda"))
     inspection_configuration = (
         _select_preparation_configuration(
-            target,
-            args.rows,
             args.in_features[0],
-            dtype,
-            args.input_activation,
         )
         if _compiler_requested(args)
         else None
@@ -585,11 +574,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     records: list[BenchmarkRecord] = []
     for in_features in args.in_features:
         preparation_configuration = _select_preparation_configuration(
-            target,
-            args.rows,
             in_features,
-            dtype,
-            args.input_activation,
         )
         results = _benchmark_width(
             args.rows,

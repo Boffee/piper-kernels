@@ -2,7 +2,7 @@
 
 import torch
 
-__all__: list[str] = []
+__all__ = ["stochastic_round_to_int"]
 
 
 def _uniform(
@@ -22,7 +22,7 @@ def _uniform(
     )
 
 
-def _stochastic_round_to_int(
+def stochastic_round_to_int(
     values: torch.Tensor,
     *,
     seed: int,

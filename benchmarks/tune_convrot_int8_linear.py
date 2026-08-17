@@ -11,6 +11,9 @@ from pathlib import Path
 import torch
 from lib.convrot import (
     CONVROT_DTYPE_NAMES,
+    DENSE_LINEAR_ANCHOR_IN_FEATURES,
+    DENSE_LINEAR_ANCHOR_OUT_FEATURES,
+    DENSE_LINEAR_ANCHOR_ROWS,
     ConvRotConfig,
     ConvRotInputs,
     ConvRotShape,
@@ -39,22 +42,42 @@ from lib.tuning import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
-from piper_kernels.convrot.int8 import _policy as convrot_policy
+from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=256)
-    parser.add_argument("--out-features", type=int, default=4096)
-    parser.add_argument("--in-features", type=int, default=4096)
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=DENSE_LINEAR_ANCHOR_ROWS[0],
+        help="activation rows M (default: 8192)",
+    )
+    parser.add_argument(
+        "--out-features",
+        type=int,
+        default=DENSE_LINEAR_ANCHOR_OUT_FEATURES[0],
+        help="linear output width N (default: 4096)",
+    )
+    parser.add_argument(
+        "--in-features",
+        type=int,
+        default=DENSE_LINEAR_ANCHOR_IN_FEATURES[0],
+        help="linear/weight width K (default: 6144)",
+    )
     parser.add_argument("--group-size", type=int, choices=SUPPORTED_GROUP_SIZES, default=256)
     parser.add_argument(
         "--input-activation",
-        choices=("swiglu",),
+        choices=("gelu_tanh", "swiglu"),
         default=None,
     )
-    parser.add_argument("--no-bias", action="store_true")
+    parser.add_argument(
+        "--bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="include bias (default: disabled)",
+    )
     parser.add_argument(
         "--dtype",
         choices=CONVROT_DTYPE_NAMES,
@@ -127,8 +150,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
-) -> tuple[convrot_policy.ConvRotInt8LinearExecutionPlan, ...]:
+    production_plan: convrot_policy.LinearExecutionPlan,
+) -> tuple[convrot_policy.LinearExecutionPlan, ...]:
     """Build a bounded explicit search around the production execution plan."""
     fusion_axis = boolean_tuning_axis(
         args.fuse_rotation_quantization,
@@ -191,7 +214,7 @@ def _candidate_plans(
     )
 
 
-def _plan_name(plan: convrot_policy.ConvRotInt8LinearExecutionPlan) -> str:
+def _plan_name(plan: convrot_policy.LinearExecutionPlan) -> str:
     preparation = (
         f"fused-pw{plan.fused_num_warps}"
         if plan.fuse_rotation_quantization
@@ -205,7 +228,7 @@ def _plan_name(plan: convrot_policy.ConvRotInt8LinearExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: convrot_policy.ConvRotInt8LinearExecutionPlan,
+    plan: convrot_policy.LinearExecutionPlan,
     workload: ConvRotWorkload,
 ) -> TuningCandidate[ConvRotInputs, torch.Tensor]:
     """Wrap one plan around the complete production-paid ConvRot device path."""
@@ -243,7 +266,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         args.out_features,
         args.in_features,
         args.input_activation,
-        not args.no_bias,
+        args.bias,
     )
     config = ConvRotConfig(
         dtype=convrot_dtype(args.dtype),
@@ -254,7 +277,6 @@ def _main(argv: Sequence[str] | None = None) -> None:
         shape,
         config,
         device=device,
-        target=target,
     )
     candidates = tuple(
         _make_candidate(plan, workload) for plan in _candidate_plans(args, workload.production_plan)

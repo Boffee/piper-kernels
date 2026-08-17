@@ -12,21 +12,13 @@ from tune_convrot_int8_linear import (
     _validate_args,
 )
 
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.convrot.int8 import triton as convrot_backend
-from piper_kernels.convrot.int8._policy import select_execution_plan
-
-_SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
+from piper_kernels.linear.convrot.int8 import triton as convrot_backend
+from piper_kernels.linear.convrot.int8._policy import select_execution_plan
 
 
-def _production_plan(*, rows: int = 512):
+def _production_plan():
     return select_execution_plan(
-        _SM120,
-        rows=rows,
-        out_features=4096,
         in_features=4096,
-        group_size=256,
-        dtype=torch.bfloat16,
     )
 
 
@@ -35,13 +27,19 @@ def _workload(*, rows: int = 2, out_features: int = 96, in_features: int = 512):
         ConvRotShape("custom", rows, out_features, in_features),
         ConvRotConfig(torch.bfloat16, 256, 0),
         device=torch.device("cpu"),
-        target=_SM120,
     )
 
 
 def test_tuner_defaults_to_complete_production_device_path() -> None:
     arguments = _parse_args([])
 
+    assert arguments.rows == 8192
+    assert arguments.out_features == 4096
+    assert arguments.in_features == 6144
+    assert arguments.group_size == 256
+    assert arguments.dtype == "bfloat16"
+    assert arguments.input_activation is None
+    assert not arguments.bias
     assert arguments.phase is ProviderPhase.PREPARED_EXECUTION
     assert arguments.fuse_rotation_quantization is None
     assert arguments.fused_num_warps is None
@@ -57,9 +55,16 @@ def test_tuner_defaults_to_complete_production_device_path() -> None:
 
 def test_tuner_input_activation_is_enabled_only_explicitly() -> None:
     assert _parse_args([]).input_activation is None
+    assert _parse_args(["--input-activation", "gelu_tanh"]).input_activation == "gelu_tanh"
     assert _parse_args(["--input-activation", "swiglu"]).input_activation == "swiglu"
     with pytest.raises(SystemExit):
         _parse_args(["--input-activation", "none"])
+
+
+def test_tuner_bias_is_enabled_only_explicitly() -> None:
+    assert not _parse_args([]).bias
+    assert _parse_args(["--bias"]).bias
+    assert not _parse_args(["--no-bias"]).bias
 
 
 def test_omitted_axes_measure_only_the_production_plan() -> None:
@@ -197,7 +202,7 @@ def test_candidate_provider_injects_plan_into_complete_operator(
         calls.append((args, kwargs))
         return torch.empty((2, 96), device="meta")
 
-    monkeypatch.setattr(convrot_backend, "_run_convrot_int8_linear", fake_run)
+    monkeypatch.setattr(convrot_backend, "run_linear", fake_run)
     provider = _make_candidate(plan, workload).make_provider()
 
     prepared = provider.prepare()
@@ -206,7 +211,7 @@ def test_candidate_provider_injects_plan_into_complete_operator(
     assert prepared is workload.inputs
     assert output.shape == (2, 96)
     assert calls[0][1]["execution_plan"] is plan
-    assert calls[0][1]["apply_swiglu"] is False
+    assert calls[0][1]["activation_fn"] is None
 
 
 @pytest.mark.parametrize(

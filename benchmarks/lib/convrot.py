@@ -6,7 +6,11 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.linear._input_activations import (
+    InputActivation,
+    input_activation_width,
+)
+from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 type ConvRotInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 
@@ -16,6 +20,9 @@ _DTYPES = {
     "float32": torch.float32,
 }
 CONVROT_DTYPE_NAMES = tuple(_DTYPES)
+DENSE_LINEAR_ANCHOR_ROWS = (8192, 32768)
+DENSE_LINEAR_ANCHOR_OUT_FEATURES = (4096, 16384)
+DENSE_LINEAR_ANCHOR_IN_FEATURES = (6144, 14336)
 
 
 @dataclass(slots=True, frozen=True)
@@ -26,18 +33,15 @@ class ConvRotShape:
     rows: int
     out_features: int
     in_features: int
-    input_activation: str | None = None
-    has_bias: bool = True
+    input_activation: InputActivation | None = None
+    has_bias: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("ConvRot shape name cannot be empty")
         if any(value <= 0 for value in (self.rows, self.out_features, self.in_features)):
             raise ValueError("ConvRot rows, out_features, and in_features must be positive")
-        if self.input_activation not in (None, "swiglu"):
-            raise ValueError(
-                f"ConvRot input activation must be None or 'swiglu', got {self.input_activation!r}"
-            )
+        input_activation_width(self.input_activation)
 
     def as_dict(self) -> dict[str, int | str]:
         """Return stable machine-readable case and dimension fields."""
@@ -94,20 +98,7 @@ def convrot_dtype(name: str) -> torch.dtype:
 
 def raw_input_features(in_features: int, input_activation: str | None) -> int:
     """Return the source width before applying an optional input activation."""
-    return in_features * (2 if input_activation == "swiglu" else 1)
-
-
-def apply_input_activation(
-    activation: torch.Tensor,
-    input_activation: str | None,
-) -> torch.Tensor:
-    """Apply the public raw-input activation contract."""
-    if input_activation is None:
-        return activation
-    if input_activation != "swiglu":
-        raise ValueError(f"unsupported input activation {input_activation!r}")
-    up, gate = activation.chunk(2, dim=-1)
-    return up * torch.nn.functional.silu(gate)
+    return in_features * input_activation_width(input_activation)
 
 
 def comfy_convrot_input(
@@ -115,10 +106,8 @@ def comfy_convrot_input(
     input_activation: str | None,
 ) -> torch.Tensor:
     """Adapt Piper's ``[up | gate]`` input to Comfy Kitchen's ``[gate | up]``."""
-    if input_activation is None:
-        return activation
     if input_activation != "swiglu":
-        raise ValueError(f"unsupported input activation {input_activation!r}")
+        return activation
     up, gate = activation.chunk(2, dim=-1)
     return torch.cat((gate, up), dim=-1)
 
