@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-17
+
 ### Changed
 
 - Piper Attention and SageAttention2++ now apply a fixed signed, normalized Hadamard transform
