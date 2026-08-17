@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.3.0rc1] - 2026-08-17
+
 ### Added
 
 - Quality-gated offline ConvRot INT8 forward-linear execution-plan tuning across dynamic
@@ -180,7 +182,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.3.0rc1...HEAD
+[0.3.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.2.1...v0.3.0rc1
 [0.2.1]: https://github.com/Boffee/piper-kernels/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Boffee/piper-kernels/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Boffee/piper-kernels/releases/tag/v0.1.0
