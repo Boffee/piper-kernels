@@ -18,17 +18,57 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
-from piper_kernels.linear._preparation_sharing import (
-    PreparationSharingPass,
-    add_post_grad_pass,
-    dimension_key,
-    tensor_metadata,
-)
+from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-_PREPARATION_PASS_VERSION = "convrot-shared-input-preparation-v4"
-_COMPILE_PASS_VERSION = "convrot-compile-v1"
+_COMPILE_PASS_VERSION = "convrot-compile-v2"
 
 type _PreparedInputNodes = tuple[torch.fx.Node, torch.fx.Node, torch.dtype]
+
+
+def _emit_prepared_input(
+    graph: torch.fx.Graph,
+    input_node: torch.fx.Node,
+    group_size: int,
+    activation_fn: str | None,
+    prepared_shape: tuple[int | torch.SymInt, ...],
+) -> _PreparedInputNodes:
+    input_value = preparation_sharing.tensor_metadata(input_node)
+    assert input_value is not None
+    input_qdata_value = input_value.new_empty(prepared_shape, dtype=torch.int8)
+    input_scale_value = input_value.new_empty(prepared_shape[:-1], dtype=torch.float32)
+    prepared = graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_prepare_input.default,
+        args=(input_node, group_size, activation_fn),
+    )
+    prepared.meta["val"] = (input_qdata_value, input_scale_value)
+    input_qdata = graph.call_function(operator.getitem, args=(prepared, 0))
+    input_qdata.meta["val"] = input_qdata_value
+    input_scale = graph.call_function(operator.getitem, args=(prepared, 1))
+    input_scale.meta["val"] = input_scale_value
+    return input_qdata, input_scale, input_value.dtype
+
+
+def _emit_linear_prepared(
+    graph: torch.fx.Graph,
+    prepared: _PreparedInputNodes,
+    weight_qdata: torch.fx.Node,
+    weight_scale: torch.fx.Node,
+    bias: torch.fx.Node | None,
+    group_size: int,
+) -> torch.fx.Node:
+    input_qdata, input_scale, logical_dtype = prepared
+    return graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_linear_prepared.default,
+        args=(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            bias,
+            group_size,
+            logical_dtype,
+        ),
+    )
 
 
 class _ConvRotPreparationRule:
@@ -37,19 +77,21 @@ class _ConvRotPreparationRule:
     linear_target = torch.ops.piper_kernels.convrot_int8_linear.default
 
     def match_key(self, node: torch.fx.Node) -> Hashable | None:
-        if node.kwargs or len(node.args) != 5:
+        if node.kwargs or len(node.args) not in (5, 6):
             return None
-        input_node, weight_qdata, _weight_scale, _bias, group_size = node.args
+        arguments = (*node.args, None) if len(node.args) == 5 else node.args
+        input_node, weight_qdata, _weight_scale, _bias, group_size, activation_fn = arguments
         if (
             not isinstance(input_node, torch.fx.Node)
             or not isinstance(weight_qdata, torch.fx.Node)
             or not isinstance(group_size, int)
             or isinstance(group_size, bool)
+            or activation_fn is not None
         ):
             return None
 
-        input_value = tensor_metadata(input_node)
-        weight_qdata_value = tensor_metadata(weight_qdata)
+        input_value = preparation_sharing.tensor_metadata(input_node)
+        weight_qdata_value = preparation_sharing.tensor_metadata(weight_qdata)
         if (
             input_value is None
             or input_value.ndim == 0
@@ -62,7 +104,7 @@ class _ConvRotPreparationRule:
         return (
             input_node,
             group_size,
-            dimension_key(weight_qdata_value.shape[1]),
+            preparation_sharing.dimension_key(weight_qdata_value.shape[1]),
             input_value.dtype,
         )
 
@@ -71,26 +113,20 @@ class _ConvRotPreparationRule:
         graph: torch.fx.Graph,
         first: torch.fx.Node,
     ) -> _PreparedInputNodes:
-        input_node, _weight_qdata, _weight_scale, _bias, group_size = first.args
+        arguments = (*first.args, None) if len(first.args) == 5 else first.args
+        input_node, _weight_qdata, _weight_scale, _bias, group_size, _activation_fn = arguments
         assert isinstance(input_node, torch.fx.Node)
-        input_value = tensor_metadata(input_node)
+        assert isinstance(group_size, int)
+        assert not isinstance(group_size, bool)
+        input_value = preparation_sharing.tensor_metadata(input_node)
         assert input_value is not None
-
-        input_qdata_value = input_value.new_empty(input_value.shape, dtype=torch.int8)
-        input_scale_value = input_value.new_empty(
-            input_value.shape[:-1],
-            dtype=torch.float32,
+        return _emit_prepared_input(
+            graph,
+            input_node,
+            group_size,
+            None,
+            tuple(input_value.shape),
         )
-        prepared = graph.call_function(
-            torch.ops.piper_kernels.convrot_int8_prepare_input.default,
-            args=(input_node, group_size),
-        )
-        prepared.meta["val"] = (input_qdata_value, input_scale_value)
-        input_qdata = graph.call_function(operator.getitem, args=(prepared, 0))
-        input_qdata.meta["val"] = input_qdata_value
-        input_scale = graph.call_function(operator.getitem, args=(prepared, 1))
-        input_scale.meta["val"] = input_scale_value
-        return input_qdata, input_scale, input_value.dtype
 
     def replace(
         self,
@@ -98,27 +134,24 @@ class _ConvRotPreparationRule:
         node: torch.fx.Node,
         prepared: _PreparedInputNodes,
     ) -> torch.fx.Node:
-        _input, weight_qdata, weight_scale, bias, group_size = node.args
-        input_qdata, input_scale, logical_dtype = prepared
-        return graph.call_function(
-            torch.ops.piper_kernels.convrot_int8_linear_prepared.default,
-            args=(
-                input_qdata,
-                input_scale,
-                weight_qdata,
-                weight_scale,
-                bias,
-                group_size,
-                logical_dtype,
-            ),
+        arguments = (*node.args, None) if len(node.args) == 5 else node.args
+        _input, weight_qdata, weight_scale, bias, group_size, _activation_fn = arguments
+        assert isinstance(weight_qdata, torch.fx.Node)
+        assert isinstance(weight_scale, torch.fx.Node)
+        assert bias is None or isinstance(bias, torch.fx.Node)
+        assert isinstance(group_size, int)
+        assert not isinstance(group_size, bool)
+        return _emit_linear_prepared(
+            graph,
+            prepared,
+            weight_qdata,
+            weight_scale,
+            bias,
+            group_size,
         )
 
 
-share_preparation_pass = PreparationSharingPass(
-    (_ConvRotPreparationRule(),),
-    version=_PREPARATION_PASS_VERSION,
-    source_files=(__file__,),
-)
+_PREPARATION_RULES = (_ConvRotPreparationRule(),)
 
 
 _packed_swiglu_patterns = PatternMatcherPass("convrot_packed_swiglu")
@@ -192,8 +225,8 @@ def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
     split_size = match.kwargs["split_size"]
     if not isinstance(packed, torch.fx.Node) or not isinstance(weight_qdata, torch.fx.Node):
         return False
-    packed_value = tensor_metadata(packed)
-    weight_value = tensor_metadata(weight_qdata)
+    packed_value = preparation_sharing.tensor_metadata(packed)
+    weight_value = preparation_sharing.tensor_metadata(weight_qdata)
     if (
         packed_value is None
         or packed_value.ndim == 0
@@ -204,9 +237,11 @@ def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
     ):
         return False
     in_features = weight_value.shape[1]
-    dimensions_match = dimension_key(split_size) == dimension_key(in_features) and dimension_key(
+    dimensions_match = preparation_sharing.dimension_key(
+        split_size
+    ) == preparation_sharing.dimension_key(in_features) and preparation_sharing.dimension_key(
         packed_value.shape[-1]
-    ) == dimension_key(2 * in_features)
+    ) == preparation_sharing.dimension_key(2 * in_features)
     if promote_gate is True:
         return dimensions_match and match.kwargs["logical_dtype"] is packed_value.dtype
     if promote_gate is False:
@@ -225,16 +260,24 @@ def _replace_packed_swiglu(
 ) -> None:
     original = match.output_node()
     graph = match.graph
+    packed_value = preparation_sharing.tensor_metadata(packed)
+    assert packed_value is not None
+    input_shape = (*packed_value.shape[:-1], packed_value.shape[-1] // 2)
     with graph.inserting_before(original):
-        replacement = graph.call_function(
-            torch.ops.piper_kernels.convrot_int8_swiglu_linear.default,
-            args=(
-                packed,
-                weight_qdata,
-                weight_scale,
-                bias,
-                group_size,
-            ),
+        prepared = _emit_prepared_input(
+            graph,
+            packed,
+            group_size,
+            "swiglu",
+            input_shape,
+        )
+        replacement = _emit_linear_prepared(
+            graph,
+            prepared,
+            weight_qdata,
+            weight_scale,
+            bias,
+            group_size,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -275,13 +318,12 @@ class _ConvRotCompilePass(CustomInferenceAwareGraphPass):
         if not is_inference:
             return
         _fold_packed_swiglu(graph)
-        share_preparation_pass(graph, is_inference=True)
+        preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
-        preparation_uuid = share_preparation_pass.uuid().hex()
         return get_hash_for_files(
-            (__file__,),
-            extra=f"{_COMPILE_PASS_VERSION}:{preparation_uuid}",
+            (__file__, preparation_sharing.__file__),
+            extra=_COMPILE_PASS_VERSION,
         )
 
 
@@ -298,7 +340,7 @@ def convrot_compile_options(
     unchanged. Pass these options to ``torch.compile`` without also supplying
     its mutually exclusive ``mode`` argument.
     """
-    return add_post_grad_pass(options, convrot_compile_pass)
+    return preparation_sharing.add_post_grad_pass(options, convrot_compile_pass)
 
 
 __all__ = ["convrot_compile_options"]

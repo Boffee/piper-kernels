@@ -13,7 +13,6 @@ from piper_kernels.linear.convrot.int8 import triton as triton_backend
 from piper_kernels.linear.convrot.int8.reference import (
     convrot_int8_addmm_,
     convrot_int8_linear,
-    convrot_int8_swiglu_linear,
 )
 
 
@@ -222,7 +221,7 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         activation,
         qdata,
         256,
-        apply_swiglu=apply_swiglu,
+        activation_fn="swiglu" if apply_swiglu else None,
     )
     candidate = replace(
         production,
@@ -239,13 +238,16 @@ def test_injected_linear_execution_plan_matches_reference(apply_swiglu: bool) ->
         scale,
         bias,
         256,
-        apply_swiglu=apply_swiglu,
+        activation_fn="swiglu" if apply_swiglu else None,
         execution_plan=candidate,
     )
-    expected = (
-        convrot_int8_swiglu_linear(activation, qdata, scale, 256, bias)
-        if apply_swiglu
-        else convrot_int8_linear(activation, qdata, scale, 256, bias)
+    expected = convrot_int8_linear(
+        activation,
+        qdata,
+        scale,
+        256,
+        bias,
+        activation_fn="swiglu" if apply_swiglu else None,
     )
 
     assert torch.equal(actual, expected)
@@ -393,14 +395,14 @@ def test_fused_up_gate_swiglu_linear_matches_materialized_path(
 
 
 @pytest.mark.parametrize(
-    ("operator_name", "input_factor", "with_bias"),
+    ("activation_fn", "input_factor", "with_bias"),
     [
-        ("convrot_int8_linear", 1, False),
-        ("convrot_int8_swiglu_linear", 2, True),
+        (None, 1, False),
+        ("swiglu", 2, True),
     ],
 )
 def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile(
-    operator_name: str,
+    activation_fn: str | None,
     input_factor: int,
     with_bias: bool,
 ) -> None:
@@ -414,7 +416,6 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
     qdata = torch.empty(out_features, in_features, dtype=torch.int8, device="meta")
     scale = torch.empty(out_features, 1, dtype=torch.float32, device="meta")
     bias = torch.empty(out_features, dtype=torch.bfloat16, device="meta") if with_bias else None
-    operator = getattr(triton_backend, operator_name)
 
     def call(
         value: torch.Tensor,
@@ -422,7 +423,14 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
         weight_scale: torch.Tensor,
         linear_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        return operator(value, packed, weight_scale, linear_bias, 256)
+        return triton_backend.convrot_int8_linear(
+            value,
+            packed,
+            weight_scale,
+            linear_bias,
+            256,
+            activation_fn,
+        )
 
     actual = torch.compile(call, backend="eager", fullgraph=True)(
         activation,
@@ -440,14 +448,14 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize(
-    ("operator_name", "rows", "in_features", "group_size", "input_factor"),
+    ("activation_fn", "rows", "in_features", "group_size", "input_factor"),
     [
-        ("convrot_int8_linear", 17, 64, 64, 1),
-        ("convrot_int8_swiglu_linear", 512, 512, 256, 2),
+        (None, 17, 64, 64, 1),
+        ("swiglu", 512, 512, 256, 2),
     ],
 )
 def test_cuda_semantic_linear_custom_ops_pass_opcheck(
-    operator_name: str,
+    activation_fn: str | None,
     rows: int,
     in_features: int,
     group_size: int,
@@ -470,9 +478,10 @@ def test_cuda_semantic_linear_custom_ops_pass_opcheck(
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
-    operator = getattr(triton_backend, operator_name)
-
-    result = torch.library.opcheck(operator, (activation, qdata, scale, bias, group_size))
+    result = torch.library.opcheck(
+        triton_backend.convrot_int8_linear,
+        (activation, qdata, scale, bias, group_size, activation_fn),
+    )
 
     assert set(result.values()) == {"SUCCESS"}
 

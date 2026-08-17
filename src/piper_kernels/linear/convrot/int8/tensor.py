@@ -153,24 +153,17 @@ def convrot_linear(
     weight: ConvRotInt8Tensor,
     bias: torch.Tensor | None = None,
     *,
-    activation_fn: Literal["swiglu"],
+    activation_fn: Literal["swiglu"] | None = None,
 ) -> torch.Tensor:
-    """Apply explicit ``[up | gate]`` SwiGLU followed by a ConvRot linear."""
-    if activation_fn != "swiglu":
-        raise ValueError(f"ConvRot activation_fn must be 'swiglu', got {activation_fn!r}")
-    if not isinstance(input, torch.Tensor):
-        raise TypeError(f"ConvRot input must be a tensor, got {type(input).__name__}")
-    if not isinstance(weight, ConvRotInt8Tensor):
-        raise TypeError(f"ConvRot weight must be ConvRotInt8Tensor, got {type(weight).__name__}")
-    if bias is not None and not isinstance(bias, torch.Tensor):
-        raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
-    return dispatch.convrot_int8_swiglu_linear(
+    """Apply an optional input activation followed by a ConvRot linear."""
+    return dispatch.convrot_int8_linear(
         input,
         weight.qdata,
         weight.scale,
         weight.dtype,
         weight.group_size,
         bias,
+        activation_fn=activation_fn,
     )
 
 

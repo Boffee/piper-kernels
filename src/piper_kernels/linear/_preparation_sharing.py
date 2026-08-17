@@ -7,16 +7,12 @@ from collections.abc import Hashable, Mapping, Sequence
 from typing import Any, Protocol
 
 import torch
-from torch._inductor.custom_graph_pass import (
-    CustomInferenceAwareGraphPass,
-    get_hash_for_files,
-)
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 
 class PreparationSharingRule[PreparedNodes](Protocol):
-    """Backend rule consumed by :class:`PreparationSharingPass`."""
+    """Backend rule consumed by :func:`share_preparation`."""
 
     @property
     def linear_target(self) -> object:
@@ -83,37 +79,22 @@ def _rewrite_rule[PreparedNodes](
     return changed
 
 
-class PreparationSharingPass(CustomInferenceAwareGraphPass):
-    """Apply one or more backend preparation-sharing rules during inference."""
-
-    def __init__(
-        self,
-        rules: Sequence[PreparationSharingRule[Any]],
-        *,
-        version: str,
-        source_files: Sequence[str],
-    ) -> None:
-        self._rules = tuple(rules)
-        self._version = version
-        self._source_files = (__file__, *source_files)
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        if not is_inference:
-            return
-        changed = False
-        for rule in self._rules:
-            changed = _rewrite_rule(graph, rule) or changed
-        if changed:
-            graph.lint()
-
-    def uuid(self) -> bytes:
-        """Invalidate Inductor caches when the engine or a backend rule changes."""
-        return get_hash_for_files(self._source_files, extra=self._version)
+def share_preparation(
+    graph: torch.fx.Graph,
+    rules: Sequence[PreparationSharingRule[Any]],
+) -> bool:
+    """Apply backend preparation-sharing rules and return whether the graph changed."""
+    changed = False
+    for rule in rules:
+        changed = _rewrite_rule(graph, rule) or changed
+    if changed:
+        graph.lint()
+    return changed
 
 
 def add_post_grad_pass(
     options: Mapping[str, object] | None,
-    compiler_pass: CustomInferenceAwareGraphPass,
+    compiler_pass: object,
 ) -> dict[str, object]:
     """Copy options and append one post-grad pass without mutating or duplicating."""
     combined = dict(options) if options is not None else {}
@@ -131,9 +112,9 @@ def add_post_grad_pass(
 
 
 __all__ = [
-    "PreparationSharingPass",
     "PreparationSharingRule",
     "add_post_grad_pass",
     "dimension_key",
+    "share_preparation",
     "tensor_metadata",
 ]

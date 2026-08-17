@@ -10,14 +10,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Quality-gated offline ConvRot INT8 forward-linear execution-plan tuning across dynamic
   preparation and GEMM schedules, with stratified large-shape output validation.
 - `convrot_compile_options` for automatically sharing input preparation and folding packed
-  `[up | gate]` SwiGLU into ConvRot linears in compiled inference graphs. The inference-only
+  `[up | gate]` SwiGLU into activated input preparation plus a prepared ConvRot linear in compiled
+  inference graphs. This lets the packed input die before output allocation. The inference-only
   post-AOT rewrites preserve operation order and use explicit graph values and operators instead
   of an identity-based runtime cache.
 
 ### Changed
 
-- The explicit activated ConvRot linear now names its function selector `activation_fn`
-  instead of `input_activation`; its storage dispatch no longer carries a redundant selector.
+- The explicit ConvRot linear now defaults to an ordinary linear and accepts
+  `activation_fn="swiglu"` for packed SwiGLU input preparation.
 - ConvRot tensors and linear operators now live under `piper_kernels.linear.convrot`, mirroring
   the `piper_kernels.attention` package hierarchy. The former `piper_kernels.convrot` import path
   and `ConvRotInt8Tensor.from_packed` compatibility factory have been removed.

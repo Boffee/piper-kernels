@@ -10,10 +10,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_linear
 from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
-from piper_kernels.linear.convrot.int8.reference import (
-    convrot_int8_linear,
-    convrot_int8_swiglu_linear,
-)
+from piper_kernels.linear.convrot.int8.reference import convrot_int8_linear
 
 from .convrot import ConvRotConfig, ConvRotInputs, ConvRotShape, make_convrot_inputs
 from .providers import BenchmarkProvider
@@ -66,7 +63,7 @@ def make_convrot_workload(
         activation,
         qdata,
         config.group_size,
-        apply_swiglu=shape.input_activation == "swiglu",
+        activation_fn=shape.input_activation,
         target=target,
     )
     return ConvRotWorkload(
@@ -83,20 +80,13 @@ def _run_convrot_reference(
 ) -> torch.Tensor:
     """Run the matching portable reference on the supplied workload inputs."""
     activation, qdata, scale, bias = inputs
-    if workload.shape.input_activation == "swiglu":
-        return convrot_int8_swiglu_linear(
-            activation,
-            qdata,
-            scale,
-            workload.config.group_size,
-            bias,
-        )
     return convrot_int8_linear(
         activation,
         qdata,
         scale,
         workload.config.group_size,
         bias,
+        activation_fn=workload.shape.input_activation,
     )
 
 
@@ -171,7 +161,7 @@ def make_planned_convrot_provider(
             scale,
             bias,
             workload.config.group_size,
-            apply_swiglu=workload.shape.input_activation == "swiglu",
+            activation_fn=workload.shape.input_activation,
             execution_plan=plan,
         )
 

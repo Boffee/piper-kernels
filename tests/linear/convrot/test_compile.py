@@ -5,10 +5,13 @@ import operator
 import pytest
 import torch
 
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_compile_options
+from piper_kernels.linear.convrot import (
+    ConvRotInt8Tensor,
+    convrot_compile_options,
+    convrot_linear,
+)
 from piper_kernels.linear.convrot._compile import (
     convrot_compile_pass,
-    share_preparation_pass,
 )
 
 
@@ -97,7 +100,7 @@ def test_pass_rewrites_only_compatible_shared_activation_groups() -> None:
     different_activation = _linear(graph, other, v_qdata, v_scale, None, 16)
     graph.output((query, consumer, key, different_group, different_activation))
 
-    share_preparation_pass(graph, is_inference=True)
+    _run_compile_pass(graph, is_inference=True)
 
     call_targets = [node.target for node in graph.nodes if node.op == "call_function"]
     prepare_target = torch.ops.piper_kernels.convrot_int8_prepare_input.default
@@ -127,9 +130,9 @@ def test_pass_keeps_singletons_and_training_graphs_unchanged() -> None:
     graph.output(result)
     original = str(graph)
 
-    share_preparation_pass(graph, is_inference=False)
+    _run_compile_pass(graph, is_inference=False)
     assert str(graph) == original
-    share_preparation_pass(graph, is_inference=True)
+    _run_compile_pass(graph, is_inference=True)
     assert str(graph) == original
 
 
@@ -145,7 +148,7 @@ def test_pass_fails_closed_without_post_aot_tensor_metadata() -> None:
     graph.output(result)
     original = str(graph)
 
-    share_preparation_pass(graph, is_inference=True)
+    _run_compile_pass(graph, is_inference=True)
 
     assert str(graph) == original
 
@@ -168,15 +171,20 @@ def test_pass_folds_exclusive_packed_swiglu(reverse_multiply: bool) -> None:
     _run_compile_pass(graph, is_inference=True)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    fused_target = torch.ops.piper_kernels.convrot_int8_swiglu_linear.default
-    assert targets.count(fused_target) == 1
+    prepare_target = torch.ops.piper_kernels.convrot_int8_prepare_input.default
+    prepared_target = torch.ops.piper_kernels.convrot_int8_linear_prepared.default
+    assert targets.count(prepare_target) == 1
+    assert targets.count(prepared_target) == 1
     assert torch.ops.piper_kernels.convrot_int8_linear.default not in targets
     assert torch.ops.aten.split.Tensor not in targets
     assert torch.ops.aten.silu.default not in targets
-    fused = next(node for node in graph.nodes if node.target == fused_target)
-    assert fused.args[0] is packed
-    assert "eager_input_vals" not in fused.meta
-    assert fused.meta["val"].shape == (2, 17, 33)
+    prepare = next(node for node in graph.nodes if node.target == prepare_target)
+    prepared = next(node for node in graph.nodes if node.target == prepared_target)
+    assert prepare.args[0] is packed
+    assert prepare.args[2] == "swiglu"
+    assert packed not in prepared.args
+    assert "eager_input_vals" not in prepared.meta
+    assert prepared.meta["val"].shape == (2, 17, 33)
     graph.lint()
 
 
@@ -271,7 +279,14 @@ def test_cuda_compile_options_fold_packed_swiglu() -> None:
     model = PackedSwiGLUProjection().eval()
     packed = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
-        expected = model(packed)
+        weight = model.projection.weight
+        assert isinstance(weight, ConvRotInt8Tensor)
+        expected = convrot_linear(
+            packed,
+            weight,
+            model.projection.bias,
+            activation_fn="swiglu",
+        )
         torch._dynamo.reset()
         actual = torch.compile(
             model,
@@ -279,7 +294,7 @@ def test_cuda_compile_options_fold_packed_swiglu() -> None:
             options=convrot_compile_options(),
         )(packed)
 
-    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.gpu

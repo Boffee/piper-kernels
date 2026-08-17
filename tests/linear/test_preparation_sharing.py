@@ -6,8 +6,8 @@ from collections.abc import Hashable
 import torch
 
 from piper_kernels.linear._preparation_sharing import (
-    PreparationSharingPass,
     add_post_grad_pass,
+    share_preparation,
 )
 
 
@@ -56,12 +56,7 @@ def test_pass_shares_groups_and_keeps_replacements_at_original_positions() -> No
     untouched = _call(graph, operator.add, singleton, 3)
     graph.output((first, middle, second, untouched))
 
-    compiler_pass = PreparationSharingPass(
-        (_ToyRule(operator.add),),
-        version="toy-v1",
-        source_files=(__file__,),
-    )
-    compiler_pass(graph, is_inference=True)
+    share_preparation(graph, (_ToyRule(operator.add),))
 
     nodes = list(graph.nodes)
     replacements = [node for node in nodes if node.target is operator.sub]
@@ -74,7 +69,7 @@ def test_pass_shares_groups_and_keeps_replacements_at_original_positions() -> No
     graph.lint()
 
 
-def test_pass_runs_every_rule_and_leaves_training_graphs_unchanged() -> None:
+def test_rewrite_runs_every_rule() -> None:
     graph = torch.fx.Graph()
     shared = graph.placeholder("shared")
     first_add = _call(graph, operator.add, shared, 1)
@@ -83,16 +78,7 @@ def test_pass_runs_every_rule_and_leaves_training_graphs_unchanged() -> None:
     second_mul = _call(graph, operator.mul, shared, 4)
     graph.output((first_add, second_add, first_mul, second_mul))
 
-    compiler_pass = PreparationSharingPass(
-        (_ToyRule(operator.add), _ToyRule(operator.mul)),
-        version="toy-v1",
-        source_files=(__file__,),
-    )
-    original = str(graph)
-    compiler_pass(graph, is_inference=False)
-    assert str(graph) == original
-
-    compiler_pass(graph, is_inference=True)
+    share_preparation(graph, (_ToyRule(operator.add), _ToyRule(operator.mul)))
 
     nodes = list(graph.nodes)
     assert sum(node.target is operator.sub for node in nodes) == 4
@@ -105,11 +91,9 @@ def test_options_compose_without_mutating_or_duplicating() -> None:
     def existing_pass(_graph: torch.fx.Graph) -> None:
         pass
 
-    compiler_pass = PreparationSharingPass(
-        (_ToyRule(operator.add),),
-        version="toy-v1",
-        source_files=(__file__,),
-    )
+    def compiler_pass(_graph: torch.fx.Graph) -> None:
+        pass
+
     original_options: dict[str, object] = {
         "max_autotune": True,
         "post_grad_custom_pre_pass": [existing_pass],

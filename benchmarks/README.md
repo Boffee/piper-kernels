@@ -255,8 +255,9 @@ production policy predicates.
 
 Compiled inference integrations can pass `convrot_compile_options()` to
 `torch.compile`. Its post-AOT graph rewrites fold an exclusive packed `[up | gate]` SwiGLU chain
-into the existing activated ConvRot operator and recognize two or more compatible ordinary
-ConvRot linears fed by the exact same FX value. The latter emits one explicit preparation node
+into activated input preparation followed by a prepared linear, so the packed input can die before
+the linear output allocation. They also recognize two or more compatible ordinary ConvRot linears
+fed by the exact same FX value. The latter emits one explicit preparation node
 and leaves every prepared GEMM at the corresponding original node position. Both are automatic
 across architectures within each compiled graph and require no attention-specific code.
 

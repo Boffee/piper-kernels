@@ -60,6 +60,9 @@ compiled_block = torch.compile(block, options=convrot_compile_options())
 # Optionally fuse a raw [up | gate] SwiGLU input with ConvRot preparation.
 mlp_output = convrot_linear(up_gate, weight, bias, activation_fn="swiglu")
 
+# The explicit API also supports an ordinary linear.
+output = convrot_linear(activation, weight, bias)
+
 # In-place low-rank update with the standard Tensor.addmm_ contract.
 weight.addmm_(lora_b, lora_a, alpha=lora_strength)
 
@@ -71,16 +74,17 @@ Use `from_quantized(..., logical_dtype=...)` to construct a weight from checkpoi
 
 For a weight with shape `[out_features, in_features]`, the SwiGLU input has shape
 `[..., 2 * in_features]` and the output has shape `[..., out_features]`.
-`convrot_linear(..., activation_fn="swiglu")` computes `up * silu(gate)` before the
-linear. Its optimized preparation fusion is selected only for measured SM120
+`convrot_linear(...)` applies an ordinary linear when `activation_fn` is omitted, matching
+`torch.nn.functional.linear`. Passing `activation_fn="swiglu"` computes `up * silu(gate)`
+before the linear. Its optimized preparation fusion is selected only for measured SM120
 configurations with group size 256. Other supported configurations materialize SwiGLU,
 then dispatch through the ordinary ConvRot linear path, which may still use an optimized
-backend. Ordinary `torch.nn.functional.linear` calls remain unchanged and do not apply an
-activation. Both single-linear entry points are inference-only and reject autograd inputs.
+backend. Both single-linear entry points are inference-only and reject autograd inputs.
 
 For compiled inference, `convrot_compile_options()` installs deterministic post-AOT Inductor
 rewrites. An exclusive `chunk(2, dim=-1)` `[up | gate]` SwiGLU chain feeding a ConvRot linear
-becomes the existing activated ConvRot operator, avoiding the materialized activated input.
+becomes an activated input-preparation node followed by a prepared linear. This avoids the
+materialized activated input and lets the packed input die before the linear output is allocated.
 Separately, two or more ordinary ConvRot linears fed by the same graph value become one explicit
 input preparation followed by independent prepared GEMMs at the original operation positions.
 Prepared tensors are ordinary graph values—there is no hidden runtime cache—and unmatched,

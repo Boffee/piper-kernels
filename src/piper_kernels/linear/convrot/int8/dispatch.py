@@ -193,12 +193,27 @@ def _run_linear(
     scale: torch.Tensor,
     group_size: int,
     bias: torch.Tensor | None,
+    activation_fn: str | None,
 ) -> torch.Tensor:
-    """Run a validated ordinary ConvRot linear through the selected backend."""
+    """Run a validated ConvRot linear through the selected backend."""
     if _supports_triton(input):
         assert triton_backend is not None
-        return triton_backend.convrot_int8_linear(input, qdata, scale, bias, group_size)
-    return reference.convrot_int8_linear(input, qdata, scale, group_size, bias)
+        return triton_backend.convrot_int8_linear(
+            input,
+            qdata,
+            scale,
+            bias,
+            group_size,
+            activation_fn,
+        )
+    return reference.convrot_int8_linear(
+        input,
+        qdata,
+        scale,
+        group_size,
+        bias,
+        activation_fn=activation_fn,
+    )
 
 
 def convrot_int8_linear(
@@ -208,6 +223,8 @@ def convrot_int8_linear(
     dtype: torch.dtype,
     group_size: int,
     bias: torch.Tensor | None = None,
+    *,
+    activation_fn: str | None = None,
 ) -> torch.Tensor:
     """Apply raw ConvRot INT8 storage to a floating-point activation.
 
@@ -216,29 +233,10 @@ def convrot_int8_linear(
     internal storage-level ABI. Consumers should call
     :func:`torch.nn.functional.linear` with a ``ConvRotInt8Tensor`` weight.
     """
-    bias = _validate_linear(
-        input,
-        qdata,
-        scale,
-        dtype,
-        group_size,
-        bias,
-        qdata.shape[1],
-    )
-    if input.device.type == "meta":
-        return input.new_empty((*input.shape[:-1], qdata.shape[0]))
-    return _run_linear(input, qdata, scale, group_size, bias)
-
-
-def convrot_int8_swiglu_linear(
-    input: torch.Tensor,  # noqa: A002
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    dtype: torch.dtype,
-    group_size: int,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    """Apply packed ``[up | gate]`` SwiGLU immediately before a ConvRot linear."""
+    if activation_fn not in (None, "swiglu"):
+        raise ValueError(
+            f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
+        )
     in_features = qdata.shape[1]
     bias = _validate_linear(
         input,
@@ -247,22 +245,8 @@ def convrot_int8_swiglu_linear(
         dtype,
         group_size,
         bias,
-        2 * in_features,
+        in_features * (2 if activation_fn == "swiglu" else 1),
     )
-
-    output_shape = (*input.shape[:-1], qdata.shape[0])
     if input.device.type == "meta":
-        return input.new_empty(output_shape)
-    if _supports_triton(input):
-        assert triton_backend is not None
-        return triton_backend.convrot_int8_swiglu_linear(
-            input,
-            qdata,
-            scale,
-            bias,
-            group_size,
-        )
-
-    up, gate = input.chunk(2, dim=-1)
-    activated = up * torch.nn.functional.silu(gate)
-    return _run_linear(activated, qdata, scale, group_size, bias)
+        return input.new_empty((*input.shape[:-1], qdata.shape[0]))
+    return _run_linear(input, qdata, scale, group_size, bias, activation_fn)

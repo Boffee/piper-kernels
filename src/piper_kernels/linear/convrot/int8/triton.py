@@ -358,6 +358,14 @@ def dtype_code(dtype: torch.dtype) -> int:
     return 0
 
 
+def _uses_swiglu(activation_fn: str | None) -> bool:
+    if activation_fn not in (None, "swiglu"):
+        raise ValueError(
+            f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
+        )
+    return activation_fn == "swiglu"
+
+
 def rotate_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     rotated: torch.Tensor,
@@ -447,11 +455,12 @@ def default_convrot_int8_execution_plan(
     weight_qdata: torch.Tensor,
     group_size: int,
     *,
-    apply_swiglu: bool = False,
+    activation_fn: str | None = None,
     target: AcceleratorTarget | None = None,
 ) -> _policy.ConvRotInt8LinearExecutionPlan:
     """Resolve production policy for execution, benchmarks, and offline tuning."""
     rows = math.prod(input.shape[:-1])
+    apply_swiglu = _uses_swiglu(activation_fn)
     target = AcceleratorTarget.from_device(input.device) if target is None else target
     return _policy.select_execution_plan(
         target,
@@ -514,6 +523,33 @@ def _prepare_input(
     return (
         input_qdata.reshape(*input.shape[:-1], in_features),
         input_scale.reshape(input.shape[:-1]),
+    )
+
+
+def _prepare_input_with_production_plan(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    group_size: int,
+    *,
+    activation_fn: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare an ordinary or packed-SwiGLU input under production policy."""
+    apply_swiglu = _uses_swiglu(activation_fn)
+    in_features = input.shape[-1] // (2 if apply_swiglu else 1)
+    plan = _policy.select_execution_plan(
+        AcceleratorTarget.from_device(input.device),
+        rows=math.prod(input.shape[:-1]),
+        out_features=0,
+        in_features=in_features,
+        group_size=group_size,
+        dtype=input.dtype,
+        swiglu=apply_swiglu,
+    )
+    return _prepare_input(
+        input,
+        in_features,
+        group_size,
+        apply_swiglu=apply_swiglu,
+        execution_plan=plan,
     )
 
 
@@ -597,12 +633,13 @@ def run_convrot_int8_linear(
     bias: torch.Tensor | None,
     group_size: int,
     *,
-    apply_swiglu: bool = False,
+    activation_fn: str | None = None,
     execution_plan: _policy.ConvRotInt8LinearExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input preparation and INT8 GEMM under one plan."""
     original_shape = input.shape
     k = weight_qdata.shape[1]
+    apply_swiglu = _uses_swiglu(activation_fn)
     expected_width = k * (2 if apply_swiglu else 1)
     if original_shape[-1] != expected_width:
         operation = "fused SwiGLU input" if apply_swiglu else "linear input"
@@ -616,7 +653,7 @@ def run_convrot_int8_linear(
             input,
             weight_qdata,
             group_size,
-            apply_swiglu=apply_swiglu,
+            activation_fn=activation_fn,
         )
     )
     input_qdata, input_scale = _prepare_input(
@@ -644,6 +681,7 @@ def convrot_int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
+    activation_fn: str | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input rotation, dynamic quantization, and INT8 GEMM."""
     return run_convrot_int8_linear(
@@ -652,6 +690,7 @@ def convrot_int8_linear(
         weight_scale,
         bias,
         group_size,
+        activation_fn=activation_fn,
     )
 
 
@@ -662,6 +701,7 @@ def _convrot_int8_linear_fake(
     _weight_scale: torch.Tensor,
     _bias: torch.Tensor | None,
     _group_size: int,
+    _activation_fn: str | None = None,
 ) -> torch.Tensor:
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
@@ -670,25 +710,13 @@ def _convrot_int8_linear_fake(
 def convrot_int8_prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
+    activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate and dynamically quantize a linear input without binding a weight."""
-    original_shape = input.shape
-    in_features = original_shape[-1]
-    rows = math.prod(original_shape[:-1])
-    plan = _policy.select_execution_plan(
-        AcceleratorTarget.from_device(input.device),
-        rows=rows,
-        out_features=0,
-        in_features=in_features,
-        group_size=group_size,
-        dtype=input.dtype,
-    )
-    return _prepare_input(
+    """Apply an optional activation, then rotate and quantize a linear input."""
+    return _prepare_input_with_production_plan(
         input,
-        in_features,
         group_size,
-        apply_swiglu=False,
-        execution_plan=plan,
+        activation_fn=activation_fn,
     )
 
 
@@ -696,9 +724,11 @@ def convrot_int8_prepare_input(
 def _convrot_int8_prepare_input_fake(
     input: torch.Tensor,  # noqa: A002
     _group_size: int,
+    activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    input_width = input.shape[-1] // (2 if _uses_swiglu(activation_fn) else 1)
     return (
-        input.new_empty(input.shape, dtype=torch.int8),
+        input.new_empty((*input.shape[:-1], input_width), dtype=torch.int8),
         input.new_empty(input.shape[:-1], dtype=torch.float32),
     )
 
@@ -750,36 +780,6 @@ def _convrot_int8_linear_prepared_fake(
         (*input_qdata.shape[:-1], weight_qdata.shape[0]),
         dtype=logical_dtype,
     )
-
-
-@torch.library.custom_op("piper_kernels::convrot_int8_swiglu_linear", mutates_args=())
-def convrot_int8_swiglu_linear(
-    input: torch.Tensor,  # noqa: A002
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-) -> torch.Tensor:
-    """Fuse ``[up | gate]`` SwiGLU with ConvRot preparation and INT8 GEMM."""
-    return run_convrot_int8_linear(
-        input,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        apply_swiglu=True,
-    )
-
-
-@convrot_int8_swiglu_linear.register_fake
-def _convrot_int8_swiglu_linear_fake(
-    input: torch.Tensor,  # noqa: A002
-    weight_qdata: torch.Tensor,
-    _weight_scale: torch.Tensor,
-    _bias: torch.Tensor | None,
-    _group_size: int,
-) -> torch.Tensor:
-    return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
 
 @torch.library.custom_op(

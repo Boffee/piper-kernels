@@ -219,7 +219,7 @@ def test_candidate_provider_injects_plan_into_complete_operator(
     assert prepared is workload.inputs
     assert output.shape == (2, 96)
     assert calls[0][1]["execution_plan"] is plan
-    assert calls[0][1]["apply_swiglu"] is False
+    assert calls[0][1]["activation_fn"] is None
 
 
 @pytest.mark.parametrize(

@@ -180,10 +180,21 @@ def convrot_int8_linear(
     weight_scale: torch.Tensor,
     group_size: int,
     bias: torch.Tensor | None = None,
+    *,
+    activation_fn: str | None = None,
 ) -> torch.Tensor:
     """Run the portable PyTorch ConvRot W8A8 linear implementation."""
+    prepared_input = input
+    if activation_fn == "swiglu":
+        in_features = weight_qdata.shape[1]
+        up, gate = torch.split(input, [in_features, in_features], dim=-1)
+        prepared_input = up * torch.nn.functional.silu(gate)
+    elif activation_fn is not None:
+        raise ValueError(
+            f"ConvRot input activation must be 'swiglu' or None, got {activation_fn!r}"
+        )
     input_qdata, input_scale = convrot_int8_prepare_input(
-        input,
+        prepared_input,
         group_size,
     )
     return convrot_int8_linear_prepared(
@@ -192,24 +203,5 @@ def convrot_int8_linear(
         weight_qdata,
         weight_scale,
         input.dtype,
-        bias,
-    )
-
-
-def convrot_int8_swiglu_linear(
-    input: torch.Tensor,  # noqa: A002
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_size: int,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Materialize raw ``[up | gate]`` SwiGLU before a portable ConvRot linear."""
-    in_features = weight_qdata.shape[1]
-    up, gate = torch.split(input, [in_features, in_features], dim=-1)
-    return convrot_int8_linear(
-        up * torch.nn.functional.silu(gate),
-        weight_qdata,
-        weight_scale,
-        group_size,
         bias,
     )
