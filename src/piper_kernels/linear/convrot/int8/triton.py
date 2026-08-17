@@ -17,18 +17,14 @@ from piper_kernels._triton.stochastic_quantization import (
 )
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import (
-    GELU_TANH_CUBIC_COEFFICIENT,
-    GELU_TANH_SCALE_COEFFICIENT,
     apply_input_activation,
     input_activation_width,
-    validate_input_activation,
 )
+from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 
 from . import _policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
-_GELU_TANH_CUBIC_COEFFICIENT = tl.constexpr(GELU_TANH_CUBIC_COEFFICIENT)
-_GELU_TANH_SCALE_COEFFICIENT = tl.constexpr(GELU_TANH_SCALE_COEFFICIENT)
 
 
 @triton.jit
@@ -123,6 +119,7 @@ def rotate_quantize_rows_kernel(
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
 ):
     """Rotate and quantize one complete row without a global-memory intermediate."""
     row = tl.program_id(0)
@@ -144,15 +141,7 @@ def rotate_quantize_rows_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        activated_gate = gate / (1.0 + tl.exp(-gate))
-        if logical_dtype_code == 1:
-            activated_gate = activated_gate.to(tl.float16).to(tl.float32)
-            values = (up * activated_gate).to(tl.float16).to(tl.float32)
-        elif logical_dtype_code == 2:
-            activated_gate = activated_gate.to(tl.bfloat16).to(tl.float32)
-            values = (up * activated_gate).to(tl.bfloat16).to(tl.float32)
-        else:
-            values = up * activated_gate
+        values = swiglu(up, gate, logical_dtype_code)
     else:
         values = tl.load(
             x_ptr + input_row_offset + offsets,
@@ -160,14 +149,7 @@ def rotate_quantize_rows_kernel(
             other=0.0,
         ).to(tl.float32)
         if activation_fn == "gelu_tanh":
-            inner = _GELU_TANH_SCALE_COEFFICIENT * (
-                values + _GELU_TANH_CUBIC_COEFFICIENT * values * values * values
-            )
-            values = 0.5 * values * (1.0 + libdevice.tanh(inner))  # pyright: ignore[reportOperatorIssue]
-            if logical_dtype_code == 1:
-                values = values.to(tl.float16).to(tl.float32)
-            elif logical_dtype_code == 2:
-                values = values.to(tl.bfloat16).to(tl.float32)
+            values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
 
     values = _rotate_hadamard_groups(values, block_size, group_size)
     values *= inverse_sqrt_group
@@ -427,6 +409,7 @@ def fused_rotate_quantize_input(
     *,
     activation_fn: str | None = None,
     num_warps: int,
+    target: AcceleratorTarget | None = None,
 ) -> None:
     """Rotate and quantize to ``input_qdata`` without a rotated intermediate.
 
@@ -445,6 +428,7 @@ def fused_rotate_quantize_input(
             f"fused preparation input must have shape {expected_input_shape}, "
             f"got {tuple(input.shape)}"
         )
+    target = AcceleratorTarget.from_device(input.device) if target is None else target
     block_size = max(128, triton.next_power_of_2(k))
     rotate_quantize_rows_kernel[(m,)](
         input,
@@ -456,30 +440,17 @@ def fused_rotate_quantize_input(
         inverse_sqrt_group=group_size**-0.5,
         logical_dtype_code=logical_dtype_code,
         activation_fn=activation_fn,
+        accelerator_backend=target.backend,
         num_warps=num_warps,
     )
 
 
 def default_execution_plan(
-    input: torch.Tensor,  # noqa: A002
     weight_qdata: torch.Tensor,
-    group_size: int,
-    *,
-    activation_fn: str | None = None,
-    target: AcceleratorTarget | None = None,
 ) -> _policy.LinearExecutionPlan:
     """Resolve production policy for execution, benchmarks, and offline tuning."""
-    rows = math.prod(input.shape[:-1])
-    validate_input_activation(activation_fn)
-    target = AcceleratorTarget.from_device(input.device) if target is None else target
     return _policy.select_execution_plan(
-        target,
-        rows=rows,
-        out_features=weight_qdata.shape[0],
         in_features=weight_qdata.shape[1],
-        group_size=group_size,
-        dtype=input.dtype,
-        activation_fn=activation_fn,
     )
 
 
@@ -490,6 +461,7 @@ def _prepare_input(
     *,
     activation_fn: str | None,
     execution_plan: _policy.LinearExecutionPlan,
+    target: AcceleratorTarget,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate and dynamically quantize a linear input for one or more weights."""
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
@@ -510,6 +482,7 @@ def _prepare_input(
             logical_dtype_code,
             activation_fn=activation_fn,
             num_warps=execution_plan.fused_num_warps,
+            target=target,
         )
     else:
         transformed_input = apply_input_activation(input_2d, activation_fn)
@@ -541,14 +514,9 @@ def _prepare_input_with_production_plan(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prepare an ordinary or activated input under production policy."""
     in_features = input.shape[-1] // input_activation_width(activation_fn)
+    target = AcceleratorTarget.from_device(input.device)
     plan = _policy.select_execution_plan(
-        AcceleratorTarget.from_device(input.device),
-        rows=math.prod(input.shape[:-1]),
-        out_features=0,
         in_features=in_features,
-        group_size=group_size,
-        dtype=input.dtype,
-        activation_fn=activation_fn,
     )
     return _prepare_input(
         input,
@@ -556,6 +524,7 @@ def _prepare_input_with_production_plan(
         group_size,
         activation_fn=activation_fn,
         execution_plan=plan,
+        target=target,
     )
 
 
@@ -651,22 +620,15 @@ def run_linear(
         raise ValueError(
             f"{operation} has {original_shape[-1]} features, expected {expected_width}"
         )
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else default_execution_plan(
-            input,
-            weight_qdata,
-            group_size,
-            activation_fn=activation_fn,
-        )
-    )
+    target = AcceleratorTarget.from_device(input.device)
+    plan = execution_plan if execution_plan is not None else default_execution_plan(weight_qdata)
     input_qdata, input_scale = _prepare_input(
         input,
         k,
         group_size,
         activation_fn=activation_fn,
         execution_plan=plan,
+        target=target,
     )
     return _execute_prepared_linear(
         input_qdata,
@@ -745,20 +707,11 @@ def linear_prepared(
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    group_size: int,
     logical_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
-    leading_shape = input_qdata.shape[:-1]
-    out_features, in_features = weight_qdata.shape
-    rows = math.prod(leading_shape)
     plan = _policy.select_execution_plan(
-        AcceleratorTarget.from_device(input_qdata.device),
-        rows=rows,
-        out_features=out_features,
-        in_features=in_features,
-        group_size=group_size,
-        dtype=logical_dtype,
+        in_features=weight_qdata.shape[1],
     )
     return _execute_prepared_linear(
         input_qdata,
@@ -778,7 +731,6 @@ def _linear_prepared_fake(
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
     _bias: torch.Tensor | None,
-    _group_size: int,
     logical_dtype: torch.dtype,
 ) -> torch.Tensor:
     return input_qdata.new_empty(

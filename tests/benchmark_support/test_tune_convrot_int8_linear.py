@@ -12,21 +12,13 @@ from tune_convrot_int8_linear import (
     _validate_args,
 )
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 from piper_kernels.linear.convrot.int8._policy import select_execution_plan
 
-_SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 
-
-def _production_plan(*, rows: int = 512):
+def _production_plan():
     return select_execution_plan(
-        _SM120,
-        rows=rows,
-        out_features=4096,
         in_features=4096,
-        group_size=256,
-        dtype=torch.bfloat16,
     )
 
 
@@ -35,7 +27,6 @@ def _workload(*, rows: int = 2, out_features: int = 96, in_features: int = 512):
         ConvRotShape("custom", rows, out_features, in_features),
         ConvRotConfig(torch.bfloat16, 256, 0),
         device=torch.device("cpu"),
-        target=_SM120,
     )
 
 

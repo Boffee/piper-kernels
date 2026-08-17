@@ -277,7 +277,6 @@ def _main(argv: Sequence[str] | None = None) -> None:
         shape,
         config,
         device=device,
-        target=target,
     )
     candidates = tuple(
         _make_candidate(plan, workload) for plan in _candidate_plans(args, workload.production_plan)

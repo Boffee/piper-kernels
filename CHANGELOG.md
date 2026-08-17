@@ -19,7 +19,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - The explicit `convrot_int8_linear` now defaults to an ordinary linear and accepts
   `activation_fn="gelu_tanh"` or `"swiglu"` for activation-aware input preparation. Portable
-  activation semantics are shared independently of the optimized ConvRot backend.
+  activation semantics and optimized Triton activation primitives are shared independently of
+  the ConvRot backend. The NVIDIA GELU path uses native approximate tanh. Optimized Triton targets
+  select fused preparation across every supported ConvRot group size, logical dtype, and row count
+  while retaining the 16,384 power-of-two preparation-extent cap; this is measured on exact SM120
+  and selected optimistically elsewhere.
 - ConvRot tensors and linear operators now live under `piper_kernels.linear.convrot`, mirroring
   the `piper_kernels.attention` package hierarchy. The former `piper_kernels.convrot` import path
   and `ConvRotInt8Tensor.from_packed` compatibility factory have been removed.
@@ -29,11 +33,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   Its benchmark accepts Cartesian M/N/K axes, and its benchmark and tuner defaults now start from
   the lower-width anchor instead of power-of-two toy dimensions. `M=131073` is reserved for final
   long, ragged, and 64-bit-indexing validation.
-- Exact SM120 ConvRot INT8 linears use one broadly selected large-M GEMM schedule with
+- ConvRot INT8 linears use one target- and shape-independent GEMM schedule with
   `128x256x128` tiles, eight warps, fixed `GROUP_M=16` launch ordering, and separate full-M and
   ragged-M-tail launches. Across the full BF16 `M=8K/32K`, `N=4K/16K`, `K=6144/14336` matrix,
-  this delivered a 2.20-5.56x complete-operator speedup over the former generic schedule without
-  a quality change; both `M=131073` expansion and contraction guards pass the same quality checks.
+  this delivered a 2.20-5.56x complete-operator speedup on exact SM120 over the former generic
+  schedule without a quality change and is selected optimistically on other targets; both
+  `M=131073` expansion and contraction guards pass the same quality checks.
 - SM120 Piper causal attention now traverses its mask-free prefix separately from the masked
   diagonal boundary and launches query blocks in reverse order. D128 uniformly uses split PV,
   with two FP32 accumulators for causal and non-causal attention at every sequence length. The

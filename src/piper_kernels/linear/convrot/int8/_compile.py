@@ -55,7 +55,6 @@ def _emit_linear_prepared(
     weight_qdata: torch.fx.Node,
     weight_scale: torch.fx.Node,
     bias: torch.fx.Node | None,
-    group_size: int,
 ) -> torch.fx.Node:
     input_qdata, input_scale, logical_dtype = prepared
     return graph.call_function(
@@ -66,7 +65,6 @@ def _emit_linear_prepared(
             weight_qdata,
             weight_scale,
             bias,
-            group_size,
             logical_dtype,
         ),
     )
@@ -136,19 +134,16 @@ class _PreparationRule:
         prepared: _PreparedInputNodes,
     ) -> torch.fx.Node:
         arguments = (*node.args, None) if len(node.args) == 5 else node.args
-        _input, weight_qdata, weight_scale, bias, group_size, _activation_fn = arguments
+        _input, weight_qdata, weight_scale, bias, _group_size, _activation_fn = arguments
         assert isinstance(weight_qdata, torch.fx.Node)
         assert isinstance(weight_scale, torch.fx.Node)
         assert bias is None or isinstance(bias, torch.fx.Node)
-        assert isinstance(group_size, int)
-        assert not isinstance(group_size, bool)
         return _emit_linear_prepared(
             graph,
             prepared,
             weight_qdata,
             weight_scale,
             bias,
-            group_size,
         )
 
 
@@ -282,7 +277,6 @@ def _replace_input_activation_and_linear(
             weight_qdata,
             weight_scale,
             bias,
-            group_size,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)

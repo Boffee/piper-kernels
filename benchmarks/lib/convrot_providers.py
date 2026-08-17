@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _policy as convrot_policy
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
@@ -54,18 +53,11 @@ def make_convrot_workload(
     config: ConvRotConfig,
     *,
     device: torch.device,
-    target: AcceleratorTarget | None = None,
 ) -> ConvRotWorkload:
     """Create shared tensors and resolve the production execution plan."""
     inputs = make_convrot_inputs(shape, config, device=device)
-    activation, qdata, _scale, _bias = inputs
-    production_plan = convrot_backend.default_execution_plan(
-        activation,
-        qdata,
-        config.group_size,
-        activation_fn=shape.input_activation,
-        target=target,
-    )
+    qdata = inputs[1]
+    production_plan = convrot_backend.default_execution_plan(qdata)
     return ConvRotWorkload(
         shape=shape,
         config=config,

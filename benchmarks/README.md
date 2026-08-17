@@ -271,11 +271,11 @@ Validate the selected plan at `M=131073` on `(N, K)=(16384, 6144)` for expansion
 indexing, and `(N, K)=(4096, 14336)` for contraction. Expand to the full N/K matrix only if those
 results are unexpected.
 
-The selected exact-SM120 production schedule uses `128x256x128` GEMM tiles, eight warps, three
-stages, and fixed `GROUP_M=16` ordering (groups of up to 16 M tiles) for every `M>=512`;
-smaller-row workloads and other accelerators retain the generic schedule. This reuses the
-existing broad large-row policy boundary; 512 is neither a measured exact crossover nor tied to a
-model or benchmark anchor. The execution-plan selector has no N- or K-specific schedule branches.
+The production schedule uses `128x256x128` GEMM tiles, eight warps, three stages, and fixed
+`GROUP_M=16` ordering (groups of up to 16 M tiles) for every target and shape. On exact SM120 at
+the H3 AdaLN guard `M=1, N=96768, K=2688`, this schedule measured 0.219 ms versus 0.526 ms for the
+former generic plan. The execution plan therefore has no target-, M-, N-, or K-specific GEMM
+schedule branch.
 Complete M tiles use a separate launch, which elides all tile masks when N and K are also aligned;
 one masked launch handles a final partial M tile. M, N, K, and the tail offset remain runtime
 values, so arbitrary row counts do not create exact-length JIT specializations.
@@ -310,8 +310,8 @@ uv run python benchmarks/tune_convrot_int8_linear.py \
 
 Omitted axes retain the production values, explicit numeric axes form a deduplicated Cartesian
 search, and `--max-candidates` limits compilation. Fused preparation is a candidate choice rather
-than a claim of production eligibility, allowing development measurements outside the currently
-selected exact-SM120 region. Forced split candidates can independently search
+than a claim of production eligibility, allowing development measurements outside the selected
+power-of-two preparation extent. Forced split candidates can independently search
 `--rotation-num-warps` and `--quantization-num-warps`; forced fused candidates search
 `--fused-num-warps`. The first tuner intentionally excludes the mutating ConvRot `addmm_` path,
 which requires a separate workload and quality protocol.

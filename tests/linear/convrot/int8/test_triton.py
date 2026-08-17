@@ -6,7 +6,6 @@ import pytest
 import torch
 from torch import nn
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import triton as triton_backend
@@ -208,14 +207,11 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
-    if dtype is torch.float32:
-        assert qdata_error.max().item() <= 1
-    else:
-        assert qdata_error.max().item() == 0
+    assert qdata_error.max().item() <= 1
     torch.testing.assert_close(
         actual_scale,
         expected_scale,
-        rtol=2 * torch.finfo(dtype).eps,
+        rtol=max(2 * torch.finfo(dtype).eps, 2e-6),
         atol=0,
     )
 
@@ -232,16 +228,10 @@ def testdtype_code(dtype: torch.dtype, expected: int) -> None:
     assert triton_backend.dtype_code(dtype) == expected
 
 
-def test_default_linear_execution_plan_supports_meta_with_resolved_target() -> None:
-    activation = torch.empty((512, 512), dtype=torch.bfloat16, device="meta")
+def test_default_linear_execution_plan_supports_meta_weight() -> None:
     qdata = torch.empty((96, 512), dtype=torch.int8, device="meta")
 
-    plan = triton_backend.default_execution_plan(
-        activation,
-        qdata,
-        256,
-        target=AcceleratorTarget(backend="cuda", architecture="sm120"),
-    )
+    plan = triton_backend.default_execution_plan(qdata)
 
     assert plan.fuse_rotation_quantization
     assert plan.matmul_block_m == 128
@@ -270,12 +260,7 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
-    production = triton_backend.default_execution_plan(
-        activation,
-        qdata,
-        256,
-        activation_fn=activation_fn,
-    )
+    production = triton_backend.default_execution_plan(qdata)
     candidate = replace(
         production,
         fuse_rotation_quantization=False,
@@ -354,11 +339,7 @@ def test_sm120_large_matmul_matches_reference(
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=dtype, device="cuda") if with_bias else None
 
-    plan = triton_backend.default_execution_plan(
-        activation,
-        qdata,
-        group_size,
-    )
+    plan = triton_backend.default_execution_plan(qdata)
     assert (
         plan.matmul_block_m,
         plan.matmul_block_n,
