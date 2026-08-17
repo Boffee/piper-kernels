@@ -43,7 +43,6 @@ def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> N
             SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=False,
-                fuse_query_quantization=False,
                 use_tensor_descriptors=False,
                 loop_num_stages=3,
                 loop_licm=True,
@@ -54,7 +53,6 @@ def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> N
             SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=True,
-                fuse_query_quantization=False,
                 use_tensor_descriptors=True,
                 use_packed_probability_conversion=False,
             ),
@@ -64,7 +62,6 @@ def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> N
             SageAttention2ppExecutionPlan(
                 block_m=128,
                 grouped_qk=True,
-                fuse_query_quantization=False,
                 use_tensor_descriptors=False,
             ),
         ),
@@ -152,30 +149,6 @@ def test_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> None:
 
 
 @pytest.mark.parametrize(
-    ("head_dim", "is_causal"),
-    [
-        (64, False),
-        (64, True),
-        (128, False),
-        (128, True),
-    ],
-)
-def test_sm120_uses_standalone_query_quantization(
-    head_dim: int,
-    is_causal: bool,
-) -> None:
-    plan = select_execution_plan(
-        _SM120,
-        candidate_block_m=64,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
-
-    assert plan.grouped_qk
-    assert not plan.fuse_query_quantization
-
-
-@pytest.mark.parametrize(
     ("target", "head_dim", "is_causal", "expected"),
     [
         (_SM89, 128, True, True),
@@ -212,7 +185,6 @@ def test_other_sm12x_targets_do_not_inherit_sm120_specializations(
     )
 
     assert plan.grouped_qk
-    assert not plan.fuse_query_quantization
     assert not plan.use_tensor_descriptors
 
 
@@ -259,7 +231,6 @@ def test_execution_plan_rejects_reverse_order_for_noncausal_invocation() -> None
         {"num_warps": 1},
         {"num_stages": 5},
         {"loop_num_stages": 5},
-        {"grouped_qk": False, "fuse_query_quantization": True},
     ],
 )
 def test_execution_plan_rejects_inconsistent_specializations(

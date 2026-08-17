@@ -145,7 +145,6 @@ def test_sm120_causal_d128_provider_quantizes_query_separately_at_all_lengths(
     assert "quantize-query-per-warp" in jit_functions
     assert "quantize-key-per-block" in jit_functions
     assert "quantize-value-per-channel" in jit_functions
-    assert provider.configuration["fuse_query_quantization"] is False
 
 
 def test_other_sm12x_sage_attention_2pp_provider_uses_grouped_quantization() -> None:

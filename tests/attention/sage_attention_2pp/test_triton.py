@@ -134,13 +134,12 @@ def test_triton_matches_quantized_reference(
     reason="raw-score reduction before scaling is tuned for SM120",
 )
 @pytest.mark.parametrize(
-    ("head_dim", "is_causal", "fuse_query"),
-    [(64, False, False), (64, True, False), (128, False, False), (128, True, False)],
+    ("head_dim", "is_causal"),
+    [(64, False), (64, True), (128, False), (128, True)],
 )
 def test_intrinsic_grouped_raw_score_reduction_matches_quantized_reference(
     head_dim: int,
     is_causal: bool,
-    fuse_query: bool,
 ) -> None:
     plan = sage_attention_2pp_policy.select_execution_plan(
         AcceleratorTarget(backend="cuda", architecture="sm120"),
@@ -149,7 +148,6 @@ def test_intrinsic_grouped_raw_score_reduction_matches_quantized_reference(
         is_causal=is_causal,
     )
     assert plan.grouped_qk
-    assert plan.fuse_query_quantization is fuse_query
     torch.manual_seed(432)
     query = torch.randn(1, 2, 193, head_dim, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
@@ -232,7 +230,6 @@ def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
         block_m=64,
         num_stages=2,
         use_tensor_descriptors=False,
-        fuse_query_quantization=False,
         loop_num_stages=3,
         loop_licm=True,
     )

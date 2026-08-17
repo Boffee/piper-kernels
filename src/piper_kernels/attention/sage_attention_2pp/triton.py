@@ -26,13 +26,11 @@ from . import _policy
 # Triton 3.7 requires globals referenced inside JIT functions to be constexpr.
 _BLOCK_N = tl.constexpr(64)
 _QUERY_GROUP_SIZE = tl.constexpr(32)
-_INT8_MAX = tl.constexpr(127.0)
 # Canonical SageAttention2++ shifts the online-softmax frame by log2(448), so
 # probabilities are born in FP8's usable range instead of scaled afterward.
 _P_FP8_LOG2_MAX = tl.constexpr(8.807354922057604)
 _V_FP8_MAX = tl.constexpr(2.25)
 _SCALE_EPSILON = tl.constexpr(1e-7)
-_LOG2_E = tl.constexpr(1.4426950408889634)
 
 
 @triton.jit
@@ -271,29 +269,6 @@ def _load_attention_value_tile(
 
 
 @triton.jit
-def _quantize_query_tile(
-    query,
-    softmax_scale,
-    block_m: tl.constexpr,
-    head_dim: tl.constexpr,
-):
-    """Quantize the query rows owned exclusively by this attention CTA."""
-    tl.static_assert(
-        block_m % _QUERY_GROUP_SIZE == 0,
-        "fused Q quantization requires complete query groups",
-    )
-    groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
-    grouped_query = query.to(tl.float32).reshape((groups, _QUERY_GROUP_SIZE, head_dim))
-    maximum = tl.max(tl.max(tl.abs(grouped_query), axis=2), axis=1)
-    quantization_scale = maximum / _INT8_MAX + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(
-        grouped_query / quantization_scale[:, None, None]
-    ).reshape((block_m, head_dim))
-    score_scale = quantization_scale * (softmax_scale * _LOG2_E)
-    return quantized, score_scale
-
-
-@triton.jit
 def _causal_attention_tile(
     query,
     query_scale,
@@ -313,7 +288,6 @@ def _causal_attention_tile(
     key_length,
     diagonal_or_tail: tl.constexpr,
     grouped_qk: tl.constexpr,
-    fuse_query_quantization: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -343,10 +317,7 @@ def _causal_attention_tile(
             + start_n // block_n
         )
         raw_scores = integer_scores.to(tl.float32).reshape((groups, _QUERY_GROUP_SIZE, block_n))
-        if fuse_query_quantization:
-            score_scale = (query_scale * key_scale)[:, None]
-        else:
-            score_scale = (query_scale * key_scale).reshape((groups, _QUERY_GROUP_SIZE))
+        score_scale = (query_scale * key_scale).reshape((groups, _QUERY_GROUP_SIZE))
         scores = (raw_scores * score_scale[:, :, None]).reshape((block_m, block_n))
     else:
         key_scale = tl.load(
@@ -423,13 +394,11 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
     output_ptr,
     query_length,
     key_length,
-    softmax_scale,
     stride_qb,
     stride_qh,
     stride_qn,
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
-    fuse_query_quantization: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     reverse_causal_blocks: tl.constexpr,
     loop_num_stages: tl.constexpr,
@@ -440,10 +409,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
-    tl.static_assert(
-        not fuse_query_quantization or grouped_qk,
-        "fused Q quantization requires grouped Q/K scales",
-    )
     tl.static_assert(block_n == _BLOCK_N, "SageAttention2++ requires 64-key tiles")
     query_block = tl.program_id(0)
     if is_causal and reverse_causal_blocks:
@@ -465,15 +430,8 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
     )
     if grouped_qk:
         groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
-    if fuse_query_quantization:
-        query, query_scale = _quantize_query_tile(  # pyright: ignore[reportGeneralTypeIssues]
-            query_values,
-            softmax_scale,
-            block_m,
-            head_dim,
-        )
-    elif grouped_qk:
-        query = query_values
+    query = query_values
+    if grouped_qk:
         query_scale = tl.load(
             query_scale_ptr
             + (batch * heads + head) * tl.cdiv(query_length, _QUERY_GROUP_SIZE)
@@ -482,7 +440,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
             other=0.0,
         )
     else:
-        query = query_values
         query_scale = tl.load(
             query_scale_ptr + (batch * heads + head) * query_length + offsets_m,
             mask=offsets_m < query_length,
@@ -528,7 +485,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 key_length,
                 diagonal_or_tail=False,
                 grouped_qk=grouped_qk,
-                fuse_query_quantization=fuse_query_quantization,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 heads=heads,
                 head_dim=head_dim,
@@ -562,7 +518,6 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 key_length,
                 diagonal_or_tail=True,
                 grouped_qk=grouped_qk,
-                fuse_query_quantization=fuse_query_quantization,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 heads=heads,
                 head_dim=head_dim,
@@ -601,10 +556,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 raw_scores = integer_scores.to(tl.float32).reshape(
                     (groups, _QUERY_GROUP_SIZE, block_n)
                 )
-                if fuse_query_quantization:
-                    score_scale = (query_scale * key_scale)[:, None]
-                else:
-                    score_scale = (query_scale * key_scale).reshape((groups, _QUERY_GROUP_SIZE))
+                score_scale = (query_scale * key_scale).reshape((groups, _QUERY_GROUP_SIZE))
             else:
                 key_scale = tl.load(
                     key_scale_ptr + (batch * heads + head) * key_length + current_n,
@@ -731,7 +683,6 @@ class _PreparedSageAttention2pp:
     key_scale: torch.Tensor
     value_scale: torch.Tensor
     output: torch.Tensor
-    softmax_scale: float
     key_length: int
     is_causal: bool
     plan: _policy.SageAttention2ppExecutionPlan
@@ -827,23 +778,6 @@ def _quantize_key_value(
     return key_int8, value_fp8, key_scale
 
 
-def _prepare_query(
-    query: torch.Tensor,
-    value_scale: torch.Tensor,
-    softmax_scale: float,
-    plan: _policy.SageAttention2ppExecutionPlan,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return Q and its scale argument for the selected attention specialization."""
-    if plan.fuse_query_quantization:
-        # The placeholder scale argument is compiled away in this specialization.
-        return query, value_scale
-    return qk_quantization.prepare_query(
-        query,
-        softmax_scale,
-        grouped=plan.grouped_qk,
-    )
-
-
 def _prepare_sage_attention_2pp(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -866,7 +800,11 @@ def _prepare_sage_attention_2pp(
         else key_length
     )
     key_mean, value_scale = _compute_kv_statistics(key, value)
-    query_argument, query_scale = _prepare_query(query, value_scale, scale, plan)
+    query_int8, query_scale = qk_quantization.prepare_query(
+        query,
+        scale,
+        grouped=plan.grouped_qk,
+    )
     key_int8, value_fp8, key_scale = _quantize_key_value(
         key,
         value,
@@ -884,14 +822,13 @@ def _prepare_sage_attention_2pp(
             value_fp8,
         )
     return _PreparedSageAttention2pp(
-        query=query_argument,
+        query=query_int8,
         key=key_argument,
         value=value_argument,
         query_scale=query_scale,
         key_scale=key_scale,
         value_scale=value_scale,
         output=output,
-        softmax_scale=scale,
         key_length=key_length,
         is_causal=is_causal,
         plan=plan,
@@ -912,13 +849,11 @@ def _launch_sage_attention_2pp(prepared: _PreparedSageAttention2pp) -> torch.Ten
         prepared.output,
         query_length,
         prepared.key_length,
-        prepared.softmax_scale,
         prepared.query.stride(0),
         prepared.query.stride(1),
         prepared.query.stride(2),
         is_causal=prepared.is_causal,
         grouped_qk=plan.grouped_qk,
-        fuse_query_quantization=plan.fuse_query_quantization,
         use_packed_probability_conversion=plan.use_packed_probability_conversion,
         reverse_causal_blocks=plan.reverse_causal_blocks,
         loop_num_stages=plan.loop_num_stages,

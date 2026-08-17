@@ -17,7 +17,6 @@ class SageAttention2ppExecutionPlan:
 
     block_m: int
     grouped_qk: bool
-    fuse_query_quantization: bool
     use_tensor_descriptors: bool
     use_packed_probability_conversion: bool = True
     num_warps: int = 4
@@ -35,8 +34,6 @@ class SageAttention2ppExecutionPlan:
             raise ValueError("SageAttention2++ num_stages must be 1, 2, 3, or 4")
         if self.loop_num_stages not in LOOP_NUM_STAGES_VALUES:
             raise ValueError("SageAttention2++ loop_num_stages must be None, 1, 2, 3, or 4")
-        if self.fuse_query_quantization and not self.grouped_qk:
-            raise ValueError("fused Q quantization requires grouped Q/K scales")
 
     def as_dict(self) -> dict[str, object]:
         """Return the execution-plan fields as plain metadata."""
@@ -53,7 +50,6 @@ def _generic_execution_plan(
     return SageAttention2ppExecutionPlan(
         block_m=min(candidate_block_m, 64) if is_causal else candidate_block_m,
         grouped_qk=target.is_cuda_capability(12),
-        fuse_query_quantization=False,
         use_tensor_descriptors=False,
     )
 
@@ -92,7 +88,6 @@ def _apply_sm120_policy(
     return replace(
         plan,
         block_m=128,
-        fuse_query_quantization=False,
         use_tensor_descriptors=use_tensor_descriptors,
         use_packed_probability_conversion=False,
     )

@@ -31,7 +31,6 @@ def test_omitted_axes_measure_only_the_production_plan() -> None:
     assert choice.num_warps == 4
     assert choice.num_stages == 3
     assert choice.use_tensor_descriptors
-    assert not choice.fuse_query_quantization
     assert not choice.use_packed_probability_conversion
 
 
@@ -62,7 +61,6 @@ def test_boolean_axes_use_execution_plan_field_names_directly() -> None:
     arguments = _parse_args(
         [
             "--no-use-tensor-descriptors",
-            "--no-fuse-query-quantization",
             "--no-reverse-causal-blocks",
             "--no-loop-licm",
             "--no-use-packed-probability-conversion",
@@ -72,7 +70,6 @@ def test_boolean_axes_use_execution_plan_field_names_directly() -> None:
     choice = _candidate_choices(arguments, _production_plan())[0]
 
     assert not choice.use_tensor_descriptors
-    assert not choice.fuse_query_quantization
     assert not choice.reverse_causal_blocks
     assert not choice.loop_licm
     assert not choice.use_packed_probability_conversion

@@ -171,18 +171,14 @@ def _sage_attention_2pp_jit_functions(
         else ("quantize-key-per-thread", qk_backend.quantize_key_per_thread_kernel)
     )
     quantization_kernels: dict[str, object] = {
-        key_name: key_kernel,
-        "quantize-value-per-channel": sage_attention_2pp_backend._quantize_value_kernel,
-    }
-    if not plan.fuse_query_quantization:
-        query_kernel = (
+        "quantize-query-per-warp" if plan.grouped_qk else "quantize-query-per-thread": (
             qk_backend.quantize_query_per_warp_kernel
             if plan.grouped_qk
             else qk_backend.quantize_query_per_thread_kernel
-        )
-        quantization_kernels[
-            "quantize-query-per-warp" if plan.grouped_qk else "quantize-query-per-thread"
-        ] = query_kernel
+        ),
+        key_name: key_kernel,
+        "quantize-value-per-channel": sage_attention_2pp_backend._quantize_value_kernel,
+    }
     return {
         "kv-statistics-partial": sage_attention_2pp_backend._kv_statistics_partial_kernel,
         "kv-statistics-finish": sage_attention_2pp_backend._finish_kv_statistics_kernel,

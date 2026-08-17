@@ -14,7 +14,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   to 33.01 dB global SQNR and from 28.18 to 29.04 dB on the worst head. SM120 D128 uses the
   standalone query quantizer so the transform does not inflate the already register-heavy
   attention recurrence; at the 8K anchor this added 1.8% complete-operator latency and was
-  neutral within measurement noise at 32K and 128K.
+  neutral within measurement noise at 32K and 128K. The obsolete fused-query recurrence and
+  tuning axis have been removed.
 
 ## [0.3.0rc1] - 2026-08-17
 
