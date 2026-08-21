@@ -171,7 +171,7 @@ def _load_value_tile(
 
 
 @triton.jit
-def _attention_tile(  # noqa: PLR0915
+def _attention_tile(  # noqa: PLR0912, PLR0915
     query,
     query_scale,
     key_ptr,
@@ -233,12 +233,17 @@ def _attention_tile(  # noqa: PLR0915
         scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
 
     if mask_keys:
-        valid_keys = current_n[None, :] < key_length
         if is_causal:
+            valid_keys = current_n[None, :] < key_length
             valid_keys &= current_n[None, :] <= offsets_m[:, None]
-        scores = tl.where(valid_queries[:, None] & valid_keys, scores, -float("inf"))
-    else:
+        else:
+            valid_keys = current_n < key_length
+    elif is_causal:
         valid_keys = tl.full((block_m, block_n), True, dtype=tl.int1)
+    else:
+        valid_keys = tl.full((block_n,), True, dtype=tl.int1)
+    if mask_keys and is_causal:
+        scores = tl.where(valid_queries[:, None] & valid_keys, scores, -float("inf"))
 
     if derive_value_log_bound:
         value_scale_multiplier = tl.load(
@@ -253,6 +258,11 @@ def _attention_tile(  # noqa: PLR0915
             mask=current_n < key_length,
             other=0.0,
         )
+    if mask_keys and not is_causal:
+        # The loop's final tile always contains at least one real key. Exclude
+        # only its padded columns from the shifted maximum and probability sum;
+        # masking the full MxN score tile on every iteration is unnecessary.
+        value_log_scale = tl.where(valid_keys, value_log_scale, -float("inf"))
     shifted_scores = scores + value_log_scale[None, :]
     block_max = tl.max(shifted_scores, axis=1)
     next_max = tl.maximum(running_max, block_max)
@@ -810,9 +820,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             grouped_qk=plan.grouped_qk,
             split_pv_head_dim=plan.split_pv_head_dim,
             unmasked_query_tiles=unmasked_queries,
-            unmasked_key_tiles=(
-                unmasked_queries and not prepared.is_causal and prepared.key_length % _BLOCK_N == 0
-            ),
+            unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
             heads=heads,
             head_dim=head_dim,
             block_m=plan.block_m,

@@ -189,14 +189,59 @@ def test_triton_matches_quantized_reference(
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_aligned_rectangular_key_tiles_do_not_require_square_attention(head_dim: int) -> None:
-    torch.manual_seed(75 + head_dim)
-    query = torch.randn(1, 2, 128, head_dim, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("query_length", [128, 129])
+def test_aligned_rectangular_key_tiles_do_not_require_square_attention(
+    head_dim: int,
+    query_length: int,
+) -> None:
+    torch.manual_seed(75 + head_dim + query_length)
+    query = torch.randn(1, 2, query_length, head_dim, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(1, 2, 64, head_dim, device="cuda", dtype=torch.bfloat16)
     value = torch.randn_like(key)
 
     with torch.no_grad():
         actual = piper_attention(query, key, value)
+        expected = reference_piper_attention(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            False,
+            qk_quantization=_qk_quantization(),
+        )
+    error = (actual.float() - expected.float()).abs()
+
+    assert torch.isfinite(actual).all()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
+
+
+@pytest.mark.parametrize("key_length", [1, 63, 65, 127, 129, 193])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("derive_value_log_bound", [False, True])
+def test_noncausal_ragged_key_tail_matches_quantized_reference(
+    key_length: int,
+    head_dim: int,
+    derive_value_log_bound: bool,
+) -> None:
+    torch.manual_seed(81 + key_length + head_dim)
+    query = torch.randn(1, 1, 129, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 1, key_length, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    plan = replace(
+        _default_piper_attention_execution_plan(query, False),
+        derive_value_log_bound=derive_value_log_bound,
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            False,
+            execution_plan=plan,
+        )
         expected = reference_piper_attention(
             query,
             key,
