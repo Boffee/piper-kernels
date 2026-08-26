@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added the standalone `sparse_piper_attention` MVP for pre-tiled BF16 `[B,S,H,128]` self-attention
+  on exact SM120. It combines exact FP32 DSA, packed UINT16 per-head routes, logical Q64/K64
+  sparsity, physical M64/K128 execution, tile-scaled INT8 V, a pre-rounding FP32 denominator, and
+  an optional always-dense K/V suffix in one softmax. A reusable plan accepts arbitrary runtime
+  per-head budgets, and compact final-tile padding is excluded from routing, quantization, and
+  valid outputs. Budget calibration, spatial packing, and model policy remain outside Kernels.
+
 ## [0.3.0] - 2026-08-17
 
 ### Changed

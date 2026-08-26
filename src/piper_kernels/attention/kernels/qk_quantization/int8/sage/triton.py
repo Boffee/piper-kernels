@@ -380,18 +380,36 @@ def prepare_query(
     softmax_scale: float,
     *,
     grouped: bool,
+    storage_query_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate and quantize Q with the selected SageAttention granularity."""
+    """Allocate and quantize Q with the selected SageAttention granularity.
+
+    ``storage_query_length`` may pad the INT8 destination beyond the logical
+    input length. Padded rows and scale groups are zero so an aligned attention
+    launch cannot let padding change real-row quantization.
+    """
     batch, heads, query_length, head_dim = query.shape
-    query_int8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+    storage_length = query_length if storage_query_length is None else storage_query_length
+    if storage_length < query_length:
+        raise ValueError("Q storage length cannot be smaller than the logical query length")
+    query_int8 = torch.empty(
+        (batch, heads, storage_length, head_dim),
+        device=query.device,
+        dtype=torch.int8,
+    )
+    if storage_length != query_length:
+        query_int8[:, :, query_length:].zero_()
     if grouped:
-        scale_groups = int(triton.cdiv(query_length, _QUERY_BLOCK))
+        logical_scale_groups = int(triton.cdiv(query_length, _QUERY_BLOCK))
+        storage_scale_groups = int(triton.cdiv(storage_length, _QUERY_BLOCK))
         query_scale = torch.empty(
-            (batch, heads, scale_groups),
+            (batch, heads, storage_scale_groups),
             device=query.device,
             dtype=torch.float32,
         )
-        quantize_query_per_warp_kernel[(scale_groups, heads, batch)](
+        if storage_scale_groups != logical_scale_groups:
+            query_scale[:, :, logical_scale_groups:].zero_()
+        quantize_query_per_warp_kernel[(logical_scale_groups, heads, batch)](
             query,
             query_int8,
             query_scale,
@@ -409,7 +427,13 @@ def prepare_query(
             num_warps=4,
         )
     else:
-        query_scale = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+        query_scale = torch.empty(
+            (batch, heads, storage_length),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        if storage_length != query_length:
+            query_scale[:, :, query_length:].zero_()
         quantize_query_per_thread_kernel[
             (triton.cdiv(query_length, _QUERY_BLOCK) * 8, heads, batch)
         ](

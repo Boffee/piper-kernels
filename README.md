@@ -13,7 +13,7 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
 | Package | Role |
 |---|---|
-| `piper_kernels` | Public Piper Attention and SageAttention2++ forward operators |
+| `piper_kernels` | Public dense and sparse Piper Attention plus SageAttention2++ operators |
 | `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
 | `piper_kernels.linear` | Linear operators, tensor formats, and optimized backends |
 | `piper_kernels.linear.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
@@ -170,6 +170,42 @@ mixed-sign lowering remains future work.
 Piper Attention is an independently developed Sage-derived design. The per-key
 quantizer, centering identity, and online-softmax lineage are not claimed as novel in
 isolation; the name identifies this package's selected combination and fused recurrence.
+
+## Sparse Piper Attention
+
+Sparse Piper is a separate non-causal SM120 operator for pre-tiled H3-style self-attention:
+
+```python
+import torch
+from piper_kernels import (
+    prepare_sparse_piper_attention_plan,
+    sparse_piper_attention,
+)
+
+keep_blocks = torch.tensor([207, 414, 622], device="cuda", dtype=torch.int32)
+plan = prepare_sparse_piper_attention_plan(keep_blocks, sparse_key_blocks=1036)
+output = sparse_piper_attention(
+    query,
+    key,
+    value,
+    plan,
+    suffix_start=1036 * 64,
+    valid_sequence_length=query.shape[1],
+)
+```
+
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The physical sequence and
+`suffix_start` are K64 aligned. Every query receives an exact FP32 DSA route over K/V rows before
+`suffix_start`, then attends to every valid K/V row after it in the same softmax. This makes text,
+generated audio, or other globally retained sections an optional dense suffix while keeping their
+queries sparse over the packed media prefix. Per-head keep counts are arbitrary runtime values;
+budget selection and calibration remain Engine responsibilities.
+
+The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
+recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
+pre-rounding denominator remain FP32. `valid_sequence_length` may exclude padding only in the
+final physical tile; padded Q/K/V values cannot change valid outputs. The returned tensor retains
+the aligned physical length. Unsupported devices use a slow exact BF16 semantic reference.
 
 ## SageAttention2++
 
