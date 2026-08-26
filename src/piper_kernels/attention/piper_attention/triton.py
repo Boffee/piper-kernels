@@ -873,14 +873,11 @@ def _prepare_piper_attention(
         value,
         is_causal=is_causal,
     )
-    query_int8, query_scale = qk_quantization.prepare_query(
+    prepared_qk = qk_quantization.prepare_query_key(
         query,
-        scale,
-        grouped=plan.grouped_qk,
-    )
-    key_int8, key_scale = qk_quantization.prepare_key(
         key,
         key_mean,
+        scale,
         grouped=plan.grouped_qk,
         storage_key_length=storage_key_length,
     )
@@ -923,17 +920,17 @@ def _prepare_piper_attention(
         num_warps=4,
     )
 
-    key_argument: torch.Tensor | TensorDescriptor = key_int8
+    key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
     value_argument: torch.Tensor | TensorDescriptor = value_int8
     if plan.use_tensor_descriptors:
         key_argument, value_argument = _make_key_value_descriptors(
-            key_int8,
+            prepared_qk.key,
             value_int8,
             split_pv_head_dim=plan.split_pv_head_dim,
         )
     query_descriptor = (
         _make_query_descriptor(
-            query_int8,
+            prepared_qk.query,
             plan.block_m,
         )
         if plan.use_tensor_descriptors and plan.block_m == 128
@@ -941,12 +938,12 @@ def _prepare_piper_attention(
     )
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     return _PreparedPiperAttention(
-        query=query_int8,
+        query=prepared_qk.query,
         query_descriptor=query_descriptor,
         key=key_argument,
         value=value_argument,
-        query_scale=query_scale,
-        key_scale=key_scale,
+        query_scale=prepared_qk.query_scale,
+        key_scale=prepared_qk.key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_log_scale=value_log_scale,
         value_mean=value_mean,

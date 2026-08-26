@@ -3,6 +3,9 @@
 import pytest
 import torch
 
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
+    triton as triton_qk_quantization,
+)
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
     rotate_signed_hadamard_heads,
@@ -85,3 +88,41 @@ def test_quantize_query_key_rejects_unknown_granularity() -> None:
 
     with pytest.raises(ValueError, match="unknown Q/K quantization granularity"):
         quantize_query_key(value, value, granularity="row")  # type: ignore[arg-type]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("grouped", [False, True])
+def test_prepared_query_key_is_shared_quantization_contract(grouped: bool) -> None:
+    torch.manual_seed(82 + grouped)
+    query = torch.randn(1, 2, 35, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 2, 67, 128, device="cuda", dtype=torch.bfloat16)
+    key_mean = key.float().mean(dim=2)
+    softmax_scale = 128**-0.5
+
+    actual = triton_qk_quantization.prepare_query_key(
+        query,
+        key,
+        key_mean,
+        softmax_scale,
+        grouped=grouped,
+        storage_query_length=64,
+        storage_key_length=128,
+    )
+    expected_query, expected_query_scale = triton_qk_quantization.prepare_query(
+        query,
+        softmax_scale,
+        grouped=grouped,
+        storage_query_length=64,
+    )
+    expected_key, expected_key_scale = triton_qk_quantization.prepare_key(
+        key,
+        key_mean,
+        grouped=grouped,
+        storage_key_length=128,
+    )
+
+    assert torch.equal(actual.query, expected_query)
+    assert torch.equal(actual.key, expected_key)
+    assert torch.equal(actual.query_scale, expected_query_scale)
+    assert torch.equal(actual.key_scale, expected_key_scale)

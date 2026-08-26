@@ -735,16 +735,13 @@ def _compute_kv_statistics(
     return key_mean, value_scale
 
 
-def _quantize_key_value(
-    key: torch.Tensor,
+def _quantize_value(
     value: torch.Tensor,
-    key_mean: torch.Tensor,
     value_scale: torch.Tensor,
     storage_key_length: int,
-    plan: _policy.SageAttention2ppExecutionPlan,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize K and V into the attention kernel's storage layouts."""
-    batch, heads, key_length, head_dim = key.shape
+) -> torch.Tensor:
+    """Quantize V into the SageAttention2++ feature-major FP8 layout."""
+    batch, heads, key_length, head_dim = value.shape
     value_shape = (batch, heads, head_dim, storage_key_length)
     value_fp8 = (
         torch.zeros(value_shape, device=value.device, dtype=torch.float8_e4m3fn)
@@ -753,12 +750,6 @@ def _quantize_key_value(
     )
 
     num_key_blocks = int(triton.cdiv(key_length, _BLOCK_N))
-    key_int8, key_scale = qk_quantization.prepare_key(
-        key,
-        key_mean,
-        grouped=plan.grouped_qk,
-        storage_key_length=storage_key_length,
-    )
     _quantize_value_kernel[(num_key_blocks, heads, batch)](
         value,
         value_scale,
@@ -775,7 +766,7 @@ def _quantize_key_value(
         block_n=_BLOCK_N,
         num_warps=4,
     )
-    return key_int8, value_fp8, key_scale
+    return value_fp8
 
 
 def _prepare_sage_attention_2pp(
@@ -800,33 +791,33 @@ def _prepare_sage_attention_2pp(
         else key_length
     )
     key_mean, value_scale = _compute_kv_statistics(key, value)
-    query_int8, query_scale = qk_quantization.prepare_query(
+    prepared_qk = qk_quantization.prepare_query_key(
         query,
+        key,
+        key_mean,
         scale,
         grouped=plan.grouped_qk,
+        storage_key_length=storage_key_length,
     )
-    key_int8, value_fp8, key_scale = _quantize_key_value(
-        key,
+    value_fp8 = _quantize_value(
         value,
-        key_mean,
         value_scale,
         storage_key_length,
-        plan,
     )
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-    key_argument: torch.Tensor | TensorDescriptor = key_int8
+    key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
     value_argument: torch.Tensor | TensorDescriptor = value_fp8
     if plan.use_tensor_descriptors:
         key_argument, value_argument = _make_attention_tensor_descriptors(
-            key_int8,
+            prepared_qk.key,
             value_fp8,
         )
     return _PreparedSageAttention2pp(
-        query=query_int8,
+        query=prepared_qk.query,
         key=key_argument,
         value=value_argument,
-        query_scale=query_scale,
-        key_scale=key_scale,
+        query_scale=prepared_qk.query_scale,
+        key_scale=prepared_qk.key_scale,
         value_scale=value_scale,
         output=output,
         key_length=key_length,

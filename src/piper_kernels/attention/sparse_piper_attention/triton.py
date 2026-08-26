@@ -151,17 +151,14 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         combined_value,
         is_causal=False,
     )
-    query_int8, query_scale = qk_quantization.prepare_query(
+    prepared_qk = qk_quantization.prepare_query_key(
         query[:, :, :logical_query_length],
-        scale,
-        grouped=True,
-        storage_query_length=query_length,
-    )
-    key_int8, key_scale = qk_quantization.prepare_key(
         combined_key,
         key_mean,
+        scale,
         grouped=True,
         storage_key_length=storage_key_length,
+        storage_query_length=query_length,
     )
     value_int8 = torch.empty(
         (batch, heads, head_dim, storage_key_length),
@@ -208,11 +205,11 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         quantize_tiles(1, key_block_offset=full_tile_count, mask_key_length=True)
 
     key_descriptor, value_descriptor = piper_backend._make_key_value_descriptors(
-        key_int8,
+        prepared_qk.key,
         value_int8,
         split_pv_head_dim=True,
     )
-    query_descriptor = piper_backend._make_query_descriptor(query_int8, _BLOCK_M)
+    query_descriptor = piper_backend._make_query_descriptor(prepared_qk.query, _BLOCK_M)
     if attention_output is None:
         attention_output = torch.empty_like(query, memory_format=torch.contiguous_format)
     elif (
@@ -224,12 +221,12 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         raise ValueError("sparse Piper output must match Q and have contiguous features")
 
     attention = piper_backend._PreparedPiperAttention(
-        query=query_int8,
+        query=prepared_qk.query,
         query_descriptor=query_descriptor,
         key=key_descriptor,
         value=value_descriptor,
-        query_scale=query_scale,
-        key_scale=key_scale,
+        query_scale=prepared_qk.query_scale,
+        key_scale=prepared_qk.key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_log_scale=torch.empty((1,), device=query.device, dtype=torch.float16),
         value_mean=value_mean,

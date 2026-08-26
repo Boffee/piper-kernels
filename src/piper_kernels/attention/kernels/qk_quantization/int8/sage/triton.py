@@ -4,6 +4,8 @@
 # Python call signature.
 # pyright: reportCallIssue=false
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
@@ -18,6 +20,22 @@ _SIGNED_HADAMARD_WORD_0 = tl.constexpr(SIGNED_HADAMARD_MASK[0])
 _SIGNED_HADAMARD_WORD_1 = tl.constexpr(SIGNED_HADAMARD_MASK[1])
 _SIGNED_HADAMARD_WORD_2 = tl.constexpr(SIGNED_HADAMARD_MASK[2])
 _SIGNED_HADAMARD_WORD_3 = tl.constexpr(SIGNED_HADAMARD_MASK[3])
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedInt8QueryKey:
+    """Attention-independent Sage-style INT8 Q/K operands.
+
+    ``query_scale`` includes the attention softmax scale and the conversion
+    from natural exponentials to the base-2 recurrence used by the attention
+    kernels. ``key`` is centered by ``key_mean`` before the signed Hadamard
+    transform and quantization.
+    """
+
+    query: torch.Tensor
+    key: torch.Tensor
+    query_scale: torch.Tensor
+    key_scale: torch.Tensor
 
 
 @triton.jit
@@ -518,3 +536,39 @@ def prepare_key(
             num_warps=4,
         )
     return key_int8, key_scale
+
+
+def prepare_query_key(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    key_mean: torch.Tensor,
+    softmax_scale: float,
+    *,
+    grouped: bool,
+    storage_key_length: int,
+    storage_query_length: int | None = None,
+) -> PreparedInt8QueryKey:
+    """Prepare the shared INT8 Q/K contract consumed by quantized attention.
+
+    Attention-specific V encoding, routing summaries, descriptors, and output
+    storage deliberately remain outside this function. A future projected
+    frontend can produce the same dataclass without materializing BF16 Q/K.
+    """
+    query_int8, query_scale = prepare_query(
+        query,
+        softmax_scale,
+        grouped=grouped,
+        storage_query_length=storage_query_length,
+    )
+    key_int8, key_scale = prepare_key(
+        key,
+        key_mean,
+        grouped=grouped,
+        storage_key_length=storage_key_length,
+    )
+    return PreparedInt8QueryKey(
+        query=query_int8,
+        key=key_int8,
+        query_scale=query_scale,
+        key_scale=key_scale,
+    )
