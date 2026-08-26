@@ -6,6 +6,17 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
+try:
+    from .dsa_triton import block_summaries as _sm120_block_summaries
+    from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
+except ModuleNotFoundError as exc:
+    if exc.name is None or not exc.name.startswith("triton"):
+        raise
+    _sm120_block_summaries = None
+    _sm120_select_routes = None
+
 _UINT16_ROUTE_CAPACITY = 1 << 16
 
 
@@ -97,12 +108,12 @@ def packed_dsa_routes_from_plan(
         device=query_blocks.device,
     )
     if _supports_sm120_selector(query_blocks, key_blocks):
-        from .dsa_triton import tiled_radix_select_packed_routes  # noqa: PLC0415
+        assert _sm120_select_routes is not None
 
         for start in range(0, query_summary.shape[2], plan.query_chunk_blocks):
             stop = min(start + plan.query_chunk_blocks, query_summary.shape[2])
             scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
-            tiled_radix_select_packed_routes(
+            _sm120_select_routes(
                 scores,
                 indices,
                 plan.keep_blocks,
@@ -121,9 +132,9 @@ def _block_summaries(
     query_valid_counts: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if _supports_sm120_selector(query_blocks, key_blocks):
-        from .dsa_triton import block_summaries  # noqa: PLC0415
+        assert _sm120_block_summaries is not None
 
-        return block_summaries(
+        return _sm120_block_summaries(
             query_blocks,
             key_blocks,
             query_valid_counts=query_valid_counts,
@@ -211,9 +222,11 @@ def _masked_extrema(
 
 
 def _supports_sm120_selector(query_blocks: torch.Tensor, key_blocks: torch.Tensor) -> bool:
+    target = AcceleratorTarget.from_device(query_blocks.device)
     return (
-        query_blocks.device.type == "cuda"
-        and torch.cuda.get_device_capability(query_blocks.device) == (12, 0)
+        _sm120_block_summaries is not None
+        and _sm120_select_routes is not None
+        and target.is_cuda_capability(12, 0)
         and query_blocks.shape[-1] == 128
         and key_blocks.shape[-1] == 128
         and query_blocks.shape[-2] == 64

@@ -205,7 +205,9 @@ The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one p
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
 pre-rounding denominator remain FP32. `valid_sequence_length` may exclude padding only in the
 final physical tile; padded Q/K/V values cannot change valid outputs. The returned tensor retains
-the aligned physical length. Unsupported devices use a slow exact BF16 semantic reference.
+the aligned physical length. Unsupported devices use a slow portable implementation of the same
+quantized Sparse Piper arithmetic. A separate exact-BF16 sparse reference serves as its quality
+oracle; it is not the public fallback.
 
 ## SageAttention2++
 

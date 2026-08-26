@@ -109,7 +109,7 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_sm120_int8_error_stays_within_the_selected_quality_gate() -> None:
+def test_sm120_matches_the_portable_quantized_reference() -> None:
     query, key, value = _inputs()
     keep = torch.tensor([1, 2], dtype=torch.int32)
     cpu_plan = prepare_sparse_piper_attention_plan(keep, sparse_key_blocks=2)
@@ -132,7 +132,7 @@ def test_sm120_int8_error_stays_within_the_selected_quality_gate() -> None:
         ).cpu()
 
     relative_l2 = (actual.float() - reference.float()).norm() / reference.float().norm()
-    assert relative_l2 < 0.025
+    assert relative_l2 < 0.015
 
 
 @pytest.mark.gpu

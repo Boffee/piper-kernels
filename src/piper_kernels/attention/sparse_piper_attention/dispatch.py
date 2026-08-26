@@ -6,12 +6,31 @@ import math
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
 from .dsa import (
     SparsePiperAttentionPlan,
     packed_dsa_routes_from_plan,
     prepare_dsa_route_plan,
 )
 from .reference import reference_sparse_piper_attention
+
+try:
+    from .gluon import (
+        _launch_gluon_paired_routed_piper_attention as _launch_sm120_attention,
+    )
+    from .triton import (
+        _prepare_folded_tile_scaled_routed_piper_attention as _prepare_sm120_attention,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name is None or not exc.name.startswith("triton"):
+        raise
+    _launch_sm120_attention = None
+    _prepare_sm120_attention = None
+
+
+def _supports_sm120(target: AcceleratorTarget) -> bool:
+    return _launch_sm120_attention is not None and target.is_cuda_capability(12, 0)
 
 
 def prepare_sparse_piper_attention_plan(
@@ -109,10 +128,8 @@ def sparse_piper_attention(
         valid_sequence_length=valid_sequence_length,
         scale=scale,
     )
-    target_is_sm120 = query.device.type == "cuda" and (
-        torch.cuda.get_device_capability(query.device) == (12, 0)
-    )
-    if target_is_sm120:
+    target = AcceleratorTarget.from_device(query.device)
+    if _supports_sm120(target):
         return _sm120_sparse_piper_attention(
             query,
             key,
@@ -187,13 +204,10 @@ def _run_sparse_piper_attention(
             scale=scale,
         )
 
-    from .gluon import _launch_gluon_paired_routed_piper_attention  # noqa: PLC0415
-    from .triton import (  # noqa: PLC0415
-        _prepare_folded_tile_scaled_routed_piper_attention,
-    )
-
+    assert _launch_sm120_attention is not None
+    assert _prepare_sm120_attention is not None
     output = torch.empty_like(query)
-    prepared = _prepare_folded_tile_scaled_routed_piper_attention(
+    prepared = _prepare_sm120_attention(
         query_blocks,
         key_blocks,
         routes.indices,
@@ -205,7 +219,7 @@ def _run_sparse_piper_attention(
         combined_value=value_head_major[:, :, :valid_sequence_length],
         attention_output=output.transpose(1, 2),
     )
-    _launch_gluon_paired_routed_piper_attention(prepared)
+    _launch_sm120_attention(prepared)
     return output
 
 

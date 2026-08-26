@@ -12,7 +12,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   sparsity, physical M64/K128 execution, tile-scaled INT8 V, a pre-rounding FP32 denominator, and
   an optional always-dense K/V suffix in one softmax. A reusable plan accepts arbitrary runtime
   per-head budgets, and compact final-tile padding is excluded from routing, quantization, and
-  valid outputs. Budget calibration, spatial packing, and model policy remain outside Kernels.
+  valid outputs. Unsupported devices use a portable quantized reference matching the SM120
+  algorithm, while an exact-BF16 sparse oracle remains separate for quality measurement. Budget
+  calibration, spatial packing, and model policy remain outside Kernels.
 
 ## [0.3.0] - 2026-08-17
 
