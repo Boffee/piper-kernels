@@ -77,6 +77,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         weight_offsets,
         sequence_offsets,
         rows,
+        sequence_length,
         input_features,
         heads * head_dim,
         heads_per_program,

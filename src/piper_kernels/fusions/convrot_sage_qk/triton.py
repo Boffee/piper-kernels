@@ -32,6 +32,7 @@ def project_rmsnorm_rope_tile(
     weight_offsets,
     sequence_offsets,
     rows,
+    sequence_length,
     input_features: tl.constexpr,
     output_features: tl.constexpr,
     heads_per_program: tl.constexpr,
@@ -83,20 +84,28 @@ def project_rmsnorm_rope_tile(
     )
     paired = tl.gather(normalized, paired_indices, axis=2)
     rotated = tl.where(feature_offsets[None, None, :] < half_rotary_dim, -paired, paired)
-    rope_mask = feature_offsets < rotary_dim
+    rotary_features = feature_offsets < rotary_dim
+    if aligned_projection:
+        rope_load_mask = rotary_features[None, None, :]
+    else:
+        # K pairs two logical K64 tiles in M128. An odd tile count leaves one
+        # physical K64 tail, so its second half has no RoPE storage to read.
+        rope_load_mask = (sequence_offsets[:, None, None] < sequence_length) & rotary_features[
+            None, None, :
+        ]
     cos = tl.load(
         cos_ptr + sequence_offsets[:, None, None] * rotary_dim + feature_offsets[None, None, :],
-        mask=rope_mask[None, None, :],
+        mask=rope_load_mask,
         other=1.0,
     )
     sin = tl.load(
         sin_ptr + sequence_offsets[:, None, None] * rotary_dim + feature_offsets[None, None, :],
-        mask=rope_mask[None, None, :],
+        mask=rope_load_mask,
         other=0.0,
     )
     rotary = normalized * cos + rotated * sin
     return tl.where(
-        rope_mask[None, None, :],
+        rotary_features[None, None, :],
         rotary,
         normalized,
     )

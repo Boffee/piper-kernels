@@ -129,7 +129,9 @@ def test_fused_key_projection_matches_the_fp32_composed_contract(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_fused_key_projection_supports_full_blocks_batches_and_odd_heads() -> None:
+def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
+    # S192 is K64-aligned but leaves a half-M128 tail whose nonexistent rows
+    # must not read beyond the physical RoPE buffers.
     operands = _random_operands(
         batch=2,
         sequence_length=192,

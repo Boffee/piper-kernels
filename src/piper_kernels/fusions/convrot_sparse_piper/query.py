@@ -85,6 +85,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         weight_offsets,
         sequence_offsets,
         rows,
+        sequence_length,
         input_features,
         heads * head_dim,
         heads_per_program,
