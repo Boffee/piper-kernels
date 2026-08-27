@@ -97,7 +97,7 @@ def _random_operands(
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("valid_sequence_length", [64, 59, 29])
-def test_fused_query_projection_matches_the_composed_contract(
+def test_fused_query_projection_matches_the_fp32_composed_contract(
     valid_sequence_length: int,
 ) -> None:
     operands = _random_operands()

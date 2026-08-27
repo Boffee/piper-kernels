@@ -113,6 +113,10 @@ plus DSA summaries directly, avoiding the three materialized BF16 projection out
 closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention
 APIs remain independent.
 
+Because no projected activation is externally observable in the fused region, projection,
+RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise
+redundant FP32-to-BF16-to-FP32 round trips without materializing FP32 activation tensors.
+
 The internal `piper_kernels.fusions.convrot_sage_qk` layer owns the reusable projection,
 RMSNorm, RoPE, signed-Hadamard, and Sage-style INT8 Q/K quantization device functions. Sparse
 Piper wraps those functions with its DSA-summary epilogues and keeps its tile-scaled V path

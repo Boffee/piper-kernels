@@ -127,10 +127,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         block_k,
         aligned_projection,
     )
-    projection = tl.reshape(
-        projection.to(tl.bfloat16),
-        (block_m, heads_per_program, head_dim),
-    ).to(tl.float32)
+    projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
     value_mean = tl.load(
         value_mean_ptr
         + (batch * heads + head_offsets[:, None]) * head_dim

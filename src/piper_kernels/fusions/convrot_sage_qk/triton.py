@@ -43,7 +43,7 @@ def project_rmsnorm_rope_tile(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    """Return one BF16-rounded, normalized, and rotated projection tile."""
+    """Return one FP32 normalized and rotated projection tile."""
     feature_offsets = tl.arange(0, head_dim)
     projection = convrot_backend.scaled_int8_matmul(
         input_ptr,
@@ -60,18 +60,12 @@ def project_rmsnorm_rope_tile(
         block_k,
         aligned_projection,
     )
-    projection = tl.reshape(
-        projection.to(tl.bfloat16),
-        (block_m, heads_per_program, head_dim),
-    )
-    projection_fp32 = projection.to(tl.float32)
+    projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
     inverse_rms = libdevice.rsqrt_rn(
-        tl.sum(projection_fp32 * projection_fp32, axis=2) / head_dim + norm_epsilon
+        tl.sum(projection * projection, axis=2) / head_dim + norm_epsilon
     )
     norm_weight = tl.load(norm_weight_ptr + feature_offsets).to(tl.float32)
-    normalized = (projection_fp32 * inverse_rms[:, :, None] * norm_weight[None, None, :]).to(
-        tl.bfloat16
-    )
+    normalized = projection * inverse_rms[:, :, None] * norm_weight[None, None, :]
 
     half_rotary_dim: tl.constexpr = rotary_dim // 2
     paired_features = tl.where(
@@ -94,17 +88,16 @@ def project_rmsnorm_rope_tile(
         cos_ptr + sequence_offsets[:, None, None] * rotary_dim + feature_offsets[None, None, :],
         mask=rope_mask[None, None, :],
         other=1.0,
-    ).to(tl.bfloat16)
+    )
     sin = tl.load(
         sin_ptr + sequence_offsets[:, None, None] * rotary_dim + feature_offsets[None, None, :],
         mask=rope_mask[None, None, :],
         other=0.0,
-    ).to(tl.bfloat16)
-    rotary_product = (normalized * cos).to(tl.bfloat16)
-    rotated_product = (rotated * sin).to(tl.bfloat16)
+    )
+    rotary = normalized * cos + rotated * sin
     return tl.where(
         rope_mask[None, None, :],
-        (rotary_product + rotated_product).to(tl.bfloat16),
+        rotary,
         normalized,
     )
 

@@ -22,7 +22,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   quantization primitives live under `piper_kernels.fusions.convrot_sage_qk`; the explicit
   `piper_kernels.fusions.convrot_sparse_piper` integration adds sparse DSA summaries and V
   preparation, and installs its pass before the independent ConvRot compiler pass. Unsupported
-  graphs remain on the ordinary public operators.
+  graphs remain on the ordinary public operators. Fused projection, RMSNorm, and RoPE remain
+  FP32 through the final INT8 encoding instead of reproducing unobservable BF16 round trips.
 
 ## [0.3.0] - 2026-08-17
 

@@ -1,4 +1,4 @@
-"""Materialized references for ConvRot-to-sparse-Piper fusion tests."""
+"""Materialized FP32 references for ConvRot-to-sparse-Piper fusion tests."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ class ProjectedValue:
     value_mean: torch.Tensor
 
 
-def _materialized_qk(
+def _materialized_fp32_qk(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -56,17 +56,14 @@ def _materialized_qk(
         weight_qdata,
         weight_scale,
         None,
-        torch.bfloat16,
+        torch.float32,
     ).view(batch, sequence_length, heads, _HEAD_DIM)
-    normalized = F.rms_norm(projected, (_HEAD_DIM,), norm_weight, norm_epsilon)
+    normalized = F.rms_norm(projected, (_HEAD_DIM,), norm_weight.float(), norm_epsilon)
     rotary_dim = cos.shape[1]
     rotary = normalized[..., :rotary_dim]
     first, second = rotary.chunk(2, dim=-1)
     rotated = torch.cat((-second, first), dim=-1)
-    rotary = (
-        rotary * cos.to(torch.bfloat16)[None, :, None, :]
-        + rotated * sin.to(torch.bfloat16)[None, :, None, :]
-    )
+    rotary = rotary * cos[None, :, None, :] + rotated * sin[None, :, None, :]
     return torch.cat((rotary, normalized[..., rotary_dim:]), dim=-1).transpose(1, 2).contiguous()
 
 
@@ -96,9 +93,9 @@ def composed_query_projection(
     norm_epsilon: float,
     softmax_scale: float,
 ) -> ProjectedQuery:
-    """Materialize the operations fused by one-pass query projection."""
+    """Materialize the FP32 operations fused by one-pass query projection."""
     sequence_length = input_qdata.shape[1]
-    query = _materialized_qk(
+    query = _materialized_fp32_qk(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -133,10 +130,10 @@ def composed_key_projection(
     valid_sequence_length: int,
     norm_epsilon: float,
 ) -> ProjectedKey:
-    """Materialize the operations fused by one-pass key projection."""
+    """Materialize the FP32 operations fused by one-pass key projection."""
     batch, sequence_length, _input_features = input_qdata.shape
     heads = weight_qdata.shape[0] // _HEAD_DIM
-    key = _materialized_qk(
+    key = _materialized_fp32_qk(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -168,7 +165,7 @@ def composed_value_projection(
     *,
     valid_sequence_length: int,
 ) -> ProjectedValue:
-    """Materialize the operations fused by one-pass value projection."""
+    """Materialize the FP32 operations fused by one-pass value projection."""
     batch, sequence_length, _input_features = input_qdata.shape
     heads = weight_qdata.shape[0] // _HEAD_DIM
     value_mean = ((input_mean @ weight_qdata.float().T) * weight_scale[:, 0]).view(
@@ -182,7 +179,7 @@ def composed_value_projection(
         weight_qdata,
         weight_scale,
         None,
-        torch.bfloat16,
+        torch.float32,
     ).view(batch, sequence_length, heads, _HEAD_DIM)
     value = projected.permute(0, 2, 1, 3).unflatten(
         2,
