@@ -551,8 +551,8 @@ def prepare_query_key(
     """Prepare the shared INT8 Q/K contract consumed by quantized attention.
 
     Attention-specific V encoding, routing summaries, descriptors, and output
-    storage deliberately remain outside this function. A future projected
-    frontend can produce the same dataclass without materializing BF16 Q/K.
+    storage deliberately remain outside this function. A fused projection
+    frontend can produce the same contract without materializing BF16 Q/K.
     """
     query_int8, query_scale = prepare_query(
         query,

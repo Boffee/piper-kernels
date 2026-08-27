@@ -21,32 +21,10 @@ from torch._inductor.pattern_matcher import (
 from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-_COMPILE_PASS_VERSION = "convrot-compile-v3"
+from . import _compile_fx
 
-type _PreparedInputNodes = tuple[torch.fx.Node, torch.fx.Node, torch.dtype]
-
-
-def _emit_prepared_input(
-    graph: torch.fx.Graph,
-    input_node: torch.fx.Node,
-    group_size: int,
-    activation_fn: str | None,
-    prepared_shape: tuple[int | torch.SymInt, ...],
-) -> _PreparedInputNodes:
-    input_value = preparation_sharing.tensor_metadata(input_node)
-    assert input_value is not None
-    input_qdata_value = input_value.new_empty(prepared_shape, dtype=torch.int8)
-    input_scale_value = input_value.new_empty(prepared_shape[:-1], dtype=torch.float32)
-    prepared = graph.call_function(
-        torch.ops.piper_kernels.convrot_int8_prepare_input.default,
-        args=(input_node, group_size, activation_fn),
-    )
-    prepared.meta["val"] = (input_qdata_value, input_scale_value)
-    input_qdata = graph.call_function(operator.getitem, args=(prepared, 0))
-    input_qdata.meta["val"] = input_qdata_value
-    input_scale = graph.call_function(operator.getitem, args=(prepared, 1))
-    input_scale.meta["val"] = input_scale_value
-    return input_qdata, input_scale, input_value.dtype
+_COMPILE_PASS_VERSION = "convrot-compile-v5"
+type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
 def _emit_linear_prepared(
@@ -119,7 +97,7 @@ class _PreparationRule:
         assert not isinstance(group_size, bool)
         input_value = preparation_sharing.tensor_metadata(input_node)
         assert input_value is not None
-        return _emit_prepared_input(
+        return _compile_fx.emit_prepared_input(
             graph,
             input_node,
             group_size,
@@ -264,7 +242,7 @@ def _replace_input_activation_and_linear(
         input_value.shape[-1] // input_activations.input_activation_width(activation_fn),
     )
     with graph.inserting_before(original):
-        prepared = _emit_prepared_input(
+        prepared = _compile_fx.emit_prepared_input(
             graph,
             input_node,
             group_size,
@@ -432,7 +410,7 @@ def _fold_input_activations(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold input activations before sharing ordinary input preparation."""
+    """Fold activations before sharing ordinary ConvRot input preparation."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
@@ -442,7 +420,12 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 
     def uuid(self) -> bytes:
         return get_hash_for_files(
-            (__file__, input_activations.__file__, preparation_sharing.__file__),
+            (
+                __file__,
+                input_activations.__file__,
+                preparation_sharing.__file__,
+                _compile_fx.__file__,
+            ),
             extra=_COMPILE_PASS_VERSION,
         )
 
@@ -453,7 +436,7 @@ compile_pass = _CompilePass()
 def convrot_int8_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Return Inductor options for input-activation folding and preparation reuse.
+    """Return Inductor options for ConvRot inference graph optimizations.
 
     Existing post-grad pre-passes run first and are preserved. Reapplying this
     helper is idempotent, and the input mapping and any contained list remain

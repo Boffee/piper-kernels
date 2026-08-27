@@ -244,3 +244,120 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         sparse_key_block_count=key_blocks.shape[2],
         dense_suffix_length=combined_key.shape[2] - key_blocks.shape[2] * _BLOCK_N,
     )
+
+
+def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912, PLR0915
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    key: torch.Tensor,
+    key_scale: torch.Tensor,
+    value: torch.Tensor,
+    value_scale_multiplier: torch.Tensor,
+    value_mean: torch.Tensor,
+    routes: torch.Tensor,
+    keep_blocks: torch.Tensor,
+    route_head_offsets: torch.Tensor,
+    *,
+    suffix_start: int,
+    valid_sequence_length: int,
+    routes_per_query: int,
+    attention_output: torch.Tensor | None = None,
+) -> _PreparedRoutedPiperAttention:
+    """Construct sparse Piper launch state from already-quantized operands."""
+    if query.ndim != 4 or query.dtype is not torch.int8:
+        raise ValueError("quantized sparse Piper Q must be [batch,heads,sequence,D128] INT8")
+    batch, heads, sequence_length, head_dim = query.shape
+    if head_dim != _HEAD_DIM or sequence_length < _BLOCK_M or sequence_length % _BLOCK_M:
+        raise ValueError("quantized sparse Piper requires aligned M64/D128 queries")
+    if key.shape != query.shape or key.dtype is not torch.int8:
+        raise ValueError("quantized sparse Piper K must match Q and use INT8")
+    if value.shape != (batch, heads, head_dim, sequence_length) or value.dtype is not torch.int8:
+        raise ValueError("quantized sparse Piper V must be transposed INT8 [B,H,D,S]")
+    tile_count = sequence_length // _BLOCK_N
+    if query_scale.shape != (batch, heads, sequence_length // 32):
+        raise ValueError("quantized sparse Piper Q scales must contain one value per Q32")
+    if key_scale.shape != (batch, heads, tile_count):
+        raise ValueError("quantized sparse Piper K scales must contain one value per K64")
+    if value_scale_multiplier.shape != (batch, heads, tile_count, 1):
+        raise ValueError("quantized sparse Piper V scales must contain one value per K64")
+    if value_mean.shape != (batch, heads, head_dim):
+        raise ValueError("quantized sparse Piper V mean must be [batch,heads,D128]")
+    scales = query_scale, key_scale, value_scale_multiplier, value_mean
+    if any(scale.dtype is not torch.float32 for scale in scales):
+        raise ValueError("quantized sparse Piper scales and V mean must use FP32")
+    tensors = query, key, value, *scales, routes, keep_blocks, route_head_offsets
+    if any(tensor.device != query.device for tensor in tensors):
+        raise ValueError("quantized sparse Piper operands must share a device")
+    if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
+    if not _BLOCK_N <= suffix_start <= valid_sequence_length <= sequence_length:
+        raise ValueError("quantized sparse Piper suffix/valid lengths must fit the sequence")
+    if suffix_start % _BLOCK_N:
+        raise ValueError("quantized sparse Piper suffix start must be K64 aligned")
+    if valid_sequence_length < sequence_length and valid_sequence_length <= sequence_length - 64:
+        raise ValueError("quantized sparse Piper supports padding only in the final K64 tile")
+    sparse_key_block_count = suffix_start // _BLOCK_N
+    query_block_count = sequence_length // _BLOCK_M
+    if routes.shape != (batch, query_block_count, routes_per_query):
+        raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
+    if routes.dtype is not torch.uint16:
+        raise ValueError("quantized sparse Piper routes must use UINT16")
+    if keep_blocks.shape != (heads,) or keep_blocks.dtype is not torch.int32:
+        raise ValueError("quantized sparse Piper keep counts must be one INT32 value per head")
+    if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
+        raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
+
+    plan = replace(
+        piper_backend._default_piper_attention_execution_plan(query, False),
+        block_m=_BLOCK_M,
+        use_tensor_descriptors=True,
+        num_stages=2,
+    )
+    if not plan.grouped_qk or not plan.split_pv_head_dim:
+        raise ValueError("quantized sparse Piper requires grouped Q/K and split PV")
+    with torch.cuda.device(query.device):
+        install_uint8_int8_dot_hook()
+    key_descriptor, value_descriptor = piper_backend._make_key_value_descriptors(
+        key,
+        value,
+        split_pv_head_dim=True,
+    )
+    query_descriptor = piper_backend._make_query_descriptor(query, _BLOCK_M)
+    if attention_output is None:
+        attention_output = torch.empty(
+            (batch, heads, sequence_length, head_dim),
+            device=query.device,
+            dtype=torch.bfloat16,
+        )
+    elif (
+        attention_output.shape != (batch, heads, sequence_length, head_dim)
+        or attention_output.dtype is not torch.bfloat16
+        or attention_output.device != query.device
+        or attention_output.stride(-1) != 1
+    ):
+        raise ValueError("quantized sparse Piper output must be BF16 [B,H,S,D128]")
+
+    attention = piper_backend._PreparedPiperAttention(
+        query=query,
+        query_descriptor=query_descriptor,
+        key=key_descriptor,
+        value=value_descriptor,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale_multiplier=value_scale_multiplier,
+        value_log_scale=torch.empty((1,), device=query.device, dtype=torch.float16),
+        value_mean=value_mean,
+        output=attention_output,
+        key_length=valid_sequence_length,
+        is_causal=False,
+        plan=plan,
+    )
+    return _PreparedRoutedPiperAttention(
+        attention=attention,
+        routes=routes,
+        route_head_offsets=route_head_offsets,
+        keep_blocks=keep_blocks,
+        query_block_count=query_block_count,
+        sparse_key_block_count=sparse_key_block_count,
+        dense_suffix_length=valid_sequence_length - suffix_start,
+    )

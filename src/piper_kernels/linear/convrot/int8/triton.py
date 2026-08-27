@@ -25,6 +25,8 @@ from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 from . import _policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
+_MEAN_BLOCK_M = 256
+_MEAN_BLOCK_K = 128
 
 
 @triton.jit
@@ -94,6 +96,77 @@ def scaled_int8_matmul(
             other=0.0,
         )
     return accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
+
+
+@triton.jit
+def _dequantized_input_mean_partial_kernel(
+    input_ptr,
+    input_scale_ptr,
+    partial_ptr,
+    sequence_length,
+    valid_sequence_length,
+    input_features: tl.constexpr,
+    row_block_count: tl.constexpr,
+    block_m: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Sum one row block of the activation represented by prepared ConvRot storage."""
+    row_block = tl.program_id(0)
+    feature_block = tl.program_id(1)
+    batch = tl.program_id(2)
+    sequence_offsets = row_block * block_m + tl.arange(0, block_m)
+    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
+    valid = (sequence_offsets[:, None] < valid_sequence_length) & (
+        feature_offsets[None, :] < input_features
+    )
+    values = tl.load(
+        input_ptr
+        + (batch * sequence_length + sequence_offsets[:, None]) * input_features
+        + feature_offsets[None, :],
+        mask=valid,
+        other=0,
+    ).to(tl.float32)
+    scales = tl.load(
+        input_scale_ptr + batch * sequence_length + sequence_offsets,
+        mask=sequence_offsets < valid_sequence_length,
+        other=0.0,
+    )
+    partial = tl.sum(values * scales[:, None], axis=0)
+    tl.store(
+        partial_ptr + (batch * row_block_count + row_block) * input_features + feature_offsets,
+        partial,
+        mask=feature_offsets < input_features,
+    )
+
+
+@triton.jit
+def _dequantized_input_mean_reduce_kernel(
+    partial_ptr,
+    output_ptr,
+    valid_sequence_length,
+    input_features: tl.constexpr,
+    row_block_count: tl.constexpr,
+    reduction_rows: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Reduce prepared-input partial sums to one FP32 feature mean per batch."""
+    feature_block = tl.program_id(0)
+    batch = tl.program_id(1)
+    row_offsets = tl.arange(0, reduction_rows)
+    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
+    partial = tl.load(
+        partial_ptr
+        + (batch * row_block_count + row_offsets[:, None]) * input_features
+        + feature_offsets[None, :],
+        mask=(row_offsets[:, None] < row_block_count) & (feature_offsets[None, :] < input_features),
+        other=0.0,
+    )
+    mean = tl.sum(partial, axis=0) / valid_sequence_length
+    tl.store(
+        output_ptr + batch * input_features + feature_offsets,
+        mean,
+        mask=feature_offsets < input_features,
+    )
 
 
 @triton.jit
@@ -740,6 +813,78 @@ def _prepare_input_fake(
     return (
         input.new_empty((*input.shape[:-1], input_width), dtype=torch.int8),
         input.new_empty(input.shape[:-1], dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_dequantized_input_mean",
+    mutates_args=(),
+)
+def dequantized_input_mean(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    valid_sequence_length: int,
+) -> torch.Tensor:
+    """Return the FP32 sequence mean represented by prepared ConvRot storage."""
+    if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
+        raise ValueError("ConvRot mean input must be [batch,sequence,features] INT8")
+    batch, sequence_length, input_features = input_qdata.shape
+    if input_scale.shape != (batch, sequence_length) or input_scale.dtype is not torch.float32:
+        raise ValueError("ConvRot mean scale must be a batch/sequence FP32 matrix")
+    if input_qdata.device.type != "cuda" or input_scale.device != input_qdata.device:
+        raise ValueError("ConvRot mean operands must share a CUDA device")
+    if not input_qdata.is_contiguous() or not input_scale.is_contiguous():
+        raise ValueError("ConvRot mean operands must be contiguous")
+    if not 1 <= valid_sequence_length <= sequence_length:
+        raise ValueError("ConvRot mean valid sequence length must fit the physical sequence")
+
+    row_block_count = int(triton.cdiv(valid_sequence_length, _MEAN_BLOCK_M))
+    partial = torch.empty(
+        (batch, row_block_count, input_features),
+        device=input_qdata.device,
+        dtype=torch.float32,
+    )
+    output = torch.empty(
+        (batch, input_features),
+        device=input_qdata.device,
+        dtype=torch.float32,
+    )
+    _dequantized_input_mean_partial_kernel[
+        (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
+    ](
+        input_qdata,
+        input_scale,
+        partial,
+        sequence_length,
+        valid_sequence_length,
+        input_features=input_features,
+        row_block_count=row_block_count,
+        block_m=_MEAN_BLOCK_M,
+        block_k=_MEAN_BLOCK_K,
+        num_warps=8,
+    )
+    _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
+        partial,
+        output,
+        valid_sequence_length,
+        input_features=input_features,
+        row_block_count=row_block_count,
+        reduction_rows=triton.next_power_of_2(row_block_count),
+        block_k=_MEAN_BLOCK_K,
+        num_warps=8,
+    )
+    return output
+
+
+@dequantized_input_mean.register_fake
+def _dequantized_input_mean_fake(
+    input_qdata: torch.Tensor,
+    _input_scale: torch.Tensor,
+    _valid_sequence_length: int,
+) -> torch.Tensor:
+    return input_qdata.new_empty(
+        (input_qdata.shape[0], input_qdata.shape[2]),
+        dtype=torch.float32,
     )
 
 

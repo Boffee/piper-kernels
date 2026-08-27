@@ -103,6 +103,22 @@ eager, and training paths remain unchanged. Existing post-grad compiler passes i
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
+The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
+`convrot_sparse_piper_compile_options` from
+`piper_kernels.fusions.convrot_sparse_piper`. It installs the fusion pass before the ordinary
+ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
+bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
+`sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
+plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. It fails
+closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention
+APIs remain independent.
+
+The internal `piper_kernels.fusions.convrot_sage_qk` layer owns the reusable projection,
+RMSNorm, RoPE, signed-Hadamard, and Sage-style INT8 Q/K quantization device functions. Sparse
+Piper wraps those functions with its DSA-summary epilogues and keeps its tile-scaled V path
+separate. This boundary lets dense Piper and Sage consumers reuse the Q/K preparation without
+depending on sparse routing or sparse-Piper storage.
+
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
 the result. It preserves the ConvRot tensor and quantized storage identities, allowing
 offload integrations to keep their existing buffers. Repeated updates are lossy, so

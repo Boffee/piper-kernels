@@ -102,12 +102,40 @@ def packed_dsa_routes_from_plan(
         key_blocks,
         query_valid_counts=query_valid_counts,
     )
+    return packed_dsa_routes_from_summaries(
+        query_summary,
+        key_max,
+        key_min,
+        plan,
+    )
+
+
+def packed_dsa_routes_from_summaries(
+    query_summary: torch.Tensor,
+    key_max: torch.Tensor,
+    key_min: torch.Tensor,
+    plan: SparsePiperAttentionPlan,
+) -> PackedDsaRoutes:
+    """Select routes from existing exact Q64/K64 extrema summaries."""
+    _validate_dsa_summaries(query_summary, key_max, key_min)
+    heads = query_summary.shape[1]
+    key_block_count = key_max.shape[2]
+    if plan.keep_blocks.shape != (heads,):
+        raise ValueError("DSA plan head count does not match summaries")
+    if plan.key_block_count != key_block_count:
+        raise ValueError("DSA plan key block count does not match summaries")
+    if (
+        plan.keep_blocks.device != query_summary.device
+        or plan.head_offsets.device != query_summary.device
+    ):
+        raise ValueError("DSA plan must share the summary device")
+
     indices = torch.empty(
         (query_summary.shape[0], query_summary.shape[2], plan.routes_per_query),
         dtype=torch.uint16,
-        device=query_blocks.device,
+        device=query_summary.device,
     )
-    if _supports_sm120_selector(query_blocks, key_blocks):
+    if _supports_sm120_summary_selector(query_summary):
         assert _sm120_select_routes is not None
 
         for start in range(0, query_summary.shape[2], plan.query_chunk_blocks):
@@ -123,6 +151,34 @@ def packed_dsa_routes_from_plan(
     else:
         _select_portable_routes(query_summary, key_max, key_min, plan, indices)
     return PackedDsaRoutes(indices, plan.head_offsets, plan.keep_blocks)
+
+
+def _validate_dsa_summaries(
+    query_summary: torch.Tensor,
+    key_max: torch.Tensor,
+    key_min: torch.Tensor,
+) -> None:
+    if query_summary.ndim != 4 or key_max.ndim != 4 or key_min.shape != key_max.shape:
+        raise ValueError("DSA summaries must use rank-four Q/max/min tensors")
+    if query_summary.shape[:2] != key_max.shape[:2]:
+        raise ValueError("DSA summary batch/head dimensions must match")
+    if query_summary.shape[-1] != key_max.shape[-1]:
+        raise ValueError("DSA summary feature dimensions must match")
+    if query_summary.shape[2] < 1 or key_max.shape[2] < 1:
+        raise ValueError("DSA summaries must contain query and key blocks")
+    if query_summary.dtype is not torch.float32 or any(
+        summary.dtype is not query_summary.dtype for summary in (key_max, key_min)
+    ):
+        raise ValueError("DSA summaries must use FP32")
+    if any(summary.device != query_summary.device for summary in (key_max, key_min)):
+        raise ValueError("DSA summaries must share a device")
+    if not query_summary.is_contiguous():
+        raise ValueError("DSA query summaries must be contiguous")
+    if any(
+        summary.stride(-1) != 1 or summary.stride(-2) != summary.shape[-1]
+        for summary in (key_max, key_min)
+    ):
+        raise ValueError("DSA key summaries must have contiguous block features")
 
 
 def _block_summaries(
@@ -236,6 +292,11 @@ def _supports_sm120_selector(query_blocks: torch.Tensor, key_blocks: torch.Tenso
         and query_blocks.dtype in (torch.bfloat16, torch.float16)
         and key_blocks.dtype == query_blocks.dtype
     )
+
+
+def _supports_sm120_summary_selector(query_summary: torch.Tensor) -> bool:
+    target = AcceleratorTarget.from_device(query_summary.device)
+    return _sm120_select_routes is not None and target.is_cuda_capability(12, 0)
 
 
 def _validate_valid_counts(

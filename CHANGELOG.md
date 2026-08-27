@@ -15,6 +15,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   valid outputs. Unsupported devices use a portable quantized reference matching the SM120
   algorithm, while an exact-BF16 sparse oracle remains separate for quality measurement. Budget
   calibration, spatial packing, and model policy remain outside Kernels.
+- Added an inference-only compiled rewrite for compatible H3-style ConvRot Q/K/V projections,
+  D128 RMSNorm, split-half RoPE, and `sparse_piper_attention` on exact SM120. It shares input
+  preparation, emits quantized Q/K/V plus DSA summaries directly, and avoids materializing
+  the three BF16 projection outputs. Reusable projection, RMSNorm, RoPE, and Sage-style Q/K
+  quantization primitives live under `piper_kernels.fusions.convrot_sage_qk`; the explicit
+  `piper_kernels.fusions.convrot_sparse_piper` integration adds sparse DSA summaries and V
+  preparation, and installs its pass before the independent ConvRot compiler pass. Unsupported
+  graphs remain on the ordinary public operators.
 
 ## [0.3.0] - 2026-08-17
 
