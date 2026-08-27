@@ -28,6 +28,75 @@ _LARGE_MATMUL_GROUP_M_TILES = 16
 
 
 @triton.jit
+def scaled_int8_matmul(
+    input_ptr,
+    weight_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    offsets_m,
+    offsets_n,
+    m,
+    n,
+    k,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    aligned_tiles: tl.constexpr,
+):
+    """Return one FP32 ConvRot projection tile before its output epilogue.
+
+    Inputs are the prepared rowwise-INT8 activation and the rotated rowwise-INT8
+    weight. Their FP32 scales are applied after the exact INT32 dot product. The
+    caller owns bias handling, logical-dtype rounding, and the final store so the
+    same projection can feed either the ordinary linear epilogue or a fused
+    attention epilogue.
+    """
+    offsets_k = tl.arange(0, block_k)
+    offsets_m_i64 = offsets_m.to(tl.int64)
+    offsets_n_i64 = offsets_n.to(tl.int64)
+    offsets_k_i64 = offsets_k.to(tl.int64)
+    input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
+    weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
+
+    for k_offset in range(tl.cdiv(k, block_k)):
+        if aligned_tiles:
+            input_values = tl.load(input_pointers)
+            weight = tl.load(weight_pointers)
+        else:
+            remaining_k = k - k_offset * block_k
+            input_values = tl.load(
+                input_pointers,
+                mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
+                other=0,
+            )
+            weight = tl.load(
+                weight_pointers,
+                mask=(offsets_n[None, :] < n) & (offsets_k[:, None] < remaining_k),
+                other=0,
+            )
+        accumulator += tl.dot(input_values, weight)
+        input_pointers += block_k
+        weight_pointers += block_k
+
+    if aligned_tiles:
+        input_scale = tl.load(input_scale_ptr + offsets_m)
+        weight_scale = tl.load(weight_scale_ptr + offsets_n)
+    else:
+        input_scale = tl.load(
+            input_scale_ptr + offsets_m,
+            mask=offsets_m < m,
+            other=0.0,
+        )
+        weight_scale = tl.load(
+            weight_scale_ptr + offsets_n,
+            mask=offsets_n < n,
+            other=0.0,
+        )
+    return accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
+
+
+@triton.jit
 def _hadamard_stage_factorized(values, block_size: tl.constexpr, stride: tl.constexpr):
     """Apply one H4 factor with eight additions per independent quartet."""
     outer: tl.constexpr = block_size // (4 * stride)
@@ -289,49 +358,23 @@ def _int8_matmul_kernel(
         pid_n = tl.program_id(1)
     offsets_m = pid_m * block_m + tl.arange(0, block_m)
     offsets_n = pid_n * block_n + tl.arange(0, block_n)
-    offsets_k = tl.arange(0, block_k)
     offsets_m_i64 = offsets_m.to(tl.int64)
     offsets_n_i64 = offsets_n.to(tl.int64)
-    offsets_k_i64 = offsets_k.to(tl.int64)
-
-    input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
-    weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
-
-    for k_offset in range(tl.cdiv(k, block_k)):
-        if aligned_tiles:
-            input_values = tl.load(input_pointers)
-            weight = tl.load(weight_pointers)
-        else:
-            input_values = tl.load(
-                input_pointers,
-                mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < k - k_offset * block_k),
-                other=0,
-            )
-            weight = tl.load(
-                weight_pointers,
-                mask=(offsets_n[None, :] < n) & (offsets_k[:, None] < k - k_offset * block_k),
-                other=0,
-            )
-        accumulator += tl.dot(input_values, weight)
-        input_pointers += block_k
-        weight_pointers += block_k
-
-    if aligned_tiles:
-        input_scale = tl.load(input_scale_ptr + offsets_m)
-        weight_scale = tl.load(weight_scale_ptr + offsets_n)
-    else:
-        input_scale = tl.load(
-            input_scale_ptr + offsets_m,
-            mask=offsets_m < m,
-            other=0.0,
-        )
-        weight_scale = tl.load(
-            weight_scale_ptr + offsets_n,
-            mask=offsets_n < n,
-            other=0.0,
-        )
-    result = accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
+    result = scaled_int8_matmul(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        offsets_m,
+        offsets_n,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        aligned_tiles,
+    )
     if has_bias:
         if aligned_tiles:
             bias = tl.load(bias_ptr + offsets_n)
