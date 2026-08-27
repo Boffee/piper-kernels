@@ -42,7 +42,6 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     key_min_ptr,
     rows,
     sequence_length,
-    valid_sequence_length,
     row_block_offset,
     input_features: tl.constexpr,
     heads: tl.constexpr,
@@ -89,7 +88,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         block_n,
         block_k,
     ).to(tl.float32)
-    valid_rows = sequence_offsets < valid_sequence_length
+    valid_rows = sequence_offsets < sequence_length
     key = tl.where(valid_rows[:, None, None], key, 0.0)
     key_head_major = tl.permute(key, (1, 0, 2))
     grouped = tl.reshape(
@@ -104,9 +103,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     local_tile_offsets = tl.arange(0, block_m // _JIT_KEY_TILE_ROWS)
     tile_offsets = row_block * (block_m // _JIT_KEY_TILE_ROWS) + local_tile_offsets
     row_in_tile = tl.arange(0, _JIT_KEY_TILE_ROWS)
-    valid = (
-        tile_offsets[:, None] * _JIT_KEY_TILE_ROWS + row_in_tile[None, :] < valid_sequence_length
-    )
+    valid = tile_offsets[:, None] * _JIT_KEY_TILE_ROWS + row_in_tile[None, :] < sequence_length
     key_max = tl.max(
         tl.where(valid[None, :, :, None], grouped, -float("inf")),
         axis=2,
@@ -152,7 +149,6 @@ def _validate_inputs(
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
-    valid_sequence_length: int,
     norm_epsilon: float,
 ) -> tuple[int, int, int, int]:
     return validate_qk_projection_inputs(
@@ -163,7 +159,6 @@ def _validate_inputs(
         norm_weight,
         cos,
         sin,
-        valid_sequence_length=valid_sequence_length,
         norm_epsilon=norm_epsilon,
         block_rows=_KEY_TILE_ROWS,
         name="K",
@@ -185,7 +180,6 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
     *,
     batch: int,
     sequence_length: int,
-    valid_sequence_length: int,
     heads: int,
     rotary_dim: int,
     norm_epsilon: float,
@@ -211,7 +205,6 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             key_min,
             batch * sequence_length,
             sequence_length,
-            valid_sequence_length,
             row_block_offset,
             input_features=input_qdata.shape[2],
             heads=heads,
@@ -246,7 +239,6 @@ def _launch_key_projection(
     norm_weight: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    valid_sequence_length: int,
     norm_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, heads, rotary_dim = _validate_inputs(
@@ -257,7 +249,6 @@ def _launch_key_projection(
         norm_weight,
         cos,
         sin,
-        valid_sequence_length=valid_sequence_length,
         norm_epsilon=norm_epsilon,
     )
     key = torch.empty(
@@ -287,7 +278,6 @@ def _launch_key_projection(
         key_min,
         batch=batch,
         sequence_length=sequence_length,
-        valid_sequence_length=valid_sequence_length,
         heads=heads,
         rotary_dim=rotary_dim,
         norm_epsilon=norm_epsilon,
@@ -307,7 +297,6 @@ def _project_key_op(
     norm_weight: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    valid_sequence_length: int,
     norm_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key_projection(
@@ -318,7 +307,6 @@ def _project_key_op(
         norm_weight,
         cos,
         sin,
-        valid_sequence_length,
         norm_epsilon,
     )
 
@@ -332,7 +320,6 @@ def _project_key_op_fake(
     _norm_weight: torch.Tensor,
     _cos: torch.Tensor,
     _sin: torch.Tensor,
-    _valid_sequence_length: int,
     _norm_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape

@@ -97,19 +97,14 @@ def _random_operands(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("valid_sequence_length", [64, 59])
-def test_fused_key_projection_matches_the_fp32_composed_contract(
-    valid_sequence_length: int,
-) -> None:
+def test_fused_key_projection_matches_the_fp32_composed_contract() -> None:
     operands = _random_operands()
     options = {
-        "valid_sequence_length": valid_sequence_length,
         "norm_epsilon": 1e-5,
     }
 
     actual_key, actual_scale, actual_max, actual_min = key_fusion._project_key_op(
         *operands.as_tuple(),
-        options["valid_sequence_length"],
         options["norm_epsilon"],
     )
     expected = composed_key_projection(*operands.as_tuple(), **options)
@@ -124,7 +119,6 @@ def test_fused_key_projection_matches_the_fp32_composed_contract(
     torch.testing.assert_close(actual_scale, expected.key_scale, atol=1e-4, rtol=3e-3)
     torch.testing.assert_close(actual_max, expected.key_max, atol=0.125, rtol=0.01)
     torch.testing.assert_close(actual_min, expected.key_min, atol=0.125, rtol=0.01)
-    assert bool((actual_key[:, :, valid_sequence_length:] == 0).all())
 
 
 @pytest.mark.gpu
@@ -141,7 +135,6 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
 
     key, key_scale, key_max, key_min = key_fusion._project_key_op(
         *operands.as_tuple(),
-        181,
         1e-5,
     )
 
@@ -149,7 +142,6 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
     assert key_scale.shape == (2, 3, 3)
     assert key_max.shape == (2, 3, 3, 128)
     assert key_min.shape == key_max.shape
-    assert bool((key[:, :, 181:] == 0).all())
 
 
 @pytest.mark.gpu
@@ -158,7 +150,7 @@ def test_key_projection_custom_op_passes_opcheck() -> None:
     operands = _random_operands()
     result = torch.library.opcheck(
         key_fusion._project_key_op,
-        (*operands.as_tuple(), 59, 1e-5),
+        (*operands.as_tuple(), 1e-5),
     )
 
     assert set(result.values()) == {"SUCCESS"}
@@ -170,7 +162,7 @@ def test_key_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return key_fusion._project_key_op(*args, 59, 1e-5)
+        return key_fusion._project_key_op(*args, 1e-5)
 
     expected = prepare(*operands.as_tuple())
     compiled = torch.compile(prepare, backend="eager", fullgraph=True)
@@ -188,7 +180,6 @@ def test_key_projection_fake_kernels_propagate_shapes() -> None:
         torch.empty((128,), device="meta", dtype=torch.bfloat16),
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         torch.empty((128, 96), device="meta", dtype=torch.float32),
-        113,
         1e-5,
     )
 

@@ -193,7 +193,6 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
-    valid_sequence_length: int,
     norm_epsilon: float,
     block_rows: int,
     name: str,
@@ -216,7 +215,7 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
     if norm_weight.shape != (_HEAD_DIM,) or norm_weight.dtype is not torch.bfloat16:
         raise ValueError(f"{name} projection RMSNorm weight must be a BF16 D128 vector")
     if cos.ndim != 2 or sin.shape != cos.shape or cos.shape[0] != sequence_length:
-        raise ValueError(f"{name} projection RoPE cos/sin must match the physical sequence")
+        raise ValueError(f"{name} projection RoPE cos/sin must match the sequence")
     rotary_dim = cos.shape[1]
     if rotary_dim < 2 or rotary_dim > _HEAD_DIM or rotary_dim % 2:
         raise ValueError(f"{name} projection rotary dimension must be even and fit D128")
@@ -232,11 +231,7 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
     ):
         raise ValueError(f"{name} projection operands must be contiguous strided tensors")
     if sequence_length < block_rows or sequence_length % block_rows:
-        raise ValueError(f"{name} projection physical sequence must be {block_rows}-row aligned")
-    if not sequence_length - block_rows < valid_sequence_length <= sequence_length:
-        raise ValueError(
-            f"{name} projection supports padding only in the final {block_rows}-row block"
-        )
+        raise ValueError(f"{name} projection sequence must be {block_rows}-row aligned")
     if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
         raise ValueError(f"{name} projection RMSNorm epsilon must be finite and positive")
     return batch, sequence_length, heads, rotary_dim

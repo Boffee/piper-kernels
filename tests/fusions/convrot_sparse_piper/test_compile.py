@@ -25,8 +25,7 @@ class _SparseProjectionAttention(torch.nn.Module):
 
     batch = 1
     sequence_length = 192
-    valid_sequence_length = 181
-    suffix_start = 128
+    sparse_key_blocks = 2
     input_features = 256
     heads = 2
     head_dim = 128
@@ -94,7 +93,6 @@ class _SparseProjectionAttention(torch.nn.Module):
         self.register_buffer("sin", sin)
         self.plan = prepare_sparse_piper_attention_plan(
             torch.full((self.heads,), 2, device="cuda", dtype=torch.int32),
-            sparse_key_blocks=self.suffix_start // 64,
         )
 
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
@@ -131,22 +129,75 @@ class _SparseProjectionAttention(torch.nn.Module):
             key,
             value,
             self.plan,
-            suffix_start=self.suffix_start,
-            valid_sequence_length=self.valid_sequence_length,
+            sparse_key_blocks=self.sparse_key_blocks,
         )
 
 
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
     def __init__(self) -> None:
         self.targets: list[object] = []
+        self.calls = 0
         self._uuid = uuid.uuid4().bytes
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         assert is_inference
+        self.calls += 1
         self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
 
     def uuid(self) -> bytes:
         return self._uuid
+
+
+class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
+    def _dynamic_norm_rope(
+        self,
+        projected: torch.Tensor,
+        norm: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, sequence, _features = projected.shape
+        normalized = F.rms_norm(
+            projected.view(batch, sequence, self.heads, self.head_dim),
+            (self.head_dim,),
+            norm,
+            1e-5,
+        )
+        rotary = normalized[..., : self.rotary_dim]
+        first, second = rotary.chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        rotary = rotary * cos.to(torch.bfloat16)[None, :, None, :]
+        rotary = rotary + rotated * sin.to(torch.bfloat16)[None, :, None, :]
+        return torch.cat((rotary, normalized[..., self.rotary_dim :]), dim=-1).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        sparse_key_blocks: int,
+    ) -> torch.Tensor:
+        batch, sequence, _features = hidden_states.shape
+        query = self._dynamic_norm_rope(
+            self.query(hidden_states),
+            self.query_norm,
+            cos,
+            sin,
+        )
+        key = self._dynamic_norm_rope(
+            self.key(hidden_states),
+            self.key_norm,
+            cos,
+            sin,
+        )
+        value = self.value(hidden_states).view(batch, sequence, self.heads, self.head_dim)
+        return sparse_piper_attention(
+            query,
+            key,
+            value,
+            self.plan,
+            sparse_key_blocks=sparse_key_blocks,
+        )
 
 
 def test_compile_options_install_fusion_before_convrot() -> None:
@@ -204,9 +255,8 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
             options=options,
         )(hidden_states)
 
-    valid = model.valid_sequence_length
-    difference = actual[:, :valid].float() - expected[:, :valid].float()
-    relative_l2 = difference.norm() / expected[:, :valid].float().norm()
+    difference = actual.float() - expected.float()
+    relative_l2 = difference.norm() / expected.float().norm()
     assert relative_l2 < 0.025
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     assert (
@@ -230,6 +280,68 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
     )
     assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_fused_projection_reuses_one_dynamic_shape_and_sparse_prefix_graph() -> None:
+    torch.manual_seed(709)
+    model = _DynamicSparseProjectionAttention().eval()
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    materialized = torch.compile(
+        model,
+        dynamic=True,
+        fullgraph=True,
+    )
+    compiled = torch.compile(
+        model,
+        dynamic=True,
+        fullgraph=True,
+        options=options,
+    )
+
+    with torch.no_grad():
+        for sequence, sparse_key_blocks in ((192, 2), (256, 2), (256, 3)):
+            hidden_states = torch.randn(
+                model.batch,
+                sequence,
+                model.input_features,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            angles = torch.rand(
+                sequence,
+                model.rotary_dim,
+                device="cuda",
+                dtype=torch.float32,
+            ).mul_(2 * torch.pi)
+            cos = angles.cos().contiguous()
+            sin = angles.sin().contiguous()
+            expected = materialized(hidden_states, cos, sin, sparse_key_blocks)
+            output = compiled(
+                hidden_states,
+                cos,
+                sin,
+                sparse_key_blocks,
+            )
+            assert output.shape == (model.batch, sequence, model.heads, model.head_dim)
+            assert bool(torch.isfinite(output).all())
+            difference = output.float() - expected.float()
+            relative_l2 = difference.norm() / expected.float().norm()
+            assert relative_l2 < 0.025
+
+    assert capture.calls == 1
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
+        == 1
+    )
 
 
 @pytest.mark.gpu

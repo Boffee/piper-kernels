@@ -26,8 +26,8 @@ class SparsePiperAttentionPlan:
 
     keep_blocks: torch.Tensor
     head_offsets: torch.Tensor
-    key_block_count: int
     routes_per_query: int
+    max_keep_blocks: int
     query_chunk_blocks: int
 
 
@@ -43,20 +43,17 @@ class PackedDsaRoutes:
 def prepare_dsa_route_plan(
     keep_blocks: torch.Tensor,
     *,
-    key_block_count: int,
     query_chunk_blocks: int = 384,
 ) -> SparsePiperAttentionPlan:
     """Normalize per-head budgets and precompute packed-route offsets."""
     if query_chunk_blocks < 1:
         raise ValueError("DSA query chunk size must be positive")
-    if not 1 <= key_block_count <= _UINT16_ROUTE_CAPACITY:
-        raise ValueError("DSA requires between 1 and 65,536 sparse key blocks")
     if keep_blocks.ndim != 1 or keep_blocks.numel() < 1:
         raise ValueError("DSA keep counts must be a nonempty vector")
     _validate_keep_blocks(
         keep_blocks,
         heads=keep_blocks.numel(),
-        key_blocks=key_block_count,
+        key_blocks=_UINT16_ROUTE_CAPACITY,
         device=keep_blocks.device,
     )
     normalized = keep_blocks.to(dtype=torch.int32).contiguous()
@@ -70,8 +67,8 @@ def prepare_dsa_route_plan(
     return SparsePiperAttentionPlan(
         keep_blocks=normalized,
         head_offsets=torch.tensor(offset_values, device=keep_blocks.device, dtype=torch.int32),
-        key_block_count=key_block_count,
         routes_per_query=offset_values[-1],
+        max_keep_blocks=max(keep_values),
         query_chunk_blocks=query_chunk_blocks,
     )
 
@@ -80,8 +77,6 @@ def packed_dsa_routes_from_plan(
     query_blocks: torch.Tensor,
     key_blocks: torch.Tensor,
     plan: SparsePiperAttentionPlan,
-    *,
-    query_valid_counts: torch.Tensor | None = None,
 ) -> PackedDsaRoutes:
     """Select exact FP32 DSA routes directly into packed UINT16 storage."""
     _validate_dsa_blocks(query_blocks, key_blocks)
@@ -89,19 +84,14 @@ def packed_dsa_routes_from_plan(
     key_block_count = key_blocks.shape[2]
     if plan.keep_blocks.shape != (heads,):
         raise ValueError("DSA plan head count does not match Q/K blocks")
-    if plan.key_block_count != key_block_count:
-        raise ValueError("DSA plan key block count does not match K blocks")
+    _validate_sparse_key_capacity(plan, key_block_count)
     if (
         plan.keep_blocks.device != query_blocks.device
         or plan.head_offsets.device != query_blocks.device
     ):
         raise ValueError("DSA plan must share the Q/K device")
 
-    query_summary, key_max, key_min = _block_summaries(
-        query_blocks,
-        key_blocks,
-        query_valid_counts=query_valid_counts,
-    )
+    query_summary, key_max, key_min = _block_summaries(query_blocks, key_blocks)
     return packed_dsa_routes_from_summaries(
         query_summary,
         key_max,
@@ -122,8 +112,7 @@ def packed_dsa_routes_from_summaries(
     key_block_count = key_max.shape[2]
     if plan.keep_blocks.shape != (heads,):
         raise ValueError("DSA plan head count does not match summaries")
-    if plan.key_block_count != key_block_count:
-        raise ValueError("DSA plan key block count does not match summaries")
+    _validate_sparse_key_capacity(plan, key_block_count)
     if (
         plan.keep_blocks.device != query_summary.device
         or plan.head_offsets.device != query_summary.device
@@ -184,22 +173,12 @@ def _validate_dsa_summaries(
 def _block_summaries(
     query_blocks: torch.Tensor,
     key_blocks: torch.Tensor,
-    *,
-    query_valid_counts: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if _supports_sm120_selector(query_blocks, key_blocks):
         assert _sm120_block_summaries is not None
 
-        return _sm120_block_summaries(
-            query_blocks,
-            key_blocks,
-            query_valid_counts=query_valid_counts,
-        )
-    return _portable_block_summaries(
-        query_blocks,
-        key_blocks,
-        query_valid_counts=query_valid_counts,
-    )
+        return _sm120_block_summaries(query_blocks, key_blocks)
+    return _portable_block_summaries(query_blocks, key_blocks)
 
 
 def _dsa_scores(
@@ -245,36 +224,12 @@ def _select_portable_routes(
 def _portable_block_summaries(
     query_blocks: torch.Tensor,
     key_blocks: torch.Tensor,
-    *,
-    query_valid_counts: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    _validate_valid_counts(
-        query_valid_counts,
-        block_count=query_blocks.shape[2],
-        block_rows=query_blocks.shape[3],
-        device=query_blocks.device,
-        name="query",
-    )
     query = query_blocks.float()
     key = key_blocks.float()
-    query_max, query_min = _masked_extrema(query, query_valid_counts)
+    query_max, query_min = query.amax(dim=-2), query.amin(dim=-2)
     key_max, key_min = key.amax(dim=-2), key.amin(dim=-2)
     return query_max + query_min, key_max, key_min
-
-
-def _masked_extrema(
-    blocks: torch.Tensor,
-    valid_counts: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if valid_counts is None:
-        return blocks.amax(dim=-2), blocks.amin(dim=-2)
-    valid = (
-        torch.arange(blocks.shape[3], device=blocks.device)[None, None, None, :]
-        < (valid_counts[None, None, :, None])
-    )
-    maximum = blocks.masked_fill(~valid[..., None], -float("inf")).amax(dim=-2)
-    minimum = blocks.masked_fill(~valid[..., None], float("inf")).amin(dim=-2)
-    return maximum, minimum
 
 
 def _supports_sm120_selector(query_blocks: torch.Tensor, key_blocks: torch.Tensor) -> bool:
@@ -297,22 +252,6 @@ def _supports_sm120_selector(query_blocks: torch.Tensor, key_blocks: torch.Tenso
 def _supports_sm120_summary_selector(query_summary: torch.Tensor) -> bool:
     target = AcceleratorTarget.from_device(query_summary.device)
     return _sm120_select_routes is not None and target.is_cuda_capability(12, 0)
-
-
-def _validate_valid_counts(
-    counts: torch.Tensor | None,
-    *,
-    block_count: int,
-    block_rows: int,
-    device: torch.device,
-    name: str,
-) -> None:
-    if counts is None:
-        return
-    if counts.shape != (block_count,) or counts.dtype != torch.int32 or counts.device != device:
-        raise ValueError(f"DSA {name} valid counts must be a device int32 block vector")
-    if bool(((counts < 1) | (counts > block_rows)).any()):
-        raise ValueError(f"DSA {name} valid counts must select rows within each block")
 
 
 def _validate_dsa_blocks(query_blocks: torch.Tensor, key_blocks: torch.Tensor) -> None:
@@ -347,3 +286,13 @@ def _validate_keep_blocks(
         raise ValueError("DSA keep counts must share the query/key device")
     if bool(((keep_blocks < 1) | (keep_blocks > key_blocks)).any()):
         raise ValueError("DSA keep counts must select between one and every key block")
+
+
+def _validate_sparse_key_capacity(
+    plan: SparsePiperAttentionPlan,
+    key_blocks: int,
+) -> None:
+    if not 1 <= key_blocks <= _UINT16_ROUTE_CAPACITY:
+        raise ValueError("DSA requires between 1 and 65,536 sparse key blocks")
+    if plan.max_keep_blocks > key_blocks:
+        raise ValueError("DSA keep counts cannot exceed the current sparse key block count")

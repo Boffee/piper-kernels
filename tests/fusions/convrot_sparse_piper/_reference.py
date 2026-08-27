@@ -67,19 +67,6 @@ def _materialized_fp32_qk(
     return torch.cat((rotary, normalized[..., rotary_dim:]), dim=-1).transpose(1, 2).contiguous()
 
 
-def _block_valid_mask(
-    sequence_length: int,
-    valid_sequence_length: int,
-    device: torch.device,
-) -> torch.Tensor:
-    row_offsets = torch.arange(_BLOCK_ROWS, device=device)
-    valid_counts = (
-        valid_sequence_length
-        - torch.arange(sequence_length // _BLOCK_ROWS, device=device) * _BLOCK_ROWS
-    ).clamp(0, _BLOCK_ROWS)
-    return (row_offsets[None, :] < valid_counts[:, None])[None, None, :, :, None]
-
-
 def composed_query_projection(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -89,7 +76,6 @@ def composed_query_projection(
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
-    valid_sequence_length: int,
     norm_epsilon: float,
     softmax_scale: float,
 ) -> ProjectedQuery:
@@ -106,14 +92,11 @@ def composed_query_projection(
         norm_epsilon,
     )
     blocks = query.unflatten(2, (sequence_length // _BLOCK_ROWS, _BLOCK_ROWS)).float()
-    valid = _block_valid_mask(sequence_length, valid_sequence_length, query.device)
-    summary = blocks.masked_fill(~valid, -float("inf")).amax(dim=3)
-    summary += blocks.masked_fill(~valid, float("inf")).amin(dim=3)
+    summary = blocks.amax(dim=3) + blocks.amin(dim=3)
     query_int8, query_scale = qk_quantization.prepare_query(
-        query[:, :, :valid_sequence_length],
+        query,
         softmax_scale,
         grouped=True,
-        storage_query_length=sequence_length,
     )
     return ProjectedQuery(query_int8, query_scale, summary)
 
@@ -127,7 +110,6 @@ def composed_key_projection(
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
-    valid_sequence_length: int,
     norm_epsilon: float,
 ) -> ProjectedKey:
     """Materialize the FP32 operations fused by one-pass key projection."""
@@ -144,15 +126,14 @@ def composed_key_projection(
         norm_epsilon,
     )
     key_int8, key_scale = qk_quantization.prepare_key(
-        key[:, :, :valid_sequence_length],
+        key,
         torch.zeros((batch, heads, _HEAD_DIM), device=key.device, dtype=torch.float32),
         grouped=True,
         storage_key_length=sequence_length,
     )
     blocks = key.unflatten(2, (sequence_length // _BLOCK_ROWS, _BLOCK_ROWS)).float()
-    valid = _block_valid_mask(sequence_length, valid_sequence_length, key.device)
-    key_max = blocks.masked_fill(~valid, -float("inf")).amax(dim=3)
-    key_min = blocks.masked_fill(~valid, float("inf")).amin(dim=3)
+    key_max = blocks.amax(dim=3)
+    key_min = blocks.amin(dim=3)
     return ProjectedKey(key_int8, key_scale, key_max, key_min)
 
 
@@ -162,8 +143,6 @@ def composed_value_projection(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    *,
-    valid_sequence_length: int,
 ) -> ProjectedValue:
     """Materialize the FP32 operations fused by one-pass value projection."""
     batch, sequence_length, _input_features = input_qdata.shape
@@ -185,12 +164,7 @@ def composed_value_projection(
         2,
         (sequence_length // _BLOCK_ROWS, _BLOCK_ROWS),
     )
-    valid = _block_valid_mask(sequence_length, valid_sequence_length, value.device)
-    centered = torch.where(
-        valid,
-        value.float() - value_mean[:, :, None, None, :],
-        0.0,
-    )
+    centered = value.float() - value_mean[:, :, None, None, :]
     value_scale = centered.abs().amax(dim=(-1, -2)) / 127.0 + 1e-7
     normalized = centered / value_scale[..., None, None]
     quantized = (

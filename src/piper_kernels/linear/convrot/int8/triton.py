@@ -104,7 +104,6 @@ def _dequantized_input_mean_partial_kernel(
     input_scale_ptr,
     partial_ptr,
     sequence_length,
-    valid_sequence_length,
     input_features: tl.constexpr,
     row_block_count: tl.constexpr,
     block_m: tl.constexpr,
@@ -116,7 +115,7 @@ def _dequantized_input_mean_partial_kernel(
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
     feature_offsets = feature_block * block_k + tl.arange(0, block_k)
-    valid = (sequence_offsets[:, None] < valid_sequence_length) & (
+    valid = (sequence_offsets[:, None] < sequence_length) & (
         feature_offsets[None, :] < input_features
     )
     values = tl.load(
@@ -128,7 +127,7 @@ def _dequantized_input_mean_partial_kernel(
     ).to(tl.float32)
     scales = tl.load(
         input_scale_ptr + batch * sequence_length + sequence_offsets,
-        mask=sequence_offsets < valid_sequence_length,
+        mask=sequence_offsets < sequence_length,
         other=0.0,
     )
     partial = tl.sum(values * scales[:, None], axis=0)
@@ -143,7 +142,7 @@ def _dequantized_input_mean_partial_kernel(
 def _dequantized_input_mean_reduce_kernel(
     partial_ptr,
     output_ptr,
-    valid_sequence_length,
+    sequence_length,
     input_features: tl.constexpr,
     row_block_count: tl.constexpr,
     reduction_rows: tl.constexpr,
@@ -161,7 +160,7 @@ def _dequantized_input_mean_reduce_kernel(
         mask=(row_offsets[:, None] < row_block_count) & (feature_offsets[None, :] < input_features),
         other=0.0,
     )
-    mean = tl.sum(partial, axis=0) / valid_sequence_length
+    mean = tl.sum(partial, axis=0) / sequence_length
     tl.store(
         output_ptr + batch * input_features + feature_offsets,
         mean,
@@ -823,7 +822,6 @@ def _prepare_input_fake(
 def dequantized_input_mean(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    valid_sequence_length: int,
 ) -> torch.Tensor:
     """Return the FP32 sequence mean represented by prepared ConvRot storage."""
     if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
@@ -835,10 +833,7 @@ def dequantized_input_mean(
         raise ValueError("ConvRot mean operands must share a CUDA device")
     if not input_qdata.is_contiguous() or not input_scale.is_contiguous():
         raise ValueError("ConvRot mean operands must be contiguous")
-    if not 1 <= valid_sequence_length <= sequence_length:
-        raise ValueError("ConvRot mean valid sequence length must fit the physical sequence")
-
-    row_block_count = int(triton.cdiv(valid_sequence_length, _MEAN_BLOCK_M))
+    row_block_count = int(triton.cdiv(sequence_length, _MEAN_BLOCK_M))
     partial = torch.empty(
         (batch, row_block_count, input_features),
         device=input_qdata.device,
@@ -856,7 +851,6 @@ def dequantized_input_mean(
         input_scale,
         partial,
         sequence_length,
-        valid_sequence_length,
         input_features=input_features,
         row_block_count=row_block_count,
         block_m=_MEAN_BLOCK_M,
@@ -866,7 +860,7 @@ def dequantized_input_mean(
     _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
         partial,
         output,
-        valid_sequence_length,
+        sequence_length,
         input_features=input_features,
         row_block_count=row_block_count,
         reduction_rows=triton.next_power_of_2(row_block_count),
@@ -880,7 +874,6 @@ def dequantized_input_mean(
 def _dequantized_input_mean_fake(
     input_qdata: torch.Tensor,
     _input_scale: torch.Tensor,
-    _valid_sequence_length: int,
 ) -> torch.Tensor:
     return input_qdata.new_empty(
         (input_qdata.shape[0], input_qdata.shape[2]),

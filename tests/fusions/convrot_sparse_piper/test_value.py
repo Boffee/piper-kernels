@@ -73,28 +73,22 @@ def _random_operands(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("valid_sequence_length", [64, 59])
-def test_fused_value_projection_matches_the_fp32_composed_contract(
-    valid_sequence_length: int,
-) -> None:
+def test_fused_value_projection_matches_the_fp32_composed_contract() -> None:
     operands = _random_operands()
     input_mean = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
-        valid_sequence_length,
     )
 
     actual_value, actual_scale, actual_mean = value_fusion._project_value_op(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
-        valid_sequence_length,
     )
     expected = composed_value_projection(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
-        valid_sequence_length=valid_sequence_length,
     )
 
     assert actual_value.shape == (1, 2, 128, 64)
@@ -111,7 +105,6 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
         rtol=2e-5,
     )
     torch.testing.assert_close(actual_mean, expected.value_mean, atol=2e-6, rtol=2e-6)
-    assert bool((actual_value[..., valid_sequence_length:] == 0).all())
 
 
 @pytest.mark.gpu
@@ -126,19 +119,16 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
     input_mean = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
-        181,
     )
     value, value_scale, value_mean = value_fusion._project_value_op(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
-        181,
     )
 
     assert value.shape == (2, 3, 128, 192)
     assert value_scale.shape == (2, 3, 3, 1)
     assert value_mean.shape == (2, 3, 128)
-    assert bool((value[..., 181:] == 0).all())
 
 
 @pytest.mark.gpu
@@ -148,20 +138,18 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
     input_mean = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
-        181,
     )
     _value, value_scale, value_mean = value_fusion._project_value_op(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
-        181,
     )
     materialized = convrot_backend.linear_prepared(
         *operands.as_tuple(),
         None,
         torch.bfloat16,
     ).view(1, 192, 3, 128)
-    exact_mean = materialized[:, :181].float().mean(dim=1)
+    exact_mean = materialized.float().mean(dim=1)
     smallest_tile_scale = value_scale[..., 0].amin(dim=-1) / 255.0
 
     assert bool(((value_mean - exact_mean).abs() <= smallest_tile_scale[:, :, None] * 0.05).all())
@@ -175,11 +163,8 @@ def test_dequantized_input_mean_matches_the_represented_activation() -> None:
     actual = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
-        181,
     )
-    expected = (operands.input_qdata[:, :181].float() * operands.input_scale[:, :181, None]).mean(
-        dim=1
-    )
+    expected = (operands.input_qdata.float() * operands.input_scale[..., None]).mean(dim=1)
 
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
@@ -191,12 +176,11 @@ def test_value_projection_custom_ops_pass_opcheck() -> None:
     input_mean = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
-        59,
     )
 
     mean_result = torch.library.opcheck(
         convrot_backend.dequantized_input_mean,
-        (operands.input_qdata, operands.input_scale, 59),
+        (operands.input_qdata, operands.input_scale),
     )
     value_result = torch.library.opcheck(
         value_fusion._project_value_op,
@@ -206,7 +190,6 @@ def test_value_projection_custom_ops_pass_opcheck() -> None:
             input_mean,
             operands.weight_qdata,
             operands.weight_scale,
-            59,
         ),
     )
 
@@ -220,14 +203,13 @@ def test_value_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        input_mean = convrot_backend.dequantized_input_mean(args[0], args[1], 59)
+        input_mean = convrot_backend.dequantized_input_mean(args[0], args[1])
         return value_fusion._project_value_op(
             args[0],
             args[1],
             input_mean,
             args[2],
             args[3],
-            59,
         )
 
     expected = prepare(*operands.as_tuple())
@@ -243,14 +225,13 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
     weight_qdata = torch.empty((3 * 128, 272), device="meta", dtype=torch.int8)
     weight_scale = torch.empty((3 * 128, 1), device="meta", dtype=torch.float32)
 
-    input_mean = convrot_backend.dequantized_input_mean(input_qdata, input_scale, 113)
+    input_mean = convrot_backend.dequantized_input_mean(input_qdata, input_scale)
     value, value_scale, value_mean = value_fusion._project_value_op(
         input_qdata,
         input_scale,
         input_mean,
         weight_qdata,
         weight_scale,
-        113,
     )
 
     assert input_mean.shape == (2, 272)

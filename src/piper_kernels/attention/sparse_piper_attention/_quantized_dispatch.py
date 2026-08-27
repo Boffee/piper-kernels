@@ -37,9 +37,9 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
     value_mean: torch.Tensor,
     keep_blocks: torch.Tensor,
     head_offsets: torch.Tensor,
-    suffix_start: int,
-    valid_sequence_length: int,
+    sparse_key_blocks: int,
     routes_per_query: int,
+    max_keep_blocks: int,
     query_chunk_blocks: int,
 ) -> torch.Tensor:
     if _prepare_sm120_quantized_attention is None or _launch_sm120_attention is None:
@@ -47,14 +47,14 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
     plan = SparsePiperAttentionPlan(
         keep_blocks=keep_blocks,
         head_offsets=head_offsets,
-        key_block_count=suffix_start // 64,
         routes_per_query=routes_per_query,
+        max_keep_blocks=max_keep_blocks,
         query_chunk_blocks=query_chunk_blocks,
     )
     routes = packed_dsa_routes_from_summaries(
         query_summary,
-        key_max[:, :, : plan.key_block_count],
-        key_min[:, :, : plan.key_block_count],
+        key_max[:, :, :sparse_key_blocks],
+        key_min[:, :, :sparse_key_blocks],
         plan,
     )
     batch, heads, sequence_length, head_dim = query.shape
@@ -74,8 +74,7 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
         routes.indices,
         routes.keep_blocks,
         routes.head_offsets,
-        suffix_start=suffix_start,
-        valid_sequence_length=valid_sequence_length,
+        sparse_key_blocks=sparse_key_blocks,
         routes_per_query=routes_per_query,
         attention_output=output.transpose(1, 2),
     )
@@ -97,9 +96,9 @@ def _sm120_sparse_piper_attention_from_quantized_fake(
     _value_mean: torch.Tensor,
     _keep_blocks: torch.Tensor,
     _head_offsets: torch.Tensor,
-    _suffix_start: int,
-    _valid_sequence_length: int,
+    _sparse_key_blocks: int,
     _routes_per_query: int,
+    _max_keep_blocks: int,
     _query_chunk_blocks: int,
 ) -> torch.Tensor:
     return query.new_empty(

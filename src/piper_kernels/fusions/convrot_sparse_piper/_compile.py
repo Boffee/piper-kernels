@@ -18,6 +18,7 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
+from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import (
@@ -31,7 +32,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import key, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v1"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v3"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _HEAD_DIM = 128
 _QUERY_BLOCK_ROWS = 64
@@ -200,16 +201,28 @@ def _sparse_piper_projection_pattern() -> CallFunction:
         value,
         KeywordArg("sparse_keep_blocks"),
         KeywordArg("sparse_head_offsets"),
-        KeywordArg("sparse_suffix_start"),
-        KeywordArg("sparse_valid_sequence_length"),
+        KeywordArg("sparse_key_blocks"),
         KeywordArg("sparse_softmax_scale"),
         KeywordArg("sparse_routes_per_query"),
+        KeywordArg("sparse_max_keep_blocks"),
         KeywordArg("sparse_query_chunk_blocks"),
     )
 
 
 def _static_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _integer_scalar(value: object) -> Argument | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, torch.SymInt)):
+        return value
+    if isinstance(value, torch.fx.Node):
+        metadata = value.meta.get("val")
+        if isinstance(metadata, (int, torch.SymInt)) and not isinstance(metadata, bool):
+            return value
+    return None
 
 
 def _positive_float(value: object) -> float | None:
@@ -219,7 +232,7 @@ def _positive_float(value: object) -> float | None:
     return converted if math.isfinite(converted) and converted > 0 else None
 
 
-def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912
+def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
     nodes = (
         "sparse_input",
         "sparse_q_weight_qdata",
@@ -252,32 +265,49 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
 
     input_value = metadata["sparse_input"]
     assert input_value is not None
+    output_value = preparation_sharing.tensor_metadata(match.output_node())
     shape = match.kwargs["sparse_attention_shape"]
-    if not isinstance(shape, (list, tuple)) or len(shape) != 4:
-        return False
-    dimensions = tuple(_static_int(value) for value in shape)
-    if any(value is None for value in dimensions):
-        return False
-    batch, sequence_length, heads, head_dim = dimensions
-    assert batch is not None
-    assert sequence_length is not None
-    assert heads is not None
-    assert head_dim is not None
     if (
         input_value.ndim != 3
-        or input_value.dtype is not torch.bfloat16
+        or output_value is None
+        or output_value.ndim != 4
+        or not isinstance(shape, (list, tuple))
+        or len(shape) != 4
+    ):
+        return False
+    input_features = _static_int(input_value.shape[-1])
+    q_weight = metadata["sparse_q_weight_qdata"]
+    assert q_weight is not None
+    output_features = _static_int(q_weight.shape[0])
+    if input_features is None or output_features is None or output_features % _HEAD_DIM:
+        return False
+    _batch, sequence_length = input_value.shape[:2]
+    heads = output_features // _HEAD_DIM
+    shape_heads = _static_int(shape[2])
+    shape_head_dim = _static_int(shape[3])
+    output_shape = output_value.shape
+    if (
+        input_value.dtype is not torch.bfloat16
         or input_value.device.type != "cuda"
-        or tuple(input_value.shape[:2]) != (batch, sequence_length)
-        or head_dim != _HEAD_DIM
-        or sequence_length < _QUERY_BLOCK_ROWS
-        or sequence_length % _QUERY_BLOCK_ROWS
+        or output_value.dtype is not torch.bfloat16
+        or output_value.device != input_value.device
+        or preparation_sharing.dimension_key(output_shape[0])
+        != preparation_sharing.dimension_key(_batch)
+        or preparation_sharing.dimension_key(output_shape[1])
+        != preparation_sharing.dimension_key(sequence_length)
+        or output_shape[2:] != (heads, _HEAD_DIM)
+        or shape_heads != heads
+        or shape_head_dim != _HEAD_DIM
+        or (
+            isinstance(sequence_length, int)
+            and (sequence_length < _QUERY_BLOCK_ROWS or sequence_length % _QUERY_BLOCK_ROWS)
+        )
     ):
         return False
     target = AcceleratorTarget.from_device(input_value.device)
     if not target.is_cuda_capability(12, 0):
         return False
 
-    input_features = _static_int(input_value.shape[-1])
     group_size = _static_int(match.kwargs["sparse_group_size"])
     if input_features is None or group_size is None or group_size < 1:
         return False
@@ -288,9 +318,9 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         assert scale is not None
         if (
             weight.dtype is not torch.int8
-            or tuple(weight.shape) != (heads * head_dim, input_features)
+            or tuple(weight.shape) != (heads * _HEAD_DIM, input_features)
             or scale.dtype is not torch.float32
-            or tuple(scale.shape) != (heads * head_dim, 1)
+            or tuple(scale.shape) != (heads * _HEAD_DIM, 1)
             or weight.device != input_value.device
             or scale.device != input_value.device
         ):
@@ -301,7 +331,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         assert norm is not None
         if (
             norm.dtype is not torch.bfloat16
-            or tuple(norm.shape) != (head_dim,)
+            or tuple(norm.shape) != (_HEAD_DIM,)
             or norm.device != input_value.device
         ):
             return False
@@ -325,31 +355,45 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         rotary_dim is None
         or half_rotary_dim is None
         or rotary_dim < 2
-        or rotary_dim > head_dim
+        or rotary_dim > _HEAD_DIM
         or rotary_dim % 2
         or half_rotary_dim != rotary_dim // 2
         or cos.dtype is not torch.float32
         or sin.dtype is not torch.float32
-        or tuple(cos.shape) != (sequence_length, rotary_dim)
-        or sin.shape != cos.shape
+        or cos.ndim != 2
+        or sin.ndim != 2
+        or cos.shape[1] != rotary_dim
+        or sin.shape[1] != rotary_dim
         or cos.device != input_value.device
         or sin.device != input_value.device
     ):
         return False
 
-    suffix_start = _static_int(match.kwargs["sparse_suffix_start"])
-    valid_sequence_length = _static_int(match.kwargs["sparse_valid_sequence_length"])
-    routes_per_query = _static_int(match.kwargs["sparse_routes_per_query"])
+    sparse_key_blocks = _integer_scalar(match.kwargs["sparse_key_blocks"])
+    routes_per_query = _integer_scalar(match.kwargs["sparse_routes_per_query"])
+    max_keep_blocks = _integer_scalar(match.kwargs["sparse_max_keep_blocks"])
     query_chunk_blocks = _static_int(match.kwargs["sparse_query_chunk_blocks"])
+    static_sparse_key_blocks = _static_int(sparse_key_blocks)
+    static_routes_per_query = _static_int(routes_per_query)
+    static_max_keep_blocks = _static_int(max_keep_blocks)
     if (
-        suffix_start is None
-        or valid_sequence_length is None
+        sparse_key_blocks is None
         or routes_per_query is None
+        or max_keep_blocks is None
         or query_chunk_blocks is None
-        or not _KEY_BLOCK_ROWS <= suffix_start <= valid_sequence_length <= sequence_length
-        or suffix_start % _KEY_BLOCK_ROWS
-        or valid_sequence_length <= sequence_length - _KEY_BLOCK_ROWS
-        or routes_per_query < 1
+        or (static_sparse_key_blocks is not None and static_sparse_key_blocks < 1)
+        or (
+            static_sparse_key_blocks is not None
+            and isinstance(sequence_length, int)
+            and static_sparse_key_blocks > sequence_length // _KEY_BLOCK_ROWS
+        )
+        or (static_routes_per_query is not None and static_routes_per_query < 1)
+        or (static_max_keep_blocks is not None and static_max_keep_blocks < 1)
+        or (
+            static_sparse_key_blocks is not None
+            and static_max_keep_blocks is not None
+            and static_sparse_key_blocks < static_max_keep_blocks
+        )
         or query_chunk_blocks < 1
     ):
         return False
@@ -383,13 +427,12 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_keep_blocks: torch.fx.Node,
     sparse_head_offsets: torch.fx.Node,
     sparse_group_size: int,
-    sparse_attention_shape: list[int] | tuple[int, ...],
     sparse_q_norm_epsilon: float,
     sparse_k_norm_epsilon: float,
-    sparse_suffix_start: int,
-    sparse_valid_sequence_length: int,
+    sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
-    sparse_routes_per_query: int,
+    sparse_routes_per_query: Argument,
+    sparse_max_keep_blocks: Argument,
     sparse_query_chunk_blocks: int,
     **_unused: object,
 ) -> None:
@@ -397,7 +440,11 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     graph = match.graph
     input_value = preparation_sharing.tensor_metadata(sparse_input)
     assert input_value is not None
-    batch, sequence_length, heads, head_dim = sparse_attention_shape
+    batch, sequence_length = input_value.shape[:2]
+    q_weight_value = preparation_sharing.tensor_metadata(sparse_q_weight_qdata)
+    assert q_weight_value is not None
+    heads = q_weight_value.shape[0] // _HEAD_DIM
+    head_dim = _HEAD_DIM
     with graph.inserting_before(original):
         input_qdata, input_scale, _logical_dtype = _compile_fx.emit_prepared_input(
             graph,
@@ -431,7 +478,6 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 sparse_q_norm_weight,
                 sparse_cos,
                 sparse_sin,
-                sparse_valid_sequence_length,
                 sparse_q_norm_epsilon,
                 sparse_softmax_scale,
             ),
@@ -466,14 +512,13 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 sparse_k_norm_weight,
                 sparse_cos,
                 sparse_sin,
-                sparse_valid_sequence_length,
                 sparse_k_norm_epsilon,
             ),
             key_values,
         )
         input_mean = graph.call_function(
             torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
-            args=(input_qdata, input_scale, sparse_valid_sequence_length),
+            args=(input_qdata, input_scale),
         )
         input_mean.meta["val"] = input_value.new_empty(
             (batch, input_value.shape[-1]),
@@ -499,7 +544,6 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 input_mean,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
-                sparse_valid_sequence_length,
             ),
             value_values,
         )
@@ -518,9 +562,9 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 value_mean,
                 sparse_keep_blocks,
                 sparse_head_offsets,
-                sparse_suffix_start,
-                sparse_valid_sequence_length,
+                sparse_key_blocks,
                 sparse_routes_per_query,
+                sparse_max_keep_blocks,
                 sparse_query_chunk_blocks,
             ),
         )

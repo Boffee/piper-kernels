@@ -96,20 +96,15 @@ def _random_operands(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("valid_sequence_length", [64, 59, 29])
-def test_fused_query_projection_matches_the_fp32_composed_contract(
-    valid_sequence_length: int,
-) -> None:
+def test_fused_query_projection_matches_the_fp32_composed_contract() -> None:
     operands = _random_operands()
     options = {
-        "valid_sequence_length": valid_sequence_length,
         "norm_epsilon": 1e-6,
         "softmax_scale": 128**-0.5,
     }
 
     actual_query, actual_scale, actual_summary = query_fusion._project_query_op(
         *operands.as_tuple(),
-        options["valid_sequence_length"],
         options["norm_epsilon"],
         options["softmax_scale"],
     )
@@ -134,9 +129,6 @@ def test_fused_query_projection_matches_the_fp32_composed_contract(
         atol=0.125,
         rtol=0.01,
     )
-    assert bool((actual_query[:, :, valid_sequence_length:] == 0).all())
-    if valid_sequence_length <= 32:
-        assert bool((actual_scale[..., 1] == 0).all())
 
 
 @pytest.mark.gpu
@@ -146,7 +138,6 @@ def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
 
     query, query_scale, query_summary = query_fusion._project_query_op(
         *operands.as_tuple(),
-        117,
         1e-6,
         128**-0.5,
     )
@@ -154,7 +145,6 @@ def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
     assert query.shape == (1, 3, 128, 128)
     assert query_scale.shape == (1, 3, 4)
     assert query_summary.shape == (1, 3, 2, 128)
-    assert bool((query[:, :, 117:] == 0).all())
 
 
 @pytest.mark.gpu
@@ -164,7 +154,7 @@ def test_fused_query_projection_custom_op_passes_opcheck() -> None:
 
     result = torch.library.opcheck(
         query_fusion._project_query_op,
-        (*operands.as_tuple(), 59, 1e-6, 128**-0.5),
+        (*operands.as_tuple(), 1e-6, 128**-0.5),
     )
 
     assert set(result.values()) == {"SUCCESS"}
@@ -176,7 +166,7 @@ def test_fused_query_projection_is_a_fullgraph_compile_boundary() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return query_fusion._project_query_op(*args, 59, 1e-6, 128**-0.5)
+        return query_fusion._project_query_op(*args, 1e-6, 128**-0.5)
 
     expected = prepare(*operands.as_tuple())
     compiled = torch.compile(prepare, backend="eager", fullgraph=True)
@@ -194,7 +184,6 @@ def test_fused_query_projection_fake_kernel_propagates_shapes() -> None:
         torch.empty((128,), device="meta", dtype=torch.bfloat16),
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         torch.empty((128, 96), device="meta", dtype=torch.float32),
-        113,
         1e-6,
         128**-0.5,
     )

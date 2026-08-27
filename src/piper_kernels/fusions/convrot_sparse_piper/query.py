@@ -43,7 +43,6 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     query_summary_ptr,
     rows,
     sequence_length,
-    valid_sequence_length,
     input_features: tl.constexpr,
     heads: tl.constexpr,
     heads_per_program: tl.constexpr,
@@ -98,16 +97,8 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         block_k,
     )
 
-    valid_rows = sequence_offsets < valid_sequence_length
-    rope = tl.where(valid_rows[:, None, None], rope, 0.0)
     rope_fp32 = rope.to(tl.float32)
-    query_summary = tl.max(
-        tl.where(valid_rows[:, None, None], rope_fp32, -float("inf")),
-        axis=0,
-    ) + tl.min(
-        tl.where(valid_rows[:, None, None], rope_fp32, float("inf")),
-        axis=0,
-    )
+    query_summary = tl.max(rope_fp32, axis=0) + tl.min(rope_fp32, axis=0)
     summary_offsets = (
         (batch * heads + head_offsets[:, None]) * (sequence_length // block_m) + query_block
     ) * head_dim + feature_offsets[None, :]
@@ -118,10 +109,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     )
 
     group_offsets = tl.arange(0, block_m // _JIT_QUERY_SCALE_ROWS)
-    row_group_valid = (
-        query_block * block_m + group_offsets * _JIT_QUERY_SCALE_ROWS < valid_sequence_length
-    )
-    group_valid = (head_offsets[:, None] < heads) & row_group_valid[None, :]
+    group_valid = head_offsets[:, None] < heads
     quantized, stored_scale = quantize_query_tile(
         rope_fp32,
         group_valid,
@@ -163,7 +151,6 @@ def _validate_inputs(
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
-    valid_sequence_length: int,
     norm_epsilon: float,
     softmax_scale: float,
 ) -> tuple[int, int, int, int]:
@@ -175,7 +162,6 @@ def _validate_inputs(
         norm_weight,
         cos,
         sin,
-        valid_sequence_length=valid_sequence_length,
         norm_epsilon=norm_epsilon,
         block_rows=_BLOCK_M,
         name="Q",
@@ -193,7 +179,6 @@ def _launch_query_projection(
     norm_weight: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    valid_sequence_length: int,
     norm_epsilon: float,
     softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -205,7 +190,6 @@ def _launch_query_projection(
         norm_weight,
         cos,
         sin,
-        valid_sequence_length=valid_sequence_length,
         norm_epsilon=norm_epsilon,
         softmax_scale=softmax_scale,
     )
@@ -239,7 +223,6 @@ def _launch_query_projection(
         query_summary,
         batch * sequence_length,
         sequence_length,
-        valid_sequence_length,
         input_features=input_qdata.shape[2],
         heads=heads,
         heads_per_program=_HEADS_PER_PROGRAM,
@@ -268,7 +251,6 @@ def _project_query_op(
     norm_weight: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    valid_sequence_length: int,
     norm_epsilon: float,
     softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -280,7 +262,6 @@ def _project_query_op(
         norm_weight,
         cos,
         sin,
-        valid_sequence_length,
         norm_epsilon,
         softmax_scale,
     )
@@ -295,7 +276,6 @@ def _project_query_op_fake(
     _norm_weight: torch.Tensor,
     cos: torch.Tensor,
     _sin: torch.Tensor,
-    _valid_sequence_length: int,
     _norm_epsilon: float,
     _softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

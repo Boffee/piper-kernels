@@ -16,7 +16,6 @@ def test_packed_routes_store_only_active_uint16_indices() -> None:
     key = torch.randn((1, 3, 5, 64, 128), generator=generator)
     plan = prepare_dsa_route_plan(
         torch.tensor([1, 3, 2], dtype=torch.int32),
-        key_block_count=5,
     )
 
     routes = packed_dsa_routes_from_plan(query, key, plan)
@@ -32,7 +31,6 @@ def test_exact_score_ties_prefer_lower_key_index() -> None:
     key = torch.zeros((1, 1, 4, 64, 128))
     plan = prepare_dsa_route_plan(
         torch.tensor([2], dtype=torch.int32),
-        key_block_count=4,
     )
 
     routes = packed_dsa_routes_from_plan(query, key, plan)
@@ -46,7 +44,6 @@ def test_existing_summaries_select_the_same_routes_as_block_inputs() -> None:
     key = torch.randn((1, 3, 6, 64, 128), generator=generator)
     plan = prepare_dsa_route_plan(
         torch.tensor([1, 4, 2], dtype=torch.int32),
-        key_block_count=6,
     )
     query_float = query.float()
     key_float = key.float()
@@ -69,7 +66,6 @@ def test_existing_summaries_accept_sparse_prefix_views() -> None:
     key_min = full_key_min[:, :, :4]
     plan = prepare_dsa_route_plan(
         torch.tensor([2, 3], dtype=torch.int32),
-        key_block_count=4,
     )
 
     expected = packed_dsa_routes_from_summaries(
@@ -94,8 +90,8 @@ def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
     query = torch.randn((1, 3, 5, 64, 128), dtype=torch.bfloat16, generator=generator)
     key = torch.randn((1, 3, 7, 64, 128), dtype=torch.bfloat16, generator=generator)
     keep = torch.tensor([1, 4, 6], dtype=torch.int32)
-    cpu_plan = prepare_dsa_route_plan(keep, key_block_count=7)
-    cuda_plan = prepare_dsa_route_plan(keep.cuda(), key_block_count=7)
+    cpu_plan = prepare_dsa_route_plan(keep)
+    cuda_plan = prepare_dsa_route_plan(keep.cuda())
 
     expected = packed_dsa_routes_from_plan(query, key, cpu_plan)
     actual = packed_dsa_routes_from_plan(query.cuda(), key.cuda(), cuda_plan)

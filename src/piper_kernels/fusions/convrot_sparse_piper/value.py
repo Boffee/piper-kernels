@@ -86,7 +86,6 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     value_scale_ptr,
     rows,
     sequence_length,
-    valid_sequence_length,
     row_block_offset,
     input_features: tl.constexpr,
     heads: tl.constexpr,
@@ -135,7 +134,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         mask=head_offsets[:, None] < heads,
         other=0.0,
     )
-    valid_rows = sequence_offsets < valid_sequence_length
+    valid_rows = sequence_offsets < sequence_length
     centered = tl.where(
         valid_rows[:, None, None],
         projection - value_mean[None, :, :],
@@ -185,8 +184,6 @@ def _validate_inputs(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    *,
-    valid_sequence_length: int,
 ) -> tuple[int, int, int]:
     if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
         raise ValueError("V projection input must be [batch,sequence,features] INT8")
@@ -209,9 +206,7 @@ def _validate_inputs(
     if any(not operand.is_contiguous() for operand in operands):
         raise ValueError("V projection operands must be contiguous")
     if sequence_length < _VALUE_TILE_ROWS or sequence_length % _VALUE_TILE_ROWS:
-        raise ValueError("V projection physical sequence must be K64 aligned")
-    if not sequence_length - _VALUE_TILE_ROWS < valid_sequence_length <= sequence_length:
-        raise ValueError("V projection supports padding only in the final K64 tile")
+        raise ValueError("V projection sequence must be K64 aligned")
     return batch, sequence_length, weight_qdata.shape[0] // _HEAD_DIM
 
 
@@ -221,7 +216,6 @@ def _launch_value_projection(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    valid_sequence_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, heads = _validate_inputs(
         input_qdata,
@@ -229,7 +223,6 @@ def _launch_value_projection(
         input_mean,
         weight_qdata,
         weight_scale,
-        valid_sequence_length=valid_sequence_length,
     )
     value = torch.empty(
         (batch, heads, _HEAD_DIM, sequence_length),
@@ -275,7 +268,6 @@ def _launch_value_projection(
             value_scale_multiplier,
             batch * sequence_length,
             sequence_length,
-            valid_sequence_length,
             row_block_offset,
             input_features=input_qdata.shape[2],
             heads=heads,
@@ -311,7 +303,6 @@ def _project_value_op(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    valid_sequence_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_value_projection(
         input_qdata,
@@ -319,7 +310,6 @@ def _project_value_op(
         input_mean,
         weight_qdata,
         weight_scale,
-        valid_sequence_length,
     )
 
 
@@ -330,7 +320,6 @@ def _project_value_op_fake(
     _input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
-    _valid_sequence_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     heads = weight_qdata.shape[0] // _HEAD_DIM

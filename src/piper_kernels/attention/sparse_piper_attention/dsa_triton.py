@@ -171,7 +171,6 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
 )
 def _block_summary_kernel(  # noqa: PLR0913, PLR0917
     input_ptr: torch.Tensor,
-    valid_counts_ptr: torch.Tensor,
     output_max_ptr: torch.Tensor,
     output_min_ptr: torch.Tensor,
     logical_block_count: int,
@@ -183,7 +182,6 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
     head_dim: tl.constexpr,
     heads: tl.constexpr,
     sum_extrema: tl.constexpr,
-    use_valid_counts: tl.constexpr,
 ) -> None:
     block = tl.program_id(0)
     batch_head = block // logical_block_count
@@ -200,14 +198,8 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
         + row_offsets * stride_ir
         + feature_offsets
     ).to(tl.float32)
-    if use_valid_counts:
-        valid_count = tl.load(valid_counts_ptr + logical_block)
-        valid = row_offsets < valid_count
-        maximum = tl.max(tl.where(valid, values, -float("inf")), axis=0)
-        minimum = tl.min(tl.where(valid, values, float("inf")), axis=0)
-    else:
-        maximum = tl.max(values, axis=0)
-        minimum = tl.min(values, axis=0)
+    maximum = tl.max(values, axis=0)
+    minimum = tl.min(values, axis=0)
     output_offsets = block * head_dim + tl.arange(0, head_dim)
     tl.store(output_max_ptr + output_offsets, maximum + minimum if sum_extrema else maximum)
     if not sum_extrema:
@@ -218,7 +210,6 @@ def block_summaries(
     query_blocks: torch.Tensor,
     key_blocks: torch.Tensor,
     *,
-    query_valid_counts: torch.Tensor | None = None,
     num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return exact FP32 Q-extrema sums and K extrema without FP32 input copies."""
@@ -243,13 +234,6 @@ def block_summaries(
         raise ValueError("optimized DSA summaries require contiguous feature dimensions")
     if num_warps not in (4, 8):
         raise ValueError("optimized DSA summaries require four or eight warps")
-    if query_valid_counts is not None and (
-        query_valid_counts.shape != (query_blocks.shape[2],)
-        or query_valid_counts.dtype != torch.int32
-        or query_valid_counts.device != query_blocks.device
-        or not query_valid_counts.is_contiguous()
-    ):
-        raise ValueError("optimized DSA query counts must be a contiguous device int32 vector")
     query_summary = torch.empty(
         (*query_blocks.shape[:-2], _HEAD_DIM),
         device=query_blocks.device,
@@ -265,7 +249,6 @@ def block_summaries(
     key_grid = (key_blocks.numel() // (key_block_rows * _HEAD_DIM),)
     _block_summary_kernel[query_grid](
         query_blocks,
-        query_blocks if query_valid_counts is None else query_valid_counts,
         query_summary,
         query_summary,
         logical_block_count=query_blocks.shape[2],
@@ -277,12 +260,10 @@ def block_summaries(
         head_dim=_HEAD_DIM,
         heads=query_blocks.shape[1],
         sum_extrema=True,
-        use_valid_counts=query_valid_counts is not None,
         num_warps=num_warps,
         num_stages=1,
     )
     _block_summary_kernel[key_grid](
-        key_blocks,
         key_blocks,
         key_max,
         key_min,
@@ -295,7 +276,6 @@ def block_summaries(
         head_dim=_HEAD_DIM,
         heads=key_blocks.shape[1],
         sum_extrema=False,
-        use_valid_counts=False,
         num_warps=num_warps,
         num_stages=1,
     )

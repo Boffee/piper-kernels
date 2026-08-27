@@ -25,8 +25,7 @@ _INPUT_FEATURES = 256
 _HEADS = 2
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
-_VALID_SEQUENCE = 181
-_SUFFIX_START = 128
+_SPARSE_KEY_BLOCKS = 2
 
 type _QuantizedQueryOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type _QuantizedKeyOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -122,7 +121,6 @@ def _prepare(
         operands.query_norm,
         operands.cos,
         operands.sin,
-        _VALID_SEQUENCE,
         1e-5,
         _HEAD_DIM**-0.5,
     )
@@ -134,13 +132,11 @@ def _prepare(
         operands.key_norm,
         operands.cos,
         operands.sin,
-        _VALID_SEQUENCE,
         1e-5,
     )
     input_mean = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
-        _VALID_SEQUENCE,
     )
     prepared_value = value._project_value_op(
         operands.input_qdata,
@@ -148,7 +144,6 @@ def _prepare(
         input_mean,
         operands.value_weight,
         operands.value_weight_scale,
-        _VALID_SEQUENCE,
     )
     return prepared_query, prepared_key, prepared_value
 
@@ -165,9 +160,9 @@ def _run_sparse_piper_attention_from_quantized(
         *prepared_value,
         plan.keep_blocks,
         plan.head_offsets,
-        _SUFFIX_START,
-        _VALID_SEQUENCE,
+        _SPARSE_KEY_BLOCKS,
         plan.routes_per_query,
+        plan.max_keep_blocks,
         plan.query_chunk_blocks,
     )
 
@@ -203,7 +198,6 @@ def test_quantized_sparse_piper_writes_engine_layout() -> None:
     query, key, value = _prepare(operands)
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 2], device="cuda", dtype=torch.int32),
-        sparse_key_blocks=2,
     )
 
     with torch.no_grad():
@@ -241,7 +235,7 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
         torch.bfloat16,
     ).view(_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
     keep = torch.full((_HEADS,), 2, device="cuda", dtype=torch.int32)
-    plan = prepare_sparse_piper_attention_plan(keep, sparse_key_blocks=2)
+    plan = prepare_sparse_piper_attention_plan(keep)
 
     with torch.no_grad():
         expected = sparse_piper_attention(
@@ -249,13 +243,12 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
             materialized_key,
             materialized_value,
             plan,
-            suffix_start=_SUFFIX_START,
-            valid_sequence_length=_VALID_SEQUENCE,
+            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
         )
         actual = _run_sparse_piper_attention_from_quantized(query, key, value, plan)
 
-    difference = actual[:, :_VALID_SEQUENCE].float() - expected[:, :_VALID_SEQUENCE].float()
-    relative_l2 = difference.norm() / expected[:, :_VALID_SEQUENCE].float().norm()
+    difference = actual.float() - expected.float()
+    relative_l2 = difference.norm() / expected.float().norm()
     assert relative_l2 < 0.025
 
 
@@ -265,7 +258,6 @@ def test_full_fused_sparse_piper_pipeline_compiles_as_one_graph() -> None:
     operands = _operands()
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 2], device="cuda", dtype=torch.int32),
-        sparse_key_blocks=2,
     )
 
     def run(input_qdata: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:

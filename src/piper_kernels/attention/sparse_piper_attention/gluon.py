@@ -122,13 +122,11 @@ def _piper_probability_pair(
     start_n_0,
     start_n_1,
     has_second,
-    key_length,
-    key_scale_stride,
+    sequence_tiles,
     mma_layout: gl.constexpr,
     key_layout: gl.constexpr,
-    column_layout: gl.constexpr,
     probability_layout: gl.constexpr,
-    mask_keys: gl.constexpr,
+    mask_duplicate: gl.constexpr,
 ):
     """Advance one shared Piper coordinate over two independently scaled K64 tiles."""
     key_0 = key_shared_0.permute([1, 0]).load(key_layout)
@@ -143,23 +141,18 @@ def _piper_probability_pair(
         key_1,
         gl.zeros([_GL_BLOCK_M, _GL_BLOCK_N], gl.int32, mma_layout),
     )
-    key_scale_0 = gl.load(key_scale_ptr + batch_head * key_scale_stride + start_n_0 // _GL_BLOCK_N)
-    key_scale_1 = gl.load(key_scale_ptr + batch_head * key_scale_stride + start_n_1 // _GL_BLOCK_N)
+    key_scale_0 = gl.load(key_scale_ptr + batch_head * sequence_tiles + start_n_0 // _GL_BLOCK_N)
+    key_scale_1 = gl.load(key_scale_ptr + batch_head * sequence_tiles + start_n_1 // _GL_BLOCK_N)
     scores_0 = integer_scores_0.to(gl.float32) * (query_scale[:, None] * key_scale_0)
     scores_1 = integer_scores_1.to(gl.float32) * (query_scale[:, None] * key_scale_1)
-    if mask_keys:
-        offsets_n = gl.arange(0, _GL_BLOCK_N, column_layout)
-        valid_0 = start_n_0 + offsets_n[None, :] < key_length
-        valid_1 = (start_n_1 + offsets_n[None, :] < key_length) & has_second
-        scores_0 = gl.where(valid_0, scores_0, -float("inf"))
-        scores_1 = gl.where(valid_1, scores_1, -float("inf"))
+    if mask_duplicate:
+        scores_1 = gl.where(has_second, scores_1, -float("inf"))
 
-    tile_count = gl.cdiv(key_length, _GL_BLOCK_N)
     value_scale_multiplier_0 = gl.load(
-        value_scale_multiplier_ptr + batch_head * tile_count + start_n_0 // _GL_BLOCK_N
+        value_scale_multiplier_ptr + batch_head * sequence_tiles + start_n_0 // _GL_BLOCK_N
     ).to(gl.float32)
     value_scale_multiplier_1 = gl.load(
-        value_scale_multiplier_ptr + batch_head * tile_count + start_n_1 // _GL_BLOCK_N
+        value_scale_multiplier_ptr + batch_head * sequence_tiles + start_n_1 // _GL_BLOCK_N
     ).to(gl.float32)
     multiplier_bits_0 = value_scale_multiplier_0.to(gl.int32, bitcast=True)
     multiplier_bits_1 = value_scale_multiplier_1.to(gl.int32, bitcast=True)
@@ -177,12 +170,8 @@ def _piper_probability_pair(
     old_weight = gl.exp2(running_max - next_max)
     current_weight = gl.exp2(block_max - next_max)
     probabilities_0 = gl.exp2(scores_0 - block_max[:, None])
-    if mask_keys:
-        probabilities_0 = gl.where(valid_0, probabilities_0, 0.0)
     probability_uint8_0 = _packed_float32_to_uint8(probabilities_0 * value_scale_multiplier_0 + 0.5)
     probabilities_1 = gl.exp2(scores_1 - block_max[:, None])
-    if mask_keys:
-        probabilities_1 = gl.where(valid_1, probabilities_1, 0.0)
     probability_uint8_1 = _packed_float32_to_uint8(probabilities_1 * value_scale_multiplier_1 + 0.5)
     probability_uint8_0 = gl.convert_layout(probability_uint8_0, probability_layout)
     probability_uint8_1 = gl.convert_layout(probability_uint8_1, probability_layout)
@@ -238,20 +227,23 @@ def _native_tile_start(
     route_base,
     tile_position,
     selected_sparse_tile_count,
-    sparse_key_block_count,
+    sparse_key_blocks,
     stride_rr,
 ):
     safe_route_position = gl.minimum(tile_position, selected_sparse_tile_count - 1)
     route = gl.load(route_base + safe_route_position * stride_rr).to(gl.int32)
     sparse_start = route * _GL_BLOCK_N
-    suffix_start = (
-        sparse_key_block_count * _GL_BLOCK_N
-        + (tile_position - selected_sparse_tile_count) * _GL_BLOCK_N
+    dense_start = (
+        sparse_key_blocks * _GL_BLOCK_N + (tile_position - selected_sparse_tile_count) * _GL_BLOCK_N
     )
-    return gl.where(tile_position < selected_sparse_tile_count, sparse_start, suffix_start)
+    return gl.where(tile_position < selected_sparse_tile_count, sparse_start, dense_start)
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=[
+        "sparse_key_blocks",
+    ]
+)
 def _paired_routed_piper_gluon_kernel(
     query_desc,
     key_desc,
@@ -264,11 +256,8 @@ def _paired_routed_piper_gluon_kernel(
     keep_blocks_ptr,
     route_head_offsets_ptr,
     output_ptr,
-    query_storage_length,
-    key_length,
-    key_storage_length,
-    sparse_key_block_count,
-    dense_suffix_length,
+    sequence_length,
+    sparse_key_blocks,
     stride_rb,
     stride_rq,
     stride_rr,
@@ -324,34 +313,36 @@ def _paired_routed_piper_gluon_kernel(
     mbarrier.init(value_barrier, count=1)
 
     selected_sparse_tile_count = gl.load(keep_blocks_ptr + head)
-    tile_count = selected_sparse_tile_count + gl.cdiv(dense_suffix_length, _GL_BLOCK_N)
+    sequence_tiles = sequence_length // _GL_BLOCK_N
+    dense_tile_count = sequence_tiles - sparse_key_blocks
+    tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
     initial_position_1 = gl.minimum(1, tile_count - 1)
     initial_n_0 = _native_tile_start(
         route_base,
         0,
         selected_sparse_tile_count,
-        sparse_key_block_count,
+        sparse_key_blocks,
         stride_rr,
     )
     initial_n_1 = _native_tile_start(
         route_base,
         initial_position_1,
         selected_sparse_tile_count,
-        sparse_key_block_count,
+        sparse_key_blocks,
         stride_rr,
     )
 
     _issue_tma(
         query_desc,
-        [batch_head * query_storage_length + start_m, 0],
+        [batch_head * sequence_length + start_m, 0],
         query_shared,
         query_barrier,
     )
     _issue_tma_pair(
         key_desc,
-        [batch_head * key_storage_length + initial_n_0, 0],
-        [batch_head * key_storage_length + initial_n_1, 0],
+        [batch_head * sequence_length + initial_n_0, 0],
+        [batch_head * sequence_length + initial_n_1, 0],
         key_shared_0,
         key_shared_1,
         key_barrier,
@@ -368,11 +359,10 @@ def _paired_routed_piper_gluon_kernel(
     query = query_shared.load(query_layout)
 
     offsets_m = gl.arange(0, _GL_BLOCK_M, row_layout)
-    query_scale_stride = gl.cdiv(query_storage_length, 32)
+    query_scale_stride = sequence_length // 32
     query_scale = gl.load(
         query_scale_ptr + batch_head * query_scale_stride + (start_m + offsets_m) // 32
     )
-    key_scale_stride = gl.cdiv(key_length, _GL_BLOCK_N)
     accumulator = gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.float32, mma_layout)
     denominator = gl.zeros([_GL_BLOCK_M], gl.float32, row_layout)
     running_max = gl.full([_GL_BLOCK_M], -float("inf"), gl.float32, row_layout)
@@ -403,11 +393,9 @@ def _paired_routed_piper_gluon_kernel(
             start_n_0,
             start_n_1,
             True,
-            key_length,
-            key_scale_stride,
+            sequence_tiles,
             mma_layout,
             key_layout,
-            column_layout,
             probability_layout,
             False,
         )
@@ -418,21 +406,21 @@ def _paired_routed_piper_gluon_kernel(
             route_base,
             next_position_0,
             selected_sparse_tile_count,
-            sparse_key_block_count,
+            sparse_key_blocks,
             stride_rr,
         )
         next_n_1 = _native_tile_start(
             route_base,
             next_position_1,
             selected_sparse_tile_count,
-            sparse_key_block_count,
+            sparse_key_blocks,
             stride_rr,
         )
         gl.barrier()
         _issue_tma_pair(
             key_desc,
-            [batch_head * key_storage_length + next_n_0, 0],
-            [batch_head * key_storage_length + next_n_1, 0],
+            [batch_head * sequence_length + next_n_0, 0],
+            [batch_head * sequence_length + next_n_1, 0],
             key_shared_0,
             key_shared_1,
             key_barrier,
@@ -486,11 +474,9 @@ def _paired_routed_piper_gluon_kernel(
         start_n_0,
         start_n_1,
         has_second,
-        key_length,
-        key_scale_stride,
+        sequence_tiles,
         mma_layout,
         key_layout,
-        column_layout,
         probability_layout,
         True,
     )
@@ -530,7 +516,7 @@ def _base_tensor(value: torch.Tensor | TritonTensorDescriptor) -> torch.Tensor:
 
 def _make_gluon_descriptors(
     prepared: _PreparedRoutedPiperAttention,
-) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor, int, int]:
+) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor, int]:
     attention = prepared.attention
     query = attention.query
     key = _base_tensor(attention.key)
@@ -539,49 +525,54 @@ def _make_gluon_descriptors(
     key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, _HEAD_DIM], gl.int8)
     value_layout = gl.NVMMASharedLayout.get_default_for([_HEAD_DIM, _BLOCK_N], gl.int8)
     batch_heads = int(query.shape[0] * query.shape[1])
-    query_storage_length = int(query.shape[2])
-    key_storage_length = int(key.shape[2])
+    sequence_length = int(query.shape[2])
+    if key.shape != query.shape or value.shape != (
+        query.shape[0],
+        query.shape[1],
+        query.shape[3],
+        sequence_length,
+    ):
+        raise ValueError("paired Gluon routed Piper requires equal Q/K/V sequence lengths")
     return (
         TensorDescriptor(
             query,
-            [batch_heads * query_storage_length, _HEAD_DIM],
+            [batch_heads * sequence_length, _HEAD_DIM],
             [_HEAD_DIM, 1],
             [_BLOCK_M, _HEAD_DIM],
             query_layout,
         ),
         TensorDescriptor(
             key,
-            [batch_heads * key_storage_length, _HEAD_DIM],
+            [batch_heads * sequence_length, _HEAD_DIM],
             [_HEAD_DIM, 1],
             [_BLOCK_N, _HEAD_DIM],
             key_layout,
         ),
         TensorDescriptor(
             value,
-            [batch_heads * _HEAD_DIM, key_storage_length],
-            [key_storage_length, 1],
+            [batch_heads * _HEAD_DIM, sequence_length],
+            [sequence_length, 1],
             [_HEAD_DIM, _BLOCK_N],
             value_layout,
         ),
-        query_storage_length,
-        key_storage_length,
+        sequence_length,
     )
 
 
 def _launch_gluon_paired_routed_piper_attention(
     prepared: _PreparedRoutedPiperAttention,
-) -> torch.Tensor:
+) -> None:
     """Launch paired K128 while retaining logical K64 routes and tile scales."""
     attention = prepared.attention
     batch, heads, query_length, head_dim = attention.output.shape
-    if head_dim != _HEAD_DIM or query_length % _BLOCK_M:
+    if head_dim != _HEAD_DIM or query_length % _BLOCK_M or attention.key_length != query_length:
         raise ValueError("paired Gluon routed Piper requires aligned M64/D128 queries")
     if attention.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
     with torch.cuda.device(attention.query.device):
         install_uint8_int8_dot_hook()
 
-    query_desc, key_desc, value_desc, query_storage, key_storage = _make_gluon_descriptors(prepared)
+    query_desc, key_desc, value_desc, sequence_length = _make_gluon_descriptors(prepared)
     routes = prepared.routes
     route_head_offsets = prepared.route_head_offsets
     stride_rb = routes.stride(0)
@@ -599,11 +590,8 @@ def _launch_gluon_paired_routed_piper_attention(
         prepared.keep_blocks,
         route_head_offsets,
         attention.output,
-        query_storage,
-        attention.key_length,
-        key_storage,
-        prepared.sparse_key_block_count,
-        prepared.dense_suffix_length,
+        sequence_length,
+        prepared.sparse_key_blocks,
         stride_rb,
         stride_rq,
         stride_rr,
@@ -615,4 +603,3 @@ def _launch_gluon_paired_routed_piper_attention(
         num_warps=4,
         num_stages=1,
     )
-    return attention.output.unflatten(2, (prepared.query_block_count, _BLOCK_M))

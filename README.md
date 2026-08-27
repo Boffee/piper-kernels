@@ -203,31 +203,30 @@ from piper_kernels import (
 )
 
 keep_blocks = torch.tensor([207, 414, 622], device="cuda", dtype=torch.int32)
-plan = prepare_sparse_piper_attention_plan(keep_blocks, sparse_key_blocks=1036)
+plan = prepare_sparse_piper_attention_plan(keep_blocks)
 output = sparse_piper_attention(
     query,
     key,
     value,
     plan,
-    suffix_start=1036 * 64,
-    valid_sequence_length=query.shape[1],
+    sparse_key_blocks=1036,
 )
 ```
 
-Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The physical sequence and
-`suffix_start` are K64 aligned. Every query receives an exact FP32 DSA route over K/V rows before
-`suffix_start`, then attends to every valid K/V row after it in the same softmax. This makes text,
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The sequence is K64 aligned,
+and every input row participates in attention. `sparse_key_blocks` is a runtime count of routeable
+K64 prefix tiles; it is not part of the reusable route-budget plan. Every query receives an exact
+FP32 DSA route over that prefix, then attends to every remaining K/V row in the same softmax. This
+makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their
 queries sparse over the packed media prefix. Per-head keep counts are arbitrary runtime values;
 budget selection and calibration remain Engine responsibilities.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
-pre-rounding denominator remain FP32. `valid_sequence_length` may exclude padding only in the
-final physical tile; padded Q/K/V values cannot change valid outputs. The returned tensor retains
-the aligned physical length. Unsupported devices use a slow portable implementation of the same
-quantized Sparse Piper arithmetic. A separate exact-BF16 sparse reference serves as its quality
-oracle; it is not the public fallback.
+pre-rounding denominator remain FP32. Unsupported devices use a slow portable implementation of
+the same quantized Sparse Piper arithmetic. A separate exact-BF16 sparse reference serves as its
+quality oracle; it is not the public fallback.
 
 ## SageAttention2++
 

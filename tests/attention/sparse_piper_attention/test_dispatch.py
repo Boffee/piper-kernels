@@ -22,7 +22,6 @@ def test_every_query_uses_sparse_prefix_plus_dense_suffix_on_cpu() -> None:
     query, key, value = _inputs()
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 2], dtype=torch.int32),
-        sparse_key_blocks=2,
     )
 
     with torch.no_grad():
@@ -31,7 +30,7 @@ def test_every_query_uses_sparse_prefix_plus_dense_suffix_on_cpu() -> None:
             key,
             value,
             plan,
-            suffix_start=2 * 64,
+            sparse_key_blocks=2,
         )
 
     assert output.shape == query.shape
@@ -42,13 +41,13 @@ def test_every_query_uses_sparse_prefix_plus_dense_suffix_on_cpu() -> None:
 def test_plan_accepts_arbitrary_per_head_budgets() -> None:
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([3, 1, 4, 2], dtype=torch.int64),
-        sparse_key_blocks=5,
         query_chunk_blocks=17,
     )
 
     assert plan.keep_blocks.tolist() == [3, 1, 4, 2]
     assert plan.head_offsets.tolist() == [0, 3, 4, 8, 10]
     assert plan.routes_per_query == 10
+    assert plan.max_keep_blocks == 4
     assert plan.query_chunk_blocks == 17
 
 
@@ -62,26 +61,35 @@ def test_dense_suffix_is_included_for_prefix_and_suffix_queries() -> None:
     value[:, 128:] = 10
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 2], dtype=torch.int32),
-        sparse_key_blocks=2,
     )
 
     with torch.no_grad():
-        output = sparse_piper_attention(query, key, value, plan, suffix_start=128)
+        output = sparse_piper_attention(query, key, value, plan, sparse_key_blocks=2)
 
     expected_by_head = torch.tensor([5.5, 13 / 3], dtype=torch.bfloat16)
     torch.testing.assert_close(output[0, 0, :, 0], expected_by_head)
     torch.testing.assert_close(output[0, -1, :, 0], expected_by_head)
 
 
-def test_contract_rejects_misaligned_sparse_prefix() -> None:
+def test_plan_is_not_bound_to_one_sparse_prefix_length() -> None:
     query, key, value = _inputs()
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 1], dtype=torch.int32),
-        sparse_key_blocks=2,
     )
 
-    with pytest.raises(ValueError, match="suffix_start"):
-        sparse_piper_attention(query, key, value, plan, suffix_start=129)
+    with torch.no_grad():
+        one_block = sparse_piper_attention(query, key, value, plan, sparse_key_blocks=1)
+        two_blocks = sparse_piper_attention(query, key, value, plan, sparse_key_blocks=2)
+
+    assert one_block.shape == two_blocks.shape == query.shape
+
+
+def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
+    query, key, value = _inputs()
+    plan = prepare_sparse_piper_attention_plan(torch.tensor([1, 1], dtype=torch.int32))
+
+    with pytest.raises(ValueError, match="sparse_key_blocks"):
+        sparse_piper_attention(query, key, value, plan, sparse_key_blocks=4)
 
 
 @pytest.mark.gpu
@@ -93,11 +101,10 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
     query, key, value = _inputs("cuda")
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
-        sparse_key_blocks=2,
     )
 
     with torch.no_grad():
-        output = sparse_piper_attention(query, key, value, plan, suffix_start=2 * 64)
+        output = sparse_piper_attention(query, key, value, plan, sparse_key_blocks=2)
 
     assert output.shape == query.shape
     assert output.is_contiguous()
@@ -109,11 +116,18 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_sm120_matches_the_portable_quantized_reference() -> None:
+@pytest.mark.parametrize(
+    ("sparse_key_blocks", "keep_values"),
+    [(1, (1, 1)), (2, (1, 2)), (3, (1, 2))],
+)
+def test_sm120_matches_the_portable_quantized_reference(
+    sparse_key_blocks: int,
+    keep_values: tuple[int, int],
+) -> None:
     query, key, value = _inputs()
-    keep = torch.tensor([1, 2], dtype=torch.int32)
-    cpu_plan = prepare_sparse_piper_attention_plan(keep, sparse_key_blocks=2)
-    cuda_plan = prepare_sparse_piper_attention_plan(keep.cuda(), sparse_key_blocks=2)
+    keep = torch.tensor(keep_values, dtype=torch.int32)
+    cpu_plan = prepare_sparse_piper_attention_plan(keep)
+    cuda_plan = prepare_sparse_piper_attention_plan(keep.cuda())
 
     with torch.no_grad():
         reference = sparse_piper_attention(
@@ -121,14 +135,14 @@ def test_sm120_matches_the_portable_quantized_reference() -> None:
             key,
             value,
             cpu_plan,
-            suffix_start=2 * 64,
+            sparse_key_blocks=sparse_key_blocks,
         )
         actual = sparse_piper_attention(
             query.cuda(),
             key.cuda(),
             value.cuda(),
             cuda_plan,
-            suffix_start=2 * 64,
+            sparse_key_blocks=sparse_key_blocks,
         ).cpu()
 
     relative_l2 = (actual.float() - reference.float()).norm() / reference.float().norm()
@@ -140,55 +154,14 @@ def test_sm120_matches_the_portable_quantized_reference() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_padded_tail_cannot_change_valid_outputs() -> None:
-    query, key, value = _inputs("cuda")
-    valid_length = 2 * 64 + 17
-    plan = prepare_sparse_piper_attention_plan(
-        torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
-        sparse_key_blocks=2,
-    )
-    changed_query = query.clone()
-    changed_key = key.clone()
-    changed_value = value.clone()
-    changed_query[:, valid_length:] = 40
-    changed_key[:, valid_length:] = -50
-    changed_value[:, valid_length:] = 60
-
-    with torch.no_grad():
-        expected = sparse_piper_attention(
-            query,
-            key,
-            value,
-            plan,
-            suffix_start=2 * 64,
-            valid_sequence_length=valid_length,
-        )
-        actual = sparse_piper_attention(
-            changed_query,
-            changed_key,
-            changed_value,
-            plan,
-            suffix_start=2 * 64,
-            valid_sequence_length=valid_length,
-        )
-
-    torch.testing.assert_close(actual[:, :valid_length], expected[:, :valid_length], atol=0, rtol=0)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="requires exact NVIDIA SM120",
-)
 def test_operator_is_opaque_to_a_full_compile_graph() -> None:
     query, key, value = _inputs("cuda")
     plan = prepare_sparse_piper_attention_plan(
         torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
-        sparse_key_blocks=2,
     )
 
     def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        return sparse_piper_attention(query, key, value, plan, suffix_start=2 * 64)
+        return sparse_piper_attention(query, key, value, plan, sparse_key_blocks=2)
 
     compiled = torch.compile(run, fullgraph=True)
     with torch.no_grad():
