@@ -75,6 +75,22 @@ def _validate_sparse_key_blocks(
         )
 
 
+def _validate_plan(
+    plan: SparsePiperAttentionPlan,
+    *,
+    heads: int,
+    device: torch.device,
+) -> None:
+    if plan.keep_blocks.shape != (heads,):
+        raise ValueError("the sparse Piper plan must contain one keep count per head")
+    if plan.head_offsets.shape != (heads + 1,):
+        raise ValueError("the sparse Piper plan must contain one route offset per head boundary")
+    if plan.keep_blocks.dtype is not torch.int32 or plan.head_offsets.dtype is not torch.int32:
+        raise ValueError("the sparse Piper plan must use INT32 keep counts and route offsets")
+    if plan.keep_blocks.device != device or plan.head_offsets.device != device:
+        raise ValueError("the sparse Piper plan and Q/K/V must share a device")
+
+
 def _validate_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -105,10 +121,7 @@ def _validate_inputs(
         raise ValueError("sparse Piper requires head_dim=128")
     if sequence < 64 or sequence % 64:
         raise ValueError("sparse Piper requires a K64-aligned sequence")
-    if plan.keep_blocks.shape != (heads,):
-        raise ValueError("the sparse Piper plan must contain one keep count per head")
-    if plan.keep_blocks.device != query.device or plan.head_offsets.device != query.device:
-        raise ValueError("the sparse Piper plan and Q/K/V must share a device")
+    _validate_plan(plan, heads=heads, device=query.device)
     _validate_sparse_key_blocks(
         sparse_key_blocks,
         sequence_blocks=sequence // 64,

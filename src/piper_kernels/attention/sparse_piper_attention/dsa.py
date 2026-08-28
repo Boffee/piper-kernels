@@ -22,7 +22,7 @@ _UINT16_ROUTE_CAPACITY = 1 << 16
 
 @dataclass(frozen=True, slots=True)
 class SparsePiperAttentionPlan:
-    """Static route-budget metadata reusable across attention calls."""
+    """Precomputed route-budget metadata reusable across attention calls."""
 
     keep_blocks: torch.Tensor
     head_offsets: torch.Tensor

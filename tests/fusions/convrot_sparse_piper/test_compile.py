@@ -7,7 +7,11 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import prepare_sparse_piper_attention_plan, sparse_piper_attention
+from piper_kernels import (
+    SparsePiperAttentionPlan,
+    prepare_sparse_piper_attention_plan,
+    sparse_piper_attention,
+)
 from piper_kernels.fusions.convrot_sparse_piper import (
     convrot_sparse_piper_compile_options,
 )
@@ -163,12 +167,13 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
             norm,
             1e-5,
         )
-        rotary = normalized[..., : self.rotary_dim]
+        rotary_dim = cos.shape[1]
+        rotary = normalized[..., :rotary_dim]
         first, second = rotary.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
         rotary = rotary * cos.to(torch.bfloat16)[None, :, None, :]
         rotary = rotary + rotated * sin.to(torch.bfloat16)[None, :, None, :]
-        return torch.cat((rotary, normalized[..., self.rotary_dim :]), dim=-1).contiguous()
+        return torch.cat((rotary, normalized[..., rotary_dim:]), dim=-1).contiguous()
 
     def forward(
         self,
@@ -176,6 +181,7 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
         cos: torch.Tensor,
         sin: torch.Tensor,
         sparse_key_blocks: int,
+        plan: SparsePiperAttentionPlan,
     ) -> torch.Tensor:
         batch, sequence, _features = hidden_states.shape
         query = self._dynamic_norm_rope(
@@ -195,7 +201,7 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
             query,
             key,
             value,
-            self.plan,
+            plan,
             sparse_key_blocks=sparse_key_blocks,
         )
 
@@ -287,7 +293,7 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_cuda_fused_projection_reuses_one_dynamic_shape_and_sparse_prefix_graph() -> None:
+def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> None:
     torch.manual_seed(709)
     model = _DynamicSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
@@ -308,7 +314,15 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_and_sparse_prefix_graph(
     )
 
     with torch.no_grad():
-        for sequence, sparse_key_blocks in ((192, 2), (256, 2), (256, 3)):
+        cases = (
+            (192, 2, (1, 1)),
+            (256, 2, (1, 2)),
+            (256, 3, (2, 2)),
+            (256, 3, (2, 3)),
+            (1024, 8, (8, 8)),
+            (1024, 9, (9, 9)),
+        )
+        for sequence, sparse_key_blocks, keep_values in cases:
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -324,18 +338,27 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_and_sparse_prefix_graph(
             ).mul_(2 * torch.pi)
             cos = angles.cos().contiguous()
             sin = angles.sin().contiguous()
-            expected = materialized(hidden_states, cos, sin, sparse_key_blocks)
+            plan = prepare_sparse_piper_attention_plan(
+                torch.tensor(keep_values, device="cuda", dtype=torch.int32)
+            )
+            expected = materialized(hidden_states, cos, sin, sparse_key_blocks, plan)
             output = compiled(
                 hidden_states,
                 cos,
                 sin,
                 sparse_key_blocks,
+                plan,
             )
             assert output.shape == (model.batch, sequence, model.heads, model.head_dim)
             assert bool(torch.isfinite(output).all())
             difference = output.float() - expected.float()
             relative_l2 = difference.norm() / expected.float().norm()
-            assert relative_l2 < 0.025
+            assert relative_l2 < 0.025, (
+                sequence,
+                sparse_key_blocks,
+                keep_values,
+                relative_l2.item(),
+            )
 
     assert capture.calls == 1
     assert (

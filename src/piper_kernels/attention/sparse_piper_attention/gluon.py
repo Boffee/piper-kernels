@@ -242,6 +242,8 @@ def _native_tile_start(
 @gluon.jit(
     do_not_specialize=[
         "sparse_key_blocks",
+        "stride_rb",
+        "stride_rq",
     ]
 )
 def _paired_routed_piper_gluon_kernel(

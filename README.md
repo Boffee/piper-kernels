@@ -220,7 +220,9 @@ FP32 DSA route over that prefix, then attends to every remaining K/V row in the 
 makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their
 queries sparse over the packed media prefix. Per-head keep counts are arbitrary runtime values;
-budget selection and calibration remain Engine responsibilities.
+budget selection and calibration remain Engine responsibilities. When the plan is passed as a
+runtime input to a dynamic compiled graph, its head allocation and total packed-route capacity may
+change between calls without compiling another graph or SM120 attention kernel.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

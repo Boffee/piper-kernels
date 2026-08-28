@@ -32,7 +32,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import key, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v3"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v5"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _HEAD_DIM = 128
 _QUERY_BLOCK_ROWS = 64
@@ -213,7 +213,7 @@ def _static_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _integer_scalar(value: object) -> Argument | None:
+def _integer_scalar_metadata(value: object) -> int | torch.SymInt | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, torch.SymInt)):
@@ -221,7 +221,15 @@ def _integer_scalar(value: object) -> Argument | None:
     if isinstance(value, torch.fx.Node):
         metadata = value.meta.get("val")
         if isinstance(metadata, (int, torch.SymInt)) and not isinstance(metadata, bool):
-            return value
+            return metadata
+    return None
+
+
+def _integer_scalar_argument(value: object) -> Argument | None:
+    if _integer_scalar_metadata(value) is None:
+        return None
+    if isinstance(value, (int, torch.SymInt, torch.fx.Node)):
+        return value
     return None
 
 
@@ -345,8 +353,8 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
     ):
         return False
 
-    rotary_dim = _static_int(match.kwargs["sparse_rotary_dim"])
-    half_rotary_dim = _static_int(match.kwargs["sparse_half_rotary_dim"])
+    rotary_dim = _integer_scalar_metadata(match.kwargs["sparse_rotary_dim"])
+    half_rotary_dim = _integer_scalar_metadata(match.kwargs["sparse_half_rotary_dim"])
     cos = metadata["sparse_cos"]
     sin = metadata["sparse_sin"]
     assert cos is not None
@@ -354,28 +362,40 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
     if (
         rotary_dim is None
         or half_rotary_dim is None
-        or rotary_dim < 2
-        or rotary_dim > _HEAD_DIM
-        or rotary_dim % 2
-        or half_rotary_dim != rotary_dim // 2
         or cos.dtype is not torch.float32
         or sin.dtype is not torch.float32
         or cos.ndim != 2
         or sin.ndim != 2
-        or cos.shape[1] != rotary_dim
-        or sin.shape[1] != rotary_dim
+        or preparation_sharing.dimension_key(cos.shape[0])
+        != preparation_sharing.dimension_key(sequence_length)
+        or preparation_sharing.dimension_key(sin.shape[0])
+        != preparation_sharing.dimension_key(sequence_length)
+        or preparation_sharing.dimension_key(cos.shape[1])
+        != preparation_sharing.dimension_key(rotary_dim)
+        or preparation_sharing.dimension_key(sin.shape[1])
+        != preparation_sharing.dimension_key(rotary_dim)
+        or preparation_sharing.dimension_key(half_rotary_dim)
+        != preparation_sharing.dimension_key((rotary_dim + 1) // 2)
         or cos.device != input_value.device
         or sin.device != input_value.device
     ):
         return False
+    if isinstance(rotary_dim, int):
+        if rotary_dim < 2 or rotary_dim > _HEAD_DIM or rotary_dim % 2:
+            return False
+        if not isinstance(half_rotary_dim, int) or half_rotary_dim != rotary_dim // 2:
+            return False
+        if cos.shape[1] != rotary_dim or sin.shape[1] != rotary_dim:
+            return False
 
-    sparse_key_blocks = _integer_scalar(match.kwargs["sparse_key_blocks"])
-    routes_per_query = _integer_scalar(match.kwargs["sparse_routes_per_query"])
-    max_keep_blocks = _integer_scalar(match.kwargs["sparse_max_keep_blocks"])
-    query_chunk_blocks = _static_int(match.kwargs["sparse_query_chunk_blocks"])
+    sparse_key_blocks = _integer_scalar_argument(match.kwargs["sparse_key_blocks"])
+    routes_per_query = _integer_scalar_argument(match.kwargs["sparse_routes_per_query"])
+    max_keep_blocks = _integer_scalar_argument(match.kwargs["sparse_max_keep_blocks"])
+    query_chunk_blocks = _integer_scalar_argument(match.kwargs["sparse_query_chunk_blocks"])
     static_sparse_key_blocks = _static_int(sparse_key_blocks)
     static_routes_per_query = _static_int(routes_per_query)
     static_max_keep_blocks = _static_int(max_keep_blocks)
+    static_query_chunk_blocks = _static_int(query_chunk_blocks)
     if (
         sparse_key_blocks is None
         or routes_per_query is None
@@ -394,7 +414,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
             and static_max_keep_blocks is not None
             and static_sparse_key_blocks < static_max_keep_blocks
         )
-        or query_chunk_blocks < 1
+        or (static_query_chunk_blocks is not None and static_query_chunk_blocks < 1)
     ):
         return False
     keep_blocks = metadata["sparse_keep_blocks"]
@@ -403,9 +423,11 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
     assert head_offsets is not None
     return (
         keep_blocks.dtype is torch.int32
-        and tuple(keep_blocks.shape) == (heads,)
+        and keep_blocks.ndim == 1
+        and (not isinstance(keep_blocks.shape[0], int) or keep_blocks.shape[0] == heads)
         and head_offsets.dtype is torch.int32
-        and tuple(head_offsets.shape) == (heads + 1,)
+        and head_offsets.ndim == 1
+        and (not isinstance(head_offsets.shape[0], int) or head_offsets.shape[0] == heads + 1)
         and keep_blocks.device == input_value.device
         and head_offsets.device == input_value.device
     )
@@ -433,7 +455,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_softmax_scale: float,
     sparse_routes_per_query: Argument,
     sparse_max_keep_blocks: Argument,
-    sparse_query_chunk_blocks: int,
+    sparse_query_chunk_blocks: Argument,
     **_unused: object,
 ) -> None:
     original = match.output_node()
