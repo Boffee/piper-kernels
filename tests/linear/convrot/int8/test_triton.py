@@ -4,6 +4,8 @@ from dataclasses import replace
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
@@ -13,6 +15,50 @@ from piper_kernels.linear.convrot.int8.reference import (
     addmm_,
     linear,
 )
+
+
+@triton.jit
+def _scaled_projection_epilogue_probe(  # noqa: PLR0913, PLR0917
+    input_ptr,
+    weight_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    output_ptr,
+    rows,
+    out_features,
+    in_features,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Exercise ConvRot's reusable scaled accumulator with a non-linear epilogue."""
+    offsets_m = tl.program_id(0) * block_m + tl.arange(0, block_m)
+    offsets_n = tl.program_id(1) * block_n + tl.arange(0, block_n)
+    projected = triton_backend.scaled_int8_matmul(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        offsets_m,
+        offsets_n,
+        rows,
+        out_features,
+        in_features,
+        block_m,
+        block_n,
+        block_k,
+        False,
+    )
+    # A future attention projection substitutes normalization, RoPE, and
+    # quantization here. This probe makes sure the reusable boundary returns an
+    # accumulator rather than owning the ordinary BF16 store.
+    projected = projected * projected + 0.25
+    output_offsets = offsets_m[:, None] * out_features + offsets_n[None, :]
+    tl.store(
+        output_ptr + output_offsets,
+        projected,
+        mask=(offsets_m[:, None] < rows) & (offsets_n[None, :] < out_features),
+    )
 
 
 @pytest.mark.gpu
@@ -30,6 +76,53 @@ def test_triton_linear_matches_gpu_reference(group_size: int) -> None:
     expected = linear(activation, qdata, scale, group_size, bias)
     actual = torch.nn.functional.linear(activation, wrapped, bias)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_scaled_projection_tile_supports_specialized_epilogues() -> None:
+    torch.manual_seed(153)
+    rows, out_features, in_features = 19, 23, 48
+    input_qdata = torch.randint(
+        -127,
+        128,
+        (rows, in_features),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    weight_qdata = torch.randint(
+        -127,
+        128,
+        (out_features, in_features),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    input_scale = torch.rand(rows, dtype=torch.float32, device="cuda") * 0.01
+    weight_scale = torch.rand(out_features, dtype=torch.float32, device="cuda") * 0.01
+    actual = torch.empty(rows, out_features, dtype=torch.float32, device="cuda")
+    block_m, block_n, block_k = 16, 32, 32
+
+    _scaled_projection_epilogue_probe[
+        (triton.cdiv(rows, block_m), triton.cdiv(out_features, block_n))
+    ](
+        input_qdata,
+        weight_qdata,
+        input_scale,
+        weight_scale,
+        actual,
+        rows,
+        out_features,
+        in_features,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+    )
+
+    # FP32 exactly represents this short INT8 reduction on CUDA.
+    accumulated = input_qdata.float() @ weight_qdata.T.float()
+    projected = accumulated * input_scale[:, None] * weight_scale[None, :]
+    expected = projected * projected + 0.25
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.gpu

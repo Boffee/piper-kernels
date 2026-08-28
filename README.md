@@ -13,7 +13,7 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
 | Package | Role |
 |---|---|
-| `piper_kernels` | Public Piper Attention and SageAttention2++ forward operators |
+| `piper_kernels` | Public dense and sparse Piper Attention plus SageAttention2++ operators |
 | `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
 | `piper_kernels.linear` | Linear operators, tensor formats, and optimized backends |
 | `piper_kernels.linear.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
@@ -103,6 +103,26 @@ eager, and training paths remain unchanged. Existing post-grad compiler passes i
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
+The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
+`convrot_sparse_piper_compile_options` from
+`piper_kernels.fusions.convrot_sparse_piper`. It installs the fusion pass before the ordinary
+ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
+bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
+`sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
+plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. It fails
+closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention
+APIs remain independent.
+
+Because no projected activation is externally observable in the fused region, projection,
+RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise
+redundant FP32-to-BF16-to-FP32 round trips without materializing FP32 activation tensors.
+
+The internal `piper_kernels.fusions.convrot_sage_qk` layer owns the reusable projection,
+RMSNorm, RoPE, signed-Hadamard, and Sage-style INT8 Q/K quantization device functions. Sparse
+Piper wraps those functions with its DSA-summary epilogues and keeps its tile-scaled V path
+separate. This boundary lets dense Piper and Sage consumers reuse the Q/K preparation without
+depending on sparse routing or sparse-Piper storage.
+
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
 the result. It preserves the ConvRot tensor and quantized storage identities, allowing
 offload integrations to keep their existing buffers. Repeated updates are lossy, so
@@ -170,6 +190,41 @@ mixed-sign lowering remains future work.
 Piper Attention is an independently developed Sage-derived design. The per-key
 quantizer, centering identity, and online-softmax lineage are not claimed as novel in
 isolation; the name identifies this package's selected combination and fused recurrence.
+
+## Sparse Piper Attention
+
+Sparse Piper is a separate non-causal SM120 operator for pre-tiled H3-style self-attention:
+
+```python
+from piper_kernels import SparsePiperAttention
+
+attention = SparsePiperAttention((0.2, 0.4, 0.6))
+output = attention(
+    query,
+    key,
+    value,
+    sparse_key_blocks=1036,
+)
+```
+
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The sequence is K64 aligned,
+and every input row participates in attention. `sparse_key_blocks` is a runtime count of routeable
+K64 prefix tiles. Every query receives an exact
+FP32 DSA route over that prefix, then attends to every remaining K/V row in the same softmax. This
+makes text,
+generated audio, or other globally retained sections an optional dense suffix while keeping their
+queries sparse over the packed media prefix. Engine owns only the semantic per-layer ratio profile.
+Each opaque attention call derives its temporary physical keep counts, packed offsets, and exact
+route storage from that immutable model configuration and the current prefix length. Dynamic
+compiled graphs accept changed prefix lengths and their resulting route capacities without compiling
+another graph or SM120 attention kernel. DSA routes remain call-local because they depend on the
+current Q/K values.
+
+The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
+recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
+pre-rounding denominator remain FP32. Unsupported devices use a slow portable implementation of
+the same quantized Sparse Piper arithmetic. A separate exact-BF16 sparse reference serves as its
+quality oracle; it is not the public fallback.
 
 ## SageAttention2++
 

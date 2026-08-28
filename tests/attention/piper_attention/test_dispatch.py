@@ -5,6 +5,7 @@ import torch
 
 import piper_kernels
 from piper_kernels import piper_attention
+from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 from piper_kernels.attention.piper_attention import triton as piper_attention_backend
 
 
@@ -66,8 +67,8 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         record_hook,
     )
     monkeypatch.setattr(
-        piper_attention_backend,
-        "_compute_kv_means",
+        piper_quantization,
+        "compute_kv_means",
         stop_at_preprocessing,
     )
     query, key, value = _inputs()

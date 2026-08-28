@@ -5,6 +5,27 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added the standalone `SparsePiperAttention` MVP for pre-tiled BF16 `[B,S,H,128]` self-attention
+  on exact SM120. It combines exact FP32 DSA, packed UINT16 per-head routes, logical Q64/K64
+  sparsity, physical M64/K128 execution, tile-scaled INT8 V, a pre-rounding FP32 denominator, and
+  an optional always-dense K/V suffix in one softmax. The immutable per-head ratio profile and
+  current sparse-prefix length resolve temporary per-head counts, offsets, and exact packed capacity
+  inside each call. Unsupported devices use a portable quantized reference matching the SM120
+  algorithm, while an exact-BF16 sparse oracle remains separate for quality measurement. Every
+  supplied row participates in attention; padding and masking policy remain Engine responsibilities,
+  alongside budget calibration, spatial packing, and model policy.
+- Added an inference-only compiled rewrite for compatible H3-style ConvRot Q/K/V projections,
+  D128 RMSNorm, split-half RoPE, and `sparse_piper_attention` on exact SM120. It shares input
+  preparation, emits quantized Q/K/V plus DSA summaries directly, and avoids materializing
+  the three BF16 projection outputs. Reusable projection, RMSNorm, RoPE, and Sage-style Q/K
+  quantization primitives live under `piper_kernels.fusions.convrot_sage_qk`; the explicit
+  `piper_kernels.fusions.convrot_sparse_piper` integration adds sparse DSA summaries and V
+  preparation, and installs its pass before the independent ConvRot compiler pass. Unsupported
+  graphs remain on the ordinary public operators. Fused projection, RMSNorm, and RoPE remain
+  FP32 through the final INT8 encoding instead of reproducing unobservable BF16 round trips.
+
 ## [0.3.0] - 2026-08-17
 
 ### Changed
@@ -196,7 +217,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.3.0rc1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Boffee/piper-kernels/compare/v0.3.0rc1...v0.3.0
 [0.3.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.2.1...v0.3.0rc1
 [0.2.1]: https://github.com/Boffee/piper-kernels/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Boffee/piper-kernels/compare/v0.1.0...v0.2.0

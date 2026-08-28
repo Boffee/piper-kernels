@@ -25,6 +25,147 @@ from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 from . import _policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
+_MEAN_BLOCK_M = 256
+_MEAN_BLOCK_K = 128
+
+
+@triton.jit
+def scaled_int8_matmul(
+    input_ptr,
+    weight_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    offsets_m,
+    offsets_n,
+    m,
+    n,
+    k,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    aligned_tiles: tl.constexpr,
+):
+    """Return one FP32 ConvRot projection tile before its output epilogue.
+
+    Inputs are the prepared rowwise-INT8 activation and the rotated rowwise-INT8
+    weight. Their FP32 scales are applied after the exact INT32 dot product. The
+    caller owns bias handling, logical-dtype rounding, and the final store so the
+    same projection can feed either the ordinary linear epilogue or a fused
+    attention epilogue.
+    """
+    offsets_k = tl.arange(0, block_k)
+    offsets_m_i64 = offsets_m.to(tl.int64)
+    offsets_n_i64 = offsets_n.to(tl.int64)
+    offsets_k_i64 = offsets_k.to(tl.int64)
+    input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
+    weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
+
+    for k_offset in range(tl.cdiv(k, block_k)):
+        if aligned_tiles:
+            input_values = tl.load(input_pointers)
+            weight = tl.load(weight_pointers)
+        else:
+            remaining_k = k - k_offset * block_k
+            input_values = tl.load(
+                input_pointers,
+                mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
+                other=0,
+            )
+            weight = tl.load(
+                weight_pointers,
+                mask=(offsets_n[None, :] < n) & (offsets_k[:, None] < remaining_k),
+                other=0,
+            )
+        accumulator += tl.dot(input_values, weight)
+        input_pointers += block_k
+        weight_pointers += block_k
+
+    if aligned_tiles:
+        input_scale = tl.load(input_scale_ptr + offsets_m)
+        weight_scale = tl.load(weight_scale_ptr + offsets_n)
+    else:
+        input_scale = tl.load(
+            input_scale_ptr + offsets_m,
+            mask=offsets_m < m,
+            other=0.0,
+        )
+        weight_scale = tl.load(
+            weight_scale_ptr + offsets_n,
+            mask=offsets_n < n,
+            other=0.0,
+        )
+    return accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
+
+
+@triton.jit
+def _dequantized_input_mean_partial_kernel(
+    input_ptr,
+    input_scale_ptr,
+    partial_ptr,
+    sequence_length,
+    input_features: tl.constexpr,
+    row_block_count: tl.constexpr,
+    block_m: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Sum one row block of the activation represented by prepared ConvRot storage."""
+    row_block = tl.program_id(0)
+    feature_block = tl.program_id(1)
+    batch = tl.program_id(2)
+    sequence_offsets = row_block * block_m + tl.arange(0, block_m)
+    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
+    valid = (sequence_offsets[:, None] < sequence_length) & (
+        feature_offsets[None, :] < input_features
+    )
+    values = tl.load(
+        input_ptr
+        + (batch * sequence_length + sequence_offsets[:, None]) * input_features
+        + feature_offsets[None, :],
+        mask=valid,
+        other=0,
+    ).to(tl.float32)
+    scales = tl.load(
+        input_scale_ptr + batch * sequence_length + sequence_offsets,
+        mask=sequence_offsets < sequence_length,
+        other=0.0,
+    )
+    partial = tl.sum(values * scales[:, None], axis=0)
+    tl.store(
+        partial_ptr + (batch * row_block_count + row_block) * input_features + feature_offsets,
+        partial,
+        mask=feature_offsets < input_features,
+    )
+
+
+@triton.jit
+def _dequantized_input_mean_reduce_kernel(
+    partial_ptr,
+    output_ptr,
+    sequence_length,
+    input_features: tl.constexpr,
+    row_block_count: tl.constexpr,
+    reduction_rows: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Reduce prepared-input partial sums to one FP32 feature mean per batch."""
+    feature_block = tl.program_id(0)
+    batch = tl.program_id(1)
+    row_offsets = tl.arange(0, reduction_rows)
+    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
+    partial = tl.load(
+        partial_ptr
+        + (batch * row_block_count + row_offsets[:, None]) * input_features
+        + feature_offsets[None, :],
+        mask=(row_offsets[:, None] < row_block_count) & (feature_offsets[None, :] < input_features),
+        other=0.0,
+    )
+    mean = tl.sum(partial, axis=0) / sequence_length
+    tl.store(
+        output_ptr + batch * input_features + feature_offsets,
+        mean,
+        mask=feature_offsets < input_features,
+    )
 
 
 @triton.jit
@@ -289,49 +430,23 @@ def _int8_matmul_kernel(
         pid_n = tl.program_id(1)
     offsets_m = pid_m * block_m + tl.arange(0, block_m)
     offsets_n = pid_n * block_n + tl.arange(0, block_n)
-    offsets_k = tl.arange(0, block_k)
     offsets_m_i64 = offsets_m.to(tl.int64)
     offsets_n_i64 = offsets_n.to(tl.int64)
-    offsets_k_i64 = offsets_k.to(tl.int64)
-
-    input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
-    weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
-
-    for k_offset in range(tl.cdiv(k, block_k)):
-        if aligned_tiles:
-            input_values = tl.load(input_pointers)
-            weight = tl.load(weight_pointers)
-        else:
-            input_values = tl.load(
-                input_pointers,
-                mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < k - k_offset * block_k),
-                other=0,
-            )
-            weight = tl.load(
-                weight_pointers,
-                mask=(offsets_n[None, :] < n) & (offsets_k[:, None] < k - k_offset * block_k),
-                other=0,
-            )
-        accumulator += tl.dot(input_values, weight)
-        input_pointers += block_k
-        weight_pointers += block_k
-
-    if aligned_tiles:
-        input_scale = tl.load(input_scale_ptr + offsets_m)
-        weight_scale = tl.load(weight_scale_ptr + offsets_n)
-    else:
-        input_scale = tl.load(
-            input_scale_ptr + offsets_m,
-            mask=offsets_m < m,
-            other=0.0,
-        )
-        weight_scale = tl.load(
-            weight_scale_ptr + offsets_n,
-            mask=offsets_n < n,
-            other=0.0,
-        )
-    result = accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
+    result = scaled_int8_matmul(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        offsets_m,
+        offsets_n,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        aligned_tiles,
+    )
     if has_bias:
         if aligned_tiles:
             bias = tl.load(bias_ptr + offsets_n)
@@ -697,6 +812,72 @@ def _prepare_input_fake(
     return (
         input.new_empty((*input.shape[:-1], input_width), dtype=torch.int8),
         input.new_empty(input.shape[:-1], dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_dequantized_input_mean",
+    mutates_args=(),
+)
+def dequantized_input_mean(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Return the FP32 sequence mean represented by prepared ConvRot storage."""
+    if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
+        raise ValueError("ConvRot mean input must be [batch,sequence,features] INT8")
+    batch, sequence_length, input_features = input_qdata.shape
+    if input_scale.shape != (batch, sequence_length) or input_scale.dtype is not torch.float32:
+        raise ValueError("ConvRot mean scale must be a batch/sequence FP32 matrix")
+    if input_qdata.device.type != "cuda" or input_scale.device != input_qdata.device:
+        raise ValueError("ConvRot mean operands must share a CUDA device")
+    if not input_qdata.is_contiguous() or not input_scale.is_contiguous():
+        raise ValueError("ConvRot mean operands must be contiguous")
+    row_block_count = int(triton.cdiv(sequence_length, _MEAN_BLOCK_M))
+    partial = torch.empty(
+        (batch, row_block_count, input_features),
+        device=input_qdata.device,
+        dtype=torch.float32,
+    )
+    output = torch.empty(
+        (batch, input_features),
+        device=input_qdata.device,
+        dtype=torch.float32,
+    )
+    _dequantized_input_mean_partial_kernel[
+        (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
+    ](
+        input_qdata,
+        input_scale,
+        partial,
+        sequence_length,
+        input_features=input_features,
+        row_block_count=row_block_count,
+        block_m=_MEAN_BLOCK_M,
+        block_k=_MEAN_BLOCK_K,
+        num_warps=8,
+    )
+    _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
+        partial,
+        output,
+        sequence_length,
+        input_features=input_features,
+        row_block_count=row_block_count,
+        reduction_rows=triton.next_power_of_2(row_block_count),
+        block_k=_MEAN_BLOCK_K,
+        num_warps=8,
+    )
+    return output
+
+
+@dequantized_input_mean.register_fake
+def _dequantized_input_mean_fake(
+    input_qdata: torch.Tensor,
+    _input_scale: torch.Tensor,
+) -> torch.Tensor:
+    return input_qdata.new_empty(
+        (input_qdata.shape[0], input_qdata.shape[2]),
+        dtype=torch.float32,
     )
 
 
