@@ -222,7 +222,7 @@ def _run_sparse_piper_attention(
 
     assert _launch_sm120_attention is not None
     assert _prepare_sm120_attention is not None
-    output = torch.empty_like(query)
+    output = torch.empty_like(query, memory_format=torch.contiguous_format)
     prepared = _prepare_sm120_attention(
         query_blocks,
         key_blocks,

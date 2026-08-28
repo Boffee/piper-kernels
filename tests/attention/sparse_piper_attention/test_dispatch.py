@@ -116,6 +116,27 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
+def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None:
+    query, key, value = (
+        tensor.transpose(1, 2).contiguous().transpose(1, 2) for tensor in _inputs("cuda")
+    )
+    plan = prepare_sparse_piper_attention_plan(
+        torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+    )
+
+    with torch.no_grad():
+        output = sparse_piper_attention(query, key, value, plan, sparse_key_blocks=2)
+
+    assert not query.is_contiguous()
+    assert output.is_contiguous()
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
 @pytest.mark.parametrize(
     ("sparse_key_blocks", "keep_values"),
     [(1, (1, 1)), (2, (1, 2)), (3, (1, 2))],

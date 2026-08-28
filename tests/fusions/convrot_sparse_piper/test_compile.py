@@ -222,6 +222,28 @@ def test_compile_options_reorder_existing_convrot_pass_without_duplication() -> 
     assert reapplied == options
 
 
+def test_compile_options_preserve_unrelated_pass_order() -> None:
+    before_convrot = object()
+    after_convrot = object()
+    options = convrot_sparse_piper_compile_options(
+        {
+            _POST_GRAD_PRE_PASS: (
+                before_convrot,
+                convrot_compile_pass,
+                after_convrot,
+            )
+        }
+    )
+
+    assert options[_POST_GRAD_PRE_PASS] == (
+        before_convrot,
+        fusion_compile_pass,
+        convrot_compile_pass,
+        after_convrot,
+    )
+    assert convrot_sparse_piper_compile_options(options) == options
+
+
 def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
     first = fusion_compile_pass.uuid()
     second = fusion_compile_pass.uuid()

@@ -630,34 +630,40 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 compile_pass = _CompilePass()
 
 
-def _without_compiler_pass(
-    options: Mapping[str, object] | None,
-    compiler_pass: object,
-) -> dict[str, object]:
-    """Copy options while removing one pass by identity."""
-    combined = dict(options) if options is not None else {}
-    existing = combined.get(_POST_GRAD_PRE_PASS)
-    if existing is compiler_pass:
-        combined.pop(_POST_GRAD_PRE_PASS)
-    elif isinstance(existing, (list, tuple)):
-        remaining = tuple(item for item in existing if item is not compiler_pass)
-        if not remaining:
-            combined.pop(_POST_GRAD_PRE_PASS)
-        elif len(remaining) == 1:
-            combined[_POST_GRAD_PRE_PASS] = remaining[0]
-        else:
-            combined[_POST_GRAD_PRE_PASS] = remaining
-    return combined
-
-
 def convrot_sparse_piper_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install sparse fusion before ordinary ConvRot graph optimizations."""
-    combined = _without_compiler_pass(options, compile_pass)
-    combined = _without_compiler_pass(combined, convrot_compile.compile_pass)
-    combined = preparation_sharing.add_post_grad_pass(combined, compile_pass)
-    return preparation_sharing.add_post_grad_pass(combined, convrot_compile.compile_pass)
+    combined = dict(options) if options is not None else {}
+    existing = combined.get(_POST_GRAD_PRE_PASS)
+    if existing is None:
+        passes: tuple[object, ...] = ()
+    elif isinstance(existing, (list, tuple)):
+        passes = tuple(existing)
+    else:
+        passes = (existing,)
+
+    convrot_pass = convrot_compile.compile_pass
+    convrot_index = next(
+        (index for index, compiler_pass in enumerate(passes) if compiler_pass is convrot_pass),
+        len(passes),
+    )
+    insertion_index = sum(
+        compiler_pass is not compile_pass and compiler_pass is not convrot_pass
+        for compiler_pass in passes[:convrot_index]
+    )
+    unrelated = tuple(
+        compiler_pass
+        for compiler_pass in passes
+        if compiler_pass is not compile_pass and compiler_pass is not convrot_pass
+    )
+    combined[_POST_GRAD_PRE_PASS] = (
+        *unrelated[:insertion_index],
+        compile_pass,
+        convrot_pass,
+        *unrelated[insertion_index:],
+    )
+    return combined
 
 
 __all__ = ["convrot_sparse_piper_compile_options"]
