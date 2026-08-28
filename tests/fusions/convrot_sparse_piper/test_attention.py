@@ -8,11 +8,7 @@ import pytest
 import torch
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import (
-    SparsePiperAttentionPlan,
-    prepare_sparse_piper_attention_plan,
-    sparse_piper_attention,
-)
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sm120_sparse_piper_attention_from_quantized,
 )
@@ -152,18 +148,14 @@ def _run_sparse_piper_attention_from_quantized(
     prepared_query: _QuantizedQueryOperands,
     prepared_key: _QuantizedKeyOperands,
     prepared_value: _QuantizedValueOperands,
-    plan: SparsePiperAttentionPlan,
+    attention: SparsePiperAttention,
 ) -> torch.Tensor:
     return _sm120_sparse_piper_attention_from_quantized(
         *prepared_query,
         *prepared_key,
         *prepared_value,
-        plan.keep_blocks,
-        plan.head_offsets,
+        list(attention._head_keep_ratio_units),
         _SPARSE_KEY_BLOCKS,
-        plan.routes_per_query,
-        plan.max_keep_blocks,
-        plan.query_chunk_blocks,
     )
 
 
@@ -196,12 +188,10 @@ def _materialize_qk(
 def test_quantized_sparse_piper_writes_engine_layout() -> None:
     operands = _operands()
     query, key, value = _prepare(operands)
-    plan = prepare_sparse_piper_attention_plan(
-        torch.tensor([1, 2], device="cuda", dtype=torch.int32),
-    )
+    attention = SparsePiperAttention((0.5, 1.0))
 
     with torch.no_grad():
-        output = _run_sparse_piper_attention_from_quantized(query, key, value, plan)
+        output = _run_sparse_piper_attention_from_quantized(query, key, value, attention)
 
     assert output.shape == (_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
     assert output.dtype is torch.bfloat16
@@ -234,18 +224,16 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
         None,
         torch.bfloat16,
     ).view(_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
-    keep = torch.full((_HEADS,), 2, device="cuda", dtype=torch.int32)
-    plan = prepare_sparse_piper_attention_plan(keep)
+    attention = SparsePiperAttention((1.0, 1.0))
 
     with torch.no_grad():
-        expected = sparse_piper_attention(
+        expected = attention(
             materialized_query,
             materialized_key,
             materialized_value,
-            plan,
             sparse_key_blocks=_SPARSE_KEY_BLOCKS,
         )
-        actual = _run_sparse_piper_attention_from_quantized(query, key, value, plan)
+        actual = _run_sparse_piper_attention_from_quantized(query, key, value, attention)
 
     difference = actual.float() - expected.float()
     relative_l2 = difference.norm() / expected.float().norm()
@@ -256,9 +244,7 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_full_fused_sparse_piper_pipeline_compiles_as_one_graph() -> None:
     operands = _operands()
-    plan = prepare_sparse_piper_attention_plan(
-        torch.tensor([1, 2], device="cuda", dtype=torch.int32),
-    )
+    attention = SparsePiperAttention((0.5, 1.0))
 
     def run(input_qdata: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
         dynamic_operands = _Operands(
@@ -276,7 +262,7 @@ def test_full_fused_sparse_piper_pipeline_compiles_as_one_graph() -> None:
             operands.sin,
         )
         query, key, value = _prepare(dynamic_operands)
-        return _run_sparse_piper_attention_from_quantized(query, key, value, plan)
+        return _run_sparse_piper_attention_from_quantized(query, key, value, attention)
 
     compiled = torch.compile(run, fullgraph=True)
     with torch.no_grad():

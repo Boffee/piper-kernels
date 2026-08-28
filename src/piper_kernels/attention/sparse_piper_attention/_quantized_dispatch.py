@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from .dsa import SparsePiperAttentionPlan, packed_dsa_routes_from_summaries
+from ._budget import _resolve_route_layout
+from .dsa import packed_dsa_routes_from_summaries
 
 try:
     from .gluon import (
@@ -35,27 +36,21 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    keep_blocks: torch.Tensor,
-    head_offsets: torch.Tensor,
+    head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
-    routes_per_query: int,
-    max_keep_blocks: int,
-    query_chunk_blocks: int,
 ) -> torch.Tensor:
     if _prepare_sm120_quantized_attention is None or _launch_sm120_attention is None:
         raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
-    plan = SparsePiperAttentionPlan(
-        keep_blocks=keep_blocks,
-        head_offsets=head_offsets,
-        routes_per_query=routes_per_query,
-        max_keep_blocks=max_keep_blocks,
-        query_chunk_blocks=query_chunk_blocks,
+    layout = _resolve_route_layout(
+        tuple(head_keep_ratio_units),
+        sparse_key_blocks,
+        query.device,
     )
     routes = packed_dsa_routes_from_summaries(
         query_summary,
         key_max[:, :, :sparse_key_blocks],
         key_min[:, :, :sparse_key_blocks],
-        plan,
+        layout,
     )
     batch, heads, sequence_length, head_dim = query.shape
     output = torch.empty(
@@ -75,7 +70,7 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
         routes.keep_blocks,
         routes.head_offsets,
         sparse_key_blocks=sparse_key_blocks,
-        routes_per_query=routes_per_query,
+        routes_per_query=layout.routes_per_query,
         attention_output=output.transpose(1, 2),
     )
     _launch_sm120_attention(prepared)
@@ -94,12 +89,8 @@ def _sm120_sparse_piper_attention_from_quantized_fake(
     _value: torch.Tensor,
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
-    _keep_blocks: torch.Tensor,
-    _head_offsets: torch.Tensor,
+    _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
-    _routes_per_query: int,
-    _max_keep_blocks: int,
-    _query_chunk_blocks: int,
 ) -> torch.Tensor:
     return query.new_empty(
         (query.shape[0], query.shape[2], query.shape[1], query.shape[3]),

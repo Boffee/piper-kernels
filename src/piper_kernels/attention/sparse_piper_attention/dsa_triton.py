@@ -209,8 +209,6 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
 def block_summaries(
     query_blocks: torch.Tensor,
     key_blocks: torch.Tensor,
-    *,
-    num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return exact FP32 Q-extrema sums and K extrema without FP32 input copies."""
     if query_blocks.ndim != 5 or key_blocks.ndim != 5:
@@ -232,8 +230,6 @@ def block_summaries(
         raise ValueError("optimized DSA summaries require CUDA BF16/FP16 inputs")
     if query_blocks.stride(-1) != 1 or key_blocks.stride(-1) != 1:
         raise ValueError("optimized DSA summaries require contiguous feature dimensions")
-    if num_warps not in (4, 8):
-        raise ValueError("optimized DSA summaries require four or eight warps")
     query_summary = torch.empty(
         (*query_blocks.shape[:-2], _HEAD_DIM),
         device=query_blocks.device,
@@ -260,7 +256,7 @@ def block_summaries(
         head_dim=_HEAD_DIM,
         heads=query_blocks.shape[1],
         sum_extrema=True,
-        num_warps=num_warps,
+        num_warps=4,
         num_stages=1,
     )
     _block_summary_kernel[key_grid](
@@ -276,7 +272,7 @@ def block_summaries(
         head_dim=_HEAD_DIM,
         heads=key_blocks.shape[1],
         sum_extrema=False,
-        num_warps=num_warps,
+        num_warps=4,
         num_stages=1,
     )
     return query_summary, key_max, key_min
@@ -289,7 +285,6 @@ def tiled_radix_select_packed_routes(
     head_offsets: torch.Tensor,
     *,
     route_query_offset: int,
-    selector_tile: int = _SELECTOR_TILE,
 ) -> None:
     """Write exact FP32 top-k routes directly into packed UINT16 storage."""
     if scores.ndim != 4 or not scores.is_contiguous() or scores.dtype != torch.float32:
@@ -319,10 +314,6 @@ def tiled_radix_select_packed_routes(
         raise ValueError("tiled DSA query range must fit the packed route output")
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled DSA scores and packed routes must share the batch dimension")
-    if selector_tile < 64:
-        raise ValueError("tiled DSA selector tile must be at least 64")
-    if selector_tile & (selector_tile - 1):
-        raise ValueError("tiled DSA selector tile must be a power of two")
     batch, heads, queries, keys = scores.shape
     _tiled_radix_select_packed_routes_kernel[(queries, heads, batch)](
         scores,
@@ -337,7 +328,7 @@ def tiled_radix_select_packed_routes(
         routes.stride(0),
         routes.stride(1),
         routes.stride(2),
-        selector_tile=selector_tile,
+        selector_tile=_SELECTOR_TILE,
         num_warps=4,
         num_stages=1,
     )

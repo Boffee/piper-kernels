@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .dsa import (
-    SparsePiperAttentionPlan,
-    packed_dsa_routes_from_plan,
-    prepare_dsa_route_plan,
+from ._budget import (
+    _RATIO_SCALE,
+    _normalize_head_keep_ratios,
+    _resolve_route_layout,
+    _ResolvedRouteLayout,
 )
+from .dsa import packed_dsa_routes_from_layout
 from .reference import reference_sparse_piper_attention
 
 try:
@@ -33,34 +36,60 @@ def _supports_sm120(target: AcceleratorTarget) -> bool:
     return _launch_sm120_attention is not None and target.is_cuda_capability(12, 0)
 
 
-def prepare_sparse_piper_attention_plan(
-    keep_blocks: torch.Tensor,
-    *,
-    query_chunk_blocks: int = 384,
-) -> SparsePiperAttentionPlan:
-    """Prepare reusable per-head route-budget metadata.
+class SparsePiperAttention(torch.nn.Module):
+    """Sparse attention with no derived state beyond its immutable ratio profile."""
 
-    ``keep_blocks[h]`` is the number of sparse-prefix K64 tiles retained for
-    head ``h``. The dense suffix is separate and is always included.
-    """
-    return prepare_dsa_route_plan(
-        keep_blocks,
-        query_chunk_blocks=query_chunk_blocks,
-    )
+    def __init__(
+        self,
+        head_keep_ratios: Sequence[float] | torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self._head_keep_ratio_units = _normalize_head_keep_ratios(head_keep_ratios)
+
+    @property
+    def head_keep_ratios(self) -> tuple[float, ...]:
+        """Return the device-independent semantic ratio profile."""
+        return tuple(units / _RATIO_SCALE for units in self._head_keep_ratio_units)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        sparse_key_blocks: int,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        """Route every query over a sparse K/V prefix and dense suffix."""
+        converted_scale = _validate_inputs(
+            query,
+            key,
+            value,
+            self._head_keep_ratio_units,
+            sparse_key_blocks=sparse_key_blocks,
+            scale=scale,
+        )
+        return _sparse_piper_attention_op(
+            query,
+            key,
+            value,
+            list(self._head_keep_ratio_units),
+            sparse_key_blocks,
+            converted_scale,
+        )
 
 
 def _validate_sparse_key_blocks(
     sparse_key_blocks: int,
     *,
     sequence_blocks: int,
-    minimum_blocks: int,
 ) -> None:
     if isinstance(sparse_key_blocks, bool):
         raise TypeError("sparse_key_blocks must be an integer")
     if torch.compiler.is_compiling():
         torch._check(
-            sparse_key_blocks >= minimum_blocks,
-            lambda: "sparse_key_blocks cannot be smaller than a per-head route budget",
+            sparse_key_blocks >= 1,
+            lambda: "sparse_key_blocks must be positive",
         )
         torch._check(
             sparse_key_blocks <= sequence_blocks,
@@ -69,33 +98,15 @@ def _validate_sparse_key_blocks(
         return
     if not isinstance(sparse_key_blocks, int):
         raise TypeError("sparse_key_blocks must be an integer")
-    if not minimum_blocks <= sparse_key_blocks <= sequence_blocks:
-        raise ValueError(
-            "sparse_key_blocks must cover every per-head route budget and fit the sequence"
-        )
-
-
-def _validate_plan(
-    plan: SparsePiperAttentionPlan,
-    *,
-    heads: int,
-    device: torch.device,
-) -> None:
-    if plan.keep_blocks.shape != (heads,):
-        raise ValueError("the sparse Piper plan must contain one keep count per head")
-    if plan.head_offsets.shape != (heads + 1,):
-        raise ValueError("the sparse Piper plan must contain one route offset per head boundary")
-    if plan.keep_blocks.dtype is not torch.int32 or plan.head_offsets.dtype is not torch.int32:
-        raise ValueError("the sparse Piper plan must use INT32 keep counts and route offsets")
-    if plan.keep_blocks.device != device or plan.head_offsets.device != device:
-        raise ValueError("the sparse Piper plan and Q/K/V must share a device")
+    if not 1 <= sparse_key_blocks <= sequence_blocks:
+        raise ValueError("sparse_key_blocks must fit the sequence block count")
 
 
 def _validate_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    plan: SparsePiperAttentionPlan,
+    head_keep_ratio_units: tuple[int, ...],
     *,
     sparse_key_blocks: int,
     scale: float | None,
@@ -121,11 +132,11 @@ def _validate_inputs(
         raise ValueError("sparse Piper requires head_dim=128")
     if sequence < 64 or sequence % 64:
         raise ValueError("sparse Piper requires a K64-aligned sequence")
-    _validate_plan(plan, heads=heads, device=query.device)
+    if len(head_keep_ratio_units) != heads:
+        raise ValueError("sparse Piper ratio profile must contain one value per head")
     _validate_sparse_key_blocks(
         sparse_key_blocks,
         sequence_blocks=sequence // 64,
-        minimum_blocks=plan.max_keep_blocks,
     )
     converted_scale = head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(converted_scale) or converted_scale <= 0:
@@ -133,60 +144,11 @@ def _validate_inputs(
     return converted_scale
 
 
-def sparse_piper_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    plan: SparsePiperAttentionPlan,
-    *,
-    sparse_key_blocks: int,
-    scale: float | None = None,
-) -> torch.Tensor:
-    """Route every query over a sparse K/V prefix and an always-dense suffix.
-
-    Q/K/V are pre-tiled sequence-major ``[B,S,H,128]`` tensors. The first
-    ``sparse_key_blocks`` K64 tiles form the routeable prefix. Every remaining
-    K/V row is included for every query. All selected rows participate in one
-    softmax.
-    """
-    converted_scale = _validate_inputs(
-        query,
-        key,
-        value,
-        plan,
-        sparse_key_blocks=sparse_key_blocks,
-        scale=scale,
-    )
-    target = AcceleratorTarget.from_device(query.device)
-    if _supports_sm120(target):
-        return _sm120_sparse_piper_attention(
-            query,
-            key,
-            value,
-            plan.keep_blocks,
-            plan.head_offsets,
-            sparse_key_blocks,
-            converted_scale,
-            plan.routes_per_query,
-            plan.max_keep_blocks,
-            plan.query_chunk_blocks,
-        )
-    return _run_sparse_piper_attention(
-        query,
-        key,
-        value,
-        plan,
-        sparse_key_blocks=sparse_key_blocks,
-        scale=converted_scale,
-        target_is_sm120=False,
-    )
-
-
 def _run_sparse_piper_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    plan: SparsePiperAttentionPlan,
+    layout: _ResolvedRouteLayout,
     *,
     sparse_key_blocks: int,
     scale: float,
@@ -204,10 +166,10 @@ def _run_sparse_piper_attention(
         2,
         (sparse_key_blocks, 64),
     )
-    routes = packed_dsa_routes_from_plan(
+    routes = packed_dsa_routes_from_layout(
         query_blocks,
         key_blocks,
-        plan,
+        layout,
     )
 
     if not target_is_sm120:
@@ -239,47 +201,38 @@ def _run_sparse_piper_attention(
 
 
 @torch.library.custom_op("piper_kernels::sparse_piper_attention", mutates_args=())
-def _sm120_sparse_piper_attention(
+def _sparse_piper_attention_op(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    keep_blocks: torch.Tensor,
-    head_offsets: torch.Tensor,
+    head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
     scale: float,
-    routes_per_query: int,
-    max_keep_blocks: int,
-    query_chunk_blocks: int,
 ) -> torch.Tensor:
-    plan = SparsePiperAttentionPlan(
-        keep_blocks=keep_blocks,
-        head_offsets=head_offsets,
-        routes_per_query=routes_per_query,
-        max_keep_blocks=max_keep_blocks,
-        query_chunk_blocks=query_chunk_blocks,
+    layout = _resolve_route_layout(
+        tuple(head_keep_ratio_units),
+        sparse_key_blocks,
+        query.device,
     )
+    target = AcceleratorTarget.from_device(query.device)
     return _run_sparse_piper_attention(
         query,
         key,
         value,
-        plan,
+        layout,
         sparse_key_blocks=sparse_key_blocks,
         scale=scale,
-        target_is_sm120=True,
+        target_is_sm120=_supports_sm120(target),
     )
 
 
-@_sm120_sparse_piper_attention.register_fake
-def _sm120_sparse_piper_attention_fake(
+@_sparse_piper_attention_op.register_fake
+def _sparse_piper_attention_op_fake(
     query: torch.Tensor,
     _key: torch.Tensor,
     _value: torch.Tensor,
-    _keep_blocks: torch.Tensor,
-    _head_offsets: torch.Tensor,
+    _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
     _scale: float,
-    _routes_per_query: int,
-    _max_keep_blocks: int,
-    _query_chunk_blocks: int,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)

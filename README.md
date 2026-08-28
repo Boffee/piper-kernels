@@ -196,33 +196,29 @@ isolation; the name identifies this package's selected combination and fused rec
 Sparse Piper is a separate non-causal SM120 operator for pre-tiled H3-style self-attention:
 
 ```python
-import torch
-from piper_kernels import (
-    prepare_sparse_piper_attention_plan,
-    sparse_piper_attention,
-)
+from piper_kernels import SparsePiperAttention
 
-keep_blocks = torch.tensor([207, 414, 622], device="cuda", dtype=torch.int32)
-plan = prepare_sparse_piper_attention_plan(keep_blocks)
-output = sparse_piper_attention(
+attention = SparsePiperAttention((0.2, 0.4, 0.6))
+output = attention(
     query,
     key,
     value,
-    plan,
     sparse_key_blocks=1036,
 )
 ```
 
 Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The sequence is K64 aligned,
 and every input row participates in attention. `sparse_key_blocks` is a runtime count of routeable
-K64 prefix tiles; it is not part of the reusable route-budget plan. Every query receives an exact
+K64 prefix tiles. Every query receives an exact
 FP32 DSA route over that prefix, then attends to every remaining K/V row in the same softmax. This
 makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their
-queries sparse over the packed media prefix. Per-head keep counts are arbitrary runtime values;
-budget selection and calibration remain Engine responsibilities. When the plan is passed as a
-runtime input to a dynamic compiled graph, its head allocation and total packed-route capacity may
-change between calls without compiling another graph or SM120 attention kernel.
+queries sparse over the packed media prefix. Engine owns only the semantic per-layer ratio profile.
+Each opaque attention call derives its temporary physical keep counts, packed offsets, and exact
+route storage from that immutable model configuration and the current prefix length. Dynamic
+compiled graphs accept changed prefix lengths and their resulting route capacities without compiling
+another graph or SM120 attention kernel. DSA routes remain call-local because they depend on the
+current Q/K values.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

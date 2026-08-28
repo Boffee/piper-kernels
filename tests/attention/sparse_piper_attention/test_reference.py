@@ -2,10 +2,13 @@
 
 import torch
 
+from piper_kernels.attention.sparse_piper_attention._budget import (
+    _normalize_head_keep_ratios,
+    _resolve_route_layout,
+)
 from piper_kernels.attention.sparse_piper_attention.dsa import (
     PackedDsaRoutes,
-    packed_dsa_routes_from_plan,
-    prepare_dsa_route_plan,
+    packed_dsa_routes_from_layout,
 )
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_exact_sparse_attention,
@@ -24,12 +27,14 @@ def _inputs() -> tuple[
     query = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
     key = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
     value = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
-    plan = prepare_dsa_route_plan(
-        torch.tensor([1, 2], dtype=torch.int32),
+    layout = _resolve_route_layout(
+        _normalize_head_keep_ratios((0.5, 1.0)),
+        2,
+        torch.device("cpu"),
     )
     query_blocks = query.transpose(1, 2).unflatten(2, (3, 64))
     key_blocks = key[:, :128].transpose(1, 2).unflatten(2, (2, 64))
-    routes = packed_dsa_routes_from_plan(query_blocks, key_blocks, plan)
+    routes = packed_dsa_routes_from_layout(query_blocks, key_blocks, layout)
     return query, key, value, routes
 
 

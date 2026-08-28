@@ -8,6 +8,8 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
+
 try:
     from .dsa_triton import block_summaries as _sm120_block_summaries
     from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
@@ -17,18 +19,7 @@ except ModuleNotFoundError as exc:
     _sm120_block_summaries = None
     _sm120_select_routes = None
 
-_UINT16_ROUTE_CAPACITY = 1 << 16
-
-
-@dataclass(frozen=True, slots=True)
-class SparsePiperAttentionPlan:
-    """Precomputed route-budget metadata reusable across attention calls."""
-
-    keep_blocks: torch.Tensor
-    head_offsets: torch.Tensor
-    routes_per_query: int
-    max_keep_blocks: int
-    query_chunk_blocks: int
+_QUERY_CHUNK_BLOCKS = 384
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,63 +31,23 @@ class PackedDsaRoutes:
     keep_blocks: torch.Tensor
 
 
-def prepare_dsa_route_plan(
-    keep_blocks: torch.Tensor,
-    *,
-    query_chunk_blocks: int = 384,
-) -> SparsePiperAttentionPlan:
-    """Normalize per-head budgets and precompute packed-route offsets."""
-    if query_chunk_blocks < 1:
-        raise ValueError("DSA query chunk size must be positive")
-    if keep_blocks.ndim != 1 or keep_blocks.numel() < 1:
-        raise ValueError("DSA keep counts must be a nonempty vector")
-    _validate_keep_blocks(
-        keep_blocks,
-        heads=keep_blocks.numel(),
-        key_blocks=_UINT16_ROUTE_CAPACITY,
-        device=keep_blocks.device,
-    )
-    normalized = keep_blocks.to(dtype=torch.int32).contiguous()
-    keep_values = [int(value) for value in normalized.detach().cpu().tolist()]
-    offset_values = [0]
-    for count in keep_values:
-        offset_values.append(offset_values[-1] + count)
-    if offset_values[-1] > torch.iinfo(torch.int32).max:
-        raise ValueError("DSA packed routes exceed INT32 offset capacity")
-
-    return SparsePiperAttentionPlan(
-        keep_blocks=normalized,
-        head_offsets=torch.tensor(offset_values, device=keep_blocks.device, dtype=torch.int32),
-        routes_per_query=offset_values[-1],
-        max_keep_blocks=max(keep_values),
-        query_chunk_blocks=query_chunk_blocks,
-    )
-
-
-def packed_dsa_routes_from_plan(
+def packed_dsa_routes_from_layout(
     query_blocks: torch.Tensor,
     key_blocks: torch.Tensor,
-    plan: SparsePiperAttentionPlan,
+    layout: _ResolvedRouteLayout,
 ) -> PackedDsaRoutes:
     """Select exact FP32 DSA routes directly into packed UINT16 storage."""
     _validate_dsa_blocks(query_blocks, key_blocks)
     heads = query_blocks.shape[1]
     key_block_count = key_blocks.shape[2]
-    if plan.keep_blocks.shape != (heads,):
-        raise ValueError("DSA plan head count does not match Q/K blocks")
-    _validate_sparse_key_capacity(plan, key_block_count)
-    if (
-        plan.keep_blocks.device != query_blocks.device
-        or plan.head_offsets.device != query_blocks.device
-    ):
-        raise ValueError("DSA plan must share the Q/K device")
+    _validate_route_layout(layout, heads, key_block_count, query_blocks.device)
 
     query_summary, key_max, key_min = _block_summaries(query_blocks, key_blocks)
     return packed_dsa_routes_from_summaries(
         query_summary,
         key_max,
         key_min,
-        plan,
+        layout,
     )
 
 
@@ -104,42 +55,35 @@ def packed_dsa_routes_from_summaries(
     query_summary: torch.Tensor,
     key_max: torch.Tensor,
     key_min: torch.Tensor,
-    plan: SparsePiperAttentionPlan,
+    layout: _ResolvedRouteLayout,
 ) -> PackedDsaRoutes:
     """Select routes from existing exact Q64/K64 extrema summaries."""
     _validate_dsa_summaries(query_summary, key_max, key_min)
     heads = query_summary.shape[1]
     key_block_count = key_max.shape[2]
-    if plan.keep_blocks.shape != (heads,):
-        raise ValueError("DSA plan head count does not match summaries")
-    _validate_sparse_key_capacity(plan, key_block_count)
-    if (
-        plan.keep_blocks.device != query_summary.device
-        or plan.head_offsets.device != query_summary.device
-    ):
-        raise ValueError("DSA plan must share the summary device")
+    _validate_route_layout(layout, heads, key_block_count, query_summary.device)
 
     indices = torch.empty(
-        (query_summary.shape[0], query_summary.shape[2], plan.routes_per_query),
+        (query_summary.shape[0], query_summary.shape[2], layout.routes_per_query),
         dtype=torch.uint16,
         device=query_summary.device,
     )
     if _supports_sm120_summary_selector(query_summary):
         assert _sm120_select_routes is not None
 
-        for start in range(0, query_summary.shape[2], plan.query_chunk_blocks):
-            stop = min(start + plan.query_chunk_blocks, query_summary.shape[2])
+        for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
+            stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
             scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
             _sm120_select_routes(
                 scores,
                 indices,
-                plan.keep_blocks,
-                plan.head_offsets,
+                layout.keep_blocks,
+                layout.head_offsets,
                 route_query_offset=start,
             )
     else:
-        _select_portable_routes(query_summary, key_max, key_min, plan, indices)
-    return PackedDsaRoutes(indices, plan.head_offsets, plan.keep_blocks)
+        _select_portable_routes(query_summary, key_max, key_min, layout, indices)
+    return PackedDsaRoutes(indices, layout.head_offsets, layout.keep_blocks)
 
 
 def _validate_dsa_summaries(
@@ -202,13 +146,13 @@ def _select_portable_routes(
     query_summary: torch.Tensor,
     key_max: torch.Tensor,
     key_min: torch.Tensor,
-    plan: SparsePiperAttentionPlan,
+    layout: _ResolvedRouteLayout,
     output: torch.Tensor,
 ) -> None:
-    offsets = plan.head_offsets.detach().cpu().tolist()
-    keep_values = plan.keep_blocks.detach().cpu().tolist()
-    for start in range(0, query_summary.shape[2], plan.query_chunk_blocks):
-        stop = min(start + plan.query_chunk_blocks, query_summary.shape[2])
+    offsets = layout.head_offsets.detach().cpu().tolist()
+    keep_values = layout.keep_blocks.detach().cpu().tolist()
+    for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
+        stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
         scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
         for head, count in enumerate(keep_values):
             selected = torch.argsort(
@@ -271,28 +215,15 @@ def _validate_dsa_blocks(query_blocks: torch.Tensor, key_blocks: torch.Tensor) -
         raise TypeError("DSA query and key blocks must be floating-point tensors")
 
 
-def _validate_keep_blocks(
-    keep_blocks: torch.Tensor,
-    *,
+def _validate_route_layout(
+    layout: _ResolvedRouteLayout,
     heads: int,
     key_blocks: int,
     device: torch.device,
 ) -> None:
-    if keep_blocks.shape != (heads,):
-        raise ValueError("DSA keep counts must contain one value per head")
-    if keep_blocks.dtype is torch.bool or keep_blocks.is_floating_point():
-        raise TypeError("DSA keep counts must use an integer dtype")
-    if keep_blocks.device != device:
-        raise ValueError("DSA keep counts must share the query/key device")
-    if bool(((keep_blocks < 1) | (keep_blocks > key_blocks)).any()):
-        raise ValueError("DSA keep counts must select between one and every key block")
-
-
-def _validate_sparse_key_capacity(
-    plan: SparsePiperAttentionPlan,
-    key_blocks: int,
-) -> None:
     if not 1 <= key_blocks <= _UINT16_ROUTE_CAPACITY:
         raise ValueError("DSA requires between 1 and 65,536 sparse key blocks")
-    if plan.max_keep_blocks > key_blocks:
-        raise ValueError("DSA keep counts cannot exceed the current sparse key block count")
+    if layout.keep_blocks.shape != (heads,) or layout.head_offsets.shape != (heads + 1,):
+        raise ValueError("DSA route layout does not match the attention head count")
+    if layout.keep_blocks.device != device or layout.head_offsets.device != device:
+        raise ValueError("DSA route layout must share the attention device")

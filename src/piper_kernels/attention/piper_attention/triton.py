@@ -31,9 +31,6 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 from . import _policy, _quantization
 
 _BLOCK_N = 64
-_MEAN_CHUNK_N = 1024
-_MEAN_BLOCK_N = 64
-_MEAN_BLOCK_D = 64
 _P_UINT8_RANGE = tl.constexpr(255.0)
 _P_UINT8_LOG2_RANGE = tl.constexpr(7.994353436858858)
 # Pad the analytical maximum to the next effective FP32 constant so the
@@ -72,114 +69,6 @@ def _conservative_value_log_scale_bound(value_scale_multiplier):
     return multiplier_bits.to(tl.float32) * (1.0 / 8388608.0) - (
         127.0 + _P_UINT8_LOG2_RANGE - _VALUE_LOG_BOUND_CORRECTION
     )
-
-
-@triton.jit
-def _kv_mean_partial_kernel(
-    key_ptr,
-    value_ptr,
-    key_partial_ptr,
-    value_partial_ptr,
-    key_length,
-    num_chunks,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    is_causal: tl.constexpr,
-    heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    chunk_n: tl.constexpr,
-    block_n: tl.constexpr,
-    block_d: tl.constexpr,
-):
-    """Reduce one raw K chunk and, when non-causal, its V chunk."""
-    chunk = tl.program_id(0)
-    feature_block = tl.program_id(1)
-    batch_head = tl.program_id(2)
-    batch = batch_head // heads
-    head = batch_head % heads
-    offsets_d = feature_block * block_d + tl.arange(0, block_d)
-    offsets_n = tl.arange(0, block_n)
-    key_accumulator = tl.zeros((block_d,), dtype=tl.float32)
-    if not is_causal:
-        value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
-    chunk_start = chunk * chunk_n
-    for offset in tl.range(0, chunk_n, block_n, disable_licm=True):
-        current_n = chunk_start + offset + offsets_n
-        mask = (current_n[:, None] < key_length) & (offsets_d[None, :] < head_dim)
-        key = tl.load(
-            key_ptr
-            + batch * stride_kb
-            + head * stride_kh
-            + current_n[:, None] * stride_kn
-            + offsets_d[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        key_accumulator += tl.sum(key, axis=0)
-        if not is_causal:
-            value = tl.load(
-                value_ptr
-                + batch * stride_vb
-                + head * stride_vh
-                + current_n[:, None] * stride_vn
-                + offsets_d[None, :],
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            value_accumulator += tl.sum(value, axis=0)
-    output_offsets = (batch_head * num_chunks + chunk) * head_dim + offsets_d
-    tl.store(key_partial_ptr + output_offsets, key_accumulator, mask=offsets_d < head_dim)
-    if not is_causal:
-        tl.store(
-            value_partial_ptr + output_offsets,
-            value_accumulator,
-            mask=offsets_d < head_dim,
-        )
-
-
-@triton.jit
-def _kv_mean_finalize_kernel(
-    key_partial_ptr,
-    value_partial_ptr,
-    key_mean_ptr,
-    value_mean_ptr,
-    key_length,
-    num_chunks,
-    is_causal: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_chunks: tl.constexpr,
-    block_d: tl.constexpr,
-):
-    """Merge K and optional non-causal V partials into compact FP32 means."""
-    batch_head = tl.program_id(0)
-    feature_block = tl.program_id(1)
-    offsets_c = tl.arange(0, block_chunks)
-    offsets_d = feature_block * block_d + tl.arange(0, block_d)
-    mask = (offsets_c[:, None] < num_chunks) & (offsets_d[None, :] < head_dim)
-    partial_offsets = (batch_head * num_chunks + offsets_c[:, None]) * head_dim + offsets_d[None, :]
-    key_partials = tl.load(key_partial_ptr + partial_offsets, mask=mask, other=0.0)
-    output_offsets = batch_head * head_dim + offsets_d
-    output_mask = offsets_d < head_dim
-    tl.store(
-        key_mean_ptr + output_offsets,
-        tl.sum(key_partials, axis=0) / key_length,
-        mask=output_mask,
-    )
-    if not is_causal:
-        value_partials = tl.load(
-            value_partial_ptr + partial_offsets,
-            mask=mask,
-            other=0.0,
-        )
-        tl.store(
-            value_mean_ptr + output_offsets,
-            tl.sum(value_partials, axis=0) / key_length,
-            mask=output_mask,
-        )
 
 
 @triton.jit
@@ -707,70 +596,6 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         )
 
 
-def _compute_kv_means(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    *,
-    is_causal: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    batch, heads, key_length, head_dim = key.shape
-    num_chunks = int(triton.cdiv(key_length, _MEAN_CHUNK_N))
-    partial_shape = (batch, heads, num_chunks, head_dim)
-    key_partial = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
-    value_partial = (
-        torch.empty_like(key_partial)
-        if not is_causal
-        else torch.empty((1,), device=value.device, dtype=torch.float32)
-    )
-    key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
-    value_mean = (
-        torch.empty_like(key_mean)
-        if not is_causal
-        else torch.empty((1,), device=value.device, dtype=torch.float32)
-    )
-    _kv_mean_partial_kernel[
-        (
-            num_chunks,
-            int(triton.cdiv(head_dim, _MEAN_BLOCK_D)),
-            batch * heads,
-        )
-    ](
-        key,
-        value,
-        key_partial,
-        value_partial,
-        key_length,
-        num_chunks,
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        is_causal=is_causal,
-        heads=heads,
-        head_dim=head_dim,
-        chunk_n=_MEAN_CHUNK_N,
-        block_n=_MEAN_BLOCK_N,
-        block_d=_MEAN_BLOCK_D,
-        num_warps=4,
-    )
-    _kv_mean_finalize_kernel[(batch * heads, int(triton.cdiv(head_dim, _MEAN_BLOCK_D)))](
-        key_partial,
-        value_partial,
-        key_mean,
-        value_mean,
-        key_length,
-        num_chunks,
-        is_causal=is_causal,
-        head_dim=head_dim,
-        block_chunks=triton.next_power_of_2(num_chunks),
-        block_d=_MEAN_BLOCK_D,
-        num_warps=4,
-    )
-    return key_mean, value_mean
-
-
 def _make_key_value_descriptors(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -868,7 +693,7 @@ def _prepare_piper_attention(
 
     # A sequence-wide V mean is valid only for non-causal attention. Per-row
     # INT8 rounding would otherwise let future V rows perturb earlier outputs.
-    key_mean, value_mean = _compute_kv_means(
+    key_mean, value_mean = _quantization.compute_kv_means(
         key,
         value,
         is_causal=is_causal,

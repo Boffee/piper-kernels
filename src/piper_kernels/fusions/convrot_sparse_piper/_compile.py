@@ -22,6 +22,7 @@ from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import (
+    _budget,
     _quantized_dispatch,
     dispatch,
 )
@@ -32,7 +33,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import key, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v5"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v9"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _HEAD_DIM = 128
 _QUERY_BLOCK_ROWS = 64
@@ -41,7 +42,7 @@ _KEY_BLOCK_ROWS = 64
 _SLICE_END = torch.iinfo(torch.int64).max
 
 
-def source_files() -> tuple[str, ...]:
+def _source_files() -> tuple[str, ...]:
     """Return every source file whose changes invalidate this graph rewrite."""
     return tuple(
         file_name
@@ -51,6 +52,7 @@ def source_files() -> tuple[str, ...]:
             query.__file__,
             key.__file__,
             value.__file__,
+            _budget.__file__,
             _quantized_dispatch.__file__,
             dispatch.__file__,
             _compile_fx.__file__,
@@ -199,13 +201,9 @@ def _sparse_piper_projection_pattern() -> CallFunction:
         _normalized_rope_pattern("sparse_q"),
         _normalized_rope_pattern("sparse_k"),
         value,
-        KeywordArg("sparse_keep_blocks"),
-        KeywordArg("sparse_head_offsets"),
+        KeywordArg("sparse_head_keep_ratio_units"),
         KeywordArg("sparse_key_blocks"),
         KeywordArg("sparse_softmax_scale"),
-        KeywordArg("sparse_routes_per_query"),
-        KeywordArg("sparse_max_keep_blocks"),
-        KeywordArg("sparse_query_chunk_blocks"),
     )
 
 
@@ -240,7 +238,7 @@ def _positive_float(value: object) -> float | None:
     return converted if math.isfinite(converted) and converted > 0 else None
 
 
-def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
+def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912
     nodes = (
         "sparse_input",
         "sparse_q_weight_qdata",
@@ -253,8 +251,6 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         "sparse_k_norm_weight",
         "sparse_cos",
         "sparse_sin",
-        "sparse_keep_blocks",
-        "sparse_head_offsets",
     )
     if any(not isinstance(match.kwargs[name], torch.fx.Node) for name in nodes):
         return False
@@ -389,47 +385,27 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
             return False
 
     sparse_key_blocks = _integer_scalar_argument(match.kwargs["sparse_key_blocks"])
-    routes_per_query = _integer_scalar_argument(match.kwargs["sparse_routes_per_query"])
-    max_keep_blocks = _integer_scalar_argument(match.kwargs["sparse_max_keep_blocks"])
-    query_chunk_blocks = _integer_scalar_argument(match.kwargs["sparse_query_chunk_blocks"])
     static_sparse_key_blocks = _static_int(sparse_key_blocks)
-    static_routes_per_query = _static_int(routes_per_query)
-    static_max_keep_blocks = _static_int(max_keep_blocks)
-    static_query_chunk_blocks = _static_int(query_chunk_blocks)
     if (
         sparse_key_blocks is None
-        or routes_per_query is None
-        or max_keep_blocks is None
-        or query_chunk_blocks is None
         or (static_sparse_key_blocks is not None and static_sparse_key_blocks < 1)
         or (
             static_sparse_key_blocks is not None
             and isinstance(sequence_length, int)
             and static_sparse_key_blocks > sequence_length // _KEY_BLOCK_ROWS
         )
-        or (static_routes_per_query is not None and static_routes_per_query < 1)
-        or (static_max_keep_blocks is not None and static_max_keep_blocks < 1)
-        or (
-            static_sparse_key_blocks is not None
-            and static_max_keep_blocks is not None
-            and static_sparse_key_blocks < static_max_keep_blocks
-        )
-        or (static_query_chunk_blocks is not None and static_query_chunk_blocks < 1)
     ):
         return False
-    keep_blocks = metadata["sparse_keep_blocks"]
-    head_offsets = metadata["sparse_head_offsets"]
-    assert keep_blocks is not None
-    assert head_offsets is not None
-    return (
-        keep_blocks.dtype is torch.int32
-        and keep_blocks.ndim == 1
-        and (not isinstance(keep_blocks.shape[0], int) or keep_blocks.shape[0] == heads)
-        and head_offsets.dtype is torch.int32
-        and head_offsets.ndim == 1
-        and (not isinstance(head_offsets.shape[0], int) or head_offsets.shape[0] == heads + 1)
-        and keep_blocks.device == input_value.device
-        and head_offsets.device == input_value.device
+    head_keep_ratio_units = match.kwargs["sparse_head_keep_ratio_units"]
+    return bool(
+        isinstance(head_keep_ratio_units, (list, tuple))
+        and len(head_keep_ratio_units) == heads
+        and all(
+            isinstance(units, int)
+            and not isinstance(units, bool)
+            and 1 <= units <= _budget._RATIO_SCALE
+            for units in head_keep_ratio_units
+        )
     )
 
 
@@ -446,16 +422,12 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_k_norm_weight: torch.fx.Node,
     sparse_cos: torch.fx.Node,
     sparse_sin: torch.fx.Node,
-    sparse_keep_blocks: torch.fx.Node,
-    sparse_head_offsets: torch.fx.Node,
+    sparse_head_keep_ratio_units: list[int],
     sparse_group_size: int,
     sparse_q_norm_epsilon: float,
     sparse_k_norm_epsilon: float,
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
-    sparse_routes_per_query: Argument,
-    sparse_max_keep_blocks: Argument,
-    sparse_query_chunk_blocks: Argument,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -582,12 +554,8 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 value,
                 value_scale,
                 value_mean,
-                sparse_keep_blocks,
-                sparse_head_offsets,
+                sparse_head_keep_ratio_units,
                 sparse_key_blocks,
-                sparse_routes_per_query,
-                sparse_max_keep_blocks,
-                sparse_query_chunk_blocks,
             ),
         )
     replacement.meta = original.meta.copy()
@@ -604,7 +572,7 @@ register_graph_pattern(
 )(_replace_sparse_piper_projection)
 
 
-def fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
+def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
     """Replace one compatible materialized sparse-attention projection region."""
     changed = _patterns.apply(graph) > 0
     if changed:
@@ -618,11 +586,11 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
-            fold_sparse_piper_projection(graph)
+            _fold_sparse_piper_projection(graph)
 
     def uuid(self) -> bytes:
         return get_hash_for_files(
-            source_files(),
+            _source_files(),
             extra=_COMPILE_PASS_VERSION,
         )
 

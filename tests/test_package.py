@@ -17,11 +17,9 @@ import piper_kernels.linear
 import piper_kernels.linear.convrot
 import piper_kernels.linear.convrot.int8
 from piper_kernels import (
-    SparsePiperAttentionPlan,
+    SparsePiperAttention,
     piper_attention,
-    prepare_sparse_piper_attention_plan,
     sage_attention_2pp,
-    sparse_piper_attention,
 )
 from piper_kernels.fusions.convrot_sparse_piper import (
     convrot_sparse_piper_compile_options,
@@ -99,15 +97,11 @@ def test_public_packages_import() -> None:
     assert piper_kernels.__name__ == "piper_kernels"
     assert piper_kernels.piper_attention is piper_attention
     assert piper_kernels.sage_attention_2pp is sage_attention_2pp
-    assert piper_kernels.sparse_piper_attention is sparse_piper_attention
-    assert piper_kernels.prepare_sparse_piper_attention_plan is prepare_sparse_piper_attention_plan
-    assert piper_kernels.SparsePiperAttentionPlan is SparsePiperAttentionPlan
+    assert piper_kernels.SparsePiperAttention is SparsePiperAttention
     assert piper_kernels.__all__ == [
-        "SparsePiperAttentionPlan",
+        "SparsePiperAttention",
         "piper_attention",
-        "prepare_sparse_piper_attention_plan",
         "sage_attention_2pp",
-        "sparse_piper_attention",
     ]
     assert piper_kernels.attention.__name__ == "piper_kernels.attention"
     assert piper_kernels.attention.piper_attention.__name__ == (

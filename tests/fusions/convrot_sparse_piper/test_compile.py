@@ -7,11 +7,7 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import (
-    SparsePiperAttentionPlan,
-    prepare_sparse_piper_attention_plan,
-    sparse_piper_attention,
-)
+from piper_kernels import SparsePiperAttention
 from piper_kernels.fusions.convrot_sparse_piper import (
     convrot_sparse_piper_compile_options,
 )
@@ -95,9 +91,7 @@ class _SparseProjectionAttention(torch.nn.Module):
             sin = torch.stack((sin, sin), dim=-1)[..., 0]
         self.register_buffer("cos", cos)
         self.register_buffer("sin", sin)
-        self.plan = prepare_sparse_piper_attention_plan(
-            torch.full((self.heads,), 2, device="cuda", dtype=torch.int32),
-        )
+        self.sparse_attention = SparsePiperAttention((0.5, 1.0))
 
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
         normalized = F.rms_norm(
@@ -128,11 +122,10 @@ class _SparseProjectionAttention(torch.nn.Module):
             self.heads,
             self.head_dim,
         )
-        return sparse_piper_attention(
+        return self.sparse_attention(
             query,
             key,
             value,
-            self.plan,
             sparse_key_blocks=self.sparse_key_blocks,
         )
 
@@ -181,7 +174,6 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
         cos: torch.Tensor,
         sin: torch.Tensor,
         sparse_key_blocks: int,
-        plan: SparsePiperAttentionPlan,
     ) -> torch.Tensor:
         batch, sequence, _features = hidden_states.shape
         query = self._dynamic_norm_rope(
@@ -197,11 +189,10 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
             sin,
         )
         value = self.value(hidden_states).view(batch, sequence, self.heads, self.head_dim)
-        return sparse_piper_attention(
+        return self.sparse_attention(
             query,
             key,
             value,
-            plan,
             sparse_key_blocks=sparse_key_blocks,
         )
 
@@ -337,14 +328,13 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
 
     with torch.no_grad():
         cases = (
-            (192, 2, (1, 1)),
-            (256, 2, (1, 2)),
-            (256, 3, (2, 2)),
-            (256, 3, (2, 3)),
-            (1024, 8, (8, 8)),
-            (1024, 9, (9, 9)),
+            (192, 2),
+            (256, 2),
+            (256, 3),
+            (1024, 8),
+            (1024, 9),
         )
-        for sequence, sparse_key_blocks, keep_values in cases:
+        for sequence, sparse_key_blocks in cases:
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -360,16 +350,12 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
             ).mul_(2 * torch.pi)
             cos = angles.cos().contiguous()
             sin = angles.sin().contiguous()
-            plan = prepare_sparse_piper_attention_plan(
-                torch.tensor(keep_values, device="cuda", dtype=torch.int32)
-            )
-            expected = materialized(hidden_states, cos, sin, sparse_key_blocks, plan)
+            expected = materialized(hidden_states, cos, sin, sparse_key_blocks)
             output = compiled(
                 hidden_states,
                 cos,
                 sin,
                 sparse_key_blocks,
-                plan,
             )
             assert output.shape == (model.batch, sequence, model.heads, model.head_dim)
             assert bool(torch.isfinite(output).all())
@@ -378,7 +364,6 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
             assert relative_l2 < 0.025, (
                 sequence,
                 sparse_key_blocks,
-                keep_values,
                 relative_l2.item(),
             )
 

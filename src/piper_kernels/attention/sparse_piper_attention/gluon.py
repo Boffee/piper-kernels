@@ -7,19 +7,16 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-from triton.tools.tensor_descriptor import TensorDescriptor as TritonTensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 
-from .triton import _PreparedRoutedPiperAttention
+from .triton import _PreparedSparsePiperAttention
 
 _BLOCK_M = 64
 _BLOCK_N = 64
@@ -512,17 +509,12 @@ def _paired_routed_piper_gluon_kernel(
     mbarrier.invalidate(value_barrier)
 
 
-def _base_tensor(value: torch.Tensor | TritonTensorDescriptor) -> torch.Tensor:
-    return value if isinstance(value, torch.Tensor) else cast(torch.Tensor, value.base)
-
-
 def _make_gluon_descriptors(
-    prepared: _PreparedRoutedPiperAttention,
+    prepared: _PreparedSparsePiperAttention,
 ) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor, int]:
-    attention = prepared.attention
-    query = attention.query
-    key = _base_tensor(attention.key)
-    value = _base_tensor(attention.value)
+    query = prepared.query
+    key = prepared.key
+    value = prepared.value
     query_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_M, _HEAD_DIM], gl.int8)
     key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, _HEAD_DIM], gl.int8)
     value_layout = gl.NVMMASharedLayout.get_default_for([_HEAD_DIM, _BLOCK_N], gl.int8)
@@ -562,16 +554,15 @@ def _make_gluon_descriptors(
 
 
 def _launch_gluon_paired_routed_piper_attention(
-    prepared: _PreparedRoutedPiperAttention,
+    prepared: _PreparedSparsePiperAttention,
 ) -> None:
     """Launch paired K128 while retaining logical K64 routes and tile scales."""
-    attention = prepared.attention
-    batch, heads, query_length, head_dim = attention.output.shape
-    if head_dim != _HEAD_DIM or query_length % _BLOCK_M or attention.key_length != query_length:
+    batch, heads, query_length, head_dim = prepared.output.shape
+    if head_dim != _HEAD_DIM or query_length % _BLOCK_M or prepared.query.shape[2] != query_length:
         raise ValueError("paired Gluon routed Piper requires aligned M64/D128 queries")
-    if attention.value_scale_multiplier.shape[-1] != 1:
+    if prepared.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
-    with torch.cuda.device(attention.query.device):
+    with torch.cuda.device(prepared.query.device):
         install_uint8_int8_dot_hook()
 
     query_desc, key_desc, value_desc, sequence_length = _make_gluon_descriptors(prepared)
@@ -584,22 +575,22 @@ def _launch_gluon_paired_routed_piper_attention(
         query_desc,
         key_desc,
         value_desc,
-        attention.query_scale,
-        attention.key_scale,
-        attention.value_scale_multiplier,
-        attention.value_mean,
+        prepared.query_scale,
+        prepared.key_scale,
+        prepared.value_scale_multiplier,
+        prepared.value_mean,
         routes,
         prepared.keep_blocks,
         route_head_offsets,
-        attention.output,
+        prepared.output,
         sequence_length,
         prepared.sparse_key_blocks,
         stride_rb,
         stride_rq,
         stride_rr,
-        attention.output.stride(0),
-        attention.output.stride(1),
-        attention.output.stride(2),
+        prepared.output.stride(0),
+        prepared.output.stride(1),
+        prepared.output.stride(2),
         heads,
         4,
         num_warps=4,

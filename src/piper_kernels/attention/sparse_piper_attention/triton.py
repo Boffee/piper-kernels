@@ -5,17 +5,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
-from piper_kernels.attention.piper_attention import triton as piper_backend
+from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
 _BLOCK_M = 64
 _BLOCK_N = 64
@@ -78,10 +77,17 @@ def _quantize_value_per_tile_kernel(
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedRoutedPiperAttention:
-    """Quantized storage and compact route metadata for one launch."""
+class _PreparedSparsePiperAttention:
+    """Only the quantized operands and routes consumed by the Gluon launch."""
 
-    attention: piper_backend._PreparedPiperAttention
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    query_scale: torch.Tensor
+    key_scale: torch.Tensor
+    value_scale_multiplier: torch.Tensor
+    value_mean: torch.Tensor
+    output: torch.Tensor
     routes: torch.Tensor
     route_head_offsets: torch.Tensor
     keep_blocks: torch.Tensor
@@ -99,7 +105,7 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
     attention_output: torch.Tensor,
-) -> _PreparedRoutedPiperAttention:
+) -> _PreparedSparsePiperAttention:
     """Prepare grouped Q/K and one folded V scale per logical K64 tile."""
     query = query_blocks.flatten(2, 3)
     if (
@@ -111,21 +117,10 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
     if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
-    plan = replace(
-        piper_backend._default_piper_attention_execution_plan(query, False),
-        block_m=_BLOCK_M,
-        use_tensor_descriptors=True,
-        num_stages=2,
-    )
-    if not plan.grouped_qk or not plan.split_pv_head_dim:
-        raise ValueError("sparse Piper requires grouped Q/K and split PV")
-    with torch.cuda.device(query.device):
-        install_uint8_int8_dot_hook()
-
     batch, heads, sequence_length, head_dim = query.shape
     tile_count = sequence_length // _BLOCK_N
 
-    key_mean, value_mean = piper_backend._compute_kv_means(
+    key_mean, value_mean = piper_quantization.compute_kv_means(
         combined_key,
         combined_value,
         is_causal=False,
@@ -169,12 +164,6 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         num_warps=4,
     )
 
-    key_descriptor, value_descriptor = piper_backend._make_key_value_descriptors(
-        prepared_qk.key,
-        value_int8,
-        split_pv_head_dim=True,
-    )
-    query_descriptor = piper_backend._make_query_descriptor(prepared_qk.query, _BLOCK_M)
     if (
         attention_output.shape != query.shape
         or attention_output.dtype != query.dtype
@@ -183,23 +172,15 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
     ):
         raise ValueError("sparse Piper output must match Q and have contiguous features")
 
-    attention = piper_backend._PreparedPiperAttention(
+    return _PreparedSparsePiperAttention(
         query=prepared_qk.query,
-        query_descriptor=query_descriptor,
-        key=key_descriptor,
-        value=value_descriptor,
+        key=prepared_qk.key,
+        value=value_int8,
         query_scale=prepared_qk.query_scale,
         key_scale=prepared_qk.key_scale,
         value_scale_multiplier=value_scale_multiplier,
-        value_log_scale=torch.empty((1,), device=query.device, dtype=torch.float16),
         value_mean=value_mean,
         output=attention_output,
-        key_length=sequence_length,
-        is_causal=False,
-        plan=plan,
-    )
-    return _PreparedRoutedPiperAttention(
-        attention=attention,
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
@@ -222,7 +203,7 @@ def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
     sparse_key_blocks: int,
     routes_per_query: int,
     attention_output: torch.Tensor,
-) -> _PreparedRoutedPiperAttention:
+) -> _PreparedSparsePiperAttention:
     """Construct sparse Piper launch state from already-quantized operands."""
     if query.ndim != 4 or query.dtype is not torch.int8:
         raise ValueError("quantized sparse Piper Q must be [batch,heads,sequence,D128] INT8")
@@ -262,22 +243,6 @@ def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
     if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
 
-    plan = replace(
-        piper_backend._default_piper_attention_execution_plan(query, False),
-        block_m=_BLOCK_M,
-        use_tensor_descriptors=True,
-        num_stages=2,
-    )
-    if not plan.grouped_qk or not plan.split_pv_head_dim:
-        raise ValueError("quantized sparse Piper requires grouped Q/K and split PV")
-    with torch.cuda.device(query.device):
-        install_uint8_int8_dot_hook()
-    key_descriptor, value_descriptor = piper_backend._make_key_value_descriptors(
-        key,
-        value,
-        split_pv_head_dim=True,
-    )
-    query_descriptor = piper_backend._make_query_descriptor(query, _BLOCK_M)
     if (
         attention_output.shape != (batch, heads, sequence_length, head_dim)
         or attention_output.dtype is not torch.bfloat16
@@ -286,23 +251,15 @@ def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
     ):
         raise ValueError("quantized sparse Piper output must be BF16 [B,H,S,D128]")
 
-    attention = piper_backend._PreparedPiperAttention(
+    return _PreparedSparsePiperAttention(
         query=query,
-        query_descriptor=query_descriptor,
-        key=key_descriptor,
-        value=value_descriptor,
+        key=key,
+        value=value,
         query_scale=query_scale,
         key_scale=key_scale,
         value_scale_multiplier=value_scale_multiplier,
-        value_log_scale=torch.empty((1,), device=query.device, dtype=torch.float16),
         value_mean=value_mean,
         output=attention_output,
-        key_length=sequence_length,
-        is_causal=False,
-        plan=plan,
-    )
-    return _PreparedRoutedPiperAttention(
-        attention=attention,
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
