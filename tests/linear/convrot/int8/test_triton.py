@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import triton as triton_backend
@@ -382,6 +383,127 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
     )
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("activation_fn", [None, "swiglu"])
+@pytest.mark.parametrize("fused", [False, True], ids=["split", "fused"])
+def test_input_preparation_populates_caller_owned_storage(
+    activation_fn: str | None,
+    fused: bool,
+) -> None:
+    torch.manual_seed(131)
+    rows, in_features = 17, 256
+    input_factor = 2 if activation_fn == "swiglu" else 1
+    activation = torch.randn(
+        rows,
+        input_factor * in_features,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    qdata = torch.empty((96, in_features), dtype=torch.int8, device="cuda")
+    plan = replace(
+        triton_backend.default_execution_plan(qdata),
+        fuse_rotation_quantization=fused,
+    )
+    target = AcceleratorTarget.from_device(activation.device)
+    expected_qdata, expected_scale = triton_backend._prepare_input(
+        activation,
+        in_features,
+        256,
+        activation_fn=activation_fn,
+        execution_plan=plan,
+        target=target,
+    )
+    qdata_storage = torch.full(
+        (rows + 2, in_features),
+        -128,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    scale_storage = torch.full(
+        (rows + 2,),
+        -1.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    qdata_out = qdata_storage[1:-1]
+    scale_out = scale_storage[1:-1]
+    actual = triton_backend._prepare_input(
+        activation,
+        in_features,
+        256,
+        activation_fn=activation_fn,
+        execution_plan=plan,
+        target=target,
+        out=(qdata_out, scale_out),
+    )
+
+    assert actual[0] is qdata_out
+    assert actual[1] is scale_out
+    assert torch.equal(qdata_out, expected_qdata)
+    assert torch.equal(scale_out, expected_scale)
+    assert torch.all(qdata_storage[[0, -1]] == -128)
+    assert torch.all(scale_storage[[0, -1]] == -1.0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
+    torch.manual_seed(132)
+    rows, in_features, out_features = 129, 256, 257
+    input_qdata = torch.randint(
+        -127,
+        128,
+        (rows, in_features),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    input_scale = torch.rand(rows, dtype=torch.float32, device="cuda") * 0.01
+    weight_qdata = torch.randint(
+        -127,
+        128,
+        (out_features, in_features),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    weight_scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
+    bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda") if with_bias else None
+    plan = triton_backend.default_execution_plan(weight_qdata)
+    expected = triton_backend._execute_prepared_linear(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        torch.bfloat16,
+        plan,
+    )
+    output_storage = torch.full(
+        (rows + 2, out_features),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    output = output_storage[1:-1]
+    actual = triton_backend._execute_prepared_linear(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        torch.bfloat16,
+        plan,
+        out=output,
+    )
+
+    assert actual is output
+    assert torch.equal(output, expected)
+    assert torch.isnan(output_storage[[0, -1]]).all()
 
 
 def _exact_sm120_available() -> bool:
