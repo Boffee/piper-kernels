@@ -38,7 +38,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     value_mean: torch.Tensor,
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
-    logical_sequence_length: int | None = None,
+    logical_sequence_length: int,
 ) -> torch.Tensor:
     if _prepare_sm120_quantized_attention is None or _launch_sm120_attention is None:
         raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
@@ -53,10 +53,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         key_min[:, :, :sparse_key_blocks],
         layout,
     )
-    batch, heads, storage_sequence_length, head_dim = query.shape
-    logical_sequence_length = (
-        storage_sequence_length if logical_sequence_length is None else logical_sequence_length
-    )
+    batch, heads, _, head_dim = query.shape
     output = torch.empty(
         (batch, logical_sequence_length, heads, head_dim),
         device=query.device,
@@ -96,12 +93,9 @@ def _sparse_piper_attention_from_quantized_op_fake(
     _value_mean: torch.Tensor,
     _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
-    logical_sequence_length: int | None = None,
+    logical_sequence_length: int,
 ) -> torch.Tensor:
-    output_sequence_length = (
-        query.shape[2] if logical_sequence_length is None else logical_sequence_length
-    )
     return query.new_empty(
-        (query.shape[0], output_sequence_length, query.shape[1], query.shape[3]),
+        (query.shape[0], logical_sequence_length, query.shape[1], query.shape[3]),
         dtype=torch.bfloat16,
     )

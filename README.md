@@ -109,9 +109,11 @@ The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
 bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
 `sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
-plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. It fails
-closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention
-APIs remain independent.
+plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. Arbitrary
+logical sequence lengths are written directly into internally K64-padded attention storage; only
+the final projection tile is masked, and the result retains the exact logical length. It fails closed
+for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention APIs
+remain independent.
 
 Because no projected activation is externally observable in the fused region, projection,
 RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise

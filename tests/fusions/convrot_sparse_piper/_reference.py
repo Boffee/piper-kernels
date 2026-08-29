@@ -10,6 +10,7 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
+from piper_kernels.fusions.convrot_sparse_piper._layout import padded_sequence_length
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
 _BLOCK_ROWS = 64
@@ -36,6 +37,17 @@ class ProjectedValue:
     value: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
+
+
+def _padded_blocks(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return K64-padded sequence blocks and their logical-row mask."""
+    sequence_length = value.shape[2]
+    storage_length = padded_sequence_length(sequence_length)
+    padded = value.new_zeros((*value.shape[:2], storage_length, value.shape[3]))
+    padded[:, :, :sequence_length] = value
+    blocks = padded.unflatten(2, (storage_length // _BLOCK_ROWS, _BLOCK_ROWS))
+    valid = torch.arange(storage_length, device=value.device) < sequence_length
+    return blocks, valid.unflatten(0, (storage_length // _BLOCK_ROWS, _BLOCK_ROWS))
 
 
 def _materialized_fp32_qk(
@@ -91,12 +103,16 @@ def composed_query_projection(
         sin,
         norm_epsilon,
     )
-    blocks = query.unflatten(2, (sequence_length // _BLOCK_ROWS, _BLOCK_ROWS)).float()
-    summary = blocks.amax(dim=3) + blocks.amin(dim=3)
+    storage_length = padded_sequence_length(sequence_length)
+    blocks, valid = _padded_blocks(query.float())
+    summary = blocks.masked_fill(~valid[None, None, :, :, None], -torch.inf).amax(
+        dim=3
+    ) + blocks.masked_fill(~valid[None, None, :, :, None], torch.inf).amin(dim=3)
     query_int8, query_scale = qk_quantization.prepare_query(
         query,
         softmax_scale,
         grouped=True,
+        storage_query_length=storage_length,
     )
     return ProjectedQuery(query_int8, query_scale, summary)
 
@@ -125,15 +141,16 @@ def composed_key_projection(
         sin,
         norm_epsilon,
     )
+    storage_length = padded_sequence_length(sequence_length)
     key_int8, key_scale = qk_quantization.prepare_key(
         key,
         torch.zeros((batch, heads, _HEAD_DIM), device=key.device, dtype=torch.float32),
         grouped=True,
-        storage_key_length=sequence_length,
+        storage_key_length=storage_length,
     )
-    blocks = key.unflatten(2, (sequence_length // _BLOCK_ROWS, _BLOCK_ROWS)).float()
-    key_max = blocks.amax(dim=3)
-    key_min = blocks.amin(dim=3)
+    blocks, valid = _padded_blocks(key.float())
+    key_max = blocks.masked_fill(~valid[None, None, :, :, None], -torch.inf).amax(dim=3)
+    key_min = blocks.masked_fill(~valid[None, None, :, :, None], torch.inf).amin(dim=3)
     return ProjectedKey(key_int8, key_scale, key_max, key_min)
 
 
@@ -160,11 +177,15 @@ def composed_value_projection(
         None,
         torch.float32,
     ).view(batch, sequence_length, heads, _HEAD_DIM)
-    value = projected.permute(0, 2, 1, 3).unflatten(
-        2,
-        (sequence_length // _BLOCK_ROWS, _BLOCK_ROWS),
+    storage_length = padded_sequence_length(sequence_length)
+    centered = projected.new_zeros((batch, heads, storage_length, _HEAD_DIM))
+    centered[:, :, :sequence_length] = (
+        projected.permute(0, 2, 1, 3).float() - value_mean[:, :, None, :]
     )
-    centered = value.float() - value_mean[:, :, None, None, :]
+    centered = centered.unflatten(
+        2,
+        (storage_length // _BLOCK_ROWS, _BLOCK_ROWS),
+    )
     value_scale = centered.abs().amax(dim=(-1, -2)) / 127.0 + 1e-7
     normalized = centered / value_scale[..., None, None]
     quantized = (

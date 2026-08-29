@@ -17,16 +17,16 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
+from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length
+
 _BLOCK_M = 128
-_VALUE_TILE_ROWS = 64
 _BLOCK_K = 128
-_HEAD_DIM = 128
 _HEADS_PER_PROGRAM = 2
-_BLOCK_N = _HEAD_DIM * _HEADS_PER_PROGRAM
+_BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
 _P_UINT8_RANGE = tl.constexpr(255.0)
 _V_INT8_RANGE = tl.constexpr(127.0)
 _SCALE_EPSILON = tl.constexpr(1e-7)
-_JIT_VALUE_TILE_ROWS = tl.constexpr(64)
+_JIT_VALUE_TILE_ROWS = tl.constexpr(TILE_ROWS)
 
 
 @triton.jit
@@ -85,7 +85,8 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     value_ptr,
     value_scale_ptr,
     rows,
-    sequence_length,
+    logical_sequence_length,
+    storage_sequence_length,
     row_block_offset,
     input_features: tl.constexpr,
     heads: tl.constexpr,
@@ -106,7 +107,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     head_block = tl.program_id(1)
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
-    row_offsets = batch * sequence_length + sequence_offsets
+    row_offsets = batch * logical_sequence_length + sequence_offsets
     feature_offsets = tl.arange(0, head_dim)
     projection_feature_offsets = tl.arange(0, block_n)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
@@ -134,7 +135,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         mask=head_offsets[:, None] < heads,
         other=0.0,
     )
-    valid_rows = sequence_offsets < sequence_length
+    valid_rows = sequence_offsets < logical_sequence_length
     centered = tl.where(
         valid_rows[:, None, None],
         projection - value_mean[None, :, :],
@@ -156,18 +157,18 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     quantized = tl.reshape(quantized, (heads_per_program, block_m, head_dim))
 
     value_offsets = (
-        (batch * heads + head_offsets[:, None, None]) * head_dim * sequence_length
-        + feature_offsets[None, None, :] * sequence_length
+        (batch * heads + head_offsets[:, None, None]) * head_dim * storage_sequence_length
+        + feature_offsets[None, None, :] * storage_sequence_length
         + sequence_offsets[None, :, None]
     )
     tl.store(
         value_ptr + value_offsets,
         quantized,
         mask=(head_offsets[:, None, None] < heads)
-        & (sequence_offsets[None, :, None] < sequence_length),
+        & (sequence_offsets[None, :, None] < storage_sequence_length),
     )
 
-    tile_count = sequence_length // _JIT_VALUE_TILE_ROWS
+    tile_count = storage_sequence_length // _JIT_VALUE_TILE_ROWS
     local_tile_offsets = tl.arange(0, block_m // _JIT_VALUE_TILE_ROWS)
     tile_offsets = row_block * (block_m // _JIT_VALUE_TILE_ROWS) + local_tile_offsets
     scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
@@ -194,7 +195,7 @@ def _validate_inputs(
         raise ValueError("V projection represented-input mean must be a batch/feature FP32 matrix")
     if weight_qdata.ndim != 2 or weight_qdata.dtype is not torch.int8:
         raise ValueError("V projection weight must be a two-dimensional INT8 tensor")
-    if weight_qdata.shape[1] != input_features or weight_qdata.shape[0] % _HEAD_DIM:
+    if weight_qdata.shape[1] != input_features or weight_qdata.shape[0] % HEAD_DIM:
         raise ValueError("V projection weight must map the input to complete D128 heads")
     if weight_scale.shape != (weight_qdata.shape[0], 1) or weight_scale.dtype is not torch.float32:
         raise ValueError("V projection weight scale must be one FP32 value per output feature")
@@ -205,9 +206,9 @@ def _validate_inputs(
         raise ValueError("V projection fusion currently requires CUDA")
     if any(not operand.is_contiguous() for operand in operands):
         raise ValueError("V projection operands must be contiguous")
-    if sequence_length < _VALUE_TILE_ROWS or sequence_length % _VALUE_TILE_ROWS:
-        raise ValueError("V projection sequence must be K64 aligned")
-    return batch, sequence_length, weight_qdata.shape[0] // _HEAD_DIM
+    if sequence_length < TILE_ROWS:
+        raise ValueError(f"V projection requires at least {TILE_ROWS} sequence rows")
+    return batch, sequence_length, weight_qdata.shape[0] // HEAD_DIM
 
 
 def _launch_value_projection(
@@ -224,28 +225,29 @@ def _launch_value_projection(
         weight_qdata,
         weight_scale,
     )
+    storage_sequence_length = padded_sequence_length(sequence_length)
     value = torch.empty(
-        (batch, heads, _HEAD_DIM, sequence_length),
+        (batch, heads, HEAD_DIM, storage_sequence_length),
         device=input_qdata.device,
         dtype=torch.int8,
     )
     value_scale_multiplier = torch.empty(
-        (batch, heads, sequence_length // _VALUE_TILE_ROWS, 1),
+        (batch, heads, storage_sequence_length // TILE_ROWS, 1),
         device=input_qdata.device,
         dtype=torch.float32,
     )
     value_mean = torch.empty(
-        (batch, heads, _HEAD_DIM),
+        (batch, heads, HEAD_DIM),
         device=input_qdata.device,
         dtype=torch.float32,
     )
-    _project_prepared_input_mean_kernel[(triton.cdiv(heads * _HEAD_DIM, _BLOCK_N), batch)](
+    _project_prepared_input_mean_kernel[(triton.cdiv(heads * HEAD_DIM, _BLOCK_N), batch)](
         input_mean,
         weight_qdata,
         weight_scale,
         value_mean,
         input_features=input_qdata.shape[2],
-        output_features=heads * _HEAD_DIM,
+        output_features=heads * HEAD_DIM,
         block_n=_BLOCK_N,
         block_k=_BLOCK_K,
         num_warps=8,
@@ -268,11 +270,12 @@ def _launch_value_projection(
             value_scale_multiplier,
             batch * sequence_length,
             sequence_length,
+            storage_sequence_length,
             row_block_offset,
             input_features=input_qdata.shape[2],
             heads=heads,
             heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=_HEAD_DIM,
+            head_dim=HEAD_DIM,
             aligned_projection=(
                 aligned_rows
                 and input_qdata.shape[2] % _BLOCK_K == 0
@@ -322,12 +325,13 @@ def _project_value_op_fake(
     _weight_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
-    heads = weight_qdata.shape[0] // _HEAD_DIM
+    storage_sequence_length = padded_sequence_length(sequence_length)
+    heads = weight_qdata.shape[0] // HEAD_DIM
     return (
-        input_qdata.new_empty((batch, heads, _HEAD_DIM, sequence_length)),
+        input_qdata.new_empty((batch, heads, HEAD_DIM, storage_sequence_length)),
         input_qdata.new_empty(
-            (batch, heads, sequence_length // _VALUE_TILE_ROWS, 1),
+            (batch, heads, storage_sequence_length // TILE_ROWS, 1),
             dtype=torch.float32,
         ),
-        input_qdata.new_empty((batch, heads, _HEAD_DIM), dtype=torch.float32),
+        input_qdata.new_empty((batch, heads, HEAD_DIM), dtype=torch.float32),
     )

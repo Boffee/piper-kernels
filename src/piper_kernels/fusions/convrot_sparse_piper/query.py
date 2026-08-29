@@ -20,13 +20,13 @@ from piper_kernels.fusions.convrot_sage_qk.triton import (
     validate_qk_projection_inputs,
 )
 
-_BLOCK_M = 64
+from ._layout import HEAD_DIM, QUERY_SCALE_ROWS, TILE_ROWS, padded_sequence_length
+
+_BLOCK_M = TILE_ROWS
 _BLOCK_K = 128
-_QUERY_SCALE_ROWS = 32
-_HEAD_DIM = 128
 _HEADS_PER_PROGRAM = 2
-_BLOCK_N = _HEAD_DIM * _HEADS_PER_PROGRAM
-_JIT_QUERY_SCALE_ROWS = tl.constexpr(32)
+_BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
+_JIT_QUERY_SCALE_ROWS = tl.constexpr(QUERY_SCALE_ROWS)
 
 
 @triton.jit
@@ -42,7 +42,8 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     query_scale_ptr,
     query_summary_ptr,
     rows,
-    sequence_length,
+    logical_sequence_length,
+    storage_sequence_length,
     input_features: tl.constexpr,
     heads: tl.constexpr,
     heads_per_program: tl.constexpr,
@@ -50,6 +51,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
     softmax_scale: tl.constexpr,
+    mask_ragged_tail: tl.constexpr,
     aligned_projection: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -64,10 +66,12 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     tl.static_assert(rotary_dim % 2 == 0)
 
     query_block = tl.program_id(0)
+    if mask_ragged_tail:
+        query_block = logical_sequence_length // block_m
     head_block = tl.program_id(1)
     batch = tl.program_id(2)
     sequence_offsets = query_block * block_m + tl.arange(0, block_m)
-    row_offsets = batch * sequence_length + sequence_offsets
+    row_offsets = batch * logical_sequence_length + sequence_offsets
     feature_offsets = tl.arange(0, head_dim)
     projection_feature_offsets = tl.arange(0, block_n)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
@@ -84,7 +88,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         weight_offsets,
         sequence_offsets,
         rows,
-        sequence_length,
+        logical_sequence_length,
         input_features,
         heads * head_dim,
         heads_per_program,
@@ -98,9 +102,20 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     )
 
     rope_fp32 = rope.to(tl.float32)
-    query_summary = tl.max(rope_fp32, axis=0) + tl.min(rope_fp32, axis=0)
+    if mask_ragged_tail:
+        valid_rows = sequence_offsets < logical_sequence_length
+        rope_fp32 = tl.where(valid_rows[:, None, None], rope_fp32, 0.0)
+        query_summary = tl.max(
+            tl.where(valid_rows[:, None, None], rope_fp32, -float("inf")),
+            axis=0,
+        ) + tl.min(
+            tl.where(valid_rows[:, None, None], rope_fp32, float("inf")),
+            axis=0,
+        )
+    else:
+        query_summary = tl.max(rope_fp32, axis=0) + tl.min(rope_fp32, axis=0)
     summary_offsets = (
-        (batch * heads + head_offsets[:, None]) * (sequence_length // block_m) + query_block
+        (batch * heads + head_offsets[:, None]) * (storage_sequence_length // block_m) + query_block
     ) * head_dim + feature_offsets[None, :]
     tl.store(
         query_summary_ptr + summary_offsets,
@@ -110,6 +125,9 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
 
     group_offsets = tl.arange(0, block_m // _JIT_QUERY_SCALE_ROWS)
     group_valid = head_offsets[:, None] < heads
+    if mask_ragged_tail:
+        group_starts = query_block * block_m + group_offsets * _JIT_QUERY_SCALE_ROWS
+        group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
     quantized, stored_scale = quantize_query_tile(
         rope_fp32,
         group_valid,
@@ -120,8 +138,8 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         _JIT_QUERY_SCALE_ROWS,
     )
     query_offsets = (
-        batch * heads * sequence_length * head_dim
-        + head_offsets[:, None, None] * sequence_length * head_dim
+        batch * heads * storage_sequence_length * head_dim
+        + head_offsets[:, None, None] * storage_sequence_length * head_dim
         + sequence_offsets[None, :, None] * head_dim
         + feature_offsets[None, None, :]
     )
@@ -131,7 +149,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         mask=head_offsets[:, None, None] < heads,
     )
     scale_offsets = (
-        (batch * heads + head_offsets[:, None]) * (sequence_length // _JIT_QUERY_SCALE_ROWS)
+        (batch * heads + head_offsets[:, None]) * (storage_sequence_length // _JIT_QUERY_SCALE_ROWS)
         + query_block * (block_m // _JIT_QUERY_SCALE_ROWS)
         + group_offsets[None, :]
     )
@@ -163,9 +181,10 @@ def _validate_inputs(
         cos,
         sin,
         norm_epsilon=norm_epsilon,
-        block_rows=_BLOCK_M,
         name="Q",
     )
+    if result[1] < TILE_ROWS:
+        raise ValueError(f"Q projection requires at least {TILE_ROWS} sequence rows")
     if not math.isfinite(softmax_scale) or softmax_scale <= 0:
         raise ValueError("Q projection softmax scale must be finite and positive")
     return result
@@ -193,52 +212,65 @@ def _launch_query_projection(
         norm_epsilon=norm_epsilon,
         softmax_scale=softmax_scale,
     )
+    storage_sequence_length = padded_sequence_length(sequence_length)
     query = torch.empty(
-        (batch, heads, sequence_length, _HEAD_DIM),
+        (batch, heads, storage_sequence_length, HEAD_DIM),
         device=input_qdata.device,
         dtype=torch.int8,
     )
     query_scale = torch.empty(
-        (batch, heads, sequence_length // _QUERY_SCALE_ROWS),
+        (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
         device=input_qdata.device,
         dtype=torch.float32,
     )
     query_summary = torch.empty(
-        (batch, heads, sequence_length // _BLOCK_M, _HEAD_DIM),
+        (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
         device=input_qdata.device,
         dtype=torch.float32,
     )
-    _convrot_project_rmsnorm_rope_quantize_query_kernel[
-        (sequence_length // _BLOCK_M, triton.cdiv(heads, _HEADS_PER_PROGRAM), batch)
-    ](
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-        norm_weight,
-        cos,
-        sin,
-        query,
-        query_scale,
-        query_summary,
-        batch * sequence_length,
-        sequence_length,
-        input_features=input_qdata.shape[2],
-        heads=heads,
-        heads_per_program=_HEADS_PER_PROGRAM,
-        head_dim=_HEAD_DIM,
-        rotary_dim=rotary_dim,
-        norm_epsilon=norm_epsilon,
-        softmax_scale=softmax_scale,
-        aligned_projection=(
-            input_qdata.shape[2] % _BLOCK_K == 0 and heads % _HEADS_PER_PROGRAM == 0
-        ),
-        block_m=_BLOCK_M,
-        block_n=_BLOCK_N,
-        block_k=_BLOCK_K,
-        num_warps=8,
-        num_stages=3,
-    )
+
+    def launch(row_block_count: int, *, mask_ragged_tail: bool) -> None:
+        _convrot_project_rmsnorm_rope_quantize_query_kernel[
+            (row_block_count, triton.cdiv(heads, _HEADS_PER_PROGRAM), batch)
+        ](
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            norm_weight,
+            cos,
+            sin,
+            query,
+            query_scale,
+            query_summary,
+            batch * sequence_length,
+            sequence_length,
+            storage_sequence_length,
+            input_features=input_qdata.shape[2],
+            heads=heads,
+            heads_per_program=_HEADS_PER_PROGRAM,
+            head_dim=HEAD_DIM,
+            rotary_dim=rotary_dim,
+            norm_epsilon=norm_epsilon,
+            softmax_scale=softmax_scale,
+            mask_ragged_tail=mask_ragged_tail,
+            aligned_projection=(
+                not mask_ragged_tail
+                and input_qdata.shape[2] % _BLOCK_K == 0
+                and heads % _HEADS_PER_PROGRAM == 0
+            ),
+            block_m=_BLOCK_M,
+            block_n=_BLOCK_N,
+            block_k=_BLOCK_K,
+            num_warps=8,
+            num_stages=3,
+        )
+
+    full_row_blocks = sequence_length // _BLOCK_M
+    if full_row_blocks:
+        launch(full_row_blocks, mask_ragged_tail=False)
+    if sequence_length % _BLOCK_M:
+        launch(1, mask_ragged_tail=True)
     return query, query_scale, query_summary
 
 
@@ -280,12 +312,13 @@ def _project_query_op_fake(
     _softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
-    heads = weight_qdata.shape[0] // _HEAD_DIM
+    storage_sequence_length = padded_sequence_length(sequence_length)
+    heads = weight_qdata.shape[0] // HEAD_DIM
     return (
-        input_qdata.new_empty((batch, heads, sequence_length, _HEAD_DIM)),
+        input_qdata.new_empty((batch, heads, storage_sequence_length, HEAD_DIM)),
         input_qdata.new_empty(
-            (batch, heads, sequence_length // _QUERY_SCALE_ROWS),
+            (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
             dtype=torch.float32,
         ),
-        cos.new_empty((batch, heads, sequence_length // _BLOCK_M, _HEAD_DIM)),
+        cos.new_empty((batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)),
     )
