@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import operator
 from collections.abc import Mapping
 
@@ -24,7 +25,7 @@ from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-swiglu-ffn-compile-v1"
+_COMPILE_PASS_VERSION = "convrot-swiglu-ffn-compile-v4"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 
@@ -64,6 +65,66 @@ def _normalized_ffn_pattern(*, explicit_up_activation: bool) -> CallFunction:
     )
 
 
+def _indexed_gate_pattern(
+    *,
+    gate_name: str,
+    indices_name: str,
+    use_aten_index: bool,
+) -> CallFunction:
+    gate = KeywordArg(gate_name)
+    indices = KeywordArg(indices_name)
+    if use_aten_index:
+        return CallFunction(
+            torch.ops.aten.index.Tensor,
+            gate,
+            [indices],
+            _users=1,
+        )
+    return CallFunction(
+        torch.ops.aten.index_select.default,
+        gate,
+        0,
+        indices,
+        _users=1,
+    )
+
+
+def _gated_updates_pattern(
+    *,
+    explicit_up_activation: bool,
+    use_aten_index: bool,
+) -> CallFunction:
+    ffn = _normalized_ffn_pattern(explicit_up_activation=explicit_up_activation)
+    update_gate = _indexed_gate_pattern(
+        gate_name="update_gate",
+        indices_name="gate_indices",
+        use_aten_index=use_aten_index,
+    )
+    gated_update = CallFunction(
+        torch.ops.aten.mul.Tensor,
+        update_gate,
+        KeywordArg("reusable_update"),
+        _users=1,
+    )
+    hidden = CallFunction(
+        torch.ops.aten.add.Tensor,
+        KeywordArg("base"),
+        gated_update,
+        _users=2,
+    )
+    ffn_gate = _indexed_gate_pattern(
+        gate_name="ffn_gate",
+        indices_name="gate_indices",
+        use_aten_index=use_aten_index,
+    )
+    gated_ffn = CallFunction(torch.ops.aten.mul.Tensor, ffn_gate, ffn, _users=1)
+    return CallFunction(
+        torch.ops.aten.add.Tensor,
+        hidden,
+        gated_ffn,
+    )
+
+
 def _metadata(match: Match, name: str) -> torch.Tensor | None:
     argument = match.kwargs[name]
     return (
@@ -75,6 +136,13 @@ def _metadata(match: Match, name: str) -> torch.Tensor | None:
 
 def _dimension_matches(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
     return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
+
+
+def _shape_matches(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return left.ndim == right.ndim and all(
+        _dimension_matches(left_dimension, right_dimension)
+        for left_dimension, right_dimension in zip(left.shape, right.shape, strict=True)
+    )
 
 
 def _valid_bias(
@@ -130,6 +198,7 @@ def _valid_normalized_ffn(match: Match) -> bool:
         or input_value.dtype is not torch.bfloat16
         or input_value.device.type != "cuda"
         or input_value.layout is not torch.strided
+        or not input_value.is_contiguous()
         or up_weight.ndim != 2
         or down_weight.ndim != 2
         or up_weight.dtype is not torch.int8
@@ -200,6 +269,87 @@ def _valid_normalized_ffn(match: Match) -> bool:
     )
 
 
+def _operator_returns_fresh_tensor(node: torch.fx.Node) -> bool:
+    """Whether an operator's schema guarantees storage independent of its inputs."""
+    if node.op != "call_function":
+        return False
+    schema = getattr(node.target, "_schema", None)
+    return bool(
+        schema is not None and len(schema.returns) == 1 and schema.returns[0].alias_info is None
+    )
+
+
+def _valid_gated_updates(match: Match) -> bool:
+    if not _valid_normalized_ffn(match):
+        return False
+    input_value = _metadata(match, "ffn_input")
+    base = _metadata(match, "base")
+    reusable_update = _metadata(match, "reusable_update")
+    update_gate = _metadata(match, "update_gate")
+    gate_indices = _metadata(match, "gate_indices")
+    ffn_gate = _metadata(match, "ffn_gate")
+    down_weight = _metadata(match, "down_weight_qdata")
+    output = preparation_sharing.tensor_metadata(match.output_node())
+    if any(
+        value is None
+        for value in (
+            input_value,
+            base,
+            reusable_update,
+            update_gate,
+            gate_indices,
+            ffn_gate,
+            down_weight,
+            output,
+        )
+    ):
+        return False
+    assert input_value is not None
+    assert base is not None
+    assert reusable_update is not None
+    assert update_gate is not None
+    assert gate_indices is not None
+    assert ffn_gate is not None
+    assert down_weight is not None
+    assert output is not None
+    reusable_update_node = match.kwargs["reusable_update"]
+    if not isinstance(reusable_update_node, torch.fx.Node):
+        return False
+    output_rows = math.prod(output.shape[:-1])
+    outputs_valid = all(
+        _shape_matches(value, output)
+        and value.dtype is input_value.dtype
+        and value.device == input_value.device
+        and value.layout is torch.strided
+        and value.is_contiguous()
+        for value in (base, reusable_update)
+    )
+    gates_valid = all(
+        gate.ndim == 2
+        and gate.dtype is input_value.dtype
+        and gate.device == input_value.device
+        and gate.layout is torch.strided
+        and gate.stride(-1) == 1
+        and _dimension_matches(gate.shape[-1], down_weight.shape[0])
+        for gate in (update_gate, ffn_gate)
+    )
+    indices_valid = (
+        gate_indices.ndim == 1
+        and gate_indices.dtype in (torch.int32, torch.int64)
+        and gate_indices.device == input_value.device
+        and gate_indices.layout is torch.strided
+        and gate_indices.is_contiguous()
+        and _dimension_matches(gate_indices.numel(), output_rows)
+    )
+    return bool(
+        outputs_valid
+        and gates_valid
+        and indices_valid
+        and _operator_returns_fresh_tensor(reusable_update_node)
+        and len(reusable_update_node.users) == 1
+    )
+
+
 def _replace_normalized_ffn(
     match: Match,
     ffn_input: torch.fx.Node,
@@ -237,8 +387,64 @@ def _replace_normalized_ffn(
     match.erase_nodes()
 
 
+def _replace_normalized_ffn_gated_updates(  # noqa: PLR0913, PLR0917
+    match: Match,
+    ffn_input: torch.fx.Node,
+    up_weight_qdata: torch.fx.Node,
+    up_weight_scale: torch.fx.Node,
+    up_bias: torch.fx.Node | None,
+    up_group_size: int,
+    down_weight_qdata: torch.fx.Node,
+    down_weight_scale: torch.fx.Node,
+    down_bias: torch.fx.Node | None,
+    down_group_size: int,
+    base: torch.fx.Node,
+    reusable_update: torch.fx.Node,
+    update_gate: torch.fx.Node,
+    gate_indices: torch.fx.Node,
+    ffn_gate: torch.fx.Node,
+    **_unused: object,
+) -> None:
+    original = match.output_node()
+    graph = match.graph
+    with graph.inserting_before(original):
+        mutation = graph.call_function(
+            torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default,
+            args=(
+                ffn_input,
+                up_weight_qdata,
+                up_weight_scale,
+                up_bias,
+                up_group_size,
+                down_weight_qdata,
+                down_weight_scale,
+                down_bias,
+                down_group_size,
+                base,
+                reusable_update,
+                update_gate,
+                ffn_gate,
+                gate_indices,
+                ffn_backend._DEFAULT_CHUNK_ROWS,
+            ),
+        )
+    mutation.meta["val"] = None
+    original.replace_all_uses_with(reusable_update)
+    match.erase_nodes()
+
+
+_gated_updates_patterns = PatternMatcherPass("convrot_swiglu_ffn_gated_updates")
 _patterns = PatternMatcherPass("convrot_swiglu_ffn")
 for _explicit_up_activation in (False, True):
+    for _use_aten_index in (False, True):
+        register_graph_pattern(
+            _gated_updates_pattern(
+                explicit_up_activation=_explicit_up_activation,
+                use_aten_index=_use_aten_index,
+            ),
+            extra_check=_valid_gated_updates,
+            pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_normalized_ffn_gated_updates)
     register_graph_pattern(
         _normalized_ffn_pattern(explicit_up_activation=_explicit_up_activation),
         extra_check=_valid_normalized_ffn,
@@ -247,7 +453,9 @@ for _explicit_up_activation in (False, True):
 
 
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
-    changed = _patterns.apply(graph) > 0
+    changes = _gated_updates_patterns.apply(graph)
+    changes += _patterns.apply(graph)
+    changed = changes > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()

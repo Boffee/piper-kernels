@@ -7,6 +7,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added inference-only `convrot_swiglu_ffn_compile_options` folding for compatible packed
+  ConvRot SwiGLU feed-forward graphs. The fused operator bounds intermediate storage to 4,096
+  rows, shares caller-owned preparation and projection buffers, and can fold the H3-style pair of
+  indexed residual gates into one FP32 epilogue that reuses a schema-proven fresh attention-update
+  allocation as output. Unsupported layouts and aliasing patterns fail closed to the ordinary
+  ConvRot graph.
 - Added the standalone `SparsePiperAttention` MVP for pre-tiled BF16 `[B,S,H,128]` self-attention
   on exact SM120. It combines exact FP32 DSA, packed UINT16 per-head routes, logical Q64/K64
   sparsity, physical M64/K128 execution, tile-scaled INT8 V, a pre-rounding FP32 denominator, and

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from piper_kernels.fusions.convrot_swiglu_ffn.triton import (
+    _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
 )
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
@@ -49,6 +50,18 @@ def _materialized_ffn(
         group_size,
         activation_fn="swiglu",
     )
+
+
+def _materialized_gated_updates(
+    ffn: torch.Tensor,
+    base: torch.Tensor,
+    reusable_update: torch.Tensor,
+    update_gate: torch.Tensor,
+    ffn_gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+) -> torch.Tensor:
+    hidden = base.float() + update_gate[gate_indices].float() * reusable_update.float()
+    return (hidden + ffn_gate[gate_indices].float() * ffn.float()).to(base.dtype)
 
 
 @pytest.mark.gpu
@@ -109,7 +122,7 @@ def test_chunked_ffn_matches_materialized_rows(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_chunked_ffn_preserves_leading_shape_and_noncontiguous_input() -> None:
+def test_chunked_ffn_rejects_noncontiguous_input() -> None:
     torch.manual_seed(202)
     input_features, intermediate_features, output_features = 256, 512, 384
     storage = torch.randn(2, 193, 2 * input_features, dtype=torch.bfloat16, device="cuda")
@@ -124,7 +137,84 @@ def test_chunked_ffn_preserves_leading_shape_and_noncontiguous_input() -> None:
         intermediate_features,
     )
 
-    expected = _materialized_ffn(
+    with pytest.raises(ValueError, match="contiguous"):
+        _chunked_swiglu_ffn_op(
+            activation,
+            up_qdata,
+            up_scale,
+            None,
+            256,
+            down_qdata,
+            down_scale,
+            None,
+            256,
+            128,
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_chunked_ffn_rejects_noncontiguous_bias() -> None:
+    torch.manual_seed(204)
+    input_features, intermediate_features, output_features = 256, 512, 384
+    activation = torch.randn(17, input_features, dtype=torch.bfloat16, device="cuda")
+    up_qdata, up_scale = _weight(2 * intermediate_features, input_features)
+    down_qdata, down_scale = _weight(output_features, intermediate_features)
+    bias_storage = torch.randn(
+        4 * intermediate_features,
+        dtype=activation.dtype,
+        device=activation.device,
+    )
+    up_bias = bias_storage[::2]
+    assert not up_bias.is_contiguous()
+
+    with pytest.raises(ValueError, match="contiguous"):
+        _chunked_swiglu_ffn_op(
+            activation,
+            up_qdata,
+            up_scale,
+            up_bias,
+            256,
+            down_qdata,
+            down_scale,
+            None,
+            256,
+            128,
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("output_features", [384, 1280], ids=["packed", "separate"])
+def test_chunked_ffn_gated_updates_matches_materialized_epilogue(
+    output_features: int,
+) -> None:
+    torch.manual_seed(203)
+    rows = 385
+    input_features, intermediate_features = 256, 512
+    activation = torch.randn(rows, input_features, dtype=torch.bfloat16, device="cuda")
+    base = torch.randn(rows, output_features, dtype=torch.bfloat16, device="cuda")
+    reusable_update = torch.randn(rows, output_features, dtype=torch.bfloat16, device="cuda")
+    up_qdata, up_scale = _weight(2 * intermediate_features, input_features)
+    down_qdata, down_scale = _weight(output_features, intermediate_features)
+    gate_storage = torch.randn(
+        7,
+        6 * output_features,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    update_gate = gate_storage[:, 2 * output_features : 3 * output_features]
+    ffn_gate = gate_storage[:, 5 * output_features :]
+    assert update_gate.stride() == (6 * output_features, 1)
+    assert ffn_gate.stride() == (6 * output_features, 1)
+    gate_indices = torch.randint(
+        0,
+        7,
+        (rows,),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    ffn = _materialized_ffn(
         activation,
         up_qdata,
         up_scale,
@@ -134,7 +224,16 @@ def test_chunked_ffn_preserves_leading_shape_and_noncontiguous_input() -> None:
         None,
         256,
     )
-    actual = _chunked_swiglu_ffn_op(
+    expected = _materialized_gated_updates(
+        ffn,
+        base,
+        reusable_update,
+        update_gate,
+        ffn_gate,
+        gate_indices,
+    )
+    actual = reusable_update.clone()
+    result = _chunked_swiglu_ffn_gated_updates_op(
         activation,
         up_qdata,
         up_scale,
@@ -144,10 +243,15 @@ def test_chunked_ffn_preserves_leading_shape_and_noncontiguous_input() -> None:
         down_scale,
         None,
         256,
+        base,
+        actual,
+        update_gate,
+        ffn_gate,
+        gate_indices,
         128,
     )
 
-    assert actual.shape == (2, 193, output_features)
+    assert result is None
     assert torch.equal(actual, expected)
 
 
