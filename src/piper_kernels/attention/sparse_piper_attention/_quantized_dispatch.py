@@ -72,10 +72,9 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         routes.head_offsets,
         sparse_key_blocks=sparse_key_blocks,
         routes_per_query=layout.routes_per_query,
-        attention_output=output.transpose(1, 2),
         logical_sequence_length=logical_sequence_length,
     )
-    _launch_sm120_attention(prepared)
+    _launch_sm120_attention(prepared, output.transpose(1, 2))
     return output
 
 

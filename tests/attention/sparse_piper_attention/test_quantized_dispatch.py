@@ -54,7 +54,6 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
         route_head_offsets=routes.head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
-        attention_output=torch.empty_like(query).transpose(1, 2),
     )
 
     quantized_arguments = (

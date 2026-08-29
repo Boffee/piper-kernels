@@ -580,9 +580,11 @@ def _make_gluon_descriptors(
 
 def _launch_sparse_piper_attention(
     prepared: _PreparedSparsePiperAttention,
+    output: torch.Tensor,
 ) -> None:
-    """Launch paired K128 while retaining logical K64 routes and tile scales."""
-    batch, heads, logical_sequence_length, head_dim = prepared.output.shape
+    """Launch paired K128 into caller-owned output storage."""
+    batch, heads, _, head_dim = prepared.query.shape
+    logical_sequence_length = prepared.logical_sequence_length
     storage_sequence_length = prepared.query.shape[2]
     if (
         head_dim != _HEAD_DIM
@@ -591,6 +593,13 @@ def _launch_sparse_piper_attention(
         != storage_sequence_length
     ):
         raise ValueError("paired Gluon routed Piper requires padded M64/D128 query storage")
+    if (
+        output.shape != (batch, heads, logical_sequence_length, head_dim)
+        or output.dtype is not torch.bfloat16
+        or output.device != prepared.query.device
+        or output.stride(-1) != 1
+    ):
+        raise ValueError("paired Gluon routed Piper output must be BF16 [B,H,S,D128]")
     if prepared.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
     with torch.cuda.device(prepared.query.device):
@@ -613,16 +622,16 @@ def _launch_sparse_piper_attention(
         routes,
         prepared.keep_blocks,
         route_head_offsets,
-        prepared.output,
+        output,
         storage_sequence_length,
         logical_sequence_length,
         prepared.sparse_key_blocks,
         stride_rb,
         stride_rq,
         stride_rr,
-        prepared.output.stride(0),
-        prepared.output.stride(1),
-        prepared.output.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         heads,
         logical_sequence_length != storage_sequence_length,
         4,

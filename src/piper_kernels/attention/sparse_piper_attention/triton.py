@@ -81,7 +81,7 @@ def _quantize_value_per_tile_kernel(
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperAttention:
-    """Only the quantized operands and routes consumed by the Gluon launch."""
+    """Quantized inputs and routing metadata consumed by the Gluon launch."""
 
     query: torch.Tensor
     key: torch.Tensor
@@ -90,11 +90,11 @@ class _PreparedSparsePiperAttention:
     key_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
-    output: torch.Tensor
     routes: torch.Tensor
     route_head_offsets: torch.Tensor
     keep_blocks: torch.Tensor
     sparse_key_blocks: int
+    logical_sequence_length: int
 
 
 def _prepare_sparse_piper_attention(
@@ -107,7 +107,6 @@ def _prepare_sparse_piper_attention(
     route_head_offsets: torch.Tensor,
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
-    attention_output: torch.Tensor,
 ) -> _PreparedSparsePiperAttention:
     """Prepare grouped Q/K and one folded V scale per logical K64 tile."""
     if (
@@ -167,14 +166,6 @@ def _prepare_sparse_piper_attention(
         num_warps=4,
     )
 
-    if (
-        attention_output.shape != query.shape
-        or attention_output.dtype != query.dtype
-        or attention_output.device != query.device
-        or attention_output.stride(-1) != 1
-    ):
-        raise ValueError("sparse Piper output must match Q and have contiguous features")
-
     return _PreparedSparsePiperAttention(
         query=prepared_qk.query,
         key=prepared_qk.key,
@@ -183,11 +174,11 @@ def _prepare_sparse_piper_attention(
         key_scale=prepared_qk.key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,
-        output=attention_output,
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
         sparse_key_blocks=sparse_key_blocks,
+        logical_sequence_length=logical_sequence_length,
     )
 
 
@@ -205,7 +196,6 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     *,
     sparse_key_blocks: int,
     routes_per_query: int,
-    attention_output: torch.Tensor,
     logical_sequence_length: int,
 ) -> _PreparedSparsePiperAttention:
     """Construct sparse Piper launch state from already-quantized operands."""
@@ -265,14 +255,6 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
 
-    if (
-        attention_output.shape != (batch, heads, logical_sequence_length, head_dim)
-        or attention_output.dtype is not torch.bfloat16
-        or attention_output.device != query.device
-        or attention_output.stride(-1) != 1
-    ):
-        raise ValueError("quantized sparse Piper output must be BF16 [B,H,S,D128]")
-
     return _PreparedSparsePiperAttention(
         query=query,
         key=key,
@@ -281,9 +263,9 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         key_scale=key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,
-        output=attention_output,
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
         sparse_key_blocks=sparse_key_blocks,
+        logical_sequence_length=logical_sequence_length,
     )
