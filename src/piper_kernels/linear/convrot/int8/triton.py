@@ -577,16 +577,26 @@ def _prepare_input(
     activation_fn: str | None,
     execution_plan: _policy.LinearExecutionPlan,
     target: AcceleratorTarget,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate and dynamically quantize a linear input for one or more weights."""
+    """Rotate and quantize an input, optionally into caller-owned storage."""
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
     m = input_2d.shape[0]
-    input_qdata = torch.empty(
-        (m, in_features),
-        device=input.device,
-        dtype=torch.int8,
-    )
-    input_scale = torch.empty(m, device=input.device, dtype=torch.float32)
+    if out is None:
+        input_qdata = torch.empty(
+            (m, in_features),
+            device=input.device,
+            dtype=torch.int8,
+        )
+        input_scale = torch.empty(m, device=input.device, dtype=torch.float32)
+        result = (
+            input_qdata.reshape(*input.shape[:-1], in_features),
+            input_scale.reshape(input.shape[:-1]),
+        )
+    else:
+        result = out
+    input_qdata = result[0].reshape(m, in_features)
+    input_scale = result[1].reshape(m)
     logical_dtype_code = dtype_code(input.dtype)
     if execution_plan.fuse_rotation_quantization:
         fused_rotate_quantize_input(
@@ -615,10 +625,7 @@ def _prepare_input(
             logical_dtype_code,
             num_warps=execution_plan.quantization_num_warps,
         )
-    return (
-        input_qdata.reshape(*input.shape[:-1], in_features),
-        input_scale.reshape(input.shape[:-1]),
-    )
+    return result
 
 
 def _prepare_input_with_production_plan(
@@ -651,19 +658,26 @@ def _execute_prepared_linear(
     bias: torch.Tensor | None,
     logical_dtype: torch.dtype,
     execution_plan: _policy.LinearExecutionPlan,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Allocate and run one INT8 GEMM from a rotated and quantized input."""
+    """Run one prepared INT8 GEMM, optionally into caller-owned storage."""
     leading_shape = input_qdata.shape[:-1]
     m = math.prod(leading_shape)
     k = input_qdata.shape[-1]
     n = weight_qdata.shape[0]
-    output = torch.empty(
-        (m, n),
-        device=input_qdata.device,
-        dtype=logical_dtype,
-    )
+    if out is None:
+        output = torch.empty(
+            (m, n),
+            device=input_qdata.device,
+            dtype=logical_dtype,
+        )
+        result = output.reshape(*leading_shape, n)
+    else:
+        result = out
     input_qdata_2d = input_qdata.reshape(m, k)
     input_scale_1d = input_scale.reshape(m)
+    output = result.reshape(m, n)
     plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n)
     # Cache grouping and the M-tail split are intrinsic to the selected large-tile family,
@@ -713,7 +727,7 @@ def _execute_prepared_linear(
             0,
             aligned_m=False,
         )
-    return output.reshape(*leading_shape, n)
+    return result
 
 
 def run_linear(
