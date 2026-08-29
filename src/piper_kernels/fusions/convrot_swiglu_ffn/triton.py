@@ -27,6 +27,7 @@ class _IndexedGatedUpdates:
     update_gate: torch.Tensor
     ffn_gate: torch.Tensor
     gate_indices: torch.Tensor
+    python_indexing: bool
 
 
 @triton.jit
@@ -44,6 +45,7 @@ def _gated_updates_kernel(
     ffn_gate_row_stride: tl.constexpr,
     update_gate_rows,
     ffn_gate_rows,
+    python_indexing: tl.constexpr,
     block_size: tl.constexpr,
 ):
     """Apply two indexed gated updates and reuse the first update as output."""
@@ -67,17 +69,23 @@ def _gated_updates_kernel(
         mask=valid,
         other=0,
     ).to(tl.int64)
-    gate_rows_valid = (
-        (gate_rows >= 0) & (gate_rows < update_gate_rows) & (gate_rows < ffn_gate_rows)
-    )
+    if python_indexing:
+        update_gate_row = tl.where(gate_rows < 0, gate_rows + update_gate_rows, gate_rows)
+        ffn_gate_row = tl.where(gate_rows < 0, gate_rows + ffn_gate_rows, gate_rows)
+    else:
+        update_gate_row = gate_rows
+        ffn_gate_row = gate_rows
+    update_gate_row_valid = (update_gate_row >= 0) & (update_gate_row < update_gate_rows)
+    ffn_gate_row_valid = (ffn_gate_row >= 0) & (ffn_gate_row < ffn_gate_rows)
+    gate_rows_valid = update_gate_row_valid & ffn_gate_row_valid
     tl.device_assert(gate_rows_valid, "gate index out of bounds", mask=valid)
     update_gate = tl.load(
-        update_gate_ptr + gate_rows * update_gate_row_stride + columns,
+        update_gate_ptr + update_gate_row * update_gate_row_stride + columns,
         mask=valid & gate_rows_valid,
         other=float("nan"),
     ).to(tl.float32)
     ffn_gate = tl.load(
-        ffn_gate_ptr + gate_rows * ffn_gate_row_stride + columns,
+        ffn_gate_ptr + ffn_gate_row * ffn_gate_row_stride + columns,
         mask=valid & gate_rows_valid,
         other=float("nan"),
     ).to(tl.float32)
@@ -405,6 +413,7 @@ def _run_chunked_swiglu_ffn(
                 ffn_gate_row_stride=ffn_gate_row_stride,
                 update_gate_rows=update_gate_rows,
                 ffn_gate_rows=ffn_gate_rows,
+                python_indexing=gated_updates.python_indexing,
                 block_size=_EPILOGUE_BLOCK_SIZE,
                 num_warps=4,
             )
@@ -473,6 +482,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
     update_gate: torch.Tensor,
     ffn_gate: torch.Tensor,
     gate_indices: torch.Tensor,
+    python_indexing: bool,
     chunk_rows: int,
 ) -> None:
     """Run a chunked FFN and apply indexed updates in reusable caller-owned storage."""
@@ -493,6 +503,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
             update_gate=update_gate,
             ffn_gate=ffn_gate,
             gate_indices=gate_indices,
+            python_indexing=python_indexing,
         ),
     )
 
@@ -513,6 +524,7 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
     _update_gate: torch.Tensor,
     _ffn_gate: torch.Tensor,
     _gate_indices: torch.Tensor,
+    _python_indexing: bool,
     _chunk_rows: int,
 ) -> None:
     return None

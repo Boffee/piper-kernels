@@ -25,7 +25,7 @@ from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-swiglu-ffn-compile-v4"
+_COMPILE_PASS_VERSION = "convrot-swiglu-ffn-compile-v5"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 
@@ -407,6 +407,10 @@ def _replace_normalized_ffn_gated_updates(  # noqa: PLR0913, PLR0917
 ) -> None:
     original = match.output_node()
     graph = match.graph
+    python_indexing = any(
+        node.op == "call_function" and node.target == torch.ops.aten.index.Tensor
+        for node in match.nodes
+    )
     with graph.inserting_before(original):
         mutation = graph.call_function(
             torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default,
@@ -425,6 +429,7 @@ def _replace_normalized_ffn_gated_updates(  # noqa: PLR0913, PLR0917
                 update_gate,
                 ffn_gate,
                 gate_indices,
+                python_indexing,
                 ffn_backend._DEFAULT_CHUNK_ROWS,
             ),
         )

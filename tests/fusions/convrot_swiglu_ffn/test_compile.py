@@ -72,11 +72,13 @@ class _SwiGluFfnGatedUpdates(torch.nn.Module):
         *,
         expose: Literal["none", "ffn", "hidden"] = "none",
         update_mode: Literal["materialized", "direct", "alias"] = "materialized",
+        python_indexing: bool = False,
     ) -> None:
         super().__init__()
         self.ffn = _SwiGluFfn()
         self.expose = expose
         self.update_mode = update_mode
+        self.python_indexing = python_indexing
         self.update = torch.nn.Linear(
             self.ffn.output_features,
             self.ffn.output_features,
@@ -100,8 +102,12 @@ class _SwiGluFfnGatedUpdates(torch.nn.Module):
             reusable_update = update_source[1:]
         else:
             reusable_update = update_source
-        selected_update_gate = update_gate.index_select(0, gate_indices)
-        selected_ffn_gate = ffn_gate.index_select(0, gate_indices)
+        if self.python_indexing:
+            selected_update_gate = update_gate[gate_indices]
+            selected_ffn_gate = ffn_gate[gate_indices]
+        else:
+            selected_update_gate = update_gate.index_select(0, gate_indices)
+            selected_ffn_gate = ffn_gate.index_select(0, gate_indices)
         hidden = base + selected_update_gate * reusable_update
         ffn = self.ffn(hidden[..., : self.ffn.input_features].contiguous())
         assert isinstance(ffn, torch.Tensor)
@@ -317,6 +323,35 @@ def test_cuda_compile_options_fold_gated_updates() -> None:
         == 1
     )
     assert torch.ops.piper_kernels.convrot_swiglu_ffn.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_compile_options_preserve_negative_python_indices() -> None:
+    torch.manual_seed(219)
+    model = _SwiGluFfnGatedUpdates(python_indexing=True).eval()
+    capture = _TargetCapturePass()
+    arguments = list(_gated_update_arguments(model, 257))
+    arguments[-1] = torch.arange(257, dtype=torch.int64, device="cuda").remainder(7) - 7
+    with torch.no_grad():
+        torch._dynamo.reset()
+        expected = torch.compile(
+            model,
+            fullgraph=True,
+            options=convrot_int8_compile_options(),
+        )(*arguments)
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=_capturing_options(capture),
+        )(*arguments)
+
+    assert torch.equal(actual, expected)
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default)
+        == 1
+    )
 
 
 @pytest.mark.gpu

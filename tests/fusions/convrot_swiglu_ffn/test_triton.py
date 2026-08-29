@@ -248,7 +248,68 @@ def test_chunked_ffn_gated_updates_matches_materialized_epilogue(
         update_gate,
         ffn_gate,
         gate_indices,
+        False,
         128,
+    )
+
+    assert result is None
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_chunked_ffn_gated_updates_preserves_negative_python_indices() -> None:
+    torch.manual_seed(205)
+    rows = 10
+    input_features, intermediate_features, output_features = 256, 512, 384
+    activation = torch.randn(rows, input_features, dtype=torch.bfloat16, device="cuda")
+    base = torch.randn(rows, output_features, dtype=torch.bfloat16, device="cuda")
+    reusable_update = torch.randn(rows, output_features, dtype=torch.bfloat16, device="cuda")
+    up_qdata, up_scale = _weight(2 * intermediate_features, input_features)
+    down_qdata, down_scale = _weight(output_features, intermediate_features)
+    update_gate = torch.randn(7, output_features, dtype=torch.bfloat16, device="cuda")
+    ffn_gate = torch.randn(5, output_features, dtype=torch.bfloat16, device="cuda")
+    gate_indices = torch.tensor(
+        [-1, -2, -3, -4, -5, 0, 1, 2, 3, 4],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    ffn = _materialized_ffn(
+        activation,
+        up_qdata,
+        up_scale,
+        None,
+        down_qdata,
+        down_scale,
+        None,
+        256,
+    )
+    expected = _materialized_gated_updates(
+        ffn,
+        base,
+        reusable_update,
+        update_gate,
+        ffn_gate,
+        gate_indices,
+    )
+    actual = reusable_update.clone()
+    result = _chunked_swiglu_ffn_gated_updates_op(
+        activation,
+        up_qdata,
+        up_scale,
+        None,
+        256,
+        down_qdata,
+        down_scale,
+        None,
+        256,
+        base,
+        actual,
+        update_gate,
+        ffn_gate,
+        gate_indices,
+        True,
+        8,
     )
 
     assert result is None
