@@ -416,6 +416,7 @@ def _run_chunked_swiglu_ffn(
                 python_indexing=gated_updates.python_indexing,
                 block_size=_EPILOGUE_BLOCK_SIZE,
                 num_warps=4,
+                debug=True,
             )
     return output
 

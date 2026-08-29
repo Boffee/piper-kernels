@@ -1,5 +1,9 @@
 """Tests for the direct chunked ConvRot SwiGLU FFN operation."""
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -314,6 +318,74 @@ def test_chunked_ffn_gated_updates_preserves_negative_python_indices() -> None:
 
     assert result is None
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_chunked_ffn_gated_updates_rejects_out_of_bounds_indices() -> None:
+    program = textwrap.dedent(
+        """
+        import torch
+
+        from piper_kernels.fusions.convrot_swiglu_ffn.triton import (
+            _chunked_swiglu_ffn_gated_updates_op,
+        )
+
+
+        def weight(out_features: int, in_features: int):
+            return (
+                torch.randint(
+                    -127,
+                    128,
+                    (out_features, in_features),
+                    dtype=torch.int8,
+                    device="cuda",
+                ),
+                torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01,
+            )
+
+
+        rows, input_features, intermediate_features, output_features = 1, 256, 256, 128
+        activation = torch.randn(rows, input_features, dtype=torch.bfloat16, device="cuda")
+        base = torch.randn(rows, output_features, dtype=torch.bfloat16, device="cuda")
+        update = torch.randn_like(base)
+        update_gate = torch.randn(1, output_features, dtype=torch.bfloat16, device="cuda")
+        ffn_gate = torch.randn_like(update_gate)
+        gate_indices = torch.tensor([1], dtype=torch.int64, device="cuda")
+        up_qdata, up_scale = weight(2 * intermediate_features, input_features)
+        down_qdata, down_scale = weight(output_features, intermediate_features)
+        _chunked_swiglu_ffn_gated_updates_op(
+            activation,
+            up_qdata,
+            up_scale,
+            None,
+            256,
+            down_qdata,
+            down_scale,
+            None,
+            256,
+            base,
+            update,
+            update_gate,
+            ffn_gate,
+            gate_indices,
+            False,
+            1,
+        )
+        torch.cuda.synchronize()
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert "gate index out of bounds" in result.stderr or "device-side assert" in result.stderr
 
 
 @pytest.mark.gpu
