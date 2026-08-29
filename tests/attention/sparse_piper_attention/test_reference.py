@@ -8,7 +8,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 )
 from piper_kernels.attention.sparse_piper_attention.dsa import (
     PackedDsaRoutes,
-    packed_dsa_routes_from_layout,
+    packed_dsa_routes_from_sequences,
 )
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_exact_sparse_attention,
@@ -32,9 +32,9 @@ def _inputs() -> tuple[
         2,
         torch.device("cpu"),
     )
-    query_blocks = query.transpose(1, 2).unflatten(2, (3, 64))
-    key_blocks = key[:, :128].transpose(1, 2).unflatten(2, (2, 64))
-    routes = packed_dsa_routes_from_layout(query_blocks, key_blocks, layout)
+    query_sequence = query.transpose(1, 2)
+    sparse_key = key[:, :128].transpose(1, 2)
+    routes = packed_dsa_routes_from_sequences(query_sequence, sparse_key, layout)
     return query, key, value, routes
 
 

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from piper_kernels.fusions.convrot_sparse_piper import query as query_fusion
+from piper_kernels.fusions.convrot_sparse_piper._layout import padded_sequence_length
 
 from ._reference import composed_query_projection
 
@@ -96,8 +97,11 @@ def _random_operands(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_fused_query_projection_matches_the_fp32_composed_contract() -> None:
-    operands = _random_operands()
+@pytest.mark.parametrize("sequence_length", [64, 65])
+def test_fused_query_projection_matches_the_fp32_composed_contract(
+    sequence_length: int,
+) -> None:
+    operands = _random_operands(sequence_length=sequence_length)
     options = {
         "norm_epsilon": 1e-6,
         "softmax_scale": 128**-0.5,
@@ -109,12 +113,13 @@ def test_fused_query_projection_matches_the_fp32_composed_contract() -> None:
         options["softmax_scale"],
     )
     expected = composed_query_projection(*operands.as_tuple(), **options)
+    storage_length = padded_sequence_length(sequence_length)
 
-    assert actual_query.shape == (1, 2, 64, 128)
+    assert actual_query.shape == (1, 2, storage_length, 128)
     assert actual_query.dtype is torch.int8
-    assert actual_scale.shape == (1, 2, 2)
+    assert actual_scale.shape == (1, 2, storage_length // 32)
     assert actual_scale.dtype is torch.float32
-    assert actual_summary.shape == (1, 2, 1, 128)
+    assert actual_summary.shape == (1, 2, storage_length // 64, 128)
     assert actual_summary.dtype is torch.float32
     assert int((actual_query.to(torch.int16) - expected.query).abs().max()) <= 1
     torch.testing.assert_close(

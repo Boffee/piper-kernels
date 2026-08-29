@@ -9,10 +9,10 @@ from .dsa import packed_dsa_routes_from_summaries
 
 try:
     from .gluon import (
-        _launch_gluon_paired_routed_piper_attention as _launch_sm120_attention,
+        _launch_sparse_piper_attention as _launch_sm120_attention,
     )
     from .triton import (
-        _prepare_quantized_routed_piper_attention as _prepare_sm120_quantized_attention,
+        _prepare_sparse_piper_attention_from_quantized as _prepare_sm120_quantized_attention,
     )
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
@@ -25,7 +25,7 @@ except ModuleNotFoundError as exc:
     "piper_kernels::sparse_piper_attention_from_quantized",
     mutates_args=(),
 )
-def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
+def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
     query_scale: torch.Tensor,
     query_summary: torch.Tensor,
@@ -38,6 +38,7 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
     value_mean: torch.Tensor,
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
+    logical_sequence_length: int,
 ) -> torch.Tensor:
     if _prepare_sm120_quantized_attention is None or _launch_sm120_attention is None:
         raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
@@ -52,9 +53,9 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
         key_min[:, :, :sparse_key_blocks],
         layout,
     )
-    batch, heads, sequence_length, head_dim = query.shape
+    batch, heads, _, head_dim = query.shape
     output = torch.empty(
-        (batch, sequence_length, heads, head_dim),
+        (batch, logical_sequence_length, heads, head_dim),
         device=query.device,
         dtype=torch.bfloat16,
     )
@@ -72,13 +73,14 @@ def _sm120_sparse_piper_attention_from_quantized(  # noqa: PLR0913, PLR0917
         sparse_key_blocks=sparse_key_blocks,
         routes_per_query=layout.routes_per_query,
         attention_output=output.transpose(1, 2),
+        logical_sequence_length=logical_sequence_length,
     )
     _launch_sm120_attention(prepared)
     return output
 
 
-@_sm120_sparse_piper_attention_from_quantized.register_fake
-def _sm120_sparse_piper_attention_from_quantized_fake(
+@_sparse_piper_attention_from_quantized_op.register_fake
+def _sparse_piper_attention_from_quantized_op_fake(
     query: torch.Tensor,
     _query_scale: torch.Tensor,
     _query_summary: torch.Tensor,
@@ -91,8 +93,9 @@ def _sm120_sparse_piper_attention_from_quantized_fake(
     _value_mean: torch.Tensor,
     _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
+    logical_sequence_length: int,
 ) -> torch.Tensor:
     return query.new_empty(
-        (query.shape[0], query.shape[2], query.shape[1], query.shape[3]),
+        (query.shape[0], logical_sequence_length, query.shape[1], query.shape[3]),
         dtype=torch.bfloat16,
     )

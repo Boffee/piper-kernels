@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from piper_kernels.fusions.convrot_sparse_piper import key as key_fusion
+from piper_kernels.fusions.convrot_sparse_piper._layout import padded_sequence_length
 
 from ._reference import composed_key_projection
 
@@ -97,8 +98,9 @@ def _random_operands(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_fused_key_projection_matches_the_fp32_composed_contract() -> None:
-    operands = _random_operands()
+@pytest.mark.parametrize("sequence_length", [64, 65])
+def test_fused_key_projection_matches_the_fp32_composed_contract(sequence_length: int) -> None:
+    operands = _random_operands(sequence_length=sequence_length)
     options = {
         "norm_epsilon": 1e-5,
     }
@@ -108,12 +110,13 @@ def test_fused_key_projection_matches_the_fp32_composed_contract() -> None:
         options["norm_epsilon"],
     )
     expected = composed_key_projection(*operands.as_tuple(), **options)
+    storage_length = padded_sequence_length(sequence_length)
 
-    assert actual_key.shape == (1, 2, 64, 128)
+    assert actual_key.shape == (1, 2, storage_length, 128)
     assert actual_key.dtype is torch.int8
-    assert actual_scale.shape == (1, 2, 1)
+    assert actual_scale.shape == (1, 2, storage_length // 64)
     assert actual_scale.dtype is torch.float32
-    assert actual_max.shape == (1, 2, 1, 128)
+    assert actual_max.shape == (1, 2, storage_length // 64, 128)
     assert actual_min.shape == actual_max.shape
     assert int((actual_key.to(torch.int16) - expected.key).abs().max()) <= 1
     torch.testing.assert_close(actual_scale, expected.key_scale, atol=1e-4, rtol=3e-3)

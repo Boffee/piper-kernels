@@ -42,22 +42,25 @@ def _quantize_value_per_tile_kernel(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    """Quantize one complete D128 K64 tile with one folded V scale."""
+    """Quantize one D128 K64 storage tile while masking the logical V tail."""
     key_block = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch = batch_head // heads
     head = batch_head % heads
     offsets_n = key_block * block_n + tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
+    valid_rows = offsets_n < key_length
     value = tl.load(
         value_ptr
         + batch * stride_vb
         + head * stride_vh
         + offsets_n[:, None] * stride_vn
         + offsets_d[None, :],
+        mask=valid_rows[:, None],
+        other=0.0,
     ).to(tl.float32)
     value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
-    centered = value - value_mean[None, :]
+    centered = tl.where(valid_rows[:, None], value - value_mean[None, :], 0.0)
     maximum = tl.max(tl.max(tl.abs(centered), axis=1), axis=0)
     value_scale = maximum / _V_INT8_RANGE + _SCALE_EPSILON
     quantized = qk_quantization.round_to_int8(centered / value_scale)
@@ -94,31 +97,31 @@ class _PreparedSparsePiperAttention:
     sparse_key_blocks: int
 
 
-def _prepare_folded_tile_scaled_routed_piper_attention(
-    query_blocks: torch.Tensor,
-    key_blocks: torch.Tensor,
+def _prepare_sparse_piper_attention(
+    query: torch.Tensor,
     routes: torch.Tensor,
     keep_blocks: torch.Tensor,
     scale: float,
     *,
+    sparse_key_blocks: int,
     route_head_offsets: torch.Tensor,
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
     attention_output: torch.Tensor,
 ) -> _PreparedSparsePiperAttention:
     """Prepare grouped Q/K and one folded V scale per logical K64 tile."""
-    query = query_blocks.flatten(2, 3)
     if (
         combined_key.shape != query.shape
         or combined_value.shape != combined_key.shape
-        or key_blocks.shape[2] > query.shape[2] // _BLOCK_N
+        or not 1 <= sparse_key_blocks <= query.shape[2] // _BLOCK_N
     ):
-        raise ValueError("combined Q/K/V must share one aligned sequence")
+        raise ValueError("combined Q/K/V and the sparse-prefix K64 count must agree")
     if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
-    batch, heads, sequence_length, head_dim = query.shape
-    tile_count = sequence_length // _BLOCK_N
+    batch, heads, logical_sequence_length, head_dim = query.shape
+    tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
+    storage_sequence_length = tile_count * _BLOCK_N
 
     key_mean, value_mean = piper_quantization.compute_kv_means(
         combined_key,
@@ -131,11 +134,11 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         key_mean,
         scale,
         grouped=True,
-        storage_key_length=sequence_length,
-        storage_query_length=sequence_length,
+        storage_key_length=storage_sequence_length,
+        storage_query_length=storage_sequence_length,
     )
     value_int8 = torch.empty(
-        (batch, heads, head_dim, sequence_length),
+        (batch, heads, head_dim, storage_sequence_length),
         device=combined_value.device,
         dtype=torch.int8,
     )
@@ -150,7 +153,7 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         value_mean,
         value_scale_multiplier,
         value_int8,
-        sequence_length,
+        logical_sequence_length,
         combined_value.stride(0),
         combined_value.stride(1),
         combined_value.stride(2),
@@ -184,11 +187,11 @@ def _prepare_folded_tile_scaled_routed_piper_attention(
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
-        sparse_key_blocks=key_blocks.shape[2],
+        sparse_key_blocks=sparse_key_blocks,
     )
 
 
-def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
+def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     query: torch.Tensor,
     query_scale: torch.Tensor,
     key: torch.Tensor,
@@ -203,19 +206,38 @@ def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
     sparse_key_blocks: int,
     routes_per_query: int,
     attention_output: torch.Tensor,
+    logical_sequence_length: int,
 ) -> _PreparedSparsePiperAttention:
     """Construct sparse Piper launch state from already-quantized operands."""
     if query.ndim != 4 or query.dtype is not torch.int8:
-        raise ValueError("quantized sparse Piper Q must be [batch,heads,sequence,D128] INT8")
-    batch, heads, sequence_length, head_dim = query.shape
-    if head_dim != _HEAD_DIM or sequence_length < _BLOCK_M or sequence_length % _BLOCK_M:
-        raise ValueError("quantized sparse Piper requires aligned M64/D128 queries")
+        raise ValueError(
+            "quantized sparse Piper Q must be [batch,heads,storage_sequence,D128] INT8"
+        )
+    batch, heads, storage_sequence_length, head_dim = query.shape
+    if (
+        head_dim != _HEAD_DIM
+        or storage_sequence_length < _BLOCK_M
+        or storage_sequence_length % _BLOCK_M
+    ):
+        raise ValueError("quantized sparse Piper requires K64-aligned D128 query storage")
+    if (
+        logical_sequence_length < _BLOCK_M
+        or logical_sequence_length > storage_sequence_length
+        or (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
+        != storage_sequence_length
+    ):
+        raise ValueError("quantized sparse Piper storage must be the padded logical sequence")
     if key.shape != query.shape or key.dtype is not torch.int8:
         raise ValueError("quantized sparse Piper K must match Q and use INT8")
-    if value.shape != (batch, heads, head_dim, sequence_length) or value.dtype is not torch.int8:
-        raise ValueError("quantized sparse Piper V must be transposed INT8 [B,H,D,S]")
-    tile_count = sequence_length // _BLOCK_N
-    if query_scale.shape != (batch, heads, sequence_length // 32):
+    if (
+        value.shape != (batch, heads, head_dim, storage_sequence_length)
+        or value.dtype is not torch.int8
+    ):
+        raise ValueError(
+            "quantized sparse Piper V must be transposed INT8 [B,H,D,storage_sequence]"
+        )
+    tile_count = storage_sequence_length // _BLOCK_N
+    if query_scale.shape != (batch, heads, storage_sequence_length // 32):
         raise ValueError("quantized sparse Piper Q scales must contain one value per Q32")
     if key_scale.shape != (batch, heads, tile_count):
         raise ValueError("quantized sparse Piper K scales must contain one value per K64")
@@ -233,7 +255,7 @@ def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
         raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
     if not 1 <= sparse_key_blocks <= tile_count:
         raise ValueError("quantized sparse Piper prefix must fit the K64 tile count")
-    query_block_count = sequence_length // _BLOCK_M
+    query_block_count = (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M
     if routes.shape != (batch, query_block_count, routes_per_query):
         raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
     if routes.dtype is not torch.uint16:
@@ -244,7 +266,7 @@ def _prepare_quantized_routed_piper_attention(  # noqa: PLR0912
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
 
     if (
-        attention_output.shape != (batch, heads, sequence_length, head_dim)
+        attention_output.shape != (batch, heads, logical_sequence_length, head_dim)
         or attention_output.dtype is not torch.bfloat16
         or attention_output.device != query.device
         or attention_output.stride(-1) != 1

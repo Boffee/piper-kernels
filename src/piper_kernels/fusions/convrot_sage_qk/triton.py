@@ -88,8 +88,8 @@ def project_rmsnorm_rope_tile(
     if aligned_projection:
         rope_load_mask = rotary_features[None, None, :]
     else:
-        # K pairs two logical K64 tiles in M128. An odd tile count leaves one
-        # physical K64 tail, so its second half has no RoPE storage to read.
+        # A partial Q64 tile or the unused half of a paired K128 tile has no
+        # logical RoPE storage to read.
         rope_load_mask = (sequence_offsets[:, None, None] < sequence_length) & rotary_features[
             None, None, :
         ]
@@ -194,7 +194,6 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
     sin: torch.Tensor,
     *,
     norm_epsilon: float,
-    block_rows: int,
     name: str,
 ) -> tuple[int, int, int, int]:
     """Validate inputs to a fused ConvRot Q/K projection kernel."""
@@ -230,8 +229,8 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
         operand.layout is not torch.strided or not operand.is_contiguous() for operand in operands
     ):
         raise ValueError(f"{name} projection operands must be contiguous strided tensors")
-    if sequence_length < block_rows or sequence_length % block_rows:
-        raise ValueError(f"{name} projection sequence must be {block_rows}-row aligned")
+    if sequence_length < 1:
+        raise ValueError(f"{name} projection sequence must contain at least one row")
     if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
         raise ValueError(f"{name} projection RMSNorm epsilon must be finite and positive")
     return batch, sequence_length, heads, rotary_dim

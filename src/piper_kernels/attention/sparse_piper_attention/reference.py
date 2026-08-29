@@ -45,7 +45,7 @@ def _active_indices(
 
     suffix_tiles = torch.arange(
         sparse_key_blocks,
-        sequence_length // _BLOCK_ROWS,
+        (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
         device=routes.indices.device,
     )
     return key_indices, torch.cat((selected_blocks, suffix_tiles))
@@ -56,7 +56,11 @@ def _quantize_value_per_tile(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize centered V with one scalar scale per logical K64 tile."""
     batch, heads, key_length, head_dim = value_centered.shape
-    grouped = value_centered.reshape(batch, heads, key_length // _BLOCK_ROWS, _BLOCK_ROWS, head_dim)
+    tile_count = (key_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    storage_length = tile_count * _BLOCK_ROWS
+    padded = value_centered.new_zeros((batch, heads, storage_length, head_dim))
+    padded[:, :, :key_length] = value_centered
+    grouped = padded.reshape(batch, heads, tile_count, _BLOCK_ROWS, head_dim)
     scale = grouped.abs().amax(dim=(3, 4)) / _V_INT8_RANGE + _SCALE_EPSILON
     quantized = (
         (grouped / scale[..., None, None])
@@ -64,7 +68,7 @@ def _quantize_value_per_tile(
         .clamp(-_V_INT8_RANGE, _V_INT8_RANGE)
         .to(torch.int8)
     )
-    return quantized.flatten(2, 3), scale
+    return quantized.flatten(2, 3)[:, :, :key_length], scale
 
 
 def _quantize_query_key(
@@ -96,7 +100,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     fallback.
     """
     batch, sequence, heads, head_dim = query.shape
-    query_blocks = sequence // _BLOCK_ROWS
+    query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
@@ -132,16 +136,16 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     tile_indices,
                 )
                 query_start = query_block * _BLOCK_ROWS
-                query_stop = query_start + _BLOCK_ROWS
+                query_stop = min(query_start + _BLOCK_ROWS, sequence)
                 block_query = query_int8[batch_index, head, query_start:query_stop]
                 block_query_scale = query_scale[batch_index, head, query_start:query_stop]
                 numerator = torch.zeros(
-                    (_BLOCK_ROWS, head_dim),
+                    (query_stop - query_start, head_dim),
                     device=query.device,
                     dtype=torch.float32,
                 )
                 denominator = torch.zeros(
-                    (_BLOCK_ROWS,),
+                    (query_stop - query_start,),
                     device=query.device,
                     dtype=torch.float32,
                 )
@@ -211,7 +215,7 @@ def reference_exact_sparse_attention(
 ) -> torch.Tensor:
     """Apply the same routes with exact BF16 inputs and FP32 attention math."""
     batch, sequence, heads, _head_dim = query.shape
-    query_blocks = sequence // _BLOCK_ROWS
+    query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     output = torch.empty_like(query)
     head_offsets = routes.head_offsets.detach().cpu().tolist()
 
@@ -228,7 +232,7 @@ def reference_exact_sparse_attention(
                     head_offsets=head_offsets,
                 )
                 query_start = query_block * _BLOCK_ROWS
-                query_stop = query_start + _BLOCK_ROWS
+                query_stop = min(query_start + _BLOCK_ROWS, sequence)
                 block_query = query[batch_index, query_start:query_stop, head].float()
                 selected_key = key[batch_index, key_indices, head].float()
                 selected_value = value[batch_index, key_indices, head].float()

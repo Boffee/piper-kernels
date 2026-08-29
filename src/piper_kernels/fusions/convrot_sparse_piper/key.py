@@ -18,13 +18,13 @@ from piper_kernels.fusions.convrot_sage_qk.triton import (
     validate_qk_projection_inputs,
 )
 
+from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length
+
 _BLOCK_M = 128
-_KEY_TILE_ROWS = 64
 _BLOCK_K = 128
-_HEAD_DIM = 128
 _HEADS_PER_PROGRAM = 2
-_BLOCK_N = _HEAD_DIM * _HEADS_PER_PROGRAM
-_JIT_KEY_TILE_ROWS = tl.constexpr(64)
+_BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
+_JIT_KEY_TILE_ROWS = tl.constexpr(TILE_ROWS)
 
 
 @triton.jit
@@ -41,7 +41,8 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     key_max_ptr,
     key_min_ptr,
     rows,
-    sequence_length,
+    logical_sequence_length,
+    storage_sequence_length,
     row_block_offset,
     input_features: tl.constexpr,
     heads: tl.constexpr,
@@ -59,7 +60,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     head_block = tl.program_id(1)
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
-    row_offsets = batch * sequence_length + sequence_offsets
+    row_offsets = batch * logical_sequence_length + sequence_offsets
     projection_feature_offsets = tl.arange(0, block_n)
     feature_offsets = tl.arange(0, head_dim)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
@@ -76,7 +77,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         weight_offsets,
         sequence_offsets,
         rows,
-        sequence_length,
+        logical_sequence_length,
         input_features,
         heads * head_dim,
         heads_per_program,
@@ -88,7 +89,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         block_n,
         block_k,
     ).to(tl.float32)
-    valid_rows = sequence_offsets < sequence_length
+    valid_rows = sequence_offsets < logical_sequence_length
     key = tl.where(valid_rows[:, None, None], key, 0.0)
     key_head_major = tl.permute(key, (1, 0, 2))
     grouped = tl.reshape(
@@ -103,7 +104,9 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     local_tile_offsets = tl.arange(0, block_m // _JIT_KEY_TILE_ROWS)
     tile_offsets = row_block * (block_m // _JIT_KEY_TILE_ROWS) + local_tile_offsets
     row_in_tile = tl.arange(0, _JIT_KEY_TILE_ROWS)
-    valid = tile_offsets[:, None] * _JIT_KEY_TILE_ROWS + row_in_tile[None, :] < sequence_length
+    valid = (
+        tile_offsets[:, None] * _JIT_KEY_TILE_ROWS + row_in_tile[None, :] < logical_sequence_length
+    )
     key_max = tl.max(
         tl.where(valid[None, :, :, None], grouped, -float("inf")),
         axis=2,
@@ -121,7 +124,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         _JIT_KEY_TILE_ROWS,
     )
     key_offsets = (
-        (batch * heads + head_offsets[:, None, None]) * sequence_length * head_dim
+        (batch * heads + head_offsets[:, None, None]) * storage_sequence_length * head_dim
         + sequence_offsets[None, :, None] * head_dim
         + feature_offsets[None, None, :]
     )
@@ -129,9 +132,9 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         key_ptr + key_offsets,
         quantized,
         mask=(head_offsets[:, None, None] < heads)
-        & (sequence_offsets[None, :, None] < sequence_length),
+        & (sequence_offsets[None, :, None] < storage_sequence_length),
     )
-    tile_count = sequence_length // _JIT_KEY_TILE_ROWS
+    tile_count = storage_sequence_length // _JIT_KEY_TILE_ROWS
     scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
     tile_mask = (head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count)
     tl.store(key_scale_ptr + scale_offsets, key_scale, mask=tile_mask)
@@ -151,7 +154,7 @@ def _validate_inputs(
     *,
     norm_epsilon: float,
 ) -> tuple[int, int, int, int]:
-    return validate_qk_projection_inputs(
+    result = validate_qk_projection_inputs(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -160,9 +163,11 @@ def _validate_inputs(
         cos,
         sin,
         norm_epsilon=norm_epsilon,
-        block_rows=_KEY_TILE_ROWS,
         name="K",
     )
+    if result[1] < TILE_ROWS:
+        raise ValueError(f"K projection requires at least {TILE_ROWS} sequence rows")
+    return result
 
 
 def _launch_projection(  # noqa: PLR0913, PLR0917
@@ -179,7 +184,8 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
     key_min: torch.Tensor,
     *,
     batch: int,
-    sequence_length: int,
+    logical_sequence_length: int,
+    storage_sequence_length: int,
     heads: int,
     rotary_dim: int,
     norm_epsilon: float,
@@ -203,13 +209,14 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             key_scale,
             key_max,
             key_min,
-            batch * sequence_length,
-            sequence_length,
+            batch * logical_sequence_length,
+            logical_sequence_length,
+            storage_sequence_length,
             row_block_offset,
             input_features=input_qdata.shape[2],
             heads=heads,
             heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=_HEAD_DIM,
+            head_dim=HEAD_DIM,
             rotary_dim=rotary_dim,
             norm_epsilon=norm_epsilon,
             aligned_projection=(
@@ -224,10 +231,10 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             num_stages=3,
         )
 
-    full_row_blocks = sequence_length // _BLOCK_M
+    full_row_blocks = logical_sequence_length // _BLOCK_M
     if full_row_blocks:
         launch(full_row_blocks, 0, aligned_rows=True)
-    if sequence_length % _BLOCK_M:
+    if logical_sequence_length % _BLOCK_M:
         launch(1, full_row_blocks, aligned_rows=False)
 
 
@@ -251,17 +258,18 @@ def _launch_key_projection(
         sin,
         norm_epsilon=norm_epsilon,
     )
+    storage_sequence_length = padded_sequence_length(sequence_length)
     key = torch.empty(
-        (batch, heads, sequence_length, _HEAD_DIM),
+        (batch, heads, storage_sequence_length, HEAD_DIM),
         device=input_qdata.device,
         dtype=torch.int8,
     )
     key_scale = torch.empty(
-        (batch, heads, sequence_length // _KEY_TILE_ROWS),
+        (batch, heads, storage_sequence_length // TILE_ROWS),
         device=input_qdata.device,
         dtype=torch.float32,
     )
-    summary_shape = (batch, heads, sequence_length // _KEY_TILE_ROWS, _HEAD_DIM)
+    summary_shape = (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
     key_max = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
     key_min = torch.empty_like(key_max)
     _launch_projection(
@@ -277,7 +285,8 @@ def _launch_key_projection(
         key_max,
         key_min,
         batch=batch,
-        sequence_length=sequence_length,
+        logical_sequence_length=sequence_length,
+        storage_sequence_length=storage_sequence_length,
         heads=heads,
         rotary_dim=rotary_dim,
         norm_epsilon=norm_epsilon,
@@ -323,14 +332,15 @@ def _project_key_op_fake(
     _norm_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
-    heads = weight_qdata.shape[0] // _HEAD_DIM
-    key = input_qdata.new_empty((batch, heads, sequence_length, _HEAD_DIM))
+    storage_sequence_length = padded_sequence_length(sequence_length)
+    heads = weight_qdata.shape[0] // HEAD_DIM
+    key = input_qdata.new_empty((batch, heads, storage_sequence_length, HEAD_DIM))
     key_scale = input_qdata.new_empty(
-        (batch, heads, sequence_length // _KEY_TILE_ROWS),
+        (batch, heads, storage_sequence_length // TILE_ROWS),
         dtype=torch.float32,
     )
     summary = input_qdata.new_empty(
-        (batch, heads, sequence_length // _KEY_TILE_ROWS, _HEAD_DIM),
+        (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
         dtype=torch.float32,
     )
     return key, key_scale, summary, summary.new_empty(summary.shape)

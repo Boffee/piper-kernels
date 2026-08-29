@@ -8,13 +8,20 @@ from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import SparsePiperAttention
+from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
+    _sparse_piper_attention_from_quantized_op,
+)
 from piper_kernels.fusions.convrot_sparse_piper import (
     convrot_sparse_piper_compile_options,
 )
+from piper_kernels.fusions.convrot_sparse_piper import key as fused_key
+from piper_kernels.fusions.convrot_sparse_piper import query as fused_query
+from piper_kernels.fusions.convrot_sparse_piper import value as fused_value
 from piper_kernels.fusions.convrot_sparse_piper._compile import (
     compile_pass as fusion_compile_pass,
 )
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_compile_options
+from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_compile_pass
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
@@ -197,6 +204,56 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
         )
 
 
+def _run_explicit_fused_projection(
+    model: _DynamicSparseProjectionAttention,
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    sparse_key_blocks: int,
+) -> torch.Tensor:
+    input_qdata, input_scale = convrot_backend.prepare_input(
+        hidden_states,
+        model.query.weight.group_size,
+    )
+    query = fused_query._project_query_op(
+        input_qdata,
+        input_scale,
+        model.query.weight.qdata,
+        model.query.weight.scale,
+        model.query_norm,
+        cos,
+        sin,
+        1e-5,
+        model.head_dim**-0.5,
+    )
+    key = fused_key._project_key_op(
+        input_qdata,
+        input_scale,
+        model.key.weight.qdata,
+        model.key.weight.scale,
+        model.key_norm,
+        cos,
+        sin,
+        1e-5,
+    )
+    input_mean = convrot_backend.dequantized_input_mean(input_qdata, input_scale)
+    value = fused_value._project_value_op(
+        input_qdata,
+        input_scale,
+        input_mean,
+        model.value.weight.qdata,
+        model.value.weight.scale,
+    )
+    return _sparse_piper_attention_from_quantized_op(
+        *query,
+        *key,
+        *value,
+        list(model.sparse_attention._head_keep_ratio_units),
+        sparse_key_blocks,
+        hidden_states.shape[1],
+    )
+
+
 def test_compile_options_install_fusion_before_convrot() -> None:
     options = convrot_sparse_piper_compile_options({"max_autotune": True})
 
@@ -314,11 +371,6 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
     options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
-    materialized = torch.compile(
-        model,
-        dynamic=True,
-        fullgraph=True,
-    )
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -329,8 +381,10 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
     with torch.no_grad():
         cases = (
             (192, 2),
+            (193, 2),
             (256, 2),
             (256, 3),
+            (257, 3),
             (1024, 8),
             (1024, 9),
         )
@@ -350,7 +404,13 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
             ).mul_(2 * torch.pi)
             cos = angles.cos().contiguous()
             sin = angles.sin().contiguous()
-            expected = materialized(hidden_states, cos, sin, sparse_key_blocks)
+            expected = _run_explicit_fused_projection(
+                model,
+                hidden_states,
+                cos,
+                sin,
+                sparse_key_blocks,
+            )
             output = compiled(
                 hidden_states,
                 cos,
@@ -359,13 +419,7 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
             )
             assert output.shape == (model.batch, sequence, model.heads, model.head_dim)
             assert bool(torch.isfinite(output).all())
-            difference = output.float() - expected.float()
-            relative_l2 = difference.norm() / expected.float().norm()
-            assert relative_l2 < 0.025, (
-                sequence,
-                sparse_key_blocks,
-                relative_l2.item(),
-            )
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
     assert capture.calls == 1
     assert (

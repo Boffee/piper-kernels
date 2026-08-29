@@ -109,9 +109,11 @@ The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
 bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
 `sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
-plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. It fails
-closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention
-APIs remain independent.
+plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. Arbitrary
+logical sequence lengths are written directly into internally K64-padded attention storage; only
+the final projection tile is masked, and the result retains the exact logical length. It fails closed
+for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention APIs
+remain independent.
 
 Because no projected activation is externally observable in the fused region, projection,
 RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise
@@ -207,9 +209,10 @@ output = attention(
 )
 ```
 
-Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The sequence is K64 aligned,
-and every input row participates in attention. `sparse_key_blocks` is a runtime count of routeable
-K64 prefix tiles. Every query receives an exact
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout, and every logical input row
+participates in attention. The sequence length may be arbitrary; the operator pads only its internal
+quantized storage to K64. `sparse_key_blocks` is a runtime count of complete routeable K64 prefix
+tiles, so any partial final tile belongs to the dense suffix. Every query receives an exact
 FP32 DSA route over that prefix, then attends to every remaining K/V row in the same softmax. This
 makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their

@@ -10,7 +10,7 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
-    _sm120_sparse_piper_attention_from_quantized,
+    _sparse_piper_attention_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_sparse_piper import key, query, value
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
@@ -48,18 +48,18 @@ def _exact_sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
-def _operands() -> _Operands:
+def _operands(*, batch: int = _BATCH, sequence_length: int = _SEQUENCE) -> _Operands:
     torch.manual_seed(199)
     input_qdata = torch.randint(
         -127,
         128,
-        (_BATCH, _SEQUENCE, _INPUT_FEATURES),
+        (batch, sequence_length, _INPUT_FEATURES),
         device="cuda",
         dtype=torch.int8,
     )
     input_scale = (
         torch.rand(
-            (_BATCH, _SEQUENCE),
+            (batch, sequence_length),
             device="cuda",
             dtype=torch.float32,
         )
@@ -91,7 +91,7 @@ def _operands() -> _Operands:
         for _ in range(2)
     )
     angles = torch.rand(
-        (_SEQUENCE, _ROTARY_DIM),
+        (sequence_length, _ROTARY_DIM),
         device="cuda",
         dtype=torch.float32,
     ).mul_(2 * torch.pi)
@@ -149,13 +149,17 @@ def _run_sparse_piper_attention_from_quantized(
     prepared_key: _QuantizedKeyOperands,
     prepared_value: _QuantizedValueOperands,
     attention: SparsePiperAttention,
+    *,
+    logical_sequence_length: int,
+    sparse_key_blocks: int,
 ) -> torch.Tensor:
-    return _sm120_sparse_piper_attention_from_quantized(
+    return _sparse_piper_attention_from_quantized_op(
         *prepared_query,
         *prepared_key,
         *prepared_value,
         list(attention._head_keep_ratio_units),
-        _SPARSE_KEY_BLOCKS,
+        sparse_key_blocks,
+        logical_sequence_length,
     )
 
 
@@ -165,6 +169,8 @@ def _materialize_qk(
     weight_scale: torch.Tensor,
     norm: torch.Tensor,
 ) -> torch.Tensor:
+    batch, sequence_length, _input_features = operands.input_qdata.shape
+    heads = weight.shape[0] // _HEAD_DIM
     projected = convrot_backend.linear_prepared(
         operands.input_qdata,
         operands.input_scale,
@@ -172,15 +178,28 @@ def _materialize_qk(
         weight_scale,
         None,
         torch.bfloat16,
-    ).view(_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
+    ).view(batch, sequence_length, heads, _HEAD_DIM)
     normalized = F.rms_norm(projected, (_HEAD_DIM,), norm, 1e-5)
-    rotary = normalized[..., :_ROTARY_DIM]
+    rotary_dim = operands.cos.shape[1]
+    rotary = normalized[..., :rotary_dim]
     first, second = rotary.chunk(2, dim=-1)
     rotated = torch.cat((-second, first), dim=-1)
     cos = operands.cos.to(torch.bfloat16)[None, :, None, :]
     sin = operands.sin.to(torch.bfloat16)[None, :, None, :]
     rotary = rotary * cos + rotated * sin
-    return torch.cat((rotary, normalized[..., _ROTARY_DIM:]), dim=-1).contiguous()
+    return torch.cat((rotary, normalized[..., rotary_dim:]), dim=-1).contiguous()
+
+
+def _materialize_value(operands: _Operands) -> torch.Tensor:
+    batch, sequence_length, _input_features = operands.input_qdata.shape
+    return convrot_backend.linear_prepared(
+        operands.input_qdata,
+        operands.input_scale,
+        operands.value_weight,
+        operands.value_weight_scale,
+        None,
+        torch.bfloat16,
+    ).view(batch, sequence_length, _HEADS, _HEAD_DIM)
 
 
 @pytest.mark.gpu
@@ -191,7 +210,14 @@ def test_quantized_sparse_piper_writes_engine_layout() -> None:
     attention = SparsePiperAttention((0.5, 1.0))
 
     with torch.no_grad():
-        output = _run_sparse_piper_attention_from_quantized(query, key, value, attention)
+        output = _run_sparse_piper_attention_from_quantized(
+            query,
+            key,
+            value,
+            attention,
+            logical_sequence_length=_SEQUENCE,
+            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+        )
 
     assert output.shape == (_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
     assert output.dtype is torch.bfloat16
@@ -216,14 +242,7 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
         operands.key_weight_scale,
         operands.key_norm,
     )
-    materialized_value = convrot_backend.linear_prepared(
-        operands.input_qdata,
-        operands.input_scale,
-        operands.value_weight,
-        operands.value_weight_scale,
-        None,
-        torch.bfloat16,
-    ).view(_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
+    materialized_value = _materialize_value(operands)
     attention = SparsePiperAttention((1.0, 1.0))
 
     with torch.no_grad():
@@ -233,8 +252,73 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
             materialized_value,
             sparse_key_blocks=_SPARSE_KEY_BLOCKS,
         )
-        actual = _run_sparse_piper_attention_from_quantized(query, key, value, attention)
+        actual = _run_sparse_piper_attention_from_quantized(
+            query,
+            key,
+            value,
+            attention,
+            logical_sequence_length=_SEQUENCE,
+            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+        )
 
+    difference = actual.float() - expected.float()
+    relative_l2 = difference.norm() / expected.float().norm()
+    assert relative_l2 < 0.025
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(
+    ("batch", "sequence_length"),
+    [(1, 65), (1, 127), (2, 129), (1, 193)],
+)
+def test_ragged_fused_projection_matches_materialized_attention(
+    batch: int,
+    sequence_length: int,
+) -> None:
+    operands = _operands(batch=batch, sequence_length=sequence_length)
+    prepared_query, prepared_key, prepared_value = _prepare(operands)
+    assert not torch.count_nonzero(prepared_query[0][:, :, sequence_length:])
+    assert not torch.count_nonzero(prepared_key[0][:, :, sequence_length:])
+    assert not torch.count_nonzero(prepared_value[0][..., sequence_length:])
+    assert all(
+        bool(torch.isfinite(metadata).all())
+        for metadata in (*prepared_query[1:], *prepared_key[1:], *prepared_value[1:])
+    )
+
+    materialized_query = _materialize_qk(
+        operands,
+        operands.query_weight,
+        operands.query_weight_scale,
+        operands.query_norm,
+    )
+    materialized_key = _materialize_qk(
+        operands,
+        operands.key_weight,
+        operands.key_weight_scale,
+        operands.key_norm,
+    )
+    materialized_value = _materialize_value(operands)
+
+    sparse_key_blocks = sequence_length // 64
+    attention = SparsePiperAttention((1.0, 1.0))
+    with torch.no_grad():
+        expected = attention(
+            materialized_query,
+            materialized_key,
+            materialized_value,
+            sparse_key_blocks=sparse_key_blocks,
+        )
+        actual = _run_sparse_piper_attention_from_quantized(
+            prepared_query,
+            prepared_key,
+            prepared_value,
+            attention,
+            logical_sequence_length=sequence_length,
+            sparse_key_blocks=sparse_key_blocks,
+        )
+
+    assert actual.shape == (batch, sequence_length, _HEADS, _HEAD_DIM)
     difference = actual.float() - expected.float()
     relative_l2 = difference.norm() / expected.float().norm()
     assert relative_l2 < 0.025
@@ -262,7 +346,14 @@ def test_full_fused_sparse_piper_pipeline_compiles_as_one_graph() -> None:
             operands.sin,
         )
         query, key, value = _prepare(dynamic_operands)
-        return _run_sparse_piper_attention_from_quantized(query, key, value, attention)
+        return _run_sparse_piper_attention_from_quantized(
+            query,
+            key,
+            value,
+            attention,
+            logical_sequence_length=_SEQUENCE,
+            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+        )
 
     compiled = torch.compile(run, fullgraph=True)
     with torch.no_grad():

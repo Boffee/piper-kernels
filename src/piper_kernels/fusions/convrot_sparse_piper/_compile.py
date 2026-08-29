@@ -31,14 +31,13 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
-from . import key, query, value
+from . import _layout, key, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v9"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v10"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
-_HEAD_DIM = 128
-_QUERY_BLOCK_ROWS = 64
-_QUERY_SCALE_ROWS = 32
-_KEY_BLOCK_ROWS = 64
+_HEAD_DIM = _layout.HEAD_DIM
+_TILE_ROWS = _layout.TILE_ROWS
+_QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
 _SLICE_END = torch.iinfo(torch.int64).max
 
 
@@ -48,6 +47,7 @@ def _source_files() -> tuple[str, ...]:
         file_name
         for file_name in (
             __file__,
+            _layout.__file__,
             convrot_sage_qk.__file__,
             query.__file__,
             key.__file__,
@@ -302,10 +302,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         or output_shape[2:] != (heads, _HEAD_DIM)
         or shape_heads != heads
         or shape_head_dim != _HEAD_DIM
-        or (
-            isinstance(sequence_length, int)
-            and (sequence_length < _QUERY_BLOCK_ROWS or sequence_length % _QUERY_BLOCK_ROWS)
-        )
+        or (isinstance(sequence_length, int) and sequence_length < _TILE_ROWS)
     ):
         return False
     target = AcceleratorTarget.from_device(input_value.device)
@@ -392,7 +389,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         or (
             static_sparse_key_blocks is not None
             and isinstance(sequence_length, int)
-            and static_sparse_key_blocks > sequence_length // _KEY_BLOCK_ROWS
+            and static_sparse_key_blocks > sequence_length // _TILE_ROWS
         )
     ):
         return False
@@ -439,7 +436,13 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     assert q_weight_value is not None
     heads = q_weight_value.shape[0] // _HEAD_DIM
     head_dim = _HEAD_DIM
+    storage_sequence_length = _layout.padded_sequence_length(sequence_length)
     with graph.inserting_before(original):
+        logical_sequence_length = graph.call_function(
+            torch.ops.aten.sym_size.int,
+            args=(sparse_input, 1),
+        )
+        logical_sequence_length.meta["val"] = sequence_length
         input_qdata, input_scale, _logical_dtype = _compile_fx.emit_prepared_input(
             graph,
             sparse_input,
@@ -449,15 +452,15 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
         )
         query_values = (
             input_value.new_empty(
-                (batch, heads, sequence_length, head_dim),
+                (batch, heads, storage_sequence_length, head_dim),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
-                (batch, heads, sequence_length // _QUERY_SCALE_ROWS),
+                (batch, heads, storage_sequence_length // _QUERY_SCALE_ROWS),
                 dtype=torch.float32,
             ),
             input_value.new_empty(
-                (batch, heads, sequence_length // _QUERY_BLOCK_ROWS, head_dim),
+                (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
                 dtype=torch.float32,
             ),
         )
@@ -479,19 +482,19 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
         )
         key_values = (
             input_value.new_empty(
-                (batch, heads, sequence_length, head_dim),
+                (batch, heads, storage_sequence_length, head_dim),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
-                (batch, heads, sequence_length // _KEY_BLOCK_ROWS),
+                (batch, heads, storage_sequence_length // _TILE_ROWS),
                 dtype=torch.float32,
             ),
             input_value.new_empty(
-                (batch, heads, sequence_length // _KEY_BLOCK_ROWS, head_dim),
+                (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
                 dtype=torch.float32,
             ),
             input_value.new_empty(
-                (batch, heads, sequence_length // _KEY_BLOCK_ROWS, head_dim),
+                (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
                 dtype=torch.float32,
             ),
         )
@@ -520,11 +523,11 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
         )
         value_values = (
             input_value.new_empty(
-                (batch, heads, head_dim, sequence_length),
+                (batch, heads, head_dim, storage_sequence_length),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
-                (batch, heads, sequence_length // _KEY_BLOCK_ROWS, 1),
+                (batch, heads, storage_sequence_length // _TILE_ROWS, 1),
                 dtype=torch.float32,
             ),
             input_value.new_empty((batch, heads, head_dim), dtype=torch.float32),
@@ -556,6 +559,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 value_mean,
                 sparse_head_keep_ratio_units,
                 sparse_key_blocks,
+                logical_sequence_length,
             ),
         )
     replacement.meta = original.meta.copy()

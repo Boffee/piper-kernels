@@ -20,12 +20,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   current sparse-prefix length resolve temporary per-head counts, offsets, and exact packed capacity
   inside each call. Unsupported devices use a portable quantized reference matching the SM120
   algorithm, while an exact-BF16 sparse oracle remains separate for quality measurement. Every
-  supplied row participates in attention; padding and masking policy remain Engine responsibilities,
-  alongside budget calibration, spatial packing, and model policy.
+  supplied row participates in attention. Arbitrary logical sequence lengths use internally padded
+  quantized storage and masked final Q/K64 tiles; public padding metadata is unnecessary. Budget
+  calibration, spatial packing, and model policy remain Engine responsibilities.
 - Added an inference-only compiled rewrite for compatible H3-style ConvRot Q/K/V projections,
   D128 RMSNorm, split-half RoPE, and `sparse_piper_attention` on exact SM120. It shares input
   preparation, emits quantized Q/K/V plus DSA summaries directly, and avoids materializing
-  the three BF16 projection outputs. Reusable projection, RMSNorm, RoPE, and Sage-style Q/K
+  the three BF16 projection outputs. Ragged sequences project directly from logical rows into
+  K64-padded attention storage; masked tail reductions exclude padding without Engine-visible
+  masks or copies. Reusable projection, RMSNorm, RoPE, and Sage-style Q/K
   quantization primitives live under `piper_kernels.fusions.convrot_sage_qk`; the explicit
   `piper_kernels.fusions.convrot_sparse_piper` integration adds sparse DSA summaries and V
   preparation, and installs its pass before the independent ConvRot compiler pass. Unsupported
