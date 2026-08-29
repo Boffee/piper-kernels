@@ -31,9 +31,9 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
-from . import _layout, key, query, value
+from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v10"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v11"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
@@ -48,9 +48,11 @@ def _source_files() -> tuple[str, ...]:
         for file_name in (
             __file__,
             _layout.__file__,
+            _output_compile.__file__,
             convrot_sage_qk.__file__,
             query.__file__,
             key.__file__,
+            output.__file__,
             value.__file__,
             _budget.__file__,
             _quantized_dispatch.__file__,
@@ -591,6 +593,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
             _fold_sparse_piper_projection(graph)
+            _output_compile._fold_attention_output(graph)
 
     def uuid(self) -> bytes:
         return get_hash_for_files(

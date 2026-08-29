@@ -250,6 +250,7 @@ def _native_tile_start(
 @gluon.jit(
     do_not_specialize=[
         "logical_sequence_length",
+        "query_block_offset",
         "sparse_key_blocks",
         "stride_rb",
         "stride_rq",
@@ -267,6 +268,7 @@ def _sparse_piper_attention_kernel(
     keep_blocks_ptr,
     route_head_offsets_ptr,
     output_ptr,
+    query_block_offset,
     storage_sequence_length,
     logical_sequence_length,
     sparse_key_blocks,
@@ -277,15 +279,21 @@ def _sparse_piper_attention_kernel(
     stride_oh,
     stride_on,
     heads,
+    has_query_block_offset: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
     kernel_warps: gl.constexpr,
 ):
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
-    query_block = gl.program_id(0)
+    local_query_block = gl.program_id(0)
+    if has_query_block_offset:
+        query_block = query_block_offset + local_query_block
+    else:
+        query_block = local_query_block
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
     start_m = query_block * _GL_BLOCK_M
+    output_start_m = local_query_block * _GL_BLOCK_M
     route_head_offset = gl.load(route_head_offsets_ptr + head)
     route_base = (
         routes_ptr + batch * stride_rb + query_block * stride_rq + route_head_offset * stride_rr
@@ -517,7 +525,7 @@ def _sparse_piper_attention_kernel(
     output_offsets = (
         batch * stride_ob
         + head * stride_oh
-        + (start_m + offsets_m[:, None]) * stride_on
+        + (output_start_m + offsets_m[:, None]) * stride_on
         + offsets_d[None, :]
     )
     if mask_ragged_tail:
@@ -580,9 +588,14 @@ def _make_gluon_descriptors(
 
 def _launch_sparse_piper_attention(
     prepared: _PreparedSparsePiperAttention,
+    output: torch.Tensor,
+    *,
+    query_block_offset: int = 0,
+    query_block_count: int | None = None,
 ) -> None:
-    """Launch paired K128 while retaining logical K64 routes and tile scales."""
-    batch, heads, logical_sequence_length, head_dim = prepared.output.shape
+    """Launch one caller-owned query-block range over the complete K/V sequence."""
+    batch, heads, _, head_dim = prepared.query.shape
+    logical_sequence_length = prepared.logical_sequence_length
     storage_sequence_length = prepared.query.shape[2]
     if (
         head_dim != _HEAD_DIM
@@ -591,6 +604,34 @@ def _launch_sparse_piper_attention(
         != storage_sequence_length
     ):
         raise ValueError("paired Gluon routed Piper requires padded M64/D128 query storage")
+    total_query_blocks = storage_sequence_length // _BLOCK_M
+    if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
+        raise TypeError("sparse Piper query block offset must be an integer")
+    if query_block_count is not None and (
+        isinstance(query_block_count, bool) or not isinstance(query_block_count, int)
+    ):
+        raise TypeError("sparse Piper query block count must be an integer or None")
+    if not 0 <= query_block_offset < total_query_blocks:
+        raise ValueError("sparse Piper query block offset must fit the logical sequence")
+    resolved_query_block_count = (
+        total_query_blocks - query_block_offset if query_block_count is None else query_block_count
+    )
+    if (
+        resolved_query_block_count < 1
+        or query_block_offset + resolved_query_block_count > total_query_blocks
+    ):
+        raise ValueError("sparse Piper query block range must fit the logical sequence")
+    output_sequence_length = min(
+        resolved_query_block_count * _BLOCK_M,
+        logical_sequence_length - query_block_offset * _BLOCK_M,
+    )
+    if (
+        output.shape != (batch, heads, output_sequence_length, head_dim)
+        or output.dtype is not torch.bfloat16
+        or output.device != prepared.query.device
+        or output.stride(-1) != 1
+    ):
+        raise ValueError("paired Gluon routed Piper output must match the query block range")
     if prepared.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
     with torch.cuda.device(prepared.query.device):
@@ -602,7 +643,7 @@ def _launch_sparse_piper_attention(
     stride_rb = routes.stride(0)
     stride_rq = routes.stride(1)
     stride_rr = routes.stride(2)
-    _sparse_piper_attention_kernel[(storage_sequence_length // _BLOCK_M, heads, batch)](
+    _sparse_piper_attention_kernel[(resolved_query_block_count, heads, batch)](
         query_desc,
         key_desc,
         value_desc,
@@ -613,17 +654,19 @@ def _launch_sparse_piper_attention(
         routes,
         prepared.keep_blocks,
         route_head_offsets,
-        prepared.output,
+        output,
+        query_block_offset,
         storage_sequence_length,
         logical_sequence_length,
         prepared.sparse_key_blocks,
         stride_rb,
         stride_rq,
         stride_rr,
-        prepared.output.stride(0),
-        prepared.output.stride(1),
-        prepared.output.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         heads,
+        query_block_offset != 0,
         logical_sequence_length != storage_sequence_length,
         4,
         num_warps=4,

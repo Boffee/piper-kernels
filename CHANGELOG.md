@@ -34,6 +34,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   preparation, and installs its pass before the independent ConvRot compiler pass. Unsupported
   graphs remain on the ordinary public operators. Fused projection, RMSNorm, and RoPE remain
   FP32 through the final INT8 encoding instead of reproducing unobservable BF16 round trips.
+- Added a bounded-workspace compiler rewrite for compatible quantized sparse-Piper attention
+  followed by a ConvRot output projection on exact SM120. It pipelines 4,096-row query chunks
+  through two BF16 attention buffers and one reusable INT8 preparation workspace, writes each
+  projection directly into its final output slice, and uses a single-stream fast path when the
+  query fits one chunk. Unsupported or shared attention outputs remain on the ordinary operators.
 
 ## [0.3.0] - 2026-08-17
 

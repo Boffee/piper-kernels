@@ -193,9 +193,8 @@ def _run_sparse_piper_attention(
         route_head_offsets=routes.head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
-        attention_output=output.transpose(1, 2),
     )
-    _launch_sm120_attention(prepared)
+    _launch_sm120_attention(prepared, output.transpose(1, 2))
     return output
 
 

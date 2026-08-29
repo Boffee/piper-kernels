@@ -86,8 +86,12 @@ import sys
 from piper_kernels.fusions import convrot_sparse_piper
 
 assert "piper_kernels.fusions.convrot_sparse_piper._compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_sparse_piper._output_compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_sparse_piper.output" not in sys.modules
 convrot_sparse_piper.convrot_sparse_piper_compile_options()
 assert "piper_kernels.fusions.convrot_sparse_piper._compile" in sys.modules
+assert "piper_kernels.fusions.convrot_sparse_piper._output_compile" in sys.modules
+assert "piper_kernels.fusions.convrot_sparse_piper.output" in sys.modules
 assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)
