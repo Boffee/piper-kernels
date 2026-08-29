@@ -11,15 +11,16 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
 
 try:
-    from .dsa_triton import block_summaries as _sm120_block_summaries
+    from .dsa_triton import sequence_block_summaries as _sm120_sequence_block_summaries
     from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
         raise
-    _sm120_block_summaries = None
+    _sm120_sequence_block_summaries = None
     _sm120_select_routes = None
 
 _QUERY_CHUNK_BLOCKS = 384
+_BLOCK_ROWS = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,26 +30,6 @@ class PackedDsaRoutes:
     indices: torch.Tensor
     head_offsets: torch.Tensor
     keep_blocks: torch.Tensor
-
-
-def packed_dsa_routes_from_layout(
-    query_blocks: torch.Tensor,
-    key_blocks: torch.Tensor,
-    layout: _ResolvedRouteLayout,
-) -> PackedDsaRoutes:
-    """Select exact FP32 DSA routes directly into packed UINT16 storage."""
-    _validate_dsa_blocks(query_blocks, key_blocks)
-    heads = query_blocks.shape[1]
-    key_block_count = key_blocks.shape[2]
-    _validate_route_layout(layout, heads, key_block_count, query_blocks.device)
-
-    query_summary, key_max, key_min = _block_summaries(query_blocks, key_blocks)
-    return packed_dsa_routes_from_summaries(
-        query_summary,
-        key_max,
-        key_min,
-        layout,
-    )
 
 
 def packed_dsa_routes_from_summaries(
@@ -86,6 +67,17 @@ def packed_dsa_routes_from_summaries(
     return PackedDsaRoutes(indices, layout.head_offsets, layout.keep_blocks)
 
 
+def packed_dsa_routes_from_sequences(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    layout: _ResolvedRouteLayout,
+) -> PackedDsaRoutes:
+    """Select routes for a ragged Q sequence and complete sparse-prefix K64 blocks."""
+    _validate_dsa_sequences(query, key)
+    query_summary, key_max, key_min = _sequence_block_summaries(query, key)
+    return packed_dsa_routes_from_summaries(query_summary, key_max, key_min, layout)
+
+
 def _validate_dsa_summaries(
     query_summary: torch.Tensor,
     key_max: torch.Tensor,
@@ -114,15 +106,20 @@ def _validate_dsa_summaries(
         raise ValueError("DSA key summaries must have contiguous block features")
 
 
-def _block_summaries(
-    query_blocks: torch.Tensor,
-    key_blocks: torch.Tensor,
+def _sequence_block_summaries(
+    query: torch.Tensor,
+    key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _supports_sm120_selector(query_blocks, key_blocks):
-        assert _sm120_block_summaries is not None
-
-        return _sm120_block_summaries(query_blocks, key_blocks)
-    return _portable_block_summaries(query_blocks, key_blocks)
+    if _supports_sm120_sequence_summaries(query, key):
+        assert _sm120_sequence_block_summaries is not None
+        return _sm120_sequence_block_summaries(query, key)
+    query_summaries = []
+    for start in range(0, query.shape[2], _BLOCK_ROWS):
+        block = query[:, :, start : start + _BLOCK_ROWS].float()
+        query_summaries.append(block.amax(dim=2) + block.amin(dim=2))
+    query_summary = torch.stack(query_summaries, dim=2)
+    key_blocks = key.unflatten(2, (key.shape[2] // _BLOCK_ROWS, _BLOCK_ROWS)).float()
+    return query_summary, key_blocks.amax(dim=3), key_blocks.amin(dim=3)
 
 
 def _dsa_scores(
@@ -165,54 +162,36 @@ def _select_portable_routes(
             output[:, start:stop, offsets[head] : offsets[head + 1]] = selected
 
 
-def _portable_block_summaries(
-    query_blocks: torch.Tensor,
-    key_blocks: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    query = query_blocks.float()
-    key = key_blocks.float()
-    query_max, query_min = query.amax(dim=-2), query.amin(dim=-2)
-    key_max, key_min = key.amax(dim=-2), key.amin(dim=-2)
-    return query_max + query_min, key_max, key_min
-
-
-def _supports_sm120_selector(query_blocks: torch.Tensor, key_blocks: torch.Tensor) -> bool:
-    target = AcceleratorTarget.from_device(query_blocks.device)
-    return (
-        _sm120_block_summaries is not None
-        and _sm120_select_routes is not None
-        and target.is_cuda_capability(12, 0)
-        and query_blocks.shape[-1] == 128
-        and key_blocks.shape[-1] == 128
-        and query_blocks.shape[-2] == 64
-        and key_blocks.shape[-2] == 64
-        and query_blocks.stride(-1) == 1
-        and key_blocks.stride(-1) == 1
-        and query_blocks.dtype in (torch.bfloat16, torch.float16)
-        and key_blocks.dtype == query_blocks.dtype
-    )
-
-
 def _supports_sm120_summary_selector(query_summary: torch.Tensor) -> bool:
     target = AcceleratorTarget.from_device(query_summary.device)
     return _sm120_select_routes is not None and target.is_cuda_capability(12, 0)
 
 
-def _validate_dsa_blocks(query_blocks: torch.Tensor, key_blocks: torch.Tensor) -> None:
-    if query_blocks.ndim != 5 or key_blocks.ndim != 5:
-        raise ValueError("DSA query and key blocks must be rank-five tensors")
-    if query_blocks.shape[:2] != key_blocks.shape[:2]:
-        raise ValueError("DSA query and key batch/head dimensions must match")
-    if query_blocks.shape[-1] != key_blocks.shape[-1]:
-        raise ValueError("DSA query and key feature dimensions must match")
-    if query_blocks.shape[2] < 1 or key_blocks.shape[2] < 1:
-        raise ValueError("DSA requires nonempty query and key block dimensions")
-    if query_blocks.shape[-2] < 1 or key_blocks.shape[-2] < 1:
-        raise ValueError("DSA blocks must contain at least one row")
-    if query_blocks.device != key_blocks.device:
-        raise ValueError("DSA query and key blocks must share a device")
-    if not query_blocks.is_floating_point() or not key_blocks.is_floating_point():
-        raise TypeError("DSA query and key blocks must be floating-point tensors")
+def _supports_sm120_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> bool:
+    target = AcceleratorTarget.from_device(query.device)
+    return (
+        _sm120_sequence_block_summaries is not None
+        and target.is_cuda_capability(12, 0)
+        and query.shape[-1] == 128
+        and key.shape[-1] == 128
+        and query.stride(-1) == 1
+        and key.stride(-1) == 1
+        and query.dtype in (torch.bfloat16, torch.float16)
+        and key.dtype == query.dtype
+    )
+
+
+def _validate_dsa_sequences(query: torch.Tensor, key: torch.Tensor) -> None:
+    if query.ndim != 4 or key.ndim != 4:
+        raise ValueError("DSA query and key sequences must be rank-four tensors")
+    if query.shape[:2] != key.shape[:2] or query.shape[-1] != key.shape[-1]:
+        raise ValueError("DSA query and key batch/head/feature dimensions must match")
+    if query.shape[2] < 1 or key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS:
+        raise ValueError("DSA requires a nonempty query and complete sparse-prefix K64 blocks")
+    if query.device != key.device:
+        raise ValueError("DSA query and key sequences must share a device")
+    if not query.is_floating_point() or not key.is_floating_point():
+        raise TypeError("DSA query and key sequences must be floating-point tensors")
 
 
 def _validate_route_layout(

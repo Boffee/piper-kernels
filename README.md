@@ -207,9 +207,10 @@ output = attention(
 )
 ```
 
-Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. The sequence is K64 aligned,
-and every input row participates in attention. `sparse_key_blocks` is a runtime count of routeable
-K64 prefix tiles. Every query receives an exact
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout, and every logical input row
+participates in attention. The sequence length may be arbitrary; the operator pads only its internal
+quantized storage to K64. `sparse_key_blocks` is a runtime count of complete routeable K64 prefix
+tiles, so any partial final tile belongs to the dense suffix. Every query receives an exact
 FP32 DSA route over that prefix, then attends to every remaining K/V row in the same softmax. This
 makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their

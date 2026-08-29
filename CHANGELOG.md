@@ -20,8 +20,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   current sparse-prefix length resolve temporary per-head counts, offsets, and exact packed capacity
   inside each call. Unsupported devices use a portable quantized reference matching the SM120
   algorithm, while an exact-BF16 sparse oracle remains separate for quality measurement. Every
-  supplied row participates in attention; padding and masking policy remain Engine responsibilities,
-  alongside budget calibration, spatial packing, and model policy.
+  supplied row participates in attention. Arbitrary logical sequence lengths use internally padded
+  quantized storage and masked final Q/K64 tiles; public padding metadata is unnecessary. Budget
+  calibration, spatial packing, and model policy remain Engine responsibilities.
 - Added an inference-only compiled rewrite for compatible H3-style ConvRot Q/K/V projections,
   D128 RMSNorm, split-half RoPE, and `sparse_piper_attention` on exact SM120. It shares input
   preparation, emits quantized Q/K/V plus DSA summaries directly, and avoids materializing

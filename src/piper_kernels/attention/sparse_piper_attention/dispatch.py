@@ -15,15 +15,15 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
-from .dsa import packed_dsa_routes_from_layout
+from .dsa import packed_dsa_routes_from_sequences
 from .reference import reference_sparse_piper_attention
 
 try:
     from .gluon import (
-        _launch_gluon_paired_routed_piper_attention as _launch_sm120_attention,
+        _launch_sparse_piper_attention as _launch_sm120_attention,
     )
     from .triton import (
-        _prepare_folded_tile_scaled_routed_piper_attention as _prepare_sm120_attention,
+        _prepare_sparse_piper_attention as _prepare_sm120_attention,
     )
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
@@ -60,7 +60,12 @@ class SparsePiperAttention(torch.nn.Module):
         sparse_key_blocks: int,
         scale: float | None = None,
     ) -> torch.Tensor:
-        """Route every query over a sparse K/V prefix and dense suffix."""
+        """Route every logical query row over a complete-K64 prefix and dense suffix.
+
+        Q/K/V use unpadded BF16 ``[batch, sequence, heads, 128]`` storage. Any
+        final partial K64 tile is retained in the dense suffix; alignment
+        required by the optimized backend remains internal.
+        """
         converted_scale = _validate_inputs(
             query,
             key,
@@ -130,8 +135,8 @@ def _validate_inputs(
     _batch, sequence, heads, head_dim = query.shape
     if head_dim != 128:
         raise ValueError("sparse Piper requires head_dim=128")
-    if sequence < 64 or sequence % 64:
-        raise ValueError("sparse Piper requires a K64-aligned sequence")
+    if sequence < 64:
+        raise ValueError("sparse Piper requires at least 64 sequence rows")
     if len(head_keep_ratio_units) != heads:
         raise ValueError("sparse Piper ratio profile must contain one value per head")
     _validate_sparse_key_blocks(
@@ -155,20 +160,14 @@ def _run_sparse_piper_attention(
     target_is_sm120: bool,
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
-    _batch, sequence, _heads, _head_dim = query.shape
-    query_block_count = sequence // 64
     sparse_key_rows = sparse_key_blocks * 64
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
-    query_blocks = query_head_major.unflatten(2, (query_block_count, 64))
-    key_blocks = key_head_major[:, :, :sparse_key_rows].unflatten(
-        2,
-        (sparse_key_blocks, 64),
-    )
-    routes = packed_dsa_routes_from_layout(
-        query_blocks,
-        key_blocks,
+    sparse_key = key_head_major[:, :, :sparse_key_rows]
+    routes = packed_dsa_routes_from_sequences(
+        query_head_major,
+        sparse_key,
         layout,
     )
 
@@ -186,11 +185,11 @@ def _run_sparse_piper_attention(
     assert _prepare_sm120_attention is not None
     output = torch.empty_like(query, memory_format=torch.contiguous_format)
     prepared = _prepare_sm120_attention(
-        query_blocks,
-        key_blocks,
+        query_head_major,
         routes.indices,
         routes.keep_blocks,
         scale,
+        sparse_key_blocks=sparse_key_blocks,
         route_head_offsets=routes.head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,

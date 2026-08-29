@@ -7,9 +7,12 @@ import piper_kernels
 from piper_kernels import SparsePiperAttention
 
 
-def _inputs(device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _inputs(
+    device: str = "cpu",
+    sequence_length: int = 3 * 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(52)
-    shape = (1, 3 * 64, 2, 128)
+    shape = (1, sequence_length, 2, 128)
     query = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
     key = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
     value = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
@@ -79,6 +82,40 @@ def test_backend_accepts_sparse_prefix_length_changes_without_derived_state() ->
     assert one_block.shape == two_blocks.shape == query.shape
 
 
+@pytest.mark.parametrize("sequence_length", [64, 65, 127, 128, 129, 181, 191, 192, 193])
+def test_public_contract_accepts_ragged_logical_lengths(sequence_length: int) -> None:
+    query, key, value = _inputs(sequence_length=sequence_length)
+    attention = _attention((0.5, 1.0))
+
+    with torch.no_grad():
+        output = attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=sequence_length // 64,
+        )
+
+    assert output.shape == query.shape
+    assert output.is_contiguous()
+    assert torch.isfinite(output).all()
+
+
+def test_partial_dense_suffix_attends_only_valid_rows() -> None:
+    sequence_length = 65
+    shape = (1, sequence_length, 2, 128)
+    query = torch.zeros(shape, dtype=torch.bfloat16)
+    key = torch.zeros_like(query)
+    value = torch.ones_like(query)
+    value[:, -1] = 10
+    attention = _attention((1.0, 1.0))
+
+    with torch.no_grad():
+        output = attention(query, key, value, sparse_key_blocks=1)
+
+    expected = torch.full_like(output, (64 + 10) / sequence_length)
+    torch.testing.assert_close(output, expected, atol=0.015625, rtol=0)
+
+
 def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
     query, key, value = _inputs()
     attention = _attention((0.5, 0.5))
@@ -111,12 +148,13 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
 )
 def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None:
     query, key, value = (
-        tensor.transpose(1, 2).contiguous().transpose(1, 2) for tensor in _inputs("cuda")
+        tensor.transpose(1, 2).contiguous().transpose(1, 2)
+        for tensor in _inputs("cuda", sequence_length=193)
     )
     attention = _attention((0.5, 1.0))
 
     with torch.no_grad():
-        output = attention(query, key, value, sparse_key_blocks=2)
+        output = attention(query, key, value, sparse_key_blocks=3)
 
     assert not query.is_contiguous()
     assert output.is_contiguous()
@@ -128,12 +166,13 @@ def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_sm120_custom_op_passes_opcheck() -> None:
+@pytest.mark.parametrize("sequence_length", [192, 193])
+def test_sm120_custom_op_passes_opcheck(sequence_length: int) -> None:
     from piper_kernels.attention.sparse_piper_attention.dispatch import (  # noqa: PLC0415
         _sparse_piper_attention_op,
     )
 
-    query, key, value = _inputs("cuda")
+    query, key, value = _inputs("cuda", sequence_length)
     attention = _attention((0.5, 1.0))
     result = torch.library.opcheck(
         _sparse_piper_attention_op,
@@ -142,7 +181,7 @@ def test_sm120_custom_op_passes_opcheck() -> None:
             key,
             value,
             list(attention._head_keep_ratio_units),
-            2,
+            sequence_length // 64,
             128**-0.5,
         ),
     )
@@ -190,12 +229,44 @@ def test_sm120_matches_the_portable_quantized_reference(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
+@pytest.mark.parametrize("sequence_length", [64, 65, 127, 128, 129, 181, 191, 192, 193])
+def test_sm120_ragged_lengths_match_the_portable_reference(sequence_length: int) -> None:
+    query, key, value = _inputs(sequence_length=sequence_length)
+    attention = _attention((0.5, 1.0))
+    sparse_key_blocks = sequence_length // 64
+
+    with torch.no_grad():
+        expected = attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=sparse_key_blocks,
+        )
+        actual = attention(
+            query.cuda(),
+            key.cuda(),
+            value.cuda(),
+            sparse_key_blocks=sparse_key_blocks,
+        ).cpu()
+
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert actual.shape == query.shape
+    assert actual.is_contiguous()
+    assert torch.isfinite(actual).all()
+    assert relative_l2 < 0.015
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
 def test_operator_is_opaque_to_a_full_compile_graph() -> None:
-    query, key, value = _inputs("cuda")
+    query, key, value = _inputs("cuda", sequence_length=193)
     attention = _attention((0.5, 1.0))
 
     def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        return attention(query, key, value, sparse_key_blocks=2)
+        return attention(query, key, value, sparse_key_blocks=3)
 
     compiled = torch.compile(run, fullgraph=True)
     with torch.no_grad():

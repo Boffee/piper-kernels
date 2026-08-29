@@ -10,7 +10,7 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
-    _sm120_sparse_piper_attention_from_quantized,
+    _sparse_piper_attention_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_sparse_piper import key, query, value
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
@@ -150,7 +150,7 @@ def _run_sparse_piper_attention_from_quantized(
     prepared_value: _QuantizedValueOperands,
     attention: SparsePiperAttention,
 ) -> torch.Tensor:
-    return _sm120_sparse_piper_attention_from_quantized(
+    return _sparse_piper_attention_from_quantized_op(
         *prepared_query,
         *prepared_key,
         *prepared_value,
