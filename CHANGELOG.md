@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
 ### Added
 
 - Added inference-only `convrot_swiglu_ffn_compile_options` folding for compatible packed
@@ -231,7 +233,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Boffee/piper-kernels/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Boffee/piper-kernels/compare/v0.3.0rc1...v0.3.0
 [0.3.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.2.1...v0.3.0rc1
 [0.2.1]: https://github.com/Boffee/piper-kernels/compare/v0.2.0...v0.2.1
