@@ -2,7 +2,11 @@
 
 from dataclasses import asdict, dataclass
 
-_FUSED_MAX_BLOCK_SIZE = 16_384
+_FUSED_MAX_CHUNK_SIZE = 16_384
+_FUSED_MAX_CHUNK_COUNT = 3
+_ALWAYS_SINGLE_CHUNK_MAX_SIZE = 4_096
+_SINGLE_CHUNK_MAX_SIZE = 8_192
+_TWO_WARP_MAX_CHUNK_SIZE = 2_048
 _FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
 _QUANTIZATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
@@ -56,10 +60,35 @@ class LinearExecutionPlan:
         return asdict(self)
 
 
-def _select_fuse_rotation_quantization(*, in_features: int) -> bool:
-    """Select whether production fuses input rotation and quantization."""
+def select_fused_preparation_chunks(in_features: int) -> tuple[int, int] | None:
+    """Return ``(chunk_count, chunk_size)`` for fused input preparation.
+
+    Preserve the inexpensive single-chunk path for small rows. Above it, choose
+    the supported layout with the least padded work, preferring fewer chunks on
+    ties.
+    """
     block_size = _preparation_block_size(in_features)
-    return block_size <= _FUSED_MAX_BLOCK_SIZE
+    if block_size <= _ALWAYS_SINGLE_CHUNK_MAX_SIZE:
+        return 1, block_size
+
+    candidates: list[tuple[int, int]] = []
+    for chunk_count in range(1, _FUSED_MAX_CHUNK_COUNT + 1):
+        chunk_width = (in_features + chunk_count - 1) // chunk_count
+        chunk_size = _preparation_block_size(chunk_width)
+        if chunk_size > _FUSED_MAX_CHUNK_SIZE:
+            continue
+        if chunk_count == 1 and chunk_size > _SINGLE_CHUNK_MAX_SIZE:
+            continue
+        if chunk_size * (chunk_count - 1) >= in_features:
+            continue
+        candidates.append((chunk_count, chunk_size))
+
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda candidate: (candidate[0] * candidate[1], candidate[0]),
+    )
 
 
 def select_execution_plan(
@@ -67,13 +96,19 @@ def select_execution_plan(
     in_features: int,
 ) -> LinearExecutionPlan:
     """Select the production preparation and GEMM schedule for one linear."""
+    fused_chunks = select_fused_preparation_chunks(in_features)
+    fused_num_warps = 4
+    if fused_chunks is not None:
+        chunk_count, chunk_size = fused_chunks
+        if chunk_count > 1 and chunk_size <= _TWO_WARP_MAX_CHUNK_SIZE:
+            fused_num_warps = 2
+        elif chunk_size == _FUSED_MAX_CHUNK_SIZE:
+            fused_num_warps = 8
     return LinearExecutionPlan(
         # Prepared inputs may feed weights with different output widths.
         # Keep every preparation choice independent of output width.
-        fuse_rotation_quantization=_select_fuse_rotation_quantization(
-            in_features=in_features,
-        ),
-        fused_num_warps=4,
+        fuse_rotation_quantization=fused_chunks is not None,
+        fused_num_warps=fused_num_warps,
         rotation_num_warps=_DEFAULT_ROTATION_NUM_WARPS,
         quantization_num_warps=_DEFAULT_QUANTIZATION_NUM_WARPS,
         matmul_block_m=128,

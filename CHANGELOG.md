@@ -5,6 +5,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Extended ConvRot INT8 fused input preparation to one, two, or three equal power-of-two chunks,
+  covering rows through 49,152 features while keeping rotation, activation, and quantization in
+  one launch without a global-memory intermediate. Production policy selects the least-padded
+  supported layout and retains the split fallback above that bound.
+
 ## [0.4.1] - 2026-08-29
 
 ### Changed
