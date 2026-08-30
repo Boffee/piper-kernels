@@ -14,9 +14,11 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
+    triton as qk_quantization,
+)
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
-    quantize_query_tile,
     validate_qk_projection_inputs,
 )
 
@@ -96,6 +98,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         rotary_dim,
         norm_epsilon,
         aligned_projection,
+        mask_ragged_tail,
         block_m,
         block_n,
         block_k,
@@ -127,7 +130,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     if mask_ragged_tail:
         group_starts = query_block * block_m + group_offsets * _JIT_QUERY_SCALE_ROWS
         group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
-    quantized, stored_scale = quantize_query_tile(
+    quantized, stored_scale = qk_quantization.quantize_query_tile(
         rope,
         group_valid,
         softmax_scale,

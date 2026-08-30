@@ -14,14 +14,14 @@ import triton.language as tl
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
+from piper_kernels.attention.kernels.sparse_piper import (
+    triton as sparse_piper_kernels,
+)
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
 _BLOCK_M = 64
 _BLOCK_N = 64
 _HEAD_DIM = 128
-_P_UINT8_RANGE = tl.constexpr(255.0)
-_V_INT8_RANGE = tl.constexpr(127.0)
-_SCALE_EPSILON = tl.constexpr(1e-7)
 
 
 @triton.jit
@@ -60,14 +60,21 @@ def _quantize_value_per_tile_kernel(
         other=0.0,
     ).to(tl.float32)
     value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
-    centered = tl.where(valid_rows[:, None], value - value_mean[None, :], 0.0)
-    maximum = tl.max(tl.max(tl.abs(centered), axis=1), axis=0)
-    value_scale = maximum / _V_INT8_RANGE + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(centered / value_scale)
+    quantized, value_scale_multiplier = sparse_piper_kernels.quantize_value_tile(  # pyright: ignore[reportGeneralTypeIssues]
+        tl.reshape(value, (block_n, 1, head_dim)),
+        tl.reshape(value_mean, (1, head_dim)),
+        valid_rows,
+        1,
+        head_dim,
+        block_n,
+        block_n,
+    )
+    quantized = tl.reshape(quantized, (block_n, head_dim))
+    value_scale_multiplier = tl.reshape(value_scale_multiplier, ())
     tile_count = tl.cdiv(key_length, block_n)
     tl.store(
         value_scale_ptr + batch_head * tile_count + key_block,
-        value_scale * _P_UINT8_RANGE,
+        value_scale_multiplier,
     )
     tl.store(
         output_ptr

@@ -119,11 +119,13 @@ Because no projected activation is externally observable in the fused region, pr
 RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise
 redundant FP32-to-BF16-to-FP32 round trips without materializing FP32 activation tensors.
 
-The internal `piper_kernels.fusions.convrot_sage_qk` layer owns the reusable projection,
-RMSNorm, RoPE, signed-Hadamard, and Sage-style INT8 Q/K quantization device functions. Sparse
-Piper wraps those functions with its DSA-summary epilogues and keeps its tile-scaled V path
-separate. This boundary lets dense Piper and Sage consumers reuse the Q/K preparation without
-depending on sparse routing or sparse-Piper storage.
+The internal `piper_kernels.fusions.projected_qk` layer owns projection-independent RMSNorm and
+RoPE. The existing Sage Q/K quantization layer owns signed-Hadamard grouped Q/K encoding shared
+with dense Piper, while `piper_kernels.attention.kernels.sparse_piper` owns only sparse Piper's
+tile-scaled V encoding. `piper_kernels.fusions.convrot_sage_qk` adapts ConvRot projection tiles
+to those boundaries and owns ConvRot validation; the explicit sparse fusion adds DSA summaries,
+storage, and graph rewriting. Another projection backend can therefore compose the same pieces
+without depending on ConvRot internals or adding a backend protocol to attention.
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
 the result. It preserves the ConvRot tensor and quantized storage identities, allowing

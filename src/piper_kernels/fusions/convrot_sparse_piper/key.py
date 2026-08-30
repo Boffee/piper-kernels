@@ -12,9 +12,11 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
+    triton as qk_quantization,
+)
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
-    quantize_key_tile,
     validate_qk_projection_inputs,
 )
 
@@ -51,6 +53,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
     aligned_projection: tl.constexpr,
+    mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -85,6 +88,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         rotary_dim,
         norm_epsilon,
         aligned_projection,
+        mask_ragged_tail,
         block_m,
         block_n,
         block_k,
@@ -116,7 +120,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         axis=2,
     )
 
-    quantized, key_scale = quantize_key_tile(
+    quantized, key_scale = qk_quantization.quantize_key_tile(
         key,
         heads_per_program,
         head_dim,
@@ -224,6 +228,7 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
                 and input_qdata.shape[2] % _BLOCK_K == 0
                 and heads % _HEADS_PER_PROGRAM == 0
             ),
+            mask_ragged_tail=not aligned_rows,
             block_m=_BLOCK_M,
             block_n=_BLOCK_N,
             block_k=_BLOCK_K,

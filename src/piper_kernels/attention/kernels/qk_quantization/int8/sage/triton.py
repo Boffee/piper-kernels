@@ -94,6 +94,77 @@ def round_to_int8(values):
 
 
 @triton.jit
+def quantize_query_tile(
+    values,
+    group_valid,
+    softmax_scale: tl.constexpr,
+    heads_per_program: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    scale_rows: tl.constexpr,
+):
+    """Return grouped INT8 Q and base-2 recurrence scales for one tile."""
+    smoothed = rotate_signed_hadamard_heads(
+        tl.reshape(values, (block_m * heads_per_program, head_dim)),
+        head_dim,
+    )
+    smoothed = tl.permute(
+        tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
+        (1, 0, 2),
+    )
+    grouped = tl.reshape(
+        smoothed,
+        (
+            heads_per_program,
+            block_m // scale_rows,
+            scale_rows,
+            head_dim,
+        ),
+    )
+    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
+    raw_scale = maximum / 127.0 + _SCALE_EPSILON
+    quantized = round_to_int8(grouped / tl.where(group_valid, raw_scale, 1.0)[:, :, None, None])
+    stored_scale = tl.where(
+        group_valid,
+        raw_scale * (softmax_scale * _LOG2_E),
+        0.0,
+    )
+    return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), stored_scale
+
+
+@triton.jit
+def quantize_key_tile(
+    values,
+    heads_per_program: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    scale_rows: tl.constexpr,
+):
+    """Encode one tile of values after any caller-required K centering."""
+    smoothed = rotate_signed_hadamard_heads(
+        tl.reshape(values, (block_m * heads_per_program, head_dim)),
+        head_dim,
+    )
+    smoothed = tl.permute(
+        tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
+        (1, 0, 2),
+    )
+    grouped = tl.reshape(
+        smoothed,
+        (
+            heads_per_program,
+            block_m // scale_rows,
+            scale_rows,
+            head_dim,
+        ),
+    )
+    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
+    key_scale = maximum / 127.0 + _SCALE_EPSILON
+    quantized = round_to_int8(grouped / key_scale[:, :, None, None])
+    return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), key_scale
+
+
+@triton.jit
 def quantize_query_per_thread_group(
     query_ptr,
     output_ptr,
