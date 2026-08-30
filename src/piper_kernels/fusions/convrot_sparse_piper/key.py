@@ -88,7 +88,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         block_m,
         block_n,
         block_k,
-    ).to(tl.float32)
+    )
     valid_rows = sequence_offsets < logical_sequence_length
     key = tl.where(valid_rows[:, None, None], key, 0.0)
     key_head_major = tl.permute(key, (1, 0, 2))
