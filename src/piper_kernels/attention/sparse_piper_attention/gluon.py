@@ -279,16 +279,12 @@ def _sparse_piper_attention_kernel(
     stride_oh,
     stride_on,
     heads,
-    has_query_block_offset: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
     kernel_warps: gl.constexpr,
 ):
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
     local_query_block = gl.program_id(0)
-    if has_query_block_offset:
-        query_block = query_block_offset + local_query_block
-    else:
-        query_block = local_query_block
+    query_block = query_block_offset + local_query_block
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
@@ -666,7 +662,6 @@ def _launch_sparse_piper_attention(
         output.stride(1),
         output.stride(2),
         heads,
-        query_block_offset != 0,
         logical_sequence_length != storage_sequence_length,
         4,
         num_warps=4,

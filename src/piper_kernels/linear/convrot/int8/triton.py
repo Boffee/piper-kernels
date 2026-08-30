@@ -406,7 +406,6 @@ def _int8_matmul_kernel(
     m,
     n,
     k,
-    row_block_count,
     row_block_offset,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -418,6 +417,7 @@ def _int8_matmul_kernel(
     if group_m:
         pid = tl.program_id(0)
         num_pid_n = tl.cdiv(n, block_n)
+        row_block_count = tl.num_programs(0) // num_pid_n
         num_pid_in_group = group_m * num_pid_n
         group_id = pid // num_pid_in_group
         pid_in_group = pid % num_pid_in_group
@@ -701,7 +701,6 @@ def _execute_prepared_linear(
             m,
             n,
             k,
-            row_block_count,
             row_block_offset,
             block_m=plan.matmul_block_m,
             block_n=plan.matmul_block_n,

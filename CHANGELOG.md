@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Reduced cold compilation for chunked sparse-Piper attention and ConvRot projections by sharing
+  one Gluon attention specialization across query-block offsets and deriving grouped matmul row
+  counts from the launch grid.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added
