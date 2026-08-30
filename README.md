@@ -83,10 +83,10 @@ always has shape `[..., out_features]`.
 `activation_fn="swiglu"` computes `up * silu(gate)` from `[up | gate]`. Portable paths use
 PyTorch operations; optimized NVIDIA preparation uses shared Triton activation primitives and
 native approximate tanh, so GELU preparation may differ from the portable path by one INT8 code
-rather than being bitwise identical. Optimized Triton configurations whose power-of-two
-preparation extent is at most 16,384 absorb these activations into input preparation across every
+rather than being bitwise identical. Optimized Triton preparation uses up to three equal
+power-of-two chunks of at most 16,384 columns, fusing rows through 49,152 columns across every
 supported ConvRot group size, logical dtype, row count, and accelerator target. This selection is
-measured on exact SM120 and optimistic on other targets. Larger extents materialize the activation
+measured on exact SM120 and optimistic on other targets. Larger rows materialize the activation
 and retain the same semantics. Both
 `F.linear` with a ConvRot INT8 weight and the explicit INT8 entry point are inference-only and
 reject autograd inputs.

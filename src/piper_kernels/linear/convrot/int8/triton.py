@@ -228,6 +228,80 @@ def _normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
 
 
 @triton.jit
+def _quantize_int8(values, scale, logical_dtype_code: tl.constexpr):
+    """Apply the shared deterministic rounding and saturation policy."""
+    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
+    return tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+
+
+@triton.jit
+def _load_activated_rotated_chunk(
+    x_ptr,
+    input_row_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    chunk_size: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+):
+    """Load, activate, and rotate one group-aligned slice of a row."""
+    offsets = chunk_start + chunk_offsets
+    mask = offsets < row_width
+    if activation_fn == "swiglu":
+        up = tl.load(
+            x_ptr + input_row_offset + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.load(
+            x_ptr + input_row_offset + row_width + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        values = swiglu(up, gate, logical_dtype_code)
+    else:
+        values = tl.load(
+            x_ptr + input_row_offset + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if activation_fn == "gelu_tanh":
+            values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
+
+    values = _rotate_hadamard_groups(values, chunk_size, group_size)
+    values *= inverse_sqrt_group
+    if logical_dtype_code == 1:
+        values = values.to(tl.float16)
+    elif logical_dtype_code == 2:
+        values = values.to(tl.bfloat16)
+    return values
+
+
+@triton.jit
+def _store_quantized_chunk(
+    q_ptr,
+    output_row_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    values,
+    scale,
+    logical_dtype_code: tl.constexpr,
+):
+    offsets = chunk_start + chunk_offsets
+    quantized = _quantize_int8(values, scale, logical_dtype_code)
+    tl.store(
+        q_ptr + output_row_offset + offsets,
+        quantized,
+        mask=offsets < row_width,
+    )
+
+
+@triton.jit
 def rotate_groups_kernel(
     x_ptr,
     out_ptr,
@@ -255,53 +329,110 @@ def rotate_quantize_rows_kernel(
     q_ptr,
     scale_ptr,
     row_width,
-    block_size: tl.constexpr,
+    chunk_size: tl.constexpr,
+    chunk_count: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
-    """Rotate and quantize one complete row without a global-memory intermediate."""
+    """Rotate and quantize a row held as one, two, or three equal chunks.
+
+    Keep every rotated chunk live until the shared row scale is known, avoiding
+    both recomputation and a global-memory intermediate.
+    """
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
-    offsets = tl.arange(0, block_size)
-    mask = offsets < row_width
+    chunk_offsets = tl.arange(0, chunk_size)
     input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
     input_row_offset = row_i64 * input_row_width
     output_row_offset = row_i64 * row_width
 
-    if activation_fn == "swiglu":
-        up = tl.load(
-            x_ptr + input_row_offset + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        gate = tl.load(
-            x_ptr + input_row_offset + row_width + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        values = swiglu(up, gate, logical_dtype_code)
-    else:
-        values = tl.load(
-            x_ptr + input_row_offset + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        if activation_fn == "gelu_tanh":
-            values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
+    values0 = _load_activated_rotated_chunk(
+        x_ptr,
+        input_row_offset,
+        row_width,
+        0,
+        chunk_offsets,
+        chunk_size,
+        group_size,
+        inverse_sqrt_group,
+        logical_dtype_code,
+        activation_fn,
+        accelerator_backend,
+    )
+    row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
+    if chunk_count >= 2:
+        values1 = _load_activated_rotated_chunk(
+            x_ptr,
+            input_row_offset,
+            row_width,
+            chunk_size,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            logical_dtype_code,
+            activation_fn,
+            accelerator_backend,
+        )
+        row_max = tl.maximum(
+            row_max,
+            tl.max(tl.abs(values1).to(tl.float32), axis=0),
+        )
+    if chunk_count >= 3:
+        values2 = _load_activated_rotated_chunk(
+            x_ptr,
+            input_row_offset,
+            row_width,
+            2 * chunk_size,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            logical_dtype_code,
+            activation_fn,
+            accelerator_backend,
+        )
+        row_max = tl.maximum(
+            row_max,
+            tl.max(tl.abs(values2).to(tl.float32), axis=0),
+        )
 
-    values = _rotate_hadamard_groups(values, block_size, group_size)
-    values *= inverse_sqrt_group
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
-    scale = tl.maximum(tl.max(tl.abs(values).to(tl.float32), axis=0) / 127.0, 1e-30)
-    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
-    quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
-    tl.store(q_ptr + output_row_offset + offsets, quantized, mask=mask)
+    scale = tl.maximum(row_max / 127.0, 1e-30)
+    _store_quantized_chunk(
+        q_ptr,
+        output_row_offset,
+        row_width,
+        0,
+        chunk_offsets,
+        values0,
+        scale,
+        logical_dtype_code,
+    )
+    if chunk_count >= 2:
+        _store_quantized_chunk(
+            q_ptr,
+            output_row_offset,
+            row_width,
+            chunk_size,
+            chunk_offsets,
+            values1,
+            scale,
+            logical_dtype_code,
+        )
+    if chunk_count >= 3:
+        _store_quantized_chunk(
+            q_ptr,
+            output_row_offset,
+            row_width,
+            2 * chunk_size,
+            chunk_offsets,
+            values2,
+            scale,
+            logical_dtype_code,
+        )
     tl.store(scale_ptr + row_i64, scale)
 
 
@@ -321,8 +452,7 @@ def quantize_rows_kernel(
     row_offset = row_i64 * row_width
     values = tl.load(x_ptr + row_offset + offsets, mask=mask, other=0.0)
     scale = tl.maximum(tl.max(tl.abs(values), axis=0) / 127.0, 1e-30)
-    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
-    quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+    quantized = _quantize_int8(values, scale, logical_dtype_code)
     tl.store(q_ptr + row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
 
@@ -374,8 +504,7 @@ def _requantize_addmm_rows_kernel(
     elif logical_dtype_code == 2:
         values = values.to(tl.bfloat16)
     scale = tl.maximum(tl.max(tl.abs(values).to(tl.float32), axis=0) / 127.0, 1e-30)
-    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
-    quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+    quantized = _quantize_int8(values, scale, logical_dtype_code)
     if stochastic:
         stochastic_scaled = values.to(tl.float32) / scale
         logical_offsets = row_i64 * row_width + offsets_i64
@@ -543,14 +672,18 @@ def fused_rotate_quantize_input(
             f"fused preparation input must have shape {expected_input_shape}, "
             f"got {tuple(input.shape)}"
         )
+    fused_chunks = _policy.select_fused_preparation_chunks(k)
+    if fused_chunks is None:
+        raise ValueError(f"fused preparation does not support row width {k}")
+    chunk_count, chunk_size = fused_chunks
     target = AcceleratorTarget.from_device(input.device) if target is None else target
-    block_size = max(128, triton.next_power_of_2(k))
     rotate_quantize_rows_kernel[(m,)](
         input,
         input_qdata,
         input_scale,
         k,
-        block_size=block_size,
+        chunk_size=chunk_size,
+        chunk_count=chunk_count,
         group_size=group_size,
         inverse_sqrt_group=group_size**-0.5,
         logical_dtype_code=logical_dtype_code,

@@ -12,6 +12,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import triton as triton_backend
+from piper_kernels.linear.convrot.int8._policy import select_execution_plan
 from piper_kernels.linear.convrot.int8.reference import (
     addmm_,
     linear,
@@ -169,7 +170,10 @@ def test_factorized_h4_rotation_handles_rounding_boundary_values(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("in_features", [512, 5_376, 7_168, 14_336])
+@pytest.mark.parametrize(
+    "in_features",
+    [512, 5_376, 7_168, 9_728, 14_336, 16_640, 28_672, 40_960, 49_152],
+)
 @pytest.mark.parametrize(
     ("dtype", "dtype_code"),
     [(torch.float16, 1), (torch.bfloat16, 2)],
@@ -202,7 +206,7 @@ def test_fused_rotation_quantization_matches_split_path_exactly(
         actual_scale,
         256,
         dtype_code,
-        num_warps=4,
+        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
     )
 
     assert torch.equal(actual_qdata, expected_qdata)
@@ -211,7 +215,10 @@ def test_fused_rotation_quantization_matches_split_path_exactly(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("in_features", [512, 5_376, 7_168, 14_336])
+@pytest.mark.parametrize(
+    "in_features",
+    [512, 5_376, 9_728, 14_336, 16_640, 28_672, 40_960, 49_152],
+)
 @pytest.mark.parametrize(
     ("dtype", "dtype_code"),
     [(torch.float16, 1), (torch.bfloat16, 2)],
@@ -247,7 +254,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
         256,
         dtype_code,
         activation_fn="swiglu",
-        num_warps=4,
+        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -262,7 +269,10 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize("in_features", [512, 5_376, 14_336])
+@pytest.mark.parametrize(
+    "in_features",
+    [512, 5_376, 14_336, 16_640, 28_672, 40_960],
+)
 @pytest.mark.parametrize(
     ("dtype", "dtype_code"),
     [(torch.float16, 1), (torch.bfloat16, 2), (torch.float32, 0)],
@@ -297,7 +307,7 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
         256,
         dtype_code,
         activation_fn="gelu_tanh",
-        num_warps=4,
+        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -599,6 +609,23 @@ def test_fused_preparation_validates_input_width_from_qdata(
             16,
             triton_backend.dtype_code(activation.dtype),
             activation_fn=activation_fn,  # type: ignore[arg-type]
+            num_warps=4,
+        )
+
+
+def test_fused_preparation_rejects_unsupported_row_width() -> None:
+    rows, in_features = 2, 49_408
+    activation = torch.empty(rows, in_features)
+    input_qdata = torch.empty(rows, in_features, dtype=torch.int8)
+    input_scale = torch.empty(rows, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=f"does not support row width {in_features}"):
+        triton_backend.fused_rotate_quantize_input(
+            activation,
+            input_qdata,
+            input_scale,
+            256,
+            triton_backend.dtype_code(activation.dtype),
             num_warps=4,
         )
 
