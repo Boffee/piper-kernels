@@ -192,7 +192,7 @@ def _project_static_down_chunk(
     linear: _LinearOperands,
     rows: int,
     output: torch.Tensor,
-    global_scale: torch.Tensor,
+    global_scale: torch.Tensor | None,
 ) -> None:
     weight_per_tensor_scale = linear.weight_per_tensor_scale
     if weight_per_tensor_scale is not None:
@@ -209,6 +209,7 @@ def _project_static_down_chunk(
             output,
         )
         return
+    assert global_scale is not None
     projected = _project_chunk_out(
         input_qdata,
         input_scale,
@@ -294,17 +295,17 @@ def _run_chunked_swiglu_ffn(
         )
         down_activation_scale = down.activation_per_tensor_scale
         assert down_activation_scale is not None
-        down_global_scale = _projection_global_scale(
-            down_activation_scale,
-            down.weight_per_tensor_scale,
-        )
+        if gated_updates is not None or down.weight_per_tensor_scale is None:
+            down_global_scale = _projection_global_scale(
+                down_activation_scale,
+                down.weight_per_tensor_scale,
+            )
 
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         if fold_projection_epilogues:
             assert packed_workspace is not None
             assert up_global_scale is not None
-            assert down_global_scale is not None
             down_activation_scale = down.activation_per_tensor_scale
             assert down_activation_scale is not None
             packed = _project_chunk_out(
@@ -315,7 +316,7 @@ def _run_chunked_swiglu_ffn(
                 stop,
                 packed_workspace,
             )
-            down_qdata, down_scale, _ = nvfp4_backend.prepare_static_projected_swiglu(
+            down_qdata, down_scale = nvfp4_backend.prepare_static_projected_swiglu(
                 packed,
                 down_activation_scale,
                 up_global_scale,
@@ -335,6 +336,7 @@ def _run_chunked_swiglu_ffn(
                 assert projected_workspace is not None
                 assert base_2d is not None
                 assert gate_layout is not None
+                assert down_global_scale is not None
                 projected = _project_chunk_out(
                     down_qdata,
                     down_scale,

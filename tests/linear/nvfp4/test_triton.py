@@ -56,7 +56,11 @@ def test_static_projected_swiglu_matches_separate_epilogue(with_bias: bool) -> N
         else nvfp4_ops._compiled_scale_result_and_add_bias(raw, source_scale, source_bias)
     )
 
-    expected = nvfp4_ops._compiled_prepare_static(projected, activation_scale, "swiglu")
+    expected_qdata, expected_scale, _ = nvfp4_ops._compiled_prepare_static(
+        projected,
+        activation_scale,
+        "swiglu",
+    )
     actual = nvfp4_triton.prepare_static_projected_swiglu(
         raw,
         activation_scale,
@@ -64,7 +68,11 @@ def test_static_projected_swiglu_matches_separate_epilogue(with_bias: bool) -> N
         source_bias,
     )
 
-    for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+    for expected_tensor, actual_tensor in zip(
+        (expected_qdata, expected_scale),
+        actual,
+        strict=True,
+    ):
         assert torch.equal(actual_tensor, expected_tensor)
 
 

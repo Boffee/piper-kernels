@@ -171,14 +171,14 @@ def _projection_epilogue_kernel(
     tl.store(output_ptr + offsets, values, mask=valid)
 
 
-def _prepare_static(
+def _prepare_static_storage(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
     *,
     swiglu: bool,
     source_global_scale: torch.Tensor | None,
     source_bias: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     input_features = int(input.shape[-1])
     output_features = input_features // 2 if swiglu else input_features
     rows = int(input.numel() // input_features)
@@ -212,7 +212,7 @@ def _prepare_static(
         blocks_per_program=_PREPARE_BLOCKS,
         num_warps=2,
     )
-    return qdata, scale, per_tensor_scale.clone()
+    return qdata, scale
 
 
 def prepare_static(
@@ -221,13 +221,14 @@ def prepare_static(
     swiglu: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare a static-scale NVFP4 activation without intermediate tensors."""
-    return _prepare_static(
+    qdata, scale = _prepare_static_storage(
         input,
         per_tensor_scale,
         swiglu=swiglu,
         source_global_scale=None,
         source_bias=None,
     )
+    return qdata, scale, per_tensor_scale.clone()
 
 
 def prepare_static_projected_swiglu(
@@ -235,9 +236,9 @@ def prepare_static_projected_swiglu(
     per_tensor_scale: torch.Tensor,
     source_global_scale: torch.Tensor,
     source_bias: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply a raw projection's affine result and prepare its packed SwiGLU output."""
-    return _prepare_static(
+    return _prepare_static_storage(
         input,
         per_tensor_scale,
         swiglu=True,

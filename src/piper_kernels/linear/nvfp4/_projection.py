@@ -1,4 +1,4 @@
-"""Raw prepared-NVFP4 projection helpers for fused consumers."""
+"""Prepared-NVFP4 projection helpers for fused consumers."""
 
 # pyright: reportCallIssue=false
 

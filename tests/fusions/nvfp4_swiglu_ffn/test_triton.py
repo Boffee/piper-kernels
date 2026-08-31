@@ -8,7 +8,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_op,
 )
 
-from ._helpers import affine_materialized, dense_reference, make_operands, materialized
+from ._helpers import dense_reference, down_affine_reference, make_operands, materialized
 
 
 def _exact_sm120_available() -> bool:
@@ -20,14 +20,14 @@ def _exact_sm120_available() -> bool:
 @pytest.mark.parametrize("rows", [127, 128, 129, 385])
 @pytest.mark.parametrize("chunk_rows", [128, 256])
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
-def test_static_chunked_ffn_matches_affine_materialized(
+def test_static_chunked_ffn_matches_down_affine_reference(
     rows: int,
     chunk_rows: int,
     with_bias: bool,
 ) -> None:
     operands = make_operands(rows=rows, dynamic=False, with_bias=with_bias)
 
-    expected = affine_materialized(operands)
+    expected = down_affine_reference(operands)
     actual = _chunked_swiglu_ffn_op(*operands.arguments(chunk_rows))
 
     assert torch.equal(actual, expected)

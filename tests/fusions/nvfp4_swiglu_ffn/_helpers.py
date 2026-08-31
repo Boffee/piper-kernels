@@ -89,7 +89,7 @@ def materialized(operands: Operands) -> torch.Tensor:
     return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
 
 
-def affine_materialized(operands: Operands) -> torch.Tensor:
+def down_affine_reference(operands: Operands) -> torch.Tensor:
     """Run the materialized reference with the down affine in its FP32 accumulator."""
     packed = nvfp4_ops.linear(operands.input, *operands.up.arguments())
     input_qdata, input_scale, input_per_tensor_scale = nvfp4_ops.prepare_input(
@@ -174,8 +174,8 @@ def make_operands(
 __all__ = [
     "Linear",
     "Operands",
-    "affine_materialized",
     "dense_reference",
+    "down_affine_reference",
     "make_operands",
     "materialized",
 ]
