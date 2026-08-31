@@ -1,1 +1,1 @@
-"""Reusable ConvRot projection fusion for Sage-style INT8 Q/K operands."""
+"""ConvRot projection adapter for fused Q/K preparation."""

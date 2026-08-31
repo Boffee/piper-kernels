@@ -11,6 +11,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   covering rows through 49,152 features while keeping rotation, activation, and quantization in
   one launch without a global-memory intermediate. Production policy selects the least-padded
   supported layout and retains the split fallback above that bound.
+- Separated projection-independent RMSNorm and RoPE from the ConvRot adapter, moved grouped Q/K
+  tile encoding into the existing Sage quantization layer shared with dense Piper, and shared the
+  sparse-only V encoder with standalone sparse-Piper preparation. Future projection backends can
+  compose these pieces without coupling attention to their weight format.
 
 ## [0.4.1] - 2026-08-29
 

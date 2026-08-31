@@ -12,8 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
-    triton as qk_quantization,
+from piper_kernels.attention.kernels.sparse_piper import (
+    triton as sparse_piper_kernels,
 )
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
@@ -23,9 +23,6 @@ _BLOCK_M = 128
 _BLOCK_K = 128
 _HEADS_PER_PROGRAM = 2
 _BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
-_P_UINT8_RANGE = tl.constexpr(255.0)
-_V_INT8_RANGE = tl.constexpr(127.0)
-_SCALE_EPSILON = tl.constexpr(1e-7)
 _JIT_VALUE_TILE_ROWS = tl.constexpr(TILE_ROWS)
 
 
@@ -136,25 +133,15 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         other=0.0,
     )
     valid_rows = sequence_offsets < logical_sequence_length
-    centered = tl.where(
-        valid_rows[:, None, None],
-        projection - value_mean[None, :, :],
-        0.0,
+    quantized, value_scale_multiplier = sparse_piper_kernels.quantize_value_tile(
+        projection,
+        value_mean,
+        valid_rows,
+        heads_per_program,
+        head_dim,
+        block_m,
+        _JIT_VALUE_TILE_ROWS,
     )
-    centered = tl.permute(centered, (1, 0, 2))
-    grouped = tl.reshape(
-        centered,
-        (
-            heads_per_program,
-            block_m // _JIT_VALUE_TILE_ROWS,
-            _JIT_VALUE_TILE_ROWS,
-            head_dim,
-        ),
-    )
-    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
-    value_scale = maximum / _V_INT8_RANGE + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(grouped / value_scale[:, :, None, None])
-    quantized = tl.reshape(quantized, (heads_per_program, block_m, head_dim))
 
     value_offsets = (
         (batch * heads + head_offsets[:, None, None]) * head_dim * storage_sequence_length
@@ -174,7 +161,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
     tl.store(
         value_scale_ptr + scale_offsets,
-        value_scale * _P_UINT8_RANGE,
+        value_scale_multiplier,
         mask=(head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count),
     )
 

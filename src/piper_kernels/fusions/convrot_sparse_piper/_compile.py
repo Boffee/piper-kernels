@@ -21,12 +21,19 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
+    triton as qk_quantization,
+)
+from piper_kernels.attention.kernels.sparse_piper import (
+    triton as sparse_piper_kernels,
+)
 from piper_kernels.attention.sparse_piper_attention import (
     _budget,
     _quantized_dispatch,
     dispatch,
 )
 from piper_kernels.fusions.convrot_sage_qk import triton as convrot_sage_qk
+from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
@@ -49,7 +56,10 @@ def _source_files() -> tuple[str, ...]:
             __file__,
             _layout.__file__,
             _output_compile.__file__,
+            qk_quantization.__file__,
+            sparse_piper_kernels.__file__,
             convrot_sage_qk.__file__,
+            projected_qk.__file__,
             query.__file__,
             key.__file__,
             output.__file__,

@@ -14,9 +14,11 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
+    triton as qk_quantization,
+)
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
-    quantize_query_tile,
     validate_qk_projection_inputs,
 )
 
@@ -96,24 +98,24 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         rotary_dim,
         norm_epsilon,
         aligned_projection,
+        mask_ragged_tail,
         block_m,
         block_n,
         block_k,
     )
 
-    rope_fp32 = rope.to(tl.float32)
     if mask_ragged_tail:
         valid_rows = sequence_offsets < logical_sequence_length
-        rope_fp32 = tl.where(valid_rows[:, None, None], rope_fp32, 0.0)
+        rope = tl.where(valid_rows[:, None, None], rope, 0.0)
         query_summary = tl.max(
-            tl.where(valid_rows[:, None, None], rope_fp32, -float("inf")),
+            tl.where(valid_rows[:, None, None], rope, -float("inf")),
             axis=0,
         ) + tl.min(
-            tl.where(valid_rows[:, None, None], rope_fp32, float("inf")),
+            tl.where(valid_rows[:, None, None], rope, float("inf")),
             axis=0,
         )
     else:
-        query_summary = tl.max(rope_fp32, axis=0) + tl.min(rope_fp32, axis=0)
+        query_summary = tl.max(rope, axis=0) + tl.min(rope, axis=0)
     summary_offsets = (
         (batch * heads + head_offsets[:, None]) * (storage_sequence_length // block_m) + query_block
     ) * head_dim + feature_offsets[None, :]
@@ -128,8 +130,8 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     if mask_ragged_tail:
         group_starts = query_block * block_m + group_offsets * _JIT_QUERY_SCALE_ROWS
         group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
-    quantized, stored_scale = quantize_query_tile(
-        rope_fp32,
+    quantized, stored_scale = qk_quantization.quantize_query_tile(
+        rope,
         group_valid,
         softmax_scale,
         heads_per_program,

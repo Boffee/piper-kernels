@@ -1,4 +1,4 @@
-"""Reusable ConvRot projection and Sage-style INT8 Q/K fusion primitives."""
+"""ConvRot projection adapter for Sage-style Q/K fusion."""
 
 from __future__ import annotations
 
@@ -7,16 +7,11 @@ import math
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
-    triton as qk_quantization,
-)
+from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
 _HEAD_DIM = 128
-_LOG2_E = tl.constexpr(1.4426950408889634)
-_SCALE_EPSILON = tl.constexpr(1e-7)
 
 
 @triton.jit
@@ -40,12 +35,12 @@ def project_rmsnorm_rope_tile(
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
     aligned_projection: tl.constexpr,
+    mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
 ):
     """Return one FP32 normalized and rotated projection tile."""
-    feature_offsets = tl.arange(0, head_dim)
     projection = convrot_backend.scaled_int8_matmul(
         input_ptr,
         weight_ptr,
@@ -62,126 +57,20 @@ def project_rmsnorm_rope_tile(
         aligned_projection,
     )
     projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
-    inverse_rms = libdevice.rsqrt_rn(
-        tl.sum(projection * projection, axis=2) / head_dim + norm_epsilon
-    )
-    norm_weight = tl.load(norm_weight_ptr + feature_offsets).to(tl.float32)
-    normalized = projection * inverse_rms[:, :, None] * norm_weight[None, None, :]
-
-    half_rotary_dim: tl.constexpr = rotary_dim // 2
-    paired_features = tl.where(
-        feature_offsets < half_rotary_dim,
-        feature_offsets + half_rotary_dim,
-        tl.where(
-            feature_offsets < rotary_dim,
-            feature_offsets - half_rotary_dim,
-            feature_offsets,
-        ),
-    )
-    paired_indices = tl.broadcast_to(
-        paired_features[None, None, :],
-        (block_m, heads_per_program, head_dim),
-    )
-    paired = tl.gather(normalized, paired_indices, axis=2)
-    rotated = tl.where(feature_offsets[None, None, :] < half_rotary_dim, -paired, paired)
-    rotary_features = feature_offsets < rotary_dim
-    if aligned_projection:
-        rope_load_mask = rotary_features[None, None, :]
-    else:
-        # A partial Q64 tile or the unused half of a paired K128 tile has no
-        # logical RoPE storage to read.
-        rope_load_mask = (sequence_offsets[:, None, None] < sequence_length) & rotary_features[
-            None, None, :
-        ]
-    cos = tl.load(
-        cos_ptr + sequence_offsets[:, None, None] * rotary_dim + feature_offsets[None, None, :],
-        mask=rope_load_mask,
-        other=1.0,
-    )
-    sin = tl.load(
-        sin_ptr + sequence_offsets[:, None, None] * rotary_dim + feature_offsets[None, None, :],
-        mask=rope_load_mask,
-        other=0.0,
-    )
-    rotary = normalized * cos + rotated * sin
-    return tl.where(
-        rotary_features[None, None, :],
-        rotary,
-        normalized,
-    )
-
-
-@triton.jit
-def quantize_query_tile(
-    values,
-    group_valid,
-    softmax_scale: tl.constexpr,
-    heads_per_program: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_m: tl.constexpr,
-    scale_rows: tl.constexpr,
-):
-    """Return Sage-style INT8 Q and base-2 recurrence scales for one tile."""
-    smoothed = qk_quantization.rotate_signed_hadamard_heads(
-        tl.reshape(values, (block_m * heads_per_program, head_dim)),
+    return projected_qk.rmsnorm_rope_tile(
+        projection,
+        norm_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        sequence_offsets,
+        sequence_length,
+        heads_per_program,
         head_dim,
+        rotary_dim,
+        norm_epsilon,
+        mask_ragged_tail,
+        block_m,
     )
-    smoothed = tl.permute(
-        tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
-        (1, 0, 2),
-    )
-    grouped = tl.reshape(
-        smoothed,
-        (
-            heads_per_program,
-            block_m // scale_rows,
-            scale_rows,
-            head_dim,
-        ),
-    )
-    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
-    raw_scale = maximum / 127.0 + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(
-        grouped / tl.where(group_valid, raw_scale, 1.0)[:, :, None, None]
-    )
-    stored_scale = tl.where(
-        group_valid,
-        raw_scale * (softmax_scale * _LOG2_E),
-        0.0,
-    )
-    return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), stored_scale
-
-
-@triton.jit
-def quantize_key_tile(
-    values,
-    heads_per_program: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_m: tl.constexpr,
-    scale_rows: tl.constexpr,
-):
-    """Return Sage-style INT8 K and K-tile scales for one projection tile."""
-    smoothed = qk_quantization.rotate_signed_hadamard_heads(
-        tl.reshape(values, (block_m * heads_per_program, head_dim)),
-        head_dim,
-    )
-    smoothed = tl.permute(
-        tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
-        (1, 0, 2),
-    )
-    grouped = tl.reshape(
-        smoothed,
-        (
-            heads_per_program,
-            block_m // scale_rows,
-            scale_rows,
-            head_dim,
-        ),
-    )
-    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
-    key_scale = maximum / 127.0 + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(grouped / key_scale[:, :, None, None])
-    return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), key_scale
 
 
 def validate_qk_projection_inputs(  # noqa: PLR0912
