@@ -89,6 +89,34 @@ def materialized(operands: Operands) -> torch.Tensor:
     return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
 
 
+def affine_materialized(operands: Operands) -> torch.Tensor:
+    """Run the materialized reference with the down affine in its FP32 accumulator."""
+    packed = nvfp4_ops.linear(operands.input, *operands.up.arguments())
+    input_qdata, input_scale, input_per_tensor_scale = nvfp4_ops.prepare_input(
+        packed,
+        operands.down.activation_scale,
+        operands.down.dynamic,
+        "swiglu",
+    )
+    weight_per_tensor_scale = operands.down.weight.per_tensor_scale
+    assert weight_per_tensor_scale is not None
+    scaling_type = F.ScalingType
+    swizzle_type = F.SwizzleType
+    result = F.scaled_mm(
+        input_qdata.view(torch.float4_e2m1fn_x2),
+        operands.down.weight.qdata.t().view(torch.float4_e2m1fn_x2),
+        [input_scale.view(torch.float8_e4m3fn), input_per_tensor_scale],
+        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
+        [operands.down.weight.scale.view(torch.float8_e4m3fn), weight_per_tensor_scale],
+        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
+        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
+        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
+        bias=operands.down.bias,
+        output_dtype=operands.input.dtype,
+    )
+    return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
+
+
 def dense_reference(operands: Operands) -> torch.Tensor:
     packed = F.linear(operands.input, operands.dense_up, operands.up.bias)
     up, gate = packed.chunk(2, dim=-1)
@@ -143,4 +171,11 @@ def make_operands(
     return Operands(input, up, down, dense_up, dense_down)
 
 
-__all__ = ["Linear", "Operands", "dense_reference", "make_operands", "materialized"]
+__all__ = [
+    "Linear",
+    "Operands",
+    "affine_materialized",
+    "dense_reference",
+    "make_operands",
+    "materialized",
+]

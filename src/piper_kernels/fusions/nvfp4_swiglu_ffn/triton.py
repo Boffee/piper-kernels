@@ -185,6 +185,46 @@ def _projection_global_scale(
     return input_per_tensor_scale * weight_per_tensor_scale
 
 
+def _project_static_down_chunk(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    input_per_tensor_scale: torch.Tensor,
+    linear: _LinearOperands,
+    rows: int,
+    output: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> None:
+    weight_per_tensor_scale = linear.weight_per_tensor_scale
+    if weight_per_tensor_scale is not None:
+        nvfp4_projection.matmul_prepared_chunk_affine_out(
+            input_qdata,
+            input_scale,
+            input_per_tensor_scale,
+            linear.weight_qdata,
+            linear.weight_scale,
+            weight_per_tensor_scale,
+            linear.bias,
+            0,
+            rows,
+            output,
+        )
+        return
+    projected = _project_chunk_out(
+        input_qdata,
+        input_scale,
+        linear,
+        0,
+        rows,
+        output,
+    )
+    nvfp4_backend.apply_projection_epilogue(
+        projected,
+        global_scale,
+        linear.bias,
+        projected,
+    )
+
+
 def _run_chunked_swiglu_ffn(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     up: _LinearOperands,
@@ -195,8 +235,9 @@ def _run_chunked_swiglu_ffn(
 ) -> torch.Tensor:
     """Run one NVFP4 FFN while bounding its materialized BF16 intermediate.
 
-    Static down-projection scales preserve the materialized graph exactly. Dynamic down scales
-    intentionally cover one chunk rather than the otherwise-unavailable full intermediate.
+    Static down-projection affine terms run in the GEMM accumulator before its output conversion.
+    Dynamic down scales intentionally cover one chunk rather than the otherwise-unavailable full
+    intermediate.
     """
     rows, output_features = _validate_inputs(
         input,
@@ -281,19 +322,14 @@ def _run_chunked_swiglu_ffn(
                 up.bias,
             )
             if gated_updates is None:
-                projected = _project_chunk_out(
+                _project_static_down_chunk(
                     down_qdata,
                     down_scale,
+                    down_activation_scale,
                     down,
-                    0,
                     stop - start,
                     output_2d[start:stop],
-                )
-                nvfp4_backend.apply_projection_epilogue(
-                    projected,
                     down_global_scale,
-                    down.bias,
-                    projected,
                 )
             else:
                 assert projected_workspace is not None

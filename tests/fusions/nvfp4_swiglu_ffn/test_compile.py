@@ -20,7 +20,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn._compile import (
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
-from ._helpers import Operands, make_operands
+from ._helpers import Operands, affine_materialized, make_operands
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
@@ -167,6 +167,8 @@ def test_cuda_compile_options_fold_complete_swiglu_ffn(dynamic: bool) -> None:
             fullgraph=True,
             options=_capturing_options(capture),
         )(activation)
+        if not dynamic:
+            expected = affine_materialized(operands).reshape_as(actual)
 
     assert torch.equal(actual, expected)
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn.default) == 1
