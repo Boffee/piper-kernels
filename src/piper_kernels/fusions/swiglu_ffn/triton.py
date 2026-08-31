@@ -40,6 +40,8 @@ class IndexedGatedUpdateLayout:
 @triton.jit
 def _gated_updates_kernel(
     ffn_ptr,
+    ffn_scale_ptr,
+    ffn_bias_ptr,
     base_ptr,
     reusable_update_ptr,
     update_gate_ptr,
@@ -53,6 +55,9 @@ def _gated_updates_kernel(
     update_gate_rows,
     ffn_gate_rows,
     python_indexing: tl.constexpr,
+    has_ffn_scale: tl.constexpr,
+    has_ffn_bias: tl.constexpr,
+    ffn_dtype_code: tl.constexpr,
     block_size: tl.constexpr,
 ):
     """Apply two indexed gated updates and reuse the first update as output."""
@@ -61,6 +66,15 @@ def _gated_updates_kernel(
     rows = offsets // features
     columns = offsets % features
     ffn = tl.load(ffn_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    if has_ffn_scale:
+        ffn *= tl.load(ffn_scale_ptr).to(tl.float32)
+    if has_ffn_bias:
+        ffn += tl.load(ffn_bias_ptr + columns, mask=valid, other=0.0).to(tl.float32)
+    if has_ffn_scale or has_ffn_bias:
+        if ffn_dtype_code == 1:
+            ffn = ffn.to(tl.float16).to(tl.float32)
+        elif ffn_dtype_code == 2:
+            ffn = ffn.to(tl.bfloat16).to(tl.float32)
     base = tl.load(base_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
     reusable_update = tl.load(
         reusable_update_ptr + offsets,
@@ -173,11 +187,16 @@ def apply_indexed_gated_updates(
     updates: IndexedGatedUpdates,
     layout: IndexedGatedUpdateLayout,
     row_offset: int,
+    *,
+    ffn_scale: torch.Tensor | None = None,
+    ffn_bias: torch.Tensor | None = None,
 ) -> None:
     """Apply one validated chunk of indexed gated updates into reusable output storage."""
     elements = ffn.numel()
     _gated_updates_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
         ffn,
+        ffn_scale if ffn_scale is not None else ffn,
+        ffn_bias if ffn_bias is not None else ffn,
         base,
         output,
         updates.update_gate,
@@ -191,6 +210,9 @@ def apply_indexed_gated_updates(
         update_gate_rows=layout.update_gate_rows,
         ffn_gate_rows=layout.ffn_gate_rows,
         python_indexing=updates.python_indexing,
+        has_ffn_scale=ffn_scale is not None,
+        has_ffn_bias=ffn_bias is not None,
+        ffn_dtype_code={torch.float16: 1, torch.bfloat16: 2}.get(ffn.dtype, 0),
         block_size=_EPILOGUE_BLOCK_SIZE,
         num_warps=4,
         debug=True,
