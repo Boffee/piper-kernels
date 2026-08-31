@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.linear.nvfp4._projection import matmul_prepared_chunk_out
+from ._projection import matmul_prepared_chunk_out
 
 DEFAULT_CHUNK_ROWS = 4096
 

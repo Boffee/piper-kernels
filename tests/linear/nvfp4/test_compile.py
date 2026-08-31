@@ -1,5 +1,6 @@
 """Tests for automatic NVFP4 preparation sharing during compilation."""
 
+import operator
 import uuid
 
 import pytest
@@ -42,6 +43,18 @@ def _linear(
     return node
 
 
+def _packed_swiglu(graph: torch.fx.Graph, packed: torch.fx.Node) -> torch.fx.Node:
+    packed_value = packed.meta["val"]
+    split_size = packed_value.shape[-1] // 2
+    split = graph.call_function(torch.ops.aten.split.Tensor, args=(packed, split_size, -1))
+    up = graph.call_function(operator.getitem, args=(split, 0))
+    gate = graph.call_function(operator.getitem, args=(split, 1))
+    silu = graph.call_function(torch.ops.aten.silu.default, args=(gate,))
+    activated = graph.call_function(torch.ops.aten.mul.Tensor, args=(up, silu))
+    activated.meta["val"] = packed_value.new_empty((*packed_value.shape[:-1], split_size))
+    return activated
+
+
 def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool = True) -> None:
     torch.fx.GraphModule({}, graph)
     compile_pass(graph, is_inference=is_inference)
@@ -50,15 +63,27 @@ def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool = True) -> No
 def test_pass_canonicalizes_repeated_family_and_shares_identical_preparations() -> None:
     graph = torch.fx.Graph()
     input = _placeholder(graph, "input", torch.empty(2, 17, 256, device="meta"))  # noqa: A001
-    qdata = _placeholder(graph, "qdata", torch.empty(128, 128, dtype=torch.uint8))
+    qdata = _placeholder(
+        graph,
+        "qdata",
+        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
+    )
     scale = _placeholder(
         graph,
         "scale",
-        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta"),
     )
-    global_scale = _placeholder(graph, "global_scale", torch.empty(()))
-    shared_activation_scale = _placeholder(graph, "shared_activation_scale", torch.empty(()))
-    other_activation_scale = _placeholder(graph, "other_activation_scale", torch.empty(()))
+    global_scale = _placeholder(graph, "global_scale", torch.empty((), device="meta"))
+    shared_activation_scale = _placeholder(
+        graph,
+        "shared_activation_scale",
+        torch.empty((), device="meta"),
+    )
+    other_activation_scale = _placeholder(
+        graph,
+        "other_activation_scale",
+        torch.empty((), device="meta"),
+    )
     first = _linear(graph, input, qdata, scale, global_scale, shared_activation_scale)
     second = _linear(graph, input, qdata, scale, global_scale, shared_activation_scale)
     other = _linear(graph, input, qdata, scale, global_scale, other_activation_scale)
@@ -77,10 +102,22 @@ def test_pass_canonicalizes_repeated_family_and_shares_identical_preparations() 
 def test_pass_leaves_eligible_singleton_semantic() -> None:
     graph = torch.fx.Graph()
     input = _placeholder(graph, "input", torch.empty(17, 256, device="meta"))  # noqa: A001
-    qdata = _placeholder(graph, "qdata", torch.empty(128, 128, dtype=torch.uint8))
-    scale = _placeholder(graph, "scale", torch.empty(128, 16, dtype=torch.float8_e4m3fn))
-    global_scale = _placeholder(graph, "global_scale", torch.empty(()))
-    activation_scale = _placeholder(graph, "activation_scale", torch.empty(()))
+    qdata = _placeholder(
+        graph,
+        "qdata",
+        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
+    )
+    scale = _placeholder(
+        graph,
+        "scale",
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta"),
+    )
+    global_scale = _placeholder(graph, "global_scale", torch.empty((), device="meta"))
+    activation_scale = _placeholder(
+        graph,
+        "activation_scale",
+        torch.empty((), device="meta"),
+    )
     projected = _linear(graph, input, qdata, scale, global_scale, activation_scale)
     graph.output(projected)
 
@@ -90,6 +127,91 @@ def test_pass_leaves_eligible_singleton_semantic() -> None:
     assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
     assert torch.ops.piper_kernels.nvfp4_prepare_input.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
+    graph.lint()
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_pass_folds_packed_swiglu_into_activated_preparation(dynamic: bool) -> None:
+    graph = torch.fx.Graph()
+    packed = _placeholder(
+        graph,
+        "packed",
+        torch.empty(17, 512, device="meta", dtype=torch.bfloat16),
+    )
+    activated = _packed_swiglu(graph, packed)
+    qdata = _placeholder(
+        graph,
+        "qdata",
+        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
+    )
+    scale = _placeholder(
+        graph,
+        "scale",
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta"),
+    )
+    global_scale = _placeholder(graph, "global_scale", torch.empty((), device="meta"))
+    activation_scale = (
+        None if dynamic else _placeholder(graph, "activation_scale", torch.empty((), device="meta"))
+    )
+    projected = graph.call_function(
+        torch.ops.piper_kernels.nvfp4_linear.default,
+        args=(
+            activated,
+            qdata,
+            scale,
+            global_scale,
+            activation_scale,
+            None,
+            dynamic,
+        ),
+    )
+    projected.meta["val"] = torch.empty(17, 128, device="meta", dtype=torch.bfloat16)
+    graph.output(projected)
+
+    _run_compile_pass(graph)
+
+    calls = [node for node in graph.nodes if node.op == "call_function"]
+    targets = [node.target for node in calls]
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 1
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    prepare = next(
+        node for node in calls if node.target == torch.ops.piper_kernels.nvfp4_prepare_input.default
+    )
+    assert prepare.args == (packed, activation_scale, dynamic, "swiglu")
+    graph.lint()
+
+
+def test_pass_leaves_invalid_static_activated_linear_semantic() -> None:
+    graph = torch.fx.Graph()
+    packed = _placeholder(
+        graph,
+        "packed",
+        torch.empty(17, 512, device="meta", dtype=torch.bfloat16),
+    )
+    activated = _packed_swiglu(graph, packed)
+    qdata = _placeholder(
+        graph,
+        "qdata",
+        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
+    )
+    scale = _placeholder(
+        graph,
+        "scale",
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta"),
+    )
+    global_scale = _placeholder(graph, "global_scale", torch.empty((), device="meta"))
+    projected = graph.call_function(
+        torch.ops.piper_kernels.nvfp4_linear.default,
+        args=(activated, qdata, scale, global_scale, None, None, False),
+    )
+    graph.output(projected)
+
+    _run_compile_pass(graph)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
+    assert torch.ops.piper_kernels.nvfp4_prepare_input.default not in targets
     graph.lint()
 
 
@@ -103,14 +225,22 @@ def test_pass_fails_closed_for_malformed_semantic_linears(case: str) -> None:
         else _placeholder(graph, "input", input_value)
     )
     qdata_dtype = torch.int8 if case == "wrong-dtype" else torch.uint8
-    qdata = _placeholder(graph, "qdata", torch.empty(128, 128, dtype=qdata_dtype))
+    qdata = _placeholder(
+        graph,
+        "qdata",
+        torch.empty(128, 128, dtype=qdata_dtype, device="meta"),
+    )
     scale = _placeholder(
         graph,
         "scale",
-        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta"),
     )
-    global_scale = _placeholder(graph, "global_scale", torch.empty(()))
-    activation_scale = _placeholder(graph, "activation_scale", torch.empty(()))
+    global_scale = _placeholder(graph, "global_scale", torch.empty((), device="meta"))
+    activation_scale = _placeholder(
+        graph,
+        "activation_scale",
+        torch.empty((), device="meta"),
+    )
     first = graph.call_function(
         torch.ops.piper_kernels.nvfp4_linear.default,
         args=(input, qdata, scale, global_scale, activation_scale, None, False),
@@ -198,4 +328,61 @@ def test_cuda_compile_shares_three_static_projections() -> None:
         assert relative_l2 < 0.01
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 1
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_compile_folds_packed_swiglu_into_nvfp4_preparation(dynamic: bool) -> None:
+    torch.manual_seed(424)
+    packed = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    up, gate = packed.chunk(2, dim=-1)
+    calibration = up * F.silu(gate)
+    activation_scale = None if dynamic else per_tensor_amax_to_scale(calibration.abs().amax())
+    quantization = QuantizeTensorToNVFP4Kwargs(
+        block_size=16,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+        use_dynamic_per_tensor_scale=dynamic,
+    )
+    dense_weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+        dense_weight,
+        per_tensor_scale=per_tensor_amax_to_scale(dense_weight.abs().amax()),
+        act_per_tensor_scale=activation_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=quantization,
+    )
+    weight = PiperNVFP4Tensor.from_torchao(torchao_weight)
+    bias = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+
+    def projected_swiglu(value: torch.Tensor) -> torch.Tensor:
+        projected_up, projected_gate = value.chunk(2, dim=-1)
+        return F.linear(projected_up * F.silu(projected_gate), weight, bias)
+
+    expected = projected_swiglu(packed)
+    dense_reference = F.linear(calibration, dense_weight, bias)
+    capture = _TargetCapturePass()
+    options = nvfp4_compile_options()
+    options["post_grad_custom_pre_pass"] = (
+        options["post_grad_custom_pre_pass"],
+        capture,
+    )
+    actual = torch.compile(projected_swiglu, fullgraph=True, options=options)(packed)
+
+    relative_l2 = (expected.float() - actual.float()).norm() / expected.float().norm()
+    expected_dense_error = (
+        expected.float() - dense_reference.float()
+    ).norm() / dense_reference.float().norm()
+    actual_dense_error = (
+        actual.float() - dense_reference.float()
+    ).norm() / dense_reference.float().norm()
+    assert relative_l2 < 0.035
+    assert actual_dense_error <= expected_dense_error + 0.001
+    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 1
+    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets

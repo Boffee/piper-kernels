@@ -9,19 +9,61 @@ from torch._inductor.custom_graph_pass import (
     CustomInferenceAwareGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.pattern_matcher import (
+    CallFunction,
+    KeywordArg,
+    Match,
+    PatternMatcherPass,
+    register_graph_pattern,
+)
 
+from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _compile_fx, _ops
+from . import _compile_fx, _ops, _validation
 
-_COMPILE_PASS_VERSION = "nvfp4-compile-v1"
+_COMPILE_PASS_VERSION = "nvfp4-compile-v2"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
-def _arguments(node: torch.fx.Node) -> tuple[object, ...] | None:
-    if node.kwargs or len(node.args) != 7:
+def _validated_semantic_linear(
+    operands: _compile_fx.SemanticLinearNodes,
+    name: str,
+) -> tuple[torch.Tensor, _validation.LinearShape] | None:
+    values = tuple(
+        preparation_sharing.tensor_metadata(value) if isinstance(value, torch.fx.Node) else None
+        for value in (
+            operands.input,
+            operands.weight_qdata,
+            operands.weight_scale,
+            operands.weight_per_tensor_scale,
+            operands.activation_per_tensor_scale,
+            operands.bias,
+        )
+    )
+    input_value, weight_qdata, weight_scale, weight_global, activation_scale, bias = values
+    if input_value is None or weight_qdata is None or weight_scale is None:
         return None
-    return node.args
+    if (
+        (operands.weight_per_tensor_scale is None) != (weight_global is None)
+        or (operands.activation_per_tensor_scale is None) != (activation_scale is None)
+        or (operands.bias is None) != (bias is None)
+    ):
+        return None
+    try:
+        shape = _validation.validate_semantic_linear(
+            input_value,
+            weight_qdata,
+            weight_scale,
+            weight_global,
+            activation_scale,
+            bias,
+            operands.dynamic_activation_scale,
+            name,
+        )
+    except ValueError:
+        return None
+    return input_value, shape
 
 
 class _PreparationRule:
@@ -33,58 +75,23 @@ class _PreparationRule:
         self,
         node: torch.fx.Node,
     ) -> preparation_sharing.PreparationMatchKey | None:
-        arguments = _arguments(node)
-        if arguments is None:
+        operands = _compile_fx.SemanticLinearNodes.from_call(node)
+        if operands is None:
             return None
-        (
-            input_node,
-            weight_qdata,
-            weight_scale,
-            weight_per_tensor_scale,
-            activation_per_tensor_scale,
-            bias,
-            dynamic_activation_scale,
-        ) = arguments
-        if (
-            not isinstance(input_node, torch.fx.Node)
-            or not isinstance(weight_qdata, torch.fx.Node)
-            or not isinstance(weight_scale, torch.fx.Node)
-            or (
-                weight_per_tensor_scale is not None
-                and not isinstance(weight_per_tensor_scale, torch.fx.Node)
-            )
-            or (
-                activation_per_tensor_scale is not None
-                and not isinstance(activation_per_tensor_scale, torch.fx.Node)
-            )
-            or (bias is not None and not isinstance(bias, torch.fx.Node))
-            or not isinstance(dynamic_activation_scale, bool)
-        ):
+        validated = _validated_semantic_linear(operands, "NVFP4 compiler linear")
+        if validated is None:
             return None
-        input_value = preparation_sharing.tensor_metadata(input_node)
-        weight_value = preparation_sharing.tensor_metadata(weight_qdata)
-        weight_scale_value = preparation_sharing.tensor_metadata(weight_scale)
-        if (
-            input_value is None
-            or input_value.ndim == 0
-            or weight_value is None
-            or weight_value.ndim != 2
-            or weight_value.dtype is not torch.uint8
-            or not isinstance(input_value.shape[-1], int)
-            or input_value.shape[-1] % 16 != 0
-            or preparation_sharing.dimension_key(input_value.shape[-1])
-            != preparation_sharing.dimension_key(2 * weight_value.shape[1])
-            or weight_scale_value is None
-            or weight_scale_value.dtype is not torch.float8_e4m3fn
-        ):
-            return None
+        input_value, shape = validated
         # Exact FX identity prevents grouping across functionalized mutations.
         family_key = (
-            input_node,
-            preparation_sharing.dimension_key(weight_value.shape[1]),
+            operands.input,
+            preparation_sharing.dimension_key(shape.input_features),
             input_value.dtype,
         )
-        preparation_key = activation_per_tensor_scale, dynamic_activation_scale
+        preparation_key = (
+            operands.activation_per_tensor_scale,
+            operands.dynamic_activation_scale,
+        )
         return family_key, preparation_key
 
     def prepare(
@@ -92,21 +99,13 @@ class _PreparationRule:
         graph: torch.fx.Graph,
         first: torch.fx.Node,
     ) -> _PreparedInputNodes:
-        arguments = _arguments(first)
-        assert arguments is not None
-        input_node = arguments[0]
-        activation_per_tensor_scale = arguments[4]
-        dynamic_activation_scale = arguments[6]
-        assert isinstance(input_node, torch.fx.Node)
-        assert activation_per_tensor_scale is None or isinstance(
-            activation_per_tensor_scale, torch.fx.Node
-        )
-        assert isinstance(dynamic_activation_scale, bool)
+        operands = _compile_fx.SemanticLinearNodes.from_call(first)
+        assert operands is not None
         return _compile_fx.emit_prepared_input(
             graph,
-            input_node,
-            activation_per_tensor_scale,
-            dynamic_activation_scale,
+            operands.input,
+            operands.activation_per_tensor_scale,
+            operands.dynamic_activation_scale,
         )
 
     def replace(
@@ -115,60 +114,170 @@ class _PreparationRule:
         node: torch.fx.Node,
         prepared: _PreparedInputNodes,
     ) -> torch.fx.Node:
-        arguments = _arguments(node)
-        assert arguments is not None
-        input_qdata, input_scale, input_per_tensor_scale, leading_shape = prepared
-        weight_qdata = arguments[1]
-        weight_scale = arguments[2]
-        weight_per_tensor_scale = arguments[3]
-        bias = arguments[5]
-        assert isinstance(weight_qdata, torch.fx.Node)
-        assert isinstance(weight_scale, torch.fx.Node)
-        input_node = arguments[0]
-        assert isinstance(input_node, torch.fx.Node)
-        assert weight_per_tensor_scale is None or isinstance(weight_per_tensor_scale, torch.fx.Node)
-        assert bias is None or isinstance(bias, torch.fx.Node)
-        input_value = preparation_sharing.tensor_metadata(input_node)
-        weight_value = preparation_sharing.tensor_metadata(weight_qdata)
-        assert input_value is not None
-        assert weight_value is not None
-        projected = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_linear_prepared.default,
-            args=(
-                input_qdata,
-                input_scale,
-                input_per_tensor_scale,
-                weight_qdata,
-                weight_scale,
-                weight_per_tensor_scale,
-                bias,
-                input_value.dtype,
-            ),
-        )
-        projected.meta["val"] = input_value.new_empty(
-            (input_qdata.meta["val"].shape[0], weight_value.shape[0])
-        )
-        if len(leading_shape) == 1:
-            return projected
-        return graph.call_function(
-            torch.ops.aten.reshape.default,
-            args=(projected, (*leading_shape, weight_value.shape[0])),
-        )
+        operands = _compile_fx.SemanticLinearNodes.from_call(node)
+        assert operands is not None
+        return _compile_fx.emit_prepared_linear(graph, prepared, operands)
 
 
 _PREPARATION_RULES = (_PreparationRule(),)
 
 
+_input_activation_patterns = PatternMatcherPass("nvfp4_input_activations")
+
+
+def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
+    return CallFunction(
+        torch.ops.piper_kernels.nvfp4_linear.default,
+        input_pattern,
+        KeywordArg("weight_qdata"),
+        KeywordArg("weight_scale"),
+        KeywordArg("weight_per_tensor_scale"),
+        KeywordArg("activation_per_tensor_scale"),
+        KeywordArg("bias"),
+        KeywordArg("dynamic_activation_scale"),
+    )
+
+
+def _activation_input_features(match: Match) -> int | torch.SymInt | None:
+    operands = _compile_fx.SemanticLinearNodes.from_call(match.output_node())
+    if operands is None:
+        return None
+    validated = _validated_semantic_linear(operands, "NVFP4 activated compiler linear")
+    if validated is None:
+        return None
+    _, shape = validated
+    return shape.input_features
+
+
+def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
+    input_features = _activation_input_features(match)
+    return bool(
+        input_features is not None
+        and input_activation_compile.valid_packed_swiglu(
+            match,
+            promote_gate=promote_gate,
+            input_features=input_features,
+        )
+    )
+
+
+def _valid_gelu_tanh(match: Match, *, promote_input: bool) -> bool:
+    input_features = _activation_input_features(match)
+    return bool(
+        input_features is not None
+        and input_activation_compile.valid_gelu_tanh(
+            match,
+            promote_input=promote_input,
+            input_features=input_features,
+        )
+    )
+
+
+def _replace_input_activation_and_linear(
+    match: Match,
+    input_node: torch.fx.Node,
+    activation_fn: str,
+) -> None:
+    original = match.output_node()
+    graph = match.graph
+    operands = _compile_fx.SemanticLinearNodes.from_call(original)
+    assert operands is not None
+    with graph.inserting_before(original):
+        prepared = _compile_fx.emit_prepared_input(
+            graph,
+            input_node,
+            operands.activation_per_tensor_scale,
+            operands.dynamic_activation_scale,
+            activation_fn,
+        )
+        replacement = _compile_fx.emit_prepared_linear(graph, prepared, operands)
+    replacement.meta = original.meta.copy()
+    replacement.meta.pop("eager_input_vals", None)
+    original.replace_all_uses_with(replacement)
+    match.erase_nodes()
+
+
+def _replace_packed_swiglu(
+    match: Match,
+    packed: torch.fx.Node,
+    **_unused: object,
+) -> None:
+    _replace_input_activation_and_linear(
+        match,
+        packed,
+        "swiglu",
+    )
+
+
+for _promote_gate in (None, False, True):
+    for _reverse_multiply in (False, True):
+        register_graph_pattern(
+            input_activation_compile.packed_swiglu_pattern(
+                _linear_pattern,
+                promote_gate=_promote_gate,
+                reverse_multiply=_reverse_multiply,
+            ),
+            extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
+                match,
+                promote_gate=promote_gate,
+            ),
+            pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_packed_swiglu)
+
+
+def _replace_gelu_tanh(
+    match: Match,
+    input: torch.fx.Node,  # noqa: A002 - pattern keyword
+    **_unused: object,
+) -> None:
+    _replace_input_activation_and_linear(
+        match,
+        input,
+        "gelu_tanh",
+    )
+
+
+for _promote_input in (False, True):
+    register_graph_pattern(
+        input_activation_compile.gelu_tanh_pattern(
+            _linear_pattern,
+            promote_input=_promote_input,
+        ),
+        extra_check=lambda match, promote_input=_promote_input: _valid_gelu_tanh(
+            match,
+            promote_input=promote_input,
+        ),
+        pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+    )(_replace_gelu_tanh)
+
+
+def _fold_input_activations(graph: torch.fx.Graph) -> bool:
+    changed = _input_activation_patterns.apply(graph) > 0
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+    return changed
+
+
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Share compatible NVFP4 activation preparation in inference graphs."""
+    """Fold input activations before sharing compatible NVFP4 preparation."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        if is_inference:
-            preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
+        if not is_inference:
+            return
+        _fold_input_activations(graph)
+        preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
         return get_hash_for_files(
-            (__file__, preparation_sharing.__file__, _compile_fx.__file__, _ops.__file__),
+            (
+                __file__,
+                input_activation_compile.__file__,
+                preparation_sharing.__file__,
+                _compile_fx.__file__,
+                _ops.__file__,
+                _validation.__file__,
+            ),
             extra=_COMPILE_PASS_VERSION,
         )
 

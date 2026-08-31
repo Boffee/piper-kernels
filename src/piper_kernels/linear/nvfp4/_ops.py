@@ -10,6 +10,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
+from piper_kernels.linear import _input_activations as input_activations
+
 from ._typing import NVFP4Storage
 
 _BLOCK_SIZE = 16
@@ -18,11 +20,13 @@ _BLOCK_SIZE = 16
 def _prepare_static_tensors(
     input: torch.Tensor,  # noqa: A002
     per_tensor_scale: torch.Tensor,
+    activation_fn: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    activated = input_activations.apply_input_activation(input, activation_fn)
     prepared = cast(
         NVFP4Storage,
         TorchAONVFP4Tensor.to_nvfp4(
-            input.reshape(-1, input.shape[-1]),
+            activated.reshape(-1, activated.shape[-1]),
             block_size=_BLOCK_SIZE,
             per_tensor_scale=per_tensor_scale,
             is_swizzled_scales=True,
@@ -34,8 +38,10 @@ def _prepare_static_tensors(
 
 def _prepare_dynamic_tensors(
     input: torch.Tensor,  # noqa: A002
+    activation_fn: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    flattened = input.reshape(-1, input.shape[-1])
+    activated = input_activations.apply_input_activation(input, activation_fn)
+    flattened = activated.reshape(-1, activated.shape[-1])
     per_tensor_scale = per_tensor_amax_to_scale(flattened.abs().amax())
     prepared = cast(
         NVFP4Storage,
@@ -80,12 +86,14 @@ def _prepare_compiled(
     input: torch.Tensor,  # noqa: A002
     activation_per_tensor_scale: torch.Tensor | None,
     dynamic_activation_scale: bool,
+    activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_activations.validate_input_activation(activation_fn)
     if dynamic_activation_scale:
-        return _compiled_prepare_dynamic(input)
+        return _compiled_prepare_dynamic(input, activation_fn)
     if activation_per_tensor_scale is None:
         raise ValueError("static NVFP4 activation preparation requires a per-tensor scale")
-    return _compiled_prepare_static(input, activation_per_tensor_scale)
+    return _compiled_prepare_static(input, activation_per_tensor_scale, activation_fn)
 
 
 def _execute_prepared(
@@ -160,12 +168,14 @@ def prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     activation_per_tensor_scale: torch.Tensor | None,
     dynamic_activation_scale: bool,
+    activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize one activation for reuse across compatible NVFP4 projections."""
+    """Apply an optional portable activation and prepare it for NVFP4 projections."""
     return _prepare_compiled(
         input,
         activation_per_tensor_scale,
         dynamic_activation_scale,
+        activation_fn,
     )
 
 
@@ -174,9 +184,10 @@ def _prepare_input_fake(
     input: torch.Tensor,  # noqa: A002
     activation_per_tensor_scale: torch.Tensor | None,
     _dynamic_activation_scale: bool,
+    activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows = input.numel() // input.shape[-1]
-    features = input.shape[-1]
+    features = input.shape[-1] // input_activations.input_activation_width(activation_fn)
     scale_rows = ((rows + 127) // 128) * 32
     scale_columns = ((features + 63) // 64) * 16
     per_tensor_scale = (
