@@ -1,11 +1,12 @@
 """Tests for the backend-neutral preparation-sharing graph pass."""
 
 import operator
-from collections.abc import Hashable
 
 import torch
 
 from piper_kernels.linear._preparation_sharing import (
+    PreparationMatchKey,
+    add_ordered_post_grad_passes,
     add_post_grad_pass,
     share_preparation,
 )
@@ -17,9 +18,9 @@ class _ToyRule:
     def __init__(self, linear_target: object) -> None:
         self.linear_target = linear_target
 
-    def match_key(self, node: torch.fx.Node) -> Hashable | None:
+    def match_key(self, node: torch.fx.Node) -> PreparationMatchKey | None:
         source = node.args[0]
-        return source if isinstance(source, torch.fx.Node) else None
+        return (source, source) if isinstance(source, torch.fx.Node) else None
 
     def prepare(self, graph: torch.fx.Graph, first: torch.fx.Node) -> torch.fx.Node:
         source = first.args[0]
@@ -106,3 +107,48 @@ def test_options_compose_without_mutating_or_duplicating() -> None:
     assert combined["max_autotune"] is True
     assert combined["post_grad_custom_pre_pass"] == (existing_pass, compiler_pass)
     assert repeated == combined
+
+
+def test_ordered_pass_group_replaces_anchor_without_moving_unrelated_passes() -> None:
+    unrelated_before = object()
+    fusion = object()
+    backend = object()
+    unrelated_after = object()
+    original = {
+        "post_grad_custom_pre_pass": (
+            unrelated_before,
+            backend,
+            unrelated_after,
+            fusion,
+        )
+    }
+
+    combined = add_ordered_post_grad_passes(original, (fusion, backend))
+    repeated = add_ordered_post_grad_passes(combined, (fusion, backend))
+
+    assert combined["post_grad_custom_pre_pass"] == (
+        unrelated_before,
+        fusion,
+        backend,
+        unrelated_after,
+    )
+    assert repeated == combined
+
+
+def test_ordered_pass_group_anchors_on_first_installed_member() -> None:
+    unrelated_before = object()
+    first = object()
+    second = object()
+    unrelated_after = object()
+
+    combined = add_ordered_post_grad_passes(
+        {"post_grad_custom_pre_pass": (unrelated_before, first, unrelated_after)},
+        (first, second),
+    )
+
+    assert combined["post_grad_custom_pre_pass"] == (
+        unrelated_before,
+        first,
+        second,
+        unrelated_after,
+    )

@@ -105,7 +105,6 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
     row_offsets = batch * logical_sequence_length + sequence_offsets
-    feature_offsets = tl.arange(0, head_dim)
     projection_feature_offsets = tl.arange(0, block_n)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
     weight_offsets = head_block * block_n + projection_feature_offsets
@@ -125,44 +124,22 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         aligned_projection,
     )
     projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
-    value_mean = tl.load(
-        value_mean_ptr
-        + (batch * heads + head_offsets[:, None]) * head_dim
-        + feature_offsets[None, :],
-        mask=head_offsets[:, None] < heads,
-        other=0.0,
-    )
-    valid_rows = sequence_offsets < logical_sequence_length
-    quantized, value_scale_multiplier = sparse_piper_kernels.quantize_value_tile(
+    sparse_piper_kernels.store_value_tile(
         projection,
-        value_mean,
-        valid_rows,
+        value_mean_ptr,
+        value_ptr,
+        value_scale_ptr,
+        batch,
+        heads,
+        head_offsets,
+        sequence_offsets,
+        logical_sequence_length,
+        storage_sequence_length,
+        row_block,
         heads_per_program,
         head_dim,
         block_m,
         _JIT_VALUE_TILE_ROWS,
-    )
-
-    value_offsets = (
-        (batch * heads + head_offsets[:, None, None]) * head_dim * storage_sequence_length
-        + feature_offsets[None, None, :] * storage_sequence_length
-        + sequence_offsets[None, :, None]
-    )
-    tl.store(
-        value_ptr + value_offsets,
-        quantized,
-        mask=(head_offsets[:, None, None] < heads)
-        & (sequence_offsets[None, :, None] < storage_sequence_length),
-    )
-
-    tile_count = storage_sequence_length // _JIT_VALUE_TILE_ROWS
-    local_tile_offsets = tl.arange(0, block_m // _JIT_VALUE_TILE_ROWS)
-    tile_offsets = row_block * (block_m // _JIT_VALUE_TILE_ROWS) + local_tile_offsets
-    scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
-    tl.store(
-        value_scale_ptr + scale_offsets,
-        value_scale_multiplier,
-        mask=(head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count),
     )
 
 

@@ -26,6 +26,7 @@ Changelog = "https://github.com/Boffee/piper-kernels/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 convrot = ["torchao>=0.17"]
+nvfp4 = ["numpy>=2", "torchao>=0.18"]
 triton = [
     "triton>=3.7,<3.8; sys_platform == 'linux'",
     "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
@@ -47,7 +48,7 @@ test = [
 ]
 dev = [
     { include-group = "test" },
-    "piper-kernels[convrot,triton]",
+    "piper-kernels[convrot,nvfp4,triton]",
     "pre-commit>=4.0",
     "pyright>=1.1.409",
     "ruff>=0.14.3",

@@ -14,8 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
-    triton as qk_quantization,
+from piper_kernels.attention.kernels.sparse_piper import (
+    triton as sparse_piper_kernels,
 )
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
@@ -74,7 +74,6 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     batch = tl.program_id(2)
     sequence_offsets = query_block * block_m + tl.arange(0, block_m)
     row_offsets = batch * logical_sequence_length + sequence_offsets
-    feature_offsets = tl.arange(0, head_dim)
     projection_feature_offsets = tl.arange(0, block_n)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
     weight_offsets = head_block * block_n + projection_feature_offsets
@@ -104,61 +103,24 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         block_k,
     )
 
-    if mask_ragged_tail:
-        valid_rows = sequence_offsets < logical_sequence_length
-        rope = tl.where(valid_rows[:, None, None], rope, 0.0)
-        query_summary = tl.max(
-            tl.where(valid_rows[:, None, None], rope, -float("inf")),
-            axis=0,
-        ) + tl.min(
-            tl.where(valid_rows[:, None, None], rope, float("inf")),
-            axis=0,
-        )
-    else:
-        query_summary = tl.max(rope, axis=0) + tl.min(rope, axis=0)
-    summary_offsets = (
-        (batch * heads + head_offsets[:, None]) * (storage_sequence_length // block_m) + query_block
-    ) * head_dim + feature_offsets[None, :]
-    tl.store(
-        query_summary_ptr + summary_offsets,
-        query_summary,
-        mask=head_offsets[:, None] < heads,
-    )
-
-    group_offsets = tl.arange(0, block_m // _JIT_QUERY_SCALE_ROWS)
-    group_valid = head_offsets[:, None] < heads
-    if mask_ragged_tail:
-        group_starts = query_block * block_m + group_offsets * _JIT_QUERY_SCALE_ROWS
-        group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
-    quantized, stored_scale = qk_quantization.quantize_query_tile(
+    sparse_piper_kernels.store_query_tile(
         rope,
-        group_valid,
+        query_ptr,
+        query_scale_ptr,
+        query_summary_ptr,
+        batch,
+        heads,
+        head_offsets,
+        sequence_offsets,
+        logical_sequence_length,
+        storage_sequence_length,
+        query_block,
         softmax_scale,
+        mask_ragged_tail,
         heads_per_program,
         head_dim,
         block_m,
         _JIT_QUERY_SCALE_ROWS,
-    )
-    query_offsets = (
-        batch * heads * storage_sequence_length * head_dim
-        + head_offsets[:, None, None] * storage_sequence_length * head_dim
-        + sequence_offsets[None, :, None] * head_dim
-        + feature_offsets[None, None, :]
-    )
-    tl.store(
-        query_ptr + query_offsets,
-        quantized,
-        mask=head_offsets[:, None, None] < heads,
-    )
-    scale_offsets = (
-        (batch * heads + head_offsets[:, None]) * (storage_sequence_length // _JIT_QUERY_SCALE_ROWS)
-        + query_block * (block_m // _JIT_QUERY_SCALE_ROWS)
-        + group_offsets[None, :]
-    )
-    tl.store(
-        query_scale_ptr + scale_offsets,
-        stored_scale,
-        mask=head_offsets[:, None] < heads,
     )
 
 

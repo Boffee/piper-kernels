@@ -9,6 +9,7 @@ from typing import Any, Protocol
 import torch
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
+type PreparationMatchKey = tuple[Hashable, Hashable]
 
 
 class PreparationSharingRule[PreparedNodes](Protocol):
@@ -19,8 +20,8 @@ class PreparationSharingRule[PreparedNodes](Protocol):
         """Return the semantic operator that consumes an unprepared input."""
         ...
 
-    def match_key(self, node: torch.fx.Node) -> Hashable | None:
-        """Return a shared-preparation key, or ``None`` for an ineligible node."""
+    def match_key(self, node: torch.fx.Node) -> PreparationMatchKey | None:
+        """Return repeated-family and exact-preparation keys for an eligible node."""
         ...
 
     def prepare(self, graph: torch.fx.Graph, first: torch.fx.Node) -> PreparedNodes:
@@ -54,27 +55,31 @@ def _rewrite_rule[PreparedNodes](
     graph: torch.fx.Graph,
     rule: PreparationSharingRule[PreparedNodes],
 ) -> bool:
-    groups: dict[Hashable, list[torch.fx.Node]] = defaultdict(list)
+    groups: dict[Hashable, dict[Hashable, list[torch.fx.Node]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for node in graph.nodes:
         if node.op != "call_function" or node.target != rule.linear_target:
             continue
-        key = rule.match_key(node)
-        if key is not None:
-            groups[key].append(node)
+        match = rule.match_key(node)
+        if match is not None:
+            family_key, preparation_key = match
+            groups[family_key][preparation_key].append(node)
 
     changed = False
-    for nodes in groups.values():
-        if len(nodes) < 2:
+    for preparation_groups in groups.values():
+        if sum(len(nodes) for nodes in preparation_groups.values()) < 2:
             continue
-        with graph.inserting_before(nodes[0]):
-            prepared = rule.prepare(graph, nodes[0])
-        for node in nodes:
-            with graph.inserting_before(node):
-                replacement = rule.replace(graph, node, prepared)
-            replacement.meta = node.meta.copy()
-            replacement.meta.pop("eager_input_vals", None)
-            node.replace_all_uses_with(replacement)
-            graph.erase_node(node)
+        for nodes in preparation_groups.values():
+            with graph.inserting_before(nodes[0]):
+                prepared = rule.prepare(graph, nodes[0])
+            for node in nodes:
+                with graph.inserting_before(node):
+                    replacement = rule.replace(graph, node, prepared)
+                replacement.meta = node.meta.copy()
+                replacement.meta.pop("eager_input_vals", None)
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
         changed = True
     return changed
 
@@ -111,8 +116,51 @@ def add_post_grad_pass(
     return combined
 
 
+def add_ordered_post_grad_passes(
+    options: Mapping[str, object] | None,
+    compiler_passes: Sequence[object],
+) -> dict[str, object]:
+    """Install an ordered pass group where its first existing member was located."""
+    if not compiler_passes:
+        return dict(options) if options is not None else {}
+    combined = dict(options) if options is not None else {}
+    existing = combined.get(_POST_GRAD_PRE_PASS)
+    if existing is None:
+        passes: tuple[object, ...] = ()
+    elif isinstance(existing, (list, tuple)):
+        passes = tuple(existing)
+    else:
+        passes = (existing,)
+
+    anchor_index = next(
+        (
+            index
+            for index, compiler_pass in enumerate(passes)
+            if any(compiler_pass is grouped for grouped in compiler_passes)
+        ),
+        len(passes),
+    )
+    unrelated = tuple(
+        compiler_pass
+        for compiler_pass in passes
+        if not any(compiler_pass is grouped for grouped in compiler_passes)
+    )
+    insertion_index = sum(
+        not any(compiler_pass is grouped for grouped in compiler_passes)
+        for compiler_pass in passes[:anchor_index]
+    )
+    combined[_POST_GRAD_PRE_PASS] = (
+        *unrelated[:insertion_index],
+        *compiler_passes,
+        *unrelated[insertion_index:],
+    )
+    return combined
+
+
 __all__ = [
+    "PreparationMatchKey",
     "PreparationSharingRule",
+    "add_ordered_post_grad_passes",
     "add_post_grad_pass",
     "dimension_key",
     "share_preparation",
