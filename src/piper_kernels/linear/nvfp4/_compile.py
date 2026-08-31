@@ -26,46 +26,6 @@ _COMPILE_PASS_VERSION = "nvfp4-compile-v2"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
-def _validated_semantic_linear(
-    operands: _compile_fx.SemanticLinearNodes,
-    name: str,
-) -> tuple[torch.Tensor, _validation.LinearShape] | None:
-    values = tuple(
-        preparation_sharing.tensor_metadata(value) if isinstance(value, torch.fx.Node) else None
-        for value in (
-            operands.input,
-            operands.weight_qdata,
-            operands.weight_scale,
-            operands.weight_per_tensor_scale,
-            operands.activation_per_tensor_scale,
-            operands.bias,
-        )
-    )
-    input_value, weight_qdata, weight_scale, weight_global, activation_scale, bias = values
-    if input_value is None or weight_qdata is None or weight_scale is None:
-        return None
-    if (
-        (operands.weight_per_tensor_scale is None) != (weight_global is None)
-        or (operands.activation_per_tensor_scale is None) != (activation_scale is None)
-        or (operands.bias is None) != (bias is None)
-    ):
-        return None
-    try:
-        shape = _validation.validate_semantic_linear(
-            input_value,
-            weight_qdata,
-            weight_scale,
-            weight_global,
-            activation_scale,
-            bias,
-            operands.dynamic_activation_scale,
-            name,
-        )
-    except ValueError:
-        return None
-    return input_value, shape
-
-
 class _PreparationRule:
     """Describe how compatible semantic NVFP4 linears share prepared inputs."""
 
@@ -78,7 +38,7 @@ class _PreparationRule:
         operands = _compile_fx.SemanticLinearNodes.from_call(node)
         if operands is None:
             return None
-        validated = _validated_semantic_linear(operands, "NVFP4 compiler linear")
+        validated = _compile_fx.validated_semantic_linear(operands, "NVFP4 compiler linear")
         if validated is None:
             return None
         input_value, shape = validated
@@ -142,7 +102,10 @@ def _activation_input_features(match: Match) -> int | torch.SymInt | None:
     operands = _compile_fx.SemanticLinearNodes.from_call(match.output_node())
     if operands is None:
         return None
-    validated = _validated_semantic_linear(operands, "NVFP4 activated compiler linear")
+    validated = _compile_fx.validated_semantic_linear(
+        operands,
+        "NVFP4 activated compiler linear",
+    )
     if validated is None:
         return None
     _, shape = validated

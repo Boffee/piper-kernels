@@ -62,17 +62,42 @@ def _validate_device(device: torch.device, name: str) -> None:
         raise ValueError(f"{name} requires exact NVIDIA SM120")
 
 
-def _validate_weight(
+def validate_activation_scale(
+    activation_per_tensor_scale: torch.Tensor | None,
+    dynamic_activation_scale: bool,
+    device: torch.device,
+    name: str,
+) -> None:
+    """Validate one NVFP4 activation's global-scale configuration."""
+    if not isinstance(dynamic_activation_scale, bool):
+        raise ValueError(f"{name} dynamic activation scale flag must be boolean")
+    if not _valid_scalar(activation_per_tensor_scale) or (
+        not dynamic_activation_scale and activation_per_tensor_scale is None
+    ):
+        raise ValueError(f"{name} static activation scale must be an FP32 scalar")
+    if activation_per_tensor_scale is not None and activation_per_tensor_scale.device != device:
+        raise ValueError(f"{name} activation scale must share the input device")
+    if activation_per_tensor_scale is not None and (
+        activation_per_tensor_scale.layout is not torch.strided
+        or not activation_per_tensor_scale.is_contiguous()
+    ):
+        raise ValueError(f"{name} activation scale must be a contiguous strided tensor")
+
+
+def validate_weight(
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     *,
-    packed_input_features: int | torch.SymInt,
+    input_features: int | torch.SymInt,
     logical_dtype: torch.dtype,
     device: torch.device,
     name: str,
 ) -> int | torch.SymInt:
+    if isinstance(input_features, int) and (input_features < 16 or input_features % 16):
+        raise ValueError(f"{name} input features must be a positive multiple of 16")
+    packed_input_features = input_features // 2
     if (
         weight_qdata.ndim != 2
         or weight_qdata.dtype is not torch.uint8
@@ -80,7 +105,6 @@ def _validate_weight(
     ):
         raise ValueError(f"{name} weight has an incompatible packed UINT8 layout")
     output_features = weight_qdata.shape[0]
-    input_features = 2 * packed_input_features
     if (
         not _shape_matches(
             weight_scale.shape,
@@ -125,25 +149,18 @@ def validate_semantic_linear(
     rows = math.prod(input.shape[:-1])
     if isinstance(rows, int) and rows < 1:
         raise ValueError(f"{name} input must contain at least one row")
-    if not isinstance(dynamic_activation_scale, bool):
-        raise ValueError(f"{name} dynamic activation scale flag must be boolean")
-    if not _valid_scalar(activation_per_tensor_scale) or (
-        not dynamic_activation_scale and activation_per_tensor_scale is None
-    ):
-        raise ValueError(f"{name} static activation scale must be an FP32 scalar")
-    if (
-        activation_per_tensor_scale is not None
-        and activation_per_tensor_scale.device != input.device
-    ):
-        raise ValueError(f"{name} activation scale must share the input device")
-    if activation_per_tensor_scale is not None and not activation_per_tensor_scale.is_contiguous():
-        raise ValueError(f"{name} activation scale must be contiguous")
-    output_features = _validate_weight(
+    validate_activation_scale(
+        activation_per_tensor_scale,
+        dynamic_activation_scale,
+        input.device,
+        name,
+    )
+    output_features = validate_weight(
         weight_qdata,
         weight_scale,
         weight_per_tensor_scale,
         bias,
-        packed_input_features=input_features // 2,
+        input_features=input_features,
         logical_dtype=input.dtype,
         device=input.device,
         name=name,
@@ -184,12 +201,12 @@ def validate_prepared_linear(
         raise ValueError(f"{name} input per-tensor scale must be an FP32 scalar")
     if logical_dtype not in _LOGICAL_DTYPES:
         raise ValueError(f"{name} logical dtype must be FP16, BF16, or FP32")
-    output_features = _validate_weight(
+    output_features = validate_weight(
         weight_qdata,
         weight_scale,
         weight_per_tensor_scale,
         bias,
-        packed_input_features=packed_input_features,
+        input_features=input_features,
         logical_dtype=logical_dtype,
         device=input_qdata.device,
         name=name,
@@ -203,4 +220,10 @@ def validate_prepared_linear(
     return LinearShape(rows, input_features, output_features)
 
 
-__all__ = ["LinearShape", "validate_prepared_linear", "validate_semantic_linear"]
+__all__ = [
+    "LinearShape",
+    "validate_activation_scale",
+    "validate_prepared_linear",
+    "validate_semantic_linear",
+    "validate_weight",
+]
