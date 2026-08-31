@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Mapping
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -29,7 +29,10 @@ class _PreparationRule:
 
     linear_target = torch.ops.piper_kernels.nvfp4_linear.default
 
-    def match_key(self, node: torch.fx.Node) -> Hashable | None:
+    def match_key(
+        self,
+        node: torch.fx.Node,
+    ) -> preparation_sharing.PreparationMatchKey | None:
         arguments = _arguments(node)
         if arguments is None:
             return None
@@ -75,15 +78,14 @@ class _PreparationRule:
             or weight_scale_value.dtype is not torch.float8_e4m3fn
         ):
             return None
-        # Exact FX identity prevents sharing across functionalized mutations and
-        # weights calibrated with different static activation scales.
-        return (
+        # Exact FX identity prevents grouping across functionalized mutations.
+        family_key = (
             input_node,
-            activation_per_tensor_scale,
-            dynamic_activation_scale,
             preparation_sharing.dimension_key(weight_value.shape[1]),
             input_value.dtype,
         )
+        preparation_key = activation_per_tensor_scale, dynamic_activation_scale
+        return family_key, preparation_key
 
     def prepare(
         self,

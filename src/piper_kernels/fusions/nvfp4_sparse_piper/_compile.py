@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import cast
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -20,7 +19,6 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_triton,
@@ -40,7 +38,7 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
 from . import _chunking, _epilogue, _validation, key, query, value
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v1"
+_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v2"
 _HEAD_DIM = layout.HEAD_DIM
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
@@ -73,15 +71,22 @@ def _source_files() -> tuple[str, ...]:
 
 
 def _linear_pattern(prefix: str) -> CallFunction:
-    return CallFunction(
-        torch.ops.piper_kernels.nvfp4_linear.default,
-        KeywordArg("sparse_input"),
+    prepared = CallFunction(
+        torch.ops.piper_kernels.nvfp4_linear_prepared.default,
+        KeywordArg(f"{prefix}_input_qdata"),
+        KeywordArg(f"{prefix}_input_scale"),
+        KeywordArg(f"{prefix}_input_per_tensor_scale"),
         KeywordArg(f"{prefix}_weight_qdata"),
         KeywordArg(f"{prefix}_weight_scale"),
         KeywordArg(f"{prefix}_weight_per_tensor_scale"),
-        KeywordArg(f"{prefix}_activation_per_tensor_scale"),
         KeywordArg(f"{prefix}_bias"),
-        KeywordArg(f"{prefix}_dynamic_activation_scale"),
+        KeywordArg(f"{prefix}_logical_dtype"),
+        _users=1,
+    )
+    return CallFunction(
+        torch.ops.aten.reshape.default,
+        prepared,
+        KeywordArg(f"{prefix}_linear_shape"),
         _users=1,
     )
 
@@ -125,14 +130,19 @@ def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]
 
 
 def _valid_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
+    prefixes = ("sparse_q", "sparse_k", "sparse_v")
     required_nodes = (
-        "sparse_input",
-        "sparse_q_weight_qdata",
-        "sparse_q_weight_scale",
-        "sparse_k_weight_qdata",
-        "sparse_k_weight_scale",
-        "sparse_v_weight_qdata",
-        "sparse_v_weight_scale",
+        *(
+            f"{prefix}_{suffix}"
+            for prefix in prefixes
+            for suffix in (
+                "input_qdata",
+                "input_scale",
+                "input_per_tensor_scale",
+                "weight_qdata",
+                "weight_scale",
+            )
+        ),
         "sparse_q_norm_weight",
         "sparse_k_norm_weight",
         "sparse_cos",
@@ -153,28 +163,29 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
     ):
         return False
 
-    input_value = metadata["sparse_input"]
-    assert input_value is not None
+    q_input = metadata["sparse_q_input_qdata"]
+    q_weight = metadata["sparse_q_weight_qdata"]
+    assert q_input is not None
+    assert q_weight is not None
     output_value = preparation_sharing.tensor_metadata(match.output_node())
     shape = match.kwargs["sparse_attention_shape"]
     if (
-        input_value.ndim != 3
+        q_input.ndim != 2
         or output_value is None
         or output_value.ndim != 4
         or not isinstance(shape, (list, tuple))
         or len(shape) != 4
     ):
         return False
-    batch = _static_int(input_value.shape[0])
-    sequence_length = input_value.shape[1]
-    input_features = _static_int(input_value.shape[2])
-    q_weight = metadata["sparse_q_weight_qdata"]
-    assert q_weight is not None
+    batch = _static_int(shape[0])
+    shape_sequence_length = _integer_scalar_metadata(shape[1])
+    sequence_length = q_input.shape[0]
     output_features = _static_int(q_weight.shape[0])
     if (
         batch != 1
-        or input_features is None
-        or input_features % 16
+        or shape_sequence_length is None
+        or preparation_sharing.dimension_key(shape_sequence_length)
+        != preparation_sharing.dimension_key(sequence_length)
         or output_features is None
         or output_features % _HEAD_DIM
     ):
@@ -182,77 +193,71 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
     heads = output_features // _HEAD_DIM
     output_shape = output_value.shape
     if (
-        input_value.dtype is not torch.bfloat16
-        or input_value.device.type != "cuda"
-        or output_value.dtype is not torch.bfloat16
-        or output_value.device != input_value.device
+        output_value.dtype is not torch.bfloat16
+        or output_value.device != q_input.device
         or tuple(output_shape[2:]) != (heads, _HEAD_DIM)
         or preparation_sharing.dimension_key(output_shape[0])
-        != preparation_sharing.dimension_key(input_value.shape[0])
+        != preparation_sharing.dimension_key(batch)
         or preparation_sharing.dimension_key(output_shape[1])
         != preparation_sharing.dimension_key(sequence_length)
         or _static_int(shape[2]) != heads
         or _static_int(shape[3]) != _HEAD_DIM
         or (isinstance(sequence_length, int) and sequence_length < _TILE_ROWS)
-        or not AcceleratorTarget.from_device(input_value.device).is_cuda_capability(12, 0)
     ):
         return False
 
-    expected_scale_shape = (
-        (output_features + 127) // 128 * 32,
-        (input_features + 63) // 64 * 16,
-    )
-    for prefix in ("sparse_q", "sparse_k", "sparse_v"):
+    for prefix in prefixes:
+        input_qdata = metadata[f"{prefix}_input_qdata"]
+        input_scale = metadata[f"{prefix}_input_scale"]
+        input_global_scale = metadata[f"{prefix}_input_per_tensor_scale"]
         weight = metadata[f"{prefix}_weight_qdata"]
-        scale = metadata[f"{prefix}_weight_scale"]
+        weight_scale = metadata[f"{prefix}_weight_scale"]
         global_scale_valid, global_scale = _optional_tensor_metadata(
             match.kwargs[f"{prefix}_weight_per_tensor_scale"]
         )
         bias_valid, bias = _optional_tensor_metadata(match.kwargs[f"{prefix}_bias"])
-        activation_scale_valid, activation_scale = _optional_tensor_metadata(
-            match.kwargs[f"{prefix}_activation_per_tensor_scale"]
-        )
-        dynamic_activation_scale = match.kwargs[f"{prefix}_dynamic_activation_scale"]
+        linear_shape = match.kwargs[f"{prefix}_linear_shape"]
+        logical_dtype = match.kwargs[f"{prefix}_logical_dtype"]
+        assert input_qdata is not None
+        assert input_scale is not None
+        assert input_global_scale is not None
         assert weight is not None
-        assert scale is not None
+        assert weight_scale is not None
+        if not global_scale_valid or not bias_valid:
+            return False
+        try:
+            projection_sequence_length, projection_heads = _validation.validate_projection(
+                input_qdata,
+                input_scale,
+                input_global_scale,
+                weight,
+                weight_scale,
+                global_scale,
+                bias,
+                query.DEFAULT_CHUNK_ROWS,
+                f"{prefix} compiler projection",
+            )
+        except ValueError:
+            return False
+        linear_sequence_length = (
+            _integer_scalar_metadata(linear_shape[1])
+            if isinstance(linear_shape, (list, tuple)) and len(linear_shape) == 3
+            else None
+        )
         if (
-            weight.dtype is not torch.uint8
-            or tuple(weight.shape) != (output_features, input_features // 2)
-            or scale.dtype is not torch.float8_e4m3fn
-            or tuple(scale.shape) != expected_scale_shape
-            or weight.device != input_value.device
-            or scale.device != input_value.device
-            or not global_scale_valid
-            or not bias_valid
-            or not activation_scale_valid
-            or not isinstance(dynamic_activation_scale, bool)
-            or (activation_scale is None and not dynamic_activation_scale)
+            preparation_sharing.dimension_key(projection_sequence_length)
+            != preparation_sharing.dimension_key(sequence_length)
+            or projection_heads != heads
+            or not isinstance(linear_shape, (list, tuple))
+            or len(linear_shape) != 3
+            or _static_int(linear_shape[0]) != 1
+            or linear_sequence_length is None
+            or preparation_sharing.dimension_key(linear_sequence_length)
+            != preparation_sharing.dimension_key(sequence_length)
+            or _static_int(linear_shape[2]) != output_features
+            or logical_dtype is not torch.bfloat16
         ):
             return False
-        if activation_scale is not None:
-            activation_scale_value = cast(torch.Tensor, activation_scale)
-            if (
-                activation_scale_value.shape != ()
-                or activation_scale_value.dtype is not torch.float32
-                or activation_scale_value.device != input_value.device
-            ):
-                return False
-        if global_scale is not None:
-            global_scale_value = cast(torch.Tensor, global_scale)
-            if (
-                global_scale_value.shape != ()
-                or global_scale_value.dtype is not torch.float32
-                or global_scale_value.device != input_value.device
-            ):
-                return False
-        if bias is not None:
-            bias_value = cast(torch.Tensor, bias)
-            if (
-                bias_value.shape != (output_features,)
-                or bias_value.dtype is not torch.bfloat16
-                or bias_value.device != input_value.device
-            ):
-                return False
 
     for name in ("sparse_q_norm_weight", "sparse_k_norm_weight"):
         norm = metadata[name]
@@ -260,7 +265,7 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
         if (
             norm.dtype is not torch.bfloat16
             or tuple(norm.shape) != (_HEAD_DIM,)
-            or norm.device != input_value.device
+            or norm.device != q_input.device
         ):
             return False
     if any(
@@ -290,8 +295,8 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
         or sin.dtype is not torch.float32
         or tuple(cos.shape) != (sequence_length, rotary_dim)
         or tuple(sin.shape) != (sequence_length, rotary_dim)
-        or cos.device != input_value.device
-        or sin.device != input_value.device
+        or cos.device != q_input.device
+        or sin.device != q_input.device
     ):
         return False
 
@@ -322,29 +327,32 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912, PLR0915
 
 def _replace_projection(  # noqa: PLR0913, PLR0917
     match: Match,
-    sparse_input: torch.fx.Node,
+    sparse_q_input_qdata: torch.fx.Node,
+    sparse_q_input_scale: torch.fx.Node,
+    sparse_q_input_per_tensor_scale: torch.fx.Node,
     sparse_q_weight_qdata: torch.fx.Node,
     sparse_q_weight_scale: torch.fx.Node,
     sparse_q_weight_per_tensor_scale: torch.fx.Node | None,
-    sparse_q_activation_per_tensor_scale: torch.fx.Node | None,
     sparse_q_bias: torch.fx.Node | None,
-    sparse_q_dynamic_activation_scale: bool,
+    sparse_k_input_qdata: torch.fx.Node,
+    sparse_k_input_scale: torch.fx.Node,
+    sparse_k_input_per_tensor_scale: torch.fx.Node,
     sparse_k_weight_qdata: torch.fx.Node,
     sparse_k_weight_scale: torch.fx.Node,
     sparse_k_weight_per_tensor_scale: torch.fx.Node | None,
-    sparse_k_activation_per_tensor_scale: torch.fx.Node | None,
     sparse_k_bias: torch.fx.Node | None,
-    sparse_k_dynamic_activation_scale: bool,
+    sparse_v_input_qdata: torch.fx.Node,
+    sparse_v_input_scale: torch.fx.Node,
+    sparse_v_input_per_tensor_scale: torch.fx.Node,
     sparse_v_weight_qdata: torch.fx.Node,
     sparse_v_weight_scale: torch.fx.Node,
     sparse_v_weight_per_tensor_scale: torch.fx.Node | None,
-    sparse_v_activation_per_tensor_scale: torch.fx.Node | None,
     sparse_v_bias: torch.fx.Node | None,
-    sparse_v_dynamic_activation_scale: bool,
     sparse_q_norm_weight: torch.fx.Node,
     sparse_k_norm_weight: torch.fx.Node,
     sparse_cos: torch.fx.Node,
     sparse_sin: torch.fx.Node,
+    sparse_attention_shape: list[Argument],
     sparse_head_keep_ratio_units: list[int],
     sparse_q_norm_epsilon: float,
     sparse_k_norm_epsilon: float,
@@ -354,43 +362,16 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
 ) -> None:
     original = match.output_node()
     graph = match.graph
-    input_value = preparation_sharing.tensor_metadata(sparse_input)
+    input_value = preparation_sharing.tensor_metadata(sparse_q_input_qdata)
     q_weight_value = preparation_sharing.tensor_metadata(sparse_q_weight_qdata)
     assert input_value is not None
     assert q_weight_value is not None
-    sequence_length = input_value.shape[1]
+    sequence_length = input_value.shape[0]
     heads = q_weight_value.shape[0] // _HEAD_DIM
     storage_sequence_length = layout.padded_sequence_length(sequence_length)
+    logical_sequence_length = _integer_scalar_argument(sparse_attention_shape[1])
+    assert logical_sequence_length is not None
     with graph.inserting_before(original):
-        logical_sequence_length = graph.call_function(
-            torch.ops.aten.sym_size.int,
-            args=(sparse_input, 1),
-        )
-        logical_sequence_length.meta["val"] = sequence_length
-        prepared_inputs: dict[
-            tuple[torch.fx.Node | None, bool], _compile_fx.PreparedInputNodes
-        ] = {}
-
-        def prepare(
-            activation_scale: torch.fx.Node | None,
-            dynamic_activation_scale: bool,
-        ) -> _compile_fx.PreparedInputNodes:
-            preparation_key = (activation_scale, dynamic_activation_scale)
-            prepared = prepared_inputs.get(preparation_key)
-            if prepared is None:
-                prepared = _compile_fx.emit_prepared_input(
-                    graph,
-                    sparse_input,
-                    activation_scale,
-                    dynamic_activation_scale,
-                )
-                prepared_inputs[preparation_key] = prepared
-            return prepared
-
-        q_input_qdata, q_input_scale, q_input_global_scale, _q_shape = prepare(
-            sparse_q_activation_per_tensor_scale,
-            sparse_q_dynamic_activation_scale,
-        )
         query_values = (
             input_value.new_empty((1, heads, storage_sequence_length, _HEAD_DIM), dtype=torch.int8),
             input_value.new_empty(
@@ -406,9 +387,9 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default,
             (
-                q_input_qdata,
-                q_input_scale,
-                q_input_global_scale,
+                sparse_q_input_qdata,
+                sparse_q_input_scale,
+                sparse_q_input_per_tensor_scale,
                 sparse_q_weight_qdata,
                 sparse_q_weight_scale,
                 sparse_q_weight_per_tensor_scale,
@@ -421,10 +402,6 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
                 query.DEFAULT_CHUNK_ROWS,
             ),
             query_values,
-        )
-        k_input_qdata, k_input_scale, k_input_global_scale, _k_shape = prepare(
-            sparse_k_activation_per_tensor_scale,
-            sparse_k_dynamic_activation_scale,
         )
         key_values = (
             input_value.new_empty((1, heads, storage_sequence_length, _HEAD_DIM), dtype=torch.int8),
@@ -444,9 +421,9 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default,
             (
-                k_input_qdata,
-                k_input_scale,
-                k_input_global_scale,
+                sparse_k_input_qdata,
+                sparse_k_input_scale,
+                sparse_k_input_per_tensor_scale,
                 sparse_k_weight_qdata,
                 sparse_k_weight_scale,
                 sparse_k_weight_per_tensor_scale,
@@ -459,16 +436,12 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             ),
             key_values,
         )
-        v_input_qdata, v_input_scale, v_input_global_scale, _v_shape = prepare(
-            sparse_v_activation_per_tensor_scale,
-            sparse_v_dynamic_activation_scale,
-        )
         value_mean_flat = graph.call_function(
             torch.ops.piper_kernels.nvfp4_linear_mean.default,
             args=(
-                v_input_qdata,
-                v_input_scale,
-                v_input_global_scale,
+                sparse_v_input_qdata,
+                sparse_v_input_scale,
+                sparse_v_input_per_tensor_scale,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
                 sparse_v_weight_per_tensor_scale,
@@ -496,9 +469,9 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default,
             (
-                v_input_qdata,
-                v_input_scale,
-                v_input_global_scale,
+                sparse_v_input_qdata,
+                sparse_v_input_scale,
+                sparse_v_input_per_tensor_scale,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
                 sparse_v_weight_per_tensor_scale,
@@ -557,10 +530,10 @@ compile_pass = _CompilePass()
 def nvfp4_sparse_piper_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Install sparse projection fusion before ordinary NVFP4 preparation sharing."""
+    """Canonicalize repeated NVFP4 projections before sparse-attention fusion."""
     return preparation_sharing.add_ordered_post_grad_passes(
         options,
-        (compile_pass, nvfp4_compile.compile_pass),
+        (nvfp4_compile.compile_pass, compile_pass),
     )
 
 

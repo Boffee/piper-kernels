@@ -47,7 +47,7 @@ def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool = True) -> No
     compile_pass(graph, is_inference=is_inference)
 
 
-def test_pass_shares_only_identically_calibrated_compatible_inputs() -> None:
+def test_pass_canonicalizes_repeated_family_and_shares_identical_preparations() -> None:
     graph = torch.fx.Graph()
     input = _placeholder(graph, "input", torch.empty(2, 17, 256, device="meta"))  # noqa: A001
     qdata = _placeholder(graph, "qdata", torch.empty(128, 128, dtype=torch.uint8))
@@ -67,10 +67,29 @@ def test_pass_shares_only_identically_calibrated_compatible_inputs() -> None:
     _run_compile_pass(graph)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 1
-    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 2
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 2
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert targets.count(torch.ops.aten.reshape.default) == 3
+    graph.lint()
+
+
+def test_pass_leaves_eligible_singleton_semantic() -> None:
+    graph = torch.fx.Graph()
+    input = _placeholder(graph, "input", torch.empty(17, 256, device="meta"))  # noqa: A001
+    qdata = _placeholder(graph, "qdata", torch.empty(128, 128, dtype=torch.uint8))
+    scale = _placeholder(graph, "scale", torch.empty(128, 16, dtype=torch.float8_e4m3fn))
+    global_scale = _placeholder(graph, "global_scale", torch.empty(()))
+    activation_scale = _placeholder(graph, "activation_scale", torch.empty(()))
+    projected = _linear(graph, input, qdata, scale, global_scale, activation_scale)
+    graph.output(projected)
+
+    _run_compile_pass(graph)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
-    assert targets.count(torch.ops.aten.reshape.default) == 2
+    assert torch.ops.piper_kernels.nvfp4_prepare_input.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
     graph.lint()
 
 

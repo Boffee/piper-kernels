@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import operator
-from collections.abc import Hashable, Mapping
+from collections.abc import Mapping
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -53,7 +53,10 @@ class _PreparationRule:
 
     linear_target = torch.ops.piper_kernels.convrot_int8_linear.default
 
-    def match_key(self, node: torch.fx.Node) -> Hashable | None:
+    def match_key(
+        self,
+        node: torch.fx.Node,
+    ) -> preparation_sharing.PreparationMatchKey | None:
         if node.kwargs or len(node.args) not in (5, 6):
             return None
         arguments = (*node.args, None) if len(node.args) == 5 else node.args
@@ -78,12 +81,13 @@ class _PreparationRule:
             return None
 
         # Exact FX identity prevents sharing across functionalized mutations.
-        return (
+        key = (
             input_node,
             group_size,
             preparation_sharing.dimension_key(weight_qdata_value.shape[1]),
             input_value.dtype,
         )
+        return key, key
 
     def prepare(
         self,
