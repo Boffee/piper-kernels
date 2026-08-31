@@ -12,8 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
-    triton as qk_quantization,
+from piper_kernels.attention.kernels.sparse_piper import (
+    triton as sparse_piper_kernels,
 )
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
@@ -65,7 +65,6 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
     row_offsets = batch * logical_sequence_length + sequence_offsets
     projection_feature_offsets = tl.arange(0, block_n)
-    feature_offsets = tl.arange(0, head_dim)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
     weight_offsets = head_block * block_n + projection_feature_offsets
     key = project_rmsnorm_rope_tile(
@@ -93,58 +92,24 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         block_n,
         block_k,
     )
-    valid_rows = sequence_offsets < logical_sequence_length
-    key = tl.where(valid_rows[:, None, None], key, 0.0)
-    key_head_major = tl.permute(key, (1, 0, 2))
-    grouped = tl.reshape(
-        key_head_major,
-        (
-            heads_per_program,
-            block_m // _JIT_KEY_TILE_ROWS,
-            _JIT_KEY_TILE_ROWS,
-            head_dim,
-        ),
-    )
-    local_tile_offsets = tl.arange(0, block_m // _JIT_KEY_TILE_ROWS)
-    tile_offsets = row_block * (block_m // _JIT_KEY_TILE_ROWS) + local_tile_offsets
-    row_in_tile = tl.arange(0, _JIT_KEY_TILE_ROWS)
-    valid = (
-        tile_offsets[:, None] * _JIT_KEY_TILE_ROWS + row_in_tile[None, :] < logical_sequence_length
-    )
-    key_max = tl.max(
-        tl.where(valid[None, :, :, None], grouped, -float("inf")),
-        axis=2,
-    )
-    key_min = tl.min(
-        tl.where(valid[None, :, :, None], grouped, float("inf")),
-        axis=2,
-    )
-
-    quantized, key_scale = qk_quantization.quantize_key_tile(
+    sparse_piper_kernels.store_key_tile(
         key,
+        key_ptr,
+        key_scale_ptr,
+        key_max_ptr,
+        key_min_ptr,
+        batch,
+        heads,
+        head_offsets,
+        sequence_offsets,
+        logical_sequence_length,
+        storage_sequence_length,
+        row_block,
         heads_per_program,
         head_dim,
         block_m,
         _JIT_KEY_TILE_ROWS,
     )
-    key_offsets = (
-        (batch * heads + head_offsets[:, None, None]) * storage_sequence_length * head_dim
-        + sequence_offsets[None, :, None] * head_dim
-        + feature_offsets[None, None, :]
-    )
-    tl.store(
-        key_ptr + key_offsets,
-        quantized,
-        mask=(head_offsets[:, None, None] < heads)
-        & (sequence_offsets[None, :, None] < storage_sequence_length),
-    )
-    tile_count = storage_sequence_length // _JIT_KEY_TILE_ROWS
-    scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
-    tile_mask = (head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count)
-    tl.store(key_scale_ptr + scale_offsets, key_scale, mask=tile_mask)
-    summary_offsets = scale_offsets[:, :, None] * head_dim + feature_offsets[None, None, :]
-    tl.store(key_max_ptr + summary_offsets, key_max, mask=tile_mask[:, :, None])
-    tl.store(key_min_ptr + summary_offsets, key_min, mask=tile_mask[:, :, None])
 
 
 def _validate_inputs(

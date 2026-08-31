@@ -6,6 +6,7 @@ from collections.abc import Hashable
 import torch
 
 from piper_kernels.linear._preparation_sharing import (
+    add_ordered_post_grad_passes,
     add_post_grad_pass,
     share_preparation,
 )
@@ -105,4 +106,30 @@ def test_options_compose_without_mutating_or_duplicating() -> None:
     assert original_options["post_grad_custom_pre_pass"] == [existing_pass]
     assert combined["max_autotune"] is True
     assert combined["post_grad_custom_pre_pass"] == (existing_pass, compiler_pass)
+    assert repeated == combined
+
+
+def test_ordered_pass_group_replaces_anchor_without_moving_unrelated_passes() -> None:
+    unrelated_before = object()
+    fusion = object()
+    backend = object()
+    unrelated_after = object()
+    original = {
+        "post_grad_custom_pre_pass": (
+            unrelated_before,
+            backend,
+            unrelated_after,
+            fusion,
+        )
+    }
+
+    combined = add_ordered_post_grad_passes(original, (fusion, backend))
+    repeated = add_ordered_post_grad_passes(combined, (fusion, backend))
+
+    assert combined["post_grad_custom_pre_pass"] == (
+        unrelated_before,
+        fusion,
+        backend,
+        unrelated_after,
+    )
     assert repeated == combined

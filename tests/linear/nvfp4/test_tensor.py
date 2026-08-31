@@ -1,0 +1,146 @@
+"""Tests for Piper's semantic TorchAO NVFP4 wrapper."""
+
+import pytest
+import torch
+from torch.nn import functional as F  # noqa: N812
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    NVFP4Tensor as TorchAONVFP4Tensor,
+)
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    QuantizeTensorToNVFP4Kwargs,
+    per_tensor_amax_to_scale,
+)
+
+from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.linear.nvfp4._ops import prepare_input
+from piper_kernels.linear.nvfp4._projection import linear_prepared_chunk_out
+
+
+def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
+    return QuantizeTensorToNVFP4Kwargs(
+        block_size=16,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+        use_dynamic_per_tensor_scale=dynamic,
+    )
+
+
+def test_from_torchao_reuses_storage_and_metadata() -> None:
+    source = TorchAONVFP4Tensor(
+        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
+        torch.empty(128, 16, dtype=torch.float8_e4m3fn, device="meta"),
+        16,
+        torch.bfloat16,
+        torch.empty((), device="meta"),
+        torch.empty((), device="meta"),
+        True,
+        False,
+        _quantization(False),
+    )
+
+    wrapped = PiperNVFP4Tensor.from_torchao(source)
+
+    assert type(wrapped) is PiperNVFP4Tensor
+    assert wrapped.qdata is source.qdata
+    assert wrapped.scale is source.scale
+    assert wrapped.per_tensor_scale is source.per_tensor_scale
+    assert wrapped.act_per_tensor_scale is source.act_per_tensor_scale
+    assert wrapped.act_quant_kwargs == source.act_quant_kwargs
+    assert PiperNVFP4Tensor.from_torchao(wrapped) is wrapped
+
+
+def test_device_copy_preserves_piper_wrapper() -> None:
+    source = PiperNVFP4Tensor(
+        torch.empty(128, 128, dtype=torch.uint8),
+        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        16,
+        torch.bfloat16,
+        torch.empty(()),
+        torch.empty(()),
+        True,
+        False,
+        _quantization(False),
+    )
+
+    moved = source.to(device="meta")
+
+    assert type(moved) is PiperNVFP4Tensor
+    assert moved.device.type == "meta"
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_semantic_linear_matches_torchao(dynamic: bool) -> None:
+    torch.manual_seed(417)
+    input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    activation_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
+    torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+        weight,
+        per_tensor_scale=per_tensor_amax_to_scale(weight.abs().amax()),
+        act_per_tensor_scale=activation_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(dynamic),
+    )
+    piper_weight = PiperNVFP4Tensor.from_torchao(torchao_weight)
+
+    expected = F.linear(input, torchao_weight)
+    actual = F.linear(input, piper_weight)
+
+    assert torch.equal(actual, expected)
+    assert torch.ops.piper_kernels.nvfp4_linear.default is not None
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_chunked_projection_matches_compiled_torchao(with_bias: bool) -> None:
+    torch.manual_seed(419)
+    input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    dense_weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    activation_scale = per_tensor_amax_to_scale(input.abs().amax())
+    weight = TorchAONVFP4Tensor.to_nvfp4(
+        dense_weight,
+        per_tensor_scale=per_tensor_amax_to_scale(dense_weight.abs().amax()),
+        act_per_tensor_scale=activation_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(False),
+    )
+    bias = torch.randn(128, device="cuda", dtype=torch.bfloat16) if with_bias else None
+
+    def project(value: torch.Tensor) -> torch.Tensor:
+        return F.linear(value, weight, bias)
+
+    expected = torch.compile(project, fullgraph=True)(input)
+    input_qdata, input_scale, input_per_tensor_scale = prepare_input(
+        input,
+        activation_scale,
+        False,
+    )
+    output = torch.empty_like(expected)
+    buffer = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+    assert weight.per_tensor_scale is not None
+    for start in range(0, input.shape[0], 128):
+        end = min(start + 128, input.shape[0])
+        chunk = linear_prepared_chunk_out(
+            input_qdata,
+            input_scale,
+            input_per_tensor_scale,
+            weight.qdata,
+            weight.scale,
+            weight.per_tensor_scale,
+            bias,
+            start,
+            end,
+            buffer,
+        )
+        output[start:end].copy_(chunk)
+
+    assert torch.equal(output, expected)

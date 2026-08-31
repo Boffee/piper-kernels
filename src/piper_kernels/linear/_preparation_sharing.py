@@ -111,8 +111,47 @@ def add_post_grad_pass(
     return combined
 
 
+def add_ordered_post_grad_passes(
+    options: Mapping[str, object] | None,
+    compiler_passes: Sequence[object],
+) -> dict[str, object]:
+    """Install an idempotent ordered pass group where its final pass was located."""
+    if not compiler_passes:
+        return dict(options) if options is not None else {}
+    combined = dict(options) if options is not None else {}
+    existing = combined.get(_POST_GRAD_PRE_PASS)
+    if existing is None:
+        passes: tuple[object, ...] = ()
+    elif isinstance(existing, (list, tuple)):
+        passes = tuple(existing)
+    else:
+        passes = (existing,)
+
+    anchor = compiler_passes[-1]
+    anchor_index = next(
+        (index for index, compiler_pass in enumerate(passes) if compiler_pass is anchor),
+        len(passes),
+    )
+    unrelated = tuple(
+        compiler_pass
+        for compiler_pass in passes
+        if not any(compiler_pass is grouped for grouped in compiler_passes)
+    )
+    insertion_index = sum(
+        not any(compiler_pass is grouped for grouped in compiler_passes)
+        for compiler_pass in passes[:anchor_index]
+    )
+    combined[_POST_GRAD_PRE_PASS] = (
+        *unrelated[:insertion_index],
+        *compiler_passes,
+        *unrelated[insertion_index:],
+    )
+    return combined
+
+
 __all__ = [
     "PreparationSharingRule",
+    "add_ordered_post_grad_passes",
     "add_post_grad_pass",
     "dimension_key",
     "share_preparation",
