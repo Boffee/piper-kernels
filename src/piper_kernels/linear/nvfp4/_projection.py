@@ -1,39 +1,14 @@
 """Raw prepared-NVFP4 projection helpers for fused consumers."""
 
-# pyright: reportCallIssue=false, reportIndexIssue=false
-
-# Triton device functions cannot carry ordinary Python type annotations.
-# ruff: noqa: ANN001, ANN202
+# pyright: reportCallIssue=false
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 
 _SWIZZLE_ROWS = 128
 _SWIZZLE_COLUMNS = 64
 _SCALE_ELEMENTS_PER_TILE = 32 * 16
-_EPILOGUE_BLOCK = 256
-
-
-@triton.jit
-def _scale_bias_kernel(
-    output_ptr,
-    global_scale_ptr,
-    bias_ptr,
-    elements,
-    output_features: tl.constexpr,
-    has_bias: tl.constexpr,
-    block: tl.constexpr,
-):
-    offsets = tl.program_id(0) * block + tl.arange(0, block)
-    valid = offsets < elements
-    values = tl.load(output_ptr + offsets, mask=valid).to(tl.float32)
-    values *= tl.load(global_scale_ptr).to(tl.float32)
-    if has_bias:
-        values += tl.load(bias_ptr + offsets % output_features, mask=valid).to(tl.float32)
-    tl.store(output_ptr + offsets, values, mask=valid)
 
 
 def _scale_slice(
@@ -85,42 +60,4 @@ def matmul_prepared_chunk_out(
     return output_chunk
 
 
-def linear_prepared_chunk_out(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_per_tensor_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_per_tensor_scale: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    row_start: int,
-    row_end: int,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    """Materialize one scaled NVFP4 linear chunk with standard BF16 semantics."""
-    output_chunk = matmul_prepared_chunk_out(
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-        row_start,
-        row_end,
-        output,
-    )
-    global_scale = input_per_tensor_scale
-    if weight_per_tensor_scale is not None:
-        global_scale = global_scale * weight_per_tensor_scale
-    _scale_bias_kernel[(triton.cdiv(output_chunk.numel(), _EPILOGUE_BLOCK),)](
-        output_chunk,
-        global_scale,
-        bias,
-        output_chunk.numel(),
-        output_features=output_chunk.shape[1],
-        has_bias=bias is not None,
-        block=_EPILOGUE_BLOCK,
-        num_warps=4,
-    )
-    return output_chunk
-
-
-__all__ = ["linear_prepared_chunk_out", "matmul_prepared_chunk_out"]
+__all__ = ["matmul_prepared_chunk_out"]

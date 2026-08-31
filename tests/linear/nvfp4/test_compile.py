@@ -141,6 +141,7 @@ def test_cuda_compile_shares_three_static_projections() -> None:
     input = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     activation_scale = per_tensor_amax_to_scale(input.abs().amax())
     weights = []
+    biases = []
     quantization = QuantizeTensorToNVFP4Kwargs(
         block_size=16,
         is_swizzled_scales=True,
@@ -157,9 +158,12 @@ def test_cuda_compile_shares_three_static_projections() -> None:
             act_quant_kwargs=quantization,
         )
         weights.append(PiperNVFP4Tensor.from_torchao(torchao_weight))
+        biases.append(torch.randn(128, device="cuda", dtype=torch.bfloat16))
 
     def projections(value: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return tuple(F.linear(value, weight) for weight in weights)
+        return tuple(
+            F.linear(value, weight, bias) for weight, bias in zip(weights, biases, strict=True)
+        )
 
     expected = projections(input)
     capture = _TargetCapturePass()
