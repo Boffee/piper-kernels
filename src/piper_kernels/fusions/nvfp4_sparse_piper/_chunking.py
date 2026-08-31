@@ -9,6 +9,8 @@ import torch
 
 from piper_kernels.linear.nvfp4._projection import matmul_prepared_chunk_out
 
+DEFAULT_CHUNK_ROWS = 4096
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedProjection:
@@ -79,4 +81,4 @@ def run_chunked_projection(
             tensor.record_stream(consumer)
 
 
-__all__ = ["PreparedProjection", "run_chunked_projection"]
+__all__ = ["DEFAULT_CHUNK_ROWS", "PreparedProjection", "run_chunked_projection"]

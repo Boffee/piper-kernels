@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 
 import torch
@@ -27,20 +26,20 @@ from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
 from piper_kernels.attention.sparse_piper_attention import (
-    _budget,
     _quantized_dispatch,
     dispatch,
 )
 from piper_kernels.fusions.convrot_sage_qk import triton as convrot_sage_qk
-from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.projected_qk import triton as projected_qk
+from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v11"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v12"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -57,13 +56,13 @@ def _source_files() -> tuple[str, ...]:
             qk_quantization.__file__,
             sparse_piper_kernels.__file__,
             convrot_sage_qk.__file__,
-            projected_qk_pattern.__file__,
+            *sparse_piper_compile.source_files(),
+            sparse_piper_pattern.__file__,
             projected_qk.__file__,
             query.__file__,
             key.__file__,
             output.__file__,
             value.__file__,
-            _budget.__file__,
             _quantized_dispatch.__file__,
             dispatch.__file__,
             _compile_fx.__file__,
@@ -84,38 +83,7 @@ def _linear_pattern(prefix: str) -> CallFunction:
     )
 
 
-def _static_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _integer_scalar_metadata(value: object) -> int | torch.SymInt | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, torch.SymInt)):
-        return value
-    if isinstance(value, torch.fx.Node):
-        metadata = value.meta.get("val")
-        if isinstance(metadata, (int, torch.SymInt)) and not isinstance(metadata, bool):
-            return metadata
-    return None
-
-
-def _integer_scalar_argument(value: object) -> Argument | None:
-    if _integer_scalar_metadata(value) is None:
-        return None
-    if isinstance(value, (int, torch.SymInt, torch.fx.Node)):
-        return value
-    return None
-
-
-def _positive_float(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    converted = float(value)
-    return converted if math.isfinite(converted) and converted > 0 else None
-
-
-def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912
+def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
     nodes = (
         "sparse_input",
         "sparse_q_weight_qdata",
@@ -124,10 +92,6 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         "sparse_k_weight_scale",
         "sparse_v_weight_qdata",
         "sparse_v_weight_scale",
-        "sparse_q_norm_weight",
-        "sparse_k_norm_weight",
-        "sparse_cos",
-        "sparse_sin",
     )
     if any(not isinstance(match.kwargs[name], torch.fx.Node) for name in nodes):
         return False
@@ -146,39 +110,19 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
 
     input_value = metadata["sparse_input"]
     assert input_value is not None
-    output_value = preparation_sharing.tensor_metadata(match.output_node())
-    shape = match.kwargs["sparse_attention_shape"]
-    if (
-        input_value.ndim != 3
-        or output_value is None
-        or output_value.ndim != 4
-        or not isinstance(shape, (list, tuple))
-        or len(shape) != 4
-    ):
+    if input_value.ndim != 3:
         return False
-    input_features = _static_int(input_value.shape[-1])
+    input_features = sparse_piper_compile.static_int(input_value.shape[-1])
     q_weight = metadata["sparse_q_weight_qdata"]
     assert q_weight is not None
-    output_features = _static_int(q_weight.shape[0])
+    output_features = sparse_piper_compile.static_int(q_weight.shape[0])
     if input_features is None or output_features is None or output_features % _HEAD_DIM:
         return False
-    _batch, sequence_length = input_value.shape[:2]
+    batch, sequence_length = input_value.shape[:2]
     heads = output_features // _HEAD_DIM
-    shape_heads = _static_int(shape[2])
-    shape_head_dim = _static_int(shape[3])
-    output_shape = output_value.shape
     if (
         input_value.dtype is not torch.bfloat16
         or input_value.device.type != "cuda"
-        or output_value.dtype is not torch.bfloat16
-        or output_value.device != input_value.device
-        or preparation_sharing.dimension_key(output_shape[0])
-        != preparation_sharing.dimension_key(_batch)
-        or preparation_sharing.dimension_key(output_shape[1])
-        != preparation_sharing.dimension_key(sequence_length)
-        or output_shape[2:] != (heads, _HEAD_DIM)
-        or shape_heads != heads
-        or shape_head_dim != _HEAD_DIM
         or (isinstance(sequence_length, int) and sequence_length < _TILE_ROWS)
     ):
         return False
@@ -186,7 +130,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
     if not target.is_cuda_capability(12, 0):
         return False
 
-    group_size = _static_int(match.kwargs["sparse_group_size"])
+    group_size = sparse_piper_compile.static_int(match.kwargs["sparse_group_size"])
     if input_features is None or group_size is None or group_size < 1:
         return False
     for prefix in ("sparse_q", "sparse_k", "sparse_v"):
@@ -204,82 +148,14 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         ):
             return False
 
-    for name in ("sparse_q_norm_weight", "sparse_k_norm_weight"):
-        norm = metadata[name]
-        assert norm is not None
-        if (
-            norm.dtype is not torch.bfloat16
-            or tuple(norm.shape) != (_HEAD_DIM,)
-            or norm.device != input_value.device
-        ):
-            return False
-    if any(
-        _positive_float(match.kwargs[name]) is None
-        for name in (
-            "sparse_q_norm_epsilon",
-            "sparse_k_norm_epsilon",
-            "sparse_softmax_scale",
-        )
-    ):
-        return False
-
-    rotary_dim = _integer_scalar_metadata(match.kwargs["sparse_rotary_dim"])
-    half_rotary_dim = _integer_scalar_metadata(match.kwargs["sparse_half_rotary_dim"])
-    cos = metadata["sparse_cos"]
-    sin = metadata["sparse_sin"]
-    assert cos is not None
-    assert sin is not None
-    if (
-        rotary_dim is None
-        or half_rotary_dim is None
-        or cos.dtype is not torch.float32
-        or sin.dtype is not torch.float32
-        or cos.ndim != 2
-        or sin.ndim != 2
-        or preparation_sharing.dimension_key(cos.shape[0])
-        != preparation_sharing.dimension_key(sequence_length)
-        or preparation_sharing.dimension_key(sin.shape[0])
-        != preparation_sharing.dimension_key(sequence_length)
-        or preparation_sharing.dimension_key(cos.shape[1])
-        != preparation_sharing.dimension_key(rotary_dim)
-        or preparation_sharing.dimension_key(sin.shape[1])
-        != preparation_sharing.dimension_key(rotary_dim)
-        or preparation_sharing.dimension_key(half_rotary_dim)
-        != preparation_sharing.dimension_key((rotary_dim + 1) // 2)
-        or cos.device != input_value.device
-        or sin.device != input_value.device
-    ):
-        return False
-    if isinstance(rotary_dim, int):
-        if rotary_dim < 2 or rotary_dim > _HEAD_DIM or rotary_dim % 2:
-            return False
-        if not isinstance(half_rotary_dim, int) or half_rotary_dim != rotary_dim // 2:
-            return False
-        if cos.shape[1] != rotary_dim or sin.shape[1] != rotary_dim:
-            return False
-
-    sparse_key_blocks = _integer_scalar_argument(match.kwargs["sparse_key_blocks"])
-    static_sparse_key_blocks = _static_int(sparse_key_blocks)
-    if (
-        sparse_key_blocks is None
-        or (static_sparse_key_blocks is not None and static_sparse_key_blocks < 1)
-        or (
-            static_sparse_key_blocks is not None
-            and isinstance(sequence_length, int)
-            and static_sparse_key_blocks > sequence_length // _TILE_ROWS
-        )
-    ):
-        return False
-    head_keep_ratio_units = match.kwargs["sparse_head_keep_ratio_units"]
-    return bool(
-        isinstance(head_keep_ratio_units, (list, tuple))
-        and len(head_keep_ratio_units) == heads
-        and all(
-            isinstance(units, int)
-            and not isinstance(units, bool)
-            and 1 <= units <= _budget._RATIO_SCALE
-            for units in head_keep_ratio_units
-        )
+    return sparse_piper_compile.valid_sparse_piper_attention(
+        match,
+        batch=batch,
+        sequence_length=sequence_length,
+        heads=heads,
+        device=input_value.device,
+        head_dim=_HEAD_DIM,
+        tile_rows=_TILE_ROWS,
     )
 
 
@@ -447,7 +323,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
 
 _patterns = PatternMatcherPass("convrot_sparse_piper_projection")
 register_graph_pattern(
-    projected_qk_pattern.sparse_piper_projection_pattern(_linear_pattern),
+    sparse_piper_pattern.sparse_piper_projection_pattern(_linear_pattern),
     extra_check=_valid_sparse_piper_projection,
     pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
 )(_replace_sparse_piper_projection)

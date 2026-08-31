@@ -11,9 +11,8 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
 )
 
 from . import _epilogue
-from ._chunking import PreparedProjection, run_chunked_projection
+from ._chunking import DEFAULT_CHUNK_ROWS, PreparedProjection, run_chunked_projection
 from ._validation import validate_projection
-from .query import DEFAULT_CHUNK_ROWS
 
 
 def _launch_value(

@@ -1,4 +1,4 @@
-"""Projection-independent RMSNorm/RoPE sparse-attention graph grammar."""
+"""Projection-independent RMSNorm/RoPE sparse-Piper graph grammar."""
 
 from __future__ import annotations
 
