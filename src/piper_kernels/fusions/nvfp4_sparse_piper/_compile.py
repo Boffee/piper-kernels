@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import operator
 from collections.abc import Mapping
 from typing import cast
 
@@ -31,6 +30,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     _quantized_dispatch,
     dispatch,
 )
+from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
@@ -44,7 +44,6 @@ _COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v1"
 _HEAD_DIM = layout.HEAD_DIM
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
-_SLICE_END = torch.iinfo(torch.int64).max
 
 
 def _source_files() -> tuple[str, ...]:
@@ -60,6 +59,7 @@ def _source_files() -> tuple[str, ...]:
             value.__file__,
             layout.__file__,
             sparse_piper_triton.__file__,
+            projected_qk_pattern.__file__,
             projected_qk_triton.__file__,
             nvfp4_projection.__file__,
             nvfp4_triton.__file__,
@@ -83,117 +83,6 @@ def _linear_pattern(prefix: str) -> CallFunction:
         KeywordArg(f"{prefix}_bias"),
         KeywordArg(f"{prefix}_dynamic_activation_scale"),
         _users=1,
-    )
-
-
-def _normalized_rope_pattern(prefix: str) -> CallFunction:
-    reshaped = CallFunction(
-        torch.ops.aten.reshape.default,
-        _linear_pattern(prefix),
-        KeywordArg("sparse_attention_shape"),
-        _users=1,
-    )
-    promoted = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        reshaped,
-        torch.float32,
-        _users=2,
-    )
-    squared = CallFunction(torch.ops.aten.pow.Tensor_Scalar, promoted, 2, _users=1)
-    mean = CallFunction(torch.ops.aten.mean.dim, squared, [3], True, _users=1)
-    variance = CallFunction(
-        torch.ops.aten.add.Scalar,
-        mean,
-        KeywordArg(f"{prefix}_norm_epsilon"),
-        _users=1,
-    )
-    inverse_rms = CallFunction(torch.ops.aten.rsqrt.default, variance, _users=1)
-    normalized = CallFunction(torch.ops.aten.mul.Tensor, promoted, inverse_rms, _users=1)
-    scaled = CallFunction(
-        torch.ops.aten.mul.Tensor,
-        normalized,
-        KeywordArg(f"{prefix}_norm_weight"),
-        _users=1,
-    )
-    rounded = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        scaled,
-        torch.bfloat16,
-        _users=2,
-    )
-    rotary = CallFunction(
-        torch.ops.aten.slice.Tensor,
-        rounded,
-        3,
-        0,
-        KeywordArg("sparse_rotary_dim"),
-        _users=2,
-    )
-    split = CallFunction(
-        torch.ops.aten.split.Tensor,
-        rotary,
-        KeywordArg("sparse_half_rotary_dim"),
-        -1,
-        _users=2,
-    )
-    first = CallFunction(operator.getitem, split, 0, _users=1)
-    second = CallFunction(operator.getitem, split, 1, _users=1)
-    cos = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        KeywordArg("sparse_cos"),
-        torch.bfloat16,
-        _users=1,
-    )
-    cos = CallFunction(torch.ops.aten.unsqueeze.default, cos, 0, _users=1)
-    cos = CallFunction(torch.ops.aten.unsqueeze.default, cos, 2, _users=1)
-    direct = CallFunction(torch.ops.aten.mul.Tensor, rotary, cos, _users=1)
-    rotated = CallFunction(
-        torch.ops.aten.cat.default,
-        [CallFunction(torch.ops.aten.neg.default, second, _users=1), first],
-        -1,
-        _users=1,
-    )
-    sin = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        KeywordArg("sparse_sin"),
-        torch.bfloat16,
-        _users=1,
-    )
-    sin = CallFunction(torch.ops.aten.unsqueeze.default, sin, 0, _users=1)
-    sin = CallFunction(torch.ops.aten.unsqueeze.default, sin, 2, _users=1)
-    rotated = CallFunction(torch.ops.aten.mul.Tensor, rotated, sin, _users=1)
-    rotary_output = CallFunction(torch.ops.aten.add.Tensor, direct, rotated, _users=1)
-    passthrough = CallFunction(
-        torch.ops.aten.slice.Tensor,
-        rounded,
-        3,
-        KeywordArg("sparse_rotary_dim"),
-        _SLICE_END,
-        _users=1,
-    )
-    return CallFunction(
-        torch.ops.aten.cat.default,
-        [rotary_output, passthrough],
-        -1,
-        _users=1,
-    )
-
-
-def _projection_pattern() -> CallFunction:
-    projected_value = CallFunction(
-        torch.ops.aten.reshape.default,
-        _linear_pattern("sparse_v"),
-        KeywordArg("sparse_attention_shape"),
-        _users=1,
-    )
-    return CallFunction(
-        torch.ops.piper_kernels.sparse_piper_attention.default,
-        _normalized_rope_pattern("sparse_q"),
-        _normalized_rope_pattern("sparse_k"),
-        projected_value,
-        KeywordArg("sparse_head_keep_ratio_units"),
-        KeywordArg("sparse_key_blocks"),
-        KeywordArg("sparse_softmax_scale"),
     )
 
 
@@ -639,7 +528,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_projection")
 register_graph_pattern(
-    _projection_pattern(),
+    projected_qk_pattern.sparse_piper_projection_pattern(_linear_pattern),
     extra_check=_valid_projection,
     pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
 )(_replace_projection)

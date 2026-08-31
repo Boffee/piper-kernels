@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import operator
 from collections.abc import Mapping
 
 import torch
@@ -33,6 +32,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     dispatch,
 )
 from piper_kernels.fusions.convrot_sage_qk import triton as convrot_sage_qk
+from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
@@ -44,7 +44,6 @@ _COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v11"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
-_SLICE_END = torch.iinfo(torch.int64).max
 
 
 def _source_files() -> tuple[str, ...]:
@@ -58,6 +57,7 @@ def _source_files() -> tuple[str, ...]:
             qk_quantization.__file__,
             sparse_piper_kernels.__file__,
             convrot_sage_qk.__file__,
+            projected_qk_pattern.__file__,
             projected_qk.__file__,
             query.__file__,
             key.__file__,
@@ -72,8 +72,8 @@ def _source_files() -> tuple[str, ...]:
     )
 
 
-def _normalized_rope_pattern(prefix: str) -> CallFunction:
-    linear = CallFunction(
+def _linear_pattern(prefix: str) -> CallFunction:
+    return CallFunction(
         torch.ops.piper_kernels.convrot_int8_linear.default,
         KeywordArg("sparse_input"),
         KeywordArg(f"{prefix}_weight_qdata"),
@@ -81,140 +81,6 @@ def _normalized_rope_pattern(prefix: str) -> CallFunction:
         None,
         KeywordArg("sparse_group_size"),
         _users=1,
-    )
-    reshaped = CallFunction(
-        torch.ops.aten.reshape.default,
-        linear,
-        KeywordArg("sparse_attention_shape"),
-        _users=1,
-    )
-    promoted = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        reshaped,
-        torch.float32,
-        _users=2,
-    )
-    squared = CallFunction(
-        torch.ops.aten.pow.Tensor_Scalar,
-        promoted,
-        2,
-        _users=1,
-    )
-    mean = CallFunction(
-        torch.ops.aten.mean.dim,
-        squared,
-        [3],
-        True,
-        _users=1,
-    )
-    variance = CallFunction(
-        torch.ops.aten.add.Scalar,
-        mean,
-        KeywordArg(f"{prefix}_norm_epsilon"),
-        _users=1,
-    )
-    inverse_rms = CallFunction(torch.ops.aten.rsqrt.default, variance, _users=1)
-    normalized = CallFunction(
-        torch.ops.aten.mul.Tensor,
-        promoted,
-        inverse_rms,
-        _users=1,
-    )
-    scaled = CallFunction(
-        torch.ops.aten.mul.Tensor,
-        normalized,
-        KeywordArg(f"{prefix}_norm_weight"),
-        _users=1,
-    )
-    rounded = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        scaled,
-        torch.bfloat16,
-        _users=2,
-    )
-    rotary = CallFunction(
-        torch.ops.aten.slice.Tensor,
-        rounded,
-        3,
-        0,
-        KeywordArg("sparse_rotary_dim"),
-        _users=2,
-    )
-    split = CallFunction(
-        torch.ops.aten.split.Tensor,
-        rotary,
-        KeywordArg("sparse_half_rotary_dim"),
-        -1,
-        _users=2,
-    )
-    first = CallFunction(operator.getitem, split, 0, _users=1)
-    second = CallFunction(operator.getitem, split, 1, _users=1)
-    cos = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        KeywordArg("sparse_cos"),
-        torch.bfloat16,
-        _users=1,
-    )
-    cos = CallFunction(torch.ops.aten.unsqueeze.default, cos, 0, _users=1)
-    cos = CallFunction(torch.ops.aten.unsqueeze.default, cos, 2, _users=1)
-    direct = CallFunction(torch.ops.aten.mul.Tensor, rotary, cos, _users=1)
-    negated_second = CallFunction(torch.ops.aten.neg.default, second, _users=1)
-    rotated = CallFunction(
-        torch.ops.aten.cat.default,
-        [negated_second, first],
-        -1,
-        _users=1,
-    )
-    sin = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        KeywordArg("sparse_sin"),
-        torch.bfloat16,
-        _users=1,
-    )
-    sin = CallFunction(torch.ops.aten.unsqueeze.default, sin, 0, _users=1)
-    sin = CallFunction(torch.ops.aten.unsqueeze.default, sin, 2, _users=1)
-    rotated = CallFunction(torch.ops.aten.mul.Tensor, rotated, sin, _users=1)
-    rotary_output = CallFunction(torch.ops.aten.add.Tensor, direct, rotated, _users=1)
-    passthrough = CallFunction(
-        torch.ops.aten.slice.Tensor,
-        rounded,
-        3,
-        KeywordArg("sparse_rotary_dim"),
-        _SLICE_END,
-        _users=1,
-    )
-    return CallFunction(
-        torch.ops.aten.cat.default,
-        [rotary_output, passthrough],
-        -1,
-        _users=1,
-    )
-
-
-def _sparse_piper_projection_pattern() -> CallFunction:
-    value = CallFunction(
-        torch.ops.piper_kernels.convrot_int8_linear.default,
-        KeywordArg("sparse_input"),
-        KeywordArg("sparse_v_weight_qdata"),
-        KeywordArg("sparse_v_weight_scale"),
-        None,
-        KeywordArg("sparse_group_size"),
-        _users=1,
-    )
-    value = CallFunction(
-        torch.ops.aten.reshape.default,
-        value,
-        KeywordArg("sparse_attention_shape"),
-        _users=1,
-    )
-    return CallFunction(
-        torch.ops.piper_kernels.sparse_piper_attention.default,
-        _normalized_rope_pattern("sparse_q"),
-        _normalized_rope_pattern("sparse_k"),
-        value,
-        KeywordArg("sparse_head_keep_ratio_units"),
-        KeywordArg("sparse_key_blocks"),
-        KeywordArg("sparse_softmax_scale"),
     )
 
 
@@ -581,7 +447,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
 
 _patterns = PatternMatcherPass("convrot_sparse_piper_projection")
 register_graph_pattern(
-    _sparse_piper_projection_pattern(),
+    projected_qk_pattern.sparse_piper_projection_pattern(_linear_pattern),
     extra_check=_valid_sparse_piper_projection,
     pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
 )(_replace_sparse_piper_projection)
