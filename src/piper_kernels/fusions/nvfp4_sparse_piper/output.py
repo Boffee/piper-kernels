@@ -1,63 +1,67 @@
-"""Bounded-workspace sparse Piper attention followed by a ConvRot output projection."""
+"""Bounded sparse Piper attention followed by a static NVFP4 projection."""
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _output as output_common
-from piper_kernels.linear.convrot.int8 import _policy, reference
-from piper_kernels.linear.convrot.int8 import triton as convrot_backend
+from piper_kernels.linear.nvfp4 import _projection, _validation
+from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
-_DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
+_DEFAULT_QUERY_CHUNK_ROWS = 8_192
 
 
 def _validate_output_projection(
     query: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    activation_per_tensor_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    group_size: int,
     logical_sequence_length: int,
     query_chunk_rows: int,
 ) -> tuple[int, int]:
-    """Validate the projection boundary and return input and output widths."""
+    """Validate the static projection boundary and return its logical dimensions."""
+    if (
+        isinstance(query_chunk_rows, bool)
+        or not isinstance(query_chunk_rows, int)
+        or query_chunk_rows < 128
+        or query_chunk_rows % 128
+    ):
+        raise ValueError("fused NVFP4 output chunk rows must be a positive multiple of 128")
     input_features = output_common.validate_attention_output(
         query,
         logical_sequence_length,
         query_chunk_rows,
     )
-
-    reference.validate_storage(
+    _validation.validate_activation_scale(
+        activation_per_tensor_scale,
+        False,
+        query.device,
+        "fused sparse Piper NVFP4 output",
+    )
+    output_features = _validation.validate_weight(
         weight_qdata,
         weight_scale,
-        group_size,
-        torch.bfloat16,
+        weight_per_tensor_scale,
+        bias,
+        input_features=input_features,
+        logical_dtype=torch.bfloat16,
+        device=query.device,
+        name="fused sparse Piper NVFP4 output",
     )
-    output_features = weight_qdata.shape[0]
-    if weight_qdata.shape[1] != input_features or output_features < 1:
-        raise ValueError(
-            "fused sparse Piper output projection weight must consume all attention heads"
-        )
-    if weight_qdata.device != query.device:
-        raise ValueError("fused sparse Piper attention and projection must share a CUDA device")
-    if bias is not None and (
-        bias.shape != (output_features,)
-        or bias.dtype is not torch.bfloat16
-        or bias.device != query.device
-        or bias.layout is not torch.strided
-        or not bias.is_contiguous()
-    ):
-        raise ValueError(
-            "fused sparse Piper output bias must be contiguous BF16 with one value per output"
-        )
-    if torch.is_grad_enabled() and (
-        weight_scale.requires_grad or (bias is not None and bias.requires_grad)
-    ):
+    differentiable_tensors = (
+        activation_per_tensor_scale,
+        weight_scale,
+        *(tensor for tensor in (weight_per_tensor_scale, bias) if tensor is not None),
+    )
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in differentiable_tensors):
         raise RuntimeError(
-            "fused sparse Piper output is inference-only and does not support autograd"
+            "fused sparse Piper NVFP4 output is inference-only and does not support autograd"
         )
-    return input_features, output_features
+    return input_features, cast(int, output_features)
 
 
 def _project_attention_chunk(  # noqa: PLR0913, PLR0917
@@ -69,35 +73,50 @@ def _project_attention_chunk(  # noqa: PLR0913, PLR0917
     prepared_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    activation_per_tensor_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    group_size: int,
-    execution_plan: _policy.LinearExecutionPlan,
-    target: AcceleratorTarget,
 ) -> None:
-    """Project one ready attention chunk into its final output rows."""
+    """Prepare and project one ready attention chunk into its final rows."""
     batch = attention_chunk.shape[0]
-    input_features = weight_qdata.shape[1]
+    input_features = 2 * weight_qdata.shape[1]
     for batch_index in range(batch):
         chunk_input = attention_chunk[batch_index, :rows].reshape(rows, input_features)
-        convrot_backend._prepare_input(
+        input_qdata, input_scale = nvfp4_backend.prepare_static_out(
             chunk_input,
-            input_features,
-            group_size,
-            activation_fn=None,
-            execution_plan=execution_plan,
-            target=target,
-            out=(prepared_input[:rows], prepared_scale[:rows]),
+            activation_per_tensor_scale,
+            (prepared_input, prepared_scale),
         )
-        convrot_backend._execute_prepared_linear(
-            prepared_input[:rows],
-            prepared_scale[:rows],
-            weight_qdata,
-            weight_scale,
-            bias,
-            torch.bfloat16,
-            execution_plan,
-            out=output[batch_index, start : start + rows],
-        )
+        output_chunk = output[batch_index, start : start + rows]
+        if weight_per_tensor_scale is not None:
+            _projection.matmul_prepared_chunk_affine_out(
+                input_qdata,
+                input_scale,
+                activation_per_tensor_scale,
+                weight_qdata,
+                weight_scale,
+                weight_per_tensor_scale,
+                bias,
+                0,
+                rows,
+                output_chunk,
+            )
+        else:
+            projected = _projection.matmul_prepared_chunk_out(
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                0,
+                rows,
+                output_chunk,
+            )
+            nvfp4_backend.apply_projection_epilogue(
+                projected,
+                activation_per_tensor_scale,
+                bias,
+                projected,
+            )
 
 
 def _run_attention_output(  # noqa: PLR0913, PLR0917
@@ -116,17 +135,19 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     logical_sequence_length: int,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    activation_per_tensor_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    group_size: int,
     query_chunk_rows: int,
 ) -> torch.Tensor:
-    """Pipeline bounded attention chunks into the final ConvRot output."""
+    """Pipeline bounded attention chunks into a static NVFP4 output."""
     input_features, output_features = _validate_output_projection(
         query,
         weight_qdata,
         weight_scale,
+        weight_per_tensor_scale,
+        activation_per_tensor_scale,
         bias,
-        group_size,
         logical_sequence_length,
         query_chunk_rows,
     )
@@ -145,16 +166,17 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         logical_sequence_length,
     )
-
     capacity = min(logical_sequence_length, query_chunk_rows)
     prepared_input = torch.empty(
-        (capacity, input_features),
+        (capacity, input_features // 2),
         device=query.device,
-        dtype=torch.int8,
+        dtype=torch.uint8,
     )
-    prepared_scale = torch.empty(capacity, device=query.device, dtype=torch.float32)
-    target = AcceleratorTarget.from_device(query.device)
-    execution_plan = convrot_backend.default_execution_plan(weight_qdata)
+    prepared_scale = torch.empty(
+        ((capacity + 127) // 128 * 32, (input_features + 63) // 64 * 16),
+        device=query.device,
+        dtype=torch.float8_e4m3fn,
+    )
 
     def project_chunk(
         attention_chunk: torch.Tensor,
@@ -171,10 +193,9 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
             prepared_scale,
             weight_qdata,
             weight_scale,
+            weight_per_tensor_scale,
+            activation_per_tensor_scale,
             bias,
-            group_size,
-            execution_plan,
-            target,
         )
 
     return output_common.run_chunked_attention_output(
@@ -189,7 +210,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
 
 
 @torch.library.custom_op(
-    "piper_kernels::convrot_sparse_piper_attention_output",
+    "piper_kernels::nvfp4_sparse_piper_attention_output",
     mutates_args=(),
 )
 def _attention_output_op(  # noqa: PLR0913, PLR0917
@@ -208,8 +229,9 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     logical_sequence_length: int,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    activation_per_tensor_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    group_size: int,
     query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
 ) -> torch.Tensor:
     return _run_attention_output(
@@ -228,8 +250,9 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         weight_qdata,
         weight_scale,
+        weight_per_tensor_scale,
+        activation_per_tensor_scale,
         bias,
-        group_size,
         query_chunk_rows,
     )
 
@@ -251,8 +274,9 @@ def _attention_output_op_fake(
     logical_sequence_length: int,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
+    _weight_per_tensor_scale: torch.Tensor | None,
+    _activation_per_tensor_scale: torch.Tensor,
     _bias: torch.Tensor | None,
-    _group_size: int,
     _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
 ) -> torch.Tensor:
     return query.new_empty(

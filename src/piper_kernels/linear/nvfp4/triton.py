@@ -23,8 +23,7 @@ _PROJECTION_BLOCK_K = 128
 
 
 @triton.jit
-def _decode_fp4(packed, logical_offsets):
-    code = tl.where(logical_offsets % 2 == 0, packed & 0xF, packed >> 4)
+def _decode_fp4_code(code):
     magnitude = code & 0x7
     value = tl.where(
         magnitude <= 4,
@@ -32,6 +31,12 @@ def _decode_fp4(packed, logical_offsets):
         tl.where(magnitude == 5, 3.0, tl.where(magnitude == 6, 4.0, 6.0)),
     )
     return tl.where(code & 0x8 == 0, value, -value)
+
+
+@triton.jit
+def _decode_fp4(packed, logical_offsets):
+    code = tl.where(logical_offsets % 2 == 0, packed & 0xF, packed >> 4)
+    return _decode_fp4_code(code)
 
 
 @triton.jit
@@ -178,6 +183,7 @@ def _prepare_static_storage(
     swiglu: bool,
     source_global_scale: torch.Tensor | None,
     source_bias: torch.Tensor | None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     contiguous_input = input.contiguous()
     input_features = int(contiguous_input.shape[-1])
@@ -185,16 +191,34 @@ def _prepare_static_storage(
     rows = int(contiguous_input.numel() // input_features)
     scale_rows = (rows + 127) // 128 * 32
     scale_columns = (output_features + 63) // 64 * 16
-    qdata = torch.empty(
-        (rows, output_features // 2),
-        device=input.device,
-        dtype=torch.uint8,
-    )
     scale_shape = (scale_rows, scale_columns)
-    if rows % 128 or output_features % 64:
-        scale = torch.zeros(scale_shape, device=input.device, dtype=torch.float8_e4m3fn)
-    else:
+    if out is None:
+        qdata = torch.empty(
+            (rows, output_features // 2),
+            device=input.device,
+            dtype=torch.uint8,
+        )
         scale = torch.empty(scale_shape, device=input.device, dtype=torch.float8_e4m3fn)
+    else:
+        qdata_storage, scale_storage = out
+        scale_elements = scale_rows * scale_columns
+        if (
+            qdata_storage.ndim != 2
+            or qdata_storage.shape[0] < rows
+            or qdata_storage.shape[1] != output_features // 2
+            or qdata_storage.dtype is not torch.uint8
+            or scale_storage.numel() < scale_elements
+            or scale_storage.dtype is not torch.float8_e4m3fn
+            or qdata_storage.device != input.device
+            or scale_storage.device != input.device
+            or not qdata_storage.is_contiguous()
+            or not scale_storage.is_contiguous()
+        ):
+            raise ValueError("NVFP4 static preparation output storage is incompatible")
+        qdata = qdata_storage[:rows]
+        scale = scale_storage.flatten()[:scale_elements].view(scale_shape)
+    if rows % 128 or output_features % 64:
+        scale.zero_()
     block_count = rows * (output_features // _NVFP4_BLOCK_SIZE)
     _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
         contiguous_input,
@@ -230,6 +254,22 @@ def prepare_static(
         source_bias=None,
     )
     return qdata, scale, per_tensor_scale.clone()
+
+
+def prepare_static_out(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    per_tensor_scale: torch.Tensor,
+    out: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare static NVFP4 storage into reusable caller-owned buffers."""
+    return _prepare_static_storage(
+        input,
+        per_tensor_scale,
+        swiglu=False,
+        source_global_scale=None,
+        source_bias=None,
+        out=out,
+    )
 
 
 def prepare_static_projected_swiglu(
@@ -286,23 +326,41 @@ def _dequantized_input_mean_partial_kernel(
     feature_block = tl.program_id(1)
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
-    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
+    feature_start = feature_block * block_k
+    feature_offsets = feature_start + tl.arange(0, block_k)
     rows = batch * sequence_length + sequence_offsets
-    valid = (sequence_offsets[:, None] < sequence_length) & (
-        feature_offsets[None, :] < input_features
-    )
+    valid_rows = sequence_offsets < sequence_length
+    packed_feature_offsets = feature_start // 2 + tl.arange(0, block_k // 2)
+    valid_packed = valid_rows[:, None] & (packed_feature_offsets[None, :] * 2 < input_features)
     packed = tl.load(
-        input_ptr + rows[:, None] * (input_features // 2) + feature_offsets[None, :] // 2,
-        mask=valid,
+        input_ptr + rows[:, None] * (input_features // 2) + packed_feature_offsets[None, :],
+        mask=valid_packed,
         other=0,
     )
+    values = tl.interleave(
+        _decode_fp4_code(packed & 0xF),
+        _decode_fp4_code(packed >> 4),
+    )
+    scale_columns = feature_start // 16 + tl.arange(0, block_k // 16)
     scale_offsets = _swizzled_scale_offsets(
         rows[:, None],
-        feature_offsets[None, :] // 16,
+        scale_columns[None, :],
         scale_column_blocks,
     )
-    scales = tl.load(input_scale_ptr + scale_offsets, mask=valid, other=0.0).to(tl.float32)
-    values = _decode_fp4(packed, feature_offsets[None, :]) * scales
+    scales = tl.load(
+        input_scale_ptr + scale_offsets,
+        mask=valid_rows[:, None] & (scale_columns[None, :] * 16 < input_features),
+        other=0.0,
+    ).to(tl.float32)
+    scales = tl.reshape(
+        tl.broadcast_to(
+            tl.reshape(scales, (block_m, block_k // 16, 1)),
+            (block_m, block_k // 16, 16),
+        ),
+        (block_m, block_k),
+    )
+    valid = valid_rows[:, None] & (feature_offsets[None, :] < input_features)
+    values = tl.where(valid, values * scales, 0.0)
     partial_offsets = (batch * row_block_count + row_block) * input_features + feature_offsets
     tl.store(
         partial_ptr + partial_offsets,

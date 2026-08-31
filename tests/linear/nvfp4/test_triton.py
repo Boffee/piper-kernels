@@ -2,6 +2,10 @@
 
 import pytest
 import torch
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    NVFP4Tensor as TorchAONVFP4Tensor,
+)
+from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
@@ -77,6 +81,45 @@ def test_static_preparation_preserves_noncontiguous_logical_order(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_static_preparation_out_preserves_logical_shapes() -> None:
+    torch.manual_seed(507)
+    rows, input_features = 127, 80
+    input = torch.randn(  # noqa: A001
+        rows,
+        input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
+    qdata_storage = torch.empty(
+        (256, input_features // 2),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    scale_storage = torch.empty(
+        (64, 32),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+
+    expected_qdata, expected_scale, _ = nvfp4_triton.prepare_static(
+        input,
+        per_tensor_scale,
+    )
+    actual_qdata, actual_scale = nvfp4_triton.prepare_static_out(
+        input,
+        per_tensor_scale,
+        (qdata_storage, scale_storage),
+    )
+
+    assert actual_qdata.shape == expected_qdata.shape
+    assert actual_scale.shape == expected_scale.shape
+    assert torch.equal(actual_qdata, expected_qdata)
+    assert torch.equal(actual_scale, expected_scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> None:
     torch.manual_seed(505)
     input = torch.randn(  # noqa: A001
@@ -148,3 +191,59 @@ def test_projection_epilogue_matches_portable_decomposition(with_bias: bool) -> 
     nvfp4_triton.apply_projection_epilogue(raw, global_scale, bias, actual)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_linear_mean_matches_batched_represented_projection() -> None:
+    torch.manual_seed(506)
+    batch, sequence_length = 2, 257
+    input_features, output_features = 80, 128
+    source = torch.randn(
+        batch * sequence_length,
+        input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    dense_weight = torch.randn(
+        output_features,
+        input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    input_scale = per_tensor_amax_to_scale(source.abs().amax())
+    weight_scale = per_tensor_amax_to_scale(dense_weight.abs().amax())
+    prepared_input = TorchAONVFP4Tensor.to_nvfp4(
+        source,
+        per_tensor_scale=input_scale,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    prepared_weight = TorchAONVFP4Tensor.to_nvfp4(
+        dense_weight,
+        per_tensor_scale=weight_scale,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    bias = torch.randn(output_features, device="cuda", dtype=torch.bfloat16)
+
+    expected = (
+        prepared_input.dequantize(torch.float32)
+        .view(batch, sequence_length, input_features)
+        .mean(dim=1)
+        @ prepared_weight.dequantize(torch.float32).t()
+        + bias.float()
+    )
+    actual = nvfp4_triton.linear_mean(
+        prepared_input.qdata,
+        prepared_input.scale,
+        input_scale,
+        prepared_weight.qdata,
+        prepared_weight.scale,
+        weight_scale,
+        bias,
+        batch,
+        sequence_length,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)

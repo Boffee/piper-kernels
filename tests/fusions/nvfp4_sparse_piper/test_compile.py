@@ -20,12 +20,17 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import (
     nvfp4_sparse_piper_compile_options,
 )
+from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
+from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
 from piper_kernels.fusions.nvfp4_sparse_piper._compile import compile_pass
 from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
+from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from ._helpers import exact_sm120_available
 
@@ -49,16 +54,21 @@ def _semantic_linear(
     activation_scale: torch.fx.Node | None,
     *,
     dynamic: bool,
+    output_features: int = 256,
 ) -> torch.fx.Node:
     weight_qdata = _placeholder(
         graph,
         f"{prefix}_weight_qdata",
-        torch.empty((256, 128), device="cuda", dtype=torch.uint8),
+        torch.empty((output_features, 128), device="cuda", dtype=torch.uint8),
     )
     weight_scale = _placeholder(
         graph,
         f"{prefix}_weight_scale",
-        torch.empty((64, 64), device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty(
+            (((output_features + 127) // 128) * 32, 64),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        ),
     )
     weight_global_scale = _placeholder(
         graph,
@@ -78,7 +88,7 @@ def _semantic_linear(
         ),
     )
     projected.meta["val"] = torch.empty(
-        (1, 192, 256),
+        (1, 192, output_features),
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -144,7 +154,12 @@ def _normalized_rope(
     )
 
 
-def _semantic_attention_graph(*, dynamic: bool) -> torch.fx.Graph:
+def _semantic_attention_graph(
+    *,
+    dynamic: bool,
+    output_dynamic: bool | None = None,
+    escape_attention: bool = False,
+) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
         input = _placeholder(  # noqa: A001
@@ -207,7 +222,35 @@ def _semantic_attention_graph(*, dynamic: bool) -> torch.fx.Graph:
             device="cuda",
             dtype=torch.bfloat16,
         )
-        graph.output(output)
+        attention_output = output
+        if output_dynamic is not None:
+            reshaped_output = graph.call_function(
+                torch.ops.aten.reshape.default,
+                args=(output, (1, 192, 256)),
+            )
+            reshaped_output.meta["val"] = torch.empty(
+                (1, 192, 256),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            output_activation_scale = (
+                None
+                if output_dynamic
+                else _placeholder(
+                    graph,
+                    "output_activation_scale",
+                    torch.empty((), device="cuda", dtype=torch.float32),
+                )
+            )
+            output = _semantic_linear(
+                graph,
+                reshaped_output,
+                "output",
+                output_activation_scale,
+                dynamic=output_dynamic,
+                output_features=320,
+            )
+        graph.output((output, attention_output) if escape_attention else output)
     torch.fx.GraphModule({}, graph)
     return graph
 
@@ -319,6 +362,152 @@ class _SparseProjectionAttention(torch.nn.Module):
         )
 
 
+class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
+    """Canonical H3 attention with one static NVFP4 output projection."""
+
+    output_features = 320
+
+    def __init__(self, *, dynamic: bool = False) -> None:
+        super().__init__(dynamic=dynamic)
+        calibration = torch.full(
+            (1, self.sequence_length, self.heads * self.head_dim),
+            3.0,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        activation_scale = per_tensor_amax_to_scale(calibration.abs().amax())
+        quantization = QuantizeTensorToNVFP4Kwargs(
+            block_size=16,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+            use_dynamic_per_tensor_scale=False,
+        )
+        dense = torch.randn(
+            (self.output_features, self.heads * self.head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+            dense,
+            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+            act_per_tensor_scale=activation_scale,
+            is_swizzled_scales=True,
+            act_quant_kwargs=quantization,
+        )
+        self.output = torch.nn.Linear(
+            self.heads * self.head_dim,
+            self.output_features,
+            bias=True,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        self.output.weight = torch.nn.Parameter(
+            PiperNVFP4Tensor.from_torchao(torchao_weight),
+            requires_grad=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        attention = super().forward(hidden_states)
+        return self.output(attention.flatten(2))
+
+
+def _nvfp4_storage(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    assert isinstance(weight, PiperNVFP4Tensor)
+    return weight.qdata, weight.scale, weight.per_tensor_scale
+
+
+def _prepare_nvfp4_input(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    assert isinstance(weight, PiperNVFP4Tensor)
+    quantization = weight.act_quant_kwargs
+    assert quantization is not None
+    return nvfp4_ops.prepare_input(
+        hidden_states,
+        weight.act_per_tensor_scale,
+        quantization.use_dynamic_per_tensor_scale,
+    )
+
+
+def _run_explicit_attention_output(
+    model: _SparseProjectionAttentionOutput,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    q_input = _prepare_nvfp4_input(hidden_states, model.query.weight)
+    k_input = _prepare_nvfp4_input(hidden_states, model.key.weight)
+    v_input = _prepare_nvfp4_input(hidden_states, model.value.weight)
+    query = fused_query.project_query(
+        *q_input,
+        *_nvfp4_storage(model.query.weight),
+        model.query.bias,
+        model.query_norm,
+        model.cos,
+        model.sin,
+        1e-5,
+        model.head_dim**-0.5,
+        4_096,
+    )
+    key = fused_key.project_key(
+        *k_input,
+        *_nvfp4_storage(model.key.weight),
+        model.key.bias,
+        model.key_norm,
+        model.cos,
+        model.sin,
+        1e-5,
+        4_096,
+    )
+    value_mean = linear_mean(
+        *v_input,
+        *_nvfp4_storage(model.value.weight),
+        model.value.bias,
+        model.batch,
+        model.sequence_length,
+    ).view(model.batch, model.heads, model.head_dim)
+    value = fused_value.project_value(
+        *v_input,
+        *_nvfp4_storage(model.value.weight),
+        model.value.bias,
+        value_mean,
+        4_096,
+    )
+    attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
+        *query,
+        *key,
+        *value,
+        value_mean,
+        list(model.sparse_attention._head_keep_ratio_units),
+        model.sparse_key_blocks,
+        model.sequence_length,
+    )
+    output_weight = model.output.weight
+    assert isinstance(output_weight, PiperNVFP4Tensor)
+    quantization = output_weight.act_quant_kwargs
+    assert quantization is not None
+    output_qdata, output_scale, output_per_tensor_scale = nvfp4_ops.prepare_input(
+        attention.flatten(2),
+        output_weight.act_per_tensor_scale,
+        quantization.use_dynamic_per_tensor_scale,
+    )
+    assert output_weight.per_tensor_scale is not None
+    scaling_type = F.ScalingType
+    swizzle_type = F.SwizzleType
+    result = F.scaled_mm(
+        output_qdata.view(torch.float4_e2m1fn_x2),
+        output_weight.qdata.t().view(torch.float4_e2m1fn_x2),
+        [output_scale.view(torch.float8_e4m3fn), output_per_tensor_scale],
+        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
+        [output_weight.scale.view(torch.float8_e4m3fn), output_weight.per_tensor_scale],
+        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
+        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
+        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
+        bias=model.output.bias,
+        output_dtype=hidden_states.dtype,
+    )
+    return result.view(model.batch, model.sequence_length, model.output_features)
+
+
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
     def __init__(self) -> None:
         self.targets: list[object] = []
@@ -388,6 +577,81 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     graph.lint()
 
 
+@pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+def test_static_output_fuses_after_prepared_sparse_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    dynamic: bool,
+    preparation_count: int,
+) -> None:
+    graph = _semantic_attention_graph(dynamic=dynamic, output_dynamic=False)
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    nvfp4_compile_pass(graph, is_inference=True)
+    compile_pass(graph, is_inference=True)
+
+    call_nodes = [node for node in graph.nodes if node.op == "call_function"]
+    targets = [node.target for node in call_nodes]
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == preparation_count
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default) == 1
+    assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
+    output_node = next(
+        node
+        for node in call_nodes
+        if node.target is torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
+    )
+    assert output_node.args[-1] == 8_192
+    graph.lint()
+
+
+def test_dynamic_output_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _semantic_attention_graph(dynamic=False, output_dynamic=True)
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    nvfp4_compile_pass(graph, is_inference=True)
+    compile_pass(graph, is_inference=True)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default not in targets
+    assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
+    graph.lint()
+
+
+def test_static_output_fails_closed_when_attention_escapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _semantic_attention_graph(
+        dynamic=False,
+        output_dynamic=False,
+        escape_attention=True,
+    )
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    nvfp4_compile_pass(graph, is_inference=True)
+    compile_pass(graph, is_inference=True)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default not in targets
+    assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
+    graph.lint()
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
@@ -435,6 +699,54 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+def test_cuda_compile_fuses_static_nvfp4_attention_output(
+    dynamic: bool,
+    preparation_count: int,
+) -> None:
+    torch.manual_seed(829)
+    model = _SparseProjectionAttentionOutput(dynamic=dynamic).eval()
+    hidden_states = torch.randn(
+        (model.batch, model.sequence_length, model.input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    capture = _TargetCapturePass()
+    with torch.no_grad():
+        expected = _run_explicit_attention_output(model, hidden_states)
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=_options_with_capture(capture),
+        )(hidden_states)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
+        == preparation_count
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default)
+        == 1
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in (
+        capture.targets
+    )
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
 
 
 @pytest.mark.gpu

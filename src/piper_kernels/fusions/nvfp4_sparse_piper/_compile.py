@@ -28,6 +28,7 @@ from piper_kernels.attention.sparse_piper_attention import (
 )
 from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.sparse_piper import _output as sparse_piper_output
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -38,9 +39,9 @@ from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
-from . import _epilogue, _validation, key, query, value
+from . import _epilogue, _output_compile, _validation, key, output, query, value
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v3"
+_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v4"
 _HEAD_DIM = layout.HEAD_DIM
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
@@ -54,12 +55,15 @@ def _source_files() -> tuple[str, ...]:
             nvfp4_chunking.__file__,
             _epilogue.__file__,
             _validation.__file__,
+            _output_compile.__file__,
             key.__file__,
+            output.__file__,
             query.__file__,
             value.__file__,
             layout.__file__,
             sparse_piper_triton.__file__,
             *sparse_piper_compile.source_files(),
+            sparse_piper_output.__file__,
             sparse_piper_pattern.__file__,
             linear_compile_fx.__file__,
             projected_qk_triton.__file__,
@@ -354,6 +358,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
             _fold_projection(graph)
+            _output_compile._fold_attention_output(graph)
 
     def uuid(self) -> bytes:
         return get_hash_for_files(_source_files(), extra=_COMPILE_PASS_VERSION)

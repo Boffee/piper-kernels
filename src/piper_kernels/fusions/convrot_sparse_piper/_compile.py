@@ -32,6 +32,7 @@ from piper_kernels.attention.sparse_piper_attention import (
 from piper_kernels.fusions.convrot_sage_qk import triton as convrot_sage_qk
 from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.sparse_piper import _output as sparse_piper_output
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -40,7 +41,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v12"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v13"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -58,6 +59,7 @@ def _source_files() -> tuple[str, ...]:
             sparse_piper_kernels.__file__,
             convrot_sage_qk.__file__,
             *sparse_piper_compile.source_files(),
+            sparse_piper_output.__file__,
             sparse_piper_pattern.__file__,
             linear_compile_fx.__file__,
             projected_qk.__file__,
