@@ -12,6 +12,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.linear import _input_activations as input_activations
 
+from . import triton as nvfp4_triton
 from ._typing import NVFP4Storage
 
 _BLOCK_SIZE = 16
@@ -93,6 +94,12 @@ def _prepare_compiled(
         return _compiled_prepare_dynamic(input, activation_fn)
     if activation_per_tensor_scale is None:
         raise ValueError("static NVFP4 activation preparation requires a per-tensor scale")
+    if activation_fn in (None, "swiglu"):
+        return nvfp4_triton.prepare_static(
+            input,
+            activation_per_tensor_scale,
+            swiglu=activation_fn == "swiglu",
+        )
     return _compiled_prepare_static(input, activation_per_tensor_scale, activation_fn)
 
 
