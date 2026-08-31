@@ -5,8 +5,23 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added inference-only `nvfp4_swiglu_ffn_compile_options` folding for compatible BF16 NVFP4
+  SwiGLU feed-forward graphs on exact SM120. The fused operator keeps the up-projection input in
+  compact prepared NVFP4 storage and bounds the materialized up/gate, activated NVFP4, and down
+  projection workspaces to 1,536 rows. It also composes with the shared H3 indexed-gated-update
+  epilogue. Static activation scales remain bit-equivalent to the materialized graph; dynamic down
+  activation scales are calculated independently per chunk, retaining dense-reference accuracy
+  without a second up projection or a full BF16 intermediate.
+
 ### Changed
 
+- Optimized dynamic-scale NVFP4 SwiGLU FFNs by compiling unrelated activation layouts
+  independently, deriving each chunk scale directly from the raw up projection, and sharing the
+  static bounded-workspace packing and affine down-projection path. Dynamic execution retains its
+  per-chunk scale semantics without materializing projection epilogues. The default 1,536-row
+  chunk improves both throughput and workspace size at the full MiniMax-H3 width.
 - Extended ConvRot INT8 fused input preparation to one, two, or three equal power-of-two chunks,
   covering rows through 49,152 features while keeping rotation, activation, and quantization in
   one launch without a global-memory intermediate. Production policy selects the least-padded

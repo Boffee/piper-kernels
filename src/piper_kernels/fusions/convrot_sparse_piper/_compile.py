@@ -33,6 +33,7 @@ from piper_kernels.fusions.convrot_sage_qk import triton as convrot_sage_qk
 from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
+from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
@@ -58,6 +59,7 @@ def _source_files() -> tuple[str, ...]:
             convrot_sage_qk.__file__,
             *sparse_piper_compile.source_files(),
             sparse_piper_pattern.__file__,
+            linear_compile_fx.__file__,
             projected_qk.__file__,
             query.__file__,
             key.__file__,
@@ -217,7 +219,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 dtype=torch.float32,
             ),
         )
-        query, query_scale, query_summary = _compile_fx.emit_tuple_result(
+        query, query_scale, query_summary = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_sparse_piper_project_query.default,
             (
@@ -251,7 +253,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 dtype=torch.float32,
             ),
         )
-        key, key_scale, key_max, key_min = _compile_fx.emit_tuple_result(
+        key, key_scale, key_max, key_min = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_sparse_piper_project_key.default,
             (
@@ -285,7 +287,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             ),
             input_value.new_empty((batch, heads, head_dim), dtype=torch.float32),
         )
-        value, value_scale, value_mean = _compile_fx.emit_tuple_result(
+        value, value_scale, value_mean = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_sparse_piper_project_value.default,
             (

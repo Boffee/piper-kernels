@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -30,13 +29,16 @@ from piper_kernels.attention.sparse_piper_attention import (
 from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
+from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.nvfp4 import _chunking as nvfp4_chunking
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
+from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
-from . import _chunking, _epilogue, _validation, key, query, value
+from . import _epilogue, _validation, key, query, value
 
 _COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v3"
 _HEAD_DIM = layout.HEAD_DIM
@@ -49,7 +51,7 @@ def _source_files() -> tuple[str, ...]:
         file_name
         for file_name in (
             __file__,
-            _chunking.__file__,
+            nvfp4_chunking.__file__,
             _epilogue.__file__,
             _validation.__file__,
             key.__file__,
@@ -59,8 +61,10 @@ def _source_files() -> tuple[str, ...]:
             sparse_piper_triton.__file__,
             *sparse_piper_compile.source_files(),
             sparse_piper_pattern.__file__,
+            linear_compile_fx.__file__,
             projected_qk_triton.__file__,
             nvfp4_projection.__file__,
+            nvfp4_validation.__file__,
             nvfp4_triton.__file__,
             _quantized_dispatch.__file__,
             dispatch.__file__,
@@ -91,51 +95,6 @@ def _linear_pattern(prefix: str) -> CallFunction:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedProjectionNodes:
-    """FX nodes belonging to one prepared NVFP4 projection."""
-
-    input_qdata: torch.fx.Node
-    input_scale: torch.fx.Node
-    input_per_tensor_scale: torch.fx.Node
-    weight_qdata: torch.fx.Node
-    weight_scale: torch.fx.Node
-    weight_per_tensor_scale: torch.fx.Node | None
-    bias: torch.fx.Node | None
-
-    @classmethod
-    def from_match(cls, match: Match, prefix: str) -> _PreparedProjectionNodes | None:
-        values = tuple(
-            match.kwargs[f"{prefix}_{suffix}"]
-            for suffix in (
-                "input_qdata",
-                "input_scale",
-                "input_per_tensor_scale",
-                "weight_qdata",
-                "weight_scale",
-                "weight_per_tensor_scale",
-                "bias",
-            )
-        )
-        if any(not isinstance(value, torch.fx.Node) for value in values[:5]) or any(
-            value is not None and not isinstance(value, torch.fx.Node) for value in values[5:]
-        ):
-            return None
-        return cls(*values)  # type: ignore[arg-type]
-
-    def arguments(self) -> tuple[torch.fx.Node | None, ...]:
-        """Return custom-op arguments in canonical prepared-linear order."""
-        return (
-            self.input_qdata,
-            self.input_scale,
-            self.input_per_tensor_scale,
-            self.weight_qdata,
-            self.weight_scale,
-            self.weight_per_tensor_scale,
-            self.bias,
-        )
-
-
 def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]:
     if value is None:
         return True, None
@@ -147,7 +106,9 @@ def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]
 
 def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
     prefixes = ("sparse_q", "sparse_k", "sparse_v")
-    projections = tuple(_PreparedProjectionNodes.from_match(match, prefix) for prefix in prefixes)
+    projections = tuple(
+        _compile_fx.PreparedLinearNodes.from_match(match, prefix) for prefix in prefixes
+    )
     if any(projection is None for projection in projections):
         return False
     q_projection = projections[0]
@@ -192,7 +153,7 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
                 weight_scale,
                 global_scale,
                 bias,
-                _chunking.DEFAULT_CHUNK_ROWS,
+                nvfp4_chunking.DEFAULT_CHUNK_ROWS,
                 f"{prefix} compiler projection",
             )
         except ValueError:
@@ -215,7 +176,7 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
             or preparation_sharing.dimension_key(linear_sequence_length)
             != preparation_sharing.dimension_key(sequence_length)
             or sparse_piper_compile.static_int(linear_shape[2]) != output_features
-            or match.kwargs[f"{prefix}_logical_dtype"] is not torch.bfloat16
+            or projection.logical_dtype is not torch.bfloat16
         ):
             return False
 
@@ -248,9 +209,9 @@ def _replace_projection(
 ) -> None:
     original = match.output_node()
     graph = match.graph
-    query_projection = _PreparedProjectionNodes.from_match(match, "sparse_q")
-    key_projection = _PreparedProjectionNodes.from_match(match, "sparse_k")
-    value_projection = _PreparedProjectionNodes.from_match(match, "sparse_v")
+    query_projection = _compile_fx.PreparedLinearNodes.from_match(match, "sparse_q")
+    key_projection = _compile_fx.PreparedLinearNodes.from_match(match, "sparse_k")
+    value_projection = _compile_fx.PreparedLinearNodes.from_match(match, "sparse_v")
     assert query_projection is not None
     assert key_projection is not None
     assert value_projection is not None
@@ -281,17 +242,17 @@ def _replace_projection(
                 dtype=torch.float32,
             ),
         )
-        query_nodes = _compile_fx.emit_tuple_result(
+        query_nodes = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default,
             (
-                *query_projection.arguments(),
+                *query_projection.storage_arguments(),
                 q_norm_weight,
                 cos,
                 sin,
                 sparse_q_norm_epsilon,
                 sparse_softmax_scale,
-                _chunking.DEFAULT_CHUNK_ROWS,
+                nvfp4_chunking.DEFAULT_CHUNK_ROWS,
             ),
             query_values,
         )
@@ -309,23 +270,23 @@ def _replace_projection(
                 dtype=torch.float32,
             ),
         )
-        key_nodes = _compile_fx.emit_tuple_result(
+        key_nodes = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default,
             (
-                *key_projection.arguments(),
+                *key_projection.storage_arguments(),
                 k_norm_weight,
                 cos,
                 sin,
                 sparse_k_norm_epsilon,
-                _chunking.DEFAULT_CHUNK_ROWS,
+                nvfp4_chunking.DEFAULT_CHUNK_ROWS,
             ),
             key_values,
         )
         value_mean_flat = graph.call_function(
             torch.ops.piper_kernels.nvfp4_linear_mean.default,
             args=(
-                *value_projection.arguments(),
+                *value_projection.storage_arguments(),
                 1,
                 logical_sequence_length,
             ),
@@ -345,13 +306,13 @@ def _replace_projection(
                 dtype=torch.float32,
             ),
         )
-        value_nodes = _compile_fx.emit_tuple_result(
+        value_nodes = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default,
             (
-                *value_projection.arguments(),
+                *value_projection.storage_arguments(),
                 value_mean,
-                _chunking.DEFAULT_CHUNK_ROWS,
+                nvfp4_chunking.DEFAULT_CHUNK_ROWS,
             ),
             value_values,
         )

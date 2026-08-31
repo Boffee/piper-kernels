@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import operator
 from collections.abc import Mapping
 
 import torch
@@ -18,6 +17,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
@@ -135,61 +135,10 @@ _PREPARATION_RULES = (_PreparationRule(),)
 _input_activation_patterns = PatternMatcherPass("convrot_input_activations")
 
 
-def _packed_swiglu_pattern(
-    *,
-    promote_gate: bool | None,
-    reverse_multiply: bool,
-) -> CallFunction:
-    """Build one exclusive packed-SwiGLU pattern in Inductor's normalized IR."""
-    split = CallFunction(
-        torch.ops.aten.split.Tensor,
-        KeywordArg("packed"),
-        KeywordArg("split_size"),
-        -1,
-        _users=2,
-    )
-    up = CallFunction(operator.getitem, split, 0, _users=1)
-    gate_users = 2 if promote_gate is False else 1
-    gate = CallFunction(operator.getitem, split, 1, _users=gate_users)
-    if promote_gate is None:
-        silu = CallFunction(torch.ops.aten.silu.default, gate, _users=1)
-    else:
-        gate_value = (
-            CallFunction(
-                torch.ops.prims.convert_element_type.default,
-                gate,
-                torch.float32,
-                _users=2,
-            )
-            if promote_gate
-            else gate
-        )
-        silu = CallFunction(
-            torch.ops.aten.div.Tensor,
-            gate_value,
-            CallFunction(
-                torch.ops.aten.add.Tensor,
-                CallFunction(
-                    torch.ops.aten.exp.default,
-                    CallFunction(torch.ops.aten.neg.default, gate_value, _users=1),
-                    _users=1,
-                ),
-                1,
-                _users=1,
-            ),
-            _users=1,
-        )
-        if promote_gate:
-            silu = CallFunction(
-                torch.ops.prims.convert_element_type.default,
-                silu,
-                KeywordArg("logical_dtype"),
-                _users=1,
-            )
-    multiply_args = (silu, up) if reverse_multiply else (up, silu)
+def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.convrot_int8_linear.default,
-        CallFunction(torch.ops.aten.mul.Tensor, *multiply_args, _users=1),
+        input_pattern,
         KeywordArg("weight_qdata"),
         KeywordArg("weight_scale"),
         KeywordArg("bias"),
@@ -198,33 +147,17 @@ def _packed_swiglu_pattern(
 
 
 def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
-    packed = match.kwargs["packed"]
     weight_qdata = match.kwargs["weight_qdata"]
-    split_size = match.kwargs["split_size"]
-    if not isinstance(packed, torch.fx.Node) or not isinstance(weight_qdata, torch.fx.Node):
+    if not isinstance(weight_qdata, torch.fx.Node):
         return False
-    packed_value = preparation_sharing.tensor_metadata(packed)
     weight_value = preparation_sharing.tensor_metadata(weight_qdata)
-    if (
-        packed_value is None
-        or packed_value.ndim == 0
-        or weight_value is None
-        or weight_value.ndim != 2
-        or isinstance(split_size, bool)
-        or not isinstance(split_size, (int, torch.SymInt))
-    ):
+    if weight_value is None or weight_value.ndim != 2:
         return False
-    in_features = weight_value.shape[1]
-    dimensions_match = preparation_sharing.dimension_key(
-        split_size
-    ) == preparation_sharing.dimension_key(in_features) and preparation_sharing.dimension_key(
-        packed_value.shape[-1]
-    ) == preparation_sharing.dimension_key(2 * in_features)
-    if promote_gate is True:
-        return dimensions_match and match.kwargs["logical_dtype"] is packed_value.dtype
-    if promote_gate is False:
-        return dimensions_match and packed_value.dtype is torch.float32
-    return dimensions_match
+    return input_activation_compile.valid_packed_swiglu(
+        match,
+        promote_gate=promote_gate,
+        input_features=weight_value.shape[1],
+    )
 
 
 def _replace_input_activation_and_linear(
@@ -291,7 +224,8 @@ def _replace_packed_swiglu(
 for _promote_gate in (None, False, True):
     for _reverse_multiply in (False, True):
         register_graph_pattern(
-            _packed_swiglu_pattern(
+            input_activation_compile.packed_swiglu_pattern(
+                _linear_pattern,
                 promote_gate=_promote_gate,
                 reverse_multiply=_reverse_multiply,
             ),
@@ -304,74 +238,18 @@ for _promote_gate in (None, False, True):
         )(_replace_packed_swiglu)
 
 
-def _gelu_tanh_pattern(*, promote_input: bool) -> CallFunction:
-    """Build PyTorch's normalized GELU-tanh decomposition feeding one linear."""
-    input_node = KeywordArg("input")
-    value = (
-        CallFunction(
-            torch.ops.prims.convert_element_type.default,
-            input_node,
-            torch.float32,
-            _users=4,
-        )
-        if promote_input
-        else input_node
-    )
-    half = CallFunction(torch.ops.aten.mul.Tensor, value, 0.5, _users=1)
-    square = CallFunction(torch.ops.aten.mul.Tensor, value, value, _users=1)
-    cube = CallFunction(torch.ops.aten.mul.Tensor, square, value, _users=1)
-    cubic_term = CallFunction(
-        torch.ops.aten.mul.Tensor,
-        cube,
-        input_activations.GELU_TANH_CUBIC_COEFFICIENT,
-        _users=1,
-    )
-    inner = CallFunction(torch.ops.aten.add.Tensor, value, cubic_term, _users=1)
-    scaled = CallFunction(
-        torch.ops.aten.mul.Tensor,
-        inner,
-        input_activations.GELU_TANH_SCALE_COEFFICIENT,
-        _users=1,
-    )
-    tanh = CallFunction(torch.ops.aten.tanh.default, scaled, _users=1)
-    shifted = CallFunction(torch.ops.aten.add.Tensor, tanh, 1, _users=1)
-    activated = CallFunction(torch.ops.aten.mul.Tensor, half, shifted, _users=1)
-    if promote_input:
-        activated = CallFunction(
-            torch.ops.prims.convert_element_type.default,
-            activated,
-            KeywordArg("logical_dtype"),
-            _users=1,
-        )
-    return CallFunction(
-        torch.ops.piper_kernels.convrot_int8_linear.default,
-        activated,
-        KeywordArg("weight_qdata"),
-        KeywordArg("weight_scale"),
-        KeywordArg("bias"),
-        KeywordArg("group_size"),
-    )
-
-
 def _valid_gelu_tanh(match: Match, *, promote_input: bool) -> bool:
-    input_node = match.kwargs["input"]
     weight_qdata = match.kwargs["weight_qdata"]
-    if not isinstance(input_node, torch.fx.Node) or not isinstance(weight_qdata, torch.fx.Node):
+    if not isinstance(weight_qdata, torch.fx.Node):
         return False
-    input_value = preparation_sharing.tensor_metadata(input_node)
     weight_value = preparation_sharing.tensor_metadata(weight_qdata)
-    if (
-        input_value is None
-        or input_value.ndim == 0
-        or weight_value is None
-        or weight_value.ndim != 2
-        or preparation_sharing.dimension_key(input_value.shape[-1])
-        != preparation_sharing.dimension_key(weight_value.shape[1])
-    ):
+    if weight_value is None or weight_value.ndim != 2:
         return False
-    if promote_input:
-        return match.kwargs["logical_dtype"] is input_value.dtype
-    return input_value.dtype is torch.float32
+    return input_activation_compile.valid_gelu_tanh(
+        match,
+        promote_input=promote_input,
+        input_features=weight_value.shape[1],
+    )
 
 
 def _replace_gelu_tanh(
@@ -396,7 +274,10 @@ def _replace_gelu_tanh(
 
 for _promote_input in (False, True):
     register_graph_pattern(
-        _gelu_tanh_pattern(promote_input=_promote_input),
+        input_activation_compile.gelu_tanh_pattern(
+            _linear_pattern,
+            promote_input=_promote_input,
+        ),
         extra_check=lambda match, promote_input=_promote_input: _valid_gelu_tanh(
             match,
             promote_input=promote_input,
@@ -426,6 +307,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
         return get_hash_for_files(
             (
                 __file__,
+                input_activation_compile.__file__,
                 input_activations.__file__,
                 preparation_sharing.__file__,
                 _compile_fx.__file__,
