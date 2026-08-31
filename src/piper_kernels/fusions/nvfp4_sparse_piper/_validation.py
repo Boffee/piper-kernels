@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -73,4 +75,34 @@ def validate_projection(
     return sequence_length, output_features // HEAD_DIM
 
 
-__all__ = ["validate_projection"]
+def validate_qk_epilogue(
+    input_qdata: torch.Tensor,
+    sequence_length: int,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    name: str,
+) -> None:
+    """Validate the RMSNorm/RoPE inputs shared by Q and K epilogues."""
+    rotary_dim = cos.shape[1] if cos.ndim == 2 else 0
+    operands = (norm_weight, cos, sin)
+    if (
+        norm_weight.shape != (HEAD_DIM,)
+        or norm_weight.dtype is not torch.bfloat16
+        or cos.ndim != 2
+        or sin.shape != cos.shape
+        or cos.shape[0] != sequence_length
+        or cos.dtype is not torch.float32
+        or sin.dtype is not torch.float32
+        or not 2 <= rotary_dim <= HEAD_DIM
+        or rotary_dim % 2
+        or any(operand.device != input_qdata.device for operand in operands)
+        or any(not operand.is_contiguous() for operand in operands)
+    ):
+        raise ValueError(f"{name} requires contiguous BF16 norm and FP32 split-half RoPE")
+    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
+        raise ValueError(f"{name} norm epsilon must be finite and positive")
+
+
+__all__ = ["validate_projection", "validate_qk_epilogue"]

@@ -15,7 +15,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
 
 from . import _epilogue
 from ._chunking import PreparedProjection, run_chunked_projection
-from ._validation import validate_projection
+from ._validation import validate_projection, validate_qk_epilogue
 
 DEFAULT_CHUNK_ROWS = 4096
 
@@ -46,24 +46,16 @@ def _launch_query(  # noqa: PLR0913, PLR0917
         chunk_rows,
         "Q projection",
     )
-    rotary_dim = cos.shape[1] if cos.ndim == 2 else 0
+    validate_qk_epilogue(
+        input_qdata,
+        sequence_length,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        "Q projection",
+    )
     operands = (norm_weight, cos, sin)
-    if (
-        norm_weight.shape != (HEAD_DIM,)
-        or norm_weight.dtype is not torch.bfloat16
-        or cos.ndim != 2
-        or sin.shape != cos.shape
-        or cos.shape[0] != sequence_length
-        or cos.dtype is not torch.float32
-        or sin.dtype is not torch.float32
-        or not 2 <= rotary_dim <= HEAD_DIM
-        or rotary_dim % 2
-        or any(operand.device != input_qdata.device for operand in operands)
-        or any(not operand.is_contiguous() for operand in operands)
-    ):
-        raise ValueError("Q projection requires contiguous BF16 norm and FP32 split-half RoPE")
-    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
-        raise ValueError("Q projection norm epsilon must be finite and positive")
     if not math.isfinite(softmax_scale) or softmax_scale <= 0:
         raise ValueError("Q projection softmax scale must be finite and positive")
     storage_sequence_length = padded_sequence_length(sequence_length)
