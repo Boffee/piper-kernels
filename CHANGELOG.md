@@ -5,8 +5,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-31
+
 ### Added
 
+- Added the TorchAO-compatible `PiperNVFP4Tensor` wrapper and `nvfp4_compile_options` for exact
+  SM120. Compiled `F.linear` calls retain a stable semantic NVFP4 operator, share prepared
+  activations across compatible projections, and can fold SwiGLU or tanh-GELU input activations
+  into preparation without changing eager TorchAO fallback behavior.
+- Added inference-only `nvfp4_sparse_piper_compile_options` folding for compatible BF16 NVFP4
+  Q/K/V projections feeding sparse Piper attention on exact SM120. Projection output is consumed
+  in double-buffered chunks of at most 4,096 rows by RMSNorm, RoPE, DSA summaries, and Q/K/V
+  encoding, avoiding full projected BF16 Q/K/V intermediates.
 - Added inference-only `nvfp4_swiglu_ffn_compile_options` folding for compatible BF16 NVFP4
   SwiGLU feed-forward graphs on exact SM120. The fused operator keeps the up-projection input in
   compact prepared NVFP4 storage and bounds the materialized up/gate, activated NVFP4, and down
@@ -267,7 +277,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Boffee/piper-kernels/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Boffee/piper-kernels/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Boffee/piper-kernels/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Boffee/piper-kernels/compare/v0.3.0rc1...v0.3.0
