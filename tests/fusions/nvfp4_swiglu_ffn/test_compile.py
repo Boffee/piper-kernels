@@ -17,6 +17,10 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn import (
 from piper_kernels.fusions.nvfp4_swiglu_ffn._compile import (
     compile_pass as fusion_compile_pass,
 )
+from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
+    _DEFAULT_CHUNK_ROWS,
+    _chunked_swiglu_ffn_op,
+)
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
@@ -156,12 +160,10 @@ def test_cuda_compile_options_fold_complete_swiglu_ffn(dynamic: bool) -> None:
     capture = _TargetCapturePass()
     with torch.no_grad():
         if dynamic:
-            torch._dynamo.reset()
-            expected = torch.compile(
-                model,
-                fullgraph=True,
-                options=nvfp4_compile_options(),
-            )(activation)
+            expected = _chunked_swiglu_ffn_op(*operands.arguments(_DEFAULT_CHUNK_ROWS)).reshape(
+                *activation.shape[:-1],
+                operands.down.weight.shape[0],
+            )
         else:
             expected = down_affine_reference(operands).reshape(
                 *activation.shape[:-1],

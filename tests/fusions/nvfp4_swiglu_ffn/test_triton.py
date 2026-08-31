@@ -36,8 +36,12 @@ def test_static_chunked_ffn_matches_down_affine_reference(
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("chunk_rows", [128, 256])
-def test_dynamic_chunked_ffn_retains_dense_accuracy(chunk_rows: int) -> None:
-    operands = make_operands(dynamic=True, seed=902)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+def test_dynamic_chunked_ffn_retains_dense_accuracy(
+    chunk_rows: int,
+    with_bias: bool,
+) -> None:
+    operands = make_operands(dynamic=True, with_bias=with_bias, seed=902)
 
     expected = materialized(operands)
     dense = dense_reference(operands)
@@ -48,6 +52,48 @@ def test_dynamic_chunked_ffn_retains_dense_accuracy(chunk_rows: int) -> None:
     chunked_error = (actual.float() - dense.float()).norm() / dense.float().norm()
     assert relative_to_materialized < 0.07
     assert chunked_error <= materialized_error + 0.002
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_dynamic_chunked_ffn_gated_updates_retains_materialized_accuracy() -> None:
+    operands = make_operands(
+        rows=385,
+        output_features=384,
+        dynamic=True,
+        seed=905,
+    )
+    rows, output_features = operands.input.shape[0], operands.down.weight.shape[0]
+    base = torch.randn(rows, output_features, device="cuda", dtype=torch.bfloat16)
+    reusable_update = torch.randn_like(base)
+    gate_storage = torch.randn(7, 6 * output_features, device="cuda", dtype=torch.bfloat16)
+    update_gate = gate_storage[:, 2 * output_features : 3 * output_features]
+    ffn_gate = gate_storage[:, 5 * output_features :]
+    gate_indices = torch.randint(0, 7, (rows,), device="cuda", dtype=torch.int64)
+    expected = _materialized_gated_updates(
+        materialized(operands),
+        base,
+        reusable_update,
+        update_gate,
+        ffn_gate,
+        gate_indices,
+    )
+    actual = reusable_update.clone()
+
+    result = _chunked_swiglu_ffn_gated_updates_op(
+        *operands.arguments(128)[:-1],
+        base,
+        actual,
+        update_gate,
+        ffn_gate,
+        gate_indices,
+        False,
+        128,
+    )
+
+    relative_error = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert result is None
+    assert relative_error < 0.07
 
 
 def _materialized_gated_updates(

@@ -57,8 +57,50 @@ def _prepare_dynamic_tensors(
     return prepared.qdata, prepared.scale, per_tensor_scale
 
 
+def _dynamic_plain_scale(input: torch.Tensor) -> torch.Tensor:  # noqa: A002
+    return per_tensor_amax_to_scale(input.abs().amax())
+
+
+def _prepare_dynamic_swiglu_tensors(
+    input: torch.Tensor,  # noqa: A002
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _prepare_dynamic_tensors(input, "swiglu")
+
+
+def _prepare_dynamic_gelu_tanh_tensors(
+    input: torch.Tensor,  # noqa: A002
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _prepare_dynamic_tensors(input, "gelu_tanh")
+
+
 _compiled_prepare_static = torch.compile(_prepare_static_tensors, fullgraph=True)
-_compiled_prepare_dynamic = torch.compile(_prepare_dynamic_tensors, fullgraph=True)
+_compiled_dynamic_plain_scale = torch.compile(_dynamic_plain_scale, fullgraph=True)
+_compiled_prepare_dynamic_swiglu = torch.compile(_prepare_dynamic_swiglu_tensors, fullgraph=True)
+_compiled_prepare_dynamic_gelu_tanh = torch.compile(
+    _prepare_dynamic_gelu_tanh_tensors,
+    fullgraph=True,
+)
+
+
+def _compiled_prepare_dynamic(
+    input: torch.Tensor,  # noqa: A002
+    activation_fn: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare dynamic activations without generalizing across unrelated layouts."""
+    if activation_fn is None:
+        per_tensor_scale = _compiled_dynamic_plain_scale(input)
+        qdata, scale = nvfp4_triton._prepare_static_storage(
+            input,
+            per_tensor_scale,
+            swiglu=False,
+            source_global_scale=None,
+            source_bias=None,
+        )
+        return qdata, scale, per_tensor_scale
+    if activation_fn == "swiglu":
+        return _compiled_prepare_dynamic_swiglu(input)
+    assert activation_fn == "gelu_tanh"
+    return _compiled_prepare_dynamic_gelu_tanh(input)
 
 
 def _scale_result(

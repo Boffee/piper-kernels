@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import cast
 
 import torch
+from torch.nn import functional as F  # noqa: N812
+from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
@@ -13,7 +15,7 @@ from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
-_DEFAULT_CHUNK_ROWS = 4_096
+_DEFAULT_CHUNK_ROWS = 1_536
 _SCALE_ROW_BLOCK = 128
 
 
@@ -131,32 +133,6 @@ def _validate_inputs(
     return cast(int, up_shape.rows), output_features
 
 
-def _project_chunk(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_per_tensor_scale: torch.Tensor,
-    linear: _LinearOperands,
-    start: int,
-    stop: int,
-) -> torch.Tensor:
-    input_chunk, scale_chunk = nvfp4_projection.prepared_input_chunk(
-        input_qdata,
-        input_scale,
-        start,
-        stop,
-    )
-    return nvfp4_ops._execute_prepared(
-        input_chunk,
-        scale_chunk,
-        input_per_tensor_scale,
-        linear.weight_qdata,
-        linear.weight_scale,
-        linear.weight_per_tensor_scale,
-        linear.bias,
-        torch.bfloat16,
-    )
-
-
 def _project_chunk_out(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -185,7 +161,48 @@ def _projection_global_scale(
     return input_per_tensor_scale * weight_per_tensor_scale
 
 
-def _project_static_down_chunk(
+def _dynamic_swiglu_scale(input: torch.Tensor) -> torch.Tensor:  # noqa: A002
+    up, gate = input.chunk(2, dim=-1)
+    activated = up * F.silu(gate)
+    return per_tensor_amax_to_scale(activated.abs().amax())
+
+
+def _projected_swiglu_scale(
+    input: torch.Tensor,  # noqa: A002
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    projected = (input.float() * global_scale.float()).to(input.dtype)
+    return _dynamic_swiglu_scale(projected)
+
+
+def _projected_swiglu_scale_and_add_bias(
+    input: torch.Tensor,  # noqa: A002
+    global_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    projected = (input.float() * global_scale.float() + bias.float()).to(input.dtype)
+    return _dynamic_swiglu_scale(projected)
+
+
+_compiled_projected_swiglu_scale = torch.compile(_projected_swiglu_scale, fullgraph=True)
+_compiled_projected_swiglu_scale_and_add_bias = torch.compile(
+    _projected_swiglu_scale_and_add_bias,
+    fullgraph=True,
+)
+
+
+def _projected_swiglu_dynamic_scale(
+    input: torch.Tensor,  # noqa: A002
+    global_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Calculate a dynamic scale without materializing the projected SwiGLU."""
+    if bias is None:
+        return _compiled_projected_swiglu_scale(input, global_scale)
+    return _compiled_projected_swiglu_scale_and_add_bias(input, global_scale, bias)
+
+
+def _project_affine_down_chunk(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     input_per_tensor_scale: torch.Tensor,
@@ -236,7 +253,7 @@ def _run_chunked_swiglu_ffn(
 ) -> torch.Tensor:
     """Run one NVFP4 FFN while bounding its materialized BF16 intermediate.
 
-    Static down-projection affine terms run in the GEMM accumulator before its output conversion.
+    Down-projection affine terms run in the GEMM accumulator before its output conversion.
     Dynamic down scales intentionally cover one chunk rather than the otherwise-unavailable full
     intermediate.
     """
@@ -273,124 +290,98 @@ def _run_chunked_swiglu_ffn(
     )
     output_2d = output.reshape(rows, output_features)
     base_2d = None if gated_updates is None else gated_updates.base.reshape(rows, output_features)
-    fold_projection_epilogues = not down.dynamic_activation_scale
-    packed_workspace = projected_workspace = None
-    up_global_scale = down_global_scale = None
-    if fold_projection_epilogues:
-        workspace_rows = min(rows, chunk_rows)
-        packed_workspace = torch.empty(
-            (workspace_rows, up.weight_qdata.shape[0]),
+    workspace_rows = min(rows, chunk_rows)
+    packed_workspace = torch.empty(
+        (workspace_rows, up.weight_qdata.shape[0]),
+        device=input.device,
+        dtype=input.dtype,
+    )
+    projected_workspace = (
+        None
+        if gated_updates is None
+        else torch.empty(
+            (workspace_rows, output_features),
             device=input.device,
             dtype=input.dtype,
         )
-        if gated_updates is not None:
-            projected_workspace = torch.empty(
-                (workspace_rows, output_features),
-                device=input.device,
-                dtype=input.dtype,
-            )
-        up_global_scale = _projection_global_scale(
-            up_per_tensor_scale,
-            up.weight_per_tensor_scale,
-        )
-        down_activation_scale = down.activation_per_tensor_scale
-        assert down_activation_scale is not None
+    )
+    up_global_scale = _projection_global_scale(
+        up_per_tensor_scale,
+        up.weight_per_tensor_scale,
+    )
+    static_down_scale = down.activation_per_tensor_scale
+    static_down_global_scale = None
+    if not down.dynamic_activation_scale:
+        assert static_down_scale is not None
         if gated_updates is not None or down.weight_per_tensor_scale is None:
-            down_global_scale = _projection_global_scale(
-                down_activation_scale,
+            static_down_global_scale = _projection_global_scale(
+                static_down_scale,
                 down.weight_per_tensor_scale,
             )
 
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
-        if fold_projection_epilogues:
-            assert packed_workspace is not None
-            assert up_global_scale is not None
-            down_activation_scale = down.activation_per_tensor_scale
-            assert down_activation_scale is not None
-            packed = _project_chunk_out(
-                up_qdata,
-                up_scale,
-                up,
-                start,
-                stop,
-                packed_workspace,
-            )
-            down_qdata, down_scale = nvfp4_backend.prepare_static_projected_swiglu(
-                packed,
-                down_activation_scale,
-                up_global_scale,
-                up.bias,
-            )
-            if gated_updates is None:
-                _project_static_down_chunk(
-                    down_qdata,
-                    down_scale,
-                    down_activation_scale,
-                    down,
-                    stop - start,
-                    output_2d[start:stop],
-                    down_global_scale,
-                )
-            else:
-                assert projected_workspace is not None
-                assert base_2d is not None
-                assert gate_layout is not None
-                assert down_global_scale is not None
-                projected = _project_chunk_out(
-                    down_qdata,
-                    down_scale,
-                    down,
-                    0,
-                    stop - start,
-                    projected_workspace,
-                )
-                gated_updates_backend.apply_indexed_gated_updates(
-                    projected,
-                    base_2d[start:stop],
-                    output_2d[start:stop],
-                    gated_updates,
-                    gate_layout,
-                    start,
-                    ffn_scale=down_global_scale,
-                    ffn_bias=down.bias,
-                )
-            continue
-        packed = _project_chunk(
+        packed = _project_chunk_out(
             up_qdata,
             up_scale,
-            up_per_tensor_scale,
             up,
             start,
             stop,
+            packed_workspace,
         )
-        down_qdata, down_scale, down_per_tensor_scale = nvfp4_ops._prepare_compiled(
+        down_per_tensor_scale = static_down_scale
+        down_global_scale = static_down_global_scale
+        if down.dynamic_activation_scale:
+            down_per_tensor_scale = _projected_swiglu_dynamic_scale(
+                packed,
+                up_global_scale,
+                up.bias,
+            )
+            if gated_updates is not None or down.weight_per_tensor_scale is None:
+                down_global_scale = _projection_global_scale(
+                    down_per_tensor_scale,
+                    down.weight_per_tensor_scale,
+                )
+        assert down_per_tensor_scale is not None
+        down_qdata, down_scale = nvfp4_backend.prepare_static_projected_swiglu(
             packed,
-            down.activation_per_tensor_scale,
-            down.dynamic_activation_scale,
-            "swiglu",
+            down_per_tensor_scale,
+            up_global_scale,
+            up.bias,
         )
-        projected = _project_chunk(
+        if gated_updates is None:
+            _project_affine_down_chunk(
+                down_qdata,
+                down_scale,
+                down_per_tensor_scale,
+                down,
+                stop - start,
+                output_2d[start:stop],
+                down_global_scale,
+            )
+            continue
+        assert projected_workspace is not None
+        assert base_2d is not None
+        assert gate_layout is not None
+        assert down_global_scale is not None
+        projected = _project_chunk_out(
             down_qdata,
             down_scale,
-            down_per_tensor_scale,
             down,
             0,
             stop - start,
+            projected_workspace,
         )
-        if gated_updates is None:
-            output_2d[start:stop].copy_(projected)
-        else:
-            assert base_2d is not None
-            assert gate_layout is not None
-            gated_updates_backend.apply_indexed_gated_updates(
-                projected,
-                base_2d[start:stop],
-                output_2d[start:stop],
-                gated_updates,
-                gate_layout,
-                start,
-            )
+        gated_updates_backend.apply_indexed_gated_updates(
+            projected,
+            base_2d[start:stop],
+            output_2d[start:stop],
+            gated_updates,
+            gate_layout,
+            start,
+            ffn_scale=down_global_scale,
+            ffn_bias=down.bias,
+        )
     return output
 
 
