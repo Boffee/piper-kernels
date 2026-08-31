@@ -179,9 +179,10 @@ def _prepare_static_storage(
     source_global_scale: torch.Tensor | None,
     source_bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    input_features = int(input.shape[-1])
+    contiguous_input = input.contiguous()
+    input_features = int(contiguous_input.shape[-1])
     output_features = input_features // 2 if swiglu else input_features
-    rows = int(input.numel() // input_features)
+    rows = int(contiguous_input.numel() // input_features)
     scale_rows = (rows + 127) // 128 * 32
     scale_columns = (output_features + 63) // 64 * 16
     qdata = torch.empty(
@@ -196,10 +197,10 @@ def _prepare_static_storage(
         scale = torch.empty(scale_shape, device=input.device, dtype=torch.float8_e4m3fn)
     block_count = rows * (output_features // _NVFP4_BLOCK_SIZE)
     _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
-        input,
+        contiguous_input,
         per_tensor_scale,
         source_global_scale if source_global_scale is not None else per_tensor_scale,
-        source_bias if source_bias is not None else input,
+        source_bias if source_bias is not None else contiguous_input,
         qdata,
         scale,
         block_count,
