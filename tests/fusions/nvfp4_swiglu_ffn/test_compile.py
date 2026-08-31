@@ -236,6 +236,41 @@ def test_cuda_compile_options_fail_closed_when_packed_projection_escapes() -> No
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_compile_options_preserve_output_reshape_when_it_changes_rank() -> None:
+    operands = make_operands(rows=258, dynamic=False, seed=916)
+    activation = operands.input.reshape(2, 129, -1)
+    model = _SwiGluFfn(operands).eval()
+    output_features = operands.down.weight.shape[0]
+
+    def flattened_ffn(value: torch.Tensor) -> torch.Tensor:
+        output = model(value.reshape(-1, value.shape[-1]))
+        assert isinstance(output, torch.Tensor)
+        return output.reshape(*value.shape[:-1], output_features)
+
+    capture = _TargetCapturePass()
+    with torch.no_grad():
+        torch._dynamo.reset()
+        expected = torch.compile(
+            flattened_ffn,
+            fullgraph=True,
+            options=nvfp4_compile_options(),
+        )(activation)
+        torch._dynamo.reset()
+        actual = torch.compile(
+            flattened_ffn,
+            fullgraph=True,
+            options=_capturing_options(capture),
+        )(activation)
+
+    assert actual.shape == (2, 129, output_features)
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 0.01
+    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn.default) == 1
+    assert capture.targets.count(torch.ops.aten.reshape.default) == 2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_cuda_compile_options_fold_gated_updates() -> None:
     rows = 257
     operands = make_operands(

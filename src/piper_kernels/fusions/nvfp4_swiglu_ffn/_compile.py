@@ -172,6 +172,9 @@ def _valid_normalized_ffn(match: Match) -> bool:
     if validated_up is None or down_shape is None:
         return False
     input_value, up_shape = validated_up
+    output_value = preparation_sharing.tensor_metadata(match.output_node())
+    if output_value is None:
+        return False
     down_activation_scale = (
         None
         if operands.down_activation_per_tensor_scale is None
@@ -191,6 +194,20 @@ def _valid_normalized_ffn(match: Match) -> bool:
     return bool(
         input_value.dtype is torch.bfloat16
         and operands.down.logical_dtype is input_value.dtype
+        and output_value.dtype is input_value.dtype
+        and output_value.device == input_value.device
+        and output_value.ndim == input_value.ndim
+        and all(
+            preparation_sharing.dimension_key(output_dimension)
+            == preparation_sharing.dimension_key(input_dimension)
+            for output_dimension, input_dimension in zip(
+                output_value.shape[:-1],
+                input_value.shape[:-1],
+                strict=True,
+            )
+        )
+        and preparation_sharing.dimension_key(output_value.shape[-1])
+        == preparation_sharing.dimension_key(down_shape.output_features)
         and preparation_sharing.dimension_key(up_shape.rows)
         == preparation_sharing.dimension_key(down_shape.rows)
         and preparation_sharing.dimension_key(up_shape.output_features)
