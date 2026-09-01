@@ -1,6 +1,6 @@
 [project]
 name = "piper-kernels"
-version = "0.5.0"
+version = "0.6.0"
 description = "Reusable PyTorch inference operators and Triton kernels."
 readme = "README.md"
 license = "Apache-2.0"

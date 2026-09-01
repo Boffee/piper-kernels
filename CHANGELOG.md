@@ -5,6 +5,38 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-01
+
+### Added
+
+- Added a bounded-workspace compiler rewrite for compatible static NVFP4 output projections
+  following quantized sparse Piper attention on exact SM120. The fused operator pipelines 8,192
+  query rows through reusable attention and activation-preparation buffers and writes each
+  projection chunk directly to the final output. Dynamic output projections and attention values
+  with additional users fail closed to the ordinary graph.
+- Added the TorchAO-compatible `ConvRotNVFP4Tensor`, `convrot_nvfp4_linear`, and
+  `convrot_nvfp4_compile_options` APIs. Static and exact dynamic activation preparation rotate and
+  pack W4A4 input in one pass, while compiled compatible projections share preparation without a
+  runtime cache. Group size is explicit serialized tensor metadata and is included in persistent
+  compiler-cache keys.
+- Added `convrot_nvfp4_swiglu_ffn_compile_options` for compatible ConvRot NVFP4 SwiGLU
+  feed-forward graphs on exact SM120. The fused operator shares the format-neutral NVFP4 FFN core,
+  prepares projected SwiGLU activations directly, and bounds up/gate, packed activation, and down
+  projection workspaces to 1,536 rows.
+- Added `convrot_nvfp4_sparse_piper_compile_options` for compatible ConvRot NVFP4 Q/K/V
+  projections and static output projections around sparse Piper attention on exact SM120. Dynamic
+  Q/K/V projections share one exact activation preparation; Q/K/V encoding reuses the standard
+  NVFP4 sparse-Piper kernels, and the output path uses bounded 8,192-row chunks.
+
+### Changed
+
+- Centralized canonical NVFP4 packed-data and swizzled-scale layout helpers, input preparation,
+  projection epilogues, SwiGLU FFN execution, and sparse-attention output orchestration so standard
+  and ConvRot NVFP4 paths share the same validation and execution machinery.
+- Kept fused NVFP4 projection, normalization, RoPE, and sparse-attention preparation in their
+  highest available intermediate precision instead of reproducing unobservable lower-precision
+  conversion round trips.
+
 ## [0.5.0] - 2026-08-31
 
 ### Added
@@ -277,7 +309,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Boffee/piper-kernels/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Boffee/piper-kernels/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Boffee/piper-kernels/compare/v0.3.0...v0.4.0
