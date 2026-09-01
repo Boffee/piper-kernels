@@ -5,6 +5,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added rotation-aware in-place `addmm_` updates to `ConvRotNVFP4Tensor`. LoRA-style
+  updates rotate only the right-hand factor, recompute weight-side NVFP4 scales, and refill
+  existing packed storage while preserving activation calibration metadata. Optional seeded
+  stochastic E2M1 rounding is reproducible without consuming the process-global RNG.
+
 ## [0.6.0] - 2026-09-01
 
 ### Added

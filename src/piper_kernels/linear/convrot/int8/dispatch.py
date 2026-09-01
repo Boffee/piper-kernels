@@ -1,11 +1,13 @@
 """Validated storage-level entrypoints for ConvRot INT8."""
 
-import math
-
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import input_activation_width
+from piper_kernels.linear.convrot._update import (
+    validate_real_scalar,
+    validate_rounding_seed,
+)
 
 from . import reference
 
@@ -21,15 +23,6 @@ def _supports_triton(input: torch.Tensor) -> bool:  # noqa: A002
     return triton_backend is not None and AcceleratorTarget.from_device(
         input.device
     ).cuda_capability_at_least(7, 5)
-
-
-def _validate_scalar(value: int | float | complex, name: str) -> float:
-    if isinstance(value, complex):
-        raise TypeError(f"ConvRot INT8 addmm_ {name} must be a real number, got {value}")
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise ValueError(f"ConvRot INT8 addmm_ {name} must be finite, got {value}")
-    return converted
 
 
 def _validate_addmm(
@@ -90,13 +83,10 @@ def addmm_(
 ) -> None:
     """Apply the logical ``beta * weight + alpha * mat1 @ mat2`` update in place."""
     _validate_addmm(qdata, scale, dtype, group_size, mat1, mat2)
-    beta_float = _validate_scalar(beta, "beta")
-    alpha_float = _validate_scalar(alpha, "alpha")
-    if rounding_seed is not None:
-        if isinstance(rounding_seed, bool) or not isinstance(rounding_seed, int):
-            raise TypeError("ConvRot INT8 addmm_ rounding_seed must be an unsigned 64-bit integer")
-        if not 0 <= rounding_seed < (1 << 64):
-            raise ValueError("ConvRot INT8 addmm_ rounding_seed must be an unsigned 64-bit integer")
+    operation = "ConvRot INT8 addmm_"
+    beta_float = validate_real_scalar(beta, "beta", operation=operation)
+    alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
+    validate_rounding_seed(rounding_seed, operation=operation)
     if beta_float == 1 and alpha_float == 0:
         return
     seed_argument = (
