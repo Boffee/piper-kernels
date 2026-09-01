@@ -9,7 +9,9 @@ import torch
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    QuantizeTensorToNVFP4Kwargs,
+)
 
 from piper_kernels.linear._dispatch import bind_linear_arguments
 from piper_kernels.linear.convrot._rotation import (
@@ -19,6 +21,7 @@ from piper_kernels.linear.convrot._rotation import (
 from piper_kernels.linear.nvfp4._typing import NVFP4Storage
 from piper_kernels.linear.nvfp4.tensor import (
     PiperNVFP4Tensor,
+    _quantize_hp,
     supports_semantic_linear,
 )
 
@@ -126,6 +129,45 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             storage.is_swizzled_scales,
             storage.use_triton_kernel,
             storage.act_quant_kwargs,
+        )
+
+    @classmethod
+    def from_hp(
+        cls,
+        hp_tensor: torch.Tensor,
+        *,
+        block_size: int = 16,
+        per_tensor_scale: torch.Tensor | None = None,
+        compute_per_tensor_scale: bool = False,
+        act_per_tensor_scale: torch.Tensor | None = None,
+        is_swizzled_scales: bool = False,
+        use_triton_kernel: bool = False,
+        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        group_size: int | None = None,
+    ) -> ConvRotNVFP4Tensor:
+        """Rotate and quantize a high-precision weight into ConvRot NVFP4 storage.
+
+        The NVFP4 arguments otherwise match TorchAO's :meth:`NVFP4Tensor.to_nvfp4`
+        builder. ``compute_per_tensor_scale=True`` derives the optional global weight
+        scale from the rotated weight, avoiding both a second rotation in the caller and
+        an incorrect scale from the logical basis. ``hp_tensor`` is detached before
+        conversion; checkpoint quantization is an inference transform and does not retain
+        an autograd graph.
+        """
+        if group_size is None:
+            raise TypeError("ConvRot NVFP4 quantization requires a group size")
+        return cls.from_torchao(
+            _quantize_hp(
+                rotate_groups(hp_tensor.detach(), group_size),
+                block_size=block_size,
+                per_tensor_scale=per_tensor_scale,
+                compute_per_tensor_scale=compute_per_tensor_scale,
+                act_per_tensor_scale=act_per_tensor_scale,
+                is_swizzled_scales=is_swizzled_scales,
+                use_triton_kernel=use_triton_kernel,
+                act_quant_kwargs=act_quant_kwargs,
+            ),
+            group_size=group_size,
         )
 
     def _stable_hash_for_caching(self) -> str:

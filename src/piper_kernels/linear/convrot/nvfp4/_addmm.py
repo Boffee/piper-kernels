@@ -20,11 +20,10 @@ from piper_kernels.linear.convrot._update import (
     validate_rounding_seed,
 )
 from piper_kernels.linear.nvfp4 import _layout
-from piper_kernels.linear.nvfp4.tensor import PiperNVFP4Tensor
-
-# TorchAO divides the global reciprocal by the minimum FP8 block scale.
-# Keep that intermediate finite even when the merged weight is exactly zero.
-_MIN_PER_TENSOR_SCALE = torch.finfo(torch.float32).tiny / torch.finfo(torch.float8_e4m3fn).tiny
+from piper_kernels.linear.nvfp4.tensor import (
+    _MIN_PER_TENSOR_SCALE,
+    PiperNVFP4Tensor,
+)
 
 
 def _validate_storage(weight: PiperNVFP4Tensor) -> None:

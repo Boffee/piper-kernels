@@ -16,7 +16,7 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 | `piper_kernels` | Public dense and sparse Piper Attention plus SageAttention2++ operators |
 | `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
 | `piper_kernels.linear` | Linear operators, tensor formats, and optimized backends |
-| `piper_kernels.linear.convrot` | ConvRot quantized tensors and linear operators; INT8 today, INT4 planned |
+| `piper_kernels.linear.convrot` | ConvRot INT8 and NVFP4 tensors, linear operators, and compiler integrations |
 
 ## Triton setup
 
@@ -142,6 +142,43 @@ The operator selects its Triton implementation on supported CUDA devices and oth
 uses the portable PyTorch reference. Install the tensor format and optimized backend with
 `piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, and
 attention-only consumers do not inherit the TorchAO dependency.
+
+## NVFP4 construction
+
+Piper's ordinary and ConvRot NVFP4 wrappers can quantize a floating-point weight without
+exposing TorchAO storage construction to the caller:
+
+```python
+from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
+from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
+
+activation_quantization = QuantizeTensorToNVFP4Kwargs(
+    block_size=16,
+    is_swizzled_scales=True,
+    use_triton_kernel=False,
+    use_dynamic_per_tensor_scale=True,
+)
+
+weight = PiperNVFP4Tensor.from_hp(
+    dense_weight,
+    compute_per_tensor_scale=True,
+    is_swizzled_scales=True,
+    act_quant_kwargs=activation_quantization,
+)
+rotated_weight = ConvRotNVFP4Tensor.from_hp(
+    dense_weight,
+    group_size=64,
+    compute_per_tensor_scale=True,
+    is_swizzled_scales=True,
+    act_quant_kwargs=activation_quantization,
+)
+```
+
+For ConvRot, the global NVFP4 scale is derived after rotation. This keeps rotation and
+quantization in one package-owned operation and prevents callers from accidentally scaling the
+logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported from
+`piper_kernels.linear.convrot` for format-policy validation.
 
 ## Piper Attention
 

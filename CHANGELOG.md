@@ -5,6 +5,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added high-precision constructors for ordinary and ConvRot NVFP4 weights. They can derive a
+  finite global scale in the stored basis, including well-defined all-zero storage, while ConvRot
+  owns rotation before quantization.
+- Exported the supported ConvRot group sizes for checkpoint producers and policy validation.
+
 ## [0.6.1] - 2026-09-01
 
 ### Added

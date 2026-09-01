@@ -73,6 +73,81 @@ def test_from_torchao_reuses_storage_and_attaches_rotation_metadata() -> None:
         ConvRotNVFP4Tensor.from_torchao(source)
 
 
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: int) -> None:
+    torch.manual_seed(610 + group_size)
+    logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
+    rotated_weight = rotate_groups(logical_weight, group_size)
+    per_tensor_scale = per_tensor_amax_to_scale(rotated_weight.abs().amax())
+    activation_scale = torch.tensor(0.5)
+
+    weight = ConvRotNVFP4Tensor.from_hp(
+        logical_weight.requires_grad_(),
+        group_size=group_size,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=activation_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(False),
+    )
+    expected = TorchAONVFP4Tensor.to_nvfp4(
+        rotated_weight,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=activation_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(False),
+    )
+
+    assert type(weight) is ConvRotNVFP4Tensor
+    assert weight.group_size == group_size
+    assert not weight.requires_grad
+    assert torch.equal(weight.qdata, expected.qdata)
+    assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+    assert weight.per_tensor_scale is per_tensor_scale
+    assert weight.act_per_tensor_scale is activation_scale
+    assert weight.act_quant_kwargs == expected.act_quant_kwargs
+
+
+def test_from_hp_computes_global_scale_in_the_rotated_basis() -> None:
+    torch.manual_seed(874)
+    logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
+    rotated_weight = rotate_groups(logical_weight, 64)
+    expected_scale = per_tensor_amax_to_scale(rotated_weight.float().abs().amax())
+
+    weight = ConvRotNVFP4Tensor.from_hp(
+        logical_weight,
+        group_size=64,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(True),
+    )
+
+    assert weight.per_tensor_scale is not None
+    assert torch.equal(weight.per_tensor_scale, expected_scale)
+
+
+def test_from_hp_computed_global_scale_handles_an_all_zero_weight() -> None:
+    weight = ConvRotNVFP4Tensor.from_hp(
+        torch.zeros(128, 256, dtype=torch.bfloat16),
+        group_size=64,
+        compute_per_tensor_scale=True,
+    )
+
+    assert weight.per_tensor_scale is not None
+    assert torch.isfinite(weight.per_tensor_scale)
+    assert weight.per_tensor_scale > 0
+    assert not torch.count_nonzero(weight.qdata)
+
+
+def test_from_hp_rejects_ambiguous_per_tensor_scale_configuration() -> None:
+    with pytest.raises(ValueError, match="both compute and receive"):
+        ConvRotNVFP4Tensor.from_hp(
+            torch.zeros(128, 256, dtype=torch.bfloat16),
+            group_size=64,
+            per_tensor_scale=torch.ones(()),
+            compute_per_tensor_scale=True,
+        )
+
+
 def test_device_and_dtype_copies_preserve_wrapper_and_group_size() -> None:
     source = ConvRotNVFP4Tensor(
         torch.empty(128, 128, dtype=torch.uint8),
