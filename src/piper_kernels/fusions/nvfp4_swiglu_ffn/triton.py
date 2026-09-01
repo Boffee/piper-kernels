@@ -7,7 +7,6 @@ from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 from . import _core
@@ -59,16 +58,19 @@ def _projected_swiglu_dynamic_scale(
 class _StandardPreparation:
     """Ordinary NVFP4 preparation used by the shared chunked runner."""
 
+    def dynamic_up_scale(
+        self,
+        input: torch.Tensor,  # noqa: A002 - match linear terminology
+    ) -> torch.Tensor:
+        return nvfp4_backend.dynamic_scale(input)
+
     def prepare_up(
         self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
-        up: _core.LinearOperands,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return nvfp4_ops._prepare_compiled(
-            input,
-            up.activation_per_tensor_scale,
-            up.dynamic_activation_scale,
-        )
+        per_tensor_scale: torch.Tensor,
+        out: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return nvfp4_backend.prepare_static_out(input, per_tensor_scale, out)
 
     def dynamic_down_scale(
         self,

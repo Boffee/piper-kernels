@@ -25,18 +25,23 @@ class _ConvRotPreparation:
         validate_group_size(self.up_group_size)
         validate_group_size(self.down_group_size)
 
+    def dynamic_up_scale(
+        self,
+        input: torch.Tensor,  # noqa: A002 - match linear terminology
+    ) -> torch.Tensor:
+        return convrot_nvfp4_backend.dynamic_scale(input, self.up_group_size)
+
     def prepare_up(
         self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
-        up: _core.LinearOperands,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if up.dynamic_activation_scale:
-            return convrot_nvfp4_backend.prepare_dynamic(input, self.up_group_size)
-        assert up.activation_per_tensor_scale is not None
-        return convrot_nvfp4_backend.prepare_static(
+        per_tensor_scale: torch.Tensor,
+        out: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return convrot_nvfp4_backend.prepare_static_out(
             input,
-            up.activation_per_tensor_scale,
+            per_tensor_scale,
             self.up_group_size,
+            out,
         )
 
     def dynamic_down_scale(

@@ -7,6 +7,7 @@ from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
 )
+from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 
 from ._helpers import dense_reference, down_affine_reference, make_operands, materialized
 
@@ -46,6 +47,42 @@ def test_dynamic_chunked_ffn_retains_dense_accuracy(with_bias: bool) -> None:
     chunked_error = (actual.float() - dense.float()).norm() / dense.float().norm()
     assert relative_to_materialized < 0.1
     assert chunked_error <= materialized_error + 0.002
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_up_preparation_uses_global_scale_and_bounded_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operands = make_operands(rows=385, dynamic=True, seed=935)
+    scale_rows = []
+    prepared_rows = []
+    original_dynamic_scale = convrot_nvfp4_backend.dynamic_scale
+    original_prepare_static_out = convrot_nvfp4_backend.prepare_static_out
+
+    def dynamic_scale(
+        input: torch.Tensor,  # noqa: A002
+        group_size: int,
+    ) -> torch.Tensor:
+        scale_rows.append(input.shape[0])
+        return original_dynamic_scale(input, group_size)
+
+    def prepare_static_out(
+        input: torch.Tensor,  # noqa: A002
+        per_tensor_scale: torch.Tensor,
+        group_size: int,
+        out: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prepared_rows.append(input.shape[0])
+        return original_prepare_static_out(input, per_tensor_scale, group_size, out)
+
+    monkeypatch.setattr(convrot_nvfp4_backend, "dynamic_scale", dynamic_scale)
+    monkeypatch.setattr(convrot_nvfp4_backend, "prepare_static_out", prepare_static_out)
+
+    _chunked_swiglu_ffn_op(*operands.arguments(128))
+
+    assert scale_rows == [385]
+    assert prepared_rows == [128, 128, 128, 1]
 
 
 def _materialized_gated_updates(

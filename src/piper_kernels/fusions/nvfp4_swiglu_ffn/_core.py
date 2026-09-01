@@ -8,6 +8,7 @@ from typing import Protocol, cast
 import torch
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
+from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
@@ -31,12 +32,20 @@ class LinearOperands:
 class PreparationBackend(Protocol):
     """Format-specific activation preparation used by the shared FFN runner."""
 
+    def dynamic_up_scale(
+        self,
+        input: torch.Tensor,  # noqa: A002 - match linear terminology
+    ) -> torch.Tensor:
+        """Calculate one global scale for the complete FFN input."""
+        ...
+
     def prepare_up(
         self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
-        up: LinearOperands,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare the FFN input for the up projection."""
+        per_tensor_scale: torch.Tensor,
+        out: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare one FFN input chunk into reusable storage."""
         ...
 
     def dynamic_down_scale(
@@ -238,7 +247,14 @@ def run_chunked_swiglu_ffn(
         chunk_rows,
     )
     leading_shape = input.shape[:-1]
-    up_qdata, up_scale, up_per_tensor_scale = preparation.prepare_up(input, up)
+    input_features = input.shape[-1]
+    input_2d = input.reshape(rows, input_features)
+    up_per_tensor_scale = (
+        preparation.dynamic_up_scale(input)
+        if up.dynamic_activation_scale
+        else up.activation_per_tensor_scale
+    )
+    assert up_per_tensor_scale is not None
     gate_layout = (
         None
         if gated_updates is None
@@ -260,6 +276,11 @@ def run_chunked_swiglu_ffn(
     output_2d = output.reshape(rows, output_features)
     base_2d = None if gated_updates is None else gated_updates.base.reshape(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
+    up_storage = nvfp4_layout.prepare_activation_storage(
+        input,
+        workspace_rows,
+        input_features,
+    )
     packed_workspace = torch.empty(
         (workspace_rows, up.weight_qdata.shape[0]),
         device=input.device,
@@ -290,12 +311,18 @@ def run_chunked_swiglu_ffn(
 
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
+        chunk_row_count = stop - start
+        up_qdata, up_scale = preparation.prepare_up(
+            input_2d[start:stop],
+            up_per_tensor_scale,
+            up_storage,
+        )
         packed = _project_chunk_out(
             up_qdata,
             up_scale,
             up,
-            start,
-            stop,
+            0,
+            chunk_row_count,
             packed_workspace,
         )
         down_per_tensor_scale = static_down_scale
@@ -324,7 +351,7 @@ def run_chunked_swiglu_ffn(
                 down_scale,
                 down_per_tensor_scale,
                 down,
-                stop - start,
+                chunk_row_count,
                 output_2d[start:stop],
                 down_global_scale,
             )
@@ -338,7 +365,7 @@ def run_chunked_swiglu_ffn(
             down_scale,
             down,
             0,
-            stop - start,
+            chunk_row_count,
             projected_workspace,
         )
         gated_updates_backend.apply_indexed_gated_updates(
