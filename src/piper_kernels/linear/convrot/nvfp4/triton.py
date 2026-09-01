@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear._input_activations import input_activation_width
 from piper_kernels.linear.convrot import triton as convrot_backend
 from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
@@ -23,6 +24,8 @@ _MAX_ROTATION_CHUNK_SIZE = 16_384
 @triton.jit
 def _rotated_chunk_amax(
     input_ptr,
+    source_global_scale_ptr,
+    source_bias_ptr,
     input_row_offset,
     row_width,
     chunk_start: tl.constexpr,
@@ -30,6 +33,9 @@ def _rotated_chunk_amax(
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    apply_source_affine: tl.constexpr,
+    has_source_bias: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
     chunk_offsets = tl.arange(0, chunk_size)
@@ -43,8 +49,12 @@ def _rotated_chunk_amax(
         group_size,
         inverse_sqrt_group,
         logical_dtype_code,
-        None,
+        activation_fn,
         accelerator_backend,
+        source_global_scale_ptr,
+        source_bias_ptr,
+        apply_source_affine,
+        has_source_bias,
     )
     return tl.max(tl.abs(values).to(tl.float32), axis=0)
 
@@ -52,6 +62,8 @@ def _rotated_chunk_amax(
 @triton.jit
 def _rotated_row_amax_kernel(
     input_ptr,
+    source_global_scale_ptr,
+    source_bias_ptr,
     row_amax_ptr,
     row_width,
     chunk_count: tl.constexpr,
@@ -61,15 +73,21 @@ def _rotated_row_amax_kernel(
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    apply_source_affine: tl.constexpr,
+    has_source_bias: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
     """Compute one exact post-rotation absolute maximum per activation row."""
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
-    input_row_offset = row_i64 * row_width
+    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
+    input_row_offset = row_i64 * input_row_width
 
     row_amax = _rotated_chunk_amax(
         input_ptr,
+        source_global_scale_ptr,
+        source_bias_ptr,
         input_row_offset,
         row_width,
         0,
@@ -77,6 +95,9 @@ def _rotated_row_amax_kernel(
         group_size,
         inverse_sqrt_group,
         logical_dtype_code,
+        activation_fn,
+        apply_source_affine,
+        has_source_bias,
         accelerator_backend,
     )
     if chunk_count >= 2:
@@ -84,6 +105,8 @@ def _rotated_row_amax_kernel(
             row_amax,
             _rotated_chunk_amax(
                 input_ptr,
+                source_global_scale_ptr,
+                source_bias_ptr,
                 input_row_offset,
                 row_width,
                 chunk_size0,
@@ -91,6 +114,9 @@ def _rotated_row_amax_kernel(
                 group_size,
                 inverse_sqrt_group,
                 logical_dtype_code,
+                activation_fn,
+                apply_source_affine,
+                has_source_bias,
                 accelerator_backend,
             ),
         )
@@ -99,6 +125,8 @@ def _rotated_row_amax_kernel(
             row_amax,
             _rotated_chunk_amax(
                 input_ptr,
+                source_global_scale_ptr,
+                source_bias_ptr,
                 input_row_offset,
                 row_width,
                 chunk_size0 + chunk_size1,
@@ -106,6 +134,9 @@ def _rotated_row_amax_kernel(
                 group_size,
                 inverse_sqrt_group,
                 logical_dtype_code,
+                activation_fn,
+                apply_source_affine,
+                has_source_bias,
                 accelerator_backend,
             ),
         )
@@ -115,6 +146,8 @@ def _rotated_row_amax_kernel(
 @triton.jit
 def _rotate_quantize_chunk(
     input_ptr,
+    source_global_scale_ptr,
+    source_bias_ptr,
     per_tensor_scale_ptr,
     qdata_ptr,
     scale_ptr,
@@ -128,6 +161,9 @@ def _rotate_quantize_chunk(
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
     scale_column_blocks: tl.constexpr,
+    activation_fn: tl.constexpr,
+    apply_source_affine: tl.constexpr,
+    has_source_bias: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
     """Rotate and encode one power-of-two row chunk into standard NVFP4 storage."""
@@ -142,8 +178,12 @@ def _rotate_quantize_chunk(
         group_size,
         inverse_sqrt_group,
         logical_dtype_code,
-        None,
+        activation_fn,
         accelerator_backend,
+        source_global_scale_ptr,
+        source_bias_ptr,
+        apply_source_affine,
+        has_source_bias,
     )
     block_count: tl.constexpr = chunk_size // _NVFP4_BLOCK_SIZE_TL
     blocked = tl.reshape(values, (block_count, _NVFP4_BLOCK_SIZE_TL))
@@ -177,6 +217,8 @@ def _rotate_quantize_chunk(
 @triton.jit
 def _rotate_quantize_nvfp4_kernel(
     input_ptr,
+    source_global_scale_ptr,
+    source_bias_ptr,
     per_tensor_scale_ptr,
     qdata_ptr,
     scale_ptr,
@@ -189,16 +231,22 @@ def _rotate_quantize_nvfp4_kernel(
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
     scale_column_blocks: tl.constexpr,
+    activation_fn: tl.constexpr,
+    apply_source_affine: tl.constexpr,
+    has_source_bias: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
     """Apply the second exact rotation and write hardware-ready NVFP4 storage."""
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
-    input_row_offset = row_i64 * row_width
+    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
+    input_row_offset = row_i64 * input_row_width
     qdata_row_offset = row_i64 * (row_width // 2)
 
     _rotate_quantize_chunk(
         input_ptr,
+        source_global_scale_ptr,
+        source_bias_ptr,
         per_tensor_scale_ptr,
         qdata_ptr,
         scale_ptr,
@@ -212,11 +260,16 @@ def _rotate_quantize_nvfp4_kernel(
         inverse_sqrt_group,
         logical_dtype_code,
         scale_column_blocks,
+        activation_fn,
+        apply_source_affine,
+        has_source_bias,
         accelerator_backend,
     )
     if chunk_count >= 2:
         _rotate_quantize_chunk(
             input_ptr,
+            source_global_scale_ptr,
+            source_bias_ptr,
             per_tensor_scale_ptr,
             qdata_ptr,
             scale_ptr,
@@ -230,11 +283,16 @@ def _rotate_quantize_nvfp4_kernel(
             inverse_sqrt_group,
             logical_dtype_code,
             scale_column_blocks,
+            activation_fn,
+            apply_source_affine,
+            has_source_bias,
             accelerator_backend,
         )
     if chunk_count >= 3:
         _rotate_quantize_chunk(
             input_ptr,
+            source_global_scale_ptr,
+            source_bias_ptr,
             per_tensor_scale_ptr,
             qdata_ptr,
             scale_ptr,
@@ -248,6 +306,9 @@ def _rotate_quantize_nvfp4_kernel(
             inverse_sqrt_group,
             logical_dtype_code,
             scale_column_blocks,
+            activation_fn,
+            apply_source_affine,
+            has_source_bias,
             accelerator_backend,
         )
 
@@ -314,14 +375,19 @@ type _ValidatedInput = tuple[
 def _validate_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
+    activation_fn: str | None = None,
 ) -> _ValidatedInput:
     validate_group_size(group_size)
     if input.ndim == 0 or input.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("ConvRot NVFP4 input must be a non-scalar FP16 or BF16 tensor")
-    input_features = int(input.shape[-1])
-    if input_features < 1:
+    source_features = int(input.shape[-1])
+    if source_features < 1:
         raise ValueError("ConvRot NVFP4 requires a nonempty feature dimension")
-    rows = int(input.numel() // input_features)
+    activation_width = input_activation_width(activation_fn)
+    if source_features % activation_width:
+        raise ValueError("ConvRot NVFP4 input activation requires equal feature partitions")
+    input_features = source_features // activation_width
+    rows = int(input.numel() // source_features)
     if rows < 1 or input_features % group_size or input_features % _NVFP4_BLOCK_SIZE:
         raise ValueError(
             "ConvRot NVFP4 requires nonempty rows divisible by the rotation and FP4 blocks"
@@ -340,10 +406,54 @@ def _validate_input(
     )
 
 
+def _validate_source_affine(
+    validated_input: _ValidatedInput,
+    source_global_scale: torch.Tensor,
+    source_bias: torch.Tensor | None,
+) -> None:
+    contiguous_input = validated_input[0]
+    if (
+        source_global_scale.shape != ()
+        or source_global_scale.dtype is not torch.float32
+        or source_global_scale.device != contiguous_input.device
+        or source_global_scale.layout is not torch.strided
+        or not source_global_scale.is_contiguous()
+    ):
+        raise ValueError(
+            "ConvRot NVFP4 source global scale must be a contiguous FP32 scalar on the input device"
+        )
+    if source_bias is not None and (
+        source_bias.shape != (contiguous_input.shape[-1],)
+        or source_bias.dtype is not contiguous_input.dtype
+        or source_bias.device != contiguous_input.device
+        or source_bias.layout is not torch.strided
+        or not source_bias.is_contiguous()
+    ):
+        raise ValueError(
+            "ConvRot NVFP4 source bias must be a contiguous input-dtype vector "
+            "matching the source features"
+        )
+
+
+def _validate_projected_swiglu(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    source_global_scale: torch.Tensor,
+    source_bias: torch.Tensor | None,
+    group_size: int,
+) -> _ValidatedInput:
+    validated_input = _validate_input(input, group_size, "swiglu")
+    _validate_source_affine(validated_input, source_global_scale, source_bias)
+    return validated_input
+
+
 def _prepare_dynamic_scale(
     validated_input: _ValidatedInput,
     group_size: int,
     out: torch.Tensor | None = None,
+    *,
+    activation_fn: str | None = None,
+    source_global_scale: torch.Tensor | None = None,
+    source_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     contiguous_input, rows, input_features, chunk_sizes, target = validated_input
     chunk_count = sum(chunk_size > 0 for chunk_size in chunk_sizes)
@@ -352,6 +462,8 @@ def _prepare_dynamic_scale(
     row_amax = torch.empty(rows, device=contiguous_input.device, dtype=torch.float32)
     _rotated_row_amax_kernel[(rows,)](
         contiguous_input,
+        source_global_scale if source_global_scale is not None else contiguous_input,
+        source_bias if source_bias is not None else contiguous_input,
         row_amax,
         input_features,
         chunk_count=chunk_count,
@@ -361,6 +473,9 @@ def _prepare_dynamic_scale(
         group_size=group_size,
         inverse_sqrt_group=group_size**-0.5,
         logical_dtype_code=convrot_backend.logical_dtype_code(contiguous_input.dtype),
+        activation_fn=activation_fn,
+        apply_source_affine=source_global_scale is not None,
+        has_source_bias=source_bias is not None,
         accelerator_backend=target.backend,
         num_warps=amax_num_warps,
     )
@@ -372,6 +487,10 @@ def _prepare_static_storage(
     per_tensor_scale: torch.Tensor,
     group_size: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    activation_fn: str | None = None,
+    source_global_scale: torch.Tensor | None = None,
+    source_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     contiguous_input, rows, input_features, chunk_sizes, target = validated_input
     if (
@@ -392,6 +511,8 @@ def _prepare_static_storage(
     _, packing_num_warps = _preparation_num_warps(chunk_sizes, group_size)
     _rotate_quantize_nvfp4_kernel[(rows,)](
         contiguous_input,
+        source_global_scale if source_global_scale is not None else per_tensor_scale,
+        source_bias if source_bias is not None else contiguous_input,
         per_tensor_scale,
         qdata,
         scale,
@@ -405,6 +526,9 @@ def _prepare_static_storage(
         logical_dtype_code=convrot_backend.logical_dtype_code(contiguous_input.dtype),
         scale_column_blocks=(input_features + nvfp4_layout.SCALE_COLUMN_TILE - 1)
         // nvfp4_layout.SCALE_COLUMN_TILE,
+        activation_fn=activation_fn,
+        apply_source_affine=source_global_scale is not None,
+        has_source_bias=source_bias is not None,
         accelerator_backend=target.backend,
         num_warps=packing_num_warps,
     )
@@ -462,4 +586,57 @@ def prepare_dynamic(
     return qdata, scale, per_tensor_scale
 
 
-__all__ = ["dynamic_scale", "prepare_dynamic", "prepare_static", "prepare_static_out"]
+def projected_swiglu_dynamic_scale(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    source_global_scale: torch.Tensor,
+    source_bias: torch.Tensor | None,
+    group_size: int,
+) -> torch.Tensor:
+    """Calculate an exact scale after projection affine, SwiGLU, and rotation."""
+    validated_input = _validate_projected_swiglu(
+        input,
+        source_global_scale,
+        source_bias,
+        group_size,
+    )
+    return _prepare_dynamic_scale(
+        validated_input,
+        group_size,
+        activation_fn="swiglu",
+        source_global_scale=source_global_scale,
+        source_bias=source_bias,
+    )
+
+
+def prepare_static_projected_swiglu(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    per_tensor_scale: torch.Tensor,
+    source_global_scale: torch.Tensor,
+    source_bias: torch.Tensor | None,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply projection affine and SwiGLU, then rotate and pack without materializing."""
+    validated_input = _validate_projected_swiglu(
+        input,
+        source_global_scale,
+        source_bias,
+        group_size,
+    )
+    return _prepare_static_storage(
+        validated_input,
+        per_tensor_scale,
+        group_size,
+        activation_fn="swiglu",
+        source_global_scale=source_global_scale,
+        source_bias=source_bias,
+    )
+
+
+__all__ = [
+    "dynamic_scale",
+    "prepare_dynamic",
+    "prepare_static",
+    "prepare_static_out",
+    "prepare_static_projected_swiglu",
+    "projected_swiglu_dynamic_scale",
+]

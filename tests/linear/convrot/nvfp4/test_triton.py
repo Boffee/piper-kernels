@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import triton as convrot_backend
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
@@ -27,6 +28,28 @@ def _materialized_reference(
         num_warps=4,
     )
     return nvfp4_ops._compiled_prepare_dynamic(rotated, None)
+
+
+def _materialized_projected_swiglu(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    source_global_scale: torch.Tensor,
+    source_bias: torch.Tensor | None,
+    group_size: int,
+) -> torch.Tensor:
+    projected = (
+        nvfp4_ops._compiled_scale_result(input, source_global_scale)
+        if source_bias is None
+        else nvfp4_ops._compiled_scale_result_and_add_bias(
+            input,
+            source_global_scale,
+            source_bias,
+        )
+    )
+    activated = apply_input_activation(projected, "swiglu")
+    flattened = activated.reshape(-1, activated.shape[-1]).contiguous()
+    rotated = torch.empty_like(flattened)
+    convrot_backend.rotate_input(flattened, rotated, group_size, num_warps=4)
+    return rotated
 
 
 @pytest.mark.parametrize(
@@ -201,6 +224,72 @@ def test_dynamic_preparation_runs_existing_nvfp4_gemm() -> None:
     )
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+def test_projected_swiglu_preparation_matches_materialized_reference(
+    group_size: int,
+    with_bias: bool,
+) -> None:
+    torch.manual_seed(606 + group_size + with_bias)
+    rows, intermediate_features = 17, 256
+    input = torch.randn(  # noqa: A001
+        (rows, 2 * intermediate_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    source_global_scale = torch.tensor(0.01, device="cuda", dtype=torch.float32)
+    source_bias = (
+        torch.randn(2 * intermediate_features, device="cuda", dtype=input.dtype)
+        if with_bias
+        else None
+    )
+    rotated = _materialized_projected_swiglu(
+        input,
+        source_global_scale,
+        source_bias,
+        group_size,
+    )
+
+    expected_dynamic = nvfp4_ops._compiled_prepare_dynamic(rotated, None)
+    actual_per_tensor_scale = convrot_nvfp4.projected_swiglu_dynamic_scale(
+        input,
+        source_global_scale,
+        source_bias,
+        group_size,
+    )
+    actual_qdata, actual_scale = convrot_nvfp4.prepare_static_projected_swiglu(
+        input,
+        actual_per_tensor_scale,
+        source_global_scale,
+        source_bias,
+        group_size,
+    )
+    for actual_tensor, expected_tensor in zip(
+        (actual_qdata, actual_scale, actual_per_tensor_scale),
+        expected_dynamic,
+        strict=True,
+    ):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+    static_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
+    expected_static = nvfp4_ops._compiled_prepare_static(rotated, static_scale, None)
+    actual_static = convrot_nvfp4.prepare_static_projected_swiglu(
+        input,
+        static_scale,
+        source_global_scale,
+        source_bias,
+        group_size,
+    )
+    for actual_tensor, expected_tensor in zip(
+        actual_static,
+        expected_static[:2],
+        strict=True,
+    ):
+        assert torch.equal(actual_tensor, expected_tensor)
 
 
 @pytest.mark.parametrize("group_size", [15, 32])
