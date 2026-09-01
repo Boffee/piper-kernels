@@ -17,7 +17,7 @@ _GELU_TANH_SCALE_COEFFICIENT = tl.constexpr(GELU_TANH_SCALE_COEFFICIENT)
 
 
 @triton.jit
-def _to_logical_dtype(values, logical_dtype_code: tl.constexpr):
+def to_logical_dtype(values, logical_dtype_code: tl.constexpr):
     if logical_dtype_code == 1:
         return values.to(tl.float16).to(tl.float32)
     elif logical_dtype_code == 2:
@@ -51,7 +51,7 @@ def gelu_tanh(
         tanh_inner = _tanh_approx(inner)
     else:
         tanh_inner = libdevice.tanh(inner)
-    return _to_logical_dtype(
+    return to_logical_dtype(
         0.5 * values * (1.0 + tanh_inner),  # pyright: ignore[reportOperatorIssue]
         logical_dtype_code,
     )
@@ -60,5 +60,5 @@ def gelu_tanh(
 @triton.jit
 def swiglu(up, gate, logical_dtype_code: tl.constexpr):
     """Apply packed ``up * silu(gate)`` with logical-dtype rounding."""
-    activated_gate = _to_logical_dtype(gate / (1.0 + tl.exp(-gate)), logical_dtype_code)
-    return _to_logical_dtype(up * activated_gate, logical_dtype_code)
+    activated_gate = to_logical_dtype(gate / (1.0 + tl.exp(-gate)), logical_dtype_code)
+    return to_logical_dtype(up * activated_gate, logical_dtype_code)

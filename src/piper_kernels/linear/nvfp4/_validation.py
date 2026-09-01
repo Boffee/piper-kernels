@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, cast
 
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+
+from . import _layout
 
 _LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -36,23 +37,20 @@ def _shape_matches(
     )
 
 
-def _scale_shape(
-    rows: int | torch.SymInt,
-    columns: int | torch.SymInt,
-) -> tuple[int | torch.SymInt, int | torch.SymInt]:
-    rows_value = cast(Any, rows)
-    columns_value = cast(Any, columns)
-    return cast(
-        tuple[int | torch.SymInt, int | torch.SymInt],
-        (
-            (rows_value + 127) // 128 * 32,
-            (columns_value + 63) // 64 * 16,
-        ),
-    )
-
-
 def _valid_scalar(value: torch.Tensor | None) -> bool:
     return value is None or (value.shape == () and value.dtype is torch.float32)
+
+
+def _validate_input_features(
+    input_features: int | torch.SymInt,
+    name: str,
+) -> None:
+    if isinstance(input_features, int) and (
+        input_features < _layout.BLOCK_SIZE or input_features % _layout.BLOCK_SIZE
+    ):
+        raise ValueError(
+            f"{name} input features must be a positive multiple of {_layout.BLOCK_SIZE}"
+        )
 
 
 def _validate_device(device: torch.device, name: str) -> None:
@@ -95,8 +93,7 @@ def validate_weight(
     device: torch.device,
     name: str,
 ) -> int | torch.SymInt:
-    if isinstance(input_features, int) and (input_features < 16 or input_features % 16):
-        raise ValueError(f"{name} input features must be a positive multiple of 16")
+    _validate_input_features(input_features, name)
     packed_input_features = input_features // 2
     if (
         weight_qdata.ndim != 2
@@ -108,7 +105,7 @@ def validate_weight(
     if (
         not _shape_matches(
             weight_scale.shape,
-            _scale_shape(output_features, input_features),
+            _layout.scale_shape(output_features, input_features),
         )
         or weight_scale.dtype is not torch.float8_e4m3fn
     ):
@@ -144,8 +141,7 @@ def validate_semantic_linear(
     if input.ndim == 0 or input.dtype not in _LOGICAL_DTYPES or input.layout is not torch.strided:
         raise ValueError(f"{name} input must be a non-scalar strided floating tensor")
     input_features = input.shape[-1]
-    if isinstance(input_features, int) and (input_features < 16 or input_features % 16):
-        raise ValueError(f"{name} input features must be a positive multiple of 16")
+    _validate_input_features(input_features, name)
     rows = math.prod(input.shape[:-1])
     if isinstance(rows, int) and rows < 1:
         raise ValueError(f"{name} input must contain at least one row")
@@ -187,12 +183,11 @@ def validate_prepared_linear(
     input_features = 2 * packed_input_features
     if isinstance(rows, int) and rows < 1:
         raise ValueError(f"{name} input must contain at least one row")
-    if isinstance(input_features, int) and (input_features < 16 or input_features % 16):
-        raise ValueError(f"{name} input features must be a positive multiple of 16")
+    _validate_input_features(input_features, name)
     if (
         not _shape_matches(
             input_scale.shape,
-            _scale_shape(rows, input_features),
+            _layout.scale_shape(rows, input_features),
         )
         or input_scale.dtype is not torch.float8_e4m3fn
     ):

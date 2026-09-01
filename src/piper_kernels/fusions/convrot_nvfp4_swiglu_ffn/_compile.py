@@ -1,4 +1,4 @@
-"""Compiler folding for a bounded-workspace NVFP4 SwiGLU FFN."""
+"""Compiler folding for a bounded-workspace ConvRot NVFP4 SwiGLU FFN."""
 
 from __future__ import annotations
 
@@ -20,26 +20,29 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
+from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
 from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
+from piper_kernels.linear.convrot import _rotation as convrot_rotation
+from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
+from piper_kernels.linear.convrot.nvfp4 import _compile_fx as convrot_nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
-from . import _core
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v1"
+_COMPILE_PASS_VERSION = "convrot-nvfp4-swiglu-ffn-compile-v1"
 
 
 @dataclass(frozen=True, slots=True)
 class _MatchedFfn:
-    up: nvfp4_compile_fx.SemanticLinearNodes
+    up: convrot_nvfp4_compile_fx.SemanticLinearNodes
     down: nvfp4_compile_fx.PreparedLinearNodes
     down_activation_per_tensor_scale: torch.fx.Node | None
     down_dynamic_activation_scale: bool
+    down_group_size: int
 
     @classmethod
     def from_match(cls, match: Match) -> _MatchedFfn | None:
@@ -47,7 +50,7 @@ class _MatchedFfn:
             node
             for node in match.nodes
             if node.op == "call_function"
-            and node.target == torch.ops.piper_kernels.nvfp4_linear.default
+            and node.target == torch.ops.piper_kernels.convrot_nvfp4_linear.default
         ]
         down_calls = [
             node
@@ -57,7 +60,7 @@ class _MatchedFfn:
         ]
         if len(up_calls) != 1 or len(down_calls) != 1:
             return None
-        up = nvfp4_compile_fx.SemanticLinearNodes.from_call(up_calls[0])
+        up = convrot_nvfp4_compile_fx.SemanticLinearNodes.from_call(up_calls[0])
         down = nvfp4_compile_fx.PreparedLinearNodes.from_call(down_calls[0])
         if up is None or down is None:
             return None
@@ -73,43 +76,48 @@ class _MatchedFfn:
         prepared = prepared_getitem.args[0]
         if (
             prepared.op != "call_function"
-            or prepared.target != torch.ops.piper_kernels.nvfp4_prepare_input.default
+            or prepared.target != torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
             or prepared.kwargs
-            or len(prepared.args) != 4
+            or len(prepared.args) != 5
             or prepared.args[0] is not up_calls[0]
-            or prepared.args[3] != "swiglu"
+            or prepared.args[4] != "swiglu"
         ):
             return None
-        activation_scale, dynamic = prepared.args[1:3]
+        activation_scale, dynamic, group_size = prepared.args[1:4]
         if (
-            activation_scale is not None and not isinstance(activation_scale, torch.fx.Node)
-        ) or not isinstance(dynamic, bool):
+            (activation_scale is not None and not isinstance(activation_scale, torch.fx.Node))
+            or not isinstance(dynamic, bool)
+            or isinstance(group_size, bool)
+            or not isinstance(group_size, int)
+        ):
             return None
-        return cls(up, down, activation_scale, dynamic)
+        return cls(up, down, activation_scale, dynamic, group_size)
 
     def arguments(self) -> tuple[Argument, ...]:
         """Return custom-op operands in canonical up/down order."""
         return (
-            self.up.input,
-            self.up.weight_qdata,
-            self.up.weight_scale,
-            self.up.weight_per_tensor_scale,
-            self.up.activation_per_tensor_scale,
-            self.up.bias,
-            self.up.dynamic_activation_scale,
+            self.up.linear.input,
+            self.up.linear.weight_qdata,
+            self.up.linear.weight_scale,
+            self.up.linear.weight_per_tensor_scale,
+            self.up.linear.activation_per_tensor_scale,
+            self.up.linear.bias,
+            self.up.linear.dynamic_activation_scale,
+            self.up.group_size,
             self.down.weight_qdata,
             self.down.weight_scale,
             self.down.weight_per_tensor_scale,
             self.down_activation_per_tensor_scale,
             self.down.bias,
             self.down_dynamic_activation_scale,
+            self.down_group_size,
         )
 
 
 def _normalized_ffn_pattern(*, reshape_output: bool) -> CallFunction:
-    """Match the stable graph produced by NVFP4 activation folding."""
+    """Match the stable graph produced by ConvRot NVFP4 activation folding."""
     packed = CallFunction(
-        torch.ops.piper_kernels.nvfp4_linear.default,
+        torch.ops.piper_kernels.convrot_nvfp4_linear.default,
         KeywordArg("ffn_input"),
         KeywordArg("up_weight_qdata"),
         KeywordArg("up_weight_scale"),
@@ -117,13 +125,15 @@ def _normalized_ffn_pattern(*, reshape_output: bool) -> CallFunction:
         KeywordArg("up_activation_per_tensor_scale"),
         KeywordArg("up_bias"),
         KeywordArg("up_dynamic_activation_scale"),
+        KeywordArg("up_group_size"),
         _users=1,
     )
     prepared = CallFunction(
-        torch.ops.piper_kernels.nvfp4_prepare_input.default,
+        torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default,
         packed,
         KeywordArg("down_activation_per_tensor_scale"),
         KeywordArg("down_dynamic_activation_scale"),
+        KeywordArg("down_group_size"),
         "swiglu",
         _users=3,
     )
@@ -162,13 +172,13 @@ def _valid_normalized_ffn(match: Match) -> bool:
     operands = _MatchedFfn.from_match(match)
     if operands is None:
         return False
-    validated_up = nvfp4_compile_fx.validated_semantic_linear(
+    validated_up = convrot_nvfp4_compile_fx.validated_semantic_linear(
         operands.up,
-        "NVFP4 FFN compiler up projection",
+        "ConvRot NVFP4 FFN compiler up projection",
     )
     down_shape = nvfp4_compile_fx.validated_prepared_linear(
         operands.down,
-        "NVFP4 FFN compiler down projection",
+        "ConvRot NVFP4 FFN compiler down projection",
     )
     if validated_up is None or down_shape is None:
         return False
@@ -184,17 +194,20 @@ def _valid_normalized_ffn(match: Match) -> bool:
     if operands.down_activation_per_tensor_scale is not None and down_activation_scale is None:
         return False
     try:
+        convrot_rotation.validate_group_size(operands.down_group_size)
         nvfp4_validation.validate_activation_scale(
             down_activation_scale,
             operands.down_dynamic_activation_scale,
             input_value.device,
-            "NVFP4 FFN compiler down projection",
+            "ConvRot NVFP4 FFN compiler down projection",
         )
     except ValueError:
         return False
     return bool(
         input_value.dtype is torch.bfloat16
         and operands.down.logical_dtype is input_value.dtype
+        and isinstance(down_shape.input_features, int)
+        and down_shape.input_features % operands.down_group_size == 0
         and output_value.dtype is input_value.dtype
         and output_value.device == input_value.device
         and output_value.ndim == input_value.ndim
@@ -227,7 +240,7 @@ def _replace_normalized_ffn(match: Match, **_unused: object) -> None:
     assert operands is not None
     with graph.inserting_before(original):
         replacement = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_swiglu_ffn.default,
+            torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn.default,
             args=(*operands.arguments(), ffn_backend._DEFAULT_CHUNK_ROWS),
         )
     replacement.meta = original.meta.copy()
@@ -244,7 +257,7 @@ def _replace_normalized_ffn_gated_updates(match: Match, **_unused: object) -> No
     python_indexing = swiglu_ffn_compile.uses_python_indexing(match)
     with graph.inserting_before(original):
         mutation = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_swiglu_ffn_gated_updates_.default,
+            torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn_gated_updates_.default,
             args=(
                 *operands.arguments(),
                 match.kwargs["base"],
@@ -263,8 +276,8 @@ def _replace_normalized_ffn_gated_updates(match: Match, **_unused: object) -> No
     match.erase_nodes()
 
 
-_gated_updates_patterns = PatternMatcherPass("nvfp4_swiglu_ffn_gated_updates")
-_patterns = PatternMatcherPass("nvfp4_swiglu_ffn")
+_gated_updates_patterns = PatternMatcherPass("convrot_nvfp4_swiglu_ffn_gated_updates")
+_patterns = PatternMatcherPass("convrot_nvfp4_swiglu_ffn")
 for _reshape_output in (False, True):
     _ffn_pattern = _normalized_ffn_pattern(reshape_output=_reshape_output)
     for _use_aten_index in (False, True):
@@ -294,7 +307,7 @@ def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold normalized NVFP4 SwiGLU FFNs after ordinary NVFP4 rewriting."""
+    """Fold normalized ConvRot NVFP4 SwiGLU FFNs after linear rewriting."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
@@ -308,6 +321,8 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     __file__,
                     _core.__file__,
                     ffn_backend.__file__,
+                    convrot_rotation.__file__,
+                    convrot_nvfp4_compile_fx.__file__,
                     nvfp4_compile_fx.__file__,
                     nvfp4_validation.__file__,
                     swiglu_ffn_compile.__file__,
@@ -323,14 +338,14 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 compile_pass = _CompilePass()
 
 
-def nvfp4_swiglu_ffn_compile_options(
+def convrot_nvfp4_swiglu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Install chunked FFN folding immediately after ordinary NVFP4 folding."""
+    """Install FFN folding immediately after ConvRot NVFP4 normalization."""
     return preparation_sharing.add_ordered_post_grad_passes(
         options,
-        (nvfp4_compile.compile_pass, compile_pass),
+        (convrot_nvfp4_compile.compile_pass, compile_pass),
     )
 
 
-__all__ = ["nvfp4_swiglu_ffn_compile_options"]
+__all__ = ["convrot_nvfp4_swiglu_ffn_compile_options"]

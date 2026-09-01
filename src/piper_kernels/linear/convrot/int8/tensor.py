@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 import torch
 from torchao.utils import TorchAOBaseTensor
 
+from piper_kernels.linear._dispatch import bind_linear_arguments
 from piper_kernels.linear._input_activations import InputActivation
 
 from .._rotation import rotate_groups
@@ -169,30 +170,6 @@ def convrot_int8_linear(
     )
 
 
-def _bind_linear_arguments(
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> tuple[Any, Any, Any]:
-    """Bind ``linear(input, weight, bias=None)`` positional and keyword forms."""
-    parameter_names = ("input", "weight", "bias")
-    if len(args) > len(parameter_names):
-        raise TypeError(f"linear() expected at most 3 positional arguments, got {len(args)}")
-
-    bound = dict(zip(parameter_names, args, strict=False))
-    for name, value in kwargs.items():
-        if name not in parameter_names:
-            raise TypeError(f"linear() got an unexpected keyword argument {name!r}")
-        if name in bound:
-            raise TypeError(f"linear() got multiple values for argument {name!r}")
-        bound[name] = value
-
-    missing = [name for name in parameter_names[:2] if name not in bound]
-    if missing:
-        names = " and ".join(repr(name) for name in missing)
-        raise TypeError(f"linear() missing required argument: {names}")
-    return bound["input"], bound["weight"], bound.get("bias")
-
-
 @ConvRotInt8Tensor.implements(torch.ops.aten.linear.default)
 @ConvRotInt8Tensor.implements_torch_function(torch.nn.functional.linear)
 def _convrot_linear_dispatch(
@@ -201,7 +178,7 @@ def _convrot_linear_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    linear_input, weight, bias = _bind_linear_arguments(args, kwargs)
+    linear_input, weight, bias = bind_linear_arguments(args, kwargs)
     if not isinstance(linear_input, torch.Tensor) or not isinstance(weight, ConvRotInt8Tensor):
         raise TypeError(
             "ConvRot linear dispatch requires a tensor input and ConvRotInt8Tensor weight"

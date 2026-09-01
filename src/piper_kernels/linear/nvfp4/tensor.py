@@ -14,7 +14,9 @@ from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwarg
 from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_linear as torchao_nvfp4_linear
 from torchao.utils import TorchAOBaseTensor
 
-from . import _ops
+from piper_kernels.linear._dispatch import bind_linear_arguments
+
+from . import _layout, _ops
 from ._typing import NVFP4Storage
 
 
@@ -74,6 +76,20 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
             )
         )
 
+    def _rebuild_with_orig_dtype(self, orig_dtype: torch.dtype) -> PiperNVFP4Tensor:
+        """Rebuild the concrete semantic wrapper while preserving its storage."""
+        return type(self)(
+            self.qdata,
+            self.scale,
+            self.block_size,
+            orig_dtype,
+            self.per_tensor_scale,
+            self.act_per_tensor_scale,
+            self.is_swizzled_scales,
+            self.use_triton_kernel,
+            self.act_quant_kwargs,
+        )
+
 
 @PiperNVFP4Tensor.implements(torch.ops.aten._to_copy.default)
 def _nvfp4_to_copy(
@@ -104,24 +120,14 @@ def _nvfp4_to_copy(
         ),
     )
     if dtype is not moved.orig_dtype:
-        moved = PiperNVFP4Tensor(
-            moved.qdata,
-            moved.scale,
-            moved.block_size,
-            dtype,
-            moved.per_tensor_scale,
-            moved.act_per_tensor_scale,
-            moved.is_swizzled_scales,
-            moved.use_triton_kernel,
-            moved.act_quant_kwargs,
-        )
+        moved = moved._rebuild_with_orig_dtype(dtype)
     return cast(
         PiperNVFP4Tensor,
         return_and_correct_aliasing(func, args, kwargs, moved),
     )
 
 
-def _supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
+def supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
     if not isinstance(input, torch.Tensor):
         return False
     tensor_input = cast(torch.Tensor, input)
@@ -132,11 +138,11 @@ def _supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool: 
         tensor_input.ndim > 0
         and tensor_input.dtype is weight.orig_dtype
         and tensor_input.device.type in ("cuda", "meta")
-        and weight.block_size == 16
+        and weight.block_size == _layout.BLOCK_SIZE
         and weight.is_swizzled_scales
         and not weight.use_triton_kernel
         and quantization is not None
-        and quantization.block_size == 16
+        and quantization.block_size == _layout.BLOCK_SIZE
         and quantization.is_swizzled_scales
         and not quantization.use_triton_kernel
         and (quantization.use_dynamic_per_tensor_scale or weight.act_per_tensor_scale is not None)
@@ -152,14 +158,12 @@ def _nvfp4_linear_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    input, weight, bias = (*args, None, None)[:3]  # noqa: A001
+    input, weight, bias = bind_linear_arguments(args, kwargs)  # noqa: A001
     if (
         not torch.compiler.is_compiling()
         or not isinstance(weight, PiperNVFP4Tensor)
-        or not _supports_semantic_linear(input, weight)
+        or not supports_semantic_linear(input, weight)
     ):
-        return torchao_nvfp4_linear(func, types, args, kwargs)
-    if kwargs:
         return torchao_nvfp4_linear(func, types, args, kwargs)
     if bias is not None and not isinstance(bias, torch.Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)

@@ -10,16 +10,19 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-_NVFP4_BLOCK_SIZE = 16
-_NVFP4_PACKED_BLOCK_SIZE = _NVFP4_BLOCK_SIZE // 2
+from . import _layout
+
+_NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
+_NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_BLOCK_SIZE)
-_NVFP4_PACKED_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_PACKED_BLOCK_SIZE)
+_NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_QDATA_BLOCK_SIZE)
 _PREPARE_BLOCKS = 32
 _EPILOGUE_BLOCK_SIZE = 256
 _MEAN_BLOCK_M = 256
 _MEAN_BLOCK_K = 128
 _PROJECTION_BLOCK_N = 64
 _PROJECTION_BLOCK_K = 128
+_AMAX_REDUCTION_BLOCK_SIZE = 1_024
 
 
 @triton.jit
@@ -40,7 +43,7 @@ def _decode_fp4(packed, logical_offsets):
 
 
 @triton.jit
-def _swizzled_scale_offsets(rows, scale_columns, column_blocks: tl.constexpr):
+def swizzled_scale_offsets(rows, scale_columns, column_blocks: tl.constexpr):
     row_block = rows // 128
     row_inner = rows % 128
     column_block = scale_columns // 4
@@ -52,7 +55,7 @@ def _swizzled_scale_offsets(rows, scale_columns, column_blocks: tl.constexpr):
 
 
 @triton.jit
-def _pack_e2m1_pairs(low, high):
+def pack_e2m1_pairs(low, high):
     return tl.inline_asm_elementwise(
         asm="""
         {
@@ -67,6 +70,30 @@ def _pack_e2m1_pairs(low, high):
         is_pure=True,
         pack=1,
     )
+
+
+@triton.jit
+def encode_nvfp4_blocks(
+    values,
+    per_tensor_scale,
+    block_count: tl.constexpr,
+):
+    """Encode FP32 values into canonical E2M1 pairs and FP8 block scales."""
+    values = values.to(tl.float32)
+    block_amax = tl.max(tl.abs(values), axis=1)
+    encoded_scale = tl.clamp(
+        block_amax * (1.0 / 6.0) / per_tensor_scale,
+        0.015625,
+        448.0,
+    ).to(tl.float8e4nv)
+    reciprocal_scale = (1.0 / per_tensor_scale) / encoded_scale.to(tl.float32)
+    scaled = tl.clamp(values * reciprocal_scale[:, None], -6.0, 6.0)
+    paired = tl.reshape(
+        scaled,
+        (block_count, _NVFP4_QDATA_BLOCK_SIZE_TL, 2),
+    )
+    low, high = tl.split(paired)
+    return pack_e2m1_pairs(low, high), encoded_scale
 
 
 @triton.jit
@@ -127,28 +154,18 @@ def _prepare_static_kernel(
         values *= gate / (1.0 + libdevice.exp(-gate))  # pyright: ignore[reportOperatorIssue]
 
     per_tensor_scale = tl.load(per_tensor_scale_ptr).to(tl.float32)
-    block_amax = tl.max(tl.abs(values), axis=1)
-    encoded_scale = tl.clamp(
-        block_amax * (1.0 / 6.0) / per_tensor_scale,
-        0.015625,
-        448.0,
-    ).to(tl.float8e4nv)
-    reciprocal_scale = (1.0 / per_tensor_scale) / encoded_scale.to(tl.float32)
-    scaled = tl.clamp(values * reciprocal_scale[:, None], -6.0, 6.0)
-
-    paired = tl.reshape(
-        scaled,
-        (blocks_per_program, _NVFP4_PACKED_BLOCK_SIZE_TL, 2),
+    packed, encoded_scale = encode_nvfp4_blocks(  # pyright: ignore[reportGeneralTypeIssues]
+        values,
+        per_tensor_scale,
+        blocks_per_program,
     )
-    low, high = tl.split(paired)
-    packed = _pack_e2m1_pairs(low, high)
     qdata_offsets = (
         rows[:, None] * (output_features // 2)
-        + scale_columns[:, None] * _NVFP4_PACKED_BLOCK_SIZE_TL
-        + tl.arange(0, _NVFP4_PACKED_BLOCK_SIZE_TL)[None, :]
+        + scale_columns[:, None] * _NVFP4_QDATA_BLOCK_SIZE_TL
+        + tl.arange(0, _NVFP4_QDATA_BLOCK_SIZE_TL)[None, :]
     )
     tl.store(qdata_ptr + qdata_offsets, packed, mask=valid_blocks[:, None])
-    scale_offsets = _swizzled_scale_offsets(
+    scale_offsets = swizzled_scale_offsets(
         rows,
         scale_columns,
         scale_column_blocks,
@@ -176,6 +193,77 @@ def _projection_epilogue_kernel(
     tl.store(output_ptr + offsets, values, mask=valid)
 
 
+@triton.jit
+def _amax_partial_kernel(
+    input_ptr,
+    partial_ptr,
+    elements,
+    block_size: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    values = tl.load(input_ptr + offsets, mask=offsets < elements, other=0.0)
+    tl.store(partial_ptr + tl.program_id(0), tl.max(tl.abs(values).to(tl.float32), axis=0))
+
+
+@triton.jit
+def _amax_scale_kernel(
+    input_ptr,
+    per_tensor_scale_ptr,
+    elements,
+    block_size: tl.constexpr,
+):
+    offsets = tl.arange(0, block_size)
+    values = tl.load(input_ptr + offsets, mask=offsets < elements, other=0.0)
+    amax = tl.max(tl.abs(values).to(tl.float32), axis=0)
+    tl.store(per_tensor_scale_ptr, amax * (1.0 / (448.0 * 6.0)))
+
+
+def dynamic_scale(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reduce a logical tensor to its exact NVFP4 global scale."""
+    if input.numel() < 1:
+        raise ValueError("dynamic NVFP4 scale requires a nonempty tensor")
+    if not input.is_floating_point():
+        raise ValueError("dynamic NVFP4 scale requires a floating tensor")
+    if out is None:
+        per_tensor_scale = torch.empty((), device=input.device, dtype=torch.float32)
+    else:
+        if (
+            out.shape != ()
+            or out.dtype is not torch.float32
+            or out.device != input.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("dynamic NVFP4 scale output must be a contiguous FP32 scalar")
+        per_tensor_scale = out
+
+    values = input.contiguous().view(-1)
+    while values.numel() > _AMAX_REDUCTION_BLOCK_SIZE:
+        partial_count = (
+            values.numel() + _AMAX_REDUCTION_BLOCK_SIZE - 1
+        ) // _AMAX_REDUCTION_BLOCK_SIZE
+        partial = torch.empty(partial_count, device=input.device, dtype=torch.float32)
+        _amax_partial_kernel[(partial_count,)](
+            values,
+            partial,
+            values.numel(),
+            block_size=_AMAX_REDUCTION_BLOCK_SIZE,
+            num_warps=8,
+        )
+        values = partial
+    _amax_scale_kernel[(1,)](
+        values,
+        per_tensor_scale,
+        values.numel(),
+        block_size=triton.next_power_of_2(values.numel()),
+        num_warps=8,
+    )
+    return per_tensor_scale
+
+
 def _prepare_static_storage(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
@@ -189,36 +277,7 @@ def _prepare_static_storage(
     input_features = int(contiguous_input.shape[-1])
     output_features = input_features // 2 if swiglu else input_features
     rows = int(contiguous_input.numel() // input_features)
-    scale_rows = (rows + 127) // 128 * 32
-    scale_columns = (output_features + 63) // 64 * 16
-    scale_shape = (scale_rows, scale_columns)
-    if out is None:
-        qdata = torch.empty(
-            (rows, output_features // 2),
-            device=input.device,
-            dtype=torch.uint8,
-        )
-        scale = torch.empty(scale_shape, device=input.device, dtype=torch.float8_e4m3fn)
-    else:
-        qdata_storage, scale_storage = out
-        scale_elements = scale_rows * scale_columns
-        if (
-            qdata_storage.ndim != 2
-            or qdata_storage.shape[0] < rows
-            or qdata_storage.shape[1] != output_features // 2
-            or qdata_storage.dtype is not torch.uint8
-            or scale_storage.numel() < scale_elements
-            or scale_storage.dtype is not torch.float8_e4m3fn
-            or qdata_storage.device != input.device
-            or scale_storage.device != input.device
-            or not qdata_storage.is_contiguous()
-            or not scale_storage.is_contiguous()
-        ):
-            raise ValueError("NVFP4 static preparation output storage is incompatible")
-        qdata = qdata_storage[:rows]
-        scale = scale_storage.flatten()[:scale_elements].view(scale_shape)
-    if rows % 128 or output_features % 64:
-        scale.zero_()
+    qdata, scale = _layout.prepare_activation_storage(input, rows, output_features, out)
     block_count = rows * (output_features // _NVFP4_BLOCK_SIZE)
     _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
         contiguous_input,
@@ -230,7 +289,8 @@ def _prepare_static_storage(
         block_count,
         input_features=input_features,
         output_features=output_features,
-        scale_column_blocks=(output_features + 63) // 64,
+        scale_column_blocks=(output_features + _layout.SCALE_COLUMN_TILE - 1)
+        // _layout.SCALE_COLUMN_TILE,
         swiglu=swiglu,
         apply_source_affine=source_global_scale is not None,
         has_source_bias=source_bias is not None,
@@ -341,21 +401,24 @@ def _dequantized_input_mean_partial_kernel(
         _decode_fp4_code(packed & 0xF),
         _decode_fp4_code(packed >> 4),
     )
-    scale_columns = feature_start // 16 + tl.arange(0, block_k // 16)
-    scale_offsets = _swizzled_scale_offsets(
+    scale_columns = feature_start // _NVFP4_BLOCK_SIZE_TL + tl.arange(
+        0,
+        block_k // _NVFP4_BLOCK_SIZE_TL,
+    )
+    scale_offsets = swizzled_scale_offsets(
         rows[:, None],
         scale_columns[None, :],
         scale_column_blocks,
     )
     scales = tl.load(
         input_scale_ptr + scale_offsets,
-        mask=valid_rows[:, None] & (scale_columns[None, :] * 16 < input_features),
+        mask=valid_rows[:, None] & (scale_columns[None, :] * _NVFP4_BLOCK_SIZE_TL < input_features),
         other=0.0,
     ).to(tl.float32)
     scales = tl.reshape(
         tl.broadcast_to(
-            tl.reshape(scales, (block_m, block_k // 16, 1)),
-            (block_m, block_k // 16, 16),
+            tl.reshape(scales, (block_m, block_k // _NVFP4_BLOCK_SIZE_TL, 1)),
+            (block_m, block_k // _NVFP4_BLOCK_SIZE_TL, _NVFP4_BLOCK_SIZE_TL),
         ),
         (block_m, block_k),
     )
@@ -440,9 +503,9 @@ def _project_input_mean_kernel(
             mask=valid,
             other=0,
         )
-        scale_offsets = _swizzled_scale_offsets(
+        scale_offsets = swizzled_scale_offsets(
             output_offsets[:, None],
-            logical_features[None, :] // 16,
+            logical_features[None, :] // _NVFP4_BLOCK_SIZE_TL,
             scale_column_blocks,
         )
         scales = tl.load(weight_scale_ptr + scale_offsets, mask=valid, other=0.0).to(tl.float32)
@@ -480,12 +543,9 @@ def _validate_linear_mean(
     input_features = 2 * packed_input_features
     if batch <= 0 or sequence_length <= 0 or rows != batch * sequence_length:
         raise ValueError("NVFP4 mean batch and sequence dimensions must match its input rows")
-    if input_features % 16:
-        raise ValueError("NVFP4 mean input features must be divisible by 16")
-    expected_input_scale_shape = (
-        triton.cdiv(rows, 128) * 32,
-        triton.cdiv(input_features, 64) * 16,
-    )
+    if input_features % _NVFP4_BLOCK_SIZE:
+        raise ValueError(f"NVFP4 mean input features must be divisible by {_NVFP4_BLOCK_SIZE}")
+    expected_input_scale_shape = _layout.scale_shape(rows, input_features)
     if (
         input_scale.shape != expected_input_scale_shape
         or input_scale.dtype is not torch.float8_e4m3fn
@@ -500,10 +560,7 @@ def _validate_linear_mean(
     ):
         raise ValueError("NVFP4 mean weight must be a compatible packed UINT8 matrix")
     output_features = weight_qdata.shape[0]
-    expected_weight_scale_shape = (
-        triton.cdiv(output_features, 128) * 32,
-        triton.cdiv(input_features, 64) * 16,
-    )
+    expected_weight_scale_shape = _layout.scale_shape(output_features, input_features)
     if (
         weight_scale.shape != expected_weight_scale_shape
         or weight_scale.dtype is not torch.float8_e4m3fn
@@ -632,4 +689,14 @@ def _linear_mean_fake(
     return input_qdata.new_empty((batch, weight_qdata.shape[0]), dtype=torch.float32)
 
 
-__all__ = ["linear_mean"]
+__all__ = [
+    "apply_projection_epilogue",
+    "dynamic_scale",
+    "encode_nvfp4_blocks",
+    "linear_mean",
+    "pack_e2m1_pairs",
+    "prepare_static",
+    "prepare_static_out",
+    "prepare_static_projected_swiglu",
+    "swizzled_scale_offsets",
+]

@@ -11,7 +11,7 @@ from torch._inductor.pattern_matcher import Match
 from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _validation
+from . import _layout, _validation
 
 type PreparedInputNodes = tuple[
     torch.fx.Node,
@@ -34,7 +34,8 @@ class SemanticLinearNodes:
     dynamic_activation_scale: bool
 
     @classmethod
-    def _from_values(cls, values: tuple[object, ...]) -> SemanticLinearNodes | None:
+    def from_values(cls, values: tuple[object, ...]) -> SemanticLinearNodes | None:
+        """Parse canonical semantic-linear operand values."""
         if len(values) != 7:
             return None
         input_node, weight_qdata, weight_scale, weight_global, activation_scale, bias, dynamic = (
@@ -66,12 +67,12 @@ class SemanticLinearNodes:
         """Parse positional operands from one semantic-linear call node."""
         if node.kwargs:
             return None
-        return cls._from_values(node.args)
+        return cls.from_values(node.args)
 
     @classmethod
     def from_match(cls, match: Match) -> SemanticLinearNodes | None:
         """Parse canonical semantic-linear keywords from a pattern match."""
-        return cls._from_values(
+        return cls.from_values(
             tuple(
                 match.kwargs[name]
                 for name in (
@@ -287,11 +288,9 @@ def emit_prepared_input(
     assert input_value is not None
     rows = input_value.numel() // input_value.shape[-1]
     features = input_value.shape[-1] // input_activations.input_activation_width(activation_fn)
-    scale_rows = ((rows + 127) // 128) * 32
-    scale_columns = ((features + 63) // 64) * 16
     values = (
-        input_value.new_empty((rows, features // 2), dtype=torch.uint8),
-        input_value.new_empty((scale_rows, scale_columns), dtype=torch.float8_e4m3fn),
+        input_value.new_empty(_layout.qdata_shape(rows, features), dtype=torch.uint8),
+        input_value.new_empty(_layout.scale_shape(rows, features), dtype=torch.float8_e4m3fn),
         input_value.new_empty((), dtype=torch.float32),
     )
     prepared = graph.call_function(

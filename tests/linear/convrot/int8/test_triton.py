@@ -328,7 +328,7 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
         (torch.bfloat16, 2),
     ],
 )
-def testdtype_code(dtype: torch.dtype, expected: int) -> None:
+def test_dtype_code(dtype: torch.dtype, expected: int) -> None:
     assert triton_backend.dtype_code(dtype) == expected
 
 

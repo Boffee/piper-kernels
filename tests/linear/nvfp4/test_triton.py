@@ -17,6 +17,24 @@ def _exact_sm120_available() -> bool:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(("rows", "features"), [(127, 80), (1_025, 5_376)])
+def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> None:
+    torch.manual_seed(500 + rows)
+    input = torch.randn(  # noqa: A001
+        rows,
+        features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    expected = per_tensor_amax_to_scale(input.abs().amax())
+    actual = nvfp4_triton.dynamic_scale(input)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 128, 129])
 @pytest.mark.parametrize("activation_fn", [None, "swiglu"])
 def test_static_preparation_matches_portable_decomposition(

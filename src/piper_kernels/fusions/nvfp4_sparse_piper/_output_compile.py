@@ -10,7 +10,6 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
-from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
@@ -19,8 +18,25 @@ from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 from . import output
 
+_ATTENTION_ARGUMENT_NAMES = (
+    "output_query",
+    "output_query_scale",
+    "output_query_summary",
+    "output_key",
+    "output_key_scale",
+    "output_key_max",
+    "output_key_min",
+    "output_value",
+    "output_value_scale_multiplier",
+    "output_value_mean",
+    "output_head_keep_ratio_units",
+    "output_sparse_key_blocks",
+    "output_logical_sequence_length",
+)
 
-def _attention_output_pattern() -> CallFunction:
+
+def _reshaped_attention_pattern() -> CallFunction:
+    """Match the common materialized sparse-attention output boundary."""
     attention = CallFunction(
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         KeywordArg("output_query"),
@@ -38,15 +54,18 @@ def _attention_output_pattern() -> CallFunction:
         KeywordArg("output_logical_sequence_length"),
         _users=1,
     )
-    reshaped = CallFunction(
+    return CallFunction(
         torch.ops.aten.reshape.default,
         attention,
         KeywordArg("output_attention_shape"),
         _users=1,
     )
+
+
+def _attention_output_pattern() -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.nvfp4_linear.default,
-        reshaped,
+        _reshaped_attention_pattern(),
         KeywordArg("output_weight_qdata"),
         KeywordArg("output_weight_scale"),
         KeywordArg("output_weight_per_tensor_scale"),
@@ -178,52 +197,19 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
     )
 
 
-def _replace_attention_output(  # noqa: PLR0913, PLR0917
-    match: Match,
-    output_query: torch.fx.Node,
-    output_query_scale: torch.fx.Node,
-    output_query_summary: torch.fx.Node,
-    output_key: torch.fx.Node,
-    output_key_scale: torch.fx.Node,
-    output_key_max: torch.fx.Node,
-    output_key_min: torch.fx.Node,
-    output_value: torch.fx.Node,
-    output_value_scale_multiplier: torch.fx.Node,
-    output_value_mean: torch.fx.Node,
-    output_head_keep_ratio_units: list[int],
-    output_sparse_key_blocks: Argument,
-    output_logical_sequence_length: Argument,
-    output_weight_qdata: torch.fx.Node,
-    output_weight_scale: torch.fx.Node,
-    output_weight_per_tensor_scale: torch.fx.Node | None,
-    output_activation_scale: torch.fx.Node,
-    output_bias: torch.fx.Node | None,
-    **_unused: object,
-) -> None:
+def _replace_attention_output(match: Match, **_unused: object) -> None:
     original = match.output_node()
     graph = match.graph
     with graph.inserting_before(original):
         replacement = graph.call_function(
             torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default,
             args=(
-                output_query,
-                output_query_scale,
-                output_query_summary,
-                output_key,
-                output_key_scale,
-                output_key_max,
-                output_key_min,
-                output_value,
-                output_value_scale_multiplier,
-                output_value_mean,
-                output_head_keep_ratio_units,
-                output_sparse_key_blocks,
-                output_logical_sequence_length,
-                output_weight_qdata,
-                output_weight_scale,
-                output_weight_per_tensor_scale,
-                output_activation_scale,
-                output_bias,
+                *(match.kwargs[name] for name in _ATTENTION_ARGUMENT_NAMES),
+                match.kwargs["output_weight_qdata"],
+                match.kwargs["output_weight_scale"],
+                match.kwargs["output_weight_per_tensor_scale"],
+                match.kwargs["output_activation_scale"],
+                match.kwargs["output_bias"],
                 output._DEFAULT_QUERY_CHUNK_ROWS,
             ),
         )
