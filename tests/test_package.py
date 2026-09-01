@@ -30,6 +30,7 @@ from piper_kernels.fusions.convrot_sparse_piper import (
     convrot_sparse_piper_compile_options,
 )
 from piper_kernels.linear.convrot import (
+    SUPPORTED_GROUP_SIZES,
     ConvRotInt8Tensor,
     convrot_int8_compile_options,
     convrot_int8_linear,
@@ -177,6 +178,7 @@ def test_public_packages_import() -> None:
     assert piper_kernels.linear.convrot.__name__ == "piper_kernels.linear.convrot"
     assert piper_kernels.linear.convrot.int8.__name__ == "piper_kernels.linear.convrot.int8"
     assert piper_kernels.linear.convrot.nvfp4.__name__ == "piper_kernels.linear.convrot.nvfp4"
+    assert piper_kernels.linear.convrot.SUPPORTED_GROUP_SIZES is SUPPORTED_GROUP_SIZES
     assert piper_kernels.linear.convrot.ConvRotInt8Tensor is ConvRotInt8Tensor
     assert piper_kernels.linear.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
     assert piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor is ConvRotNVFP4Tensor
@@ -194,6 +196,7 @@ def test_public_packages_import() -> None:
     assert not hasattr(piper_kernels.linear.convrot, "linear_input_act")
     assert not hasattr(piper_kernels.linear.convrot.int8, "linear_input_act")
     assert piper_kernels.linear.convrot.__all__ == [
+        "SUPPORTED_GROUP_SIZES",
         "ConvRotInt8Tensor",
         "convrot_int8_compile_options",
         "convrot_int8_linear",

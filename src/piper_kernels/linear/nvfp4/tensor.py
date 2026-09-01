@@ -10,7 +10,10 @@ from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    QuantizeTensorToNVFP4Kwargs,
+    per_tensor_amax_to_scale,
+)
 from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_linear as torchao_nvfp4_linear
 from torchao.utils import TorchAOBaseTensor
 
@@ -18,6 +21,42 @@ from piper_kernels.linear._dispatch import bind_linear_arguments
 
 from . import _layout, _ops
 from ._typing import NVFP4Storage
+
+
+def _quantize_hp(
+    hp_tensor: torch.Tensor,
+    *,
+    block_size: int = 16,
+    per_tensor_scale: torch.Tensor | None = None,
+    compute_per_tensor_scale: bool = False,
+    act_per_tensor_scale: torch.Tensor | None = None,
+    is_swizzled_scales: bool = False,
+    use_triton_kernel: bool = False,
+    act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+) -> TorchAONVFP4Tensor:
+    """Quantize one detached high-precision weight with optional derived global scale."""
+    if compute_per_tensor_scale and per_tensor_scale is not None:
+        raise ValueError("NVFP4 from_hp cannot both compute and receive a per-tensor scale")
+    source = hp_tensor.detach()
+    if compute_per_tensor_scale:
+        amax = source.float().abs().amax()
+        if not bool(torch.isfinite(amax)):
+            raise ValueError("cannot quantize an NVFP4 weight with non-finite values")
+        derived_scale = per_tensor_amax_to_scale(amax)
+        per_tensor_scale = torch.where(
+            amax == 0,
+            torch.ones_like(derived_scale),
+            derived_scale,
+        )
+    return TorchAONVFP4Tensor.to_nvfp4(
+        source,
+        block_size=block_size,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=act_per_tensor_scale,
+        is_swizzled_scales=is_swizzled_scales,
+        use_triton_kernel=use_triton_kernel,
+        act_quant_kwargs=act_quant_kwargs,
+    )
 
 
 class PiperNVFP4Tensor(TorchAONVFP4Tensor):
@@ -33,6 +72,39 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
     is_swizzled_scales: bool
     use_triton_kernel: bool
     act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None
+
+    @classmethod
+    def from_hp(
+        cls,
+        hp_tensor: torch.Tensor,
+        *,
+        block_size: int = 16,
+        per_tensor_scale: torch.Tensor | None = None,
+        compute_per_tensor_scale: bool = False,
+        act_per_tensor_scale: torch.Tensor | None = None,
+        is_swizzled_scales: bool = False,
+        use_triton_kernel: bool = False,
+        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+    ) -> PiperNVFP4Tensor:
+        """Quantize a detached high-precision weight into Piper NVFP4 storage.
+
+        The arguments otherwise match TorchAO's :meth:`NVFP4Tensor.to_nvfp4`
+        builder. ``compute_per_tensor_scale=True`` derives the optional global
+        weight scale from ``hp_tensor`` and handles an all-zero weight without
+        producing a zero global scale.
+        """
+        return cls.from_torchao(
+            _quantize_hp(
+                hp_tensor,
+                block_size=block_size,
+                per_tensor_scale=per_tensor_scale,
+                compute_per_tensor_scale=compute_per_tensor_scale,
+                act_per_tensor_scale=act_per_tensor_scale,
+                is_swizzled_scales=is_swizzled_scales,
+                use_triton_kernel=use_triton_kernel,
+                act_quant_kwargs=act_quant_kwargs,
+            )
+        )
 
     @classmethod
     def from_torchao(cls, tensor: TorchAONVFP4Tensor) -> PiperNVFP4Tensor:

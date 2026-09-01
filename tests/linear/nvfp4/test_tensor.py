@@ -47,6 +47,31 @@ def test_from_torchao_reuses_storage_and_metadata() -> None:
     assert PiperNVFP4Tensor.from_torchao(wrapped) is wrapped
 
 
+def test_from_hp_matches_torchao_quantization_with_computed_global_scale() -> None:
+    torch.manual_seed(418)
+    source = torch.randn(128, 256, dtype=torch.bfloat16).requires_grad_()
+    per_tensor_scale = per_tensor_amax_to_scale(source.float().abs().amax())
+
+    weight = PiperNVFP4Tensor.from_hp(
+        source,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(True),
+    )
+    expected = TorchAONVFP4Tensor.to_nvfp4(
+        source.detach(),
+        per_tensor_scale=per_tensor_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(True),
+    )
+
+    assert type(weight) is PiperNVFP4Tensor
+    assert not weight.requires_grad
+    assert torch.equal(weight.qdata, expected.qdata)
+    assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+    assert torch.equal(weight.per_tensor_scale, per_tensor_scale)
+
+
 def test_device_copy_preserves_piper_wrapper() -> None:
     source = PiperNVFP4Tensor(
         torch.empty(128, 128, dtype=torch.uint8),
