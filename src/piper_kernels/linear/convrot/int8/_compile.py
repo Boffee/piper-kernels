@@ -20,6 +20,7 @@ from torch._inductor.pattern_matcher import (
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.convrot import triton as convrot_triton
 
 from . import _compile_fx
 
@@ -310,6 +311,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 input_activation_compile.__file__,
                 input_activations.__file__,
                 preparation_sharing.__file__,
+                convrot_triton.__file__,
                 _compile_fx.__file__,
             ),
             extra=_COMPILE_PASS_VERSION,

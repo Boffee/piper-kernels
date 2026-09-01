@@ -20,13 +20,19 @@ from piper_kernels.linear._input_activations import (
     apply_input_activation,
     input_activation_width,
 )
-from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
+from piper_kernels.linear.convrot import triton as convrot_backend
 
 from . import _policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
 _MEAN_BLOCK_M = 256
 _MEAN_BLOCK_K = 128
+
+# Preserve the established INT8 module-level utility surface while the
+# implementations live at the format-independent ConvRot boundary.
+dtype_code = convrot_backend.logical_dtype_code
+rotate_groups_kernel = convrot_backend.rotate_groups_kernel
+rotate_input = convrot_backend.rotate_input
 
 
 @triton.jit
@@ -169,47 +175,6 @@ def _dequantized_input_mean_reduce_kernel(
 
 
 @triton.jit
-def _hadamard_stage_factorized(values, block_size: tl.constexpr, stride: tl.constexpr):
-    """Apply one H4 factor with eight additions per independent quartet."""
-    outer: tl.constexpr = block_size // (4 * stride)
-    grouped = tl.reshape(values, (outer, 4, stride))
-    quartets = tl.permute(grouped, (0, 2, 1))
-    paired = tl.reshape(quartets, (outer, stride, 2, 2))
-    ac, bd = tl.split(paired)
-    a, c = tl.split(ac)
-    b, d = tl.split(bd)
-    p = a + b
-    q = a - b
-    r = c + d
-    s = c - d
-    y0 = p + s
-    y1 = p - s
-    y2 = q + r
-    y3 = r - q
-    y02 = tl.join(y0, y2)
-    y13 = tl.join(y1, y3)
-    transformed = tl.reshape(tl.join(y02, y13), (outer, stride, 4))
-    transformed = tl.permute(transformed, (0, 2, 1))
-    return tl.reshape(transformed, (block_size,))
-
-
-@triton.jit
-def _rotate_hadamard_groups(
-    values,
-    block_size: tl.constexpr,
-    group_size: tl.constexpr,
-):
-    """Apply every H4 factor within independent ConvRot groups."""
-    values = _hadamard_stage_factorized(values, block_size, 1)
-    values = _hadamard_stage_factorized(values, block_size, 4)
-    if group_size >= 64:
-        values = _hadamard_stage_factorized(values, block_size, 16)
-    if group_size >= 256:
-        values = _hadamard_stage_factorized(values, block_size, 64)
-    return values
-
-
-@triton.jit
 def _normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
     """Normalize values without dividing by an underflowed logical scale."""
     if logical_dtype_code == 1:
@@ -235,53 +200,6 @@ def _quantize_int8(values, scale, logical_dtype_code: tl.constexpr):
 
 
 @triton.jit
-def _load_activated_rotated_chunk(
-    x_ptr,
-    input_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    chunk_size: tl.constexpr,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-):
-    """Load, activate, and rotate one group-aligned slice of a row."""
-    offsets = chunk_start + chunk_offsets
-    mask = offsets < row_width
-    if activation_fn == "swiglu":
-        up = tl.load(
-            x_ptr + input_row_offset + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        gate = tl.load(
-            x_ptr + input_row_offset + row_width + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        values = swiglu(up, gate, logical_dtype_code)
-    else:
-        values = tl.load(
-            x_ptr + input_row_offset + offsets,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        if activation_fn == "gelu_tanh":
-            values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
-
-    values = _rotate_hadamard_groups(values, chunk_size, group_size)
-    values *= inverse_sqrt_group
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
-    return values
-
-
-@triton.jit
 def _store_quantized_chunk(
     q_ptr,
     output_row_offset,
@@ -299,28 +217,6 @@ def _store_quantized_chunk(
         quantized,
         mask=offsets < row_width,
     )
-
-
-@triton.jit
-def rotate_groups_kernel(
-    x_ptr,
-    out_ptr,
-    row_width,
-    groups_per_row,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-):
-    group_id = tl.program_id(0)
-    row = group_id // groups_per_row
-    group = group_id % groups_per_row
-    offsets = tl.arange(0, group_size)
-    row_offset = row.to(tl.int64) * row_width
-    pointers = x_ptr + row_offset + group * group_size + offsets
-    values = tl.load(pointers).to(tl.float32)
-
-    values = _rotate_hadamard_groups(values, group_size, group_size)
-
-    tl.store(out_ptr + row_offset + group * group_size + offsets, values * inverse_sqrt_group)
 
 
 @triton.jit
@@ -349,7 +245,7 @@ def rotate_quantize_rows_kernel(
     input_row_offset = row_i64 * input_row_width
     output_row_offset = row_i64 * row_width
 
-    values0 = _load_activated_rotated_chunk(
+    values0 = convrot_backend.load_activated_rotated_chunk(
         x_ptr,
         input_row_offset,
         row_width,
@@ -364,7 +260,7 @@ def rotate_quantize_rows_kernel(
     )
     row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
     if chunk_count >= 2:
-        values1 = _load_activated_rotated_chunk(
+        values1 = convrot_backend.load_activated_rotated_chunk(
             x_ptr,
             input_row_offset,
             row_width,
@@ -382,7 +278,7 @@ def rotate_quantize_rows_kernel(
             tl.max(tl.abs(values1).to(tl.float32), axis=0),
         )
     if chunk_count >= 3:
-        values2 = _load_activated_rotated_chunk(
+        values2 = convrot_backend.load_activated_rotated_chunk(
             x_ptr,
             input_row_offset,
             row_width,
@@ -592,35 +488,6 @@ def _int8_matmul_kernel(
             result,
             mask=(offsets_m[:, None] < m) & (offsets_n[None, :] < n),
         )
-
-
-def dtype_code(dtype: torch.dtype) -> int:
-    if dtype is torch.float16:
-        return 1
-    if dtype is torch.bfloat16:
-        return 2
-    return 0
-
-
-def rotate_input(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    rotated: torch.Tensor,
-    group_size: int,
-    *,
-    num_warps: int,
-) -> None:
-    """Apply the split-path input rotation."""
-    m, k = input.shape
-    groups_per_row = k // group_size
-    rotate_groups_kernel[(m * groups_per_row,)](
-        input,
-        rotated,
-        k,
-        groups_per_row,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        num_warps=num_warps,
-    )
 
 
 def quantize_input(

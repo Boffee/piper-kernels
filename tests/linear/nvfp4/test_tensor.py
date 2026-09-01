@@ -66,6 +66,28 @@ def test_device_copy_preserves_piper_wrapper() -> None:
     assert moved.device.type == "meta"
 
 
+def test_dtype_copy_preserves_concrete_piper_subclass() -> None:
+    class DerivedPiperNVFP4Tensor(PiperNVFP4Tensor):
+        pass
+
+    source = DerivedPiperNVFP4Tensor(
+        torch.empty(128, 128, dtype=torch.uint8),
+        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        16,
+        torch.bfloat16,
+        torch.empty(()),
+        torch.empty(()),
+        True,
+        False,
+        _quantization(False),
+    )
+
+    moved = source.to(dtype=torch.float16)
+
+    assert type(moved) is DerivedPiperNVFP4Tensor
+    assert moved.orig_dtype is torch.float16
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])

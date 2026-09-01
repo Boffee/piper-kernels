@@ -12,10 +12,9 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.linear import _input_activations as input_activations
 
+from . import _layout
 from . import triton as nvfp4_triton
 from ._typing import NVFP4Storage
-
-_BLOCK_SIZE = 16
 
 
 def _prepare_static_tensors(
@@ -28,7 +27,7 @@ def _prepare_static_tensors(
         NVFP4Storage,
         TorchAONVFP4Tensor.to_nvfp4(
             activated.reshape(-1, activated.shape[-1]),
-            block_size=_BLOCK_SIZE,
+            block_size=_layout.BLOCK_SIZE,
             per_tensor_scale=per_tensor_scale,
             is_swizzled_scales=True,
             use_triton_kernel=False,
@@ -48,17 +47,13 @@ def _prepare_dynamic_tensors(
         NVFP4Storage,
         TorchAONVFP4Tensor.to_nvfp4(
             flattened,
-            block_size=_BLOCK_SIZE,
+            block_size=_layout.BLOCK_SIZE,
             per_tensor_scale=per_tensor_scale,
             is_swizzled_scales=True,
             use_triton_kernel=False,
         ),
     )
     return prepared.qdata, prepared.scale, per_tensor_scale
-
-
-def _dynamic_plain_scale(input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-    return per_tensor_amax_to_scale(input.abs().amax())
 
 
 def _prepare_dynamic_swiglu_tensors(
@@ -74,7 +69,6 @@ def _prepare_dynamic_gelu_tanh_tensors(
 
 
 _compiled_prepare_static = torch.compile(_prepare_static_tensors, fullgraph=True)
-_compiled_dynamic_plain_scale = torch.compile(_dynamic_plain_scale, fullgraph=True)
 _compiled_prepare_dynamic_swiglu = torch.compile(_prepare_dynamic_swiglu_tensors, fullgraph=True)
 _compiled_prepare_dynamic_gelu_tanh = torch.compile(
     _prepare_dynamic_gelu_tanh_tensors,
@@ -88,7 +82,7 @@ def _compiled_prepare_dynamic(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare dynamic activations without generalizing across unrelated layouts."""
     if activation_fn is None:
-        per_tensor_scale = _compiled_dynamic_plain_scale(input)
+        per_tensor_scale = nvfp4_triton.dynamic_scale(input)
         qdata, scale = nvfp4_triton._prepare_static_storage(
             input,
             per_tensor_scale,
@@ -237,16 +231,16 @@ def _prepare_input_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows = input.numel() // input.shape[-1]
     features = input.shape[-1] // input_activations.input_activation_width(activation_fn)
-    scale_rows = ((rows + 127) // 128) * 32
-    scale_columns = ((features + 63) // 64) * 16
+    qdata_shape = _layout.qdata_shape(rows, features)
+    scale_shape = _layout.scale_shape(rows, features)
     per_tensor_scale = (
         activation_per_tensor_scale.new_empty(())
         if activation_per_tensor_scale is not None
         else input.new_empty((), dtype=torch.float32)
     )
     return (
-        input.new_empty((rows, features // 2), dtype=torch.uint8),
-        input.new_empty((scale_rows, scale_columns), dtype=torch.float8_e4m3fn),
+        input.new_empty(qdata_shape, dtype=torch.uint8),
+        input.new_empty(scale_shape, dtype=torch.float8_e4m3fn),
         per_tensor_scale,
     )
 

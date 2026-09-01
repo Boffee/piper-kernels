@@ -7,7 +7,7 @@ from typing import cast
 import torch
 
 from piper_kernels.fusions.sparse_piper import _output as output_common
-from piper_kernels.linear.nvfp4 import _projection, _validation
+from piper_kernels.linear.nvfp4 import _layout, _projection, _validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 _DEFAULT_QUERY_CHUNK_ROWS = 8_192
@@ -168,12 +168,12 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     )
     capacity = min(logical_sequence_length, query_chunk_rows)
     prepared_input = torch.empty(
-        (capacity, input_features // 2),
+        _layout.qdata_shape(capacity, input_features),
         device=query.device,
         dtype=torch.uint8,
     )
     prepared_scale = torch.empty(
-        ((capacity + 127) // 128 * 32, (input_features + 63) // 64 * 16),
+        _layout.scale_shape(capacity, input_features),
         device=query.device,
         dtype=torch.float8_e4m3fn,
     )
