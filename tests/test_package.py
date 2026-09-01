@@ -16,6 +16,7 @@ import piper_kernels.fusions.convrot_sparse_piper
 import piper_kernels.linear
 import piper_kernels.linear.convrot
 import piper_kernels.linear.convrot.int8
+import piper_kernels.linear.convrot.nvfp4
 from piper_kernels import (
     SparsePiperAttention,
     piper_attention,
@@ -29,6 +30,7 @@ from piper_kernels.linear.convrot import (
     convrot_int8_compile_options,
     convrot_int8_linear,
 )
+from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor, convrot_nvfp4_linear
 
 
 def test_removed_convrot_root_package_is_not_importable() -> None:
@@ -128,10 +130,13 @@ def test_public_packages_import() -> None:
     assert piper_kernels.linear.__name__ == "piper_kernels.linear"
     assert piper_kernels.linear.convrot.__name__ == "piper_kernels.linear.convrot"
     assert piper_kernels.linear.convrot.int8.__name__ == "piper_kernels.linear.convrot.int8"
+    assert piper_kernels.linear.convrot.nvfp4.__name__ == "piper_kernels.linear.convrot.nvfp4"
     assert piper_kernels.linear.convrot.ConvRotInt8Tensor is ConvRotInt8Tensor
     assert piper_kernels.linear.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
+    assert piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor is ConvRotNVFP4Tensor
     assert piper_kernels.linear.convrot.convrot_int8_compile_options is convrot_int8_compile_options
     assert piper_kernels.linear.convrot.convrot_int8_linear is convrot_int8_linear
+    assert piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_linear is convrot_nvfp4_linear
     assert convrot_int8_linear.__module__ == "piper_kernels.linear.convrot.int8.tensor"
     assert not hasattr(piper_kernels.linear.convrot, "convrot_linear")
     assert not hasattr(piper_kernels.linear.convrot, "convrot_compile_options")

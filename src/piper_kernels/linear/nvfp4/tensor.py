@@ -14,6 +14,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwarg
 from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_linear as torchao_nvfp4_linear
 from torchao.utils import TorchAOBaseTensor
 
+from piper_kernels.linear._dispatch import bind_linear_arguments
+
 from . import _layout, _ops
 from ._typing import NVFP4Storage
 
@@ -125,7 +127,7 @@ def _nvfp4_to_copy(
     )
 
 
-def _supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
+def supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
     if not isinstance(input, torch.Tensor):
         return False
     tensor_input = cast(torch.Tensor, input)
@@ -156,14 +158,12 @@ def _nvfp4_linear_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    input, weight, bias = (*args, None, None)[:3]  # noqa: A001
+    input, weight, bias = bind_linear_arguments(args, kwargs)  # noqa: A001
     if (
         not torch.compiler.is_compiling()
         or not isinstance(weight, PiperNVFP4Tensor)
-        or not _supports_semantic_linear(input, weight)
+        or not supports_semantic_linear(input, weight)
     ):
-        return torchao_nvfp4_linear(func, types, args, kwargs)
-    if kwargs:
         return torchao_nvfp4_linear(func, types, args, kwargs)
     if bias is not None and not isinstance(bias, torch.Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)
