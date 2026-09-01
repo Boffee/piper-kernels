@@ -22,6 +22,10 @@ from piper_kernels.linear.convrot._update import (
 from piper_kernels.linear.nvfp4 import _layout
 from piper_kernels.linear.nvfp4.tensor import PiperNVFP4Tensor
 
+# TorchAO divides the global reciprocal by the minimum FP8 block scale.
+# Keep that intermediate finite even when the merged weight is exactly zero.
+_MIN_PER_TENSOR_SCALE = torch.finfo(torch.float32).tiny / torch.finfo(torch.float8_e4m3fn).tiny
+
 
 def _validate_storage(weight: PiperNVFP4Tensor) -> None:
     if weight.device.type == "meta":
@@ -182,7 +186,7 @@ def addmm_(
     per_tensor_scale = None
     if weight.per_tensor_scale is not None:
         per_tensor_scale = per_tensor_amax_to_scale(merged.detach().abs().amax()).clamp_min(
-            torch.finfo(torch.float32).tiny
+            _MIN_PER_TENSOR_SCALE
         )
     encoded = PiperNVFP4Tensor.from_torchao(
         TorchAONVFP4Tensor.to_nvfp4(
