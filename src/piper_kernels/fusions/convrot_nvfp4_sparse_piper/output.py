@@ -1,33 +1,43 @@
-"""Bounded sparse Piper attention followed by a static NVFP4 projection."""
+"""Bounded sparse attention followed by a static ConvRot NVFP4 projection."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
-from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
-
-from . import _output
+from piper_kernels.fusions.nvfp4_sparse_piper import _output
+from piper_kernels.linear.convrot._rotation import validate_group_size
+from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 
 _DEFAULT_QUERY_CHUNK_ROWS = _output.DEFAULT_QUERY_CHUNK_ROWS
 
 
-class _StandardPreparation:
-    """Ordinary NVFP4 preparation for the shared attention-output runner."""
+@dataclass(frozen=True, slots=True)
+class _ConvRotPreparation:
+    """ConvRot preparation for the shared NVFP4 attention-output runner."""
 
-    @staticmethod
+    group_size: int
+
+    def __post_init__(self) -> None:
+        validate_group_size(self.group_size)
+
     def prepare_static_out(
+        self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
         per_tensor_scale: torch.Tensor,
         out: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_backend.prepare_static_out(input, per_tensor_scale, out)
-
-
-_STANDARD_PREPARATION = _StandardPreparation()
+        return convrot_nvfp4_backend.prepare_static_out(
+            input,
+            per_tensor_scale,
+            self.group_size,
+            out,
+        )
 
 
 @torch.library.custom_op(
-    "piper_kernels::nvfp4_sparse_piper_attention_output",
+    "piper_kernels::convrot_nvfp4_sparse_piper_attention_output",
     mutates_args=(),
 )
 def _attention_output_op(  # noqa: PLR0913, PLR0917
@@ -49,6 +59,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     weight_per_tensor_scale: torch.Tensor | None,
     activation_per_tensor_scale: torch.Tensor,
     bias: torch.Tensor | None,
+    group_size: int,
     query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
 ) -> torch.Tensor:
     return _output.run_attention_output(
@@ -71,7 +82,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _STANDARD_PREPARATION,
+        _ConvRotPreparation(group_size),
     )
 
 
@@ -95,8 +106,16 @@ def _attention_output_op_fake(
     _weight_per_tensor_scale: torch.Tensor | None,
     _activation_per_tensor_scale: torch.Tensor,
     _bias: torch.Tensor | None,
+    group_size: int,
     _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
 ) -> torch.Tensor:
+    validate_group_size(group_size)
+    input_features = 2 * weight_qdata.shape[1]
+    if isinstance(input_features, int) and input_features % group_size:
+        raise ValueError(
+            f"ConvRot NVFP4 projection input features {input_features} must be divisible "
+            f"by group size {group_size}"
+        )
     return query.new_empty(
         (query.shape[0], logical_sequence_length, weight_qdata.shape[0]),
         dtype=torch.bfloat16,

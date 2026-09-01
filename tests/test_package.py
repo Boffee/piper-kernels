@@ -12,6 +12,7 @@ import piper_kernels.attention.piper_attention
 import piper_kernels.attention.sage_attention_2pp
 import piper_kernels.attention.sparse_piper_attention
 import piper_kernels.fusions
+import piper_kernels.fusions.convrot_nvfp4_sparse_piper
 import piper_kernels.fusions.convrot_sparse_piper
 import piper_kernels.linear
 import piper_kernels.linear.convrot
@@ -21,6 +22,9 @@ from piper_kernels import (
     SparsePiperAttention,
     piper_attention,
     sage_attention_2pp,
+)
+from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
+    convrot_nvfp4_sparse_piper_compile_options,
 )
 from piper_kernels.fusions.convrot_sparse_piper import (
     convrot_sparse_piper_compile_options,
@@ -117,6 +121,23 @@ assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_convrot_nvfp4_sparse_piper_compiler_integration_is_loaded_lazily() -> None:
+    script = """
+import sys
+from piper_kernels.fusions import convrot_nvfp4_sparse_piper
+
+assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._output_compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper.output" not in sys.modules
+convrot_nvfp4_sparse_piper.convrot_nvfp4_sparse_piper_compile_options()
+assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._compile" in sys.modules
+assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._output_compile" in sys.modules
+assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper.output" in sys.modules
+assert "piper_kernels.linear.convrot.nvfp4._compile" in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_public_packages_import() -> None:
     assert piper_kernels.__name__ == "piper_kernels"
     assert piper_kernels.piper_attention is piper_attention
@@ -138,6 +159,13 @@ def test_public_packages_import() -> None:
         "piper_kernels.attention.sparse_piper_attention"
     )
     assert piper_kernels.fusions.__name__ == "piper_kernels.fusions"
+    assert piper_kernels.fusions.convrot_nvfp4_sparse_piper.__name__ == (
+        "piper_kernels.fusions.convrot_nvfp4_sparse_piper"
+    )
+    assert (
+        piper_kernels.fusions.convrot_nvfp4_sparse_piper.convrot_nvfp4_sparse_piper_compile_options
+        is convrot_nvfp4_sparse_piper_compile_options
+    )
     assert piper_kernels.fusions.convrot_sparse_piper.__name__ == (
         "piper_kernels.fusions.convrot_sparse_piper"
     )

@@ -40,7 +40,7 @@ from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
-from . import _epilogue, _output_compile, _validation, key, output, query, value
+from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
 
 _COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v4"
 _HEAD_DIM = layout.HEAD_DIM
@@ -55,6 +55,7 @@ def _source_files() -> tuple[str, ...]:
             __file__,
             nvfp4_chunking.__file__,
             _epilogue.__file__,
+            _output.__file__,
             _validation.__file__,
             _output_compile.__file__,
             key.__file__,
