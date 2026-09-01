@@ -28,6 +28,7 @@ from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
+from . import _core
 from . import triton as ffn_backend
 
 _COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v1"
@@ -305,6 +306,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 file_name
                 for file_name in (
                     __file__,
+                    _core.__file__,
                     ffn_backend.__file__,
                     nvfp4_compile_fx.__file__,
                     nvfp4_validation.__file__,
