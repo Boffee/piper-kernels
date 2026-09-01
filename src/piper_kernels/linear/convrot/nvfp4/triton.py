@@ -550,10 +550,16 @@ def prepare_static(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
     group_size: int,
+    activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Rotate and pack an activation using a supplied static scale."""
-    validated_input = _validate_input(input, group_size)
-    qdata, scale = _prepare_static_storage(validated_input, per_tensor_scale, group_size)
+    """Apply an optional activation, then rotate and pack using a supplied scale."""
+    validated_input = _validate_input(input, group_size, activation_fn)
+    qdata, scale = _prepare_static_storage(
+        validated_input,
+        per_tensor_scale,
+        group_size,
+        activation_fn=activation_fn,
+    )
     return qdata, scale, per_tensor_scale.clone()
 
 
@@ -571,17 +577,23 @@ def prepare_static_out(
 def prepare_dynamic(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
+    activation_fn: str | None = None,
     *,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Rotate twice and prepare exact dynamically scaled NVFP4 activations."""
-    validated_input = _validate_input(input, group_size)
-    per_tensor_scale = _prepare_dynamic_scale(validated_input, group_size)
+    """Apply an optional activation, then prepare exact dynamic ConvRot NVFP4 storage."""
+    validated_input = _validate_input(input, group_size, activation_fn)
+    per_tensor_scale = _prepare_dynamic_scale(
+        validated_input,
+        group_size,
+        activation_fn=activation_fn,
+    )
     qdata, scale = _prepare_static_storage(
         validated_input,
         per_tensor_scale,
         group_size,
         out,
+        activation_fn=activation_fn,
     )
     return qdata, scale, per_tensor_scale
 

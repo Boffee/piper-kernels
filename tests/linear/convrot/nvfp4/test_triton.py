@@ -292,6 +292,36 @@ def test_projected_swiglu_preparation_matches_materialized_reference(
         assert torch.equal(actual_tensor, expected_tensor)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_swiglu_preparation_matches_materialized_activation(
+    group_size: int,
+    dynamic: bool,
+) -> None:
+    torch.manual_seed(607 + group_size + dynamic)
+    input = torch.randn(17, 512, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    activated = apply_input_activation(input, "swiglu")
+    rotated = torch.empty_like(activated)
+    convrot_backend.rotate_input(activated, rotated, group_size, num_warps=4)
+
+    if dynamic:
+        expected = nvfp4_ops._compiled_prepare_dynamic(rotated, None)
+        actual = convrot_nvfp4.prepare_dynamic(input, group_size, "swiglu")
+    else:
+        per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
+        expected = nvfp4_ops._compiled_prepare_static(rotated, per_tensor_scale, None)
+        actual = convrot_nvfp4.prepare_static(
+            input,
+            per_tensor_scale,
+            group_size,
+            "swiglu",
+        )
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+
 @pytest.mark.parametrize("group_size", [15, 32])
 def test_dynamic_preparation_rejects_unsupported_group_size(group_size: int) -> None:
     with pytest.raises(ValueError, match="group size"):

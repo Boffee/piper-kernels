@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
@@ -60,13 +61,18 @@ def validated_semantic_linear(
 def emit_prepared_input(
     graph: torch.fx.Graph,
     operands: SemanticLinearNodes,
+    *,
+    input_node: torch.fx.Node | None = None,
+    activation_fn: str | None = None,
 ) -> PreparedInputNodes:
     """Emit shared ConvRot NVFP4 preparation with complete fake metadata."""
-    input_node = operands.linear.input
+    input_node = operands.linear.input if input_node is None else input_node
     input_value = preparation_sharing.tensor_metadata(input_node)
     assert input_value is not None
     rows = input_value.numel() // input_value.shape[-1]
-    input_features = input_value.shape[-1]
+    input_features = input_value.shape[-1] // input_activations.input_activation_width(
+        activation_fn
+    )
     values = (
         input_value.new_empty(
             nvfp4_layout.qdata_shape(rows, input_features),
@@ -85,6 +91,7 @@ def emit_prepared_input(
             operands.linear.activation_per_tensor_scale,
             operands.linear.dynamic_activation_scale,
             operands.group_size,
+            activation_fn,
         ),
     )
     prepared.meta["val"] = values
