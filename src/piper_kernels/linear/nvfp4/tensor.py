@@ -22,6 +22,10 @@ from piper_kernels.linear._dispatch import bind_linear_arguments
 from . import _layout, _ops
 from ._typing import NVFP4Storage
 
+# TorchAO divides the global reciprocal by the FP8 block scale. Keep that
+# intermediate finite even when the weight is zero or extremely small.
+_MIN_PER_TENSOR_SCALE = torch.finfo(torch.float32).tiny / torch.finfo(torch.float8_e4m3fn).tiny
+
 
 def _quantize_hp(
     hp_tensor: torch.Tensor,
@@ -42,12 +46,7 @@ def _quantize_hp(
         amax = source.float().abs().amax()
         if not bool(torch.isfinite(amax)):
             raise ValueError("cannot quantize an NVFP4 weight with non-finite values")
-        derived_scale = per_tensor_amax_to_scale(amax)
-        per_tensor_scale = torch.where(
-            amax == 0,
-            torch.ones_like(derived_scale),
-            derived_scale,
-        )
+        per_tensor_scale = per_tensor_amax_to_scale(amax).clamp_min(_MIN_PER_TENSOR_SCALE)
     return TorchAONVFP4Tensor.to_nvfp4(
         source,
         block_size=block_size,

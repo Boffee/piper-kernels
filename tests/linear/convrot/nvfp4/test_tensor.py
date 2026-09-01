@@ -133,7 +133,9 @@ def test_from_hp_computed_global_scale_handles_an_all_zero_weight() -> None:
     )
 
     assert weight.per_tensor_scale is not None
-    assert torch.equal(weight.per_tensor_scale, torch.ones(()))
+    assert torch.isfinite(weight.per_tensor_scale)
+    assert weight.per_tensor_scale > 0
+    assert not torch.count_nonzero(weight.qdata)
 
 
 def test_from_hp_rejects_ambiguous_per_tensor_scale_configuration() -> None:
