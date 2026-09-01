@@ -98,7 +98,7 @@ def test_device_and_dtype_copies_preserve_wrapper_and_group_size() -> None:
     assert moved.group_size == 64
 
 
-def test_tensor_flatten_round_trip_preserves_group_size() -> None:
+def test_tensor_flatten_round_trip_preserves_storage_and_metadata() -> None:
     source = _meta_weight(group_size=64)
     names, metadata = source.__tensor_flatten__()
     tensors = {name: getattr(source, name) for name in names}
@@ -111,9 +111,16 @@ def test_tensor_flatten_round_trip_preserves_group_size() -> None:
     )
 
     assert type(rebuilt) is ConvRotNVFP4Tensor
-    assert rebuilt.group_size == 64
     assert rebuilt.qdata is source.qdata
     assert rebuilt.scale is source.scale
+    assert rebuilt.per_tensor_scale is source.per_tensor_scale
+    assert rebuilt.act_per_tensor_scale is source.act_per_tensor_scale
+    assert rebuilt.block_size == source.block_size
+    assert rebuilt.orig_dtype is source.orig_dtype
+    assert rebuilt.group_size == source.group_size
+    assert rebuilt.is_swizzled_scales is source.is_swizzled_scales
+    assert rebuilt.use_triton_kernel is source.use_triton_kernel
+    assert rebuilt.act_quant_kwargs == source.act_quant_kwargs
 
 
 def test_stable_hash_distinguishes_rotation_groups() -> None:

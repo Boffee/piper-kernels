@@ -29,8 +29,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
     """Standard NVFP4 weight storage carrying its grouped rotation metadata."""
 
     tensor_attribute_names: ClassVar[list[str]] = [
-        "block_size",
-        "orig_dtype",
+        *PiperNVFP4Tensor.tensor_attribute_names,
         "group_size",
     ]
     group_size: int
