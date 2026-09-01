@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.linear.convrot._rotation import validate_group_size
+from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
@@ -19,7 +20,8 @@ def _prepare_input(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if dynamic_activation_scale:
         return convrot_nvfp4.prepare_dynamic(input, group_size)
-    assert activation_per_tensor_scale is not None
+    if activation_per_tensor_scale is None:
+        raise ValueError("static ConvRot NVFP4 preparation requires a per-tensor scale")
     return convrot_nvfp4.prepare_static(
         input,
         activation_per_tensor_scale,
@@ -98,4 +100,53 @@ def _linear_fake(
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
 
-__all__ = ["linear"]
+@torch.library.custom_op("piper_kernels::convrot_nvfp4_prepare_input", mutates_args=())
+def prepare_input(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    activation_per_tensor_scale: torch.Tensor | None,
+    dynamic_activation_scale: bool,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare one activation in the grouped ConvRot NVFP4 basis."""
+    validate_group_size(group_size)
+    return _prepare_input(
+        input,
+        activation_per_tensor_scale,
+        dynamic_activation_scale,
+        group_size,
+    )
+
+
+@prepare_input.register_fake  # pyright: ignore[reportFunctionMemberAccess]
+def _prepare_input_fake(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    activation_per_tensor_scale: torch.Tensor | None,
+    _dynamic_activation_scale: bool,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_group_size(group_size)
+    if input.ndim == 0:
+        raise ValueError("ConvRot NVFP4 input must be non-scalar")
+    input_features = input.shape[-1]
+    if isinstance(input_features, int) and input_features % group_size:
+        raise ValueError(
+            f"ConvRot NVFP4 input features {input_features} must be divisible "
+            f"by group size {group_size}"
+        )
+    rows = input.numel() // input_features
+    per_tensor_scale = (
+        activation_per_tensor_scale.new_empty(())
+        if activation_per_tensor_scale is not None
+        else input.new_empty((), dtype=torch.float32)
+    )
+    return (
+        input.new_empty(nvfp4_layout.qdata_shape(rows, input_features), dtype=torch.uint8),
+        input.new_empty(
+            nvfp4_layout.scale_shape(rows, input_features),
+            dtype=torch.float8_e4m3fn,
+        ),
+        per_tensor_scale,
+    )
+
+
+__all__ = ["linear", "prepare_input"]

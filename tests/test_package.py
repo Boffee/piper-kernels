@@ -30,7 +30,11 @@ from piper_kernels.linear.convrot import (
     convrot_int8_compile_options,
     convrot_int8_linear,
 )
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor, convrot_nvfp4_linear
+from piper_kernels.linear.convrot.nvfp4 import (
+    ConvRotNVFP4Tensor,
+    convrot_nvfp4_compile_options,
+    convrot_nvfp4_linear,
+)
 
 
 def test_removed_convrot_root_package_is_not_importable() -> None:
@@ -54,6 +58,20 @@ assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
 assert "piper_kernels.linear._preparation_sharing" in sys.modules
 assert "piper_kernels.fusions.convrot_sparse_piper._compile" not in sys.modules
 assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_convrot_nvfp4_compiler_integration_is_loaded_lazily() -> None:
+    script = """
+import sys
+import piper_kernels.linear.convrot.nvfp4 as convrot_nvfp4
+
+assert "piper_kernels.linear.convrot.nvfp4._compile" not in sys.modules
+assert "piper_kernels.linear._preparation_sharing" not in sys.modules
+convrot_nvfp4.convrot_nvfp4_compile_options()
+assert "piper_kernels.linear.convrot.nvfp4._compile" in sys.modules
+assert "piper_kernels.linear._preparation_sharing" in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 
@@ -134,6 +152,10 @@ def test_public_packages_import() -> None:
     assert piper_kernels.linear.convrot.ConvRotInt8Tensor is ConvRotInt8Tensor
     assert piper_kernels.linear.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
     assert piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor is ConvRotNVFP4Tensor
+    assert (
+        piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_compile_options
+        is convrot_nvfp4_compile_options
+    )
     assert piper_kernels.linear.convrot.convrot_int8_compile_options is convrot_int8_compile_options
     assert piper_kernels.linear.convrot.convrot_int8_linear is convrot_int8_linear
     assert piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_linear is convrot_nvfp4_linear
@@ -149,3 +171,12 @@ def test_public_packages_import() -> None:
         "convrot_int8_linear",
     ]
     assert piper_kernels.linear.convrot.int8.__all__ == ["ConvRotInt8Tensor"]
+    assert piper_kernels.linear.convrot.nvfp4.__all__ == [
+        "ConvRotNVFP4Tensor",
+        "convrot_nvfp4_compile_options",
+        "convrot_nvfp4_linear",
+        "dynamic_scale",
+        "prepare_dynamic",
+        "prepare_static",
+        "prepare_static_out",
+    ]

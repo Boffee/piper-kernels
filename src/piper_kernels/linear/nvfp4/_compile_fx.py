@@ -34,7 +34,8 @@ class SemanticLinearNodes:
     dynamic_activation_scale: bool
 
     @classmethod
-    def _from_values(cls, values: tuple[object, ...]) -> SemanticLinearNodes | None:
+    def from_values(cls, values: tuple[object, ...]) -> SemanticLinearNodes | None:
+        """Parse canonical semantic-linear operand values."""
         if len(values) != 7:
             return None
         input_node, weight_qdata, weight_scale, weight_global, activation_scale, bias, dynamic = (
@@ -66,12 +67,12 @@ class SemanticLinearNodes:
         """Parse positional operands from one semantic-linear call node."""
         if node.kwargs:
             return None
-        return cls._from_values(node.args)
+        return cls.from_values(node.args)
 
     @classmethod
     def from_match(cls, match: Match) -> SemanticLinearNodes | None:
         """Parse canonical semantic-linear keywords from a pattern match."""
-        return cls._from_values(
+        return cls.from_values(
             tuple(
                 match.kwargs[name]
                 for name in (
