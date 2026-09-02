@@ -31,7 +31,7 @@ def test_public_api_exports_sparse_attention_backend() -> None:
 
 def test_mean_pool_backend_runs_through_the_common_attention_path() -> None:
     query, key, value = _inputs()
-    attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
+    attention = SparsePiperAttention((0.5, 1.0), routing="mean")
 
     with torch.no_grad():
         output = attention(query, key, value, sparse_key_blocks=2)
@@ -63,11 +63,11 @@ def test_backend_owns_only_an_immutable_semantic_ratio_profile() -> None:
 
     assert attention.head_keep_ratios == (0.75, 0.25, 1.0, 0.5)
     assert attention._head_keep_ratio_units == (750_000, 250_000, 1_000_000, 500_000)
-    assert attention.routing == "dsa"
+    assert attention.routing == "minmax"
 
 
 def test_routing_policy_is_validated_at_construction() -> None:
-    with pytest.raises(ValueError, match="'dsa' or 'mean_pool'"):
+    with pytest.raises(ValueError, match="'minmax' or 'mean'"):
         SparsePiperAttention((1.0,), routing="unknown")
 
 
@@ -132,6 +132,64 @@ def test_partial_dense_suffix_attends_only_valid_rows() -> None:
 
     expected = torch.full_like(output, (64 + 10) / sequence_length)
     torch.testing.assert_close(output, expected, atol=0.015625, rtol=0)
+
+
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_internal_block_lengths_make_padded_values_unobservable(
+    routing: str,
+    device: str,
+) -> None:
+    if device == "cuda" and (
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
+    ):
+        pytest.skip("requires exact NVIDIA SM120")
+    query, key, value = _inputs(device=device)
+    block_lengths = torch.tensor([64, 17, 51], device=device, dtype=torch.int32)
+    valid_rows = torch.arange(query.shape[1], device=device) % 64
+    valid_rows = valid_rows < block_lengths.repeat_interleave(64)
+    corrupted = [tensor.clone() for tensor in (query, key, value)]
+    for tensor in corrupted:
+        tensor[:, ~valid_rows] = torch.randn_like(tensor[:, ~valid_rows]).mul_(100)
+    attention = SparsePiperAttention((0.5, 1.0), routing=routing)
+
+    with torch.no_grad():
+        expected = attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=2,
+            block_lengths=block_lengths,
+        )
+        actual = attention(
+            *corrupted,
+            sparse_key_blocks=2,
+            block_lengths=block_lengths,
+        )
+
+    assert actual.shape == query.shape
+    torch.testing.assert_close(actual[:, valid_rows], expected[:, valid_rows], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "block_lengths",
+    [
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.tensor([64, 64, 64], dtype=torch.int64),
+    ],
+)
+def test_internal_block_lengths_reject_invalid_metadata(block_lengths: torch.Tensor) -> None:
+    query, key, value = _inputs()
+    attention = SparsePiperAttention((0.5, 1.0))
+
+    with pytest.raises(ValueError, match="block lengths"):
+        attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=2,
+            block_lengths=block_lengths,
+        )
 
 
 def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
@@ -302,7 +360,7 @@ def test_operator_is_opaque_to_a_full_compile_graph() -> None:
 )
 def test_mean_pool_operator_is_opaque_to_a_full_compile_graph() -> None:
     query, key, value = _inputs("cuda", sequence_length=193)
-    attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
+    attention = SparsePiperAttention((0.5, 1.0), routing="mean")
 
     def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         return attention(query, key, value, sparse_key_blocks=3)

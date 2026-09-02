@@ -9,17 +9,21 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
+from .coarse import coarse_attention
 
 try:
-    from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
+    from ._routes_triton import tiled_radix_select_packed_routes as _sm120_select_routes
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
         raise
     _sm120_select_routes = None
 
-_DSA_ROUTING = 0
-_MEAN_POOL_ROUTING = 1
-_ROUTING_MODE_BY_NAME = {"dsa": _DSA_ROUTING, "mean_pool": _MEAN_POOL_ROUTING}
+_MINMAX_ROUTING = 0
+_MEAN_ROUTING = 1
+_ROUTING_MODE_BY_NAME = {
+    "minmax": _MINMAX_ROUTING,
+    "mean": _MEAN_ROUTING,
+}
 _ROUTING_NAME_BY_MODE = {mode: name for name, mode in _ROUTING_MODE_BY_NAME.items()}
 
 
@@ -28,8 +32,16 @@ class PackedRoutes:
     """UINT16 routes packed by physical head for every query block."""
 
     indices: torch.Tensor
-    head_offsets: torch.Tensor
-    keep_blocks: torch.Tensor
+    route_head_offsets: torch.Tensor
+    head_keep_blocks: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PackedRoutesAndCoarseOutput:
+    """Packed fine routes and the coarse output derived from the same scores."""
+
+    routes: PackedRoutes
+    coarse_output: torch.Tensor
 
 
 class PackedRouteBuilder:
@@ -42,10 +54,10 @@ class PackedRouteBuilder:
         batch: int,
         heads: int,
         query_blocks: int,
-        key_blocks: int,
+        sparse_key_blocks: int,
         device: torch.device,
     ) -> None:
-        _validate_route_layout(layout, heads, key_blocks, device)
+        _validate_route_layout(layout, heads, sparse_key_blocks, device)
         self._layout = layout
         self.routes = PackedRoutes(
             indices=torch.empty(
@@ -53,66 +65,155 @@ class PackedRouteBuilder:
                 dtype=torch.uint16,
                 device=device,
             ),
-            head_offsets=layout.head_offsets,
-            keep_blocks=layout.keep_blocks,
+            route_head_offsets=layout.route_head_offsets,
+            head_keep_blocks=layout.head_keep_blocks,
         )
         self._use_sm120 = _supports_sm120_selector(device)
-        self._offsets = None if self._use_sm120 else layout.head_offsets.detach().cpu().tolist()
-        self._keep_values = None if self._use_sm120 else layout.keep_blocks.detach().cpu().tolist()
+        self._route_head_offsets = (
+            None if self._use_sm120 else layout.route_head_offsets.detach().cpu().tolist()
+        )
+        self._head_keep_block_values = (
+            None if self._use_sm120 else layout.head_keep_blocks.detach().cpu().tolist()
+        )
 
     def write(
         self,
         scores: torch.Tensor,
         *,
-        route_query_offset: int,
+        query_block_offset: int,
     ) -> None:
-        """Select stable top-k routes from one contiguous score chunk."""
+        """Select stable top-k routes from one dense-key score chunk."""
         if self._use_sm120:
             assert _sm120_select_routes is not None
             _sm120_select_routes(
                 scores,
                 self.routes.indices,
-                self._layout.keep_blocks,
-                self._layout.head_offsets,
-                route_query_offset=route_query_offset,
+                self._layout.head_keep_blocks,
+                self._layout.route_head_offsets,
+                query_block_offset=query_block_offset,
             )
             return
-        assert self._offsets is not None
-        assert self._keep_values is not None
+        assert self._route_head_offsets is not None
+        assert self._head_keep_block_values is not None
         _select_portable_routes(
             scores,
             self.routes.indices,
-            self._offsets,
-            self._keep_values,
-            route_query_offset=route_query_offset,
+            self._route_head_offsets,
+            self._head_keep_block_values,
+            query_block_offset=query_block_offset,
+        )
+
+
+class PackedRouteAndCoarseBuilder:
+    """Route over a sparse prefix while attending coarsely over a wider prefix."""
+
+    def __init__(
+        self,
+        layout: _ResolvedRouteLayout,
+        pooled_value: torch.Tensor,
+        *,
+        batch: int,
+        heads: int,
+        query_blocks: int,
+        sparse_key_blocks: int,
+        device: torch.device,
+    ) -> None:
+        if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
+            raise ValueError("pooled V must use [batch,heads,key blocks,features]")
+        if pooled_value.shape[:2] != (batch, heads):
+            raise ValueError("pooled V must match the routing batch and heads")
+        coarse_key_blocks = pooled_value.shape[2]
+        if not sparse_key_blocks <= coarse_key_blocks:
+            raise ValueError("coarse attention must include every sparse key block")
+        if pooled_value.dtype is not torch.float32:
+            raise ValueError("pooled V must use FP32")
+        if pooled_value.device != device:
+            raise ValueError("pooled V and routing scores must share a device")
+        self._route_builder = PackedRouteBuilder(
+            layout,
+            batch=batch,
+            heads=heads,
+            query_blocks=query_blocks,
+            sparse_key_blocks=sparse_key_blocks,
+            device=device,
+        )
+        self._pooled_value = pooled_value
+        self._sparse_key_blocks = sparse_key_blocks
+        self._coarse_output = pooled_value.new_empty(
+            (batch, heads, query_blocks, pooled_value.shape[-1])
+        )
+        self._written_query_ranges: list[tuple[int, int]] = []
+
+    def write(
+        self,
+        scores: torch.Tensor,
+        *,
+        query_block_offset: int,
+    ) -> None:
+        """Route over each score prefix without retaining the full coarse matrix."""
+        if scores.ndim != 4:
+            raise ValueError("coarse route scores must use rank-four block tensors")
+        if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
+            raise TypeError("coarse score query-block offset must be an integer")
+        query_block_count = scores.shape[2]
+        query_block_stop = query_block_offset + query_block_count
+        if not 0 <= query_block_offset < query_block_stop <= self._coarse_output.shape[2]:
+            raise ValueError("coarse score query-block range must fit the output")
+        if any(
+            query_block_offset < written_stop and written_start < query_block_stop
+            for written_start, written_stop in self._written_query_ranges
+        ):
+            raise ValueError("coarse score query-block ranges must not overlap")
+        self._route_builder.write(
+            scores[..., : self._sparse_key_blocks],
+            query_block_offset=query_block_offset,
+        )
+        self._coarse_output[:, :, query_block_offset:query_block_stop] = coarse_attention(
+            scores,
+            self._pooled_value,
+        )
+        self._written_query_ranges.append((query_block_offset, query_block_stop))
+
+    def finish(self) -> PackedRoutesAndCoarseOutput:
+        """Return packed routes and their query-block-aligned coarse output."""
+        next_query_block = 0
+        for written_start, written_stop in sorted(self._written_query_ranges):
+            if written_start != next_query_block:
+                raise RuntimeError("coarse score chunks must cover every query block")
+            next_query_block = written_stop
+        if next_query_block != self._coarse_output.shape[2]:
+            raise RuntimeError("coarse score chunks must cover every query block")
+        return PackedRoutesAndCoarseOutput(
+            routes=self._route_builder.routes,
+            coarse_output=self._coarse_output,
         )
 
 
 def _validate_route_layout(
     layout: _ResolvedRouteLayout,
     heads: int,
-    key_blocks: int,
+    sparse_key_blocks: int,
     device: torch.device,
 ) -> None:
     """Validate metadata shared by every packed block-routing policy."""
-    if not 1 <= key_blocks <= _UINT16_ROUTE_CAPACITY:
+    if not 1 <= sparse_key_blocks <= _UINT16_ROUTE_CAPACITY:
         raise ValueError("sparse routing requires between 1 and 65,536 sparse key blocks")
-    if layout.keep_blocks.shape != (heads,) or layout.head_offsets.shape != (heads + 1,):
+    if layout.head_keep_blocks.shape != (heads,) or layout.route_head_offsets.shape != (heads + 1,):
         raise ValueError("sparse route layout does not match the attention head count")
-    if layout.keep_blocks.device != device or layout.head_offsets.device != device:
+    if layout.head_keep_blocks.device != device or layout.route_head_offsets.device != device:
         raise ValueError("sparse route layout must share the attention device")
 
 
 def _select_portable_routes(
     scores: torch.Tensor,
-    output: torch.Tensor,
-    offsets: list[int],
-    keep_values: list[int],
+    routes: torch.Tensor,
+    route_head_offsets: list[int],
+    head_keep_block_values: list[int],
     *,
-    route_query_offset: int,
+    query_block_offset: int,
 ) -> None:
-    query_stop = route_query_offset + scores.shape[2]
-    for head, count in enumerate(keep_values):
+    query_stop = query_block_offset + scores.shape[2]
+    for head, count in enumerate(head_keep_block_values):
         selected = torch.argsort(
             scores[:, head],
             dim=-1,
@@ -120,7 +221,11 @@ def _select_portable_routes(
             stable=True,
         )[..., :count]
         selected = selected.sort(dim=-1).values.to(torch.uint16)
-        output[:, route_query_offset:query_stop, offsets[head] : offsets[head + 1]] = selected
+        routes[
+            :,
+            query_block_offset:query_stop,
+            route_head_offsets[head] : route_head_offsets[head + 1],
+        ] = selected
 
 
 def _supports_sm120_selector(device: torch.device) -> bool:
@@ -131,7 +236,7 @@ def _supports_sm120_selector(device: torch.device) -> bool:
 def validate_routing_mode(routing_mode: int) -> None:
     """Reject routing modes outside the internal static operator contract."""
     if not is_valid_routing_mode(routing_mode):
-        raise ValueError("sparse Piper routing mode must be DSA or mean_pool")
+        raise ValueError("sparse Piper routing mode must be minmax or mean")
 
 
 def is_valid_routing_mode(routing_mode: int) -> bool:
@@ -140,12 +245,14 @@ def is_valid_routing_mode(routing_mode: int) -> bool:
 
 
 __all__ = [
-    "_DSA_ROUTING",
-    "_MEAN_POOL_ROUTING",
+    "_MEAN_ROUTING",
+    "_MINMAX_ROUTING",
     "_ROUTING_MODE_BY_NAME",
     "_ROUTING_NAME_BY_MODE",
+    "PackedRouteAndCoarseBuilder",
     "PackedRouteBuilder",
     "PackedRoutes",
+    "PackedRoutesAndCoarseOutput",
     "is_valid_routing_mode",
     "validate_routing_mode",
 ]

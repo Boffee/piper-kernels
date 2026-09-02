@@ -18,7 +18,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
     validate_routing_mode,
 )
 from piper_kernels.fusions.convrot_sage_qk.triton import (
@@ -26,7 +26,13 @@ from piper_kernels.fusions.convrot_sage_qk.triton import (
     validate_qk_projection_inputs,
 )
 
-from ._layout import HEAD_DIM, QUERY_SCALE_ROWS, TILE_ROWS, padded_sequence_length
+from ._layout import (
+    HEAD_DIM,
+    QUERY_SCALE_ROWS,
+    TILE_ROWS,
+    padded_sequence_length,
+    validate_block_lengths,
+)
 
 _BLOCK_M = TILE_ROWS
 _BLOCK_K = 128
@@ -47,6 +53,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     query_ptr,
     query_scale_ptr,
     query_summary_ptr,
+    block_lengths_ptr,
     rows,
     logical_sequence_length,
     storage_sequence_length,
@@ -58,6 +65,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     norm_epsilon: tl.constexpr,
     softmax_scale: tl.constexpr,
     mean_pool_summary: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     aligned_projection: tl.constexpr,
     block_m: tl.constexpr,
@@ -113,6 +121,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         query_ptr,
         query_scale_ptr,
         query_summary_ptr,
+        block_lengths_ptr,
         batch,
         heads,
         head_offsets,
@@ -122,6 +131,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         query_block,
         softmax_scale,
         mean_pool_summary,
+        mask_block_lengths,
         mask_ragged_tail,
         heads_per_program,
         head_dim,
@@ -160,7 +170,7 @@ def _validate_inputs(
     return result
 
 
-def _launch_query_projection(
+def _launch_query_projection(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -171,6 +181,7 @@ def _launch_query_projection(
     norm_epsilon: float,
     softmax_scale: float,
     routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     batch, sequence_length, heads, rotary_dim = _validate_inputs(
@@ -185,6 +196,7 @@ def _launch_query_projection(
         softmax_scale=softmax_scale,
     )
     storage_sequence_length = padded_sequence_length(sequence_length)
+    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     query = torch.empty(
         (batch, heads, storage_sequence_length, HEAD_DIM),
         device=input_qdata.device,
@@ -201,6 +213,9 @@ def _launch_query_projection(
         dtype=torch.float32,
     )
 
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else query_scale
+
     def launch(row_block_count: int, *, mask_ragged_tail: bool) -> None:
         _convrot_project_rmsnorm_rope_quantize_query_kernel[
             (row_block_count, triton.cdiv(heads, _HEADS_PER_PROGRAM), batch)
@@ -215,6 +230,7 @@ def _launch_query_projection(
             query,
             query_scale,
             query_summary,
+            block_lengths_ptr,
             batch * sequence_length,
             sequence_length,
             storage_sequence_length,
@@ -225,7 +241,8 @@ def _launch_query_projection(
             rotary_dim=rotary_dim,
             norm_epsilon=norm_epsilon,
             softmax_scale=softmax_scale,
-            mean_pool_summary=routing_mode == _MEAN_POOL_ROUTING,
+            mean_pool_summary=routing_mode == _MEAN_ROUTING,
+            mask_block_lengths=has_block_lengths,
             mask_ragged_tail=mask_ragged_tail,
             aligned_projection=(
                 not mask_ragged_tail
@@ -248,7 +265,7 @@ def _launch_query_projection(
 
 
 @torch.library.custom_op("piper_kernels::convrot_sparse_piper_project_query", mutates_args=())
-def _project_query_op(
+def _project_query_op(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -259,6 +276,7 @@ def _project_query_op(
     norm_epsilon: float,
     softmax_scale: float,
     routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_query_projection(
         input_qdata,
@@ -271,6 +289,7 @@ def _project_query_op(
         norm_epsilon,
         softmax_scale,
         routing_mode,
+        block_lengths,
     )
 
 
@@ -286,6 +305,7 @@ def _project_query_op_fake(
     _norm_epsilon: float,
     _softmax_scale: float,
     _routing_mode: int,
+    _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     storage_sequence_length = padded_sequence_length(sequence_length)

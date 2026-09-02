@@ -17,7 +17,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
 )
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
-from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length
+from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length, validate_block_lengths
 
 _BLOCK_M = 128
 _BLOCK_K = 128
@@ -81,6 +81,8 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     value_mean_ptr,
     value_ptr,
     value_scale_ptr,
+    block_mean_ptr,
+    block_lengths_ptr,
     rows,
     logical_sequence_length,
     storage_sequence_length,
@@ -90,6 +92,8 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     aligned_projection: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
+    emit_block_mean: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -129,6 +133,8 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         value_mean_ptr,
         value_ptr,
         value_scale_ptr,
+        block_mean_ptr,
+        block_lengths_ptr,
         batch,
         heads,
         head_offsets,
@@ -136,6 +142,8 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         storage_sequence_length,
         row_block,
+        mask_block_lengths,
+        emit_block_mean,
         heads_per_program,
         head_dim,
         block_m,
@@ -181,7 +189,10 @@ def _launch_value_projection(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    block_lengths: torch.Tensor | None,
+    *,
+    emit_block_mean: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, heads = _validate_inputs(
         input_qdata,
         input_scale,
@@ -189,6 +200,7 @@ def _launch_value_projection(
         weight_qdata,
         weight_scale,
     )
+    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     storage_sequence_length = padded_sequence_length(sequence_length)
     value = torch.empty(
         (batch, heads, HEAD_DIM, storage_sequence_length),
@@ -205,6 +217,17 @@ def _launch_value_projection(
         device=input_qdata.device,
         dtype=torch.float32,
     )
+    block_mean = (
+        torch.empty(
+            (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
+            device=input_qdata.device,
+            dtype=torch.float32,
+        )
+        if emit_block_mean
+        else value_mean
+    )
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else value_mean
     _project_prepared_input_mean_kernel[(triton.cdiv(heads * HEAD_DIM, _BLOCK_N), batch)](
         input_mean,
         weight_qdata,
@@ -232,6 +255,8 @@ def _launch_value_projection(
             value_mean,
             value,
             value_scale_multiplier,
+            block_mean,
+            block_lengths_ptr,
             batch * sequence_length,
             sequence_length,
             storage_sequence_length,
@@ -245,6 +270,8 @@ def _launch_value_projection(
                 and input_qdata.shape[2] % _BLOCK_K == 0
                 and heads % _HEADS_PER_PROGRAM == 0
             ),
+            mask_block_lengths=has_block_lengths,
+            emit_block_mean=emit_block_mean,
             block_m=_BLOCK_M,
             block_n=_BLOCK_N,
             block_k=_BLOCK_K,
@@ -257,7 +284,7 @@ def _launch_value_projection(
         launch(full_row_blocks, 0, aligned_rows=True)
     if sequence_length % _BLOCK_M:
         launch(1, full_row_blocks, aligned_rows=False)
-    return value, value_scale_multiplier, value_mean
+    return value, value_scale_multiplier, value_mean, block_mean
 
 
 @torch.library.custom_op(
@@ -270,24 +297,24 @@ def _project_value_op(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _launch_value_projection(
+    value, value_scale_multiplier, value_mean, _block_mean = _launch_value_projection(
         input_qdata,
         input_scale,
         input_mean,
         weight_qdata,
         weight_scale,
+        block_lengths,
+        emit_block_mean=False,
     )
+    return value, value_scale_multiplier, value_mean
 
 
-@_project_value_op.register_fake
-def _project_value_op_fake(
+def _fake_value_projection(
     input_qdata: torch.Tensor,
-    _input_scale: torch.Tensor,
-    _input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
-    _weight_scale: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     storage_sequence_length = padded_sequence_length(sequence_length)
     heads = weight_qdata.shape[0] // HEAD_DIM
@@ -298,4 +325,59 @@ def _project_value_op_fake(
             dtype=torch.float32,
         ),
         input_qdata.new_empty((batch, heads, HEAD_DIM), dtype=torch.float32),
+        input_qdata.new_empty(
+            (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
+            dtype=torch.float32,
+        ),
     )
+
+
+@_project_value_op.register_fake
+def _project_value_op_fake(
+    input_qdata: torch.Tensor,
+    _input_scale: torch.Tensor,
+    _input_mean: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _block_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    value, value_scale_multiplier, value_mean, _block_mean = _fake_value_projection(
+        input_qdata,
+        weight_qdata,
+    )
+    return value, value_scale_multiplier, value_mean
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_sparse_piper_project_value_with_block_means",
+    mutates_args=(),
+)
+def _project_value_with_block_means_op(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    input_mean: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _launch_value_projection(
+        input_qdata,
+        input_scale,
+        input_mean,
+        weight_qdata,
+        weight_scale,
+        block_lengths,
+        emit_block_mean=True,
+    )
+
+
+@_project_value_with_block_means_op.register_fake
+def _project_value_with_block_means_op_fake(
+    input_qdata: torch.Tensor,
+    _input_scale: torch.Tensor,
+    _input_mean: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _block_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _fake_value_projection(input_qdata, weight_qdata)

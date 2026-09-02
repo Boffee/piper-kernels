@@ -19,6 +19,8 @@ from piper_kernels.attention.kernels.sparse_piper import (
 )
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
+from ._block_layout import valid_block_rows
+
 _BLOCK_M = 64
 _BLOCK_N = 64
 _HEAD_DIM = 128
@@ -30,6 +32,7 @@ def _quantize_value_per_tile_kernel(
     value_mean_ptr,
     value_scale_ptr,
     output_ptr,
+    block_lengths_ptr,
     key_length,
     stride_vb,
     stride_vh,
@@ -41,6 +44,7 @@ def _quantize_value_per_tile_kernel(
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
 ):
     """Quantize one D128 K64 storage tile while masking the logical V tail."""
     key_block = tl.program_id(0)
@@ -50,6 +54,8 @@ def _quantize_value_per_tile_kernel(
     offsets_n = key_block * block_n + tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
     valid_rows = offsets_n < key_length
+    if mask_block_lengths:
+        valid_rows &= offsets_n - key_block * block_n < tl.load(block_lengths_ptr + key_block)
     value = tl.load(
         value_ptr
         + batch * stride_vb
@@ -99,7 +105,7 @@ class _PreparedSparsePiperAttention:
     value_mean: torch.Tensor
     routes: torch.Tensor
     route_head_offsets: torch.Tensor
-    keep_blocks: torch.Tensor
+    head_keep_blocks: torch.Tensor
     block_lengths: torch.Tensor | None
     sparse_key_blocks: int
     logical_sequence_length: int
@@ -108,13 +114,14 @@ class _PreparedSparsePiperAttention:
 def _prepare_sparse_piper_attention(
     query: torch.Tensor,
     routes: torch.Tensor,
-    keep_blocks: torch.Tensor,
+    head_keep_blocks: torch.Tensor,
     scale: float,
     *,
     sparse_key_blocks: int,
     route_head_offsets: torch.Tensor,
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> _PreparedSparsePiperAttention:
     """Prepare grouped Q/K and one folded V scale per logical K64 tile."""
     if (
@@ -127,6 +134,20 @@ def _prepare_sparse_piper_attention(
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
     batch, heads, logical_sequence_length, head_dim = query.shape
+    if block_lengths is not None and (
+        logical_sequence_length % _BLOCK_N
+        or block_lengths.shape != (logical_sequence_length // _BLOCK_N,)
+        or block_lengths.dtype is not torch.int32
+        or block_lengths.device != query.device
+        or not block_lengths.is_contiguous()
+    ):
+        raise ValueError("padded sparse Piper requires one contiguous device INT32 length per K64")
+    if block_lengths is not None:
+        valid_rows = valid_block_rows(block_lengths).reshape(-1)
+        valid_rows = valid_rows[None, None, :, None]
+        query = torch.where(valid_rows, query, 0)
+        combined_key = torch.where(valid_rows, combined_key, 0)
+        combined_value = torch.where(valid_rows, combined_value, 0)
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
     storage_sequence_length = tile_count * _BLOCK_N
 
@@ -160,6 +181,7 @@ def _prepare_sparse_piper_attention(
         value_mean,
         value_scale_multiplier,
         value_int8,
+        block_lengths if block_lengths is not None else value_mean,
         logical_sequence_length,
         combined_value.stride(0),
         combined_value.stride(1),
@@ -171,6 +193,7 @@ def _prepare_sparse_piper_attention(
         heads=heads,
         head_dim=head_dim,
         block_n=_BLOCK_N,
+        mask_block_lengths=block_lengths is not None,
         num_warps=4,
     )
 
@@ -184,8 +207,8 @@ def _prepare_sparse_piper_attention(
         value_mean=value_mean,
         routes=routes,
         route_head_offsets=route_head_offsets,
-        keep_blocks=keep_blocks,
-        block_lengths=None,
+        head_keep_blocks=head_keep_blocks,
+        block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         logical_sequence_length=logical_sequence_length,
     )
@@ -200,7 +223,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     routes: torch.Tensor,
-    keep_blocks: torch.Tensor,
+    head_keep_blocks: torch.Tensor,
     route_head_offsets: torch.Tensor,
     *,
     sparse_key_blocks: int,
@@ -211,8 +234,8 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     """Construct sparse Piper launch state from already-quantized operands.
 
     ``block_lengths`` opts into internally padded K64 storage. Each entry gives
-    the valid prefix length in ``[1, 64]`` of one physical block, and the entries
-    must sum to ``logical_sequence_length``. Output then retains the full storage
+    the valid prefix length in ``[1, 64]`` of one physical block and supersedes
+    ``logical_sequence_length`` for masking. Output then retains the full storage
     sequence for a later layout gather. Without it, the established compact
     logical sequence plus one possible ragged tail remains unchanged.
     """
@@ -255,7 +278,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         raise ValueError("quantized sparse Piper V scales must contain one value per K64")
     if value_mean.shape != (batch, heads, head_dim):
         raise ValueError("quantized sparse Piper V mean must be [batch,heads,D128]")
-    # Layout construction owns the value-range and sum invariants documented
+    # Layout construction owns the value-range invariants documented
     # above. Inspecting CUDA values here would add a validation kernel or a host
     # synchronization to every launch; only launch-critical tensor properties
     # are checked on this hot path.
@@ -272,7 +295,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         value,
         *scales,
         routes,
-        keep_blocks,
+        head_keep_blocks,
         route_head_offsets,
         *((block_lengths,) if block_lengths is not None else ()),
     )
@@ -291,8 +314,8 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
     if routes.dtype is not torch.uint16:
         raise ValueError("quantized sparse Piper routes must use UINT16")
-    if keep_blocks.shape != (heads,) or keep_blocks.dtype is not torch.int32:
-        raise ValueError("quantized sparse Piper keep counts must be one INT32 value per head")
+    if head_keep_blocks.shape != (heads,) or head_keep_blocks.dtype is not torch.int32:
+        raise ValueError("quantized sparse Piper head keep blocks must be one INT32 value per head")
     if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
 
@@ -306,7 +329,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         value_mean=value_mean,
         routes=routes,
         route_head_offsets=route_head_offsets,
-        keep_blocks=keep_blocks,
+        head_keep_blocks=head_keep_blocks,
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         logical_sequence_length=logical_sequence_length,

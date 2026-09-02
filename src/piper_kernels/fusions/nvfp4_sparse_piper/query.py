@@ -13,8 +13,8 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     padded_sequence_length,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _DSA_ROUTING,
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
     validate_routing_mode,
 )
 from piper_kernels.linear.nvfp4._chunking import (
@@ -106,7 +106,7 @@ def _launch_query(  # noqa: PLR0913, PLR0917
             sequence_length,
             norm_epsilon,
             softmax_scale,
-            routing_mode == _MEAN_POOL_ROUTING,
+            routing_mode == _MEAN_ROUTING,
         )
 
     consumer_tensors = [input_per_tensor_scale, *operands]
@@ -137,7 +137,7 @@ def project_query(  # noqa: PLR0913, PLR0917
     norm_epsilon: float,
     softmax_scale: float,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    routing_mode: int = _DSA_ROUTING,
+    routing_mode: int = _MINMAX_ROUTING,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_query(
         input_qdata,
@@ -172,7 +172,7 @@ def _project_query_fake(
     _norm_epsilon: float,
     _softmax_scale: float,
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    _routing_mode: int = _DSA_ROUTING,
+    _routing_mode: int = _MINMAX_ROUTING,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)

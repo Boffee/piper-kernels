@@ -5,8 +5,8 @@ import torch
 
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
+    _resolve_head_keep_blocks,
     _resolve_route_layout,
-    _resolved_keep_values,
 )
 
 
@@ -15,27 +15,27 @@ def test_h3_ratio_profile_resolves_exact_physical_budget() -> None:
 
     layout = _resolve_route_layout(units, 1036, torch.device("cpu"))
 
-    assert layout.keep_blocks.tolist() == [207, 414, 622]
-    assert layout.head_offsets.tolist() == [0, 207, 621, 1243]
+    assert layout.head_keep_blocks.tolist() == [207, 414, 622]
+    assert layout.route_head_offsets.tolist() == [0, 207, 621, 1243]
     assert layout.routes_per_query == 1243
 
 
 def test_largest_remainder_rounding_preserves_nearest_total() -> None:
     units = _normalize_head_keep_ratios((0.5, 0.5))
 
-    assert _resolved_keep_values(units, 3) == (2, 1)
+    assert _resolve_head_keep_blocks(units, 3) == (2, 1)
 
 
 def test_minimum_route_does_not_reduce_a_dense_head() -> None:
     units = _normalize_head_keep_ratios((0.001, 1.0))
 
-    assert _resolved_keep_values(units, 100) == (1, 100)
+    assert _resolve_head_keep_blocks(units, 100) == (1, 100)
 
 
 @pytest.mark.parametrize("units", [(), (0,), (1_000_001,)])
 def test_physical_budget_rejects_invalid_fixed_point_profiles(units: tuple[int, ...]) -> None:
     with pytest.raises(ValueError, match="ratio profile"):
-        _resolved_keep_values(units, 100)
+        _resolve_head_keep_blocks(units, 100)
 
 
 @pytest.mark.parametrize(

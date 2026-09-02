@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._routes import _MEAN_POOL_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routes import _MEAN_ROUTING
 from piper_kernels.fusions.nvfp4_sparse_piper import key, query, value
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
@@ -72,7 +72,7 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
         1e-5,
         128,
     )
-    actual_value = value.project_value(
+    actual_value = value.project_value_with_block_means(
         *v_projection.as_tuple(),
         biases[2],
         value_mean,
@@ -88,6 +88,14 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
     torch.testing.assert_close(actual_key[3], expected_key[3], atol=0.125, rtol=0.01)
     assert int((actual_value[0].to(torch.int16) - expected_value[0]).abs().max()) <= 1
     torch.testing.assert_close(actual_value[1], expected_value[1], atol=2e-5, rtol=2e-3)
+    expected_block_mean = torch.stack(
+        [
+            materialized_value[start : start + 64].float().mean(dim=0)
+            for start in range(0, materialized_value.shape[0], 64)
+        ],
+        dim=1,
+    )[None]
+    torch.testing.assert_close(actual_value[2], expected_block_mean, atol=0.015625, rtol=0.01)
 
     exact_mean = materialized_value.float().mean(dim=0)[None]
     smallest_tile_step = (expected_value[1] / 255.0).amin(dim=2)
@@ -124,7 +132,7 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
         1e-5,
         128**-0.5,
         128,
-        _MEAN_POOL_ROUTING,
+        _MEAN_ROUTING,
     )
     actual_key = key.project_key(
         *k_projection.as_tuple(),
@@ -134,7 +142,7 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
         operands.sin,
         1e-5,
         128,
-        _MEAN_POOL_ROUTING,
+        _MEAN_ROUTING,
     )
 
     def block_means(sequence: torch.Tensor) -> torch.Tensor:
@@ -159,6 +167,31 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
         rtol=0.01,
     )
     assert actual_key[3].numel() == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_value_block_means_respect_internal_block_lengths() -> None:
+    operands = make_operands(sequence_length=128)
+    projection = operands.projection(2)
+    block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
+    value_mean = torch.zeros((1, 2, 128), device="cuda", dtype=torch.float32)
+
+    actual = value.project_value_with_block_means(
+        *projection.as_tuple(),
+        None,
+        value_mean,
+        128,
+        block_lengths,
+    )
+    materialized = materialize_projection(projection).view(128, 2, 128)
+    expected = torch.stack(
+        (materialized[:64].mean(dim=0), materialized[64:81].mean(dim=0)),
+        dim=1,
+    )[None]
+
+    torch.testing.assert_close(actual[2], expected, atol=0.015625, rtol=0.01)
+    assert not bool(actual[0][..., 81:].any())
 
 
 @pytest.mark.gpu
@@ -198,6 +231,16 @@ def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
         (
             value.project_value,
             (*v_projection.as_tuple(), None, value_mean, 128),
+        ),
+        (
+            value.project_value_with_block_means,
+            (
+                *v_projection.as_tuple(),
+                None,
+                value_mean,
+                128,
+                torch.tensor([64, 64], device="cuda", dtype=torch.int32),
+            ),
         ),
     )
 
@@ -243,6 +286,11 @@ def test_projection_fake_kernels_propagate_padded_shapes() -> None:
         torch.empty((1, 3, 128), device="meta", dtype=torch.float32),
         128,
     )
+    summarized_value = value.project_value_with_block_means(
+        *prepared,
+        torch.empty((1, 3, 128), device="meta", dtype=torch.float32),
+        128,
+    )
 
     assert [output.shape for output in projected_query] == [
         (1, 3, 256, 128),
@@ -258,4 +306,9 @@ def test_projection_fake_kernels_propagate_padded_shapes() -> None:
     assert [output.shape for output in projected_value] == [
         (1, 3, 128, 256),
         (1, 3, 4, 1),
+    ]
+    assert [output.shape for output in summarized_value] == [
+        (1, 3, 128, 256),
+        (1, 3, 4, 1),
+        (1, 3, 4, 128),
     ]

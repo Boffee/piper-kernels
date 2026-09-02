@@ -109,7 +109,7 @@ The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
 bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
 `sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
-plus DSA summaries directly, avoiding the three materialized BF16 projection outputs. Arbitrary
+plus routing summaries directly, avoiding the three materialized BF16 projection outputs. Arbitrary
 logical sequence lengths are written directly into internally K64-padded attention storage; only
 the final projection tile is masked, and the result retains the exact logical length. It fails closed
 for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention APIs
@@ -123,7 +123,7 @@ The internal `piper_kernels.fusions.projected_qk` layer owns projection-independ
 RoPE. The existing Sage Q/K quantization layer owns signed-Hadamard grouped Q/K encoding shared
 with dense Piper, while `piper_kernels.attention.kernels.sparse_piper` owns only sparse Piper's
 tile-scaled V encoding. `piper_kernels.fusions.convrot_sage_qk` adapts ConvRot projection tiles
-to those boundaries and owns ConvRot validation; the explicit sparse fusion adds DSA summaries,
+to those boundaries and owns ConvRot validation; the explicit sparse fusion adds routing summaries,
 storage, and graph rewriting. Another projection backend can therefore compose the same pieces
 without depending on ConvRot internals or adding a backend protocol to attention.
 
@@ -241,21 +241,25 @@ from piper_kernels import SparsePiperAttention
 
 attention = SparsePiperAttention(
     (0.2, 0.4, 0.6),
-    routing="mean_pool",
+    routing="mean",
 )
 output = attention(
     query,
     key,
     value,
     sparse_key_blocks=1036,
+    block_lengths=block_lengths,  # optional valid-front padded K64 storage
 )
 ```
 
-Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout, and every logical input row
-participates in attention. The sequence length may be arbitrary; the operator pads only its internal
-quantized storage to K64. `sparse_key_blocks` is a runtime count of complete routeable K64 prefix
-tiles, so any partial final tile belongs to the dense suffix. Routing defaults to exact FP32 DSA;
-passing `routing="mean_pool"` instead scores FP32 Q64/K64 mean summaries. Both policies select the
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. Without `block_lengths`, every row
+participates in attention and the sequence length may be arbitrary; the operator pads only its
+internal quantized storage to K64. Supplying one contiguous device INT32 length in `[1, 64]` per
+physical K64 block instead selects valid-front padded storage. The output retains that physical
+layout so the caller can apply its existing gather; padded query rows are unspecified.
+`sparse_key_blocks` is a runtime count of complete routeable physical K64 prefix tiles, so any
+compact partial final tile belongs to the dense suffix. Routing defaults to FP32 min/max pooling;
+passing `routing="mean"` instead scores FP32 Q64/K64 mean summaries. Both policies select the
 same per-head block budget over the sparse prefix, after which every query attends to every
 remaining K/V row in the same softmax. This makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their
@@ -266,6 +270,38 @@ compiled graphs accept changed prefix lengths and their resulting route capaciti
 another graph or SM120 attention kernel. Routes remain call-local because both policies depend on
 the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler rewrites preserve
 the selected policy while producing its summaries directly from fused projections.
+
+Sparse Piper also exposes a policy-independent coarse-attention residual:
+
+```python
+from piper_kernels import mean_pool_coarse_residual
+
+output = mean_pool_coarse_residual(
+    fine_output,
+    query,
+    key,
+    value,
+    compression_gate,
+    sparse_key_blocks=sparse_key_blocks,
+    coarse_key_blocks=total_key_blocks,
+    coarse_scale=coarse_scale,
+    block_lengths=block_lengths,
+)
+```
+
+This convenience path mean-pools Q and K/V blocks, applies dense coarse attention, expands each
+result over its physical K64 query block, multiplies the caller-provided gate directly without an
+implicit activation, and adds it to fine attention. `coarse_key_blocks` may include blocks after the
+sparse-routing prefix, including a partial compact tail; omitting it preserves the original
+`sparse_key_blocks` scope. `block_lengths` is optional for compact storage and selects valid-front
+internally padded storage when supplied. The `minmax_pool_coarse_residual` convenience API
+derives extrema-based scores under the same layout contract, while
+`coarse_attention_residual` remains available for learned or already-materialized block scores.
+These composable implementations are the correctness and training contract; compatible compiled
+ConvRot INT8 graphs fuse the shared route scores, wider coarse attention, and gated residual.
+Bounded attention-to-output projection fusion currently remains limited to fine attention without
+`block_lengths`; padded or coarse graphs materialize the BF16 attention output before its output
+projection.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

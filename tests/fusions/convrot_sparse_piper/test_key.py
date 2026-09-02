@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _DSA_ROUTING,
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.convrot_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_sparse_piper._layout import padded_sequence_length
@@ -112,7 +112,7 @@ def test_fused_key_projection_matches_the_fp32_composed_contract(sequence_length
     actual_key, actual_scale, actual_max, actual_min = key_fusion._project_key_op(
         *operands.as_tuple(),
         options["norm_epsilon"],
-        _DSA_ROUTING,
+        _MINMAX_ROUTING,
     )
     expected = composed_key_projection(*operands.as_tuple(), **options)
     storage_length = padded_sequence_length(sequence_length)
@@ -140,7 +140,7 @@ def test_mean_pool_key_projection_emits_exact_valid_prefix_means(
     actual_key, actual_scale, actual_mean, actual_aux = key_fusion._project_key_op(
         *operands.as_tuple(),
         1e-5,
-        _MEAN_POOL_ROUTING,
+        _MEAN_ROUTING,
     )
     expected = composed_mean_pool_summary(
         *operands.as_tuple(),
@@ -168,7 +168,7 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
     key, key_scale, key_max, key_min = key_fusion._project_key_op(
         *operands.as_tuple(),
         1e-5,
-        _DSA_ROUTING,
+        _MINMAX_ROUTING,
     )
 
     assert key.shape == (2, 3, 192, 128)
@@ -179,18 +179,46 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
+def test_fused_key_projection_ignores_internal_padding(routing_mode: int) -> None:
+    operands = _random_operands(sequence_length=192)
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = torch.arange(192, device="cuda") % 64
+    valid_rows = valid_rows < block_lengths.repeat_interleave(64)
+    corrupted_qdata = operands.input_qdata.clone()
+    corrupted_scale = operands.input_scale.clone()
+    corrupted_qdata[:, ~valid_rows] = 127
+    corrupted_scale[:, ~valid_rows] = 100
+    arguments = (*operands.as_tuple()[2:], 1e-5, routing_mode, block_lengths)
+
+    expected = key_fusion._project_key_op(
+        operands.input_qdata,
+        operands.input_scale,
+        *arguments,
+    )
+    actual = key_fusion._project_key_op(
+        corrupted_qdata,
+        corrupted_scale,
+        *arguments,
+    )
+
+    assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_key_projection_custom_op_passes_opcheck() -> None:
     operands = _random_operands()
     result = torch.library.opcheck(
         key_fusion._project_key_op,
-        (*operands.as_tuple(), 1e-5, _DSA_ROUTING),
+        (*operands.as_tuple(), 1e-5, _MINMAX_ROUTING),
     )
 
     assert set(result.values()) == {"SUCCESS"}
 
     mean_result = torch.library.opcheck(
         key_fusion._project_key_op,
-        (*operands.as_tuple(), 1e-5, _MEAN_POOL_ROUTING),
+        (*operands.as_tuple(), 1e-5, _MEAN_ROUTING),
     )
     assert set(mean_result.values()) == {"SUCCESS"}
 
@@ -201,7 +229,7 @@ def test_key_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return key_fusion._project_key_op(*args, 1e-5, _DSA_ROUTING)
+        return key_fusion._project_key_op(*args, 1e-5, _MINMAX_ROUTING)
 
     expected = prepare(*operands.as_tuple())
     compiled = torch.compile(prepare, backend="eager", fullgraph=True)
@@ -220,7 +248,7 @@ def test_key_projection_fake_kernels_propagate_shapes() -> None:
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         1e-5,
-        _DSA_ROUTING,
+        _MINMAX_ROUTING,
     )
 
     assert key.shape == (2, 3, 128, 128)

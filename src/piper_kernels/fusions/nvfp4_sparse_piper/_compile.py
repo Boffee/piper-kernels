@@ -27,7 +27,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     dispatch,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
     is_valid_routing_mode,
 )
 from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
@@ -282,8 +282,8 @@ def _replace_projection(
             ),
             key_summary,
             (
-                input_value.new_empty((0,), dtype=torch.float32)
-                if sparse_routing_mode == _MEAN_POOL_ROUTING
+                input_value.new_empty((1, heads, 0, _HEAD_DIM), dtype=torch.float32)
+                if sparse_routing_mode == _MEAN_ROUTING
                 else input_value.new_empty(key_summary.shape, dtype=torch.float32)
             ),
         )

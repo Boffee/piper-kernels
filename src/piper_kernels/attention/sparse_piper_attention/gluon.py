@@ -86,6 +86,30 @@ def _fma_fp32(lhs, rhs, addend):
 
 
 @gluon.jit
+def _mul_fp32(lhs, rhs):
+    return gl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[lhs, rhs],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _add_fp32(lhs, rhs):
+    return gl.inline_asm_elementwise(
+        asm="add.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[lhs, rhs],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
 def _issue_tma(descriptor, offsets, shared, barrier):
     mbarrier.expect(barrier, descriptor.block_type.nbytes)
     tma.async_copy_global_to_shared(descriptor, offsets, barrier, shared)
@@ -277,9 +301,11 @@ def _sparse_piper_attention_kernel(
     key_scale_ptr,
     value_scale_multiplier_ptr,
     value_mean_ptr,
+    coarse_output_ptr,
+    compression_gate_ptr,
     block_lengths_ptr,
     routes_ptr,
-    keep_blocks_ptr,
+    head_keep_blocks_ptr,
     route_head_offsets_ptr,
     output_ptr,
     query_block_offset,
@@ -292,9 +318,16 @@ def _sparse_piper_attention_kernel(
     stride_ob,
     stride_oh,
     stride_on,
+    stride_cb,
+    stride_ch,
+    stride_cq,
+    stride_gb,
+    stride_gh,
+    stride_gn,
     heads,
     mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
+    apply_coarse_residual: gl.constexpr,
     kernel_warps: gl.constexpr,
 ):
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
@@ -344,7 +377,7 @@ def _sparse_piper_attention_kernel(
     mbarrier.init(key_barrier, count=1)
     mbarrier.init(value_barrier, count=1)
 
-    selected_sparse_tile_count = gl.load(keep_blocks_ptr + head)
+    selected_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
     sequence_tiles = storage_sequence_length // _GL_BLOCK_N
     dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
@@ -537,6 +570,33 @@ def _sparse_piper_attention_kernel(
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
     value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + offsets_d).to(gl.float32)
     output += value_mean[None, :]
+    if mask_ragged_tail:
+        valid_queries = start_m + offsets_m < logical_sequence_length
+    if apply_coarse_residual:
+        coarse = gl.load(
+            coarse_output_ptr
+            + batch * stride_cb
+            + head * stride_ch
+            + query_block * stride_cq
+            + offsets_d
+        ).to(gl.float32)
+        gate_offsets = (
+            batch * stride_gb
+            + head * stride_gh
+            + (start_m + offsets_m[:, None]) * stride_gn
+            + offsets_d[None, :]
+        )
+        if mask_ragged_tail:
+            gate = gl.load(
+                compression_gate_ptr + gate_offsets,
+                mask=valid_queries[:, None],
+                other=0.0,
+            ).to(gl.float32)
+        else:
+            gate = gl.load(compression_gate_ptr + gate_offsets).to(gl.float32)
+        fine_output = output.to(gl.bfloat16).to(gl.float32)
+        residual = _mul_fp32(gate, coarse[None, :])
+        output = _add_fp32(fine_output, residual)
     output_offsets = (
         batch * stride_ob
         + head * stride_oh
@@ -544,7 +604,6 @@ def _sparse_piper_attention_kernel(
         + offsets_d[None, :]
     )
     if mask_ragged_tail:
-        valid_queries = start_m + offsets_m < logical_sequence_length
         gl.store(
             output_ptr + output_offsets,
             output.to(gl.bfloat16),
@@ -607,6 +666,8 @@ def _launch_sparse_piper_attention(
     *,
     query_block_offset: int = 0,
     query_block_count: int | None = None,
+    coarse_output: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch one caller-owned query-block range over the complete K/V sequence."""
     batch, heads, _, head_dim = prepared.query.shape
@@ -657,6 +718,27 @@ def _launch_sparse_piper_attention(
         raise ValueError("paired Gluon routed Piper output must match the query block range")
     if prepared.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
+    has_coarse_residual = coarse_output is not None or compression_gate is not None
+    if (coarse_output is None) != (compression_gate is None):
+        raise ValueError("coarse output and compression gate must be supplied together")
+    gate_sequence_length = storage_sequence_length if has_block_lengths else logical_sequence_length
+    if has_coarse_residual:
+        assert coarse_output is not None
+        assert compression_gate is not None
+        if (
+            coarse_output.shape != (batch, heads, total_query_blocks, head_dim)
+            or coarse_output.dtype is not torch.float32
+            or coarse_output.device != prepared.query.device
+            or coarse_output.stride(-1) != 1
+        ):
+            raise ValueError("Gluon coarse output must be FP32 [batch,heads,Q64,D128]")
+        if (
+            compression_gate.shape != (batch, gate_sequence_length, heads, head_dim)
+            or compression_gate.dtype is not torch.bfloat16
+            or compression_gate.device != prepared.query.device
+            or compression_gate.stride(-1) != 1
+        ):
+            raise ValueError("Gluon compression gate must match token-major attention output")
     with torch.cuda.device(prepared.query.device):
         install_uint8_int8_dot_hook()
 
@@ -666,6 +748,18 @@ def _launch_sparse_piper_attention(
     stride_rb = routes.stride(0)
     stride_rq = routes.stride(1)
     stride_rr = routes.stride(2)
+    coarse_tensor = prepared.value_mean if coarse_output is None else coarse_output
+    gate_tensor = output if compression_gate is None else compression_gate
+    coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
+    gate_strides = (
+        (0, 0, 0)
+        if compression_gate is None
+        else (
+            compression_gate.stride(0),
+            compression_gate.stride(2),
+            compression_gate.stride(1),
+        )
+    )
     _sparse_piper_attention_kernel[(resolved_query_block_count, heads, batch)](
         query_desc,
         key_desc,
@@ -674,9 +768,15 @@ def _launch_sparse_piper_attention(
         prepared.key_scale,
         prepared.value_scale_multiplier,
         prepared.value_mean,
-        prepared.block_lengths if prepared.block_lengths is not None else prepared.keep_blocks,
+        coarse_tensor,
+        gate_tensor,
+        (
+            prepared.block_lengths
+            if prepared.block_lengths is not None
+            else prepared.head_keep_blocks
+        ),
         routes,
-        prepared.keep_blocks,
+        prepared.head_keep_blocks,
         route_head_offsets,
         output,
         query_block_offset,
@@ -689,9 +789,12 @@ def _launch_sparse_piper_attention(
         output.stride(0),
         output.stride(1),
         output.stride(2),
+        *coarse_strides,
+        *gate_strides,
         heads,
         has_block_lengths,
         not has_block_lengths and logical_sequence_length != storage_sequence_length,
+        has_coarse_residual,
         4,
         num_warps=4,
         num_stages=1,
