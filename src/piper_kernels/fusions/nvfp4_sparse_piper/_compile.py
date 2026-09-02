@@ -26,7 +26,10 @@ from piper_kernels.attention.sparse_piper_attention import (
     _quantized_dispatch,
     dispatch,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import _DSA_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_POOL_ROUTING,
+    is_valid_routing_mode,
+)
 from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _output as sparse_piper_output
@@ -113,7 +116,7 @@ def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]
 
 
 def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
-    if match.kwargs["sparse_routing_mode"] != _DSA_ROUTING:
+    if not is_valid_routing_mode(match.kwargs["sparse_routing_mode"]):
         return False
     prefixes = ("sparse_q", "sparse_k", "sparse_v")
     projections = tuple(
@@ -264,21 +267,24 @@ def _replace_projection(
                 sparse_q_norm_epsilon,
                 sparse_softmax_scale,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
+                sparse_routing_mode,
             ),
             query_values,
+        )
+        key_summary = input_value.new_empty(
+            (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
+            dtype=torch.float32,
         )
         key_values = (
             input_value.new_empty((1, heads, storage_sequence_length, _HEAD_DIM), dtype=torch.int8),
             input_value.new_empty(
                 (1, heads, storage_sequence_length // _TILE_ROWS), dtype=torch.float32
             ),
-            input_value.new_empty(
-                (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
-                dtype=torch.float32,
-            ),
-            input_value.new_empty(
-                (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
-                dtype=torch.float32,
+            key_summary,
+            (
+                input_value.new_empty((0,), dtype=torch.float32)
+                if sparse_routing_mode == _MEAN_POOL_ROUTING
+                else input_value.new_empty(key_summary.shape, dtype=torch.float32)
             ),
         )
         key_nodes = linear_compile_fx.emit_tuple_result(
@@ -291,6 +297,7 @@ def _replace_projection(
                 sin,
                 sparse_k_norm_epsilon,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
+                sparse_routing_mode,
             ),
             key_values,
         )

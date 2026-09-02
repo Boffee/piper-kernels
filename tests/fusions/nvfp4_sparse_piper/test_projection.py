@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from piper_kernels.attention.sparse_piper_attention._routes import _MEAN_POOL_ROUTING
 from piper_kernels.fusions.nvfp4_sparse_piper import key, query, value
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
@@ -91,6 +92,73 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
     exact_mean = materialized_value.float().mean(dim=0)[None]
     smallest_tile_step = (expected_value[1] / 255.0).amin(dim=2)
     assert bool(((value_mean - exact_mean).abs() <= smallest_tile_step * 0.05).all())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
+    operands = make_operands()
+    q_projection = operands.projection(0)
+    k_projection = operands.projection(1)
+    transformed_query = materialize_qk(
+        q_projection,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        norm_epsilon=1e-5,
+    )
+    transformed_key = materialize_qk(
+        k_projection,
+        operands.key_norm,
+        operands.cos,
+        operands.sin,
+        norm_epsilon=1e-5,
+    )
+
+    actual_query = query.project_query(
+        *q_projection.as_tuple(),
+        None,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        1e-5,
+        128**-0.5,
+        128,
+        _MEAN_POOL_ROUTING,
+    )
+    actual_key = key.project_key(
+        *k_projection.as_tuple(),
+        None,
+        operands.key_norm,
+        operands.cos,
+        operands.sin,
+        1e-5,
+        128,
+        _MEAN_POOL_ROUTING,
+    )
+
+    def block_means(sequence: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            [
+                sequence[:, :, start : start + 64].mean(dim=2)
+                for start in range(0, sequence.shape[2], 64)
+            ],
+            dim=2,
+        )
+
+    torch.testing.assert_close(
+        actual_query[2],
+        block_means(transformed_query),
+        atol=0.125,
+        rtol=0.01,
+    )
+    torch.testing.assert_close(
+        actual_key[2],
+        block_means(transformed_key),
+        atol=0.125,
+        rtol=0.01,
+    )
+    assert actual_key[3].numel() == 0
 
 
 @pytest.mark.gpu

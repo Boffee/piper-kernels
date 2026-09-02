@@ -9,6 +9,11 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     TILE_ROWS,
     padded_sequence_length,
 )
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _DSA_ROUTING,
+    _MEAN_POOL_ROUTING,
+    validate_routing_mode,
+)
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
     PreparedProjection,
@@ -32,7 +37,9 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     sin: torch.Tensor,
     norm_epsilon: float,
     chunk_rows: int,
+    routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_routing_mode(routing_mode)
     sequence_length, heads = validate_projection(
         input_qdata,
         input_scale,
@@ -66,8 +73,13 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         dtype=torch.float32,
     )
     summary_shape = (1, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
-    key_max = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
-    key_min = torch.empty_like(key_max)
+    key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
+    mean_pool_summary = routing_mode == _MEAN_POOL_ROUTING
+    key_aux = (
+        torch.empty(0, device=input_qdata.device, dtype=torch.float32)
+        if mean_pool_summary
+        else torch.empty_like(key_summary)
+    )
     projection = PreparedProjection(
         input_qdata,
         input_scale,
@@ -86,14 +98,15 @@ def _launch_key(  # noqa: PLR0913, PLR0917
             sin,
             key,
             key_scale,
-            key_max,
-            key_min,
+            key_summary,
+            key_aux,
             start,
             sequence_length,
             norm_epsilon,
+            mean_pool_summary,
         )
 
-    outputs = (key, key_scale, key_max, key_min)
+    outputs = (key, key_scale, key_summary, key_aux)
     consumer_tensors = [input_per_tensor_scale, *operands]
     consumer_tensors.extend(
         operand for operand in (weight_per_tensor_scale, bias) if operand is not None
@@ -116,6 +129,7 @@ def project_key(  # noqa: PLR0913, PLR0917
     sin: torch.Tensor,
     norm_epsilon: float,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    routing_mode: int = _DSA_ROUTING,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key(
         input_qdata,
@@ -130,6 +144,7 @@ def project_key(  # noqa: PLR0913, PLR0917
         sin,
         norm_epsilon,
         chunk_rows,
+        routing_mode,
     )
 
 
@@ -147,6 +162,7 @@ def _project_key_fake(
     _sin: torch.Tensor,
     _norm_epsilon: float,
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    routing_mode: int = _DSA_ROUTING,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
@@ -160,7 +176,12 @@ def _project_key_fake(
         (1, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
         dtype=torch.float32,
     )
-    return key, key_scale, summary, summary.new_empty(summary.shape)
+    key_aux = (
+        summary.new_empty(0)
+        if routing_mode == _MEAN_POOL_ROUTING
+        else summary.new_empty(summary.shape)
+    )
+    return key, key_scale, summary, key_aux
 
 
 __all__ = ["project_key"]
