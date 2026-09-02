@@ -113,6 +113,7 @@ def _piper_probability_pair(
     query_scale,
     key_scale_ptr,
     value_scale_multiplier_ptr,
+    block_lengths_ptr,
     denominator,
     running_max,
     batch_head,
@@ -124,6 +125,7 @@ def _piper_probability_pair(
     mma_layout: gl.constexpr,
     key_layout: gl.constexpr,
     probability_layout: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
     mask_duplicate: gl.constexpr,
 ):
@@ -144,7 +146,18 @@ def _piper_probability_pair(
     key_scale_1 = gl.load(key_scale_ptr + batch_head * sequence_tiles + start_n_1 // _GL_BLOCK_N)
     scores_0 = integer_scores_0.to(gl.float32) * (query_scale[:, None] * key_scale_0)
     scores_1 = integer_scores_1.to(gl.float32) * (query_scale[:, None] * key_scale_1)
-    if mask_ragged_tail:
+    if mask_block_lengths:
+        column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
+        offsets_n = gl.arange(0, _GL_BLOCK_N, column_layout)
+        block_length_0 = gl.load(block_lengths_ptr + start_n_0 // _GL_BLOCK_N)
+        block_length_1 = gl.load(block_lengths_ptr + start_n_1 // _GL_BLOCK_N)
+        valid_keys_0 = offsets_n < block_length_0
+        valid_keys_1 = offsets_n < block_length_1
+        if mask_duplicate:
+            valid_keys_1 &= has_second
+        scores_0 = gl.where(valid_keys_0[None, :], scores_0, -float("inf"))
+        scores_1 = gl.where(valid_keys_1[None, :], scores_1, -float("inf"))
+    elif mask_ragged_tail:
         column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
         offsets_n = gl.arange(0, _GL_BLOCK_N, column_layout)
         valid_keys_0 = start_n_0 + offsets_n < logical_sequence_length
@@ -264,6 +277,7 @@ def _sparse_piper_attention_kernel(
     key_scale_ptr,
     value_scale_multiplier_ptr,
     value_mean_ptr,
+    block_lengths_ptr,
     routes_ptr,
     keep_blocks_ptr,
     route_head_offsets_ptr,
@@ -279,6 +293,7 @@ def _sparse_piper_attention_kernel(
     stride_oh,
     stride_on,
     heads,
+    mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
     kernel_warps: gl.constexpr,
 ):
@@ -404,6 +419,7 @@ def _sparse_piper_attention_kernel(
             query_scale,
             key_scale_ptr,
             value_scale_multiplier_ptr,
+            block_lengths_ptr,
             denominator,
             running_max,
             batch_head,
@@ -415,6 +431,7 @@ def _sparse_piper_attention_kernel(
             mma_layout,
             key_layout,
             probability_layout,
+            mask_block_lengths,
             mask_ragged_tail,
             False,
         )
@@ -487,6 +504,7 @@ def _sparse_piper_attention_kernel(
         query_scale,
         key_scale_ptr,
         value_scale_multiplier_ptr,
+        block_lengths_ptr,
         denominator,
         running_max,
         batch_head,
@@ -498,6 +516,7 @@ def _sparse_piper_attention_kernel(
         mma_layout,
         key_layout,
         probability_layout,
+        mask_block_lengths,
         mask_ragged_tail,
         True,
     )
@@ -593,11 +612,15 @@ def _launch_sparse_piper_attention(
     batch, heads, _, head_dim = prepared.query.shape
     logical_sequence_length = prepared.logical_sequence_length
     storage_sequence_length = prepared.query.shape[2]
+    has_block_lengths = prepared.block_lengths is not None
     if (
         head_dim != _HEAD_DIM
         or storage_sequence_length % _BLOCK_M
-        or (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
-        != storage_sequence_length
+        or (
+            not has_block_lengths
+            and (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
+            != storage_sequence_length
+        )
     ):
         raise ValueError("paired Gluon routed Piper requires padded M64/D128 query storage")
     total_query_blocks = storage_sequence_length // _BLOCK_M
@@ -617,9 +640,13 @@ def _launch_sparse_piper_attention(
         or query_block_offset + resolved_query_block_count > total_query_blocks
     ):
         raise ValueError("sparse Piper query block range must fit the logical sequence")
-    output_sequence_length = min(
-        resolved_query_block_count * _BLOCK_M,
-        logical_sequence_length - query_block_offset * _BLOCK_M,
+    output_sequence_length = (
+        resolved_query_block_count * _BLOCK_M
+        if has_block_lengths
+        else min(
+            resolved_query_block_count * _BLOCK_M,
+            logical_sequence_length - query_block_offset * _BLOCK_M,
+        )
     )
     if (
         output.shape != (batch, heads, output_sequence_length, head_dim)
@@ -647,6 +674,7 @@ def _launch_sparse_piper_attention(
         prepared.key_scale,
         prepared.value_scale_multiplier,
         prepared.value_mean,
+        prepared.block_lengths if prepared.block_lengths is not None else prepared.keep_blocks,
         routes,
         prepared.keep_blocks,
         route_head_offsets,
@@ -662,7 +690,8 @@ def _launch_sparse_piper_attention(
         output.stride(1),
         output.stride(2),
         heads,
-        logical_sequence_length != storage_sequence_length,
+        has_block_lengths,
+        not has_block_lengths and logical_sequence_length != storage_sequence_length,
         4,
         num_warps=4,
         num_stages=1,

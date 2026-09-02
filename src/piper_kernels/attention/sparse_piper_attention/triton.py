@@ -100,6 +100,7 @@ class _PreparedSparsePiperAttention:
     routes: torch.Tensor
     route_head_offsets: torch.Tensor
     keep_blocks: torch.Tensor
+    block_lengths: torch.Tensor | None
     sparse_key_blocks: int
     logical_sequence_length: int
 
@@ -184,6 +185,7 @@ def _prepare_sparse_piper_attention(
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
+        block_lengths=None,
         sparse_key_blocks=sparse_key_blocks,
         logical_sequence_length=logical_sequence_length,
     )
@@ -204,8 +206,16 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     sparse_key_blocks: int,
     routes_per_query: int,
     logical_sequence_length: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> _PreparedSparsePiperAttention:
-    """Construct sparse Piper launch state from already-quantized operands."""
+    """Construct sparse Piper launch state from already-quantized operands.
+
+    ``block_lengths`` opts into internally padded K64 storage. Each entry gives
+    the valid prefix length in ``[1, 64]`` of one physical block, and the entries
+    must sum to ``logical_sequence_length``. Output then retains the full storage
+    sequence for a later layout gather. Without it, the established compact
+    logical sequence plus one possible ragged tail remains unchanged.
+    """
     if query.ndim != 4 or query.dtype is not torch.int8:
         raise ValueError(
             "quantized sparse Piper Q must be [batch,heads,storage_sequence,D128] INT8"
@@ -217,13 +227,16 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         or storage_sequence_length % _BLOCK_M
     ):
         raise ValueError("quantized sparse Piper requires K64-aligned D128 query storage")
-    if (
-        logical_sequence_length < _BLOCK_M
-        or logical_sequence_length > storage_sequence_length
-        or (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
-        != storage_sequence_length
-    ):
-        raise ValueError("quantized sparse Piper storage must be the padded logical sequence")
+    if block_lengths is None:
+        if (
+            logical_sequence_length < _BLOCK_M
+            or logical_sequence_length > storage_sequence_length
+            or (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
+            != storage_sequence_length
+        ):
+            raise ValueError("quantized sparse Piper storage must be the padded logical sequence")
+    elif not 1 <= logical_sequence_length <= storage_sequence_length:
+        raise ValueError("quantized sparse Piper logical length must fit block-length storage")
     if key.shape != query.shape or key.dtype is not torch.int8:
         raise ValueError("quantized sparse Piper K must match Q and use INT8")
     if (
@@ -242,17 +255,38 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         raise ValueError("quantized sparse Piper V scales must contain one value per K64")
     if value_mean.shape != (batch, heads, head_dim):
         raise ValueError("quantized sparse Piper V mean must be [batch,heads,D128]")
+    # Layout construction owns the value-range and sum invariants documented
+    # above. Inspecting CUDA values here would add a validation kernel or a host
+    # synchronization to every launch; only launch-critical tensor properties
+    # are checked on this hot path.
+    if block_lengths is not None and (
+        block_lengths.shape != (tile_count,) or block_lengths.dtype is not torch.int32
+    ):
+        raise ValueError("quantized sparse Piper block lengths must be one INT32 value per K64")
     scales = query_scale, key_scale, value_scale_multiplier, value_mean
     if any(scale.dtype is not torch.float32 for scale in scales):
         raise ValueError("quantized sparse Piper scales and V mean must use FP32")
-    tensors = query, key, value, *scales, routes, keep_blocks, route_head_offsets
+    tensors = (
+        query,
+        key,
+        value,
+        *scales,
+        routes,
+        keep_blocks,
+        route_head_offsets,
+        *((block_lengths,) if block_lengths is not None else ()),
+    )
     if any(tensor.device != query.device for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must share a device")
     if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
     if not 1 <= sparse_key_blocks <= tile_count:
         raise ValueError("quantized sparse Piper prefix must fit the K64 tile count")
-    query_block_count = (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M
+    query_block_count = (
+        tile_count
+        if block_lengths is not None
+        else (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M
+    )
     if routes.shape != (batch, query_block_count, routes_per_query):
         raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
     if routes.dtype is not torch.uint16:
@@ -273,6 +307,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         routes=routes,
         route_head_offsets=route_head_offsets,
         keep_blocks=keep_blocks,
+        block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         logical_sequence_length=logical_sequence_length,
     )

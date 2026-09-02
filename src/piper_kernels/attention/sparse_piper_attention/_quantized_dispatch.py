@@ -40,6 +40,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
     logical_sequence_length: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> _PreparedSparsePiperAttention:
     """Build the validated SM120 launch state for quantized sparse Piper."""
     if _prepare_sm120_quantized_attention is None:
@@ -69,6 +70,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         sparse_key_blocks=sparse_key_blocks,
         routes_per_query=layout.routes_per_query,
         logical_sequence_length=logical_sequence_length,
+        block_lengths=block_lengths,
     )
 
 
@@ -108,10 +110,23 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
     logical_sequence_length: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Run quantized sparse Piper with compact or internally padded K64 storage.
+
+    ``block_lengths`` is trusted layout metadata with one INT32 value per
+    physical K64 block. Each value must be in ``[1, 64]``, valid tokens must
+    occupy the front of the block, and the values must sum to
+    ``logical_sequence_length``. Supplying it returns the full padded query
+    storage; outputs for padded query rows are unspecified and must be removed
+    by the caller's layout gather.
+    """
     batch, heads, _, head_dim = query.shape
+    output_sequence_length = (
+        query.shape[2] if block_lengths is not None else logical_sequence_length
+    )
     output = torch.empty(
-        (batch, logical_sequence_length, heads, head_dim),
+        (batch, output_sequence_length, heads, head_dim),
         device=query.device,
         dtype=torch.bfloat16,
     )
@@ -129,6 +144,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         head_keep_ratio_units,
         sparse_key_blocks,
         logical_sequence_length,
+        block_lengths,
     )
     _launch_quantized_sparse_piper_attention(prepared, output.transpose(1, 2))
     return output
@@ -149,8 +165,12 @@ def _sparse_piper_attention_from_quantized_op_fake(
     _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
     logical_sequence_length: int,
+    _block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    output_sequence_length = (
+        query.shape[2] if _block_lengths is not None else logical_sequence_length
+    )
     return query.new_empty(
-        (query.shape[0], logical_sequence_length, query.shape[1], query.shape[3]),
+        (query.shape[0], output_sequence_length, query.shape[1], query.shape[3]),
         dtype=torch.bfloat16,
     )
