@@ -17,14 +17,8 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
-from ._routes import (
-    _MEAN_POOL_ROUTING,
-    _ROUTING_MODE_BY_NAME,
-    _ROUTING_NAME_BY_MODE,
-    validate_routing_mode,
-)
-from .dsa import packed_dsa_routes_from_sequences
-from .mean_pool import packed_mean_pool_routes_from_sequences
+from ._routes import _ROUTING_MODE_BY_NAME, _ROUTING_NAME_BY_MODE, validate_routing_mode
+from ._routing import packed_routes_from_sequences
 from .reference import reference_sparse_piper_attention
 
 try:
@@ -52,14 +46,14 @@ class SparsePiperAttention(torch.nn.Module):
         self,
         head_keep_ratios: Sequence[float] | torch.Tensor,
         *,
-        routing: str = "dsa",
+        routing: str = "minmax",
     ) -> None:
         super().__init__()
         self._head_keep_ratio_units = _normalize_head_keep_ratios(head_keep_ratios)
         try:
             self._routing_mode = _ROUTING_MODE_BY_NAME[routing]
         except (KeyError, TypeError) as exc:
-            raise ValueError("sparse Piper routing must be 'dsa' or 'mean_pool'") from exc
+            raise ValueError("sparse Piper routing must be 'minmax' or 'mean'") from exc
 
     @property
     def head_keep_ratios(self) -> tuple[float, ...]:
@@ -202,20 +196,13 @@ def _run_sparse_piper_attention(
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
     validate_routing_mode(routing_mode)
-    if routing_mode == _MEAN_POOL_ROUTING:
-        routes = packed_mean_pool_routes_from_sequences(
-            query_head_major,
-            sparse_key,
-            layout,
-            block_lengths,
-        )
-    else:
-        routes = packed_dsa_routes_from_sequences(
-            query_head_major,
-            sparse_key,
-            layout,
-            block_lengths,
-        )
+    routes = packed_routes_from_sequences(
+        query_head_major,
+        sparse_key,
+        layout,
+        routing_mode,
+        block_lengths,
+    )
 
     if not target_is_sm120:
         return reference_sparse_piper_attention(

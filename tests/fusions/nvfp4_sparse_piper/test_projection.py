@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._routes import _MEAN_POOL_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routes import _MEAN_ROUTING
 from piper_kernels.fusions.nvfp4_sparse_piper import key, query, value
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
@@ -132,7 +132,7 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
         1e-5,
         128**-0.5,
         128,
-        _MEAN_POOL_ROUTING,
+        _MEAN_ROUTING,
     )
     actual_key = key.project_key(
         *k_projection.as_tuple(),
@@ -142,7 +142,7 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
         operands.sin,
         1e-5,
         128,
-        _MEAN_POOL_ROUTING,
+        _MEAN_ROUTING,
     )
 
     def block_means(sequence: torch.Tensor) -> torch.Tensor:

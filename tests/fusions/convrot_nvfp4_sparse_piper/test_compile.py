@@ -14,8 +14,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _DSA_ROUTING,
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
     convrot_nvfp4_sparse_piper_compile_options,
@@ -60,7 +60,7 @@ def _convrot_graph(
     *,
     dynamic: bool,
     output_dynamic: bool | None = None,
-    routing_mode: int = _DSA_ROUTING,
+    routing_mode: int = _MINMAX_ROUTING,
 ) -> torch.fx.Graph:
     graph = _semantic_attention_graph(
         dynamic=dynamic,
@@ -119,7 +119,7 @@ def test_compile_options_compose_with_convrot_nvfp4_ffn(sparse_first: bool) -> N
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
-@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
+@pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 def test_convrot_preparation_reuses_nvfp4_sparse_projection_kernels(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
@@ -193,7 +193,7 @@ def _convert_weight(weight: torch.Tensor) -> ConvRotNVFP4Tensor:
 
 
 class _ConvRotSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
-    def __init__(self, *, dynamic: bool, routing: str = "dsa") -> None:
+    def __init__(self, *, dynamic: bool, routing: str = "minmax") -> None:
         super().__init__(dynamic=dynamic, routing=routing)
         for projection in (self.query, self.key, self.value, self.output):
             projection.weight = torch.nn.Parameter(
@@ -309,7 +309,7 @@ class _TargetCapturePass(CustomInferenceAwareGraphPass):
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("dynamic", "routing"),
-    [(False, "dsa"), (True, "dsa"), (False, "mean_pool")],
+    [(False, "minmax"), (True, "minmax"), (False, "mean")],
 )
 def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     dynamic: bool,

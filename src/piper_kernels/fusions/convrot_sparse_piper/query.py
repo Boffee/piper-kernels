@@ -18,7 +18,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
     validate_routing_mode,
 )
 from piper_kernels.fusions.convrot_sage_qk.triton import (
@@ -241,7 +241,7 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
             rotary_dim=rotary_dim,
             norm_epsilon=norm_epsilon,
             softmax_scale=softmax_scale,
-            mean_pool_summary=routing_mode == _MEAN_POOL_ROUTING,
+            mean_pool_summary=routing_mode == _MEAN_ROUTING,
             mask_block_lengths=has_block_lengths,
             mask_ragged_tail=mask_ragged_tail,
             aligned_projection=(

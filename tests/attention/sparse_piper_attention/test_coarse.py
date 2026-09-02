@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-import piper_kernels.attention.sparse_piper_attention.mean_pool as mean_pool_module
+import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
     apply_coarse_attention_residual,
     coarse_attention,
@@ -11,12 +11,13 @@ from piper_kernels import (
     mean_pool_block_values,
     mean_pool_coarse_residual,
 )
-from piper_kernels.attention.sparse_piper_attention.dsa import (
-    _dsa_scores,
-    _sequence_block_summaries,
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
 )
-from piper_kernels.attention.sparse_piper_attention.mean_pool import (
-    _sequence_block_means,
+from piper_kernels.attention.sparse_piper_attention._routing import routing_scores
+from piper_kernels.attention.sparse_piper_attention._summaries import (
+    sequence_block_summaries,
 )
 
 
@@ -84,7 +85,7 @@ def test_coarse_attention_uses_caller_supplied_block_logits() -> None:
 def test_mean_pool_coarse_residual_matches_explicit_sparse_prefix_composition(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(mean_pool_module, "_QUERY_CHUNK_BLOCKS", 2)
+    monkeypatch.setattr(routing_module, "_QUERY_CHUNK_BLOCKS", 2)
     generator = torch.Generator().manual_seed(918)
     shape = (1, 129, 2, 8)
     query = torch.randn(shape, generator=generator)
@@ -323,23 +324,35 @@ def test_residual_is_differentiable_independently_of_the_score_policy() -> None:
         assert bool(torch.isfinite(tensor.grad).all())
 
 
-def test_mean_pool_and_dsa_scores_feed_the_same_coarse_attention_contract() -> None:
+def test_pooling_policies_feed_the_same_coarse_attention_contract() -> None:
     generator = torch.Generator().manual_seed(804)
     query = torch.randn((1, 2, 2 * 64, 8), generator=generator)
     key = torch.randn((1, 2, 3 * 64, 8), generator=generator)
     value = torch.randn((1, 3 * 64, 2, 6), generator=generator)
-    query_mean = _sequence_block_means(query)
-    key_mean = _sequence_block_means(key)
-    query_dsa, key_max, key_min = _sequence_block_summaries(query, key)
-    mean_scores = query_mean @ key_mean.mT
-    dsa_scores = _dsa_scores(query_dsa, key_max, key_min)
+    query_mean, key_mean, mean_aux = sequence_block_summaries(
+        query,
+        key,
+        _MEAN_ROUTING,
+    )
+    query_minmax, key_max, key_min = sequence_block_summaries(
+        query,
+        key,
+        _MINMAX_ROUTING,
+    )
+    mean_scores = routing_scores(query_mean, key_mean, mean_aux, _MEAN_ROUTING)
+    minmax_scores = routing_scores(
+        query_minmax,
+        key_max,
+        key_min,
+        _MINMAX_ROUTING,
+    )
     pooled_value = mean_pool_block_values(value)
 
     mean_output = coarse_attention(mean_scores, pooled_value)
-    dsa_output = coarse_attention(dsa_scores, pooled_value)
+    minmax_output = coarse_attention(minmax_scores, pooled_value)
 
-    assert mean_output.shape == dsa_output.shape == (1, 2, 2, 6)
-    assert not torch.equal(mean_output, dsa_output)
+    assert mean_output.shape == minmax_output.shape == (1, 2, 2, 6)
+    assert not torch.equal(mean_output, minmax_output)
 
 
 def test_compiled_residual_accepts_changed_block_lengths_without_another_graph() -> None:

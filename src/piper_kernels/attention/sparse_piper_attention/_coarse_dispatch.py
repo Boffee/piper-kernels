@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import torch
 
-from ._routes import _DSA_ROUTING, _MEAN_POOL_ROUTING
+from ._routes import _ROUTING_NAME_BY_MODE, validate_routing_mode
+from ._routing import coarse_residual_impl
 from .coarse import validate_coarse_residual_inputs
-from .dsa import _dsa_coarse_residual_impl
-from .mean_pool import _mean_pool_coarse_residual_impl
 
 
 def _routing_label(routing_mode: int) -> str:
-    if routing_mode == _MEAN_POOL_ROUTING:
-        return "mean-pool"
-    if routing_mode == _DSA_ROUTING:
-        return "DSA"
-    raise ValueError(f"unsupported sparse Piper routing mode {routing_mode}")
+    validate_routing_mode(routing_mode)
+    return _ROUTING_NAME_BY_MODE[routing_mode]
 
 
 @torch.library.custom_op(
@@ -35,13 +31,7 @@ def _sparse_piper_coarse_residual_op(
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Preserve a Q/K/V-derived coarse residual as one semantic operation."""
-    _routing_label(routing_mode)
-    implementation = (
-        _mean_pool_coarse_residual_impl
-        if routing_mode == _MEAN_POOL_ROUTING
-        else _dsa_coarse_residual_impl
-    )
-    return implementation(
+    return coarse_residual_impl(
         fine_output,
         query,
         key,
@@ -50,6 +40,7 @@ def _sparse_piper_coarse_residual_op(
         sparse_key_blocks=sparse_key_blocks,
         coarse_key_blocks=coarse_key_blocks,
         coarse_scale=coarse_scale,
+        routing_mode=routing_mode,
         block_lengths=block_lengths,
     )
 

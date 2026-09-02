@@ -6,8 +6,11 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
-from piper_kernels.attention.sparse_piper_attention.dsa import packed_dsa_routes_from_sequences
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MINMAX_ROUTING,
+    PackedRoutes,
+)
+from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_exact_sparse_attention,
     reference_sparse_piper_attention,
@@ -32,7 +35,12 @@ def _inputs() -> tuple[
     )
     query_sequence = query.transpose(1, 2)
     sparse_key = key[:, :128].transpose(1, 2)
-    routes = packed_dsa_routes_from_sequences(query_sequence, sparse_key, layout)
+    routes = packed_routes_from_sequences(
+        query_sequence,
+        sparse_key,
+        layout,
+        _MINMAX_ROUTING,
+    )
     return query, key, value, routes
 
 

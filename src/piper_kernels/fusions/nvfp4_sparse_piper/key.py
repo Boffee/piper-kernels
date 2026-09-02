@@ -10,8 +10,8 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     padded_sequence_length,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _DSA_ROUTING,
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
     validate_routing_mode,
 )
 from piper_kernels.linear.nvfp4._chunking import (
@@ -74,9 +74,13 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     )
     summary_shape = (1, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
     key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
-    mean_pool_summary = routing_mode == _MEAN_POOL_ROUTING
+    mean_pool_summary = routing_mode == _MEAN_ROUTING
     key_aux = (
-        torch.empty(0, device=input_qdata.device, dtype=torch.float32)
+        torch.empty(
+            (1, heads, 0, HEAD_DIM),
+            device=input_qdata.device,
+            dtype=torch.float32,
+        )
         if mean_pool_summary
         else torch.empty_like(key_summary)
     )
@@ -129,7 +133,7 @@ def project_key(  # noqa: PLR0913, PLR0917
     sin: torch.Tensor,
     norm_epsilon: float,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    routing_mode: int = _DSA_ROUTING,
+    routing_mode: int = _MINMAX_ROUTING,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key(
         input_qdata,
@@ -162,7 +166,7 @@ def _project_key_fake(
     _sin: torch.Tensor,
     _norm_epsilon: float,
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    routing_mode: int = _DSA_ROUTING,
+    routing_mode: int = _MINMAX_ROUTING,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
@@ -177,8 +181,8 @@ def _project_key_fake(
         dtype=torch.float32,
     )
     key_aux = (
-        summary.new_empty(0)
-        if routing_mode == _MEAN_POOL_ROUTING
+        summary.new_empty((1, heads, 0, HEAD_DIM))
+        if routing_mode == _MEAN_ROUTING
         else summary.new_empty(summary.shape)
     )
     return key, key_scale, summary, key_aux

@@ -18,9 +18,12 @@ except ModuleNotFoundError as exc:
         raise
     _sm120_select_routes = None
 
-_DSA_ROUTING = 0
-_MEAN_POOL_ROUTING = 1
-_ROUTING_MODE_BY_NAME = {"dsa": _DSA_ROUTING, "mean_pool": _MEAN_POOL_ROUTING}
+_MINMAX_ROUTING = 0
+_MEAN_ROUTING = 1
+_ROUTING_MODE_BY_NAME = {
+    "minmax": _MINMAX_ROUTING,
+    "mean": _MEAN_ROUTING,
+}
 _ROUTING_NAME_BY_MODE = {mode: name for name, mode in _ROUTING_MODE_BY_NAME.items()}
 
 
@@ -233,7 +236,7 @@ def _supports_sm120_selector(device: torch.device) -> bool:
 def validate_routing_mode(routing_mode: int) -> None:
     """Reject routing modes outside the internal static operator contract."""
     if not is_valid_routing_mode(routing_mode):
-        raise ValueError("sparse Piper routing mode must be DSA or mean_pool")
+        raise ValueError("sparse Piper routing mode must be minmax or mean")
 
 
 def is_valid_routing_mode(routing_mode: int) -> bool:
@@ -242,8 +245,8 @@ def is_valid_routing_mode(routing_mode: int) -> bool:
 
 
 __all__ = [
-    "_DSA_ROUTING",
-    "_MEAN_POOL_ROUTING",
+    "_MEAN_ROUTING",
+    "_MINMAX_ROUTING",
     "_ROUTING_MODE_BY_NAME",
     "_ROUTING_NAME_BY_MODE",
     "PackedRouteAndCoarseBuilder",

@@ -1,5 +1,8 @@
 """Sparse-Piper-specific operand preparation primitives."""
 
+# Triton device-function return types are not represented in its Python stubs.
+# pyright: reportGeneralTypeIssues=false
+
 from __future__ import annotations
 
 import triton
@@ -12,6 +15,27 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 _P_UINT8_RANGE = tl.constexpr(255.0)
 _V_INT8_RANGE = tl.constexpr(127.0)
 _SCALE_EPSILON = tl.constexpr(1e-7)
+
+
+@triton.jit
+def summarize_block_tiles(
+    values,
+    valid_rows,
+    mean_pool_summary: tl.constexpr,
+    combine_extrema: tl.constexpr,
+):
+    """Reduce ``[heads,blocks,rows,features]`` through one routing policy."""
+    valid = valid_rows[None, :, :, None]
+    if mean_pool_summary:
+        valid_count = tl.sum(valid_rows.to(tl.int32), axis=1)
+        primary = tl.sum(tl.where(valid, values, 0.0), axis=2) / valid_count[None, :, None]
+        auxiliary = primary
+    else:
+        maximum = tl.max(tl.where(valid, values, -float("inf")), axis=2)
+        minimum = tl.min(tl.where(valid, values, float("inf")), axis=2)
+        primary = maximum + minimum if combine_extrema else maximum
+        auxiliary = minimum
+    return primary, auxiliary
 
 
 @triton.jit
@@ -80,20 +104,17 @@ def store_query_tile(
         valid_rows = sequence_offsets - query_block * block_m < block_length
     if mask_block_lengths or mask_ragged_tail:
         values = tl.where(valid_rows[:, None, None], values, 0.0)
-    if mean_pool_summary:
-        if mask_block_lengths:
-            valid_count = block_length
-        else:
-            valid_count = (
-                logical_sequence_length - query_block * block_m if mask_ragged_tail else block_m
-            )
-        summary = tl.sum(values, axis=0) / valid_count
-    elif mask_block_lengths or mask_ragged_tail:
-        summary = tl.max(
-            tl.where(valid_rows[:, None, None], values, -float("inf")), axis=0
-        ) + tl.min(tl.where(valid_rows[:, None, None], values, float("inf")), axis=0)
-    else:
-        summary = tl.max(values, axis=0) + tl.min(values, axis=0)
+    summary_values = tl.reshape(
+        tl.permute(values, (1, 0, 2)),
+        (heads_per_program, 1, block_m, head_dim),
+    )
+    summary, _summary_aux = summarize_block_tiles(
+        summary_values,
+        tl.reshape(valid_rows, (1, block_m)),
+        mean_pool_summary,
+        True,
+    )
+    summary = tl.reshape(summary, (heads_per_program, head_dim))
     summary_offsets = (
         (batch * heads + head_offsets[:, None]) * (storage_sequence_length // block_m) + query_block
     ) * head_dim + feature_offsets[None, :]
@@ -193,18 +214,12 @@ def store_key_tile(
             head_dim,
         ),
     )
-    if mean_pool_summary:
-        valid_count = tl.sum(valid.to(tl.int32), axis=1)
-        key_summary = tl.sum(grouped, axis=2) / valid_count[None, :, None]
-    else:
-        key_summary = tl.max(
-            tl.where(valid[None, :, :, None], grouped, -float("inf")),
-            axis=2,
-        )
-        key_aux = tl.min(
-            tl.where(valid[None, :, :, None], grouped, float("inf")),
-            axis=2,
-        )
+    key_summary, key_aux = summarize_block_tiles(
+        grouped,
+        valid,
+        mean_pool_summary,
+        False,
+    )
 
     quantized, key_scale = qk_quantization.quantize_key_tile(
         values,

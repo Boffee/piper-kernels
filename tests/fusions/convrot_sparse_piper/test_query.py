@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _DSA_ROUTING,
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.convrot_sparse_piper import query as query_fusion
 from piper_kernels.fusions.convrot_sparse_piper._layout import padded_sequence_length
@@ -115,7 +115,7 @@ def test_fused_query_projection_matches_the_fp32_composed_contract(
         *operands.as_tuple(),
         options["norm_epsilon"],
         options["softmax_scale"],
-        _DSA_ROUTING,
+        _MINMAX_ROUTING,
     )
     expected = composed_query_projection(*operands.as_tuple(), **options)
     storage_length = padded_sequence_length(sequence_length)
@@ -153,7 +153,7 @@ def test_mean_pool_query_projection_emits_exact_valid_prefix_means(
         *operands.as_tuple(),
         1e-6,
         128**-0.5,
-        _MEAN_POOL_ROUTING,
+        _MEAN_ROUTING,
     )
     expected = composed_mean_pool_summary(
         *operands.as_tuple(),
@@ -174,7 +174,7 @@ def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
         *operands.as_tuple(),
         1e-6,
         128**-0.5,
-        _DSA_ROUTING,
+        _MINMAX_ROUTING,
     )
 
     assert query.shape == (1, 3, 128, 128)
@@ -184,7 +184,7 @@ def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("routing_mode", [_MEAN_POOL_ROUTING, _DSA_ROUTING])
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
 def test_fused_query_projection_ignores_internal_padding(routing_mode: int) -> None:
     operands = _random_operands(sequence_length=192)
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
@@ -217,14 +217,14 @@ def test_fused_query_projection_custom_op_passes_opcheck() -> None:
 
     result = torch.library.opcheck(
         query_fusion._project_query_op,
-        (*operands.as_tuple(), 1e-6, 128**-0.5, _DSA_ROUTING),
+        (*operands.as_tuple(), 1e-6, 128**-0.5, _MINMAX_ROUTING),
     )
 
     assert set(result.values()) == {"SUCCESS"}
 
     mean_result = torch.library.opcheck(
         query_fusion._project_query_op,
-        (*operands.as_tuple(), 1e-6, 128**-0.5, _MEAN_POOL_ROUTING),
+        (*operands.as_tuple(), 1e-6, 128**-0.5, _MEAN_ROUTING),
     )
     assert set(mean_result.values()) == {"SUCCESS"}
 
@@ -235,7 +235,7 @@ def test_fused_query_projection_is_a_fullgraph_compile_boundary() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return query_fusion._project_query_op(*args, 1e-6, 128**-0.5, _DSA_ROUTING)
+        return query_fusion._project_query_op(*args, 1e-6, 128**-0.5, _MINMAX_ROUTING)
 
     expected = prepare(*operands.as_tuple())
     compiled = torch.compile(prepare, backend="eager", fullgraph=True)
@@ -255,7 +255,7 @@ def test_fused_query_projection_fake_kernel_propagates_shapes() -> None:
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         1e-6,
         128**-0.5,
-        _DSA_ROUTING,
+        _MINMAX_ROUTING,
     )
 
     assert query.shape == (2, 3, 128, 128)

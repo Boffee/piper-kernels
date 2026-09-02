@@ -14,7 +14,7 @@ _UINT16_ROUTE_CAPACITY = 1 << 16
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedRouteLayout:
-    """Layout-specific integer metadata consumed by DSA and attention."""
+    """Layout-specific integer metadata consumed by sparse routing and attention."""
 
     head_keep_blocks: torch.Tensor
     route_head_offsets: torch.Tensor

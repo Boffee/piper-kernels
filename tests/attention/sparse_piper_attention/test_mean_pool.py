@@ -1,5 +1,6 @@
 """Mean-pool packed routing tests."""
 
+import pytest
 import torch
 
 from piper_kernels.attention.sparse_piper_attention._budget import (
@@ -7,14 +8,59 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_ROUTING,
     PackedRouteAndCoarseBuilder,
 )
-from piper_kernels.attention.sparse_piper_attention.mean_pool import (
-    _sequence_block_means,
-    packed_mean_pool_routes_and_coarse_from_summaries,
-    packed_mean_pool_routes_from_sequences,
-    packed_mean_pool_routes_from_summaries,
+from piper_kernels.attention.sparse_piper_attention._routing import (
+    packed_routes_and_coarse_from_summaries,
+    packed_routes_from_sequences,
+    packed_routes_from_summaries,
 )
+from piper_kernels.attention.sparse_piper_attention._summaries import (
+    sequence_block_summaries,
+)
+from piper_kernels.attention.sparse_piper_attention.coarse import (
+    _mean_pool_head_major_blocks,
+)
+
+
+def _sequence_block_means(sequence, block_lengths=None):
+    return _mean_pool_head_major_blocks(sequence, block_lengths)
+
+
+def packed_mean_pool_routes_from_sequences(query, key, layout, block_lengths=None):
+    return packed_routes_from_sequences(query, key, layout, _MEAN_ROUTING, block_lengths)
+
+
+def packed_mean_pool_routes_from_summaries(query_mean, key_mean, layout):
+    return packed_routes_from_summaries(
+        query_mean,
+        key_mean,
+        key_mean[:, :, :0],
+        layout,
+        _MEAN_ROUTING,
+    )
+
+
+def packed_mean_pool_routes_and_coarse_from_summaries(
+    query_mean,
+    key_mean,
+    pooled_value,
+    layout,
+    *,
+    sparse_key_blocks,
+    coarse_scale,
+):
+    return packed_routes_and_coarse_from_summaries(
+        query_mean,
+        key_mean,
+        key_mean[:, :, :0],
+        pooled_value,
+        layout,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_scale=coarse_scale,
+        routing_mode=_MEAN_ROUTING,
+    )
 
 
 def _layout(
@@ -149,3 +195,34 @@ def test_route_and_coarse_builder_places_out_of_order_query_chunks_by_offset() -
     expected = expected @ pooled_value
     torch.testing.assert_close(result.coarse_output, expected)
     assert result.routes.indices.tolist() == [[[0], [1]]]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_sm120_padded_summaries_match_portable_valid_prefix_means() -> None:
+    generator = torch.Generator().manual_seed(73)
+    block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
+    query = torch.randn((1, 2, 3 * 64, 128), dtype=torch.bfloat16, generator=generator)
+    key = torch.randn((1, 2, 2 * 64, 128), dtype=torch.bfloat16, generator=generator)
+    valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
+    valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
+    query = query.unflatten(2, (3, 64))
+    key = key.unflatten(2, (2, 64))
+    query[:, :, ~valid_query_rows] = 10_000
+    key[:, :, ~valid_key_rows] = -10_000
+    query = query.flatten(2, 3)
+    key = key.flatten(2, 3)
+
+    expected = sequence_block_summaries(query, key, _MEAN_ROUTING, block_lengths)
+    actual = sequence_block_summaries(
+        query.cuda(),
+        key.cuda(),
+        _MEAN_ROUTING,
+        block_lengths.cuda(),
+    )
+
+    for actual_summary, expected_summary in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_summary.cpu(), expected_summary, atol=1e-6, rtol=1e-6)

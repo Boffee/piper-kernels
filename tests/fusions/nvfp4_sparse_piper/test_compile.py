@@ -21,8 +21,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from piper_kernels import SparsePiperAttention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _DSA_ROUTING,
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import (
@@ -163,7 +163,7 @@ def _semantic_attention_graph(
     dynamic: bool,
     output_dynamic: bool | None = None,
     escape_attention: bool = False,
-    routing_mode: int = _DSA_ROUTING,
+    routing_mode: int = _MINMAX_ROUTING,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
@@ -275,7 +275,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         *,
         batch: int = 1,
         dynamic: bool = False,
-        routing: str = "dsa",
+        routing: str = "minmax",
     ) -> None:
         super().__init__()
         self.batch = batch
@@ -378,7 +378,7 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
 
     output_features = 320
 
-    def __init__(self, *, dynamic: bool = False, routing: str = "dsa") -> None:
+    def __init__(self, *, dynamic: bool = False, routing: str = "minmax") -> None:
         super().__init__(dynamic=dynamic, routing=routing)
         calibration = torch.full(
             (1, self.sequence_length, self.heads * self.head_dim),
@@ -556,7 +556,7 @@ def test_compile_options_install_versioned_idempotent_passes() -> None:
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
-@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
+@pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 def test_prepared_projection_family_fuses_without_materializing_linears(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
@@ -594,7 +594,7 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
-@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
+@pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 def test_static_output_fuses_after_prepared_sparse_projection(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
@@ -678,7 +678,7 @@ def test_static_output_fails_closed_when_attention_escapes(
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("dynamic", "preparation_count", "routing"),
-    [(False, 3, "dsa"), (True, 1, "dsa"), (False, 3, "mean_pool")],
+    [(False, 3, "minmax"), (True, 1, "minmax"), (False, 3, "mean")],
 )
 def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
     dynamic: bool,

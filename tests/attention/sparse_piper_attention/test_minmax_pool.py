@@ -1,25 +1,78 @@
-"""Exact packed DSA routing tests."""
+"""Exact packed minmax-pool routing tests."""
 
 import pytest
 import torch
 
-import piper_kernels.attention.sparse_piper_attention.dsa as dsa_module
+import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
     coarse_attention_residual,
-    dsa_coarse_residual,
     mean_pool_block_values,
+    minmax_pool_coarse_residual,
 )
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention.dsa import (
-    _dsa_scores,
-    _sequence_block_summaries,
-    packed_dsa_routes_and_coarse_from_summaries,
-    packed_dsa_routes_from_sequences,
-    packed_dsa_routes_from_summaries,
+from piper_kernels.attention.sparse_piper_attention._routes import _MINMAX_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routing import (
+    packed_routes_and_coarse_from_summaries,
+    packed_routes_from_sequences,
+    packed_routes_from_summaries,
+    routing_scores,
 )
+from piper_kernels.attention.sparse_piper_attention._summaries import (
+    sequence_block_summaries,
+)
+
+
+def _sequence_block_summaries(query, key, block_lengths=None):
+    return sequence_block_summaries(query, key, _MINMAX_ROUTING, block_lengths)
+
+
+def _minmax_pool_scores(query_summary, key_max, key_min):
+    return routing_scores(query_summary, key_max, key_min, _MINMAX_ROUTING)
+
+
+def packed_minmax_pool_routes_from_sequences(query, key, layout, block_lengths=None):
+    return packed_routes_from_sequences(
+        query,
+        key,
+        layout,
+        _MINMAX_ROUTING,
+        block_lengths,
+    )
+
+
+def packed_minmax_pool_routes_from_summaries(query_summary, key_max, key_min, layout):
+    return packed_routes_from_summaries(
+        query_summary,
+        key_max,
+        key_min,
+        layout,
+        _MINMAX_ROUTING,
+    )
+
+
+def packed_minmax_pool_routes_and_coarse_from_summaries(
+    query_summary,
+    key_max,
+    key_min,
+    pooled_value,
+    layout,
+    *,
+    sparse_key_blocks,
+    coarse_scale,
+):
+    return packed_routes_and_coarse_from_summaries(
+        query_summary,
+        key_max,
+        key_min,
+        pooled_value,
+        layout,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_scale=coarse_scale,
+        routing_mode=_MINMAX_ROUTING,
+    )
 
 
 def _layout(
@@ -41,7 +94,7 @@ def test_packed_routes_store_only_active_uint16_indices() -> None:
     key = torch.randn((1, 3, 5 * 64, 128), generator=generator)
     layout = _layout((1, 3, 2), 5)
 
-    routes = packed_dsa_routes_from_sequences(query, key, layout)
+    routes = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
     assert routes.indices.shape == (1, 2, 6)
     assert routes.indices.dtype is torch.uint16
@@ -54,7 +107,7 @@ def test_exact_score_ties_prefer_lower_key_index() -> None:
     key = torch.zeros((1, 1, 4 * 64, 128))
     layout = _layout((2,), 4)
 
-    routes = packed_dsa_routes_from_sequences(query, key, layout)
+    routes = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
     assert routes.indices.tolist() == [[[0, 1], [0, 1]]]
 
@@ -70,8 +123,8 @@ def test_existing_summaries_select_the_same_routes_as_sequence_inputs() -> None:
     key_max = key_float.amax(dim=3)
     key_min = key_float.amin(dim=3)
 
-    expected = packed_dsa_routes_from_sequences(query, key, layout)
-    actual = packed_dsa_routes_from_summaries(query_summary, key_max, key_min, layout)
+    expected = packed_minmax_pool_routes_from_sequences(query, key, layout)
+    actual = packed_minmax_pool_routes_from_summaries(query_summary, key_max, key_min, layout)
 
     assert torch.equal(actual.indices, expected.indices)
 
@@ -85,13 +138,13 @@ def test_existing_summaries_accept_sparse_prefix_views() -> None:
     key_min = full_key_min[:, :, :4]
     layout = _layout((2, 3), 4)
 
-    expected = packed_dsa_routes_from_summaries(
+    expected = packed_minmax_pool_routes_from_summaries(
         query_summary,
         key_max.contiguous(),
         key_min.contiguous(),
         layout,
     )
-    actual = packed_dsa_routes_from_summaries(query_summary, key_max, key_min, layout)
+    actual = packed_minmax_pool_routes_from_summaries(query_summary, key_max, key_min, layout)
 
     assert not key_max.is_contiguous()
     assert torch.equal(actual.indices, expected.indices)
@@ -103,7 +156,7 @@ def test_ragged_query_sequence_produces_a_final_route_row() -> None:
     key = torch.randn((1, 2, 3 * 64, 128), generator=generator)
     layout = _layout((1, 2), 3)
 
-    routes = packed_dsa_routes_from_sequences(query, key, layout)
+    routes = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
     assert routes.indices.shape == (1, 2, 3)
     assert bool((routes.indices.to(torch.int32) < 3).all())
@@ -148,7 +201,7 @@ def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
     valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
     valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
     layout = _layout((1, 2), 2)
-    expected_routes = packed_dsa_routes_from_summaries(
+    expected_routes = packed_minmax_pool_routes_from_summaries(
         expected_query,
         expected_key_max,
         expected_key_min,
@@ -167,7 +220,7 @@ def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
             corrupted_key,
             block_lengths,
         )
-        routes = packed_dsa_routes_from_sequences(
+        routes = packed_minmax_pool_routes_from_sequences(
             corrupted_query,
             corrupted_key,
             layout,
@@ -180,8 +233,8 @@ def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
         assert torch.equal(routes.indices, expected_routes.indices)
 
 
-def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatch) -> None:
-    monkeypatch.setattr(dsa_module, "_QUERY_CHUNK_BLOCKS", 2)
+def test_minmax_pool_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatch) -> None:
+    monkeypatch.setattr(routing_module, "_QUERY_CHUNK_BLOCKS", 2)
     generator = torch.Generator().manual_seed(642)
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
     shape = (1, 3 * 64, 2, 8)
@@ -199,11 +252,11 @@ def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatc
     pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :coarse_key_blocks]
     expected = coarse_attention_residual(
         fine_output,
-        _dsa_scores(query_summary, key_max, key_min) * coarse_scale,
+        _minmax_pool_scores(query_summary, key_max, key_min) * coarse_scale,
         pooled_value,
         compression_gate,
     )
-    actual = dsa_coarse_residual(
+    actual = minmax_pool_coarse_residual(
         fine_output,
         query,
         key,
@@ -218,7 +271,7 @@ def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatc
     torch.testing.assert_close(actual, expected)
 
 
-def test_dsa_coarse_residual_can_include_a_partial_block_after_sparse_prefix() -> None:
+def test_minmax_pool_coarse_residual_can_include_a_partial_block_after_sparse_prefix() -> None:
     generator = torch.Generator().manual_seed(645)
     shape = (1, 129, 1, 4)
     fine_output, query, key, value, compression_gate = [
@@ -231,11 +284,11 @@ def test_dsa_coarse_residual_can_include_a_partial_block_after_sparse_prefix() -
     )
     expected = coarse_attention_residual(
         fine_output,
-        _dsa_scores(query_summary, key_max, key_min) * coarse_scale,
+        _minmax_pool_scores(query_summary, key_max, key_min) * coarse_scale,
         mean_pool_block_values(value),
         compression_gate,
     )
-    actual = dsa_coarse_residual(
+    actual = minmax_pool_coarse_residual(
         fine_output,
         query,
         key,
@@ -250,7 +303,7 @@ def test_dsa_coarse_residual_can_include_a_partial_block_after_sparse_prefix() -
 
 
 @pytest.mark.parametrize("compile_function", [False, True])
-def test_dsa_coarse_residual_preserves_composed_gradients(
+def test_minmax_pool_coarse_residual_preserves_composed_gradients(
     compile_function: bool,
 ) -> None:
     generator = torch.Generator().manual_seed(643)
@@ -259,9 +312,9 @@ def test_dsa_coarse_residual_preserves_composed_gradients(
     fine_output, query, key, value, compression_gate = tensors
 
     residual = (
-        torch.compile(dsa_coarse_residual, backend="eager", fullgraph=True)
+        torch.compile(minmax_pool_coarse_residual, backend="eager", fullgraph=True)
         if compile_function
-        else dsa_coarse_residual
+        else minmax_pool_coarse_residual
     )
     output = residual(
         fine_output,
@@ -279,7 +332,7 @@ def test_dsa_coarse_residual_preserves_composed_gradients(
         assert bool(torch.all(torch.isfinite(tensor.grad)))
 
 
-def test_dsa_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
+def test_minmax_pool_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
     generator = torch.Generator().manual_seed(644)
     shape = (1, 2 * 64, 1, 4)
     fine_output, query, key, value, compression_gate = [
@@ -292,7 +345,7 @@ def test_dsa_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
         return graph.forward
 
     def run(candidate_block_lengths):
-        return dsa_coarse_residual(
+        return minmax_pool_coarse_residual(
             fine_output,
             query,
             key,
@@ -313,7 +366,7 @@ def test_dsa_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
     assert not torch.equal(first, second)
 
 
-def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
+def test_route_and_coarse_path_reuses_chunked_minmax_pool_scores() -> None:
     generator = torch.Generator().manual_seed(66)
     query_summary = torch.randn((1, 2, 385, 8), generator=generator)
     key_max = torch.randn((1, 2, 5, 8), generator=generator)
@@ -323,7 +376,7 @@ def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
     layout = _layout((1, 2), sparse_key_blocks)
     coarse_scale = 8**-0.5
 
-    actual = packed_dsa_routes_and_coarse_from_summaries(
+    actual = packed_minmax_pool_routes_and_coarse_from_summaries(
         query_summary,
         key_max,
         key_min,
@@ -332,13 +385,13 @@ def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
         sparse_key_blocks=sparse_key_blocks,
         coarse_scale=coarse_scale,
     )
-    expected_routes = packed_dsa_routes_from_summaries(
+    expected_routes = packed_minmax_pool_routes_from_summaries(
         query_summary,
         key_max[:, :, :sparse_key_blocks],
         key_min[:, :, :sparse_key_blocks],
         layout,
     )
-    expected_scores = _dsa_scores(query_summary, key_max, key_min) * coarse_scale
+    expected_scores = _minmax_pool_scores(query_summary, key_max, key_min) * coarse_scale
     expected_output = torch.softmax(expected_scores, dim=-1) @ pooled_value
 
     assert torch.equal(actual.routes.indices, expected_routes.indices)
@@ -357,8 +410,8 @@ def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
     cpu_layout = _layout((1, 4, 6), 7)
     cuda_layout = _layout((1, 4, 6), 7, "cuda")
 
-    expected = packed_dsa_routes_from_sequences(query, key, cpu_layout)
-    actual = packed_dsa_routes_from_sequences(query.cuda(), key.cuda(), cuda_layout)
+    expected = packed_minmax_pool_routes_from_sequences(query, key, cpu_layout)
+    actual = packed_minmax_pool_routes_from_sequences(query.cuda(), key.cuda(), cuda_layout)
 
     torch.testing.assert_close(
         actual.indices.cpu().to(torch.int32),
@@ -439,10 +492,10 @@ def test_sm120_ragged_routes_ignore_invalid_query_storage() -> None:
 
     query_storage[:, :, 65:] = 10_000
     positive_summary, _key_max, _key_min = _sequence_block_summaries(query, key)
-    positive_padding = packed_dsa_routes_from_sequences(query, key, layout)
+    positive_padding = packed_minmax_pool_routes_from_sequences(query, key, layout)
     query_storage[:, :, 65:] = -10_000
     negative_summary, _key_max, _key_min = _sequence_block_summaries(query, key)
-    negative_padding = packed_dsa_routes_from_sequences(query, key, layout)
+    negative_padding = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
     assert torch.equal(positive_summary, negative_summary)
     assert torch.equal(positive_padding.indices, negative_padding.indices)

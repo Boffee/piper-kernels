@@ -16,7 +16,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _MEAN_POOL_ROUTING,
+    _MEAN_ROUTING,
     validate_routing_mode,
 )
 from piper_kernels.fusions.convrot_sage_qk.triton import (
@@ -263,9 +263,13 @@ def _launch_key_projection(
     )
     summary_shape = (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
     key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
-    mean_pool_summary = routing_mode == _MEAN_POOL_ROUTING
+    mean_pool_summary = routing_mode == _MEAN_ROUTING
     key_aux = (
-        torch.empty(0, device=input_qdata.device, dtype=torch.float32)
+        torch.empty(
+            (batch, heads, 0, HEAD_DIM),
+            device=input_qdata.device,
+            dtype=torch.float32,
+        )
         if mean_pool_summary
         else torch.empty_like(key_summary)
     )
@@ -349,8 +353,8 @@ def _project_key_op_fake(
         dtype=torch.float32,
     )
     key_aux = (
-        summary.new_empty(0)
-        if routing_mode == _MEAN_POOL_ROUTING
+        summary.new_empty((batch, heads, 0, HEAD_DIM))
+        if routing_mode == _MEAN_ROUTING
         else summary.new_empty(summary.shape)
     )
     return key, key_scale, summary, key_aux

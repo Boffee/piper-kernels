@@ -7,16 +7,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from ._budget import _resolve_route_layout
-from ._routes import _MEAN_POOL_ROUTING, PackedRoutes, validate_routing_mode
+from ._routes import PackedRoutes, validate_routing_mode
+from ._routing import (
+    packed_routes_and_coarse_from_summaries,
+    packed_routes_from_summaries,
+)
 from .coarse import _resolve_coarse_key_blocks
-from .dsa import (
-    packed_dsa_routes_and_coarse_from_summaries,
-    packed_dsa_routes_from_summaries,
-)
-from .mean_pool import (
-    packed_mean_pool_routes_and_coarse_from_summaries,
-    packed_mean_pool_routes_from_summaries,
-)
 
 if TYPE_CHECKING:
     from .triton import _PreparedSparsePiperAttention
@@ -59,19 +55,13 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         query.device,
     )
     validate_routing_mode(routing_mode)
-    if routing_mode == _MEAN_POOL_ROUTING:
-        routes = packed_mean_pool_routes_from_summaries(
-            query_summary,
-            key_summary[:, :, :sparse_key_blocks],
-            layout,
-        )
-    else:
-        routes = packed_dsa_routes_from_summaries(
-            query_summary,
-            key_summary[:, :, :sparse_key_blocks],
-            key_aux[:, :, :sparse_key_blocks],
-            layout,
-        )
+    routes = packed_routes_from_summaries(
+        query_summary,
+        key_summary[:, :, :sparse_key_blocks],
+        key_aux[:, :, :sparse_key_blocks],
+        layout,
+        routing_mode,
+    )
     return _prepare_quantized_sparse_piper_attention_from_routes(
         query,
         query_scale,
@@ -154,25 +144,16 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
         available_coarse_key_blocks=block_mean.shape[2],
     )
     pooled_value = block_mean[:, :, :coarse_key_blocks]
-    if routing_mode == _MEAN_POOL_ROUTING:
-        routed = packed_mean_pool_routes_and_coarse_from_summaries(
-            query_summary,
-            key_summary[:, :, :coarse_key_blocks],
-            pooled_value,
-            layout,
-            sparse_key_blocks=sparse_key_blocks,
-            coarse_scale=coarse_scale,
-        )
-    else:
-        routed = packed_dsa_routes_and_coarse_from_summaries(
-            query_summary,
-            key_summary[:, :, :coarse_key_blocks],
-            key_aux[:, :, :coarse_key_blocks],
-            pooled_value,
-            layout,
-            sparse_key_blocks=sparse_key_blocks,
-            coarse_scale=coarse_scale,
-        )
+    routed = packed_routes_and_coarse_from_summaries(
+        query_summary,
+        key_summary[:, :, :coarse_key_blocks],
+        key_aux[:, :, :coarse_key_blocks],
+        pooled_value,
+        layout,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_scale=coarse_scale,
+        routing_mode=routing_mode,
+    )
     prepared = _prepare_quantized_sparse_piper_attention_from_routes(
         query,
         query_scale,

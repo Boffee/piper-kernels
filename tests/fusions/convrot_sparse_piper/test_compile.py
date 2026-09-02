@@ -9,8 +9,8 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import (
     SparsePiperAttention,
-    dsa_coarse_residual,
     mean_pool_coarse_residual,
+    minmax_pool_coarse_residual,
 )
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -48,7 +48,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         *,
         value_bias: bool = False,
         strided_rope: bool = False,
-        routing: str = "dsa",
+        routing: str = "minmax",
     ) -> None:
         super().__init__()
         projections = []
@@ -183,7 +183,9 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             block_lengths=block_lengths,
         )
         residual = (
-            mean_pool_coarse_residual if self.coarse_routing == "mean_pool" else dsa_coarse_residual
+            mean_pool_coarse_residual
+            if self.coarse_routing == "mean"
+            else minmax_pool_coarse_residual
         )
         return residual(
             fine_output,
@@ -270,7 +272,7 @@ class _DynamicCoarseSparseProjectionAttention(_DynamicSparseProjectionAttention)
 
     def __init__(self) -> None:
         super().__init__()
-        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
+        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing="mean")
 
     def forward(
         self,
@@ -379,7 +381,7 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
 class _MeanPoolSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
     def __init__(self) -> None:
         super().__init__()
-        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
+        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing="mean")
 
 
 class _DynamicSparseProjectionAttentionOutput(_DynamicSparseProjectionAttention):
@@ -634,7 +636,7 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-@pytest.mark.parametrize("routing", ["mean_pool", "dsa"])
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
 def test_cuda_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
     torch.manual_seed(703)
     model = _SparseProjectionAttention(routing=routing).eval()
@@ -681,7 +683,7 @@ def test_cuda_projection_fusion_respects_internal_block_lengths(routing: str) ->
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-@pytest.mark.parametrize("routing", ["mean_pool", "dsa"])
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
 def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None:
     torch.manual_seed(713)
     model = _CoarseSparseProjectionAttention(sparse_routing=routing).eval()
@@ -755,7 +757,7 @@ def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) ->
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-@pytest.mark.parametrize("routing", ["mean_pool", "dsa"])
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
 def test_cuda_coarse_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
     torch.manual_seed(715)
     model = _CoarseSparseProjectionAttention(sparse_routing=routing).eval()
@@ -826,7 +828,7 @@ def test_cuda_coarse_projection_fusion_respects_internal_block_lengths(routing: 
 )
 def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
     torch.manual_seed(716)
-    model = _CoarseSparseProjectionAttention(sparse_routing="mean_pool").eval()
+    model = _CoarseSparseProjectionAttention(sparse_routing="mean").eval()
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,
@@ -877,8 +879,8 @@ def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> N
 def test_cuda_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
     torch.manual_seed(717)
     model = _CoarseSparseProjectionAttention(
-        sparse_routing="dsa",
-        coarse_routing="mean_pool",
+        sparse_routing="minmax",
+        coarse_routing="mean",
     ).eval()
     hidden_states = torch.randn(
         model.batch,

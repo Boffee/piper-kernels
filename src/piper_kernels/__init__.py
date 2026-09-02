@@ -7,9 +7,9 @@ from .attention.sparse_piper_attention import (
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
-    dsa_coarse_residual,
     mean_pool_block_values,
     mean_pool_coarse_residual,
+    minmax_pool_coarse_residual,
 )
 
 __all__ = [
@@ -17,9 +17,9 @@ __all__ = [
     "apply_coarse_attention_residual",
     "coarse_attention",
     "coarse_attention_residual",
-    "dsa_coarse_residual",
     "mean_pool_block_values",
     "mean_pool_coarse_residual",
+    "minmax_pool_coarse_residual",
     "piper_attention",
     "sage_attention_2pp",
 ]
