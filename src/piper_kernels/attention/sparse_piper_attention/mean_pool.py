@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import torch
 
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
+    PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
     PackedRoutes,
+    PackedRoutesAndCoarseOutput,
 )
 
 _BLOCK_ROWS = 64
@@ -21,7 +25,7 @@ def packed_mean_pool_routes_from_summaries(
 ) -> PackedRoutes:
     """Select routes from existing FP32 Q64/K64 valid-prefix means."""
     _validate_mean_summaries(query_mean, key_mean)
-    batch, heads, query_blocks, head_dim = query_mean.shape
+    batch, heads, query_blocks, _head_dim = query_mean.shape
     key_blocks = key_mean.shape[2]
     builder = PackedRouteBuilder(
         layout,
@@ -31,22 +35,36 @@ def packed_mean_pool_routes_from_summaries(
         key_blocks=key_blocks,
         device=query_mean.device,
     )
-    flat_key = key_mean.reshape(batch * heads, key_blocks, head_dim).transpose(1, 2)
-    for start in range(0, query_blocks, _QUERY_CHUNK_BLOCKS):
-        stop = min(start + _QUERY_CHUNK_BLOCKS, query_blocks)
-        flat_query = query_mean[:, :, start:stop].reshape(
-            batch * heads,
-            stop - start,
-            head_dim,
-        )
-        scores = torch.bmm(flat_query, flat_key).reshape(
-            batch,
-            heads,
-            stop - start,
-            key_blocks,
-        )
+    for start, scores in _mean_pool_score_chunks(query_mean, key_mean):
         builder.write(scores, route_query_offset=start)
     return builder.routes
+
+
+def packed_mean_pool_routes_and_coarse_from_summaries(
+    query_mean: torch.Tensor,
+    key_mean: torch.Tensor,
+    pooled_value: torch.Tensor,
+    layout: _ResolvedRouteLayout,
+    *,
+    coarse_scale: float,
+) -> PackedRoutesAndCoarseOutput:
+    """Select fine routes and apply coarse attention from each mean-score chunk."""
+    _validate_mean_summaries(query_mean, key_mean)
+    batch, heads, query_blocks, _head_dim = query_mean.shape
+    key_blocks = key_mean.shape[2]
+    builder = PackedRouteAndCoarseBuilder(
+        layout,
+        pooled_value,
+        batch=batch,
+        heads=heads,
+        query_blocks=query_blocks,
+        key_blocks=key_blocks,
+        device=query_mean.device,
+        coarse_scale=coarse_scale,
+    )
+    for start, scores in _mean_pool_score_chunks(query_mean, key_mean):
+        builder.write(scores, route_query_offset=start)
+    return builder.finish()
 
 
 def packed_mean_pool_routes_from_sequences(
@@ -76,6 +94,31 @@ def _sequence_block_means(
     if full_rows != rows:
         summaries.append(sequence[:, :, full_rows:].float().mean(dim=2, keepdim=True))
     return summaries[0] if len(summaries) == 1 else torch.cat(summaries, dim=2)
+
+
+def _mean_pool_score_chunks(
+    query_mean: torch.Tensor,
+    key_mean: torch.Tensor,
+) -> Iterator[tuple[int, torch.Tensor]]:
+    batch, heads, query_blocks, head_dim = query_mean.shape
+    key_blocks = key_mean.shape[2]
+    flat_key = key_mean.reshape(batch * heads, key_blocks, head_dim).transpose(1, 2)
+    for start in range(0, query_blocks, _QUERY_CHUNK_BLOCKS):
+        stop = min(start + _QUERY_CHUNK_BLOCKS, query_blocks)
+        flat_query = query_mean[:, :, start:stop].reshape(
+            batch * heads,
+            stop - start,
+            head_dim,
+        )
+        yield (
+            start,
+            torch.bmm(flat_query, flat_key).reshape(
+                batch,
+                heads,
+                stop - start,
+                key_blocks,
+            ),
+        )
 
 
 def _validate_mean_summaries(query_mean: torch.Tensor, key_mean: torch.Tensor) -> None:
@@ -116,6 +159,7 @@ def _validate_mean_sequences(
 
 
 __all__ = [
+    "packed_mean_pool_routes_and_coarse_from_summaries",
     "packed_mean_pool_routes_from_sequences",
     "packed_mean_pool_routes_from_summaries",
 ]

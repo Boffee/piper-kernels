@@ -215,6 +215,8 @@ def store_value_tile(
     value_mean_ptr,
     value_ptr,
     value_scale_ptr,
+    block_mean_ptr,
+    block_lengths_ptr,
     batch,
     heads,
     head_offsets,
@@ -222,12 +224,14 @@ def store_value_tile(
     logical_sequence_length,
     storage_sequence_length,
     row_block,
+    mask_block_lengths: tl.constexpr,
+    emit_block_mean: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Center, quantize, and store one sparse-Piper value tile."""
+    """Center, quantize, and optionally mean-pool one sparse-Piper value tile."""
     feature_offsets = tl.arange(0, head_dim)
     value_mean = tl.load(
         value_mean_ptr
@@ -236,7 +240,46 @@ def store_value_tile(
         mask=head_offsets[:, None] < heads,
         other=0.0,
     )
-    valid_rows = sequence_offsets < logical_sequence_length
+    tile_count = storage_sequence_length // scale_rows
+    local_tile_offsets = tl.arange(0, block_m // scale_rows)
+    tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
+    scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
+    if mask_block_lengths:
+        block_lengths = tl.load(
+            block_lengths_ptr + tile_offsets,
+            mask=tile_offsets < tile_count,
+            other=0,
+        )
+        rows_in_tile = tl.arange(0, scale_rows)
+        grouped_valid = rows_in_tile[None, :] < block_lengths[:, None]
+        valid_rows = tl.reshape(grouped_valid, (block_m,))
+    else:
+        valid_rows = sequence_offsets < logical_sequence_length
+    if emit_block_mean:
+        value_blocks = tl.reshape(
+            tl.permute(values, (1, 0, 2)),
+            (
+                heads_per_program,
+                block_m // scale_rows,
+                scale_rows,
+                head_dim,
+            ),
+        )
+        grouped_valid = tl.reshape(valid_rows, (block_m // scale_rows, scale_rows))
+        valid_count = tl.maximum(tl.sum(grouped_valid.to(tl.int32), axis=1), 1)
+        block_mean = (
+            tl.sum(
+                tl.where(grouped_valid[None, :, :, None], value_blocks, 0.0),
+                axis=2,
+            )
+            / valid_count[None, :, None]
+        )
+        block_mean_offsets = scale_offsets[:, :, None] * head_dim + feature_offsets[None, None, :]
+        tl.store(
+            block_mean_ptr + block_mean_offsets,
+            block_mean,
+            mask=(head_offsets[:, None, None] < heads) & (tile_offsets[None, :, None] < tile_count),
+        )
     quantized, value_scale_multiplier = quantize_value_tile(  # pyright: ignore[reportGeneralTypeIssues]
         values,
         value_mean,
@@ -258,10 +301,6 @@ def store_value_tile(
         & (sequence_offsets[None, :, None] < storage_sequence_length),
     )
 
-    tile_count = storage_sequence_length // scale_rows
-    local_tile_offsets = tl.arange(0, block_m // scale_rows)
-    tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
-    scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
     tl.store(
         value_scale_ptr + scale_offsets,
         value_scale_multiplier,

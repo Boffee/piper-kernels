@@ -256,6 +256,8 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
     value_mean_ptr,
     value_ptr,
     value_scale_ptr,
+    block_mean_ptr,
+    block_lengths_ptr,
     chunk_rows,
     chunk_start,
     logical_sequence_length,
@@ -268,6 +270,8 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
     heads: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
+    emit_block_mean: tl.constexpr,
     block_m: tl.constexpr,
 ):
     local_block = row_block_offset + tl.program_id(0)
@@ -297,6 +301,8 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
         value_mean_ptr,
         value_ptr,
         value_scale_ptr,
+        block_mean_ptr,
+        block_lengths_ptr,
         batch,
         heads,
         head_offsets,
@@ -304,6 +310,8 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         storage_sequence_length,
         row_block,
+        mask_block_lengths,
+        emit_block_mean,
         heads_per_program,
         head_dim,
         block_m,
@@ -433,7 +441,7 @@ def launch_key(  # noqa: PLR0913, PLR0917
         launch(1, full_blocks, ragged=True)
 
 
-def launch_value(
+def launch_value(  # noqa: PLR0913, PLR0917
     projection,
     input_per_tensor_scale,
     weight_per_tensor_scale,
@@ -441,12 +449,18 @@ def launch_value(
     value_mean,
     value,
     value_scale,
+    block_mean,
+    block_lengths,
     chunk_start: int,
     logical_sequence_length: int,
+    *,
+    emit_block_mean: bool,
 ) -> None:
     chunk_rows, output_features = projection.shape
     heads = output_features // HEAD_DIM
     storage_sequence_length = value.shape[3]
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else value_mean
 
     def launch(row_blocks: int, row_block_offset: int) -> None:
         _value_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
@@ -457,6 +471,8 @@ def launch_value(
             value_mean,
             value,
             value_scale,
+            block_mean,
+            block_lengths_ptr,
             chunk_rows,
             chunk_start,
             logical_sequence_length,
@@ -469,6 +485,8 @@ def launch_value(
             heads=heads,
             heads_per_program=_HEADS_PER_PROGRAM,
             head_dim=HEAD_DIM,
+            mask_block_lengths=has_block_lengths,
+            emit_block_mean=emit_block_mean,
             block_m=_KEY_VALUE_BLOCK_M,
             num_warps=8,
         )

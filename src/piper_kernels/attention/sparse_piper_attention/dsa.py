@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
+    PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
     PackedRoutes,
+    PackedRoutesAndCoarseOutput,
 )
 
 try:
@@ -41,11 +45,37 @@ def packed_dsa_routes_from_summaries(
         key_blocks=key_block_count,
         device=query_summary.device,
     )
-    for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
-        stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
-        scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
+    for start, scores in _dsa_score_chunks(query_summary, key_max, key_min):
         builder.write(scores, route_query_offset=start)
     return builder.routes
+
+
+def packed_dsa_routes_and_coarse_from_summaries(
+    query_summary: torch.Tensor,
+    key_max: torch.Tensor,
+    key_min: torch.Tensor,
+    pooled_value: torch.Tensor,
+    layout: _ResolvedRouteLayout,
+    *,
+    coarse_scale: float,
+) -> PackedRoutesAndCoarseOutput:
+    """Select fine routes and apply coarse attention from each DSA-score chunk."""
+    _validate_dsa_summaries(query_summary, key_max, key_min)
+    batch, heads, query_blocks, _head_dim = query_summary.shape
+    key_blocks = key_max.shape[2]
+    builder = PackedRouteAndCoarseBuilder(
+        layout,
+        pooled_value,
+        batch=batch,
+        heads=heads,
+        query_blocks=query_blocks,
+        key_blocks=key_blocks,
+        device=query_summary.device,
+        coarse_scale=coarse_scale,
+    )
+    for start, scores in _dsa_score_chunks(query_summary, key_max, key_min):
+        builder.write(scores, route_query_offset=start)
+    return builder.finish()
 
 
 def packed_dsa_routes_from_sequences(
@@ -118,6 +148,16 @@ def _dsa_scores(
     minimum_scores = torch.bmm(flat_query, flat_key_min.transpose(1, 2))
     torch.maximum(scores, minimum_scores, out=scores)
     return scores.reshape(batch, heads, query_count, key_count)
+
+
+def _dsa_score_chunks(
+    query_summary: torch.Tensor,
+    key_max: torch.Tensor,
+    key_min: torch.Tensor,
+) -> Iterator[tuple[int, torch.Tensor]]:
+    for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
+        stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
+        yield start, _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
 
 
 def _supports_sm120_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> bool:

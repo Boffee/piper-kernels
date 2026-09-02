@@ -37,6 +37,7 @@ class ProjectedValue:
     value: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
+    block_mean: torch.Tensor
 
 
 def _padded_blocks(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -204,6 +205,10 @@ def composed_value_projection(
         None,
         torch.float32,
     ).view(batch, sequence_length, heads, _HEAD_DIM)
+    projected_blocks, valid = _padded_blocks(projected.permute(0, 2, 1, 3).float())
+    block_mean = (projected_blocks * valid[None, None, :, :, None]).sum(dim=3) / valid.sum(dim=1)[
+        None, None, :, None
+    ]
     storage_length = padded_sequence_length(sequence_length)
     centered = projected.new_zeros((batch, heads, storage_length, _HEAD_DIM))
     centered[:, :, :sequence_length] = (
@@ -224,4 +229,5 @@ def composed_value_projection(
         quantized.flatten(2, 3).permute(0, 1, 3, 2).contiguous(),
         (value_scale * 255.0).unsqueeze(-1),
         value_mean,
+        block_mean,
     )

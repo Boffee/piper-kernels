@@ -8,7 +8,9 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention.dsa import (
+    _dsa_scores,
     _sequence_block_summaries,
+    packed_dsa_routes_and_coarse_from_summaries,
     packed_dsa_routes_from_sequences,
     packed_dsa_routes_from_summaries,
 )
@@ -99,6 +101,36 @@ def test_ragged_query_sequence_produces_a_final_route_row() -> None:
 
     assert routes.indices.shape == (1, 2, 3)
     assert bool((routes.indices.to(torch.int32) < 3).all())
+
+
+def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
+    generator = torch.Generator().manual_seed(66)
+    query_summary = torch.randn((1, 2, 385, 8), generator=generator)
+    key_max = torch.randn((1, 2, 5, 8), generator=generator)
+    key_min = torch.randn((1, 2, 5, 8), generator=generator)
+    pooled_value = torch.randn((1, 2, 5, 6), generator=generator)
+    layout = _layout((2, 3), 5)
+    coarse_scale = 8**-0.5
+
+    actual = packed_dsa_routes_and_coarse_from_summaries(
+        query_summary,
+        key_max,
+        key_min,
+        pooled_value,
+        layout,
+        coarse_scale=coarse_scale,
+    )
+    expected_routes = packed_dsa_routes_from_summaries(
+        query_summary,
+        key_max,
+        key_min,
+        layout,
+    )
+    expected_scores = _dsa_scores(query_summary, key_max, key_min) * coarse_scale
+    expected_output = torch.softmax(expected_scores, dim=-1) @ pooled_value
+
+    assert torch.equal(actual.routes.indices, expected_routes.indices)
+    torch.testing.assert_close(actual.coarse_output, expected_output)
 
 
 @pytest.mark.gpu

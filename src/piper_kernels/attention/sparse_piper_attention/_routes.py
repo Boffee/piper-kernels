@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
+from .coarse import coarse_attention
 
 try:
     from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
@@ -30,6 +32,14 @@ class PackedRoutes:
     indices: torch.Tensor
     head_offsets: torch.Tensor
     keep_blocks: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PackedRoutesAndCoarseOutput:
+    """Packed fine routes and the coarse output derived from the same scores."""
+
+    routes: PackedRoutes
+    coarse_output: torch.Tensor
 
 
 class PackedRouteBuilder:
@@ -85,6 +95,67 @@ class PackedRouteBuilder:
             self._offsets,
             self._keep_values,
             route_query_offset=route_query_offset,
+        )
+
+
+class PackedRouteAndCoarseBuilder:
+    """Consume each score chunk once for fine routing and coarse attention."""
+
+    def __init__(
+        self,
+        layout: _ResolvedRouteLayout,
+        pooled_value: torch.Tensor,
+        *,
+        batch: int,
+        heads: int,
+        query_blocks: int,
+        key_blocks: int,
+        device: torch.device,
+        coarse_scale: float,
+    ) -> None:
+        if not math.isfinite(coarse_scale) or coarse_scale <= 0:
+            raise ValueError("coarse attention scale must be finite and positive")
+        if pooled_value.shape[:3] != (batch, heads, key_blocks):
+            raise ValueError("pooled V must match the routing batch, heads, and key blocks")
+        if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
+            raise ValueError("pooled V must use [batch,heads,key blocks,features]")
+        if pooled_value.dtype is not torch.float32:
+            raise ValueError("pooled V must use FP32")
+        if pooled_value.device != device:
+            raise ValueError("pooled V and routing scores must share a device")
+        self._route_builder = PackedRouteBuilder(
+            layout,
+            batch=batch,
+            heads=heads,
+            query_blocks=query_blocks,
+            key_blocks=key_blocks,
+            device=device,
+        )
+        self._pooled_value = pooled_value
+        self._coarse_scale = coarse_scale
+        self._coarse_chunks: list[torch.Tensor] = []
+
+    def write(
+        self,
+        scores: torch.Tensor,
+        *,
+        route_query_offset: int,
+    ) -> None:
+        """Consume one raw score chunk without retaining its score matrix."""
+        self._route_builder.write(scores, route_query_offset=route_query_offset)
+        scores.mul_(self._coarse_scale)
+        self._coarse_chunks.append(coarse_attention(scores, self._pooled_value))
+
+    def finish(self) -> PackedRoutesAndCoarseOutput:
+        """Return packed routes and the concatenated query-block output."""
+        coarse_output = (
+            self._coarse_chunks[0]
+            if len(self._coarse_chunks) == 1
+            else torch.cat(self._coarse_chunks, dim=2)
+        )
+        return PackedRoutesAndCoarseOutput(
+            routes=self._route_builder.routes,
+            coarse_output=coarse_output,
         )
 
 
@@ -144,8 +215,10 @@ __all__ = [
     "_MEAN_POOL_ROUTING",
     "_ROUTING_MODE_BY_NAME",
     "_ROUTING_NAME_BY_MODE",
+    "PackedRouteAndCoarseBuilder",
     "PackedRouteBuilder",
     "PackedRoutes",
+    "PackedRoutesAndCoarseOutput",
     "is_valid_routing_mode",
     "validate_routing_mode",
 ]

@@ -112,6 +112,64 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(sequence_leng
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("sequence_length", [64, 65, 192])
+def test_fused_value_projection_optionally_emits_valid_prefix_block_means(
+    sequence_length: int,
+) -> None:
+    operands = _random_operands(sequence_length=sequence_length)
+    input_mean = convrot_backend.dequantized_input_mean(
+        operands.input_qdata,
+        operands.input_scale,
+    )
+
+    actual = value_fusion._project_value_with_block_means_op(
+        *operands.as_tuple()[:2],
+        input_mean,
+        *operands.as_tuple()[2:],
+    )
+    expected = composed_value_projection(
+        *operands.as_tuple()[:2],
+        input_mean,
+        *operands.as_tuple()[2:],
+    )
+
+    assert int((actual[0].to(torch.int16) - expected.value).abs().max()) <= 1
+    torch.testing.assert_close(actual[1], expected.value_scale_multiplier, atol=2e-4, rtol=2e-5)
+    torch.testing.assert_close(actual[2], expected.value_mean, atol=2e-6, rtol=2e-6)
+    assert actual[3].shape == expected.block_mean.shape
+    torch.testing.assert_close(actual[3], expected.block_mean, atol=0.015625, rtol=0.01)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_fused_value_block_means_respect_internal_block_lengths() -> None:
+    operands = _random_operands(sequence_length=128)
+    block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
+    dequantized = operands.input_qdata.float() * operands.input_scale[..., None]
+    input_mean = torch.cat((dequantized[:, :64], dequantized[:, 64:81]), dim=1).mean(dim=1)
+
+    actual = value_fusion._project_value_with_block_means_op(
+        *operands.as_tuple()[:2],
+        input_mean,
+        *operands.as_tuple()[2:],
+        block_lengths,
+    )
+    projected = convrot_backend.linear_prepared(
+        *operands.as_tuple(),
+        None,
+        torch.float32,
+    ).view(1, 128, 2, 128)
+    expected = torch.stack(
+        (projected[:, :64].mean(dim=1), projected[:, 64:81].mean(dim=1)),
+        dim=2,
+    )
+
+    torch.testing.assert_close(actual[3], expected, atol=0.015625, rtol=0.01)
+    assert not bool(actual[0][..., 81:].any())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> None:
     operands = _random_operands(
         batch=2,
@@ -195,9 +253,21 @@ def test_value_projection_custom_ops_pass_opcheck() -> None:
             operands.weight_scale,
         ),
     )
+    summarized_value_result = torch.library.opcheck(
+        value_fusion._project_value_with_block_means_op,
+        (
+            operands.input_qdata,
+            operands.input_scale,
+            input_mean,
+            operands.weight_qdata,
+            operands.weight_scale,
+            torch.tensor([64], device="cuda", dtype=torch.int32),
+        ),
+    )
 
     assert set(mean_result.values()) == {"SUCCESS"}
     assert set(value_result.values()) == {"SUCCESS"}
+    assert set(summarized_value_result.values()) == {"SUCCESS"}
 
 
 @pytest.mark.gpu
@@ -236,6 +306,13 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
         weight_qdata,
         weight_scale,
     )
+    summarized = value_fusion._project_value_with_block_means_op(
+        input_qdata,
+        input_scale,
+        input_mean,
+        weight_qdata,
+        weight_scale,
+    )
 
     assert input_mean.shape == (2, 272)
     assert input_mean.dtype is torch.float32
@@ -245,3 +322,10 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
     assert value_scale.dtype is torch.float32
     assert value_mean.shape == (2, 3, 128)
     assert value_mean.dtype is torch.float32
+    assert [tensor.shape for tensor in summarized[:3]] == [
+        value.shape,
+        value_scale.shape,
+        value_mean.shape,
+    ]
+    assert summarized[3].shape == (2, 3, 2, 128)
+    assert summarized[3].dtype is torch.float32

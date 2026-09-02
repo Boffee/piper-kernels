@@ -8,6 +8,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 )
 from piper_kernels.attention.sparse_piper_attention.mean_pool import (
     _sequence_block_means,
+    packed_mean_pool_routes_and_coarse_from_summaries,
     packed_mean_pool_routes_from_sequences,
     packed_mean_pool_routes_from_summaries,
 )
@@ -92,3 +93,26 @@ def test_ragged_query_mean_uses_only_logical_rows() -> None:
     torch.testing.assert_close(query_mean[:, :, 0], torch.full_like(query_mean[:, :, 0], 2))
     torch.testing.assert_close(query_mean[:, :, 1], torch.full_like(query_mean[:, :, 1], 7))
     assert routes.indices.shape == (1, 2, 1)
+
+
+def test_route_and_coarse_path_reuses_chunked_mean_scores() -> None:
+    generator = torch.Generator().manual_seed(72)
+    query_mean = torch.randn((1, 2, 385, 8), generator=generator)
+    key_mean = torch.randn((1, 2, 5, 8), generator=generator)
+    pooled_value = torch.randn((1, 2, 5, 6), generator=generator)
+    layout = _layout((2, 3), 5)
+    coarse_scale = 8**-0.5
+
+    actual = packed_mean_pool_routes_and_coarse_from_summaries(
+        query_mean,
+        key_mean,
+        pooled_value,
+        layout,
+        coarse_scale=coarse_scale,
+    )
+    expected_routes = packed_mean_pool_routes_from_summaries(query_mean, key_mean, layout)
+    expected_output = torch.softmax((query_mean @ key_mean.mT) * coarse_scale, dim=-1)
+    expected_output = expected_output @ pooled_value
+
+    assert torch.equal(actual.routes.indices, expected_routes.indices)
+    torch.testing.assert_close(actual.coarse_output, expected_output)
