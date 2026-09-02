@@ -17,7 +17,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
 )
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
-from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length
+from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length, validate_block_lengths
 
 _BLOCK_M = 128
 _BLOCK_K = 128
@@ -183,23 +183,6 @@ def _validate_inputs(
     return batch, sequence_length, weight_qdata.shape[0] // HEAD_DIM
 
 
-def _validate_block_lengths(
-    block_lengths: torch.Tensor | None,
-    sequence_length: int,
-    device: torch.device,
-) -> None:
-    if block_lengths is None:
-        return
-    if (
-        sequence_length % TILE_ROWS
-        or block_lengths.shape != (sequence_length // TILE_ROWS,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != device
-        or not block_lengths.is_contiguous()
-    ):
-        raise ValueError("V projection block lengths must be one contiguous INT32 value per K64")
-
-
 def _launch_value_projection(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -217,7 +200,7 @@ def _launch_value_projection(
         weight_qdata,
         weight_scale,
     )
-    _validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
+    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     storage_sequence_length = padded_sequence_length(sequence_length)
     value = torch.empty(
         (batch, heads, HEAD_DIM, storage_sequence_length),
@@ -314,6 +297,7 @@ def _project_value_op(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     value, value_scale_multiplier, value_mean, _block_mean = _launch_value_projection(
         input_qdata,
@@ -321,7 +305,7 @@ def _project_value_op(
         input_mean,
         weight_qdata,
         weight_scale,
-        None,
+        block_lengths,
         emit_block_mean=False,
     )
     return value, value_scale_multiplier, value_mean
@@ -355,6 +339,7 @@ def _project_value_op_fake(
     _input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
+    _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     value, value_scale_multiplier, value_mean, _block_mean = _fake_value_projection(
         input_qdata,

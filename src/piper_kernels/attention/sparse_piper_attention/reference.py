@@ -9,6 +9,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
+from ._block_layout import valid_block_rows
 from ._routes import PackedRoutes
 
 _RECURRENCE_ROWS = 128
@@ -26,7 +27,8 @@ def _active_indices(
     sparse_key_blocks: int,
     sequence_length: int,
     route_head_offsets: list[int],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    block_lengths: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     route_start, route_stop = route_head_offsets[head : head + 2]
     selected_blocks = routes.indices[
         batch,
@@ -48,11 +50,18 @@ def _active_indices(
         (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
         device=routes.indices.device,
     )
-    return key_indices, torch.cat((selected_blocks, suffix_tiles))
+    tile_indices = torch.cat((selected_blocks, suffix_tiles))
+    valid_keys = (
+        None
+        if block_lengths is None
+        else valid_block_rows(block_lengths.index_select(0, tile_indices)).flatten()
+    )
+    return key_indices, tile_indices, valid_keys
 
 
 def _quantize_value_per_tile(
     value_centered: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize centered V with one scalar scale per logical K64 tile."""
     batch, heads, key_length, head_dim = value_centered.shape
@@ -61,6 +70,9 @@ def _quantize_value_per_tile(
     padded = value_centered.new_zeros((batch, heads, storage_length, head_dim))
     padded[:, :, :key_length] = value_centered
     grouped = padded.reshape(batch, heads, tile_count, _BLOCK_ROWS, head_dim)
+    if block_lengths is not None:
+        valid_rows = valid_block_rows(block_lengths)
+        grouped = torch.where(valid_rows[None, None, :, :, None], grouped, 0)
     scale = grouped.abs().amax(dim=(3, 4)) / _V_INT8_RANGE + _SCALE_EPSILON
     quantized = (
         (grouped / scale[..., None, None])
@@ -91,6 +103,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     *,
     sparse_key_blocks: int,
     scale: float,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate the selected quantized Sparse Piper algorithm in PyTorch.
 
@@ -105,6 +118,13 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
 
+    if block_lengths is not None:
+        valid_rows = valid_block_rows(block_lengths).reshape(-1)
+        valid_rows = valid_rows[None, None, :, None]
+        query_head_major = torch.where(valid_rows, query_head_major, 0)
+        key_head_major = torch.where(valid_rows, key_head_major, 0)
+        value_head_major = torch.where(valid_rows, value_head_major, 0)
+
     value_float = value_head_major.float()
     value_mean = value_float.mean(dim=2, keepdim=True)
     value_centered = value_float - value_mean
@@ -112,14 +132,14 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
         query_head_major,
         key_head_major,
     )
-    value_int8, value_scale = _quantize_value_per_tile(value_centered)
+    value_int8, value_scale = _quantize_value_per_tile(value_centered, block_lengths)
     output = torch.empty_like(query_head_major)
     route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 
     for batch_index in range(batch):
         for head in range(heads):
             for query_block in range(query_blocks):
-                key_indices, tile_indices = _active_indices(
+                key_indices, tile_indices, valid_keys = _active_indices(
                     routes,
                     batch=batch_index,
                     head=head,
@@ -127,6 +147,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     sparse_key_blocks=sparse_key_blocks,
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
+                    block_lengths=block_lengths,
                 )
                 selected_key = key_int8[batch_index, head].index_select(0, key_indices)
                 selected_value = value_int8[batch_index, head].index_select(0, key_indices)
@@ -162,6 +183,11 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                         * selected_key_scale[None, pair_start:pair_stop]
                         * scale
                     )
+                    if valid_keys is not None:
+                        scores = scores.masked_fill(
+                            ~valid_keys[pair_start:pair_stop][None, :],
+                            -float("inf"),
+                        )
                     pair_tile_start = pair_start // _BLOCK_ROWS
                     pair_tile_stop = (pair_stop + _BLOCK_ROWS - 1) // _BLOCK_ROWS
                     pair_value_scales = selected_value_scale[pair_tile_start:pair_tile_stop]
@@ -212,6 +238,7 @@ def reference_exact_sparse_attention(
     *,
     sparse_key_blocks: int,
     scale: float,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply the same routes with exact BF16 inputs and FP32 attention math."""
     batch, sequence, heads, _head_dim = query.shape
@@ -222,7 +249,7 @@ def reference_exact_sparse_attention(
     for batch_index in range(batch):
         for head in range(heads):
             for query_block in range(query_blocks):
-                key_indices, _tile_indices = _active_indices(
+                key_indices, _tile_indices, valid_keys = _active_indices(
                     routes,
                     batch=batch_index,
                     head=head,
@@ -230,13 +257,17 @@ def reference_exact_sparse_attention(
                     sparse_key_blocks=sparse_key_blocks,
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
+                    block_lengths=block_lengths,
                 )
                 query_start = query_block * _BLOCK_ROWS
                 query_stop = min(query_start + _BLOCK_ROWS, sequence)
                 block_query = query[batch_index, query_start:query_stop, head].float()
                 selected_key = key[batch_index, key_indices, head].float()
                 selected_value = value[batch_index, key_indices, head].float()
-                probability = torch.softmax(block_query @ selected_key.mT * scale, dim=-1)
+                scores = block_query @ selected_key.mT * scale
+                if valid_keys is not None:
+                    scores = scores.masked_fill(~valid_keys[None, :], -float("inf"))
+                probability = torch.softmax(scores, dim=-1)
                 output[batch_index, query_start:query_stop, head] = (
                     probability @ selected_value
                 ).to(value.dtype)

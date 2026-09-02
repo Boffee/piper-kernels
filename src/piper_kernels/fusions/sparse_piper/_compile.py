@@ -49,7 +49,7 @@ def source_files() -> tuple[str, ...]:
     return tuple(file_name for file_name in (__file__, _budget.__file__) if file_name is not None)
 
 
-def valid_sparse_piper_attention(  # noqa: PLR0911
+def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
     match: Match,
     *,
     batch: int | torch.SymInt,
@@ -176,6 +176,22 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
         )
     ):
         return False
+    block_lengths_node = match.kwargs.get("sparse_block_lengths")
+    if block_lengths_node is not None:
+        if not isinstance(block_lengths_node, torch.fx.Node):
+            return False
+        block_lengths = preparation_sharing.tensor_metadata(block_lengths_node)
+        if (
+            block_lengths is None
+            or block_lengths.ndim != 1
+            or block_lengths.dtype is not torch.int32
+            or block_lengths.device != device
+            or block_lengths.layout is not torch.strided
+            or not block_lengths.is_contiguous()
+            or preparation_sharing.dimension_key(block_lengths.shape[0] * tile_rows)
+            != preparation_sharing.dimension_key(sequence_length)
+        ):
+            return False
     head_keep_ratio_units = match.kwargs["sparse_head_keep_ratio_units"]
     return bool(
         isinstance(head_keep_ratio_units, (list, tuple))

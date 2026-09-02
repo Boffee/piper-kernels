@@ -248,13 +248,17 @@ output = attention(
     key,
     value,
     sparse_key_blocks=1036,
+    block_lengths=block_lengths,  # optional valid-front padded K64 storage
 )
 ```
 
-Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout, and every logical input row
-participates in attention. The sequence length may be arbitrary; the operator pads only its internal
-quantized storage to K64. `sparse_key_blocks` is a runtime count of complete routeable K64 prefix
-tiles, so any partial final tile belongs to the dense suffix. Routing defaults to exact FP32 DSA;
+Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. Without `block_lengths`, every row
+participates in attention and the sequence length may be arbitrary; the operator pads only its
+internal quantized storage to K64. Supplying one contiguous device INT32 length in `[1, 64]` per
+physical K64 block instead selects valid-front padded storage. The output retains that physical
+layout so the caller can apply its existing gather; padded query rows are unspecified.
+`sparse_key_blocks` is a runtime count of complete routeable physical K64 prefix tiles, so any
+compact partial final tile belongs to the dense suffix. Routing defaults to exact FP32 DSA;
 passing `routing="mean_pool"` instead scores FP32 Q64/K64 mean summaries. Both policies select the
 same per-head block budget over the sparse prefix, after which every query attends to every
 remaining K/V row in the same softmax. This makes text,

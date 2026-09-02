@@ -8,6 +8,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
+from ._block_layout import validate_block_lengths
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
     _MEAN_POOL_ROUTING,
@@ -18,6 +19,7 @@ from ._routes import (
 )
 from .coarse import (
     _apply_chunked_coarse_residual,
+    _mean_pool_head_major_blocks,
     _mean_pool_token_blocks,
     _preserve_coarse_residual_in_graph,
     validate_coarse_residual_inputs,
@@ -176,29 +178,23 @@ def packed_mean_pool_routes_from_sequences(
     query: torch.Tensor,
     key: torch.Tensor,
     layout: _ResolvedRouteLayout,
+    block_lengths: torch.Tensor | None = None,
 ) -> PackedRoutes:
-    """Portable eager fallback for compact Q and complete sparse-prefix K64 blocks."""
-    _validate_mean_sequences(query, key)
-    query_mean = _sequence_block_means(query)
-    key_mean = _sequence_block_means(key)
+    """Route compact or valid-front padded Q and sparse-prefix K64 blocks."""
+    _validate_mean_sequences(query, key, block_lengths)
+    query_mean = _sequence_block_means(query, block_lengths)
+    key_mean = _sequence_block_means(
+        key,
+        None if block_lengths is None else block_lengths[: key.shape[2] // _BLOCK_ROWS],
+    )
     return packed_mean_pool_routes_from_summaries(query_mean, key_mean, layout)
 
 
 def _sequence_block_means(
     sequence: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    rows = sequence.shape[2]
-    full_rows = rows // _BLOCK_ROWS * _BLOCK_ROWS
-    summaries = []
-    if full_rows:
-        blocks = sequence[:, :, :full_rows].unflatten(
-            2,
-            (full_rows // _BLOCK_ROWS, _BLOCK_ROWS),
-        )
-        summaries.append(blocks.float().mean(dim=3))
-    if full_rows != rows:
-        summaries.append(sequence[:, :, full_rows:].float().mean(dim=2, keepdim=True))
-    return summaries[0] if len(summaries) == 1 else torch.cat(summaries, dim=2)
+    return _mean_pool_head_major_blocks(sequence, block_lengths)
 
 
 def _mean_pool_score_chunks(
@@ -254,6 +250,7 @@ def _validate_mean_summaries(query_mean: torch.Tensor, key_mean: torch.Tensor) -
 def _validate_mean_sequences(
     query: torch.Tensor,
     key: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> None:
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError("mean-pool query and key sequences must be rank-four tensors")
@@ -269,6 +266,16 @@ def _validate_mean_sequences(
         raise ValueError("mean-pool query and key features must be contiguous")
     if key.shape[2] % _BLOCK_ROWS:
         raise ValueError("mean-pool sparse keys require complete K64 blocks")
+    if block_lengths is not None:
+        block_count = validate_block_lengths(
+            block_lengths,
+            sequence_length=query.shape[2],
+            device=query.device,
+            context="padded mean-pool routing",
+            require_contiguous=True,
+        )
+        if key.shape[2] // _BLOCK_ROWS > block_count:
+            raise ValueError("padded mean-pool keys cannot exceed the block-length layout")
 
 
 __all__ = [

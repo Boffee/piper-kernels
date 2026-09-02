@@ -232,6 +232,25 @@ def test_dequantized_input_mean_matches_the_represented_activation() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_dequantized_input_mean_ignores_internal_padding() -> None:
+    operands = _random_operands(batch=2, sequence_length=192, input_features=256)
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = torch.arange(192, device="cuda") % 64
+    valid_rows = valid_rows < block_lengths.repeat_interleave(64)
+
+    actual = convrot_backend.dequantized_input_mean(
+        operands.input_qdata,
+        operands.input_scale,
+        block_lengths,
+    )
+    represented = operands.input_qdata.float() * operands.input_scale[..., None]
+    expected = represented[:, valid_rows].mean(dim=1)
+
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_value_projection_custom_ops_pass_opcheck() -> None:
     operands = _random_operands()
     input_mean = convrot_backend.dequantized_input_mean(

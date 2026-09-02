@@ -12,7 +12,7 @@ from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
 from .coarse import coarse_attention
 
 try:
-    from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
+    from ._routes_triton import tiled_radix_select_packed_routes as _sm120_select_routes
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
         raise

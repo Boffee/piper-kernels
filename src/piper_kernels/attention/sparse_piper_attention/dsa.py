@@ -9,6 +9,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
+from ._block_layout import valid_block_rows, validate_block_lengths
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
     _DSA_ROUTING,
@@ -197,11 +198,6 @@ def packed_dsa_routes_from_sequences(
 ) -> PackedRoutes:
     """Select routes for compact or valid-front padded Q and sparse-prefix K64."""
     _validate_dsa_sequences(query, key, block_lengths)
-    if block_lengths is not None:
-        torch._assert_async(
-            torch.all((block_lengths >= 1) & (block_lengths <= _BLOCK_ROWS)),
-            f"padded DSA block lengths must lie in [1, {_BLOCK_ROWS}]",
-        )
     query_summary, key_max, key_min = _sequence_block_summaries(query, key, block_lengths)
     return packed_dsa_routes_from_summaries(query_summary, key_max, key_min, layout)
 
@@ -239,8 +235,6 @@ def _sequence_block_summaries(
     key: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if block_lengths is not None:
-        _validate_dsa_block_lengths(query, key, block_lengths)
     if _supports_sm120_sequence_summaries(query, key):
         assert _sm120_sequence_block_summaries is not None
         return _sm120_sequence_block_summaries(query, key, block_lengths)
@@ -271,29 +265,11 @@ def _padded_block_extrema(
     block_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     blocks = sequence.unflatten(2, (block_lengths.numel(), _BLOCK_ROWS)).float()
-    valid_rows = torch.arange(_BLOCK_ROWS, device=sequence.device) < block_lengths[:, None]
+    valid_rows = valid_block_rows(block_lengths)
     valid_rows = valid_rows[None, None, :, :, None]
     maximum = torch.where(valid_rows, blocks, -float("inf")).amax(dim=3)
     minimum = torch.where(valid_rows, blocks, float("inf")).amin(dim=3)
     return maximum, minimum
-
-
-def _validate_dsa_block_lengths(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    block_lengths: torch.Tensor,
-) -> None:
-    query_rows = query.shape[2]
-    if (
-        query_rows % _BLOCK_ROWS
-        or block_lengths.shape != (query_rows // _BLOCK_ROWS,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != query.device
-        or not block_lengths.is_contiguous()
-        or key.shape[2] % _BLOCK_ROWS
-        or key.shape[2] // _BLOCK_ROWS > block_lengths.numel()
-    ):
-        raise ValueError("padded DSA requires one contiguous device INT32 length per query K64")
 
 
 def _dsa_scores(
@@ -385,4 +361,12 @@ def _validate_dsa_sequences(
     if not query.is_floating_point() or not key.is_floating_point():
         raise TypeError("DSA query and key sequences must be floating-point tensors")
     if block_lengths is not None:
-        _validate_dsa_block_lengths(query, key, block_lengths)
+        block_count = validate_block_lengths(
+            block_lengths,
+            sequence_length=query.shape[2],
+            device=query.device,
+            context="padded DSA",
+            require_contiguous=True,
+        )
+        if key.shape[2] // _BLOCK_ROWS > block_count:
+            raise ValueError("padded DSA keys cannot exceed the block-length layout")

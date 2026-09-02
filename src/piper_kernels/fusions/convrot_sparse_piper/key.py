@@ -24,7 +24,7 @@ from piper_kernels.fusions.convrot_sage_qk.triton import (
     validate_qk_projection_inputs,
 )
 
-from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length
+from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length, validate_block_lengths
 
 _BLOCK_M = 128
 _BLOCK_K = 128
@@ -46,6 +46,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     key_scale_ptr,
     key_summary_ptr,
     key_aux_ptr,
+    block_lengths_ptr,
     rows,
     logical_sequence_length,
     storage_sequence_length,
@@ -57,6 +58,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
     mean_pool_summary: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     aligned_projection: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
@@ -103,6 +105,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         key_scale_ptr,
         key_summary_ptr,
         key_aux_ptr,
+        block_lengths_ptr,
         batch,
         heads,
         head_offsets,
@@ -111,6 +114,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         storage_sequence_length,
         row_block,
         mean_pool_summary,
+        mask_block_lengths,
         heads_per_program,
         head_dim,
         block_m,
@@ -165,7 +169,11 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
     rotary_dim: int,
     norm_epsilon: float,
     mean_pool_summary: bool,
+    block_lengths: torch.Tensor | None,
 ) -> None:
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else key_scale
+
     def launch(row_block_count: int, row_block_offset: int, *, aligned_rows: bool) -> None:
         _convrot_project_quantize_key_kernel[
             (
@@ -185,6 +193,7 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             key_scale,
             key_summary,
             key_aux,
+            block_lengths_ptr,
             batch * logical_sequence_length,
             logical_sequence_length,
             storage_sequence_length,
@@ -196,6 +205,7 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             rotary_dim=rotary_dim,
             norm_epsilon=norm_epsilon,
             mean_pool_summary=mean_pool_summary,
+            mask_block_lengths=has_block_lengths,
             aligned_projection=(
                 aligned_rows
                 and input_qdata.shape[2] % _BLOCK_K == 0
@@ -226,6 +236,7 @@ def _launch_key_projection(
     sin: torch.Tensor,
     norm_epsilon: float,
     routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     batch, sequence_length, heads, rotary_dim = _validate_inputs(
@@ -239,6 +250,7 @@ def _launch_key_projection(
         norm_epsilon=norm_epsilon,
     )
     storage_sequence_length = padded_sequence_length(sequence_length)
+    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     key = torch.empty(
         (batch, heads, storage_sequence_length, HEAD_DIM),
         device=input_qdata.device,
@@ -276,6 +288,7 @@ def _launch_key_projection(
         rotary_dim=rotary_dim,
         norm_epsilon=norm_epsilon,
         mean_pool_summary=mean_pool_summary,
+        block_lengths=block_lengths,
     )
     return key, key_scale, key_summary, key_aux
 
@@ -294,6 +307,7 @@ def _project_key_op(
     sin: torch.Tensor,
     norm_epsilon: float,
     routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key_projection(
         input_qdata,
@@ -305,6 +319,7 @@ def _project_key_op(
         sin,
         norm_epsilon,
         routing_mode,
+        block_lengths,
     )
 
 
@@ -319,6 +334,7 @@ def _project_key_op_fake(
     _sin: torch.Tensor,
     _norm_epsilon: float,
     routing_mode: int,
+    _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     storage_sequence_length = padded_sequence_length(sequence_length)

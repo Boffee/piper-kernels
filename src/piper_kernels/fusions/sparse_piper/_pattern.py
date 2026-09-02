@@ -116,7 +116,15 @@ def _sparse_piper_projection_components(
     *,
     operand_users: int,
     attention_users: int | None = None,
-) -> tuple[CallFunction, CallFunction, CallFunction, CallFunction, KeywordArg]:
+    with_block_lengths: bool = False,
+) -> tuple[
+    CallFunction,
+    CallFunction,
+    CallFunction,
+    CallFunction,
+    KeywordArg,
+    KeywordArg | None,
+]:
     query = _normalized_rope_pattern(
         projection("sparse_q"),
         "sparse_q",
@@ -134,6 +142,7 @@ def _sparse_piper_projection_components(
         _users=operand_users,
     )
     sparse_key_blocks = KeywordArg("sparse_key_blocks")
+    block_lengths = KeywordArg("sparse_block_lengths") if with_block_lengths else None
     arguments = (
         torch.ops.piper_kernels.sparse_piper_attention.default,
         query,
@@ -143,36 +152,65 @@ def _sparse_piper_projection_components(
         sparse_key_blocks,
         KeywordArg("sparse_softmax_scale"),
         KeywordArg("sparse_routing_mode"),
+        *((block_lengths,) if block_lengths is not None else ()),
     )
     attention = (
         CallFunction(*arguments)
         if attention_users is None
         else CallFunction(*arguments, _users=attention_users)
     )
-    return attention, query, key, value, sparse_key_blocks
+    return attention, query, key, value, sparse_key_blocks, block_lengths
+
+
+def _sparse_piper_attention_projection_pattern(
+    projection: ProjectionPattern,
+    *,
+    with_block_lengths: bool,
+) -> CallFunction:
+    attention, _query, _key, _value, _sparse_key_blocks, _block_lengths = (
+        _sparse_piper_projection_components(
+            projection,
+            operand_users=1,
+            with_block_lengths=with_block_lengths,
+        )
+    )
+    return attention
 
 
 def sparse_piper_projection_pattern(
     projection: ProjectionPattern,
 ) -> CallFunction:
     """Match the common projected Q/K/V sparse-Piper attention region."""
-    attention, _query, _key, _value, _sparse_key_blocks = _sparse_piper_projection_components(
+    return _sparse_piper_attention_projection_pattern(
         projection,
-        operand_users=1,
+        with_block_lengths=False,
     )
-    return attention
 
 
-def sparse_piper_coarse_residual_projection_pattern(
+def sparse_piper_block_lengths_projection_pattern(
     projection: ProjectionPattern,
 ) -> CallFunction:
-    """Match projected sparse attention plus a Q/K/V-derived coarse residual."""
-    fine_output, query, key, value, sparse_key_blocks = _sparse_piper_projection_components(
+    """Match projected sparse attention over valid-front padded K64 storage."""
+    return _sparse_piper_attention_projection_pattern(
         projection,
-        operand_users=2,
-        attention_users=1,
+        with_block_lengths=True,
     )
-    return CallFunction(
+
+
+def _sparse_piper_coarse_residual_projection_pattern(
+    projection: ProjectionPattern,
+    *,
+    with_block_lengths: bool,
+) -> CallFunction:
+    fine_output, query, key, value, sparse_key_blocks, block_lengths = (
+        _sparse_piper_projection_components(
+            projection,
+            operand_users=2,
+            attention_users=1,
+            with_block_lengths=with_block_lengths,
+        )
+    )
+    arguments = (
         torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
         fine_output,
         query,
@@ -183,10 +221,34 @@ def sparse_piper_coarse_residual_projection_pattern(
         KeywordArg("coarse_key_blocks"),
         KeywordArg("coarse_scale"),
         KeywordArg("coarse_routing_mode"),
+        *((block_lengths,) if block_lengths is not None else ()),
+    )
+    return CallFunction(*arguments)
+
+
+def sparse_piper_coarse_residual_projection_pattern(
+    projection: ProjectionPattern,
+) -> CallFunction:
+    """Match projected sparse attention plus a Q/K/V-derived coarse residual."""
+    return _sparse_piper_coarse_residual_projection_pattern(
+        projection,
+        with_block_lengths=False,
+    )
+
+
+def sparse_piper_coarse_residual_block_lengths_projection_pattern(
+    projection: ProjectionPattern,
+) -> CallFunction:
+    """Match sparse plus coarse attention over valid-front padded K64 storage."""
+    return _sparse_piper_coarse_residual_projection_pattern(
+        projection,
+        with_block_lengths=True,
     )
 
 
 __all__ = [
+    "sparse_piper_block_lengths_projection_pattern",
+    "sparse_piper_coarse_residual_block_lengths_projection_pattern",
     "sparse_piper_coarse_residual_projection_pattern",
     "sparse_piper_projection_pattern",
 ]

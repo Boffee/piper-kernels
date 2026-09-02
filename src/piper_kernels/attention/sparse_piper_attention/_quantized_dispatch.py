@@ -250,10 +250,10 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
 
     ``block_lengths`` is trusted layout metadata with one INT32 value per
     physical K64 block. Each value must be in ``[1, 64]``, valid tokens must
-    occupy the front of the block, and the values must sum to
-    ``logical_sequence_length``. Supplying it returns the full padded query
-    storage; outputs for padded query rows are unspecified and must be removed
-    by the caller's layout gather.
+    occupy the front of the block, and the metadata becomes the source of
+    token validity instead of ``logical_sequence_length``. Supplying it returns
+    the full padded query storage; outputs for padded query rows are unspecified
+    and must be removed by the caller's layout gather.
     """
     output = _new_quantized_attention_output(
         query,

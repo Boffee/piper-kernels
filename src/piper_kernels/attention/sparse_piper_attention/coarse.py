@@ -6,9 +6,10 @@ import math
 from collections.abc import Iterable
 
 import torch
-from torch.nn import functional
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
+
+from ._block_layout import valid_block_rows, validate_block_lengths
 
 
 def _preserve_coarse_residual_in_graph(*tensors: torch.Tensor) -> bool:
@@ -22,34 +23,6 @@ def validate_coarse_scale(coarse_scale: float) -> None:
     """Reject scales that do not preserve fine-route score ordering."""
     if not math.isfinite(coarse_scale) or coarse_scale <= 0:
         raise ValueError("coarse attention scale must be finite and positive")
-
-
-def _validate_block_lengths(
-    block_lengths: torch.Tensor,
-    *,
-    sequence_length: int,
-    device: torch.device,
-    context: str,
-    require_contiguous: bool = False,
-) -> int:
-    """Validate public valid-prefix block metadata without synchronizing CUDA."""
-    if (
-        block_lengths.ndim != 1
-        or block_lengths.numel() < 1
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != device
-        or sequence_length != block_lengths.numel() * _BLOCK_ROWS
-        or (require_contiguous and not block_lengths.is_contiguous())
-    ):
-        contiguity = " contiguous" if require_contiguous else ""
-        raise ValueError(
-            f"{context} block lengths must be one{contiguity} device INT32 value per K64"
-        )
-    torch._assert_async(
-        torch.all((block_lengths >= 1) & (block_lengths <= _BLOCK_ROWS)),
-        f"{context} block lengths must lie in [1, {_BLOCK_ROWS}]",
-    )
-    return block_lengths.numel()
 
 
 def _validate_key_block_scopes(
@@ -145,7 +118,7 @@ def validate_coarse_residual_inputs(
         available_sparse_key_blocks = query.shape[1] // _BLOCK_ROWS
         available_coarse_key_blocks = (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     else:
-        available_sparse_key_blocks = available_coarse_key_blocks = _validate_block_lengths(
+        available_sparse_key_blocks = available_coarse_key_blocks = validate_block_lengths(
             block_lengths,
             sequence_length=query.shape[1],
             device=query.device,
@@ -179,7 +152,7 @@ def mean_pool_block_values(
         raise ValueError("coarse attention V must contain at least one sequence row")
 
     if block_lengths is not None:
-        _validate_block_lengths(
+        validate_block_lengths(
             block_lengths,
             sequence_length=sequence_length,
             device=value.device,
@@ -193,45 +166,53 @@ def _mean_pool_token_blocks(
     block_lengths: torch.Tensor | None,
 ) -> torch.Tensor:
     """Mean-pool validated token-major Q, K, or V storage into FP32 blocks."""
-    sequence_length = sequence.shape[1]
-
-    if block_lengths is None:
-        block_count = (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-        storage_length = block_count * _BLOCK_ROWS
-        padded = functional.pad(sequence, (0, 0, 0, 0, 0, storage_length - sequence_length))
-        lengths = torch.minimum(
-            torch.full(
-                (block_count,),
-                _BLOCK_ROWS,
-                dtype=torch.int32,
-                device=sequence.device,
-            ),
-            sequence_length
-            - torch.arange(block_count, dtype=torch.int32, device=sequence.device) * _BLOCK_ROWS,
-        )
-        blocks = padded.reshape(
-            sequence.shape[0],
-            block_count,
-            _BLOCK_ROWS,
-            sequence.shape[2],
-            sequence.shape[3],
-        )
-    else:
-        block_count = block_lengths.numel()
-        lengths = block_lengths
-        blocks = sequence.reshape(
-            sequence.shape[0],
-            block_count,
-            _BLOCK_ROWS,
-            sequence.shape[2],
-            sequence.shape[3],
-        )
-        valid_rows = torch.arange(_BLOCK_ROWS, device=sequence.device)[None, :] < lengths[:, None]
-        blocks = torch.where(valid_rows[None, :, :, None, None], blocks, 0)
-
-    pooled = blocks.sum(dim=2, dtype=torch.float32)
-    pooled /= lengths.reshape(1, block_count, 1, 1)
+    pooled = _mean_pool_sequence_blocks(sequence, sequence_dim=1, block_lengths=block_lengths)
     return pooled.permute(0, 2, 1, 3).contiguous()
+
+
+def _mean_pool_head_major_blocks(
+    sequence: torch.Tensor,
+    block_lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    """Mean-pool validated head-major Q or K storage into FP32 blocks."""
+    return _mean_pool_sequence_blocks(
+        sequence,
+        sequence_dim=2,
+        block_lengths=block_lengths,
+    ).contiguous()
+
+
+def _mean_pool_sequence_blocks(
+    sequence: torch.Tensor,
+    *,
+    sequence_dim: int,
+    block_lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    """Pool K64 storage along one sequence dimension without materializing padding."""
+    sequence_length = sequence.shape[sequence_dim]
+    if block_lengths is not None:
+        block_count = block_lengths.numel()
+        blocks = sequence.unflatten(sequence_dim, (block_count, _BLOCK_ROWS))
+        mask_shape = [1] * blocks.ndim
+        mask_shape[sequence_dim : sequence_dim + 2] = (block_count, _BLOCK_ROWS)
+        blocks = torch.where(valid_block_rows(block_lengths).reshape(mask_shape), blocks, 0)
+        pooled = blocks.sum(dim=sequence_dim + 1, dtype=torch.float32)
+        length_shape = [1] * sequence.ndim
+        length_shape[sequence_dim] = block_count
+        return pooled / block_lengths.reshape(length_shape)
+
+    full_rows = sequence_length // _BLOCK_ROWS * _BLOCK_ROWS
+    summaries = []
+    if full_rows:
+        blocks = sequence.narrow(sequence_dim, 0, full_rows).unflatten(
+            sequence_dim,
+            (full_rows // _BLOCK_ROWS, _BLOCK_ROWS),
+        )
+        summaries.append(blocks.sum(dim=sequence_dim + 1, dtype=torch.float32) / _BLOCK_ROWS)
+    if full_rows != sequence_length:
+        tail = sequence.narrow(sequence_dim, full_rows, sequence_length - full_rows)
+        summaries.append(tail.mean(dim=sequence_dim, keepdim=True, dtype=torch.float32))
+    return summaries[0] if len(summaries) == 1 else torch.cat(summaries, dim=sequence_dim)
 
 
 def coarse_attention(

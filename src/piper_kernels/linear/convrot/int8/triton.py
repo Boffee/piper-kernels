@@ -109,9 +109,11 @@ def _dequantized_input_mean_partial_kernel(
     input_ptr,
     input_scale_ptr,
     partial_ptr,
+    block_lengths_ptr,
     sequence_length,
     input_features: tl.constexpr,
     row_block_count: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
 ):
@@ -124,6 +126,13 @@ def _dequantized_input_mean_partial_kernel(
     valid = (sequence_offsets[:, None] < sequence_length) & (
         feature_offsets[None, :] < input_features
     )
+    if mask_block_lengths:
+        block_lengths = tl.load(
+            block_lengths_ptr + sequence_offsets // 64,
+            mask=sequence_offsets < sequence_length,
+            other=0,
+        )
+        valid &= sequence_offsets[:, None] % 64 < block_lengths[:, None]
     values = tl.load(
         input_ptr
         + (batch * sequence_length + sequence_offsets[:, None]) * input_features
@@ -148,10 +157,12 @@ def _dequantized_input_mean_partial_kernel(
 def _dequantized_input_mean_reduce_kernel(
     partial_ptr,
     output_ptr,
+    valid_count_ptr,
     sequence_length,
     input_features: tl.constexpr,
     row_block_count: tl.constexpr,
     reduction_rows: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     block_k: tl.constexpr,
 ):
     """Reduce prepared-input partial sums to one FP32 feature mean per batch."""
@@ -166,7 +177,8 @@ def _dequantized_input_mean_reduce_kernel(
         mask=(row_offsets[:, None] < row_block_count) & (feature_offsets[None, :] < input_features),
         other=0.0,
     )
-    mean = tl.sum(partial, axis=0) / sequence_length
+    valid_count = tl.load(valid_count_ptr) if mask_block_lengths else sequence_length
+    mean = tl.sum(partial, axis=0) / valid_count
     tl.store(
         output_ptr + batch * input_features + feature_offsets,
         mean,
@@ -835,8 +847,9 @@ def _prepare_input_fake(
 def dequantized_input_mean(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return the FP32 sequence mean represented by prepared ConvRot storage."""
+    """Return the FP32 compact or valid-front padded prepared-input mean."""
     if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
         raise ValueError("ConvRot mean input must be [batch,sequence,features] INT8")
     batch, sequence_length, input_features = input_qdata.shape
@@ -846,6 +859,14 @@ def dequantized_input_mean(
         raise ValueError("ConvRot mean operands must share a CUDA device")
     if not input_qdata.is_contiguous() or not input_scale.is_contiguous():
         raise ValueError("ConvRot mean operands must be contiguous")
+    if block_lengths is not None and (
+        sequence_length % 64
+        or block_lengths.shape != (sequence_length // 64,)
+        or block_lengths.dtype is not torch.int32
+        or block_lengths.device != input_qdata.device
+        or not block_lengths.is_contiguous()
+    ):
+        raise ValueError("ConvRot mean block lengths must be one contiguous device INT32 per K64")
     row_block_count = int(triton.cdiv(sequence_length, _MEAN_BLOCK_M))
     partial = torch.empty(
         (batch, row_block_count, input_features),
@@ -857,15 +878,20 @@ def dequantized_input_mean(
         device=input_qdata.device,
         dtype=torch.float32,
     )
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else input_scale
+    valid_count = block_lengths.sum(dtype=torch.float32) if has_block_lengths else input_scale
     _dequantized_input_mean_partial_kernel[
         (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
     ](
         input_qdata,
         input_scale,
         partial,
+        block_lengths_ptr,
         sequence_length,
         input_features=input_features,
         row_block_count=row_block_count,
+        mask_block_lengths=has_block_lengths,
         block_m=_MEAN_BLOCK_M,
         block_k=_MEAN_BLOCK_K,
         num_warps=8,
@@ -873,10 +899,12 @@ def dequantized_input_mean(
     _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
         partial,
         output,
+        valid_count,
         sequence_length,
         input_features=input_features,
         row_block_count=row_block_count,
         reduction_rows=triton.next_power_of_2(row_block_count),
+        mask_block_lengths=has_block_lengths,
         block_k=_MEAN_BLOCK_K,
         num_warps=8,
     )
@@ -887,6 +915,7 @@ def dequantized_input_mean(
 def _dequantized_input_mean_fake(
     input_qdata: torch.Tensor,
     _input_scale: torch.Tensor,
+    _block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return input_qdata.new_empty(
         (input_qdata.shape[0], input_qdata.shape[2]),

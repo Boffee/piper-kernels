@@ -50,7 +50,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v17"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v18"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -234,6 +234,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
     sparse_routing_mode: int,
+    sparse_block_lengths: torch.fx.Node | None = None,
     coarse_compression_gate: torch.fx.Node | None = None,
     coarse_key_blocks: Argument | None = None,
     coarse_scale: float | None = None,
@@ -250,6 +251,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     heads = q_weight_value.shape[0] // _HEAD_DIM
     head_dim = _HEAD_DIM
     storage_sequence_length = _layout.padded_sequence_length(sequence_length)
+    block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
     with graph.inserting_before(original):
         logical_sequence_length = graph.call_function(
             torch.ops.aten.sym_size.int,
@@ -291,6 +293,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 sparse_q_norm_epsilon,
                 sparse_softmax_scale,
                 sparse_routing_mode,
+                *block_length_arguments,
             ),
             query_values,
         )
@@ -329,12 +332,12 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
         key, key_scale, key_summary, key_aux = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_sparse_piper_project_key.default,
-            (*key_arguments, sparse_routing_mode),
+            (*key_arguments, sparse_routing_mode, *block_length_arguments),
             key_values,
         )
         input_mean = graph.call_function(
             torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
-            args=(input_qdata, input_scale),
+            args=(input_qdata, input_scale, *block_length_arguments),
         )
         input_mean.meta["val"] = input_value.new_empty(
             (batch, input_value.shape[-1]),
@@ -373,6 +376,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 input_mean,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
+                *block_length_arguments,
             ),
             value_values,
         )
@@ -403,7 +407,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                     logical_sequence_length,
                     sparse_routing_mode,
                     coarse_scale,
-                    None,
+                    sparse_block_lengths,
                     coarse_key_blocks,
                 ),
             )
@@ -416,6 +420,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                     sparse_key_blocks,
                     logical_sequence_length,
                     sparse_routing_mode,
+                    *block_length_arguments,
                 ),
             )
     replacement.meta = original.meta.copy()
@@ -425,16 +430,29 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
 
 
 _patterns = PatternMatcherPass("convrot_sparse_piper_projection")
-register_graph_pattern(
-    sparse_piper_pattern.sparse_piper_coarse_residual_projection_pattern(_linear_pattern),
-    extra_check=_valid_sparse_piper_coarse_residual_projection,
-    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-)(_replace_sparse_piper_projection)
-register_graph_pattern(
-    sparse_piper_pattern.sparse_piper_projection_pattern(_linear_pattern),
-    extra_check=_valid_sparse_piper_projection,
-    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-)(_replace_sparse_piper_projection)
+for pattern, extra_check in (
+    (
+        sparse_piper_pattern.sparse_piper_coarse_residual_block_lengths_projection_pattern,
+        _valid_sparse_piper_coarse_residual_projection,
+    ),
+    (
+        sparse_piper_pattern.sparse_piper_coarse_residual_projection_pattern,
+        _valid_sparse_piper_coarse_residual_projection,
+    ),
+    (
+        sparse_piper_pattern.sparse_piper_block_lengths_projection_pattern,
+        _valid_sparse_piper_projection,
+    ),
+    (
+        sparse_piper_pattern.sparse_piper_projection_pattern,
+        _valid_sparse_piper_projection,
+    ),
+):
+    register_graph_pattern(
+        pattern(_linear_pattern),
+        extra_check=extra_check,
+        pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+    )(_replace_sparse_piper_projection)
 
 
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:

@@ -54,6 +54,7 @@ def store_query_tile(
     query_ptr,
     query_scale_ptr,
     query_summary_ptr,
+    block_lengths_ptr,
     batch,
     heads,
     head_offsets,
@@ -63,6 +64,7 @@ def store_query_tile(
     query_block,
     softmax_scale: tl.constexpr,
     mean_pool_summary: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
@@ -72,14 +74,21 @@ def store_query_tile(
     """Quantize and store one transformed sparse-Piper query tile and route summary."""
     feature_offsets = tl.arange(0, head_dim)
     valid_rows = sequence_offsets < logical_sequence_length
-    if mask_ragged_tail:
+    block_length = block_m
+    if mask_block_lengths:
+        block_length = tl.load(block_lengths_ptr + query_block)
+        valid_rows = sequence_offsets - query_block * block_m < block_length
+    if mask_block_lengths or mask_ragged_tail:
         values = tl.where(valid_rows[:, None, None], values, 0.0)
     if mean_pool_summary:
-        valid_count = (
-            logical_sequence_length - query_block * block_m if mask_ragged_tail else block_m
-        )
+        if mask_block_lengths:
+            valid_count = block_length
+        else:
+            valid_count = (
+                logical_sequence_length - query_block * block_m if mask_ragged_tail else block_m
+            )
         summary = tl.sum(values, axis=0) / valid_count
-    elif mask_ragged_tail:
+    elif mask_block_lengths or mask_ragged_tail:
         summary = tl.max(
             tl.where(valid_rows[:, None, None], values, -float("inf")), axis=0
         ) + tl.min(tl.where(valid_rows[:, None, None], values, float("inf")), axis=0)
@@ -96,7 +105,10 @@ def store_query_tile(
 
     group_offsets = tl.arange(0, block_m // scale_rows)
     group_valid = head_offsets[:, None] < heads
-    if mask_ragged_tail:
+    if mask_block_lengths:
+        group_starts = group_offsets * scale_rows
+        group_valid = group_valid & (group_starts[None, :] < block_length)
+    elif mask_ragged_tail:
         group_starts = query_block * block_m + group_offsets * scale_rows
         group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
     quantized, stored_scale = qk_quantization.quantize_query_tile(
@@ -138,6 +150,7 @@ def store_key_tile(
     key_scale_ptr,
     key_summary_ptr,
     key_aux_ptr,
+    block_lengths_ptr,
     batch,
     heads,
     head_offsets,
@@ -146,6 +159,7 @@ def store_key_tile(
     storage_sequence_length,
     row_block,
     mean_pool_summary: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -153,8 +167,23 @@ def store_key_tile(
 ):
     """Quantize and store one transformed sparse-Piper key tile and route summaries."""
     feature_offsets = tl.arange(0, head_dim)
-    valid_rows = sequence_offsets < logical_sequence_length
-    values = tl.where(valid_rows[:, None, None], values, 0.0)
+    local_tile_offsets = tl.arange(0, block_m // scale_rows)
+    tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
+    row_in_tile = tl.arange(0, scale_rows)
+    if mask_block_lengths:
+        lengths = tl.load(
+            block_lengths_ptr + tile_offsets,
+            mask=tile_offsets < storage_sequence_length // scale_rows,
+            other=0,
+        )
+        valid = row_in_tile[None, :] < lengths[:, None]
+    else:
+        valid = tile_offsets[:, None] * scale_rows + row_in_tile[None, :] < logical_sequence_length
+    values = tl.where(
+        tl.reshape(valid, (block_m,))[:, None, None],
+        values,
+        0.0,
+    )
     grouped = tl.reshape(
         tl.permute(values, (1, 0, 2)),
         (
@@ -164,10 +193,6 @@ def store_key_tile(
             head_dim,
         ),
     )
-    local_tile_offsets = tl.arange(0, block_m // scale_rows)
-    tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
-    row_in_tile = tl.arange(0, scale_rows)
-    valid = tile_offsets[:, None] * scale_rows + row_in_tile[None, :] < logical_sequence_length
     if mean_pool_summary:
         valid_count = tl.sum(valid.to(tl.int32), axis=1)
         key_summary = tl.sum(grouped, axis=2) / valid_count[None, :, None]

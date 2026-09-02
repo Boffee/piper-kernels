@@ -179,6 +179,34 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("routing_mode", [_MEAN_POOL_ROUTING, _DSA_ROUTING])
+def test_fused_key_projection_ignores_internal_padding(routing_mode: int) -> None:
+    operands = _random_operands(sequence_length=192)
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = torch.arange(192, device="cuda") % 64
+    valid_rows = valid_rows < block_lengths.repeat_interleave(64)
+    corrupted_qdata = operands.input_qdata.clone()
+    corrupted_scale = operands.input_scale.clone()
+    corrupted_qdata[:, ~valid_rows] = 127
+    corrupted_scale[:, ~valid_rows] = 100
+    arguments = (*operands.as_tuple()[2:], 1e-5, routing_mode, block_lengths)
+
+    expected = key_fusion._project_key_op(
+        operands.input_qdata,
+        operands.input_scale,
+        *arguments,
+    )
+    actual = key_fusion._project_key_op(
+        corrupted_qdata,
+        corrupted_scale,
+        *arguments,
+    )
+
+    assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_key_projection_custom_op_passes_opcheck() -> None:
     operands = _random_operands()
     result = torch.library.opcheck(

@@ -48,6 +48,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         *,
         value_bias: bool = False,
         strided_rope: bool = False,
+        routing: str = "dsa",
     ) -> None:
         super().__init__()
         projections = []
@@ -103,7 +104,7 @@ class _SparseProjectionAttention(torch.nn.Module):
             sin = torch.stack((sin, sin), dim=-1)[..., 0]
         self.register_buffer("cos", cos)
         self.register_buffer("sin", sin)
-        self.sparse_attention = SparsePiperAttention((0.5, 1.0))
+        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
         normalized = F.rms_norm(
@@ -139,13 +140,18 @@ class _SparseProjectionAttention(torch.nn.Module):
         )
         return query, key, value
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        block_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         query, key, value = self._project_inputs(hidden_states)
         return self.sparse_attention(
             query,
             key,
             value,
             sparse_key_blocks=self.sparse_key_blocks,
+            block_lengths=block_lengths,
         )
 
 
@@ -159,14 +165,14 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
         sparse_routing: str,
         coarse_routing: str | None = None,
     ) -> None:
-        super().__init__()
-        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=sparse_routing)
+        super().__init__(routing=sparse_routing)
         self.coarse_routing = sparse_routing if coarse_routing is None else coarse_routing
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         compression_gate: torch.Tensor,
+        block_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value = self._project_inputs(hidden_states)
         fine_output = self.sparse_attention(
@@ -174,6 +180,7 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             key,
             value,
             sparse_key_blocks=self.sparse_key_blocks,
+            block_lengths=block_lengths,
         )
         residual = (
             mean_pool_coarse_residual if self.coarse_routing == "mean_pool" else dsa_coarse_residual
@@ -187,6 +194,7 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             sparse_key_blocks=self.sparse_key_blocks,
             coarse_key_blocks=self.coarse_key_blocks,
             coarse_scale=self.coarse_scale,
+            block_lengths=block_lengths,
         )
 
 
@@ -412,6 +420,7 @@ def _run_explicit_fused_projection(
     compression_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     input_qdata, input_scale = convrot_backend.prepare_input(
         hidden_states,
@@ -429,6 +438,7 @@ def _run_explicit_fused_projection(
         1e-5,
         model.head_dim**-0.5,
         routing_mode,
+        block_lengths,
     )
     key = fused_key._project_key_op(
         input_qdata,
@@ -440,8 +450,13 @@ def _run_explicit_fused_projection(
         sin,
         1e-5,
         routing_mode,
+        block_lengths,
     )
-    input_mean = convrot_backend.dequantized_input_mean(input_qdata, input_scale)
+    input_mean = convrot_backend.dequantized_input_mean(
+        input_qdata,
+        input_scale,
+        block_lengths,
+    )
     projection_arguments = (
         input_qdata,
         input_scale,
@@ -450,7 +465,7 @@ def _run_explicit_fused_projection(
         model.value.weight.scale,
     )
     if compression_gate is None:
-        value = fused_value._project_value_op(*projection_arguments)
+        value = fused_value._project_value_op(*projection_arguments, block_lengths)
         return _sparse_piper_attention_from_quantized_op(
             *query,
             *key,
@@ -459,10 +474,14 @@ def _run_explicit_fused_projection(
             sparse_key_blocks,
             hidden_states.shape[1],
             routing_mode,
+            block_lengths,
         )
     assert coarse_scale is not None
     assert coarse_key_blocks is not None
-    value = fused_value._project_value_with_block_means_op(*projection_arguments)
+    value = fused_value._project_value_with_block_means_op(
+        *projection_arguments,
+        block_lengths,
+    )
     return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
         *query,
         *key,
@@ -473,7 +492,7 @@ def _run_explicit_fused_projection(
         hidden_states.shape[1],
         routing_mode,
         coarse_scale,
-        None,
+        block_lengths,
         coarse_key_blocks,
     )
 
@@ -616,6 +635,53 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean_pool", "dsa"])
+def test_cuda_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
+    torch.manual_seed(703)
+    model = _SparseProjectionAttention(routing=routing).eval()
+    hidden_states = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+
+    with torch.no_grad():
+        expected = _run_explicit_fused_projection(
+            model,
+            hidden_states,
+            model.cos,
+            model.sin,
+            model.sparse_key_blocks,
+            block_lengths=block_lengths,
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=options,
+        )(hidden_states, block_lengths)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
+        == 1
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+@pytest.mark.parametrize("routing", ["mean_pool", "dsa"])
 def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None:
     torch.manual_seed(713)
     model = _CoarseSparseProjectionAttention(sparse_routing=routing).eval()
@@ -682,6 +748,125 @@ def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) ->
         torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
     )
     assert all(target not in capture.targets for target in absent_targets)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+@pytest.mark.parametrize("routing", ["mean_pool", "dsa"])
+def test_cuda_coarse_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
+    torch.manual_seed(715)
+    model = _CoarseSparseProjectionAttention(sparse_routing=routing).eval()
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    hidden_states = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    valid_rows = torch.arange(model.sequence_length, device="cuda") % 64
+    valid_rows = valid_rows < block_lengths.repeat_interleave(64)
+    hidden_states[:, ~valid_rows] = torch.randn_like(hidden_states[:, ~valid_rows]).mul_(100)
+    compression_gate = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.heads,
+        model.head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+
+    with torch.no_grad():
+        semantic = model(hidden_states, compression_gate, block_lengths)
+        expected = _run_explicit_fused_projection(
+            model,
+            hidden_states,
+            model.cos,
+            model.sin,
+            model.sparse_key_blocks,
+            compression_gate=compression_gate,
+            coarse_scale=model.coarse_scale,
+            coarse_key_blocks=model.coarse_key_blocks,
+            block_lengths=block_lengths,
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=options,
+        )(hidden_states, compression_gate, block_lengths)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    relative_l2 = (
+        actual[:, valid_rows].float() - semantic[:, valid_rows].float()
+    ).norm() / semantic[:, valid_rows].float().norm()
+    assert relative_l2 < 0.025
+    assert (
+        capture.targets.count(
+            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+        )
+        == 1
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
+    assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
+    torch.manual_seed(716)
+    model = _CoarseSparseProjectionAttention(sparse_routing="mean_pool").eval()
+    hidden_states = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    compression_gate = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.heads,
+        model.head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    compiled = torch.compile(model, fullgraph=True, options=options)
+
+    with torch.no_grad():
+        for lengths in ([64, 17, 51], [33, 64, 11]):
+            block_lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+            expected = _run_explicit_fused_projection(
+                model,
+                hidden_states,
+                model.cos,
+                model.sin,
+                model.sparse_key_blocks,
+                compression_gate=compression_gate,
+                coarse_scale=model.coarse_scale,
+                coarse_key_blocks=model.coarse_key_blocks,
+                block_lengths=block_lengths,
+            )
+            actual = compiled(hidden_states, compression_gate, block_lengths)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    assert capture.calls == 1
 
 
 @pytest.mark.gpu
