@@ -174,6 +174,7 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
     input_ptr: torch.Tensor,
     output_max_ptr: torch.Tensor,
     output_min_ptr: torch.Tensor,
+    block_lengths_ptr: torch.Tensor,
     logical_block_count: int,
     logical_row_count: int,
     stride_ib: int,
@@ -184,6 +185,7 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
     head_dim: tl.constexpr,
     heads: tl.constexpr,
     sum_extrema: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
 ) -> None:
     block = tl.program_id(0)
@@ -200,8 +202,11 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
         + row_offsets * stride_ir
         + feature_offsets
     )
-    if mask_ragged_tail:
-        valid_rows = logical_block * block_rows + row_offsets < logical_row_count
+    if mask_block_lengths or mask_ragged_tail:
+        if mask_block_lengths:
+            valid_rows = row_offsets < tl.load(block_lengths_ptr + logical_block)
+        else:
+            valid_rows = logical_block * block_rows + row_offsets < logical_row_count
         values = tl.load(
             input_ptr + input_offsets,
             mask=valid_rows,
@@ -222,8 +227,9 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
 def sequence_block_summaries(
     query: torch.Tensor,
     key: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Summarize a ragged Q sequence and an aligned sparse-prefix K sequence."""
+    """Summarize compact or valid-front padded Q and sparse-prefix K blocks."""
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError("optimized DSA sequence summaries require rank-four Q/K tensors")
     if (
@@ -244,6 +250,17 @@ def sequence_block_summaries(
 
     batch, heads, query_rows, _head_dim = query.shape
     key_rows = key.shape[2]
+    if block_lengths is not None and (
+        query_rows % _BLOCK_ROWS
+        or block_lengths.shape != (query_rows // _BLOCK_ROWS,)
+        or block_lengths.dtype is not torch.int32
+        or block_lengths.device != query.device
+        or not block_lengths.is_contiguous()
+        or key_rows // _BLOCK_ROWS > block_lengths.numel()
+    ):
+        raise ValueError(
+            "optimized padded DSA requires one contiguous device INT32 length per query K64"
+        )
     query_blocks = (query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     key_blocks = key_rows // _BLOCK_ROWS
     query_summary = torch.empty(
@@ -261,6 +278,7 @@ def sequence_block_summaries(
         query,
         query_summary,
         query_summary,
+        query if block_lengths is None else block_lengths,
         logical_block_count=query_blocks,
         logical_row_count=query_rows,
         stride_ib=query.stride(0),
@@ -271,6 +289,7 @@ def sequence_block_summaries(
         head_dim=_HEAD_DIM,
         heads=heads,
         sum_extrema=True,
+        mask_block_lengths=block_lengths is not None,
         mask_ragged_tail=query_rows % _BLOCK_ROWS != 0,
         num_warps=4,
         num_stages=1,
@@ -279,6 +298,7 @@ def sequence_block_summaries(
         key,
         key_max,
         key_min,
+        key if block_lengths is None else block_lengths,
         logical_block_count=key_blocks,
         logical_row_count=key_rows,
         stride_ib=key.stride(0),
@@ -289,6 +309,7 @@ def sequence_block_summaries(
         head_dim=_HEAD_DIM,
         heads=heads,
         sum_extrema=False,
+        mask_block_lengths=block_lengths is not None,
         mask_ragged_tail=False,
         num_warps=4,
         num_stages=1,

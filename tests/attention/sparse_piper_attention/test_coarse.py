@@ -2,11 +2,13 @@
 
 import torch
 
+import piper_kernels.attention.sparse_piper_attention.mean_pool as mean_pool_module
 from piper_kernels import (
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
     mean_pool_block_values,
+    mean_pool_coarse_residual,
 )
 from piper_kernels.attention.sparse_piper_attention.dsa import (
     _dsa_scores,
@@ -67,6 +69,128 @@ def test_coarse_attention_uses_caller_supplied_block_logits() -> None:
 
     assert actual.shape == (1, 1, 2, 2)
     torch.testing.assert_close(actual, expected)
+
+
+def test_mean_pool_coarse_residual_matches_explicit_sparse_prefix_composition(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(mean_pool_module, "_QUERY_CHUNK_BLOCKS", 2)
+    generator = torch.Generator().manual_seed(918)
+    shape = (1, 129, 2, 8)
+    query = torch.randn(shape, generator=generator)
+    key = torch.randn(shape, generator=generator)
+    value = torch.randn(shape, generator=generator)
+    fine_output = torch.randn(shape, generator=generator)
+    compression_gate = torch.randn(shape, generator=generator)
+    sparse_key_blocks = 2
+    coarse_scale = shape[-1] ** -0.5
+
+    query_mean = mean_pool_block_values(query)
+    key_mean = mean_pool_block_values(key)[:, :, :sparse_key_blocks]
+    pooled_value = mean_pool_block_values(value)[:, :, :sparse_key_blocks]
+    expected = coarse_attention_residual(
+        fine_output,
+        (query_mean @ key_mean.mT) * coarse_scale,
+        pooled_value,
+        compression_gate,
+    )
+    actual = mean_pool_coarse_residual(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_scale=coarse_scale,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_mean_pool_coarse_residual_supports_valid_front_padded_blocks() -> None:
+    generator = torch.Generator().manual_seed(919)
+    block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
+    shape = (1, 3 * 64, 2, 8)
+    tensors = [torch.randn(shape, generator=generator) for _ in range(5)]
+    fine_output, query, key, value, compression_gate = tensors
+    sparse_key_blocks = 3
+    coarse_scale = shape[-1] ** -0.5
+
+    query_mean = mean_pool_block_values(query, block_lengths)
+    key_mean = mean_pool_block_values(key, block_lengths)
+    pooled_value = mean_pool_block_values(value, block_lengths)
+    expected = coarse_attention_residual(
+        fine_output,
+        (query_mean @ key_mean.mT) * coarse_scale,
+        pooled_value,
+        compression_gate,
+    )
+    actual = mean_pool_coarse_residual(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_scale=coarse_scale,
+        block_lengths=block_lengths,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_mean_pool_coarse_residual_preserves_composed_gradients() -> None:
+    generator = torch.Generator().manual_seed(920)
+    shape = (1, 65, 1, 4)
+    tensors = [torch.randn(shape, generator=generator, requires_grad=True) for _ in range(5)]
+    fine_output, query, key, value, compression_gate = tensors
+
+    output = mean_pool_coarse_residual(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks=1,
+        coarse_scale=shape[-1] ** -0.5,
+    )
+    output.square().sum().backward()
+
+    for tensor in tensors:
+        assert tensor.grad is not None
+        assert bool(torch.all(torch.isfinite(tensor.grad)))
+
+
+def test_mean_pool_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
+    generator = torch.Generator().manual_seed(921)
+    shape = (1, 2 * 64, 1, 4)
+    fine_output, query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(5)
+    ]
+    captured_graphs = []
+
+    def capture_backend(graph, _example_inputs):
+        captured_graphs.append(graph)
+        return graph.forward
+
+    def run(candidate_block_lengths):
+        return mean_pool_coarse_residual(
+            fine_output,
+            query,
+            key,
+            value,
+            compression_gate,
+            sparse_key_blocks=2,
+            coarse_scale=shape[-1] ** -0.5,
+            block_lengths=candidate_block_lengths,
+        )
+
+    compiled = torch.compile(run, backend=capture_backend, fullgraph=True)
+    first = compiled(torch.tensor([64, 17], dtype=torch.int32))
+    second = compiled(torch.tensor([63, 18], dtype=torch.int32))
+
+    assert len(captured_graphs) == 1
+    assert not torch.equal(first, second)
 
 
 def test_residual_expands_each_coarse_row_over_its_fine_query_block() -> None:

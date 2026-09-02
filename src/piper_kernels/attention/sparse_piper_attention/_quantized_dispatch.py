@@ -8,7 +8,6 @@ import torch
 
 from ._budget import _resolve_route_layout
 from ._routes import _MEAN_POOL_ROUTING, PackedRoutes, validate_routing_mode
-from .coarse import apply_coarse_attention_residual
 from .dsa import (
     packed_dsa_routes_and_coarse_from_summaries,
     packed_dsa_routes_from_summaries,
@@ -201,6 +200,8 @@ def _launch_quantized_sparse_piper_attention(
     *,
     query_block_offset: int = 0,
     query_block_count: int | None = None,
+    coarse_output: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch a prepared quantized sparse-Piper query range."""
     if _launch_sm120_attention is None:
@@ -210,6 +211,8 @@ def _launch_quantized_sparse_piper_attention(
         output,
         query_block_offset=query_block_offset,
         query_block_count=query_block_count,
+        coarse_output=coarse_output,
+        compression_gate=compression_gate,
     )
 
 
@@ -294,7 +297,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run quantized sparse attention plus a gated block-level residual."""
-    fine_output = _new_quantized_attention_output(
+    output = _new_quantized_attention_output(
         query,
         logical_sequence_length,
         block_lengths,
@@ -318,12 +321,13 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         coarse_scale,
         block_lengths,
     )
-    _launch_quantized_sparse_piper_attention(prepared, fine_output.transpose(1, 2))
-    return apply_coarse_attention_residual(
-        fine_output,
-        coarse_output,
-        compression_gate,
+    _launch_quantized_sparse_piper_attention(
+        prepared,
+        output.transpose(1, 2),
+        coarse_output=coarse_output,
+        compression_gate=compression_gate,
     )
+    return output
 
 
 @_sparse_piper_attention_from_quantized_op.register_fake

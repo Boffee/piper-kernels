@@ -23,7 +23,9 @@ from piper_kernels import (
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
+    dsa_coarse_residual,
     mean_pool_block_values,
+    mean_pool_coarse_residual,
     piper_attention,
     sage_attention_2pp,
 )
@@ -151,13 +153,17 @@ def test_public_packages_import() -> None:
     assert piper_kernels.apply_coarse_attention_residual is apply_coarse_attention_residual
     assert piper_kernels.coarse_attention is coarse_attention
     assert piper_kernels.coarse_attention_residual is coarse_attention_residual
+    assert piper_kernels.dsa_coarse_residual is dsa_coarse_residual
     assert piper_kernels.mean_pool_block_values is mean_pool_block_values
+    assert piper_kernels.mean_pool_coarse_residual is mean_pool_coarse_residual
     assert piper_kernels.__all__ == [
         "SparsePiperAttention",
         "apply_coarse_attention_residual",
         "coarse_attention",
         "coarse_attention_residual",
+        "dsa_coarse_residual",
         "mean_pool_block_values",
+        "mean_pool_coarse_residual",
         "piper_attention",
         "sage_attention_2pp",
     ]

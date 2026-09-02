@@ -209,7 +209,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
             coarse_arguments,
         )
 
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected, atol=0.00390625, rtol=0.01)
     assert torch.equal(zero_gate_output, fine_output)
     assert set(opcheck.values()) == {"SUCCESS"}
 
@@ -253,12 +253,36 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
         combined_value=value_head_major,
     )
 
+    query_block_count = (sequence_length + 63) // 64
+    coarse_output = torch.randn(
+        (shape[0], shape[2], query_block_count, shape[3]),
+        dtype=torch.float32,
+        device=query.device,
+        generator=generator,
+    )
+    compression_gate = torch.randn(
+        shape,
+        dtype=torch.bfloat16,
+        device=query.device,
+        generator=generator,
+    )
+    fine_output = torch.empty_like(query)
     full_output = torch.empty_like(query)
     chunks: list[torch.Tensor] = []
-    query_block_count = (sequence_length + 63) // 64
     query_block_offset = 0
     with torch.no_grad():
-        _launch_sparse_piper_attention(prepared, full_output.transpose(1, 2))
+        _launch_sparse_piper_attention(prepared, fine_output.transpose(1, 2))
+        expected = apply_coarse_attention_residual(
+            fine_output,
+            coarse_output,
+            compression_gate,
+        )
+        _launch_sparse_piper_attention(
+            prepared,
+            full_output.transpose(1, 2),
+            coarse_output=coarse_output,
+            compression_gate=compression_gate,
+        )
         while query_block_offset < query_block_count:
             remaining_blocks = query_block_count - query_block_offset
             range_block_count = 1 if query_block_offset == 0 else min(2, remaining_blocks)
@@ -278,6 +302,8 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 output.transpose(1, 2),
                 query_block_offset=query_block_offset,
                 query_block_count=range_block_count,
+                coarse_output=coarse_output,
+                compression_gate=compression_gate,
             )
             assert bool(torch.all(guarded[:, 0] == 123.0))
             assert bool(torch.all(guarded[:, -1] == 123.0))
@@ -285,6 +311,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
             query_block_offset += range_block_count
 
     ranged_output = torch.cat(chunks, dim=1)
+    assert torch.equal(full_output, expected)
     assert torch.equal(ranged_output, full_output)
 
 

@@ -270,24 +270,28 @@ the selected policy while producing its summaries directly from fused projection
 Sparse Piper also exposes a policy-independent coarse-attention residual:
 
 ```python
-from piper_kernels import coarse_attention_residual, mean_pool_block_values
+from piper_kernels import mean_pool_coarse_residual
 
-pooled_value = mean_pool_block_values(value, block_lengths)
-output = coarse_attention_residual(
+output = mean_pool_coarse_residual(
     fine_output,
-    block_scores,
-    pooled_value,
+    query,
+    key,
+    value,
     compression_gate,
+    sparse_key_blocks=sparse_key_blocks,
+    coarse_scale=coarse_scale,
+    block_lengths=block_lengths,
 )
 ```
 
-`block_scores` contains already-scaled FP32 logits and may come from mean-pool, DSA, or a learned
-block scorer. Coarse attention applies dense softmax over key blocks, attends over pooled V,
+This convenience path mean-pools Q and the routeable K/V prefix, applies dense coarse attention,
 expands each result over its physical K64 query block, multiplies the caller-provided gate directly
 without an implicit activation, and adds it to fine attention. `block_lengths` is optional for
-compact storage and selects valid-front internally padded storage when supplied. This composable
-implementation is the correctness and training contract; the SM120 fused epilogue remains a
-separate optimization.
+compact storage and selects valid-front internally padded storage when supplied. The lower-level
+`dsa_coarse_residual` convenience API derives extrema-based DSA scores under the same layout
+contract, while `coarse_attention_residual` remains available for learned or already-materialized
+block scores. These composable implementations are the correctness and training contract; the
+SM120 fused epilogue remains a separate optimization.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -99,7 +98,7 @@ class PackedRouteBuilder:
 
 
 class PackedRouteAndCoarseBuilder:
-    """Consume each score chunk once for fine routing and coarse attention."""
+    """Consume each caller-scaled score chunk for routing and coarse attention."""
 
     def __init__(
         self,
@@ -111,10 +110,7 @@ class PackedRouteAndCoarseBuilder:
         query_blocks: int,
         key_blocks: int,
         device: torch.device,
-        coarse_scale: float,
     ) -> None:
-        if not math.isfinite(coarse_scale) or coarse_scale <= 0:
-            raise ValueError("coarse attention scale must be finite and positive")
         if pooled_value.shape[:3] != (batch, heads, key_blocks):
             raise ValueError("pooled V must match the routing batch, heads, and key blocks")
         if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
@@ -132,7 +128,6 @@ class PackedRouteAndCoarseBuilder:
             device=device,
         )
         self._pooled_value = pooled_value
-        self._coarse_scale = coarse_scale
         self._coarse_chunks: list[torch.Tensor] = []
 
     def write(
@@ -141,9 +136,8 @@ class PackedRouteAndCoarseBuilder:
         *,
         route_query_offset: int,
     ) -> None:
-        """Consume one raw score chunk without retaining its score matrix."""
+        """Consume one scaled score chunk without retaining its score matrix."""
         self._route_builder.write(scores, route_query_offset=route_query_offset)
-        scores.mul_(self._coarse_scale)
         self._coarse_chunks.append(coarse_attention(scores, self._pooled_value))
 
     def finish(self) -> PackedRoutesAndCoarseOutput:

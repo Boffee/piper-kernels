@@ -2,10 +2,65 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch.nn import functional
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
+
+
+def validate_coarse_scale(coarse_scale: float) -> None:
+    """Reject scales that do not preserve fine-route score ordering."""
+    if not math.isfinite(coarse_scale) or coarse_scale <= 0:
+        raise ValueError("coarse attention scale must be finite and positive")
+
+
+def validate_coarse_residual_inputs(
+    fine_output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    compression_gate: torch.Tensor,
+    sparse_key_blocks: int,
+    coarse_scale: float,
+    block_lengths: torch.Tensor | None,
+    *,
+    policy: str,
+) -> None:
+    """Validate the shared token-level contract for Q/K/V-derived coarse paths."""
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError(f"{policy} coarse attention requires equal Q/K/V shapes")
+    if fine_output.shape != query.shape:
+        raise ValueError(f"{policy} coarse attention must match the fine output shape")
+    if compression_gate.shape != fine_output.shape:
+        raise ValueError(f"{policy} coarse attention gate must match the fine output shape")
+    if any(tensor.device != query.device for tensor in (fine_output, key, value, compression_gate)):
+        raise ValueError(f"{policy} coarse attention tensors must share a device")
+    if any(not tensor.is_floating_point() for tensor in (fine_output, query, key, value)):
+        raise TypeError(f"{policy} coarse attention tensors must be floating-point")
+    if not compression_gate.is_floating_point() or compression_gate.dtype is not fine_output.dtype:
+        raise ValueError(f"{policy} coarse attention gate must share the fine output dtype")
+
+    validate_coarse_scale(coarse_scale)
+    available_key_blocks = (
+        query.shape[1] // TILE_ROWS if block_lengths is None else block_lengths.numel()
+    )
+    if isinstance(sparse_key_blocks, bool):
+        raise TypeError("sparse_key_blocks must be an integer")
+    if torch.compiler.is_compiling():
+        torch._check(
+            sparse_key_blocks >= 1,
+            lambda: "sparse_key_blocks must be positive",
+        )
+        torch._check(
+            sparse_key_blocks <= available_key_blocks,
+            lambda: "sparse_key_blocks cannot exceed the available K64 blocks",
+        )
+    elif not isinstance(sparse_key_blocks, int):
+        raise TypeError("sparse_key_blocks must be an integer")
+    elif not 1 <= sparse_key_blocks <= available_key_blocks:
+        raise ValueError("sparse_key_blocks must fit the available K64 blocks")
 
 
 def mean_pool_block_values(

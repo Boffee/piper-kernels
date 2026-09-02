@@ -3,6 +3,12 @@
 import pytest
 import torch
 
+import piper_kernels.attention.sparse_piper_attention.dsa as dsa_module
+from piper_kernels import (
+    coarse_attention_residual,
+    dsa_coarse_residual,
+    mean_pool_block_values,
+)
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
@@ -103,6 +109,167 @@ def test_ragged_query_sequence_produces_a_final_route_row() -> None:
     assert bool((routes.indices.to(torch.int32) < 3).all())
 
 
+def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
+    generator = torch.Generator().manual_seed(641)
+    block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
+    query = torch.randn((1, 2, 3 * 64, 8), generator=generator)
+    key = torch.randn((1, 2, 2 * 64, 8), generator=generator)
+    query_blocks = query.unflatten(2, (3, 64))
+    key_blocks = key.unflatten(2, (2, 64))
+    expected_query = torch.stack(
+        [
+            block[:, :, : int(length)].amax(dim=2) + block[:, :, : int(length)].amin(dim=2)
+            for block, length in zip(query_blocks.unbind(2), block_lengths, strict=True)
+        ],
+        dim=2,
+    )
+    expected_key_max = torch.stack(
+        [
+            block[:, :, : int(length)].amax(dim=2)
+            for block, length in zip(
+                key_blocks.unbind(2),
+                block_lengths[:2],
+                strict=True,
+            )
+        ],
+        dim=2,
+    )
+    expected_key_min = torch.stack(
+        [
+            block[:, :, : int(length)].amin(dim=2)
+            for block, length in zip(
+                key_blocks.unbind(2),
+                block_lengths[:2],
+                strict=True,
+            )
+        ],
+        dim=2,
+    )
+    valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
+    valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
+    layout = _layout((1, 2), 2)
+    expected_routes = packed_dsa_routes_from_summaries(
+        expected_query,
+        expected_key_max,
+        expected_key_min,
+        layout,
+    )
+
+    for fill in (-10_000.0, 10_000.0):
+        corrupted_query = query_blocks.clone()
+        corrupted_key = key_blocks.clone()
+        corrupted_query[:, :, ~valid_query_rows] = fill
+        corrupted_key[:, :, ~valid_key_rows] = fill
+        corrupted_query = corrupted_query.flatten(2, 3)
+        corrupted_key = corrupted_key.flatten(2, 3)
+        query_summary, key_max, key_min = _sequence_block_summaries(
+            corrupted_query,
+            corrupted_key,
+            block_lengths,
+        )
+        routes = packed_dsa_routes_from_sequences(
+            corrupted_query,
+            corrupted_key,
+            layout,
+            block_lengths,
+        )
+
+        torch.testing.assert_close(query_summary, expected_query)
+        torch.testing.assert_close(key_max, expected_key_max)
+        torch.testing.assert_close(key_min, expected_key_min)
+        assert torch.equal(routes.indices, expected_routes.indices)
+
+
+def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatch) -> None:
+    monkeypatch.setattr(dsa_module, "_QUERY_CHUNK_BLOCKS", 2)
+    generator = torch.Generator().manual_seed(642)
+    block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
+    shape = (1, 3 * 64, 2, 8)
+    fine_output, query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(5)
+    ]
+    sparse_key_blocks = 2
+    coarse_scale = shape[-1] ** -0.5
+    query_summary, key_max, key_min = _sequence_block_summaries(
+        query.transpose(1, 2),
+        key.transpose(1, 2)[:, :, : sparse_key_blocks * 64],
+        block_lengths,
+    )
+    pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :sparse_key_blocks]
+    expected = coarse_attention_residual(
+        fine_output,
+        _dsa_scores(query_summary, key_max, key_min) * coarse_scale,
+        pooled_value,
+        compression_gate,
+    )
+    actual = dsa_coarse_residual(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_scale=coarse_scale,
+        block_lengths=block_lengths,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dsa_coarse_residual_preserves_composed_gradients() -> None:
+    generator = torch.Generator().manual_seed(643)
+    shape = (1, 129, 1, 4)
+    tensors = [torch.randn(shape, generator=generator, requires_grad=True) for _ in range(5)]
+    fine_output, query, key, value, compression_gate = tensors
+
+    output = dsa_coarse_residual(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks=2,
+        coarse_scale=shape[-1] ** -0.5,
+    )
+    output.square().sum().backward()
+
+    for tensor in tensors:
+        assert tensor.grad is not None
+        assert bool(torch.all(torch.isfinite(tensor.grad)))
+
+
+def test_dsa_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
+    generator = torch.Generator().manual_seed(644)
+    shape = (1, 2 * 64, 1, 4)
+    fine_output, query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(5)
+    ]
+    captured_graphs = []
+
+    def capture_backend(graph, _example_inputs):
+        captured_graphs.append(graph)
+        return graph.forward
+
+    def run(candidate_block_lengths):
+        return dsa_coarse_residual(
+            fine_output,
+            query,
+            key,
+            value,
+            compression_gate,
+            sparse_key_blocks=2,
+            coarse_scale=shape[-1] ** -0.5,
+            block_lengths=candidate_block_lengths,
+        )
+
+    compiled = torch.compile(run, backend=capture_backend, fullgraph=True)
+    first = compiled(torch.tensor([64, 17], dtype=torch.int32))
+    second = compiled(torch.tensor([63, 18], dtype=torch.int32))
+
+    assert len(captured_graphs) == 1
+    assert not torch.equal(first, second)
+
+
 def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
     generator = torch.Generator().manual_seed(66)
     query_summary = torch.randn((1, 2, 385, 8), generator=generator)
@@ -154,6 +321,36 @@ def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
         atol=0,
         rtol=0,
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_sm120_padded_summaries_match_portable_valid_prefix_extrema() -> None:
+    generator = torch.Generator().manual_seed(545)
+    block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
+    query = torch.randn((1, 2, 3 * 64, 128), dtype=torch.bfloat16, generator=generator)
+    key = torch.randn((1, 2, 2 * 64, 128), dtype=torch.bfloat16, generator=generator)
+    valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
+    valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
+    query = query.unflatten(2, (3, 64))
+    key = key.unflatten(2, (2, 64))
+    query[:, :, ~valid_query_rows] = 10_000
+    key[:, :, ~valid_key_rows] = -10_000
+    query = query.flatten(2, 3)
+    key = key.flatten(2, 3)
+
+    expected = _sequence_block_summaries(query, key, block_lengths)
+    actual = _sequence_block_summaries(
+        query.cuda(),
+        key.cuda(),
+        block_lengths.cuda(),
+    )
+
+    for actual_summary, expected_summary in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_summary.cpu(), expected_summary, atol=0, rtol=0)
 
 
 @pytest.mark.gpu
