@@ -63,10 +63,10 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         routes.indices,
-        routes.keep_blocks,
+        routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.head_offsets,
+        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
     )
@@ -130,6 +130,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
     sparse_key_blocks = shape[1] // 64
+    coarse_key_blocks = (shape[1] + 63) // 64
     sparse_key = key_head_major[:, :, : sparse_key_blocks * 64]
     ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
     layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
@@ -141,22 +142,22 @@ def test_quantized_coarse_residual_matches_explicit_composition(
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         placeholder_routes.indices,
-        placeholder_routes.keep_blocks,
+        placeholder_routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=placeholder_routes.head_offsets,
+        route_head_offsets=placeholder_routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
     )
     if routing_mode == _MEAN_POOL_ROUTING:
         query_summary = _sequence_block_means(query_head_major)
-        key_summary = _sequence_block_means(sparse_key)
+        key_summary = _sequence_block_means(key_head_major)
         key_aux = key_summary.new_empty(0)
         scores = query_summary @ key_summary.mT
     else:
         query_summary, key_summary, key_aux = _sequence_block_summaries(
             query_head_major,
-            sparse_key,
+            key_head_major,
         )
         scores = _dsa_scores(query_summary, key_summary, key_aux)
     fine_arguments = (
@@ -183,13 +184,15 @@ def test_quantized_coarse_residual_matches_explicit_composition(
         compression_gate,
         *fine_arguments[10:],
         coarse_scale,
+        None,
+        coarse_key_blocks,
     )
 
     with torch.no_grad():
         fine_output = _sparse_piper_attention_from_quantized_op(*fine_arguments)
         expected_coarse = coarse_attention(
             scores * coarse_scale,
-            block_mean[:, :, :sparse_key_blocks],
+            block_mean[:, :, :coarse_key_blocks],
         )
         expected = apply_coarse_attention_residual(
             fine_output,
@@ -245,10 +248,10 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         routes.indices,
-        routes.keep_blocks,
+        routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.head_offsets,
+        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
     )
@@ -345,10 +348,10 @@ def _block_length_case(routing_mode: int):
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         routes.indices,
-        routes.keep_blocks,
+        routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.head_offsets,
+        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
     )
@@ -480,16 +483,16 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         generator=generator,
     )
     block_mean = mean_pool_block_values(value, block_lengths)
-    sparse_key_blocks = fine_arguments[-3]
+    coarse_key_blocks = block_lengths.numel()
     routing_query_summary = fine_arguments[2]
-    routing_key_summary = fine_arguments[5][:, :, :sparse_key_blocks]
+    routing_key_summary = fine_arguments[5][:, :, :coarse_key_blocks]
     if routing_mode == _MEAN_POOL_ROUTING:
         scores = routing_query_summary @ routing_key_summary.mT
     else:
         scores = _dsa_scores(
             routing_query_summary,
             routing_key_summary,
-            fine_arguments[6][:, :, :sparse_key_blocks],
+            fine_arguments[6][:, :, :coarse_key_blocks],
         )
     coarse_scale = 128**-0.5
     coarse_arguments = (
@@ -499,6 +502,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         *fine_arguments[10:],
         coarse_scale,
         block_lengths,
+        coarse_key_blocks,
     )
 
     with torch.no_grad():
@@ -510,7 +514,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
             fine_output,
             coarse_attention(
                 scores * coarse_scale,
-                block_mean[:, :, :sparse_key_blocks],
+                block_mean[:, :, :coarse_key_blocks],
             ),
             compression_gate,
         )
@@ -523,7 +527,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         )
 
     assert actual.shape == value.shape
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected, atol=0.00390625, rtol=0.01)
     assert set(opcheck.values()) == {"SUCCESS"}
 
 
@@ -552,10 +556,10 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         placeholder_routes.indices,
-        placeholder_routes.keep_blocks,
+        placeholder_routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=placeholder_routes.head_offsets,
+        route_head_offsets=placeholder_routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
     )

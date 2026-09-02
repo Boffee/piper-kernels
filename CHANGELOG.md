@@ -11,7 +11,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   scores from mean-pool, DSA, or learned policies attend over padding-aware pooled V, expand over
   physical K64 query blocks, and apply a token-level compression gate before the residual add. The
   `mean_pool_coarse_residual` and `dsa_coarse_residual` convenience paths derive bounded-workspace
-  scores directly from Q/K/V, including valid-front padded block summaries.
+  scores directly from Q/K/V, including valid-front padded block summaries. Their optional
+  `coarse_key_blocks` scope can extend beyond the sparse-routing prefix and is preserved by the
+  compatible ConvRot INT8 compiler fusion.
 - Added high-precision constructors for ordinary and ConvRot NVFP4 weights. They can derive a
   finite global scale in the stored basis, including well-defined all-zero storage, while ConvRot
   owns rotation before quantization.

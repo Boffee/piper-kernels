@@ -279,19 +279,22 @@ output = mean_pool_coarse_residual(
     value,
     compression_gate,
     sparse_key_blocks=sparse_key_blocks,
+    coarse_key_blocks=total_key_blocks,
     coarse_scale=coarse_scale,
     block_lengths=block_lengths,
 )
 ```
 
-This convenience path mean-pools Q and the routeable K/V prefix, applies dense coarse attention,
-expands each result over its physical K64 query block, multiplies the caller-provided gate directly
-without an implicit activation, and adds it to fine attention. `block_lengths` is optional for
-compact storage and selects valid-front internally padded storage when supplied. The lower-level
-`dsa_coarse_residual` convenience API derives extrema-based DSA scores under the same layout
-contract, while `coarse_attention_residual` remains available for learned or already-materialized
-block scores. These composable implementations are the correctness and training contract; the
-SM120 fused epilogue remains a separate optimization.
+This convenience path mean-pools Q and K/V blocks, applies dense coarse attention, expands each
+result over its physical K64 query block, multiplies the caller-provided gate directly without an
+implicit activation, and adds it to fine attention. `coarse_key_blocks` may include blocks after the
+sparse-routing prefix, including a partial compact tail; omitting it preserves the original
+`sparse_key_blocks` scope. `block_lengths` is optional for compact storage and selects valid-front
+internally padded storage when supplied. The lower-level `dsa_coarse_residual` convenience API
+derives extrema-based DSA scores under the same layout contract, while
+`coarse_attention_residual` remains available for learned or already-materialized block scores.
+These composable implementations are the correctness and training contract; compatible compiled
+ConvRot INT8 graphs fuse the shared route scores, wider coarse attention, and gated residual.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

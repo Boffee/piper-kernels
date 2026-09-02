@@ -1,5 +1,6 @@
 """Sparse Piper Attention for NVIDIA SM120 inference."""
 
+from . import _coarse_dispatch as _coarse_dispatch
 from .coarse import (
     apply_coarse_attention_residual,
     coarse_attention,

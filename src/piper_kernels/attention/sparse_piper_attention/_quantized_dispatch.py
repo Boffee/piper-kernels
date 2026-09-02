@@ -8,6 +8,7 @@ import torch
 
 from ._budget import _resolve_route_layout
 from ._routes import _MEAN_POOL_ROUTING, PackedRoutes, validate_routing_mode
+from .coarse import _resolve_coarse_key_blocks
 from .dsa import (
     packed_dsa_routes_and_coarse_from_summaries,
     packed_dsa_routes_from_summaries,
@@ -111,8 +112,8 @@ def _prepare_quantized_sparse_piper_attention_from_routes(  # noqa: PLR0913, PLR
         value_scale_multiplier,
         value_mean,
         routes.indices,
-        routes.keep_blocks,
-        routes.head_offsets,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
         sparse_key_blocks=sparse_key_blocks,
         routes_per_query=routes.indices.shape[2],
         logical_sequence_length=logical_sequence_length,
@@ -138,30 +139,38 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     routing_mode: int,
     coarse_scale: float,
     block_lengths: torch.Tensor | None = None,
+    coarse_key_blocks: int | None = None,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor]:
-    """Prepare fine attention and coarse output from the same routing scores."""
+    """Prepare fine routes and a potentially wider coarse K/V prefix."""
     layout = _resolve_route_layout(
         tuple(head_keep_ratio_units),
         sparse_key_blocks,
         query.device,
     )
     validate_routing_mode(routing_mode)
-    sparse_block_mean = block_mean[:, :, :sparse_key_blocks]
+    coarse_key_blocks = _resolve_coarse_key_blocks(
+        sparse_key_blocks,
+        coarse_key_blocks,
+        available_coarse_key_blocks=block_mean.shape[2],
+    )
+    pooled_value = block_mean[:, :, :coarse_key_blocks]
     if routing_mode == _MEAN_POOL_ROUTING:
         routed = packed_mean_pool_routes_and_coarse_from_summaries(
             query_summary,
-            key_summary[:, :, :sparse_key_blocks],
-            sparse_block_mean,
+            key_summary[:, :, :coarse_key_blocks],
+            pooled_value,
             layout,
+            sparse_key_blocks=sparse_key_blocks,
             coarse_scale=coarse_scale,
         )
     else:
         routed = packed_dsa_routes_and_coarse_from_summaries(
             query_summary,
-            key_summary[:, :, :sparse_key_blocks],
-            key_aux[:, :, :sparse_key_blocks],
-            sparse_block_mean,
+            key_summary[:, :, :coarse_key_blocks],
+            key_aux[:, :, :coarse_key_blocks],
+            pooled_value,
             layout,
+            sparse_key_blocks=sparse_key_blocks,
             coarse_scale=coarse_scale,
         )
     prepared = _prepare_quantized_sparse_piper_attention_from_routes(
@@ -295,8 +304,9 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     routing_mode: int,
     coarse_scale: float,
     block_lengths: torch.Tensor | None = None,
+    coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
-    """Run quantized sparse attention plus a gated block-level residual."""
+    """Run quantized sparse attention plus a gated, independently scoped residual."""
     output = _new_quantized_attention_output(
         query,
         logical_sequence_length,
@@ -320,6 +330,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         routing_mode,
         coarse_scale,
         block_lengths,
+        coarse_key_blocks,
     )
     _launch_quantized_sparse_piper_attention(
         prepared,
@@ -375,6 +386,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     _routing_mode: int,
     _coarse_scale: float,
     _block_lengths: torch.Tensor | None = None,
+    _coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
     return _new_quantized_attention_output(
         query,

@@ -181,14 +181,14 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
         operands.input_qdata,
         operands.input_scale,
     )
-    value, value_scale, value_mean = value_fusion._project_value_op(
+    value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
     )
 
     assert value.shape == (2, 3, 128, 192)
-    assert value_scale.shape == (2, 3, 3, 1)
+    assert value_scale_multiplier.shape == (2, 3, 3, 1)
     assert value_mean.shape == (2, 3, 128)
 
 
@@ -200,7 +200,7 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
         operands.input_qdata,
         operands.input_scale,
     )
-    _value, value_scale, value_mean = value_fusion._project_value_op(
+    _value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
@@ -211,7 +211,7 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
         torch.bfloat16,
     ).view(1, 192, 3, 128)
     exact_mean = materialized.float().mean(dim=1)
-    smallest_tile_scale = value_scale[..., 0].amin(dim=-1) / 255.0
+    smallest_tile_scale = value_scale_multiplier[..., 0].amin(dim=-1) / 255.0
 
     assert bool(((value_mean - exact_mean).abs() <= smallest_tile_scale[:, :, None] * 0.05).all())
 
@@ -299,7 +299,7 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
     weight_scale = torch.empty((3 * 128, 1), device="meta", dtype=torch.float32)
 
     input_mean = convrot_backend.dequantized_input_mean(input_qdata, input_scale)
-    value, value_scale, value_mean = value_fusion._project_value_op(
+    value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
         input_qdata,
         input_scale,
         input_mean,
@@ -318,13 +318,13 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
     assert input_mean.dtype is torch.float32
     assert value.shape == (2, 3, 128, 128)
     assert value.dtype is torch.int8
-    assert value_scale.shape == (2, 3, 2, 1)
-    assert value_scale.dtype is torch.float32
+    assert value_scale_multiplier.shape == (2, 3, 2, 1)
+    assert value_scale_multiplier.dtype is torch.float32
     assert value_mean.shape == (2, 3, 128)
     assert value_mean.dtype is torch.float32
     assert [tensor.shape for tensor in summarized[:3]] == [
         value.shape,
-        value_scale.shape,
+        value_scale_multiplier.shape,
         value_mean.shape,
     ]
     assert summarized[3].shape == (2, 3, 2, 128)

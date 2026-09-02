@@ -6,23 +6,65 @@ from collections.abc import Iterator
 
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
+
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
+    _MEAN_POOL_ROUTING,
     PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
     PackedRoutes,
     PackedRoutesAndCoarseOutput,
 )
 from .coarse import (
-    apply_coarse_attention_residual,
-    coarse_attention,
-    mean_pool_block_values,
+    _apply_chunked_coarse_residual,
+    _mean_pool_token_blocks,
+    _preserve_coarse_residual_in_graph,
     validate_coarse_residual_inputs,
     validate_coarse_scale,
 )
 
-_BLOCK_ROWS = 64
 _QUERY_CHUNK_BLOCKS = 384
+
+
+def _mean_pool_coarse_residual_impl(
+    fine_output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    compression_gate: torch.Tensor,
+    *,
+    sparse_key_blocks: int,
+    coarse_key_blocks: int,
+    coarse_scale: float,
+    block_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    coarse_key_blocks = validate_coarse_residual_inputs(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks,
+        coarse_key_blocks,
+        coarse_scale,
+        block_lengths,
+        routing_label="mean-pool",
+    )
+
+    query_mean = _mean_pool_token_blocks(query, block_lengths)
+    key_mean = _mean_pool_token_blocks(key, block_lengths)[:, :, :coarse_key_blocks]
+    pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :coarse_key_blocks]
+    return _apply_chunked_coarse_residual(
+        fine_output,
+        pooled_value,
+        compression_gate,
+        _mean_pool_score_chunks(
+            query_mean,
+            key_mean,
+            score_scale=coarse_scale,
+        ),
+    )
 
 
 def mean_pool_coarse_residual(
@@ -33,45 +75,47 @@ def mean_pool_coarse_residual(
     compression_gate: torch.Tensor,
     *,
     sparse_key_blocks: int,
+    coarse_key_blocks: int | None = None,
     coarse_scale: float,
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Add an unfused mean-pool coarse branch over the sparse K64 prefix.
+    """Add a mean-pool coarse branch over a K64 prefix.
 
     All token tensors use ``[batch,sequence,heads,features]``. Compact storage
     may end in one partial block. With ``block_lengths``, storage instead holds
     complete physical K64 blocks whose valid rows occupy each block's prefix.
+    ``coarse_key_blocks`` defaults to ``sparse_key_blocks`` for compatibility
+    and may extend the coarse branch across the following dense-key blocks.
     Coarse scores are computed in bounded query-block chunks and the caller's
     compression gate is applied directly without an implicit activation.
+    Compatible compiled inference graphs may fuse this with sparse attention.
     """
-    validate_coarse_residual_inputs(
+    resolved_coarse_key_blocks = (
+        sparse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
+    )
+    if _preserve_coarse_residual_in_graph(fine_output, query, key, value, compression_gate):
+        return torch.ops.piper_kernels.sparse_piper_coarse_residual.default(
+            fine_output,
+            query,
+            key,
+            value,
+            compression_gate,
+            sparse_key_blocks,
+            resolved_coarse_key_blocks,
+            coarse_scale,
+            _MEAN_POOL_ROUTING,
+            block_lengths,
+        )
+    return _mean_pool_coarse_residual_impl(
         fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks,
-        coarse_scale,
-        block_lengths,
-        policy="mean-pool",
-    )
-
-    query_mean = mean_pool_block_values(query, block_lengths)
-    key_mean = mean_pool_block_values(key, block_lengths)[:, :, :sparse_key_blocks]
-    pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :sparse_key_blocks]
-    coarse_chunks = [
-        coarse_attention(scores, pooled_value)
-        for _start, scores in _mean_pool_score_chunks(
-            query_mean,
-            key_mean,
-            score_scale=coarse_scale,
-        )
-    ]
-    coarse_output = coarse_chunks[0] if len(coarse_chunks) == 1 else torch.cat(coarse_chunks, dim=2)
-    return apply_coarse_attention_residual(
-        fine_output,
-        coarse_output,
-        compression_gate,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_key_blocks=resolved_coarse_key_blocks,
+        coarse_scale=coarse_scale,
+        block_lengths=block_lengths,
     )
 
 
@@ -83,17 +127,17 @@ def packed_mean_pool_routes_from_summaries(
     """Select routes from existing FP32 Q64/K64 valid-prefix means."""
     _validate_mean_summaries(query_mean, key_mean)
     batch, heads, query_blocks, _head_dim = query_mean.shape
-    key_blocks = key_mean.shape[2]
+    sparse_key_blocks = key_mean.shape[2]
     builder = PackedRouteBuilder(
         layout,
         batch=batch,
         heads=heads,
         query_blocks=query_blocks,
-        key_blocks=key_blocks,
+        sparse_key_blocks=sparse_key_blocks,
         device=query_mean.device,
     )
     for start, scores in _mean_pool_score_chunks(query_mean, key_mean):
-        builder.write(scores, route_query_offset=start)
+        builder.write(scores, query_block_offset=start)
     return builder.routes
 
 
@@ -103,20 +147,20 @@ def packed_mean_pool_routes_and_coarse_from_summaries(
     pooled_value: torch.Tensor,
     layout: _ResolvedRouteLayout,
     *,
+    sparse_key_blocks: int,
     coarse_scale: float,
 ) -> PackedRoutesAndCoarseOutput:
-    """Select fine routes and apply coarse attention from each mean-score chunk."""
+    """Route over a sparse prefix and attend coarsely over every supplied K block."""
     _validate_mean_summaries(query_mean, key_mean)
     validate_coarse_scale(coarse_scale)
     batch, heads, query_blocks, _head_dim = query_mean.shape
-    key_blocks = key_mean.shape[2]
     builder = PackedRouteAndCoarseBuilder(
         layout,
         pooled_value,
         batch=batch,
         heads=heads,
         query_blocks=query_blocks,
-        key_blocks=key_blocks,
+        sparse_key_blocks=sparse_key_blocks,
         device=query_mean.device,
     )
     for start, scores in _mean_pool_score_chunks(
@@ -124,7 +168,7 @@ def packed_mean_pool_routes_and_coarse_from_summaries(
         key_mean,
         score_scale=coarse_scale,
     ):
-        builder.write(scores, route_query_offset=start)
+        builder.write(scores, query_block_offset=start)
     return builder.finish()
 
 

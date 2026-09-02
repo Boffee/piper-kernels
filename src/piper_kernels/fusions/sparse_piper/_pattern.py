@@ -16,6 +16,8 @@ _SLICE_END = torch.iinfo(torch.int64).max
 def _normalized_rope_pattern(
     projection: CallFunction,
     prefix: str,
+    *,
+    output_users: int = 1,
 ) -> CallFunction:
     reshaped = CallFunction(
         torch.ops.aten.reshape.default,
@@ -105,30 +107,86 @@ def _normalized_rope_pattern(
         torch.ops.aten.cat.default,
         [rotary_output, passthrough],
         -1,
-        _users=1,
+        _users=output_users,
     )
+
+
+def _sparse_piper_projection_components(
+    projection: ProjectionPattern,
+    *,
+    operand_users: int,
+    attention_users: int | None = None,
+) -> tuple[CallFunction, CallFunction, CallFunction, CallFunction, KeywordArg]:
+    query = _normalized_rope_pattern(
+        projection("sparse_q"),
+        "sparse_q",
+        output_users=operand_users,
+    )
+    key = _normalized_rope_pattern(
+        projection("sparse_k"),
+        "sparse_k",
+        output_users=operand_users,
+    )
+    value = CallFunction(
+        torch.ops.aten.reshape.default,
+        projection("sparse_v"),
+        KeywordArg("sparse_attention_shape"),
+        _users=operand_users,
+    )
+    sparse_key_blocks = KeywordArg("sparse_key_blocks")
+    arguments = (
+        torch.ops.piper_kernels.sparse_piper_attention.default,
+        query,
+        key,
+        value,
+        KeywordArg("sparse_head_keep_ratio_units"),
+        sparse_key_blocks,
+        KeywordArg("sparse_softmax_scale"),
+        KeywordArg("sparse_routing_mode"),
+    )
+    attention = (
+        CallFunction(*arguments)
+        if attention_users is None
+        else CallFunction(*arguments, _users=attention_users)
+    )
+    return attention, query, key, value, sparse_key_blocks
 
 
 def sparse_piper_projection_pattern(
     projection: ProjectionPattern,
 ) -> CallFunction:
     """Match the common projected Q/K/V sparse-Piper attention region."""
-    projected_value = CallFunction(
-        torch.ops.aten.reshape.default,
-        projection("sparse_v"),
-        KeywordArg("sparse_attention_shape"),
-        _users=1,
+    attention, _query, _key, _value, _sparse_key_blocks = _sparse_piper_projection_components(
+        projection,
+        operand_users=1,
+    )
+    return attention
+
+
+def sparse_piper_coarse_residual_projection_pattern(
+    projection: ProjectionPattern,
+) -> CallFunction:
+    """Match projected sparse attention plus a Q/K/V-derived coarse residual."""
+    fine_output, query, key, value, sparse_key_blocks = _sparse_piper_projection_components(
+        projection,
+        operand_users=2,
+        attention_users=1,
     )
     return CallFunction(
-        torch.ops.piper_kernels.sparse_piper_attention.default,
-        _normalized_rope_pattern(projection("sparse_q"), "sparse_q"),
-        _normalized_rope_pattern(projection("sparse_k"), "sparse_k"),
-        projected_value,
-        KeywordArg("sparse_head_keep_ratio_units"),
-        KeywordArg("sparse_key_blocks"),
-        KeywordArg("sparse_softmax_scale"),
-        KeywordArg("sparse_routing_mode"),
+        torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
+        fine_output,
+        query,
+        key,
+        value,
+        KeywordArg("coarse_compression_gate"),
+        sparse_key_blocks,
+        KeywordArg("coarse_key_blocks"),
+        KeywordArg("coarse_scale"),
+        KeywordArg("coarse_routing_mode"),
     )
 
 
-__all__ = ["sparse_piper_projection_pattern"]
+__all__ = [
+    "sparse_piper_coarse_residual_projection_pattern",
+    "sparse_piper_projection_pattern",
+]

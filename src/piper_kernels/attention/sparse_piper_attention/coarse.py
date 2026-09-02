@@ -3,17 +3,109 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 
 import torch
 from torch.nn import functional
 
-from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
+
+
+def _preserve_coarse_residual_in_graph(*tensors: torch.Tensor) -> bool:
+    """Use the semantic boundary only when no compiled backward is required."""
+    return torch.compiler.is_compiling() and not (
+        torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors)
+    )
 
 
 def validate_coarse_scale(coarse_scale: float) -> None:
     """Reject scales that do not preserve fine-route score ordering."""
     if not math.isfinite(coarse_scale) or coarse_scale <= 0:
         raise ValueError("coarse attention scale must be finite and positive")
+
+
+def _validate_block_lengths(
+    block_lengths: torch.Tensor,
+    *,
+    sequence_length: int,
+    device: torch.device,
+    context: str,
+    require_contiguous: bool = False,
+) -> int:
+    """Validate public valid-prefix block metadata without synchronizing CUDA."""
+    if (
+        block_lengths.ndim != 1
+        or block_lengths.numel() < 1
+        or block_lengths.dtype is not torch.int32
+        or block_lengths.device != device
+        or sequence_length != block_lengths.numel() * _BLOCK_ROWS
+        or (require_contiguous and not block_lengths.is_contiguous())
+    ):
+        contiguity = " contiguous" if require_contiguous else ""
+        raise ValueError(
+            f"{context} block lengths must be one{contiguity} device INT32 value per K64"
+        )
+    torch._assert_async(
+        torch.all((block_lengths >= 1) & (block_lengths <= _BLOCK_ROWS)),
+        f"{context} block lengths must lie in [1, {_BLOCK_ROWS}]",
+    )
+    return block_lengths.numel()
+
+
+def _validate_key_block_scopes(
+    sparse_key_blocks: int,
+    coarse_key_blocks: int | None,
+    *,
+    available_sparse_key_blocks: int,
+    available_coarse_key_blocks: int,
+) -> int:
+    """Validate the sparse prefix and resolve its enclosing coarse prefix."""
+    if isinstance(sparse_key_blocks, bool):
+        raise TypeError("sparse_key_blocks must be an integer")
+    if torch.compiler.is_compiling():
+        torch._check(sparse_key_blocks >= 1, lambda: "sparse_key_blocks must be positive")
+        torch._check(
+            sparse_key_blocks <= available_sparse_key_blocks,
+            lambda: "sparse_key_blocks cannot exceed the available K64 blocks",
+        )
+    else:
+        if not isinstance(sparse_key_blocks, int):
+            raise TypeError("sparse_key_blocks must be an integer")
+        if not 1 <= sparse_key_blocks <= available_sparse_key_blocks:
+            raise ValueError("sparse_key_blocks must fit the available K64 blocks")
+    return _resolve_coarse_key_blocks(
+        sparse_key_blocks,
+        coarse_key_blocks,
+        available_coarse_key_blocks=available_coarse_key_blocks,
+    )
+
+
+def _resolve_coarse_key_blocks(
+    sparse_key_blocks: int,
+    coarse_key_blocks: int | None,
+    *,
+    available_coarse_key_blocks: int,
+) -> int:
+    """Resolve a coarse prefix that contains the sparse-routing prefix."""
+    resolved = sparse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
+    if isinstance(resolved, bool):
+        raise TypeError("coarse_key_blocks must be an integer")
+    if torch.compiler.is_compiling():
+        torch._check(
+            resolved >= sparse_key_blocks,
+            lambda: "coarse_key_blocks cannot exclude sparse key blocks",
+        )
+        torch._check(
+            resolved <= available_coarse_key_blocks,
+            lambda: "coarse_key_blocks cannot exceed the available K64 blocks",
+        )
+    elif not isinstance(resolved, int):
+        raise TypeError("coarse_key_blocks must be an integer")
+    elif not sparse_key_blocks <= resolved <= available_coarse_key_blocks:
+        raise ValueError(
+            "coarse_key_blocks must include the sparse prefix and fit the available K64 blocks"
+        )
+    return resolved
 
 
 def validate_coarse_residual_inputs(
@@ -23,44 +115,48 @@ def validate_coarse_residual_inputs(
     value: torch.Tensor,
     compression_gate: torch.Tensor,
     sparse_key_blocks: int,
+    coarse_key_blocks: int | None,
     coarse_scale: float,
     block_lengths: torch.Tensor | None,
     *,
-    policy: str,
-) -> None:
-    """Validate the shared token-level contract for Q/K/V-derived coarse paths."""
+    routing_label: str,
+) -> int:
+    """Validate the shared contract and resolve the coarse K64 prefix length."""
+    tensors = (fine_output, query, key, value, compression_gate)
+    if any(tensor.ndim != 4 for tensor in tensors):
+        raise ValueError(
+            f"{routing_label} coarse attention tensors must use [batch,sequence,heads,features]"
+        )
     if query.shape != key.shape or query.shape != value.shape:
-        raise ValueError(f"{policy} coarse attention requires equal Q/K/V shapes")
+        raise ValueError(f"{routing_label} coarse attention requires equal Q/K/V shapes")
     if fine_output.shape != query.shape:
-        raise ValueError(f"{policy} coarse attention must match the fine output shape")
+        raise ValueError(f"{routing_label} coarse attention must match the fine output shape")
     if compression_gate.shape != fine_output.shape:
-        raise ValueError(f"{policy} coarse attention gate must match the fine output shape")
+        raise ValueError(f"{routing_label} coarse attention gate must match the fine output shape")
     if any(tensor.device != query.device for tensor in (fine_output, key, value, compression_gate)):
-        raise ValueError(f"{policy} coarse attention tensors must share a device")
+        raise ValueError(f"{routing_label} coarse attention tensors must share a device")
     if any(not tensor.is_floating_point() for tensor in (fine_output, query, key, value)):
-        raise TypeError(f"{policy} coarse attention tensors must be floating-point")
+        raise TypeError(f"{routing_label} coarse attention tensors must be floating-point")
     if not compression_gate.is_floating_point() or compression_gate.dtype is not fine_output.dtype:
-        raise ValueError(f"{policy} coarse attention gate must share the fine output dtype")
+        raise ValueError(f"{routing_label} coarse attention gate must share the fine output dtype")
 
     validate_coarse_scale(coarse_scale)
-    available_key_blocks = (
-        query.shape[1] // TILE_ROWS if block_lengths is None else block_lengths.numel()
+    if block_lengths is None:
+        available_sparse_key_blocks = query.shape[1] // _BLOCK_ROWS
+        available_coarse_key_blocks = (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    else:
+        available_sparse_key_blocks = available_coarse_key_blocks = _validate_block_lengths(
+            block_lengths,
+            sequence_length=query.shape[1],
+            device=query.device,
+            context=f"{routing_label} coarse attention",
+        )
+    return _validate_key_block_scopes(
+        sparse_key_blocks,
+        coarse_key_blocks,
+        available_sparse_key_blocks=available_sparse_key_blocks,
+        available_coarse_key_blocks=available_coarse_key_blocks,
     )
-    if isinstance(sparse_key_blocks, bool):
-        raise TypeError("sparse_key_blocks must be an integer")
-    if torch.compiler.is_compiling():
-        torch._check(
-            sparse_key_blocks >= 1,
-            lambda: "sparse_key_blocks must be positive",
-        )
-        torch._check(
-            sparse_key_blocks <= available_key_blocks,
-            lambda: "sparse_key_blocks cannot exceed the available K64 blocks",
-        )
-    elif not isinstance(sparse_key_blocks, int):
-        raise TypeError("sparse_key_blocks must be an integer")
-    elif not 1 <= sparse_key_blocks <= available_key_blocks:
-        raise ValueError("sparse_key_blocks must fit the available K64 blocks")
 
 
 def mean_pool_block_values(
@@ -82,48 +178,55 @@ def mean_pool_block_values(
     if sequence_length < 1:
         raise ValueError("coarse attention V must contain at least one sequence row")
 
+    if block_lengths is not None:
+        _validate_block_lengths(
+            block_lengths,
+            sequence_length=sequence_length,
+            device=value.device,
+            context="coarse attention",
+        )
+    return _mean_pool_token_blocks(value, block_lengths)
+
+
+def _mean_pool_token_blocks(
+    sequence: torch.Tensor,
+    block_lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    """Mean-pool validated token-major Q, K, or V storage into FP32 blocks."""
+    sequence_length = sequence.shape[1]
+
     if block_lengths is None:
-        block_count = (sequence_length + TILE_ROWS - 1) // TILE_ROWS
-        storage_length = block_count * TILE_ROWS
-        padded = functional.pad(value, (0, 0, 0, 0, 0, storage_length - sequence_length))
+        block_count = (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+        storage_length = block_count * _BLOCK_ROWS
+        padded = functional.pad(sequence, (0, 0, 0, 0, 0, storage_length - sequence_length))
         lengths = torch.minimum(
             torch.full(
                 (block_count,),
-                TILE_ROWS,
+                _BLOCK_ROWS,
                 dtype=torch.int32,
-                device=value.device,
+                device=sequence.device,
             ),
             sequence_length
-            - torch.arange(block_count, dtype=torch.int32, device=value.device) * TILE_ROWS,
+            - torch.arange(block_count, dtype=torch.int32, device=sequence.device) * _BLOCK_ROWS,
         )
         blocks = padded.reshape(
-            value.shape[0],
+            sequence.shape[0],
             block_count,
-            TILE_ROWS,
-            value.shape[2],
-            value.shape[3],
+            _BLOCK_ROWS,
+            sequence.shape[2],
+            sequence.shape[3],
         )
     else:
-        if (
-            block_lengths.ndim != 1
-            or block_lengths.numel() < 1
-            or block_lengths.dtype is not torch.int32
-        ):
-            raise ValueError("coarse attention block lengths must be a nonempty INT32 vector")
-        if block_lengths.device != value.device:
-            raise ValueError("coarse attention V and block lengths must share a device")
         block_count = block_lengths.numel()
-        if sequence_length != block_count * TILE_ROWS:
-            raise ValueError("coarse attention padded V must contain one physical K64 per length")
         lengths = block_lengths
-        blocks = value.reshape(
-            value.shape[0],
+        blocks = sequence.reshape(
+            sequence.shape[0],
             block_count,
-            TILE_ROWS,
-            value.shape[2],
-            value.shape[3],
+            _BLOCK_ROWS,
+            sequence.shape[2],
+            sequence.shape[3],
         )
-        valid_rows = torch.arange(TILE_ROWS, device=value.device)[None, :] < lengths[:, None]
+        valid_rows = torch.arange(_BLOCK_ROWS, device=sequence.device)[None, :] < lengths[:, None]
         blocks = torch.where(valid_rows[None, :, :, None, None], blocks, 0)
 
     pooled = blocks.sum(dim=2, dtype=torch.float32)
@@ -170,14 +273,32 @@ def apply_coarse_attention_residual(
     if any(tensor.device != fine_output.device for tensor in (coarse_output, compression_gate)):
         raise ValueError("fine output, coarse output, and compression gate must share a device")
     batch, sequence_length, heads, features = fine_output.shape
-    query_blocks = (sequence_length + TILE_ROWS - 1) // TILE_ROWS
+    query_blocks = (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     if coarse_output.shape != (batch, heads, query_blocks, features):
-        raise ValueError("coarse output must contain one K64 result per fine query block")
+        raise ValueError("coarse output must contain one Q64 result per fine query block")
 
-    expanded = coarse_output.permute(0, 2, 1, 3).repeat_interleave(TILE_ROWS, dim=1)
+    expanded = coarse_output.permute(0, 2, 1, 3).repeat_interleave(_BLOCK_ROWS, dim=1)
     expanded = expanded[:, :sequence_length]
     output = fine_output.float() + compression_gate.float() * expanded
     return output.to(fine_output.dtype)
+
+
+def _apply_chunked_coarse_residual(
+    fine_output: torch.Tensor,
+    pooled_value: torch.Tensor,
+    compression_gate: torch.Tensor,
+    score_chunks: Iterable[tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    """Apply and concatenate coarse-score chunks before the gated residual."""
+    coarse_chunks = [
+        coarse_attention(scores, pooled_value) for _query_offset, scores in score_chunks
+    ]
+    coarse_output = coarse_chunks[0] if len(coarse_chunks) == 1 else torch.cat(coarse_chunks, dim=2)
+    return apply_coarse_attention_residual(
+        fine_output,
+        coarse_output,
+        compression_gate,
+    )
 
 
 def coarse_attention_residual(

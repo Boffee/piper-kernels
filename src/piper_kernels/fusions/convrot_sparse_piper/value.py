@@ -356,11 +356,11 @@ def _project_value_op_fake(
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    value, value_scale, value_mean, _block_mean = _fake_value_projection(
+    value, value_scale_multiplier, value_mean, _block_mean = _fake_value_projection(
         input_qdata,
         weight_qdata,
     )
-    return value, value_scale, value_mean
+    return value, value_scale_multiplier, value_mean
 
 
 @torch.library.custom_op(

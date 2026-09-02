@@ -23,14 +23,14 @@ from piper_kernels.attention.sparse_piper_attention.dsa import (
 
 
 def _layout(
-    keep_values: tuple[int, ...],
-    key_blocks: int,
+    head_keep_block_values: tuple[int, ...],
+    sparse_key_blocks: int,
     device: torch.device | str = "cpu",
 ):
-    ratios = tuple(value / key_blocks for value in keep_values)
+    ratios = tuple(value / sparse_key_blocks for value in head_keep_block_values)
     return _resolve_route_layout(
         _normalize_head_keep_ratios(ratios),
-        key_blocks,
+        sparse_key_blocks,
         torch.device(device),
     )
 
@@ -45,7 +45,7 @@ def test_packed_routes_store_only_active_uint16_indices() -> None:
 
     assert routes.indices.shape == (1, 2, 6)
     assert routes.indices.dtype is torch.uint16
-    assert routes.head_offsets.tolist() == [0, 1, 4, 6]
+    assert routes.route_head_offsets.tolist() == [0, 1, 4, 6]
     assert bool((routes.indices.to(torch.int32) < 5).all())
 
 
@@ -189,13 +189,14 @@ def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatc
         torch.randn(shape, generator=generator) for _ in range(5)
     ]
     sparse_key_blocks = 2
+    coarse_key_blocks = 3
     coarse_scale = shape[-1] ** -0.5
     query_summary, key_max, key_min = _sequence_block_summaries(
         query.transpose(1, 2),
-        key.transpose(1, 2)[:, :, : sparse_key_blocks * 64],
+        key.transpose(1, 2)[:, :, : coarse_key_blocks * 64],
         block_lengths,
     )
-    pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :sparse_key_blocks]
+    pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :coarse_key_blocks]
     expected = coarse_attention_residual(
         fine_output,
         _dsa_scores(query_summary, key_max, key_min) * coarse_scale,
@@ -209,6 +210,7 @@ def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatc
         value,
         compression_gate,
         sparse_key_blocks=sparse_key_blocks,
+        coarse_key_blocks=coarse_key_blocks,
         coarse_scale=coarse_scale,
         block_lengths=block_lengths,
     )
@@ -216,13 +218,52 @@ def test_dsa_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatc
     torch.testing.assert_close(actual, expected)
 
 
-def test_dsa_coarse_residual_preserves_composed_gradients() -> None:
+def test_dsa_coarse_residual_can_include_a_partial_block_after_sparse_prefix() -> None:
+    generator = torch.Generator().manual_seed(645)
+    shape = (1, 129, 1, 4)
+    fine_output, query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(5)
+    ]
+    coarse_scale = shape[-1] ** -0.5
+    query_summary, key_max, key_min = _sequence_block_summaries(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+    )
+    expected = coarse_attention_residual(
+        fine_output,
+        _dsa_scores(query_summary, key_max, key_min) * coarse_scale,
+        mean_pool_block_values(value),
+        compression_gate,
+    )
+    actual = dsa_coarse_residual(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks=2,
+        coarse_key_blocks=3,
+        coarse_scale=coarse_scale,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("compile_function", [False, True])
+def test_dsa_coarse_residual_preserves_composed_gradients(
+    compile_function: bool,
+) -> None:
     generator = torch.Generator().manual_seed(643)
     shape = (1, 129, 1, 4)
     tensors = [torch.randn(shape, generator=generator, requires_grad=True) for _ in range(5)]
     fine_output, query, key, value, compression_gate = tensors
 
-    output = dsa_coarse_residual(
+    residual = (
+        torch.compile(dsa_coarse_residual, backend="eager", fullgraph=True)
+        if compile_function
+        else dsa_coarse_residual
+    )
+    output = residual(
         fine_output,
         query,
         key,
@@ -267,6 +308,8 @@ def test_dsa_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
     second = compiled(torch.tensor([63, 18], dtype=torch.int32))
 
     assert len(captured_graphs) == 1
+    targets = [node.target for node in captured_graphs[0].graph.nodes if node.op == "call_function"]
+    assert targets == [torch.ops.piper_kernels.sparse_piper_coarse_residual.default]
     assert not torch.equal(first, second)
 
 
@@ -276,7 +319,8 @@ def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
     key_max = torch.randn((1, 2, 5, 8), generator=generator)
     key_min = torch.randn((1, 2, 5, 8), generator=generator)
     pooled_value = torch.randn((1, 2, 5, 6), generator=generator)
-    layout = _layout((2, 3), 5)
+    sparse_key_blocks = 3
+    layout = _layout((1, 2), sparse_key_blocks)
     coarse_scale = 8**-0.5
 
     actual = packed_dsa_routes_and_coarse_from_summaries(
@@ -285,12 +329,13 @@ def test_route_and_coarse_path_reuses_chunked_dsa_scores() -> None:
         key_min,
         pooled_value,
         layout,
+        sparse_key_blocks=sparse_key_blocks,
         coarse_scale=coarse_scale,
     )
     expected_routes = packed_dsa_routes_from_summaries(
         query_summary,
-        key_max,
-        key_min,
+        key_max[:, :, :sparse_key_blocks],
+        key_min[:, :, :sparse_key_blocks],
         layout,
     )
     expected_scores = _dsa_scores(query_summary, key_max, key_min) * coarse_scale
@@ -348,6 +393,23 @@ def test_sm120_padded_summaries_match_portable_valid_prefix_extrema() -> None:
         key.cuda(),
         block_lengths.cuda(),
     )
+
+    for actual_summary, expected_summary in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_summary.cpu(), expected_summary, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_sm120_ragged_key_summaries_match_portable_extrema() -> None:
+    generator = torch.Generator().manual_seed(546)
+    query = torch.randn((1, 2, 129, 128), dtype=torch.bfloat16, generator=generator)
+    key = torch.randn((1, 2, 193, 128), dtype=torch.bfloat16, generator=generator)
+
+    expected = _sequence_block_summaries(query, key)
+    actual = _sequence_block_summaries(query.cuda(), key.cuda())
 
     for actual_summary, expected_summary in zip(actual, expected, strict=True):
         torch.testing.assert_close(actual_summary.cpu(), expected_summary, atol=0, rtol=0)

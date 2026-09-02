@@ -7,10 +7,10 @@ import torch
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     quantize_query_key,
 )
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from ._routes import PackedRoutes
 
-_BLOCK_ROWS = 64
 _RECURRENCE_ROWS = 128
 _P_UINT8_RANGE = 255.0
 _V_INT8_RANGE = 127.0
@@ -25,9 +25,9 @@ def _active_indices(
     query_block: int,
     sparse_key_blocks: int,
     sequence_length: int,
-    head_offsets: list[int],
+    route_head_offsets: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    route_start, route_stop = head_offsets[head : head + 2]
+    route_start, route_stop = route_head_offsets[head : head + 2]
     selected_blocks = routes.indices[
         batch,
         query_block,
@@ -114,7 +114,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     )
     value_int8, value_scale = _quantize_value_per_tile(value_centered)
     output = torch.empty_like(query_head_major)
-    head_offsets = routes.head_offsets.detach().cpu().tolist()
+    route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 
     for batch_index in range(batch):
         for head in range(heads):
@@ -126,7 +126,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     query_block=query_block,
                     sparse_key_blocks=sparse_key_blocks,
                     sequence_length=sequence,
-                    head_offsets=head_offsets,
+                    route_head_offsets=route_head_offsets,
                 )
                 selected_key = key_int8[batch_index, head].index_select(0, key_indices)
                 selected_value = value_int8[batch_index, head].index_select(0, key_indices)
@@ -217,7 +217,7 @@ def reference_exact_sparse_attention(
     batch, sequence, heads, _head_dim = query.shape
     query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     output = torch.empty_like(query)
-    head_offsets = routes.head_offsets.detach().cpu().tolist()
+    route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 
     for batch_index in range(batch):
         for head in range(heads):
@@ -229,7 +229,7 @@ def reference_exact_sparse_attention(
                     query_block=query_block,
                     sparse_key_blocks=sparse_key_blocks,
                     sequence_length=sequence,
-                    head_offsets=head_offsets,
+                    route_head_offsets=route_head_offsets,
                 )
                 query_start = query_block * _BLOCK_ROWS
                 query_stop = min(query_start + _BLOCK_ROWS, sequence)

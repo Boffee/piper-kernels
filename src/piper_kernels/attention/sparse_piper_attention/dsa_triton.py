@@ -30,7 +30,7 @@ def _ordered_float_bits(scores):  # noqa: ANN001, ANN202
 def _tiled_radix_select_pass(  # noqa: ANN202
     scores_ptr,  # noqa: ANN001
     score_base,  # noqa: ANN001
-    key_count,  # noqa: ANN001
+    sparse_key_blocks,  # noqa: ANN001
     prefix,  # noqa: ANN001
     rank,  # noqa: ANN001
     shift: tl.constexpr,
@@ -38,9 +38,9 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 ):
     """Select one radix byte while streaming a score row in fixed tiles."""
     histogram = tl.zeros([_RADIX_BINS], tl.int32)
-    for tile_start in range(0, key_count, selector_tile):
+    for tile_start in range(0, sparse_key_blocks, selector_tile):
         key_offsets = tile_start + tl.arange(0, selector_tile)
-        valid = key_offsets < key_count
+        valid = key_offsets < sparse_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
         ordered_bits = _ordered_float_bits(scores)
         active = valid
@@ -63,8 +63,8 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 
 @triton.jit(
     do_not_specialize=[
-        "key_count",
-        "route_query_offset",
+        "sparse_key_blocks",
+        "query_block_offset",
         "score_batch_stride",
         "score_head_stride",
         "score_query_stride",
@@ -76,10 +76,10 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     scores_ptr: torch.Tensor,
     routes_ptr: torch.Tensor,
-    keep_blocks_ptr: torch.Tensor,
-    head_offsets_ptr: torch.Tensor,
-    key_count: int,
-    route_query_offset: int,
+    head_keep_blocks_ptr: torch.Tensor,
+    route_head_offsets_ptr: torch.Tensor,
+    sparse_key_blocks: int,
+    query_block_offset: int,
     score_batch_stride: int,
     score_head_stride: int,
     score_query_stride: int,
@@ -89,24 +89,26 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     selector_tile: tl.constexpr,
 ) -> None:
     """Select exact stable FP32 top-k routes with runtime row dimensions."""
-    query = tl.program_id(0)
+    query_block = tl.program_id(0)
     head = tl.program_id(1)
     batch = tl.program_id(2)
-    score_base = batch * score_batch_stride + head * score_head_stride + query * score_query_stride
-    head_offset = tl.load(head_offsets_ptr + head)
+    score_base = (
+        batch * score_batch_stride + head * score_head_stride + query_block * score_query_stride
+    )
+    route_head_offset = tl.load(route_head_offsets_ptr + head)
     output_base = (
         batch * route_batch_stride
-        + (route_query_offset + query) * route_query_stride
-        + head_offset * route_route_stride
+        + (query_block_offset + query_block) * route_query_stride
+        + route_head_offset * route_route_stride
     )
-    keep_count = tl.load(keep_blocks_ptr + head)
+    head_keep_block_count = tl.load(head_keep_blocks_ptr + head)
 
     prefix = 0
-    rank = keep_count
+    rank = head_keep_block_count
     prefix, rank = _tiled_radix_select_pass(
         scores_ptr,
         score_base,
-        key_count,
+        sparse_key_blocks,
         prefix,
         rank,
         24,
@@ -115,7 +117,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     prefix, rank = _tiled_radix_select_pass(
         scores_ptr,
         score_base,
-        key_count,
+        sparse_key_blocks,
         prefix,
         rank,
         16,
@@ -124,7 +126,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     prefix, rank = _tiled_radix_select_pass(
         scores_ptr,
         score_base,
-        key_count,
+        sparse_key_blocks,
         prefix,
         rank,
         8,
@@ -133,7 +135,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     threshold_bits, equal_keep = _tiled_radix_select_pass(
         scores_ptr,
         score_base,
-        key_count,
+        sparse_key_blocks,
         prefix,
         rank,
         0,
@@ -142,9 +144,9 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
 
     output_offset = 0
     equal_offset = 0
-    for tile_start in range(0, key_count, selector_tile):
+    for tile_start in range(0, sparse_key_blocks, selector_tile):
         key_offsets = tile_start + tl.arange(0, selector_tile)
-        valid = key_offsets < key_count
+        valid = key_offsets < sparse_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
         ordered_bits = _ordered_float_bits(scores)
         equal = valid & (ordered_bits == threshold_bits)
@@ -229,7 +231,7 @@ def sequence_block_summaries(
     key: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Summarize compact or valid-front padded Q and sparse-prefix K blocks."""
+    """Summarize compact or valid-front padded Q/K blocks."""
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError("optimized DSA sequence summaries require rank-four Q/K tensors")
     if (
@@ -238,9 +240,8 @@ def sequence_block_summaries(
         or key.shape[-1] != _HEAD_DIM
         or query.shape[2] < 1
         or key.shape[2] < _BLOCK_ROWS
-        or key.shape[2] % _BLOCK_ROWS
     ):
-        raise ValueError("optimized DSA sequences require ragged Q and aligned K64/D128 K")
+        raise ValueError("optimized DSA sequences require nonempty ragged Q/K with D128 K")
     if query.device.type != "cuda" or query.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("optimized DSA sequence summaries require CUDA BF16/FP16 inputs")
     if key.device != query.device or key.dtype != query.dtype:
@@ -256,13 +257,14 @@ def sequence_block_summaries(
         or block_lengths.dtype is not torch.int32
         or block_lengths.device != query.device
         or not block_lengths.is_contiguous()
+        or key_rows % _BLOCK_ROWS
         or key_rows // _BLOCK_ROWS > block_lengths.numel()
     ):
         raise ValueError(
             "optimized padded DSA requires one contiguous device INT32 length per query K64"
         )
     query_blocks = (query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-    key_blocks = key_rows // _BLOCK_ROWS
+    key_blocks = (key_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     query_summary = torch.empty(
         (batch, heads, query_blocks, _HEAD_DIM),
         device=query.device,
@@ -310,7 +312,7 @@ def sequence_block_summaries(
         heads=heads,
         sum_extrema=False,
         mask_block_lengths=block_lengths is not None,
-        mask_ragged_tail=False,
+        mask_ragged_tail=block_lengths is None and key_rows % _BLOCK_ROWS != 0,
         num_warps=4,
         num_stages=1,
     )
@@ -320,47 +322,49 @@ def sequence_block_summaries(
 def tiled_radix_select_packed_routes(
     scores: torch.Tensor,
     routes: torch.Tensor,
-    keep_blocks: torch.Tensor,
-    head_offsets: torch.Tensor,
+    head_keep_blocks: torch.Tensor,
+    route_head_offsets: torch.Tensor,
     *,
-    route_query_offset: int,
+    query_block_offset: int,
 ) -> None:
     """Write exact FP32 top-k routes directly into packed UINT16 storage."""
-    if scores.ndim != 4 or not scores.is_contiguous() or scores.dtype != torch.float32:
-        raise ValueError("tiled DSA radix selection requires contiguous rank-four FP32 scores")
+    if scores.ndim != 4 or scores.stride(-1) != 1 or scores.dtype != torch.float32:
+        raise ValueError("tiled DSA radix selection requires rank-four FP32 scores with dense keys")
     if routes.ndim != 3 or routes.dtype != torch.uint16 or not routes.is_contiguous():
         raise ValueError(
             "packed tiled DSA radix selection requires contiguous rank-three uint16 routes"
         )
     if (
-        keep_blocks.ndim != 1
-        or keep_blocks.shape[0] != scores.shape[1]
-        or keep_blocks.dtype != torch.int32
-        or keep_blocks.device != routes.device
-        or not keep_blocks.is_contiguous()
+        head_keep_blocks.ndim != 1
+        or head_keep_blocks.shape[0] != scores.shape[1]
+        or head_keep_blocks.dtype != torch.int32
+        or head_keep_blocks.device != routes.device
+        or not head_keep_blocks.is_contiguous()
     ):
-        raise ValueError("tiled DSA keep counts must be a contiguous device int32 head vector")
+        raise ValueError("tiled DSA head keep blocks must be a contiguous device int32 head vector")
     if (
-        head_offsets.shape != (scores.shape[1] + 1,)
-        or head_offsets.dtype != torch.int32
-        or head_offsets.device != routes.device
-        or not head_offsets.is_contiguous()
+        route_head_offsets.shape != (scores.shape[1] + 1,)
+        or route_head_offsets.dtype != torch.int32
+        or route_head_offsets.device != routes.device
+        or not route_head_offsets.is_contiguous()
     ):
-        raise ValueError("packed tiled DSA head offsets must be a contiguous device int32 vector")
+        raise ValueError(
+            "packed tiled DSA route head offsets must be a contiguous device int32 vector"
+        )
     if scores.device != routes.device or scores.device.type != "cuda":
         raise ValueError("tiled DSA scores and routes must share a CUDA device")
-    if not 0 <= route_query_offset <= routes.shape[1] - scores.shape[2]:
+    if not 0 <= query_block_offset <= routes.shape[1] - scores.shape[2]:
         raise ValueError("tiled DSA query range must fit the packed route output")
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled DSA scores and packed routes must share the batch dimension")
-    batch, heads, queries, keys = scores.shape
-    _tiled_radix_select_packed_routes_kernel[(queries, heads, batch)](
+    batch, heads, query_blocks, sparse_key_blocks = scores.shape
+    _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
         scores,
         routes,
-        keep_blocks,
-        head_offsets,
-        keys,
-        route_query_offset,
+        head_keep_blocks,
+        route_head_offsets,
+        sparse_key_blocks,
+        query_block_offset,
         scores.stride(0),
         scores.stride(1),
         scores.stride(2),

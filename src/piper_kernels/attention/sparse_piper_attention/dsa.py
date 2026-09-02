@@ -7,18 +7,20 @@ from collections.abc import Iterator
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
+    _DSA_ROUTING,
     PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
     PackedRoutes,
     PackedRoutesAndCoarseOutput,
 )
 from .coarse import (
-    apply_coarse_attention_residual,
-    coarse_attention,
-    mean_pool_block_values,
+    _apply_chunked_coarse_residual,
+    _mean_pool_token_blocks,
+    _preserve_coarse_residual_in_graph,
     validate_coarse_residual_inputs,
     validate_coarse_scale,
 )
@@ -31,7 +33,52 @@ except ModuleNotFoundError as exc:
     _sm120_sequence_block_summaries = None
 
 _QUERY_CHUNK_BLOCKS = 384
-_BLOCK_ROWS = 64
+
+
+def _dsa_coarse_residual_impl(
+    fine_output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    compression_gate: torch.Tensor,
+    *,
+    sparse_key_blocks: int,
+    coarse_key_blocks: int,
+    coarse_scale: float,
+    block_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    coarse_key_blocks = validate_coarse_residual_inputs(
+        fine_output,
+        query,
+        key,
+        value,
+        compression_gate,
+        sparse_key_blocks,
+        coarse_key_blocks,
+        coarse_scale,
+        block_lengths,
+        routing_label="DSA",
+    )
+
+    query_head_major = query.transpose(1, 2)
+    coarse_key = key.transpose(1, 2)[:, :, : coarse_key_blocks * _BLOCK_ROWS]
+    query_summary, key_max, key_min = _sequence_block_summaries(
+        query_head_major,
+        coarse_key,
+        block_lengths,
+    )
+    pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :coarse_key_blocks]
+    return _apply_chunked_coarse_residual(
+        fine_output,
+        pooled_value,
+        compression_gate,
+        _dsa_score_chunks(
+            query_summary,
+            key_max,
+            key_min,
+            score_scale=coarse_scale,
+        ),
+    )
 
 
 def dsa_coarse_residual(
@@ -42,51 +89,47 @@ def dsa_coarse_residual(
     compression_gate: torch.Tensor,
     *,
     sparse_key_blocks: int,
+    coarse_key_blocks: int | None = None,
     coarse_scale: float,
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Add an unfused DSA-score coarse branch over the sparse K64 prefix.
+    """Add a DSA-score coarse branch over a K64 prefix.
 
     All token tensors use ``[batch,sequence,heads,features]``. Compact storage
     may end in one partial block. With ``block_lengths``, storage instead holds
     complete physical K64 blocks whose valid rows occupy each block's prefix.
+    ``coarse_key_blocks`` defaults to ``sparse_key_blocks`` for compatibility
+    and may extend the coarse branch across the following dense-key blocks.
     Coarse scores are computed in bounded query-block chunks and the caller's
     compression gate is applied directly without an implicit activation.
+    Compatible compiled inference graphs may fuse this with sparse attention.
     """
-    validate_coarse_residual_inputs(
+    resolved_coarse_key_blocks = (
+        sparse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
+    )
+    if _preserve_coarse_residual_in_graph(fine_output, query, key, value, compression_gate):
+        return torch.ops.piper_kernels.sparse_piper_coarse_residual.default(
+            fine_output,
+            query,
+            key,
+            value,
+            compression_gate,
+            sparse_key_blocks,
+            resolved_coarse_key_blocks,
+            coarse_scale,
+            _DSA_ROUTING,
+            block_lengths,
+        )
+    return _dsa_coarse_residual_impl(
         fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks,
-        coarse_scale,
-        block_lengths,
-        policy="DSA",
-    )
-
-    query_head_major = query.transpose(1, 2)
-    sparse_key = key.transpose(1, 2)[:, :, : sparse_key_blocks * _BLOCK_ROWS]
-    query_summary, key_max, key_min = _sequence_block_summaries(
-        query_head_major,
-        sparse_key,
-        block_lengths,
-    )
-    pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :sparse_key_blocks]
-    coarse_chunks = [
-        coarse_attention(scores, pooled_value)
-        for _start, scores in _dsa_score_chunks(
-            query_summary,
-            key_max,
-            key_min,
-            score_scale=coarse_scale,
-        )
-    ]
-    coarse_output = coarse_chunks[0] if len(coarse_chunks) == 1 else torch.cat(coarse_chunks, dim=2)
-    return apply_coarse_attention_residual(
-        fine_output,
-        coarse_output,
-        compression_gate,
+        sparse_key_blocks=sparse_key_blocks,
+        coarse_key_blocks=resolved_coarse_key_blocks,
+        coarse_scale=coarse_scale,
+        block_lengths=block_lengths,
     )
 
 
@@ -99,17 +142,17 @@ def packed_dsa_routes_from_summaries(
     """Select routes from existing exact Q64/K64 extrema summaries."""
     _validate_dsa_summaries(query_summary, key_max, key_min)
     heads = query_summary.shape[1]
-    key_block_count = key_max.shape[2]
+    sparse_key_blocks = key_max.shape[2]
     builder = PackedRouteBuilder(
         layout,
         batch=query_summary.shape[0],
         heads=heads,
         query_blocks=query_summary.shape[2],
-        key_blocks=key_block_count,
+        sparse_key_blocks=sparse_key_blocks,
         device=query_summary.device,
     )
     for start, scores in _dsa_score_chunks(query_summary, key_max, key_min):
-        builder.write(scores, route_query_offset=start)
+        builder.write(scores, query_block_offset=start)
     return builder.routes
 
 
@@ -120,20 +163,20 @@ def packed_dsa_routes_and_coarse_from_summaries(
     pooled_value: torch.Tensor,
     layout: _ResolvedRouteLayout,
     *,
+    sparse_key_blocks: int,
     coarse_scale: float,
 ) -> PackedRoutesAndCoarseOutput:
-    """Select fine routes and apply coarse attention from each DSA-score chunk."""
+    """Route over a sparse prefix and attend coarsely over every supplied K block."""
     _validate_dsa_summaries(query_summary, key_max, key_min)
     validate_coarse_scale(coarse_scale)
     batch, heads, query_blocks, _head_dim = query_summary.shape
-    key_blocks = key_max.shape[2]
     builder = PackedRouteAndCoarseBuilder(
         layout,
         pooled_value,
         batch=batch,
         heads=heads,
         query_blocks=query_blocks,
-        key_blocks=key_blocks,
+        sparse_key_blocks=sparse_key_blocks,
         device=query_summary.device,
     )
     for start, scores in _dsa_score_chunks(
@@ -142,7 +185,7 @@ def packed_dsa_routes_and_coarse_from_summaries(
         key_min,
         score_scale=coarse_scale,
     ):
-        builder.write(scores, route_query_offset=start)
+        builder.write(scores, query_block_offset=start)
     return builder.finish()
 
 
@@ -154,6 +197,11 @@ def packed_dsa_routes_from_sequences(
 ) -> PackedRoutes:
     """Select routes for compact or valid-front padded Q and sparse-prefix K64."""
     _validate_dsa_sequences(query, key, block_lengths)
+    if block_lengths is not None:
+        torch._assert_async(
+            torch.all((block_lengths >= 1) & (block_lengths <= _BLOCK_ROWS)),
+            f"padded DSA block lengths must lie in [1, {_BLOCK_ROWS}]",
+        )
     query_summary, key_max, key_min = _sequence_block_summaries(query, key, block_lengths)
     return packed_dsa_routes_from_summaries(query_summary, key_max, key_min, layout)
 
@@ -201,13 +249,21 @@ def _sequence_block_summaries(
         key_blocks = key.shape[2] // _BLOCK_ROWS
         key_max, key_min = _padded_block_extrema(key, block_lengths[:key_blocks])
         return query_max + query_min, key_max, key_min
-    query_summaries = []
-    for start in range(0, query.shape[2], _BLOCK_ROWS):
-        block = query[:, :, start : start + _BLOCK_ROWS].float()
-        query_summaries.append(block.amax(dim=2) + block.amin(dim=2))
-    query_summary = torch.stack(query_summaries, dim=2)
-    key_blocks = key.unflatten(2, (key.shape[2] // _BLOCK_ROWS, _BLOCK_ROWS)).float()
-    return query_summary, key_blocks.amax(dim=3), key_blocks.amin(dim=3)
+    query_max, query_min = _compact_block_extrema(query)
+    key_max, key_min = _compact_block_extrema(key)
+    return query_max + query_min, key_max, key_min
+
+
+def _compact_block_extrema(
+    sequence: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP32 extrema for compact blocks, including a ragged tail."""
+    extrema = []
+    for start in range(0, sequence.shape[2], _BLOCK_ROWS):
+        block = sequence[:, :, start : start + _BLOCK_ROWS].float()
+        extrema.append((block.amax(dim=2), block.amin(dim=2)))
+    maxima, minima = zip(*extrema, strict=True)
+    return torch.stack(maxima, dim=2), torch.stack(minima, dim=2)
 
 
 def _padded_block_extrema(
@@ -234,6 +290,7 @@ def _validate_dsa_block_lengths(
         or block_lengths.dtype is not torch.int32
         or block_lengths.device != query.device
         or not block_lengths.is_contiguous()
+        or key.shape[2] % _BLOCK_ROWS
         or key.shape[2] // _BLOCK_ROWS > block_lengths.numel()
     ):
         raise ValueError("padded DSA requires one contiguous device INT32 length per query K64")
@@ -247,11 +304,11 @@ def _dsa_scores(
     score_scale: float | None = None,
 ) -> torch.Tensor:
     """Contract exact FP32 scores while keeping only two score buffers."""
-    batch, heads, query_count, head_dim = query_summary.shape
-    key_count = key_max.shape[2]
-    flat_query = query_summary.reshape(batch * heads, query_count, head_dim)
-    flat_key_max = key_max.reshape(batch * heads, key_count, head_dim)
-    flat_key_min = key_min.reshape(batch * heads, key_count, head_dim)
+    batch, heads, query_blocks, head_dim = query_summary.shape
+    key_blocks = key_max.shape[2]
+    flat_query = query_summary.reshape(batch * heads, query_blocks, head_dim)
+    flat_key_max = key_max.reshape(batch * heads, key_blocks, head_dim)
+    flat_key_min = key_min.reshape(batch * heads, key_blocks, head_dim)
     if score_scale is None:
         scores = torch.bmm(flat_query, flat_key_max.transpose(1, 2))
         minimum_scores = torch.bmm(flat_query, flat_key_min.transpose(1, 2))
@@ -275,7 +332,7 @@ def _dsa_scores(
         scores = torch.maximum(scores, minimum_scores)
     else:
         torch.maximum(scores, minimum_scores, out=scores)
-    return scores.reshape(batch, heads, query_count, key_count)
+    return scores.reshape(batch, heads, query_blocks, key_blocks)
 
 
 def _dsa_score_chunks(

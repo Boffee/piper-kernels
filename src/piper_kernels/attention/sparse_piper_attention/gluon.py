@@ -305,7 +305,7 @@ def _sparse_piper_attention_kernel(
     compression_gate_ptr,
     block_lengths_ptr,
     routes_ptr,
-    keep_blocks_ptr,
+    head_keep_blocks_ptr,
     route_head_offsets_ptr,
     output_ptr,
     query_block_offset,
@@ -377,7 +377,7 @@ def _sparse_piper_attention_kernel(
     mbarrier.init(key_barrier, count=1)
     mbarrier.init(value_barrier, count=1)
 
-    selected_sparse_tile_count = gl.load(keep_blocks_ptr + head)
+    selected_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
     sequence_tiles = storage_sequence_length // _GL_BLOCK_N
     dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
@@ -731,7 +731,7 @@ def _launch_sparse_piper_attention(
             or coarse_output.device != prepared.query.device
             or coarse_output.stride(-1) != 1
         ):
-            raise ValueError("Gluon coarse output must be FP32 [batch,heads,K64,D128]")
+            raise ValueError("Gluon coarse output must be FP32 [batch,heads,Q64,D128]")
         if (
             compression_gate.shape != (batch, gate_sequence_length, heads, head_dim)
             or compression_gate.dtype is not torch.bfloat16
@@ -770,9 +770,13 @@ def _launch_sparse_piper_attention(
         prepared.value_mean,
         coarse_tensor,
         gate_tensor,
-        prepared.block_lengths if prepared.block_lengths is not None else prepared.keep_blocks,
+        (
+            prepared.block_lengths
+            if prepared.block_lengths is not None
+            else prepared.head_keep_blocks
+        ),
         routes,
-        prepared.keep_blocks,
+        prepared.head_keep_blocks,
         route_head_offsets,
         output,
         query_block_offset,

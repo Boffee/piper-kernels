@@ -8,6 +8,7 @@ from collections.abc import Sequence
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from ._budget import (
     _RATIO_SCALE,
@@ -106,7 +107,7 @@ class SparsePiperAttention(torch.nn.Module):
 def _validate_sparse_key_blocks(
     sparse_key_blocks: int,
     *,
-    sequence_blocks: int,
+    available_sparse_key_blocks: int,
 ) -> None:
     if isinstance(sparse_key_blocks, bool):
         raise TypeError("sparse_key_blocks must be an integer")
@@ -116,13 +117,13 @@ def _validate_sparse_key_blocks(
             lambda: "sparse_key_blocks must be positive",
         )
         torch._check(
-            sparse_key_blocks <= sequence_blocks,
+            sparse_key_blocks <= available_sparse_key_blocks,
             lambda: "sparse_key_blocks cannot exceed the sequence block count",
         )
         return
     if not isinstance(sparse_key_blocks, int):
         raise TypeError("sparse_key_blocks must be an integer")
-    if not 1 <= sparse_key_blocks <= sequence_blocks:
+    if not 1 <= sparse_key_blocks <= available_sparse_key_blocks:
         raise ValueError("sparse_key_blocks must fit the sequence block count")
 
 
@@ -160,7 +161,7 @@ def _validate_inputs(
         raise ValueError("sparse Piper ratio profile must contain one value per head")
     _validate_sparse_key_blocks(
         sparse_key_blocks,
-        sequence_blocks=sequence // 64,
+        available_sparse_key_blocks=sequence // _BLOCK_ROWS,
     )
     converted_scale = head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(converted_scale) or converted_scale <= 0:
@@ -180,7 +181,7 @@ def _run_sparse_piper_attention(
     routing_mode: int,
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
-    sparse_key_rows = sparse_key_blocks * 64
+    sparse_key_rows = sparse_key_blocks * _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
@@ -207,10 +208,10 @@ def _run_sparse_piper_attention(
     prepared = _prepare_sm120_attention(
         query_head_major,
         routes.indices,
-        routes.keep_blocks,
+        routes.head_keep_blocks,
         scale,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.head_offsets,
+        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
     )

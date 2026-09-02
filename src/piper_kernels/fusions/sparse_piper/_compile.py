@@ -176,15 +176,15 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
         )
     ):
         return False
-    ratios = match.kwargs["sparse_head_keep_ratio_units"]
+    head_keep_ratio_units = match.kwargs["sparse_head_keep_ratio_units"]
     return bool(
-        isinstance(ratios, (list, tuple))
-        and len(ratios) == heads
+        isinstance(head_keep_ratio_units, (list, tuple))
+        and len(head_keep_ratio_units) == heads
         and all(
             isinstance(units, int)
             and not isinstance(units, bool)
             and 1 <= units <= _budget._RATIO_SCALE
-            for units in ratios
+            for units in head_keep_ratio_units
         )
     )
 

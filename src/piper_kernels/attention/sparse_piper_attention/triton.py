@@ -99,7 +99,7 @@ class _PreparedSparsePiperAttention:
     value_mean: torch.Tensor
     routes: torch.Tensor
     route_head_offsets: torch.Tensor
-    keep_blocks: torch.Tensor
+    head_keep_blocks: torch.Tensor
     block_lengths: torch.Tensor | None
     sparse_key_blocks: int
     logical_sequence_length: int
@@ -108,7 +108,7 @@ class _PreparedSparsePiperAttention:
 def _prepare_sparse_piper_attention(
     query: torch.Tensor,
     routes: torch.Tensor,
-    keep_blocks: torch.Tensor,
+    head_keep_blocks: torch.Tensor,
     scale: float,
     *,
     sparse_key_blocks: int,
@@ -184,7 +184,7 @@ def _prepare_sparse_piper_attention(
         value_mean=value_mean,
         routes=routes,
         route_head_offsets=route_head_offsets,
-        keep_blocks=keep_blocks,
+        head_keep_blocks=head_keep_blocks,
         block_lengths=None,
         sparse_key_blocks=sparse_key_blocks,
         logical_sequence_length=logical_sequence_length,
@@ -200,7 +200,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     routes: torch.Tensor,
-    keep_blocks: torch.Tensor,
+    head_keep_blocks: torch.Tensor,
     route_head_offsets: torch.Tensor,
     *,
     sparse_key_blocks: int,
@@ -272,7 +272,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         value,
         *scales,
         routes,
-        keep_blocks,
+        head_keep_blocks,
         route_head_offsets,
         *((block_lengths,) if block_lengths is not None else ()),
     )
@@ -291,8 +291,8 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
     if routes.dtype is not torch.uint16:
         raise ValueError("quantized sparse Piper routes must use UINT16")
-    if keep_blocks.shape != (heads,) or keep_blocks.dtype is not torch.int32:
-        raise ValueError("quantized sparse Piper keep counts must be one INT32 value per head")
+    if head_keep_blocks.shape != (heads,) or head_keep_blocks.dtype is not torch.int32:
+        raise ValueError("quantized sparse Piper head keep blocks must be one INT32 value per head")
     if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
 
@@ -306,7 +306,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         value_mean=value_mean,
         routes=routes,
         route_head_offsets=route_head_offsets,
-        keep_blocks=keep_blocks,
+        head_keep_blocks=head_keep_blocks,
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         logical_sequence_length=logical_sequence_length,
