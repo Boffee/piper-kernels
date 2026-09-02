@@ -10,12 +10,19 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 )
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
+    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
     _DSA_ROUTING,
     _MEAN_POOL_ROUTING,
 )
+from piper_kernels.attention.sparse_piper_attention.coarse import (
+    apply_coarse_attention_residual,
+    coarse_attention,
+    mean_pool_block_values,
+)
 from piper_kernels.attention.sparse_piper_attention.dsa import (
+    _dsa_scores,
     _sequence_block_summaries,
     packed_dsa_routes_from_sequences,
 )
@@ -96,6 +103,114 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
     assert actual.shape == query.shape
     assert actual.is_contiguous()
     assert torch.equal(actual, expected)
+    assert set(opcheck.values()) == {"SUCCESS"}
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
+def test_quantized_coarse_residual_matches_explicit_composition(
+    routing_mode: int,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(1221 + routing_mode)
+    shape = (1, 193, 2, 128)
+    query = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    key = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    value = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    compression_gate = torch.randn(
+        shape,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    query_head_major = query.transpose(1, 2)
+    key_head_major = key.transpose(1, 2)
+    value_head_major = value.transpose(1, 2)
+    sparse_key_blocks = shape[1] // 64
+    sparse_key = key_head_major[:, :, : sparse_key_blocks * 64]
+    ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
+    placeholder_routes = packed_dsa_routes_from_sequences(
+        query_head_major,
+        sparse_key,
+        layout,
+    )
+    prepared = _prepare_sparse_piper_attention(
+        query_head_major,
+        placeholder_routes.indices,
+        placeholder_routes.keep_blocks,
+        128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
+        route_head_offsets=placeholder_routes.head_offsets,
+        combined_key=key_head_major,
+        combined_value=value_head_major,
+    )
+    if routing_mode == _MEAN_POOL_ROUTING:
+        query_summary = _sequence_block_means(query_head_major)
+        key_summary = _sequence_block_means(sparse_key)
+        key_aux = key_summary.new_empty(0)
+        scores = query_summary @ key_summary.mT
+    else:
+        query_summary, key_summary, key_aux = _sequence_block_summaries(
+            query_head_major,
+            sparse_key,
+        )
+        scores = _dsa_scores(query_summary, key_summary, key_aux)
+    fine_arguments = (
+        prepared.query,
+        prepared.query_scale,
+        query_summary,
+        prepared.key,
+        prepared.key_scale,
+        key_summary,
+        key_aux,
+        prepared.value,
+        prepared.value_scale_multiplier,
+        prepared.value_mean,
+        list(ratio_units),
+        sparse_key_blocks,
+        shape[1],
+        routing_mode,
+    )
+    block_mean = mean_pool_block_values(value)
+    coarse_scale = 128**-0.5
+    coarse_arguments = (
+        *fine_arguments[:10],
+        block_mean,
+        compression_gate,
+        *fine_arguments[10:],
+        coarse_scale,
+    )
+
+    with torch.no_grad():
+        fine_output = _sparse_piper_attention_from_quantized_op(*fine_arguments)
+        expected_coarse = coarse_attention(
+            scores * coarse_scale,
+            block_mean[:, :, :sparse_key_blocks],
+        )
+        expected = apply_coarse_attention_residual(
+            fine_output,
+            expected_coarse,
+            compression_gate,
+        )
+        actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *coarse_arguments,
+        )
+        zero_gate_arguments = list(coarse_arguments)
+        zero_gate_arguments[11] = torch.zeros_like(compression_gate)
+        zero_gate_output = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *zero_gate_arguments,
+        )
+        opcheck = torch.library.opcheck(
+            _sparse_piper_attention_with_coarse_residual_from_quantized_op,
+            coarse_arguments,
+        )
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(zero_gate_output, fine_output)
     assert set(opcheck.values()) == {"SUCCESS"}
 
 
@@ -227,7 +342,7 @@ def _block_length_case(routing_mode: int):
         routing_mode,
     )
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32, device=query.device)
-    return shape, query, prepared, arguments, block_lengths
+    return shape, query, value, prepared, arguments, block_lengths
 
 
 @pytest.mark.gpu
@@ -237,7 +352,9 @@ def _block_length_case(routing_mode: int):
 )
 @pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
 def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
-    shape, query, prepared, arguments, block_lengths = _block_length_case(routing_mode)
+    shape, query, _value, prepared, arguments, block_lengths = _block_length_case(
+        routing_mode,
+    )
     storage_sequence_length = shape[1]
     full_block_lengths = torch.full(
         (storage_sequence_length // 64,),
@@ -311,6 +428,76 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
             *partial_arguments,
             block_lengths.to(torch.int64),
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
+def test_quantized_coarse_residual_supports_internal_block_padding(
+    routing_mode: int,
+) -> None:
+    _shape, _query, value, _prepared, arguments, block_lengths = _block_length_case(
+        routing_mode,
+    )
+    logical_sequence_length = int(block_lengths.sum().item())
+    fine_arguments = list(arguments)
+    fine_arguments[-2] = logical_sequence_length
+    generator = torch.Generator(device="cuda").manual_seed(1223 + routing_mode)
+    compression_gate = torch.randn(
+        value.shape,
+        dtype=torch.bfloat16,
+        device=value.device,
+        generator=generator,
+    )
+    block_mean = mean_pool_block_values(value, block_lengths)
+    sparse_key_blocks = fine_arguments[-3]
+    routing_query_summary = fine_arguments[2]
+    routing_key_summary = fine_arguments[5][:, :, :sparse_key_blocks]
+    if routing_mode == _MEAN_POOL_ROUTING:
+        scores = routing_query_summary @ routing_key_summary.mT
+    else:
+        scores = _dsa_scores(
+            routing_query_summary,
+            routing_key_summary,
+            fine_arguments[6][:, :, :sparse_key_blocks],
+        )
+    coarse_scale = 128**-0.5
+    coarse_arguments = (
+        *fine_arguments[:10],
+        block_mean,
+        compression_gate,
+        *fine_arguments[10:],
+        coarse_scale,
+        block_lengths,
+    )
+
+    with torch.no_grad():
+        fine_output = _sparse_piper_attention_from_quantized_op(
+            *fine_arguments,
+            block_lengths,
+        )
+        expected = apply_coarse_attention_residual(
+            fine_output,
+            coarse_attention(
+                scores * coarse_scale,
+                block_mean[:, :, :sparse_key_blocks],
+            ),
+            compression_gate,
+        )
+        actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *coarse_arguments,
+        )
+        opcheck = torch.library.opcheck(
+            _sparse_piper_attention_with_coarse_residual_from_quantized_op,
+            coarse_arguments,
+        )
+
+    assert actual.shape == value.shape
+    assert torch.equal(actual, expected)
+    assert set(opcheck.values()) == {"SUCCESS"}
 
 
 @pytest.mark.gpu
