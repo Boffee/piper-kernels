@@ -31,6 +31,9 @@ from piper_kernels.fusions.nvfp4_sparse_piper import (
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
 from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
 from piper_kernels.fusions.nvfp4_sparse_piper._compile import compile_pass
+from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
+    _fold_attention_output,
+)
 from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
@@ -256,6 +259,100 @@ def _semantic_attention_graph(
                 output_features=320,
             )
         graph.output((output, attention_output) if escape_attention else output)
+    torch.fx.GraphModule({}, graph)
+    return graph
+
+
+def _quantized_attention_output_graph(
+    *,
+    with_block_lengths: bool,
+    with_coarse: bool,
+) -> torch.fx.Graph:
+    """Build an already-prepared attention boundary for output-only folding."""
+    graph = torch.fx.Graph()
+    with FakeTensorMode():
+        tensors = {
+            "query": torch.empty((1, 2, 192, 128), device="cuda", dtype=torch.int8),
+            "query_scale": torch.empty((1, 2, 6), device="cuda", dtype=torch.float32),
+            "query_summary": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
+            "key": torch.empty((1, 2, 192, 128), device="cuda", dtype=torch.int8),
+            "key_scale": torch.empty((1, 2, 3), device="cuda", dtype=torch.float32),
+            "key_summary": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
+            "key_aux": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
+            "value": torch.empty((1, 2, 128, 192), device="cuda", dtype=torch.int8),
+            "value_scale": torch.empty((1, 2, 3, 1), device="cuda", dtype=torch.float32),
+            "value_mean": torch.empty((1, 2, 128), device="cuda", dtype=torch.float32),
+        }
+        operands = tuple(_placeholder(graph, name, value) for name, value in tensors.items())
+        block_lengths = (
+            _placeholder(
+                graph,
+                "block_lengths",
+                torch.empty(3, device="cuda", dtype=torch.int32),
+            )
+            if with_block_lengths
+            else None
+        )
+        if with_coarse:
+            block_mean = _placeholder(
+                graph,
+                "block_mean",
+                torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
+            )
+            compression_gate = _placeholder(
+                graph,
+                "compression_gate",
+                torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
+            )
+            attention = graph.call_function(
+                torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
+                args=(
+                    *operands,
+                    block_mean,
+                    compression_gate,
+                    [5_000, 10_000],
+                    2,
+                    192,
+                    _MINMAX_ROUTING,
+                    0.125,
+                    block_lengths,
+                    3,
+                ),
+            )
+        else:
+            arguments = (*operands, [5_000, 10_000], 2, 192, _MINMAX_ROUTING)
+            attention = graph.call_function(
+                torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
+                args=(*arguments, block_lengths) if with_block_lengths else arguments,
+            )
+        attention.meta["val"] = torch.empty(
+            (1, 192, 2, 128),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        reshaped = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(attention, (1, 192, 256)),
+        )
+        reshaped.meta["val"] = torch.empty(
+            (1, 192, 256),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        activation_scale = _placeholder(
+            graph,
+            "output_activation_scale",
+            torch.empty((), device="cuda", dtype=torch.float32),
+        )
+        output = _semantic_linear(
+            graph,
+            reshaped,
+            "output",
+            activation_scale,
+            dynamic=False,
+            output_features=320,
+        )
+        graph.output(output)
     torch.fx.GraphModule({}, graph)
     return graph
 
@@ -626,7 +723,37 @@ def test_static_output_fuses_after_prepared_sparse_projection(
         for node in call_nodes
         if node.target is torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
     )
-    assert output_node.args[-1] == 8_192
+    assert output_node.args[19] == 8_192
+    graph.lint()
+
+
+@pytest.mark.parametrize("with_block_lengths", [False, True])
+@pytest.mark.parametrize("with_coarse", [False, True])
+def test_output_fold_supports_every_bounded_attention_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    with_block_lengths: bool,
+    with_coarse: bool,
+) -> None:
+    graph = _quantized_attention_output_graph(
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
+    )
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    assert _fold_attention_output(graph)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default) == 1
+    assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
+    assert (
+        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+        not in targets
+    )
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     graph.lint()
 
 

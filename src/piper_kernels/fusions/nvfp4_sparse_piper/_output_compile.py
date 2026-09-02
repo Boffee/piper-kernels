@@ -13,61 +13,24 @@ from torch._inductor.pattern_matcher import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 from . import output
 
-_ATTENTION_ARGUMENT_NAMES = (
-    "output_query",
-    "output_query_scale",
-    "output_query_summary",
-    "output_key",
-    "output_key_scale",
-    "output_key_summary",
-    "output_key_aux",
-    "output_value",
-    "output_value_scale_multiplier",
-    "output_value_mean",
-    "output_head_keep_ratio_units",
-    "output_sparse_key_blocks",
-    "output_logical_sequence_length",
-    "output_routing_mode",
-)
 
-
-def _reshaped_attention_pattern() -> CallFunction:
-    """Match the common materialized sparse-attention output boundary."""
-    attention = CallFunction(
-        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-        KeywordArg("output_query"),
-        KeywordArg("output_query_scale"),
-        KeywordArg("output_query_summary"),
-        KeywordArg("output_key"),
-        KeywordArg("output_key_scale"),
-        KeywordArg("output_key_summary"),
-        KeywordArg("output_key_aux"),
-        KeywordArg("output_value"),
-        KeywordArg("output_value_scale_multiplier"),
-        KeywordArg("output_value_mean"),
-        KeywordArg("output_head_keep_ratio_units"),
-        KeywordArg("output_sparse_key_blocks"),
-        KeywordArg("output_logical_sequence_length"),
-        KeywordArg("output_routing_mode"),
-        _users=1,
-    )
-    return CallFunction(
-        torch.ops.aten.reshape.default,
-        attention,
-        KeywordArg("output_attention_shape"),
-        _users=1,
-    )
-
-
-def _attention_output_pattern() -> CallFunction:
+def _attention_output_pattern(
+    *,
+    with_block_lengths: bool,
+    with_coarse: bool,
+) -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.nvfp4_linear.default,
-        _reshaped_attention_pattern(),
+        sparse_piper_pattern.reshaped_quantized_attention_pattern(
+            with_block_lengths=with_block_lengths,
+            with_coarse=with_coarse,
+        ),
         KeywordArg("output_weight_qdata"),
         KeywordArg("output_weight_scale"),
         KeywordArg("output_weight_per_tensor_scale"),
@@ -144,25 +107,37 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
     batch = query.shape[0]
     heads = sparse_piper_compile.static_int(query.shape[1])
     head_dim = sparse_piper_compile.static_int(query.shape[3])
-    logical_sequence_length = sparse_piper_compile.integer_scalar_metadata(
-        match.kwargs["output_logical_sequence_length"]
-    )
+    reshaped_node = match.output_node().args[0]
+    if not isinstance(reshaped_node, torch.fx.Node):
+        return False
+    attention_node = reshaped_node.args[0]
+    if not isinstance(attention_node, torch.fx.Node):
+        return False
+    attention = preparation_sharing.tensor_metadata(attention_node)
     attention_shape = _shape_dimensions(match.kwargs["output_attention_shape"])
     if (
         heads is None
         or head_dim != 128
-        or logical_sequence_length is None
+        or attention is None
+        or attention.ndim != 4
+        or attention.dtype is not torch.bfloat16
+        or attention.device != query.device
+        or attention.layout is not torch.strided
+        or not attention.is_contiguous()
         or attention_shape is None
         or len(attention_shape) != 3
     ):
         return False
     input_features = heads * head_dim
     if (
-        not _same_dimension(attention_shape[0], batch)
-        or not _same_dimension(attention_shape[1], logical_sequence_length)
+        not _same_dimension(attention.shape[0], batch)
+        or attention.shape[2] != heads
+        or attention.shape[3] != head_dim
+        or not _same_dimension(attention_shape[0], batch)
+        or not _same_dimension(attention_shape[1], attention.shape[1])
         or attention_shape[2] != input_features
         or not _same_dimension(projected.shape[0], batch)
-        or not _same_dimension(projected.shape[1], logical_sequence_length)
+        or not _same_dimension(projected.shape[1], attention.shape[1])
     ):
         return False
 
@@ -206,13 +181,14 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
         replacement = graph.call_function(
             torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default,
             args=(
-                *(match.kwargs[name] for name in _ATTENTION_ARGUMENT_NAMES),
+                *sparse_piper_pattern.quantized_attention_arguments(match),
                 match.kwargs["output_weight_qdata"],
                 match.kwargs["output_weight_scale"],
                 match.kwargs["output_weight_per_tensor_scale"],
                 match.kwargs["output_activation_scale"],
                 match.kwargs["output_bias"],
                 output._DEFAULT_QUERY_CHUNK_ROWS,
+                *sparse_piper_pattern.bounded_attention_arguments(match),
             ),
         )
     replacement.meta = original.meta.copy()
@@ -222,11 +198,16 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
 
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_attention_output")
-register_graph_pattern(
-    _attention_output_pattern(),
-    extra_check=_valid_attention_output,
-    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-)(_replace_attention_output)
+for _with_block_lengths in (False, True):
+    for _with_coarse in (False, True):
+        register_graph_pattern(
+            _attention_output_pattern(
+                with_block_lengths=_with_block_lengths,
+                with_coarse=_with_coarse,
+            ),
+            extra_check=_valid_attention_output,
+            pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_attention_output)
 
 
 def _fold_attention_output(graph: torch.fx.Graph) -> bool:

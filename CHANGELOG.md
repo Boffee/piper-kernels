@@ -7,6 +7,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Extended bounded sparse-attention output projection fusion to valid-front padded K64 storage and
+  fused coarse residuals. ConvRot INT8, standard NVFP4, and ConvRot NVFP4 now share ranged
+  attention launches that pass `block_lengths`, block-level coarse output, and the token-level
+  compression gate directly into each projection chunk instead of materializing the full BF16
+  attention result.
 - Added a policy-independent Sparse Piper coarse-attention residual. Caller-provided FP32 block
   scores from mean pooling, min/max pooling, or learned policies attend over padding-aware pooled
   V, expand over physical K64 query blocks, and apply a token-level compression gate before the

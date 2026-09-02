@@ -155,6 +155,11 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None,
     query_chunk_rows: int,
     preparation: PreparationBackend,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into a static NVFP4 output."""
     input_features, output_features = _validate_output_projection(
@@ -167,7 +172,7 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         query_chunk_rows,
     )
-    prepared_attention = output_common.prepare_attention(
+    prepared = output_common.prepare_attention(
         query,
         query_scale,
         query_summary,
@@ -182,8 +187,14 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
     )
-    capacity = min(logical_sequence_length, query_chunk_rows)
+    sequence_length = prepared.sequence_length
+    capacity = min(sequence_length, query_chunk_rows)
     prepared_input = torch.empty(
         _layout.qdata_shape(capacity, input_features),
         device=query.device,
@@ -217,9 +228,7 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         )
 
     return output_common.run_chunked_attention_output(
-        prepared_attention,
-        query,
-        logical_sequence_length,
+        prepared,
         output_features,
         query_chunk_rows,
         project_chunk,

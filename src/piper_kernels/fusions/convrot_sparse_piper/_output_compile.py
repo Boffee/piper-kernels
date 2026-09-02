@@ -13,6 +13,7 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _layout, output
@@ -21,30 +22,12 @@ from . import _layout, output
 def _attention_output_pattern(
     *,
     explicit_activation: bool,
+    with_block_lengths: bool,
+    with_coarse: bool,
 ) -> CallFunction:
-    attention = CallFunction(
-        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-        KeywordArg("output_query"),
-        KeywordArg("output_query_scale"),
-        KeywordArg("output_query_summary"),
-        KeywordArg("output_key"),
-        KeywordArg("output_key_scale"),
-        KeywordArg("output_key_summary"),
-        KeywordArg("output_key_aux"),
-        KeywordArg("output_value"),
-        KeywordArg("output_value_scale_multiplier"),
-        KeywordArg("output_value_mean"),
-        KeywordArg("output_head_keep_ratio_units"),
-        KeywordArg("output_sparse_key_blocks"),
-        KeywordArg("output_logical_sequence_length"),
-        KeywordArg("output_routing_mode"),
-        _users=1,
-    )
-    reshaped = CallFunction(
-        torch.ops.aten.reshape.default,
-        attention,
-        KeywordArg("output_attention_shape"),
-        _users=1,
+    reshaped = sparse_piper_pattern.reshaped_quantized_attention_pattern(
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
     )
     arguments: list[object] = [
         reshaped,
@@ -227,6 +210,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                 output_bias,
                 output_group_size,
                 output._DEFAULT_QUERY_CHUNK_ROWS,
+                *sparse_piper_pattern.bounded_attention_arguments(match),
             ),
         )
     replacement.meta = original.meta.copy()
@@ -237,11 +221,17 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
 
 _patterns = PatternMatcherPass("convrot_sparse_piper_attention_output")
 for _explicit_activation in (False, True):
-    register_graph_pattern(
-        _attention_output_pattern(explicit_activation=_explicit_activation),
-        extra_check=_valid_attention_output,
-        pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-    )(_replace_attention_output)
+    for _with_block_lengths in (False, True):
+        for _with_coarse in (False, True):
+            register_graph_pattern(
+                _attention_output_pattern(
+                    explicit_activation=_explicit_activation,
+                    with_block_lengths=_with_block_lengths,
+                    with_coarse=_with_coarse,
+                ),
+                extra_check=_valid_attention_output,
+                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_attention_output)
 
 
 def _fold_attention_output(graph: torch.fx.Graph) -> bool:

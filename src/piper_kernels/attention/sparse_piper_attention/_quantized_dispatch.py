@@ -170,16 +170,31 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     return prepared, routed.coarse_output
 
 
+def _quantized_attention_output_sequence_length(
+    query: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+) -> int:
+    """Resolve compact logical rows or valid-front padded physical rows."""
+    return query.shape[2] if block_lengths is not None else logical_sequence_length
+
+
 def _new_quantized_attention_output(
     query: torch.Tensor,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None,
 ) -> torch.Tensor:
-    output_sequence_length = (
-        query.shape[2] if block_lengths is not None else logical_sequence_length
-    )
     return query.new_empty(
-        (query.shape[0], output_sequence_length, query.shape[1], query.shape[3]),
+        (
+            query.shape[0],
+            _quantized_attention_output_sequence_length(
+                query,
+                logical_sequence_length,
+                block_lengths,
+            ),
+            query.shape[1],
+            query.shape[3],
+        ),
         dtype=torch.bfloat16,
     )
 

@@ -299,9 +299,10 @@ derives extrema-based scores under the same layout contract, while
 `coarse_attention_residual` remains available for learned or already-materialized block scores.
 These composable implementations are the correctness and training contract; compatible compiled
 ConvRot INT8 graphs fuse the shared route scores, wider coarse attention, and gated residual.
-Bounded attention-to-output projection fusion currently remains limited to fine attention without
-`block_lengths`; padded or coarse graphs materialize the BF16 attention output before its output
-projection.
+When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
+quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
+residual. It passes the coarse result and compression gate into each ranged attention launch and
+projects that chunk directly, so the full BF16 attention output is not materialized.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
