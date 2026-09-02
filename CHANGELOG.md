@@ -11,6 +11,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   finite global scale in the stored basis, including well-defined all-zero storage, while ConvRot
   owns rotation before quantization.
 - Exported the supported ConvRot group sizes for checkpoint producers and policy validation.
+- Added opt-in `routing="mean_pool"` block selection to `SparsePiperAttention`, using FP32
+  Q64/K64 mean summaries with the existing per-head budgets and packed UINT16 route layout. DSA
+  remains the default. Standalone and quantized dispatch, plus compatible ConvRot INT8, NVFP4, and
+  ConvRot NVFP4 compiler fusions, preserve the selected routing policy.
 
 ## [0.6.1] - 2026-09-01
 

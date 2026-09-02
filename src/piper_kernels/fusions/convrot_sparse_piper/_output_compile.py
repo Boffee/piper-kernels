@@ -18,7 +18,10 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from . import _layout, output
 
 
-def _attention_output_pattern(*, explicit_activation: bool) -> CallFunction:
+def _attention_output_pattern(
+    *,
+    explicit_activation: bool,
+) -> CallFunction:
     attention = CallFunction(
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         KeywordArg("output_query"),
@@ -26,14 +29,15 @@ def _attention_output_pattern(*, explicit_activation: bool) -> CallFunction:
         KeywordArg("output_query_summary"),
         KeywordArg("output_key"),
         KeywordArg("output_key_scale"),
-        KeywordArg("output_key_max"),
-        KeywordArg("output_key_min"),
+        KeywordArg("output_key_summary"),
+        KeywordArg("output_key_aux"),
         KeywordArg("output_value"),
         KeywordArg("output_value_scale_multiplier"),
         KeywordArg("output_value_mean"),
         KeywordArg("output_head_keep_ratio_units"),
         KeywordArg("output_sparse_key_blocks"),
         KeywordArg("output_logical_sequence_length"),
+        KeywordArg("output_routing_mode"),
         _users=1,
     )
     reshaped = CallFunction(
@@ -183,14 +187,15 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
     output_query_summary: torch.fx.Node,
     output_key: torch.fx.Node,
     output_key_scale: torch.fx.Node,
-    output_key_max: torch.fx.Node,
-    output_key_min: torch.fx.Node,
+    output_key_summary: torch.fx.Node,
+    output_key_aux: torch.fx.Node,
     output_value: torch.fx.Node,
     output_value_scale_multiplier: torch.fx.Node,
     output_value_mean: torch.fx.Node,
     output_head_keep_ratio_units: list[int],
     output_sparse_key_blocks: Argument,
     output_logical_sequence_length: Argument,
+    output_routing_mode: int,
     output_weight_qdata: torch.fx.Node,
     output_weight_scale: torch.fx.Node,
     output_bias: torch.fx.Node | None,
@@ -208,14 +213,15 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                 output_query_summary,
                 output_key,
                 output_key_scale,
-                output_key_max,
-                output_key_min,
+                output_key_summary,
+                output_key_aux,
                 output_value,
                 output_value_scale_multiplier,
                 output_value_mean,
                 output_head_keep_ratio_units,
                 output_sparse_key_blocks,
                 output_logical_sequence_length,
+                output_routing_mode,
                 output_weight_qdata,
                 output_weight_scale,
                 output_bias,

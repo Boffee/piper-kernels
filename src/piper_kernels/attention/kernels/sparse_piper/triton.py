@@ -62,24 +62,27 @@ def store_query_tile(
     storage_sequence_length,
     query_block,
     softmax_scale: tl.constexpr,
+    mean_pool_summary: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Quantize and store one transformed sparse-Piper query tile and summary."""
+    """Quantize and store one transformed sparse-Piper query tile and route summary."""
     feature_offsets = tl.arange(0, head_dim)
+    valid_rows = sequence_offsets < logical_sequence_length
     if mask_ragged_tail:
-        valid_rows = sequence_offsets < logical_sequence_length
         values = tl.where(valid_rows[:, None, None], values, 0.0)
-        summary = tl.max(
-            tl.where(valid_rows[:, None, None], values, -float("inf")),
-            axis=0,
-        ) + tl.min(
-            tl.where(valid_rows[:, None, None], values, float("inf")),
-            axis=0,
+    if mean_pool_summary:
+        valid_count = (
+            logical_sequence_length - query_block * block_m if mask_ragged_tail else block_m
         )
+        summary = tl.sum(values, axis=0) / valid_count
+    elif mask_ragged_tail:
+        summary = tl.max(
+            tl.where(valid_rows[:, None, None], values, -float("inf")), axis=0
+        ) + tl.min(tl.where(valid_rows[:, None, None], values, float("inf")), axis=0)
     else:
         summary = tl.max(values, axis=0) + tl.min(values, axis=0)
     summary_offsets = (
@@ -133,8 +136,8 @@ def store_key_tile(
     values,
     key_ptr,
     key_scale_ptr,
-    key_max_ptr,
-    key_min_ptr,
+    key_summary_ptr,
+    key_aux_ptr,
     batch,
     heads,
     head_offsets,
@@ -142,12 +145,13 @@ def store_key_tile(
     logical_sequence_length,
     storage_sequence_length,
     row_block,
+    mean_pool_summary: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Quantize and store one transformed sparse-Piper key tile and extrema."""
+    """Quantize and store one transformed sparse-Piper key tile and route summaries."""
     feature_offsets = tl.arange(0, head_dim)
     valid_rows = sequence_offsets < logical_sequence_length
     values = tl.where(valid_rows[:, None, None], values, 0.0)
@@ -164,14 +168,18 @@ def store_key_tile(
     tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
     row_in_tile = tl.arange(0, scale_rows)
     valid = tile_offsets[:, None] * scale_rows + row_in_tile[None, :] < logical_sequence_length
-    key_max = tl.max(
-        tl.where(valid[None, :, :, None], grouped, -float("inf")),
-        axis=2,
-    )
-    key_min = tl.min(
-        tl.where(valid[None, :, :, None], grouped, float("inf")),
-        axis=2,
-    )
+    if mean_pool_summary:
+        valid_count = tl.sum(valid.to(tl.int32), axis=1)
+        key_summary = tl.sum(grouped, axis=2) / valid_count[None, :, None]
+    else:
+        key_summary = tl.max(
+            tl.where(valid[None, :, :, None], grouped, -float("inf")),
+            axis=2,
+        )
+        key_aux = tl.min(
+            tl.where(valid[None, :, :, None], grouped, float("inf")),
+            axis=2,
+        )
 
     quantized, key_scale = qk_quantization.quantize_key_tile(
         values,
@@ -196,8 +204,9 @@ def store_key_tile(
     tile_mask = (head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count)
     tl.store(key_scale_ptr + scale_offsets, key_scale, mask=tile_mask)
     summary_offsets = scale_offsets[:, :, None] * head_dim + feature_offsets[None, None, :]
-    tl.store(key_max_ptr + summary_offsets, key_max, mask=tile_mask[:, :, None])
-    tl.store(key_min_ptr + summary_offsets, key_min, mask=tile_mask[:, :, None])
+    tl.store(key_summary_ptr + summary_offsets, key_summary, mask=tile_mask[:, :, None])
+    if not mean_pool_summary:
+        tl.store(key_aux_ptr + summary_offsets, key_aux, mask=tile_mask[:, :, None])
 
 
 @triton.jit

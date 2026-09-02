@@ -24,14 +24,15 @@ _ATTENTION_ARGUMENT_NAMES = (
     "output_query_summary",
     "output_key",
     "output_key_scale",
-    "output_key_max",
-    "output_key_min",
+    "output_key_summary",
+    "output_key_aux",
     "output_value",
     "output_value_scale_multiplier",
     "output_value_mean",
     "output_head_keep_ratio_units",
     "output_sparse_key_blocks",
     "output_logical_sequence_length",
+    "output_routing_mode",
 )
 
 
@@ -44,14 +45,15 @@ def _reshaped_attention_pattern() -> CallFunction:
         KeywordArg("output_query_summary"),
         KeywordArg("output_key"),
         KeywordArg("output_key_scale"),
-        KeywordArg("output_key_max"),
-        KeywordArg("output_key_min"),
+        KeywordArg("output_key_summary"),
+        KeywordArg("output_key_aux"),
         KeywordArg("output_value"),
         KeywordArg("output_value_scale_multiplier"),
         KeywordArg("output_value_mean"),
         KeywordArg("output_head_keep_ratio_units"),
         KeywordArg("output_sparse_key_blocks"),
         KeywordArg("output_logical_sequence_length"),
+        KeywordArg("output_routing_mode"),
         _users=1,
     )
     return CallFunction(

@@ -20,6 +20,10 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _DSA_ROUTING,
+    _MEAN_POOL_ROUTING,
+)
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import (
     nvfp4_sparse_piper_compile_options,
@@ -159,6 +163,7 @@ def _semantic_attention_graph(
     dynamic: bool,
     output_dynamic: bool | None = None,
     escape_attention: bool = False,
+    routing_mode: int = _DSA_ROUTING,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
@@ -215,7 +220,7 @@ def _semantic_attention_graph(
         )
         output = graph.call_function(
             torch.ops.piper_kernels.sparse_piper_attention.default,
-            args=(query, key, value, [5000, 10000], 2, 128**-0.5),
+            args=(query, key, value, [5000, 10000], 2, 128**-0.5, routing_mode),
         )
         output.meta["val"] = torch.empty(
             (1, 192, 2, 128),
@@ -265,7 +270,13 @@ class _SparseProjectionAttention(torch.nn.Module):
     head_dim = 128
     rotary_dim = 96
 
-    def __init__(self, *, batch: int = 1, dynamic: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        batch: int = 1,
+        dynamic: bool = False,
+        routing: str = "dsa",
+    ) -> None:
         super().__init__()
         self.batch = batch
         calibration = torch.full(
@@ -323,7 +334,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         ).mul_(2 * torch.pi)
         self.register_buffer("cos", angles.cos().contiguous())
         self.register_buffer("sin", angles.sin().contiguous())
-        self.sparse_attention = SparsePiperAttention((0.5, 1.0))
+        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
         normalized = F.rms_norm(
@@ -367,8 +378,8 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
 
     output_features = 320
 
-    def __init__(self, *, dynamic: bool = False) -> None:
-        super().__init__(dynamic=dynamic)
+    def __init__(self, *, dynamic: bool = False, routing: str = "dsa") -> None:
+        super().__init__(dynamic=dynamic, routing=routing)
         calibration = torch.full(
             (1, self.sequence_length, self.heads * self.head_dim),
             3.0,
@@ -447,6 +458,7 @@ def _run_explicit_attention_output(
         1e-5,
         model.head_dim**-0.5,
         4_096,
+        model.sparse_attention._routing_mode,
     )
     key = fused_key.project_key(
         *k_input,
@@ -457,6 +469,7 @@ def _run_explicit_attention_output(
         model.sin,
         1e-5,
         4_096,
+        model.sparse_attention._routing_mode,
     )
     value_mean = linear_mean(
         *v_input,
@@ -480,6 +493,7 @@ def _run_explicit_attention_output(
         list(model.sparse_attention._head_keep_ratio_units),
         model.sparse_key_blocks,
         model.sequence_length,
+        model.sparse_attention._routing_mode,
     )
     output_weight = model.output.weight
     assert isinstance(output_weight, PiperNVFP4Tensor)
@@ -542,12 +556,14 @@ def test_compile_options_install_versioned_idempotent_passes() -> None:
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
 def test_prepared_projection_family_fuses_without_materializing_linears(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
     preparation_count: int,
+    routing_mode: int,
 ) -> None:
-    graph = _semantic_attention_graph(dynamic=dynamic)
+    graph = _semantic_attention_graph(dynamic=dynamic, routing_mode=routing_mode)
     monkeypatch.setattr(
         AcceleratorTarget,
         "from_device",
@@ -578,12 +594,18 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
 def test_static_output_fuses_after_prepared_sparse_projection(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
     preparation_count: int,
+    routing_mode: int,
 ) -> None:
-    graph = _semantic_attention_graph(dynamic=dynamic, output_dynamic=False)
+    graph = _semantic_attention_graph(
+        dynamic=dynamic,
+        output_dynamic=False,
+        routing_mode=routing_mode,
+    )
     monkeypatch.setattr(
         AcceleratorTarget,
         "from_device",
@@ -654,13 +676,17 @@ def test_static_output_fails_closed_when_attention_escapes(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+@pytest.mark.parametrize(
+    ("dynamic", "preparation_count", "routing"),
+    [(False, 3, "dsa"), (True, 1, "dsa"), (False, 3, "mean_pool")],
+)
 def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
     dynamic: bool,
     preparation_count: int,
+    routing: str,
 ) -> None:
     torch.manual_seed(823)
-    model = _SparseProjectionAttention(dynamic=dynamic).eval()
+    model = _SparseProjectionAttention(dynamic=dynamic, routing=routing).eval()
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",

@@ -239,7 +239,10 @@ Sparse Piper is a separate non-causal SM120 operator for pre-tiled H3-style self
 ```python
 from piper_kernels import SparsePiperAttention
 
-attention = SparsePiperAttention((0.2, 0.4, 0.6))
+attention = SparsePiperAttention(
+    (0.2, 0.4, 0.6),
+    routing="mean_pool",
+)
 output = attention(
     query,
     key,
@@ -251,16 +254,18 @@ output = attention(
 Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout, and every logical input row
 participates in attention. The sequence length may be arbitrary; the operator pads only its internal
 quantized storage to K64. `sparse_key_blocks` is a runtime count of complete routeable K64 prefix
-tiles, so any partial final tile belongs to the dense suffix. Every query receives an exact
-FP32 DSA route over that prefix, then attends to every remaining K/V row in the same softmax. This
-makes text,
+tiles, so any partial final tile belongs to the dense suffix. Routing defaults to exact FP32 DSA;
+passing `routing="mean_pool"` instead scores FP32 Q64/K64 mean summaries. Both policies select the
+same per-head block budget over the sparse prefix, after which every query attends to every
+remaining K/V row in the same softmax. This makes text,
 generated audio, or other globally retained sections an optional dense suffix while keeping their
 queries sparse over the packed media prefix. Engine owns only the semantic per-layer ratio profile.
 Each opaque attention call derives its temporary physical keep counts, packed offsets, and exact
 route storage from that immutable model configuration and the current prefix length. Dynamic
 compiled graphs accept changed prefix lengths and their resulting route capacities without compiling
-another graph or SM120 attention kernel. DSA routes remain call-local because they depend on the
-current Q/K values.
+another graph or SM120 attention kernel. Routes remain call-local because both policies depend on
+the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler rewrites preserve
+the selected policy while producing its summaries directly from fused projections.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

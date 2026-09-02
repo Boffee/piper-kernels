@@ -15,7 +15,14 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
+from ._routes import (
+    _MEAN_POOL_ROUTING,
+    _ROUTING_MODE_BY_NAME,
+    _ROUTING_NAME_BY_MODE,
+    validate_routing_mode,
+)
 from .dsa import packed_dsa_routes_from_sequences
+from .mean_pool import packed_mean_pool_routes_from_sequences
 from .reference import reference_sparse_piper_attention
 
 try:
@@ -42,14 +49,25 @@ class SparsePiperAttention(torch.nn.Module):
     def __init__(
         self,
         head_keep_ratios: Sequence[float] | torch.Tensor,
+        *,
+        routing: str = "dsa",
     ) -> None:
         super().__init__()
         self._head_keep_ratio_units = _normalize_head_keep_ratios(head_keep_ratios)
+        try:
+            self._routing_mode = _ROUTING_MODE_BY_NAME[routing]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("sparse Piper routing must be 'dsa' or 'mean_pool'") from exc
 
     @property
     def head_keep_ratios(self) -> tuple[float, ...]:
         """Return the device-independent semantic ratio profile."""
         return tuple(units / _RATIO_SCALE for units in self._head_keep_ratio_units)
+
+    @property
+    def routing(self) -> str:
+        """Return the block-routing policy selected for this module."""
+        return _ROUTING_NAME_BY_MODE[self._routing_mode]
 
     def forward(
         self,
@@ -81,6 +99,7 @@ class SparsePiperAttention(torch.nn.Module):
             list(self._head_keep_ratio_units),
             sparse_key_blocks,
             converted_scale,
+            self._routing_mode,
         )
 
 
@@ -158,18 +177,18 @@ def _run_sparse_piper_attention(
     sparse_key_blocks: int,
     scale: float,
     target_is_sm120: bool,
+    routing_mode: int,
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
     sparse_key_rows = sparse_key_blocks * 64
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
-    value_head_major = value.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
-    routes = packed_dsa_routes_from_sequences(
-        query_head_major,
-        sparse_key,
-        layout,
-    )
+    validate_routing_mode(routing_mode)
+    if routing_mode == _MEAN_POOL_ROUTING:
+        routes = packed_mean_pool_routes_from_sequences(query_head_major, sparse_key, layout)
+    else:
+        routes = packed_dsa_routes_from_sequences(query_head_major, sparse_key, layout)
 
     if not target_is_sm120:
         return reference_sparse_piper_attention(
@@ -183,6 +202,7 @@ def _run_sparse_piper_attention(
 
     assert _launch_sm120_attention is not None
     assert _prepare_sm120_attention is not None
+    value_head_major = value.transpose(1, 2)
     output = torch.empty_like(query, memory_format=torch.contiguous_format)
     prepared = _prepare_sm120_attention(
         query_head_major,
@@ -206,6 +226,7 @@ def _sparse_piper_attention_op(
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
     scale: float,
+    routing_mode: int,
 ) -> torch.Tensor:
     layout = _resolve_route_layout(
         tuple(head_keep_ratio_units),
@@ -221,6 +242,7 @@ def _sparse_piper_attention_op(
         sparse_key_blocks=sparse_key_blocks,
         scale=scale,
         target_is_sm120=_supports_sm120(target),
+        routing_mode=routing_mode,
     )
 
 
@@ -232,5 +254,6 @@ def _sparse_piper_attention_op_fake(
     _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
     _scale: float,
+    _routing_mode: int,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)

@@ -154,6 +154,33 @@ def composed_key_projection(
     return ProjectedKey(key_int8, key_scale, key_max, key_min)
 
 
+def composed_mean_pool_summary(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    norm_epsilon: float,
+) -> torch.Tensor:
+    """Materialize the exact FP32 valid-prefix Q64/K64 means."""
+    projected = _materialized_fp32_qk(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+    )
+    blocks, valid = _padded_blocks(projected.float())
+    lengths = valid.sum(dim=1)
+    return (blocks * valid[None, None, :, :, None]).sum(dim=3) / lengths[None, None, :, None]
+
+
 def composed_value_projection(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,

@@ -127,6 +127,7 @@ def sparse_piper_projection_pattern(
         KeywordArg("sparse_head_keep_ratio_units"),
         KeywordArg("sparse_key_blocks"),
         KeywordArg("sparse_softmax_scale"),
+        KeywordArg("sparse_routing_mode"),
     )
 
 

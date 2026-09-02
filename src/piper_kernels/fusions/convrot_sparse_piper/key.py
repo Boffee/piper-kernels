@@ -15,6 +15,10 @@ import triton.language as tl
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_POOL_ROUTING,
+    validate_routing_mode,
+)
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
     validate_qk_projection_inputs,
@@ -40,8 +44,8 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     sin_ptr,
     key_ptr,
     key_scale_ptr,
-    key_max_ptr,
-    key_min_ptr,
+    key_summary_ptr,
+    key_aux_ptr,
     rows,
     logical_sequence_length,
     storage_sequence_length,
@@ -52,13 +56,14 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
+    mean_pool_summary: tl.constexpr,
     aligned_projection: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    """Project K once and emit INT8 operands plus exact DSA extrema."""
+    """Project K once and emit INT8 operands plus route summaries."""
     row_block = row_block_offset + tl.program_id(0)
     head_block = tl.program_id(1)
     batch = tl.program_id(2)
@@ -96,8 +101,8 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         key,
         key_ptr,
         key_scale_ptr,
-        key_max_ptr,
-        key_min_ptr,
+        key_summary_ptr,
+        key_aux_ptr,
         batch,
         heads,
         head_offsets,
@@ -105,6 +110,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         storage_sequence_length,
         row_block,
+        mean_pool_summary,
         heads_per_program,
         head_dim,
         block_m,
@@ -149,8 +155,8 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
     sin: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
-    key_max: torch.Tensor,
-    key_min: torch.Tensor,
+    key_summary: torch.Tensor,
+    key_aux: torch.Tensor,
     *,
     batch: int,
     logical_sequence_length: int,
@@ -158,6 +164,7 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
     heads: int,
     rotary_dim: int,
     norm_epsilon: float,
+    mean_pool_summary: bool,
 ) -> None:
     def launch(row_block_count: int, row_block_offset: int, *, aligned_rows: bool) -> None:
         _convrot_project_quantize_key_kernel[
@@ -176,8 +183,8 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             sin,
             key,
             key_scale,
-            key_max,
-            key_min,
+            key_summary,
+            key_aux,
             batch * logical_sequence_length,
             logical_sequence_length,
             storage_sequence_length,
@@ -188,6 +195,7 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
             head_dim=HEAD_DIM,
             rotary_dim=rotary_dim,
             norm_epsilon=norm_epsilon,
+            mean_pool_summary=mean_pool_summary,
             aligned_projection=(
                 aligned_rows
                 and input_qdata.shape[2] % _BLOCK_K == 0
@@ -217,7 +225,9 @@ def _launch_key_projection(
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
+    routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_routing_mode(routing_mode)
     batch, sequence_length, heads, rotary_dim = _validate_inputs(
         input_qdata,
         input_scale,
@@ -240,8 +250,13 @@ def _launch_key_projection(
         dtype=torch.float32,
     )
     summary_shape = (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
-    key_max = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
-    key_min = torch.empty_like(key_max)
+    key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
+    mean_pool_summary = routing_mode == _MEAN_POOL_ROUTING
+    key_aux = (
+        torch.empty(0, device=input_qdata.device, dtype=torch.float32)
+        if mean_pool_summary
+        else torch.empty_like(key_summary)
+    )
     _launch_projection(
         input_qdata,
         input_scale,
@@ -252,16 +267,17 @@ def _launch_key_projection(
         sin,
         key,
         key_scale,
-        key_max,
-        key_min,
+        key_summary,
+        key_aux,
         batch=batch,
         logical_sequence_length=sequence_length,
         storage_sequence_length=storage_sequence_length,
         heads=heads,
         rotary_dim=rotary_dim,
         norm_epsilon=norm_epsilon,
+        mean_pool_summary=mean_pool_summary,
     )
-    return key, key_scale, key_max, key_min
+    return key, key_scale, key_summary, key_aux
 
 
 @torch.library.custom_op(
@@ -277,6 +293,7 @@ def _project_key_op(
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
+    routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key_projection(
         input_qdata,
@@ -287,6 +304,7 @@ def _project_key_op(
         cos,
         sin,
         norm_epsilon,
+        routing_mode,
     )
 
 
@@ -300,6 +318,7 @@ def _project_key_op_fake(
     _cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
+    routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     storage_sequence_length = padded_sequence_length(sequence_length)
@@ -313,4 +332,9 @@ def _project_key_op_fake(
         (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
         dtype=torch.float32,
     )
-    return key, key_scale, summary, summary.new_empty(summary.shape)
+    key_aux = (
+        summary.new_empty(0)
+        if routing_mode == _MEAN_POOL_ROUTING
+        else summary.new_empty(summary.shape)
+    )
+    return key, key_scale, summary, key_aux

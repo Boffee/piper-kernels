@@ -13,6 +13,10 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _DSA_ROUTING,
+    _MEAN_POOL_ROUTING,
+)
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
     convrot_nvfp4_sparse_piper_compile_options,
 )
@@ -52,8 +56,17 @@ def _exact_sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
-def _convrot_graph(*, dynamic: bool, output_dynamic: bool | None = None) -> torch.fx.Graph:
-    graph = _semantic_attention_graph(dynamic=dynamic, output_dynamic=output_dynamic)
+def _convrot_graph(
+    *,
+    dynamic: bool,
+    output_dynamic: bool | None = None,
+    routing_mode: int = _DSA_ROUTING,
+) -> torch.fx.Graph:
+    graph = _semantic_attention_graph(
+        dynamic=dynamic,
+        output_dynamic=output_dynamic,
+        routing_mode=routing_mode,
+    )
     for node in graph.nodes:
         if (
             node.op == "call_function"
@@ -106,12 +119,14 @@ def test_compile_options_compose_with_convrot_nvfp4_ffn(sparse_first: bool) -> N
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
 def test_convrot_preparation_reuses_nvfp4_sparse_projection_kernels(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
     preparation_count: int,
+    routing_mode: int,
 ) -> None:
-    graph = _convrot_graph(dynamic=dynamic)
+    graph = _convrot_graph(dynamic=dynamic, routing_mode=routing_mode)
 
     _run_passes(graph, monkeypatch)
 
@@ -178,8 +193,8 @@ def _convert_weight(weight: torch.Tensor) -> ConvRotNVFP4Tensor:
 
 
 class _ConvRotSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
-    def __init__(self, *, dynamic: bool) -> None:
-        super().__init__(dynamic=dynamic)
+    def __init__(self, *, dynamic: bool, routing: str = "dsa") -> None:
+        super().__init__(dynamic=dynamic, routing=routing)
         for projection in (self.query, self.key, self.value, self.output):
             projection.weight = torch.nn.Parameter(
                 _convert_weight(projection.weight),
@@ -223,6 +238,7 @@ def _explicit_fused(
         1e-5,
         model.head_dim**-0.5,
         4_096,
+        model.sparse_attention._routing_mode,
     )
     key = fused_key.project_key(
         *prepared[1],
@@ -235,6 +251,7 @@ def _explicit_fused(
         model.sin,
         1e-5,
         4_096,
+        model.sparse_attention._routing_mode,
     )
     value_mean = linear_mean(
         *prepared[2],
@@ -264,6 +281,7 @@ def _explicit_fused(
         list(model.sparse_attention._head_keep_ratio_units),
         model.sparse_key_blocks,
         model.sequence_length,
+        model.sparse_attention._routing_mode,
         output_weight.qdata,
         output_weight.scale,
         output_weight.per_tensor_scale,
@@ -289,10 +307,16 @@ class _TargetCapturePass(CustomInferenceAwareGraphPass):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("dynamic", [False, True])
-def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(dynamic: bool) -> None:
+@pytest.mark.parametrize(
+    ("dynamic", "routing"),
+    [(False, "dsa"), (True, "dsa"), (False, "mean_pool")],
+)
+def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
+    dynamic: bool,
+    routing: str,
+) -> None:
     torch.manual_seed(967 + dynamic)
-    model = _ConvRotSparseProjectionAttentionOutput(dynamic=dynamic).eval()
+    model = _ConvRotSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
     input = torch.randn(  # noqa: A001
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",

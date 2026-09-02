@@ -2,34 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
+from ._budget import _ResolvedRouteLayout
+from ._routes import (
+    PackedRouteBuilder,
+    PackedRoutes,
+)
 
 try:
     from .dsa_triton import sequence_block_summaries as _sm120_sequence_block_summaries
-    from .dsa_triton import tiled_radix_select_packed_routes as _sm120_select_routes
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
         raise
     _sm120_sequence_block_summaries = None
-    _sm120_select_routes = None
 
 _QUERY_CHUNK_BLOCKS = 384
 _BLOCK_ROWS = 64
-
-
-@dataclass(frozen=True, slots=True)
-class PackedDsaRoutes:
-    """UINT16 routes packed by physical head for every query block."""
-
-    indices: torch.Tensor
-    head_offsets: torch.Tensor
-    keep_blocks: torch.Tensor
 
 
 def packed_dsa_routes_from_summaries(
@@ -37,41 +28,31 @@ def packed_dsa_routes_from_summaries(
     key_max: torch.Tensor,
     key_min: torch.Tensor,
     layout: _ResolvedRouteLayout,
-) -> PackedDsaRoutes:
+) -> PackedRoutes:
     """Select routes from existing exact Q64/K64 extrema summaries."""
     _validate_dsa_summaries(query_summary, key_max, key_min)
     heads = query_summary.shape[1]
     key_block_count = key_max.shape[2]
-    _validate_route_layout(layout, heads, key_block_count, query_summary.device)
-
-    indices = torch.empty(
-        (query_summary.shape[0], query_summary.shape[2], layout.routes_per_query),
-        dtype=torch.uint16,
+    builder = PackedRouteBuilder(
+        layout,
+        batch=query_summary.shape[0],
+        heads=heads,
+        query_blocks=query_summary.shape[2],
+        key_blocks=key_block_count,
         device=query_summary.device,
     )
-    if _supports_sm120_summary_selector(query_summary):
-        assert _sm120_select_routes is not None
-
-        for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
-            stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
-            scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
-            _sm120_select_routes(
-                scores,
-                indices,
-                layout.keep_blocks,
-                layout.head_offsets,
-                route_query_offset=start,
-            )
-    else:
-        _select_portable_routes(query_summary, key_max, key_min, layout, indices)
-    return PackedDsaRoutes(indices, layout.head_offsets, layout.keep_blocks)
+    for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
+        stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
+        scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
+        builder.write(scores, route_query_offset=start)
+    return builder.routes
 
 
 def packed_dsa_routes_from_sequences(
     query: torch.Tensor,
     key: torch.Tensor,
     layout: _ResolvedRouteLayout,
-) -> PackedDsaRoutes:
+) -> PackedRoutes:
     """Select routes for a ragged Q sequence and complete sparse-prefix K64 blocks."""
     _validate_dsa_sequences(query, key)
     query_summary, key_max, key_min = _sequence_block_summaries(query, key)
@@ -139,34 +120,6 @@ def _dsa_scores(
     return scores.reshape(batch, heads, query_count, key_count)
 
 
-def _select_portable_routes(
-    query_summary: torch.Tensor,
-    key_max: torch.Tensor,
-    key_min: torch.Tensor,
-    layout: _ResolvedRouteLayout,
-    output: torch.Tensor,
-) -> None:
-    offsets = layout.head_offsets.detach().cpu().tolist()
-    keep_values = layout.keep_blocks.detach().cpu().tolist()
-    for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
-        stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
-        scores = _dsa_scores(query_summary[:, :, start:stop], key_max, key_min)
-        for head, count in enumerate(keep_values):
-            selected = torch.argsort(
-                scores[:, head],
-                dim=-1,
-                descending=True,
-                stable=True,
-            )[..., :count]
-            selected = selected.sort(dim=-1).values.to(torch.uint16)
-            output[:, start:stop, offsets[head] : offsets[head + 1]] = selected
-
-
-def _supports_sm120_summary_selector(query_summary: torch.Tensor) -> bool:
-    target = AcceleratorTarget.from_device(query_summary.device)
-    return _sm120_select_routes is not None and target.is_cuda_capability(12, 0)
-
-
 def _supports_sm120_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> bool:
     target = AcceleratorTarget.from_device(query.device)
     return (
@@ -192,17 +145,3 @@ def _validate_dsa_sequences(query: torch.Tensor, key: torch.Tensor) -> None:
         raise ValueError("DSA query and key sequences must share a device")
     if not query.is_floating_point() or not key.is_floating_point():
         raise TypeError("DSA query and key sequences must be floating-point tensors")
-
-
-def _validate_route_layout(
-    layout: _ResolvedRouteLayout,
-    heads: int,
-    key_blocks: int,
-    device: torch.device,
-) -> None:
-    if not 1 <= key_blocks <= _UINT16_ROUTE_CAPACITY:
-        raise ValueError("DSA requires between 1 and 65,536 sparse key blocks")
-    if layout.keep_blocks.shape != (heads,) or layout.head_offsets.shape != (heads + 1,):
-        raise ValueError("DSA route layout does not match the attention head count")
-    if layout.keep_blocks.device != device or layout.head_offsets.device != device:
-        raise ValueError("DSA route layout must share the attention device")

@@ -268,6 +268,12 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
         return (projected, attention) if self.escape_attention else projected
 
 
+class _MeanPoolSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
+
+
 class _DynamicSparseProjectionAttentionOutput(_DynamicSparseProjectionAttention):
     output_features = 320
 
@@ -307,6 +313,7 @@ def _run_explicit_fused_projection(
         hidden_states,
         model.query.weight.group_size,
     )
+    routing_mode = model.sparse_attention._routing_mode
     query = fused_query._project_query_op(
         input_qdata,
         input_scale,
@@ -317,6 +324,7 @@ def _run_explicit_fused_projection(
         sin,
         1e-5,
         model.head_dim**-0.5,
+        routing_mode,
     )
     key = fused_key._project_key_op(
         input_qdata,
@@ -327,6 +335,7 @@ def _run_explicit_fused_projection(
         cos,
         sin,
         1e-5,
+        routing_mode,
     )
     input_mean = convrot_backend.dequantized_input_mean(input_qdata, input_scale)
     value = fused_value._project_value_op(
@@ -343,6 +352,7 @@ def _run_explicit_fused_projection(
         list(model.sparse_attention._head_keep_ratio_units),
         sparse_key_blocks,
         hidden_states.shape[1],
+        routing_mode,
     )
 
 
@@ -515,6 +525,60 @@ def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
         )(hidden_states)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        == 1
+    )
+    assert (
+        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in capture.targets
+    )
+    assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
+    torch.manual_seed(720)
+    model = _MeanPoolSparseProjectionAttentionOutput().eval()
+    hidden_states = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+
+    with torch.no_grad():
+        expected, _attention = _run_explicit_attention_output(
+            model,
+            hidden_states,
+            model.cos,
+            model.sin,
+            model.sparse_key_blocks,
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=options,
+        )(hidden_states)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_project_query.default)
+        == 1
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_project_key.default) == 1
+    )
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
         == 1
