@@ -32,7 +32,7 @@ def _arguments(
     group_size: int = _GROUP_SIZE,
 ) -> tuple[tuple[object, ...], torch.Tensor]:
     standard, _unused = standard_arguments(sequence_length=sequence_length, bias=True)
-    attention_arguments = standard[:13]
+    attention_arguments = standard[:14]
     activation_scale = standard[-2]
     bias = standard[-1]
     assert isinstance(activation_scale, torch.Tensor)
@@ -134,6 +134,7 @@ def test_attention_output_fake_kernel_propagates_shape() -> None:
         [500_000, 1_000_000],
         2,
         191,
+        0,
         torch.empty((_OUTPUT_FEATURES, 128), device="meta", dtype=torch.uint8),
         torch.empty((96, 64), device="meta", dtype=torch.float8_e4m3fn),
         torch.empty((), device="meta", dtype=torch.float32),

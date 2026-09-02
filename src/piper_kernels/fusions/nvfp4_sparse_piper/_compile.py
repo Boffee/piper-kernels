@@ -26,6 +26,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     _quantized_dispatch,
     dispatch,
 )
+from piper_kernels.attention.sparse_piper_attention._routes import _DSA_ROUTING
 from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _output as sparse_piper_output
@@ -112,6 +113,8 @@ def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]
 
 
 def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
+    if match.kwargs["sparse_routing_mode"] != _DSA_ROUTING:
+        return False
     prefixes = ("sparse_q", "sparse_k", "sparse_v")
     projections = tuple(
         _compile_fx.PreparedLinearNodes.from_match(match, prefix) for prefix in prefixes
@@ -212,6 +215,7 @@ def _replace_projection(
     sparse_k_norm_epsilon: float,
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
+    sparse_routing_mode: int,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -333,6 +337,7 @@ def _replace_projection(
                 sparse_head_keep_ratio_units,
                 sparse_key_blocks,
                 logical_sequence_length,
+                sparse_routing_mode,
             ),
         )
     replacement.meta = original.meta.copy()

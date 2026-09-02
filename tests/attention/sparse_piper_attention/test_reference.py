@@ -6,10 +6,8 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention.dsa import (
-    PackedDsaRoutes,
-    packed_dsa_routes_from_sequences,
-)
+from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
+from piper_kernels.attention.sparse_piper_attention.dsa import packed_dsa_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_exact_sparse_attention,
     reference_sparse_piper_attention,
@@ -20,7 +18,7 @@ def _inputs() -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    PackedDsaRoutes,
+    PackedRoutes,
 ]:
     generator = torch.Generator().manual_seed(55)
     shape = (1, 3 * 64, 2, 128)

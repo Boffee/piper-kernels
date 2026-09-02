@@ -55,14 +55,15 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     query_summary: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
-    key_max: torch.Tensor,
-    key_min: torch.Tensor,
+    key_summary: torch.Tensor,
+    key_aux: torch.Tensor,
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
     logical_sequence_length: int,
+    routing_mode: int,
 ) -> _PreparedSparsePiperAttention:
     """Prepare routing once for a format-specific chunked output projection."""
     return _quantized_dispatch._prepare_quantized_sparse_piper_attention(
@@ -71,14 +72,15 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
         query_summary,
         key,
         key_scale,
-        key_max,
-        key_min,
+        key_summary,
+        key_aux,
         value,
         value_scale_multiplier,
         value_mean,
         head_keep_ratio_units,
         sparse_key_blocks,
         logical_sequence_length,
+        routing_mode,
     )
 
 

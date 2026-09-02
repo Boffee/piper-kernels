@@ -11,6 +11,10 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
 )
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _DSA_ROUTING,
+    _MEAN_POOL_ROUTING,
+)
 from piper_kernels.attention.sparse_piper_attention.dsa import (
     _sequence_block_summaries,
     packed_dsa_routes_from_sequences,
@@ -18,6 +22,7 @@ from piper_kernels.attention.sparse_piper_attention.dsa import (
 from piper_kernels.attention.sparse_piper_attention.gluon import (
     _launch_sparse_piper_attention,
 )
+from piper_kernels.attention.sparse_piper_attention.mean_pool import _sequence_block_means
 from piper_kernels.attention.sparse_piper_attention.triton import (
     _prepare_sparse_piper_attention,
 )
@@ -73,6 +78,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
         list(ratio_units),
         sparse_key_blocks,
         sequence_length,
+        _DSA_ROUTING,
     )
     with torch.no_grad():
         expected = SparsePiperAttention(ratios)(
@@ -167,7 +173,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     assert torch.equal(ranged_output, full_output)
 
 
-def _block_length_case():
+def _block_length_case(routing_mode: int):
     generator = torch.Generator(device="cuda").manual_seed(417)
     storage_sequence_length = 3 * 64
     shape = (1, storage_sequence_length, 2, 128)
@@ -185,10 +191,15 @@ def _block_length_case():
         key_head_major[:, :, : sparse_key_blocks * 64],
         layout,
     )
-    query_summary, key_max, key_min = _sequence_block_summaries(
-        query_head_major,
-        key_head_major,
-    )
+    if routing_mode == _MEAN_POOL_ROUTING:
+        query_summary = _sequence_block_means(query_head_major)
+        key_summary = _sequence_block_means(key_head_major)
+        key_aux = key_summary.new_empty(0)
+    else:
+        query_summary, key_summary, key_aux = _sequence_block_summaries(
+            query_head_major,
+            key_head_major,
+        )
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         routes.indices,
@@ -205,14 +216,15 @@ def _block_length_case():
         query_summary,
         prepared.key,
         prepared.key_scale,
-        key_max,
-        key_min,
+        key_summary,
+        key_aux,
         prepared.value,
         prepared.value_scale_multiplier,
         prepared.value_mean,
         list(ratio_units),
         sparse_key_blocks,
         storage_sequence_length,
+        routing_mode,
     )
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32, device=query.device)
     return shape, query, prepared, arguments, block_lengths
@@ -223,8 +235,9 @@ def _block_length_case():
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_block_lengths_mask_internal_key_padding() -> None:
-    shape, query, prepared, arguments, block_lengths = _block_length_case()
+@pytest.mark.parametrize("routing_mode", [_DSA_ROUTING, _MEAN_POOL_ROUTING])
+def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
+    shape, query, prepared, arguments, block_lengths = _block_length_case(routing_mode)
     storage_sequence_length = shape[1]
     full_block_lengths = torch.full(
         (storage_sequence_length // 64,),
@@ -243,8 +256,8 @@ def test_block_lengths_mask_internal_key_padding() -> None:
     corrupted_arguments[3] = corrupted_key
     corrupted_arguments[7] = corrupted_value
     partial_arguments = list(arguments)
-    partial_arguments[-1] = 64 + 17 + 51
-    corrupted_arguments[-1] = partial_arguments[-1]
+    partial_arguments[-2] = 64 + 17 + 51
+    corrupted_arguments[-2] = partial_arguments[-2]
 
     with torch.no_grad():
         legacy = _sparse_piper_attention_from_quantized_op(*arguments)
@@ -298,3 +311,71 @@ def test_block_lengths_mask_internal_key_padding() -> None:
             *partial_arguments,
             block_lengths.to(torch.int64),
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(418)
+    shape = (1, 3 * 64, 2, 128)
+    query = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    key = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    value = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    query_head_major = query.transpose(1, 2)
+    key_head_major = key.transpose(1, 2)
+    value_head_major = value.transpose(1, 2)
+    sparse_key_blocks = 2
+    ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
+    placeholder_routes = packed_dsa_routes_from_sequences(
+        query_head_major,
+        key_head_major[:, :, : sparse_key_blocks * 64],
+        layout,
+    )
+    prepared = _prepare_sparse_piper_attention(
+        query_head_major,
+        placeholder_routes.indices,
+        placeholder_routes.keep_blocks,
+        128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
+        route_head_offsets=placeholder_routes.head_offsets,
+        combined_key=key_head_major,
+        combined_value=value_head_major,
+    )
+    query_mean = _sequence_block_means(query_head_major)
+    key_mean = _sequence_block_means(key_head_major)
+    arguments = (
+        prepared.query,
+        prepared.query_scale,
+        query_mean,
+        prepared.key,
+        prepared.key_scale,
+        key_mean,
+        key_mean.new_empty(0),
+        prepared.value,
+        prepared.value_scale_multiplier,
+        prepared.value_mean,
+        list(ratio_units),
+        sparse_key_blocks,
+        shape[1],
+        _MEAN_POOL_ROUTING,
+    )
+
+    with torch.no_grad():
+        expected = SparsePiperAttention((0.5, 1.0), routing="mean_pool")(
+            query,
+            key,
+            value,
+            sparse_key_blocks=sparse_key_blocks,
+        )
+        actual = _sparse_piper_attention_from_quantized_op(*arguments)
+        opcheck = torch.library.opcheck(
+            _sparse_piper_attention_from_quantized_op,
+            arguments,
+        )
+
+    assert torch.equal(actual, expected)
+    assert set(opcheck.values()) == {"SUCCESS"}

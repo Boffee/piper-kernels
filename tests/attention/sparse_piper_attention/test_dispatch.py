@@ -29,6 +29,18 @@ def test_public_api_exports_sparse_attention_backend() -> None:
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
 
 
+def test_mean_pool_backend_runs_through_the_common_attention_path() -> None:
+    query, key, value = _inputs()
+    attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
+
+    with torch.no_grad():
+        output = attention(query, key, value, sparse_key_blocks=2)
+
+    assert output.shape == query.shape
+    assert output.dtype is torch.bfloat16
+    assert torch.isfinite(output).all()
+
+
 def test_every_query_uses_sparse_prefix_plus_dense_suffix_on_cpu() -> None:
     query, key, value = _inputs()
     attention = _attention((0.5, 1.0))
@@ -51,6 +63,12 @@ def test_backend_owns_only_an_immutable_semantic_ratio_profile() -> None:
 
     assert attention.head_keep_ratios == (0.75, 0.25, 1.0, 0.5)
     assert attention._head_keep_ratio_units == (750_000, 250_000, 1_000_000, 500_000)
+    assert attention.routing == "dsa"
+
+
+def test_routing_policy_is_validated_at_construction() -> None:
+    with pytest.raises(ValueError, match="'dsa' or 'mean_pool'"):
+        SparsePiperAttention((1.0,), routing="unknown")
 
 
 def test_dense_suffix_is_included_for_prefix_and_suffix_queries() -> None:
@@ -183,6 +201,7 @@ def test_sm120_custom_op_passes_opcheck(sequence_length: int) -> None:
             list(attention._head_keep_ratio_units),
             sequence_length // 64,
             128**-0.5,
+            attention._routing_mode,
         ),
     )
 
@@ -264,6 +283,26 @@ def test_sm120_ragged_lengths_match_the_portable_reference(sequence_length: int)
 def test_operator_is_opaque_to_a_full_compile_graph() -> None:
     query, key, value = _inputs("cuda", sequence_length=193)
     attention = _attention((0.5, 1.0))
+
+    def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return attention(query, key, value, sparse_key_blocks=3)
+
+    compiled = torch.compile(run, fullgraph=True)
+    with torch.no_grad():
+        expected = run(query, key, value)
+        actual = compiled(query, key, value)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_mean_pool_operator_is_opaque_to_a_full_compile_graph() -> None:
+    query, key, value = _inputs("cuda", sequence_length=193)
+    attention = SparsePiperAttention((0.5, 1.0), routing="mean_pool")
 
     def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         return attention(query, key, value, sparse_key_blocks=3)

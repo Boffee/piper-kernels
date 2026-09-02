@@ -7,10 +7,14 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _DSA_ROUTING,
+    _MEAN_POOL_ROUTING,
+)
 from piper_kernels.fusions.convrot_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_sparse_piper._layout import padded_sequence_length
 
-from ._reference import composed_key_projection
+from ._reference import composed_key_projection, composed_mean_pool_summary
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +112,7 @@ def test_fused_key_projection_matches_the_fp32_composed_contract(sequence_length
     actual_key, actual_scale, actual_max, actual_min = key_fusion._project_key_op(
         *operands.as_tuple(),
         options["norm_epsilon"],
+        _DSA_ROUTING,
     )
     expected = composed_key_projection(*operands.as_tuple(), **options)
     storage_length = padded_sequence_length(sequence_length)
@@ -126,6 +131,30 @@ def test_fused_key_projection_matches_the_fp32_composed_contract(sequence_length
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("sequence_length", [64, 65])
+def test_mean_pool_key_projection_emits_exact_valid_prefix_means(
+    sequence_length: int,
+) -> None:
+    operands = _random_operands(sequence_length=sequence_length)
+
+    actual_key, actual_scale, actual_mean, actual_aux = key_fusion._project_key_op(
+        *operands.as_tuple(),
+        1e-5,
+        _MEAN_POOL_ROUTING,
+    )
+    expected = composed_mean_pool_summary(
+        *operands.as_tuple(),
+        norm_epsilon=1e-5,
+    )
+
+    assert actual_key.dtype is torch.int8
+    assert actual_scale.dtype is torch.float32
+    assert actual_aux.numel() == 0
+    torch.testing.assert_close(actual_mean, expected, atol=0.015625, rtol=0.01)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
     # S192 is K64-aligned but leaves a half-M128 tail whose nonexistent rows
     # must not read beyond the physical RoPE buffers.
@@ -139,6 +168,7 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
     key, key_scale, key_max, key_min = key_fusion._project_key_op(
         *operands.as_tuple(),
         1e-5,
+        _DSA_ROUTING,
     )
 
     assert key.shape == (2, 3, 192, 128)
@@ -153,10 +183,16 @@ def test_key_projection_custom_op_passes_opcheck() -> None:
     operands = _random_operands()
     result = torch.library.opcheck(
         key_fusion._project_key_op,
-        (*operands.as_tuple(), 1e-5),
+        (*operands.as_tuple(), 1e-5, _DSA_ROUTING),
     )
 
     assert set(result.values()) == {"SUCCESS"}
+
+    mean_result = torch.library.opcheck(
+        key_fusion._project_key_op,
+        (*operands.as_tuple(), 1e-5, _MEAN_POOL_ROUTING),
+    )
+    assert set(mean_result.values()) == {"SUCCESS"}
 
 
 @pytest.mark.gpu
@@ -165,7 +201,7 @@ def test_key_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return key_fusion._project_key_op(*args, 1e-5)
+        return key_fusion._project_key_op(*args, 1e-5, _DSA_ROUTING)
 
     expected = prepare(*operands.as_tuple())
     compiled = torch.compile(prepare, backend="eager", fullgraph=True)
@@ -184,6 +220,7 @@ def test_key_projection_fake_kernels_propagate_shapes() -> None:
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         torch.empty((128, 96), device="meta", dtype=torch.float32),
         1e-5,
+        _DSA_ROUTING,
     )
 
     assert key.shape == (2, 3, 128, 128)

@@ -12,6 +12,7 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
 )
+from piper_kernels.attention.sparse_piper_attention._routes import _DSA_ROUTING
 from piper_kernels.fusions.convrot_sparse_piper import key, query, value
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
@@ -119,6 +120,7 @@ def _prepare(
         operands.sin,
         1e-5,
         _HEAD_DIM**-0.5,
+        _DSA_ROUTING,
     )
     prepared_key = key._project_key_op(
         operands.input_qdata,
@@ -129,6 +131,7 @@ def _prepare(
         operands.cos,
         operands.sin,
         1e-5,
+        _DSA_ROUTING,
     )
     input_mean = convrot_backend.dequantized_input_mean(
         operands.input_qdata,
@@ -160,6 +163,7 @@ def _run_sparse_piper_attention_from_quantized(
         list(attention._head_keep_ratio_units),
         sparse_key_blocks,
         logical_sequence_length,
+        attention._routing_mode,
     )
 
 

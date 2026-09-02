@@ -17,6 +17,10 @@ import triton.language as tl
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_POOL_ROUTING,
+    validate_routing_mode,
+)
 from piper_kernels.fusions.convrot_sage_qk.triton import (
     project_rmsnorm_rope_tile,
     validate_qk_projection_inputs,
@@ -53,13 +57,14 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
     softmax_scale: tl.constexpr,
+    mean_pool_summary: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     aligned_projection: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    """Project one Q64/two-head tile and emit Q32 INT8 plus exact Q64 summaries."""
+    """Project one Q64/two-head tile and emit Q32 INT8 plus route summaries."""
     tl.static_assert(block_m == 64)
     tl.static_assert(heads_per_program == 2)
     tl.static_assert(block_n == heads_per_program * head_dim)
@@ -116,6 +121,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         storage_sequence_length,
         query_block,
         softmax_scale,
+        mean_pool_summary,
         mask_ragged_tail,
         heads_per_program,
         head_dim,
@@ -164,7 +170,9 @@ def _launch_query_projection(
     sin: torch.Tensor,
     norm_epsilon: float,
     softmax_scale: float,
+    routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_routing_mode(routing_mode)
     batch, sequence_length, heads, rotary_dim = _validate_inputs(
         input_qdata,
         input_scale,
@@ -217,6 +225,7 @@ def _launch_query_projection(
             rotary_dim=rotary_dim,
             norm_epsilon=norm_epsilon,
             softmax_scale=softmax_scale,
+            mean_pool_summary=routing_mode == _MEAN_POOL_ROUTING,
             mask_ragged_tail=mask_ragged_tail,
             aligned_projection=(
                 not mask_ragged_tail
@@ -249,6 +258,7 @@ def _project_query_op(
     sin: torch.Tensor,
     norm_epsilon: float,
     softmax_scale: float,
+    routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_query_projection(
         input_qdata,
@@ -260,6 +270,7 @@ def _project_query_op(
         sin,
         norm_epsilon,
         softmax_scale,
+        routing_mode,
     )
 
 
@@ -274,6 +285,7 @@ def _project_query_op_fake(
     _sin: torch.Tensor,
     _norm_epsilon: float,
     _softmax_scale: float,
+    _routing_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     storage_sequence_length = padded_sequence_length(sequence_length)

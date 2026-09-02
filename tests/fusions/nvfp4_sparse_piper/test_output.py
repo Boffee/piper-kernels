@@ -138,6 +138,7 @@ def _arguments(
         list(attention._head_keep_ratio_units),
         sparse_key_blocks,
         sequence_length,
+        attention._routing_mode,
         output_weight.qdata,
         output_weight.scale,
         output_weight.per_tensor_scale,
@@ -153,6 +154,7 @@ def _arguments(
             list(attention._head_keep_ratio_units),
             sparse_key_blocks,
             sequence_length,
+            attention._routing_mode,
         )
         expected = _affine_nvfp4_linear(
             materialized_attention.flatten(2),
@@ -246,6 +248,7 @@ def test_attention_output_fake_kernel_propagates_shape() -> None:
         [500_000, 1_000_000],
         2,
         191,
+        0,
         torch.empty((_OUTPUT_FEATURES, 128), device="meta", dtype=torch.uint8),
         torch.empty((96, 64), device="meta", dtype=torch.float8_e4m3fn),
         torch.empty((), device="meta", dtype=torch.float32),

@@ -215,7 +215,7 @@ def _semantic_attention_graph(
         )
         output = graph.call_function(
             torch.ops.piper_kernels.sparse_piper_attention.default,
-            args=(query, key, value, [5000, 10000], 2, 128**-0.5),
+            args=(query, key, value, [5000, 10000], 2, 128**-0.5, 0),
         )
         output.meta["val"] = torch.empty(
             (1, 192, 2, 128),
@@ -480,6 +480,7 @@ def _run_explicit_attention_output(
         list(model.sparse_attention._head_keep_ratio_units),
         model.sparse_key_blocks,
         model.sequence_length,
+        model.sparse_attention._routing_mode,
     )
     output_weight = model.output.weight
     assert isinstance(output_weight, PiperNVFP4Tensor)

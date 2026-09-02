@@ -264,6 +264,7 @@ def _explicit_fused(
         list(model.sparse_attention._head_keep_ratio_units),
         model.sparse_key_blocks,
         model.sequence_length,
+        model.sparse_attention._routing_mode,
         output_weight.qdata,
         output_weight.scale,
         output_weight.per_tensor_scale,

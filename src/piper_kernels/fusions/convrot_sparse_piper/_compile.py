@@ -28,6 +28,11 @@ from piper_kernels.attention.kernels.sparse_piper import (
 from piper_kernels.attention.sparse_piper_attention import (
     _quantized_dispatch,
     dispatch,
+    mean_pool,
+)
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_POOL_ROUTING,
+    is_valid_routing_mode,
 )
 from piper_kernels.fusions.convrot_sage_qk import triton as convrot_sage_qk
 from piper_kernels.fusions.projected_qk import triton as projected_qk
@@ -41,7 +46,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v13"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v15"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -69,6 +74,7 @@ def _source_files() -> tuple[str, ...]:
             value.__file__,
             _quantized_dispatch.__file__,
             dispatch.__file__,
+            mean_pool.__file__,
             _compile_fx.__file__,
         )
         if file_name is not None
@@ -88,6 +94,8 @@ def _linear_pattern(prefix: str) -> CallFunction:
 
 
 def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
+    if not is_valid_routing_mode(match.kwargs["sparse_routing_mode"]):
+        return False
     nodes = (
         "sparse_input",
         "sparse_q_weight_qdata",
@@ -182,10 +190,12 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_k_norm_epsilon: float,
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
+    sparse_routing_mode: int,
     **_unused: object,
 ) -> None:
     original = match.output_node()
     graph = match.graph
+    mean_pool_routing = sparse_routing_mode == _MEAN_POOL_ROUTING
     input_value = preparation_sharing.tensor_metadata(sparse_input)
     assert input_value is not None
     batch, sequence_length = input_value.shape[:2]
@@ -234,6 +244,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 sparse_sin,
                 sparse_q_norm_epsilon,
                 sparse_softmax_scale,
+                sparse_routing_mode,
             ),
             query_values,
         )
@@ -250,24 +261,29 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
                 dtype=torch.float32,
             ),
-            input_value.new_empty(
-                (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
-                dtype=torch.float32,
+            (
+                input_value.new_empty((0,), dtype=torch.float32)
+                if mean_pool_routing
+                else input_value.new_empty(
+                    (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
+                    dtype=torch.float32,
+                )
             ),
         )
-        key, key_scale, key_max, key_min = linear_compile_fx.emit_tuple_result(
+        key_arguments = (
+            input_qdata,
+            input_scale,
+            sparse_k_weight_qdata,
+            sparse_k_weight_scale,
+            sparse_k_norm_weight,
+            sparse_cos,
+            sparse_sin,
+            sparse_k_norm_epsilon,
+        )
+        key, key_scale, key_summary, key_aux = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_sparse_piper_project_key.default,
-            (
-                input_qdata,
-                input_scale,
-                sparse_k_weight_qdata,
-                sparse_k_weight_scale,
-                sparse_k_norm_weight,
-                sparse_cos,
-                sparse_sin,
-                sparse_k_norm_epsilon,
-            ),
+            (*key_arguments, sparse_routing_mode),
             key_values,
         )
         input_mean = graph.call_function(
@@ -309,14 +325,15 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 query_summary,
                 key,
                 key_scale,
-                key_max,
-                key_min,
+                key_summary,
+                key_aux,
                 value,
                 value_scale,
                 value_mean,
                 sparse_head_keep_ratio_units,
                 sparse_key_blocks,
                 logical_sequence_length,
+                sparse_routing_mode,
             ),
         )
     replacement.meta = original.meta.copy()

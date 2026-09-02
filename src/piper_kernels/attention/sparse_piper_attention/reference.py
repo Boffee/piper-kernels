@@ -8,7 +8,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     quantize_query_key,
 )
 
-from .dsa import PackedDsaRoutes
+from ._routes import PackedRoutes
 
 _BLOCK_ROWS = 64
 _RECURRENCE_ROWS = 128
@@ -18,7 +18,7 @@ _SCALE_EPSILON = 1e-7
 
 
 def _active_indices(
-    routes: PackedDsaRoutes,
+    routes: PackedRoutes,
     *,
     batch: int,
     head: int,
@@ -87,7 +87,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    routes: PackedDsaRoutes,
+    routes: PackedRoutes,
     *,
     sparse_key_blocks: int,
     scale: float,
@@ -208,7 +208,7 @@ def reference_exact_sparse_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    routes: PackedDsaRoutes,
+    routes: PackedRoutes,
     *,
     sparse_key_blocks: int,
     scale: float,
