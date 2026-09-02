@@ -267,6 +267,28 @@ another graph or SM120 attention kernel. Routes remain call-local because both p
 the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler rewrites preserve
 the selected policy while producing its summaries directly from fused projections.
 
+Sparse Piper also exposes a policy-independent coarse-attention residual:
+
+```python
+from piper_kernels import coarse_attention_residual, mean_pool_block_values
+
+pooled_value = mean_pool_block_values(value, block_lengths)
+output = coarse_attention_residual(
+    fine_output,
+    block_scores,
+    pooled_value,
+    compression_gate,
+)
+```
+
+`block_scores` contains already-scaled FP32 logits and may come from mean-pool, DSA, or a learned
+block scorer. Coarse attention applies dense softmax over key blocks, attends over pooled V,
+expands each result over its physical K64 query block, multiplies the caller-provided gate directly
+without an implicit activation, and adds it to fine attention. `block_lengths` is optional for
+compact storage and selects valid-front internally padded storage when supplied. This composable
+implementation is the correctness and training contract; the SM120 fused epilogue remains a
+separate optimization.
+
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
 pre-rounding denominator remain FP32. Unsupported devices use a slow portable implementation of

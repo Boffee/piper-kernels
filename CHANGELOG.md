@@ -7,6 +7,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added a policy-independent Sparse Piper coarse-attention residual. Caller-provided FP32 block
+  scores from mean-pool, DSA, or learned policies attend over padding-aware pooled V, expand over
+  physical K64 query blocks, and apply a token-level compression gate before the residual add.
 - Added high-precision constructors for ordinary and ConvRot NVFP4 weights. They can derive a
   finite global scale in the stored basis, including well-defined all-zero storage, while ConvRot
   owns rotation before quantization.
