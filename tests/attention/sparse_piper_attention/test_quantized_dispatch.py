@@ -235,7 +235,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
             coarse_arguments,
         )
 
-    torch.testing.assert_close(actual, expected, atol=0.00390625, rtol=0.01)
+    assert torch.equal(actual, expected)
     assert torch.equal(zero_gate_output, fine_output)
     assert set(opcheck.values()) == {"SUCCESS"}
 
