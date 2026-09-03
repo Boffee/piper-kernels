@@ -44,6 +44,7 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from ..nvfp4_sparse_piper.test_compile import (
+    _quantized_attention_output_graph,
     _semantic_attention_graph,
     _SparseProjectionAttentionOutput,
 )
@@ -160,7 +161,40 @@ def test_static_convrot_output_fuses_after_sparse_projection(
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     output_node = next(node for node in call_nodes if node.target is fused)
-    assert output_node.args[-2:] == (_GROUP_SIZE, 8_192)
+    assert output_node.args[19:21] == (_GROUP_SIZE, 8_192)
+    graph.lint()
+
+
+@pytest.mark.parametrize("with_block_lengths", [False, True])
+@pytest.mark.parametrize("with_coarse", [False, True])
+def test_convrot_output_fold_supports_every_bounded_attention_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    with_block_lengths: bool,
+    with_coarse: bool,
+) -> None:
+    graph = _quantized_attention_output_graph(
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
+    )
+    for node in graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == torch.ops.piper_kernels.nvfp4_linear.default
+        ):
+            node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
+            node.args = (*node.args, _GROUP_SIZE)
+
+    _run_passes(graph, monkeypatch)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    fused = torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
+    assert targets.count(fused) == 1
+    assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
+    assert (
+        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+        not in targets
+    )
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
 
 

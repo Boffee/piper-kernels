@@ -14,15 +14,23 @@ from torch._inductor.pattern_matcher import (
 from piper_kernels.fusions.nvfp4_sparse_piper import (
     _output_compile as nvfp4_output_compile,
 )
+from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear.convrot._rotation import validate_group_size
 
 from . import output
 
 
-def _attention_output_pattern() -> CallFunction:
+def _attention_output_pattern(
+    *,
+    with_block_lengths: bool,
+    with_coarse: bool,
+) -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.convrot_nvfp4_linear.default,
-        nvfp4_output_compile._reshaped_attention_pattern(),
+        sparse_piper_pattern.reshaped_quantized_attention_pattern(
+            with_block_lengths=with_block_lengths,
+            with_coarse=with_coarse,
+        ),
         KeywordArg("output_weight_qdata"),
         KeywordArg("output_weight_scale"),
         KeywordArg("output_weight_per_tensor_scale"),
@@ -56,7 +64,7 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
         replacement = graph.call_function(
             torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default,
             args=(
-                *(match.kwargs[name] for name in nvfp4_output_compile._ATTENTION_ARGUMENT_NAMES),
+                *sparse_piper_pattern.quantized_attention_arguments(match),
                 match.kwargs["output_weight_qdata"],
                 match.kwargs["output_weight_scale"],
                 match.kwargs["output_weight_per_tensor_scale"],
@@ -64,6 +72,7 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
                 match.kwargs["output_bias"],
                 match.kwargs["output_group_size"],
                 output._DEFAULT_QUERY_CHUNK_ROWS,
+                *sparse_piper_pattern.bounded_attention_arguments(match),
             ),
         )
     replacement.meta = original.meta.copy()
@@ -73,11 +82,16 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
 
 
 _patterns = PatternMatcherPass("convrot_nvfp4_sparse_piper_attention_output")
-register_graph_pattern(
-    _attention_output_pattern(),
-    extra_check=_valid_attention_output,
-    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-)(_replace_attention_output)
+for _with_block_lengths in (False, True):
+    for _with_coarse in (False, True):
+        register_graph_pattern(
+            _attention_output_pattern(
+                with_block_lengths=_with_block_lengths,
+                with_coarse=_with_coarse,
+            ),
+            extra_check=_valid_attention_output,
+            pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_attention_output)
 
 
 def _fold_attention_output(graph: torch.fx.Graph) -> bool:

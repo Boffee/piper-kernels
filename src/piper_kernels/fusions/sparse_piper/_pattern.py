@@ -1,16 +1,40 @@
-"""Projection-independent RMSNorm/RoPE sparse-Piper graph grammar."""
+"""Shared graph grammar for sparse-Piper projection fusion passes."""
 
 from __future__ import annotations
 
 import operator
 from collections.abc import Callable
+from typing import cast
 
 import torch
-from torch._inductor.pattern_matcher import CallFunction, KeywordArg
+from torch._inductor.pattern_matcher import CallFunction, KeywordArg, Match
+from torch.fx.node import Argument
 
 type ProjectionPattern = Callable[[str], CallFunction]
 
 _SLICE_END = torch.iinfo(torch.int64).max
+
+_QUANTIZED_ATTENTION_OPERAND_NAMES = (
+    "output_query",
+    "output_query_scale",
+    "output_query_summary",
+    "output_key",
+    "output_key_scale",
+    "output_key_summary",
+    "output_key_aux",
+    "output_value",
+    "output_value_scale_multiplier",
+    "output_value_mean",
+)
+_QUANTIZED_ATTENTION_POLICY_NAMES = (
+    "output_head_keep_ratio_units",
+    "output_sparse_key_blocks",
+    "output_logical_sequence_length",
+    "output_routing_mode",
+)
+_QUANTIZED_ATTENTION_ARGUMENT_NAMES = (
+    _QUANTIZED_ATTENTION_OPERAND_NAMES + _QUANTIZED_ATTENTION_POLICY_NAMES
+)
 
 
 def _normalized_rope_pattern(
@@ -246,7 +270,68 @@ def sparse_piper_coarse_residual_block_lengths_projection_pattern(
     )
 
 
+def reshaped_quantized_attention_pattern(
+    *,
+    with_block_lengths: bool,
+    with_coarse: bool,
+) -> CallFunction:
+    """Match one materialized quantized attention result before projection."""
+    operands = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_OPERAND_NAMES)
+    policy = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_POLICY_NAMES)
+    if with_coarse:
+        attention = CallFunction(
+            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
+            *operands,
+            KeywordArg("output_block_mean"),
+            KeywordArg("output_compression_gate"),
+            *policy,
+            KeywordArg("output_coarse_scale"),
+            KeywordArg("output_block_lengths") if with_block_lengths else None,
+            KeywordArg("output_coarse_key_blocks"),
+            _users=1,
+        )
+    else:
+        attention = CallFunction(
+            torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
+            *operands,
+            *policy,
+            *((KeywordArg("output_block_lengths"),) if with_block_lengths else ()),
+            _users=1,
+        )
+    return CallFunction(
+        torch.ops.aten.reshape.default,
+        attention,
+        KeywordArg("output_attention_shape"),
+        _users=1,
+    )
+
+
+def quantized_attention_arguments(match: Match) -> tuple[Argument, ...]:
+    """Return the quantized attention operands and routing policy."""
+    return cast(
+        tuple[Argument, ...],
+        tuple(match.kwargs[name] for name in _QUANTIZED_ATTENTION_ARGUMENT_NAMES),
+    )
+
+
+def bounded_attention_arguments(match: Match) -> tuple[Argument, ...]:
+    """Return optional padding and coarse-residual arguments."""
+    return cast(
+        tuple[Argument, ...],
+        (
+            match.kwargs.get("output_block_lengths"),
+            match.kwargs.get("output_block_mean"),
+            match.kwargs.get("output_compression_gate"),
+            match.kwargs.get("output_coarse_scale"),
+            match.kwargs.get("output_coarse_key_blocks"),
+        ),
+    )
+
+
 __all__ = [
+    "bounded_attention_arguments",
+    "quantized_attention_arguments",
+    "reshaped_quantized_attention_pattern",
     "sparse_piper_block_lengths_projection_pattern",
     "sparse_piper_coarse_residual_block_lengths_projection_pattern",
     "sparse_piper_coarse_residual_projection_pattern",

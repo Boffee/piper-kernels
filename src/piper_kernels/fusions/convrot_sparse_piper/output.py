@@ -120,6 +120,11 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None,
     group_size: int,
     query_chunk_rows: int,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into the final ConvRot output."""
     input_features, output_features = _validate_output_projection(
@@ -131,7 +136,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         query_chunk_rows,
     )
-    prepared_attention = output_common.prepare_attention(
+    prepared = output_common.prepare_attention(
         query,
         query_scale,
         query_summary,
@@ -146,8 +151,14 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
     )
-    capacity = min(logical_sequence_length, query_chunk_rows)
+    sequence_length = prepared.sequence_length
+    capacity = min(sequence_length, query_chunk_rows)
     prepared_input = torch.empty(
         (capacity, input_features),
         device=query.device,
@@ -179,9 +190,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         )
 
     return output_common.run_chunked_attention_output(
-        prepared_attention,
-        query,
-        logical_sequence_length,
+        prepared,
         output_features,
         query_chunk_rows,
         project_chunk,
@@ -213,6 +222,11 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None,
     group_size: int,
     query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
     return _run_attention_output(
         query,
@@ -234,6 +248,11 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         bias,
         group_size,
         query_chunk_rows,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
     )
 
 
@@ -258,10 +277,17 @@ def _attention_output_op_fake(
     _bias: torch.Tensor | None,
     _group_size: int,
     _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    _block_mean: torch.Tensor | None = None,
+    _compression_gate: torch.Tensor | None = None,
+    _coarse_scale: float | None = None,
+    _coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
-    return query.new_empty(
-        (query.shape[0], logical_sequence_length, weight_qdata.shape[0]),
-        dtype=torch.bfloat16,
+    return output_common.new_projected_output(
+        query,
+        logical_sequence_length,
+        block_lengths,
+        weight_qdata.shape[0],
     )
 
 

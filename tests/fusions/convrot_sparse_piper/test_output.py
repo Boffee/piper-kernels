@@ -6,6 +6,10 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
+from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
+    _sparse_piper_attention_from_quantized_op,
+    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
+)
 from piper_kernels.fusions.convrot_sparse_piper import output as output_fusion
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
@@ -84,6 +88,75 @@ def _arguments(
     return arguments, expected
 
 
+def _padded_arguments(
+    *,
+    coarse: bool,
+) -> tuple[tuple[object, ...], torch.Tensor]:
+    sequence_length = 192
+    arguments, _unbounded_expected = _arguments(
+        batch=1,
+        sequence_length=sequence_length,
+        bias=True,
+    )
+    attention_arguments = arguments[:14]
+    projection_arguments = arguments[14:]
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    block_mean = (
+        torch.randn(
+            (1, _HEADS, sequence_length // 64, _HEAD_DIM),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        if coarse
+        else None
+    )
+    compression_gate = (
+        torch.randn(
+            (1, sequence_length, _HEADS, _HEAD_DIM),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        if coarse
+        else None
+    )
+    coarse_scale = 0.125 if coarse else None
+    coarse_key_blocks = sequence_length // 64 if coarse else None
+    if coarse:
+        assert block_mean is not None
+        assert compression_gate is not None
+        materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *attention_arguments[:10],
+            block_mean,
+            compression_gate,
+            *attention_arguments[10:],
+            coarse_scale,
+            block_lengths,
+            coarse_key_blocks,
+        )
+    else:
+        materialized_attention = _sparse_piper_attention_from_quantized_op(
+            *attention_arguments,
+            block_lengths,
+        )
+    weight, scale, bias, group_size = projection_arguments
+    expected = convrot_backend.run_linear(
+        materialized_attention.flatten(2),
+        weight,
+        scale,
+        bias,
+        group_size,
+    )
+    return (
+        *arguments,
+        64,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
+    ), expected
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
@@ -120,6 +193,19 @@ def test_attention_output_obeys_a_nondefault_current_stream() -> None:
         actual = output_fusion._attention_output_op(*arguments, 128)
     stream.synchronize()
 
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("coarse", [False, True])
+def test_attention_output_supports_padded_and_coarse_attention(coarse: bool) -> None:
+    arguments, expected = _padded_arguments(coarse=coarse)
+
+    with torch.no_grad():
+        actual = output_fusion._attention_output_op(*arguments)
+
+    assert actual.shape == expected.shape == (1, 192, _OUTPUT_FEATURES)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -162,6 +248,35 @@ def test_attention_output_fake_kernel_propagates_shape() -> None:
 
     assert output.shape == (2, 191, _OUTPUT_FEATURES)
     assert output.dtype is torch.bfloat16
+
+
+def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:
+    arguments = (
+        torch.empty((2, 3, 192, 128), device="meta", dtype=torch.int8),
+        torch.empty((2, 3, 6), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 192, 128), device="meta", dtype=torch.int8),
+        torch.empty((2, 3, 3), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 128, 192), device="meta", dtype=torch.int8),
+        torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 128), device="meta", dtype=torch.float32),
+        [500_000, 1_000_000, 750_000],
+        2,
+        132,
+        0,
+        torch.empty((_OUTPUT_FEATURES, 3 * 128), device="meta", dtype=torch.int8),
+        torch.empty((_OUTPUT_FEATURES, 1), device="meta", dtype=torch.float32),
+        None,
+        128,
+        64,
+        torch.empty(3, device="meta", dtype=torch.int32),
+    )
+
+    output = output_fusion._attention_output_op(*arguments)
+
+    assert output.shape == (2, 192, _OUTPUT_FEATURES)
 
 
 @pytest.mark.gpu

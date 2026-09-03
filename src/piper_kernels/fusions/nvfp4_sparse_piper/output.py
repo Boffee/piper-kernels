@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 from . import _output
@@ -51,6 +52,11 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     activation_per_tensor_scale: torch.Tensor,
     bias: torch.Tensor | None,
     query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
     return _output.run_attention_output(
         query,
@@ -74,6 +80,11 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         bias,
         query_chunk_rows,
         _STANDARD_PREPARATION,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
     )
 
 
@@ -99,10 +110,17 @@ def _attention_output_op_fake(
     _activation_per_tensor_scale: torch.Tensor,
     _bias: torch.Tensor | None,
     _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    _block_mean: torch.Tensor | None = None,
+    _compression_gate: torch.Tensor | None = None,
+    _coarse_scale: float | None = None,
+    _coarse_key_blocks: int | None = None,
 ) -> torch.Tensor:
-    return query.new_empty(
-        (query.shape[0], logical_sequence_length, weight_qdata.shape[0]),
-        dtype=torch.bfloat16,
+    return output_common.new_projected_output(
+        query,
+        logical_sequence_length,
+        block_lengths,
+        weight_qdata.shape[0],
     )
 
 

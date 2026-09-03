@@ -12,6 +12,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
+    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import output
 from piper_kernels.linear.convrot._rotation import rotate_groups
@@ -81,6 +82,89 @@ def _arguments(
     ), expected
 
 
+def _padded_arguments(
+    *,
+    coarse: bool,
+) -> tuple[tuple[object, ...], torch.Tensor]:
+    sequence_length = 192
+    arguments, _unbounded_expected = _arguments(sequence_length)
+    attention_arguments = arguments[:14]
+    projection_arguments = arguments[14:]
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    block_mean = (
+        torch.randn(
+            (1, 2, sequence_length // 64, 128),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        if coarse
+        else None
+    )
+    compression_gate = (
+        torch.randn(
+            (1, sequence_length, 2, 128),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        if coarse
+        else None
+    )
+    coarse_scale = 0.125 if coarse else None
+    coarse_key_blocks = sequence_length // 64 if coarse else None
+    if coarse:
+        assert block_mean is not None
+        assert compression_gate is not None
+        materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *attention_arguments[:10],
+            block_mean,
+            compression_gate,
+            *attention_arguments[10:],
+            coarse_scale,
+            block_lengths,
+            coarse_key_blocks,
+        )
+    else:
+        materialized_attention = _sparse_piper_attention_from_quantized_op(
+            *attention_arguments,
+            block_lengths,
+        )
+    (
+        weight_qdata,
+        weight_scale,
+        weight_per_tensor_scale,
+        activation_scale,
+        bias,
+        group_size,
+    ) = projection_arguments
+    input_qdata, input_scale, input_per_tensor_scale = convrot_nvfp4_ops.prepare_input(
+        materialized_attention.flatten(2),
+        activation_scale,
+        False,
+        group_size,
+    )
+    expected = F.scaled_mm(
+        input_qdata.view(torch.float4_e2m1fn_x2),
+        weight_qdata.t().view(torch.float4_e2m1fn_x2),
+        [input_scale.view(torch.float8_e4m3fn), input_per_tensor_scale],
+        [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+        [weight_scale.view(torch.float8_e4m3fn), weight_per_tensor_scale],
+        [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+        [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+        [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+        bias=bias,
+        output_dtype=torch.bfloat16,
+    ).reshape(1, sequence_length, _OUTPUT_FEATURES)
+    return (
+        *arguments,
+        128,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
+    ), expected
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
@@ -98,6 +182,26 @@ def test_attention_output_matches_materialized_convrot_linear(
         actual = output._attention_output_op(*arguments, chunk_rows)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("coarse", [False, True])
+def test_attention_output_supports_padded_and_coarse_attention(coarse: bool) -> None:
+    arguments, expected = _padded_arguments(coarse=coarse)
+
+    with torch.no_grad():
+        actual = output._attention_output_op(*arguments)
+
+    block_lengths = arguments[-5]
+    assert isinstance(block_lengths, torch.Tensor)
+    valid_rows = torch.arange(64, device="cuda")[None] < block_lengths[:, None]
+    torch.testing.assert_close(
+        actual[:, valid_rows.flatten()],
+        expected[:, valid_rows.flatten()],
+        atol=0,
+        rtol=0,
+    )
 
 
 @pytest.mark.gpu

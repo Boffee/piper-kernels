@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,6 +20,35 @@ if TYPE_CHECKING:
 DEFAULT_QUERY_CHUNK_ROWS = 4_096
 
 type ChunkProjector = Callable[[torch.Tensor, torch.Tensor, int, int], None]
+
+_output_sequence_length = _quantized_dispatch._quantized_attention_output_sequence_length
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAttentionOutput:
+    """Shared launch state for one bounded attention-to-projection pipeline."""
+
+    attention: _PreparedSparsePiperAttention
+    sequence_length: int
+    coarse_output: torch.Tensor | None
+    compression_gate: torch.Tensor | None
+
+
+def new_projected_output(
+    query: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    output_features: int,
+) -> torch.Tensor:
+    """Allocate the projected compact or valid-front padded output shape."""
+    return query.new_empty(
+        (
+            query.shape[0],
+            _output_sequence_length(query, logical_sequence_length, block_lengths),
+            output_features,
+        ),
+        dtype=torch.bfloat16,
+    )
 
 
 def validate_attention_output(
@@ -64,40 +94,88 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
-) -> _PreparedSparsePiperAttention:
-    """Prepare routing once for a format-specific chunked output projection."""
-    return _quantized_dispatch._prepare_quantized_sparse_piper_attention(
-        query,
-        query_scale,
-        query_summary,
-        key,
-        key_scale,
-        key_summary,
-        key_aux,
-        value,
-        value_scale_multiplier,
-        value_mean,
-        head_keep_ratio_units,
-        sparse_key_blocks,
-        logical_sequence_length,
-        routing_mode,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    compression_gate: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
+) -> _PreparedAttentionOutput:
+    """Prepare fine routing and, when requested, one shared coarse result."""
+    if (block_mean is None) != (compression_gate is None):
+        raise ValueError("block means and compression gate must be supplied together")
+    if block_mean is None:
+        if coarse_scale is not None or coarse_key_blocks is not None:
+            raise ValueError("coarse output metadata requires block means")
+        prepared = _quantized_dispatch._prepare_quantized_sparse_piper_attention(
+            query,
+            query_scale,
+            query_summary,
+            key,
+            key_scale,
+            key_summary,
+            key_aux,
+            value,
+            value_scale_multiplier,
+            value_mean,
+            head_keep_ratio_units,
+            sparse_key_blocks,
+            logical_sequence_length,
+            routing_mode,
+            block_lengths,
+        )
+        coarse_output = None
+    else:
+        if coarse_scale is None:
+            raise ValueError("coarse output requires a scale")
+        prepared, coarse_output = (
+            _quantized_dispatch._prepare_quantized_sparse_piper_attention_with_coarse(
+                query,
+                query_scale,
+                query_summary,
+                key,
+                key_scale,
+                key_summary,
+                key_aux,
+                value,
+                value_scale_multiplier,
+                value_mean,
+                block_mean,
+                head_keep_ratio_units,
+                sparse_key_blocks,
+                logical_sequence_length,
+                routing_mode,
+                coarse_scale,
+                block_lengths,
+                coarse_key_blocks,
+            )
+        )
+    return _PreparedAttentionOutput(
+        attention=prepared,
+        sequence_length=_output_sequence_length(
+            query,
+            logical_sequence_length,
+            block_lengths,
+        ),
+        coarse_output=coarse_output,
+        compression_gate=compression_gate,
     )
 
 
 def run_chunked_attention_output(
-    prepared_attention: _PreparedSparsePiperAttention,
-    query: torch.Tensor,
-    logical_sequence_length: int,
+    prepared: _PreparedAttentionOutput,
     output_features: int,
     query_chunk_rows: int,
     project_chunk: ChunkProjector,
     projector_tensors: Sequence[torch.Tensor],
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into one format-specific projection."""
+    prepared_attention = prepared.attention
+    query = prepared_attention.query
     chunk_blocks = query_chunk_rows // TILE_ROWS
-    total_blocks = (logical_sequence_length + TILE_ROWS - 1) // TILE_ROWS
+    sequence_length = prepared.sequence_length
+    total_blocks = (sequence_length + TILE_ROWS - 1) // TILE_ROWS
     chunk_count = (total_blocks + chunk_blocks - 1) // chunk_blocks
-    capacity = min(logical_sequence_length, query_chunk_rows)
+    capacity = min(sequence_length, query_chunk_rows)
     batch, heads, head_dim = query.shape[0], query.shape[1], query.shape[3]
     attention_buffers = torch.empty(
         (min(2, chunk_count), batch, capacity, heads, head_dim),
@@ -105,7 +183,7 @@ def run_chunked_attention_output(
         dtype=torch.bfloat16,
     )
     output = torch.empty(
-        (batch, logical_sequence_length, output_features),
+        (batch, sequence_length, output_features),
         device=query.device,
         dtype=torch.bfloat16,
     )
@@ -115,8 +193,10 @@ def run_chunked_attention_output(
         _quantized_dispatch._launch_quantized_sparse_piper_attention(
             prepared_attention,
             attention_chunk.transpose(1, 2),
+            coarse_output=prepared.coarse_output,
+            compression_gate=prepared.compression_gate,
         )
-        project_chunk(attention_chunk, output, 0, logical_sequence_length)
+        project_chunk(attention_chunk, output, 0, sequence_length)
         return output
 
     with torch.cuda.device(query.device):
@@ -132,13 +212,15 @@ def run_chunked_attention_output(
                 producer.wait_event(reusable[slot])
             block_count = min(chunk_blocks, total_blocks - block_start)
             start = block_start * TILE_ROWS
-            rows = min(block_count * TILE_ROWS, logical_sequence_length - start)
+            rows = min(block_count * TILE_ROWS, sequence_length - start)
             attention_chunk = attention_buffers[slot, :, :rows]
             _quantized_dispatch._launch_quantized_sparse_piper_attention(
                 prepared_attention,
                 attention_chunk.transpose(1, 2),
                 query_block_offset=block_start,
                 query_block_count=block_count,
+                coarse_output=prepared.coarse_output,
+                compression_gate=prepared.compression_gate,
             )
             ready[slot].record(producer)
             with torch.cuda.stream(consumer):
@@ -155,6 +237,7 @@ def run_chunked_attention_output(
 
 __all__ = [
     "DEFAULT_QUERY_CHUNK_ROWS",
+    "new_projected_output",
     "prepare_attention",
     "run_chunked_attention_output",
     "validate_attention_output",

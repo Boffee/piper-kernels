@@ -15,6 +15,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
+    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
 from piper_kernels.linear.nvfp4 import _ops
@@ -165,6 +166,85 @@ def _arguments(
     return arguments, expected
 
 
+def _padded_arguments(
+    *,
+    coarse: bool,
+) -> tuple[tuple[object, ...], torch.Tensor]:
+    sequence_length = 192
+    arguments, _unbounded_expected = _arguments(
+        sequence_length=sequence_length,
+        bias=True,
+    )
+    attention_arguments = arguments[:14]
+    projection_arguments = arguments[14:]
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    block_mean = (
+        torch.randn(
+            (1, _HEADS, sequence_length // 64, _HEAD_DIM),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        if coarse
+        else None
+    )
+    compression_gate = (
+        torch.randn(
+            (1, sequence_length, _HEADS, _HEAD_DIM),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        if coarse
+        else None
+    )
+    coarse_scale = 0.125 if coarse else None
+    coarse_key_blocks = sequence_length // 64 if coarse else None
+    if coarse:
+        assert block_mean is not None
+        assert compression_gate is not None
+        materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *attention_arguments[:10],
+            block_mean,
+            compression_gate,
+            *attention_arguments[10:],
+            coarse_scale,
+            block_lengths,
+            coarse_key_blocks,
+        )
+    else:
+        materialized_attention = _sparse_piper_attention_from_quantized_op(
+            *attention_arguments,
+            block_lengths,
+        )
+    weight_qdata, weight_scale, weight_per_tensor_scale, activation_scale, bias = (
+        projection_arguments
+    )
+    output_weight = TorchAONVFP4Tensor(
+        weight_qdata,
+        weight_scale,
+        16,
+        torch.bfloat16,
+        per_tensor_scale=weight_per_tensor_scale,
+        act_per_tensor_scale=activation_scale,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    expected = _affine_nvfp4_linear(
+        materialized_attention.flatten(2),
+        output_weight,
+        activation_scale,
+        bias,
+    )
+    return (
+        *arguments,
+        128,
+        block_lengths,
+        block_mean,
+        compression_gate,
+        coarse_scale,
+        coarse_key_blocks,
+    ), expected
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
@@ -197,6 +277,27 @@ def test_attention_output_obeys_a_nondefault_current_stream() -> None:
     stream.synchronize()
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("coarse", [False, True])
+def test_attention_output_supports_padded_and_coarse_attention(coarse: bool) -> None:
+    arguments, expected = _padded_arguments(coarse=coarse)
+
+    with torch.no_grad():
+        actual = output._attention_output_op(*arguments)
+
+    assert actual.shape == expected.shape == (1, 192, _OUTPUT_FEATURES)
+    block_lengths = arguments[-5]
+    assert isinstance(block_lengths, torch.Tensor)
+    valid_rows = torch.arange(64, device="cuda")[None] < block_lengths[:, None]
+    torch.testing.assert_close(
+        actual[:, valid_rows.flatten()],
+        expected[:, valid_rows.flatten()],
+        atol=0,
+        rtol=0,
+    )
 
 
 @pytest.mark.gpu
