@@ -2,121 +2,10 @@
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import input_activation_width
-from piper_kernels.linear.convrot._update import (
-    validate_real_scalar,
-    validate_rounding_seed,
-)
 
 from . import reference
-
-try:
-    from . import triton as triton_backend
-except ModuleNotFoundError as error:
-    if error.name != "triton":
-        raise
-    triton_backend = None
-
-
-def _supports_triton(input: torch.Tensor) -> bool:  # noqa: A002
-    return triton_backend is not None and AcceleratorTarget.from_device(
-        input.device
-    ).cuda_capability_at_least(7, 5)
-
-
-def _validate_addmm(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    dtype: torch.dtype,
-    group_size: int,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-) -> None:
-    reference.validate_storage(qdata, scale, group_size, dtype)
-    if qdata.device.type == "meta":
-        raise ValueError("ConvRot INT8 addmm_ cannot update a meta tensor without values")
-    if mat1.ndim != 2 or mat2.ndim != 2:
-        raise ValueError(
-            "ConvRot INT8 addmm_ matrices must be 2-D, "
-            f"got shapes {tuple(mat1.shape)} and {tuple(mat2.shape)}"
-        )
-    expected_mat1 = (qdata.shape[0], mat2.shape[0])
-    expected_mat2 = (mat1.shape[1], qdata.shape[1])
-    if tuple(mat1.shape) != expected_mat1 or tuple(mat2.shape) != expected_mat2:
-        raise ValueError(
-            "ConvRot INT8 addmm_ shape mismatch: expected "
-            f"mat1 {expected_mat1} and mat2 {expected_mat2} for weight {tuple(qdata.shape)}, "
-            f"got {tuple(mat1.shape)} and {tuple(mat2.shape)}"
-        )
-    if mat1.device != qdata.device or mat2.device != qdata.device:
-        raise ValueError(
-            "ConvRot INT8 addmm_ weight and matrices must share a device, "
-            f"got {qdata.device}/{mat1.device}/{mat2.device}"
-        )
-    if mat1.dtype is not dtype or mat2.dtype is not dtype:
-        raise ValueError(
-            "ConvRot INT8 addmm_ matrices must match the weight's logical dtype, "
-            f"got {dtype}/{mat1.dtype}/{mat2.dtype}"
-        )
-    if mat1.layout is not torch.strided or mat2.layout is not torch.strided:
-        raise ValueError("ConvRot INT8 addmm_ matrices must use strided layout")
-    if torch.is_grad_enabled() and (
-        scale.requires_grad or mat1.requires_grad or mat2.requires_grad
-    ):
-        raise RuntimeError(
-            "ConvRot INT8 addmm_ does not support autograd; detach its inputs or use no_grad"
-        )
-
-
-def addmm_(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    dtype: torch.dtype,
-    group_size: int,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    *,
-    beta: int | float | complex = 1,
-    alpha: int | float | complex = 1,
-    rounding_seed: int | None = None,
-) -> None:
-    """Apply the logical ``beta * weight + alpha * mat1 @ mat2`` update in place."""
-    _validate_addmm(qdata, scale, dtype, group_size, mat1, mat2)
-    operation = "ConvRot INT8 addmm_"
-    beta_float = validate_real_scalar(beta, "beta", operation=operation)
-    alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
-    validate_rounding_seed(rounding_seed, operation=operation)
-    if beta_float == 1 and alpha_float == 0:
-        return
-    seed_argument = (
-        rounding_seed
-        if rounding_seed is None or rounding_seed < (1 << 63)
-        else rounding_seed - (1 << 64)
-    )
-    if _supports_triton(qdata):
-        assert triton_backend is not None
-        triton_backend.addmm_(
-            qdata,
-            scale,
-            mat1,
-            mat2,
-            group_size,
-            beta_float,
-            alpha_float,
-            seed_argument,
-        )
-    else:
-        reference.addmm_(
-            qdata,
-            scale,
-            mat1,
-            mat2,
-            group_size,
-            beta_float,
-            alpha_float,
-            seed_argument,
-        )
+from ._backend import supports_triton, triton_backend
 
 
 def _validate_linear(
@@ -187,7 +76,7 @@ def _run_linear(
     activation_fn: str | None,
 ) -> torch.Tensor:
     """Run a validated ConvRot linear through the selected backend."""
-    if _supports_triton(input):
+    if supports_triton(input):
         assert triton_backend is not None
         return triton_backend.linear(
             input,

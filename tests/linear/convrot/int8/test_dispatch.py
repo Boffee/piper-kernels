@@ -154,8 +154,19 @@ def test_addmm_rejects_grad_enabled_scale_but_allows_no_grad() -> None:
         assert weight.addmm_(mat1, mat2) is weight
 
 
+def test_add_rejects_grad_enabled_scale_but_allows_no_grad() -> None:
+    weight = _weight(scale_requires_grad=True)
+    update = torch.randn(7, 32)
+
+    with pytest.raises(RuntimeError, match="does not support autograd"):
+        weight.add_(update)
+
+    with torch.no_grad():
+        assert weight.add_(update) is weight
+
+
 @pytest.mark.parametrize("storage_name", ["qdata", "scale"])
-@pytest.mark.parametrize("operation", ["linear", "swiglu", "addmm"])
+@pytest.mark.parametrize("operation", ["linear", "swiglu", "addmm", "add"])
 def test_operations_revalidate_canonical_storage_layout(
     storage_name: str,
     operation: str,
@@ -176,7 +187,9 @@ def test_operations_revalidate_canonical_storage_layout(
                 weight,
                 activation_fn="swiglu",
             )
-        return weight.addmm_(torch.empty(7, 3), torch.empty(3, 32))
+        if operation == "addmm":
+            return weight.addmm_(torch.empty(7, 3), torch.empty(3, 32))
+        return weight.add_(torch.empty(7, 32))
 
     with pytest.raises(ValueError, match="qdata and scale must be contiguous"):
         call()

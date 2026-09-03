@@ -13,6 +13,7 @@ from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import triton as triton_backend
 from piper_kernels.linear.convrot.int8._policy import select_execution_plan
+from piper_kernels.linear.convrot.int8.reference import add_ as reference_add_
 from piper_kernels.linear.convrot.int8.reference import (
     addmm_,
     linear,
@@ -783,6 +784,22 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_semantic_add_custom_op_passes_opcheck() -> None:
+    torch.manual_seed(127)
+    qdata = torch.randint(-127, 128, (32, 64), dtype=torch.int8, device="cuda")
+    scale = torch.rand(32, 1, dtype=torch.float32, device="cuda") * 0.01
+    update = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
+
+    result = torch.library.opcheck(
+        triton_backend.add_,
+        (qdata, scale, update, 64, 1.25, 123),
+    )
+
+    assert set(result.values()) == {"SUCCESS"}
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_cuda_linear_accepts_noncontiguous_vector_bias(
     input_activation: str | None,
@@ -917,6 +934,31 @@ def test_triton_addmm_matches_gpu_reference(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("alpha", [1.5, -0.25])
+def test_triton_add_matches_gpu_reference(dtype: torch.dtype, alpha: float) -> None:
+    torch.manual_seed(19)
+    weight = torch.randn(96, 64, dtype=dtype, device="cuda")
+    update = torch.randn_like(weight)
+    actual = ConvRotInt8Tensor.from_hp(weight, group_size=64)
+    expected = actual.clone()
+
+    reference_add_(expected.qdata, expected.scale, update, 64, alpha)
+    result = actual.add_(update, alpha=alpha)
+
+    assert result is actual
+    qdata_error = (actual.qdata.to(torch.int16) - expected.qdata.to(torch.int16)).abs()
+    assert qdata_error.max().item() <= 2
+    assert torch.allclose(
+        actual.scale,
+        expected.scale,
+        rtol=2 * torch.finfo(dtype).eps,
+        atol=1e-7,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_triton_addmm_runs_under_torch_compile() -> None:
     torch.manual_seed(30)
     weight = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
@@ -940,6 +982,29 @@ def test_triton_addmm_runs_under_torch_compile() -> None:
         )
 
     result = torch.compile(merge, fullgraph=True)(actual, mat1, mat2)
+
+    assert result is actual
+    assert torch.equal(actual.qdata, expected.qdata)
+    assert torch.equal(actual.scale, expected.scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_triton_add_runs_under_torch_compile() -> None:
+    torch.manual_seed(31)
+    weight = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
+    update = torch.randn_like(weight)
+    expected = ConvRotInt8Tensor.from_hp(weight, group_size=64)
+    actual = expected.clone()
+    expected.add_(update, alpha=1.25)
+
+    def merge(
+        target: ConvRotInt8Tensor,
+        dense_update: torch.Tensor,
+    ) -> ConvRotInt8Tensor:
+        return target.add_(dense_update, alpha=1.25)
+
+    result = torch.compile(merge, fullgraph=True)(actual, update)
 
     assert result is actual
     assert torch.equal(actual.qdata, expected.qdata)

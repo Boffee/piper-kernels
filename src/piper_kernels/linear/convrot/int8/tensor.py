@@ -4,13 +4,14 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 import torch
+from torch.types import Number
 from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.linear._dispatch import bind_linear_arguments
 from piper_kernels.linear._input_activations import InputActivation
 
 from .._rotation import rotate_groups
-from . import dispatch
+from . import _update, dispatch
 from .reference import quantize_weight, validate_storage
 
 
@@ -120,7 +121,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         """
         if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
             raise TypeError("ConvRot addmm_ matrices must be tensors")
-        dispatch.addmm_(
+        _update.addmm_(
             self.qdata,
             self.scale,
             self.dtype,
@@ -128,6 +129,29 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             mat1,
             mat2,
             beta=beta,
+            alpha=alpha,
+            rounding_seed=rounding_seed,
+        )
+        return self
+
+    def add_(
+        self,
+        other: object,
+        *,
+        alpha: Number | complex | None = 1,
+        rounding_seed: int | None = None,
+    ) -> "ConvRotInt8Tensor":
+        """Add a dense logical update and requantize in place."""
+        if not isinstance(other, torch.Tensor):
+            raise TypeError("ConvRot add_ update must be a tensor")
+        if alpha is None:
+            raise TypeError("ConvRot add_ alpha must be a real number, got None")
+        _update.add_(
+            self.qdata,
+            self.scale,
+            self.dtype,
+            self.group_size,
+            other,
             alpha=alpha,
             rounding_seed=rounding_seed,
         )
@@ -207,7 +231,7 @@ def _convrot_addmm_dispatch(
         raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
     if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
         raise TypeError("ConvRot addmm_ matrices must be tensors")
-    dispatch.addmm_(
+    _update.addmm_(
         weight.qdata,
         weight.scale,
         weight.dtype,
@@ -215,6 +239,29 @@ def _convrot_addmm_dispatch(
         mat1,
         mat2,
         beta=kwargs.get("beta", 1),
+        alpha=kwargs.get("alpha", 1),
+    )
+    return weight
+
+
+@ConvRotInt8Tensor.implements(torch.ops.aten.add_.Tensor)
+def _convrot_add_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> ConvRotInt8Tensor:
+    weight, update = args
+    if not isinstance(weight, ConvRotInt8Tensor):
+        raise TypeError(f"ConvRot add_ weight must be ConvRotInt8Tensor, got {type(weight)}")
+    if not isinstance(update, torch.Tensor):
+        raise TypeError("ConvRot add_ update must be a tensor")
+    _update.add_(
+        weight.qdata,
+        weight.scale,
+        weight.dtype,
+        weight.group_size,
+        update,
         alpha=kwargs.get("alpha", 1),
     )
     return weight

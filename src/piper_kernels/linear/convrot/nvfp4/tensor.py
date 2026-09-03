@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
 import torch
+from torch.types import Number
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -25,7 +26,7 @@ from piper_kernels.linear.nvfp4.tensor import (
     supports_semantic_linear,
 )
 
-from . import _addmm, _ops
+from . import _ops, _update
 
 
 class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
@@ -210,12 +211,33 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """
         if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
             raise TypeError("ConvRot NVFP4 addmm_ matrices must be tensors")
-        _addmm.addmm_(
+        _update.addmm_(
             self,
             self.group_size,
             mat1,
             mat2,
             beta=beta,
+            alpha=alpha,
+            rounding_seed=rounding_seed,
+        )
+        return self
+
+    def add_(
+        self,
+        other: object,
+        *,
+        alpha: Number | complex | None = 1,
+        rounding_seed: int | None = None,
+    ) -> ConvRotNVFP4Tensor:
+        """Add a dense logical update and requantize in place."""
+        if not isinstance(other, torch.Tensor):
+            raise TypeError("ConvRot NVFP4 add_ update must be a tensor")
+        if alpha is None:
+            raise TypeError("ConvRot NVFP4 add_ alpha must be a real number, got None")
+        _update.add_(
+            self,
+            self.group_size,
+            other,
             alpha=alpha,
             rounding_seed=rounding_seed,
         )
@@ -296,12 +318,33 @@ def _convrot_nvfp4_addmm_dispatch(
         )
     if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
         raise TypeError("ConvRot NVFP4 addmm_ matrices must be tensors")
-    _addmm.addmm_(
+    _update.addmm_(
         weight,
         weight.group_size,
         mat1,
         mat2,
         beta=kwargs.get("beta", 1),
+        alpha=kwargs.get("alpha", 1),
+    )
+    return weight
+
+
+@ConvRotNVFP4Tensor.implements(torch.ops.aten.add_.Tensor)
+def _convrot_nvfp4_add_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> ConvRotNVFP4Tensor:
+    weight, update = args
+    if not isinstance(weight, ConvRotNVFP4Tensor):
+        raise TypeError(f"ConvRot NVFP4 add_ weight must be ConvRotNVFP4Tensor, got {type(weight)}")
+    if not isinstance(update, torch.Tensor):
+        raise TypeError("ConvRot NVFP4 add_ update must be a tensor")
+    _update.add_(
+        weight,
+        weight.group_size,
+        update,
         alpha=kwargs.get("alpha", 1),
     )
     return weight

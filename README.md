@@ -71,6 +71,9 @@ weight.addmm_(lora_b, lora_a, alpha=lora_strength)
 
 # Reproducible stochastic terminal-code selection for a quantized LoRA merge.
 weight.addmm_(lora_b, lora_a, alpha=lora_strength, rounding_seed=seed)
+
+# In-place full-rank logical update for a materialized adapter delta.
+weight.add_(dense_update, alpha=adapter_strength, rounding_seed=seed)
 ```
 
 Use `from_quantized(..., logical_dtype=...)` to construct a weight from checkpoint storage.
@@ -127,16 +130,20 @@ to those boundaries and owns ConvRot validation; the explicit sparse fusion adds
 storage, and graph rewriting. Another projection backend can therefore compose the same pieces
 without depending on ConvRot internals or adding a backend protocol to attention.
 
-`addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)` and requantizes
-the result. It preserves the ConvRot tensor and quantized storage identities, allowing
-offload integrations to keep their existing buffers. Repeated updates are lossy, so
-reload a pristine base weight before changing or removing a previously merged adapter.
+`addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)`, while `add_`
+accepts an exact-shape dense logical update and computes `weight = weight + alpha * update`.
+Both operations requantize the result and preserve the ConvRot tensor and quantized storage
+identities, allowing offload integrations to keep their existing buffers. Repeated updates are
+lossy, so reload a pristine base weight before changing or removing a previously merged adapter.
 Passing an unsigned 64-bit `rounding_seed` stochastically selects one of the two adjacent
 INT8 codes with probability proportional to distance, without changing the deterministic
 row scales or consuming PyTorch's process-global random-number generator. Omitting the seed
 retains nearest-integer rounding. This is an inference operation and does not support
 autograd. Torch and Triton each replay for a fixed seed, device, and backend; their random
 samples are not promised to match each other or different Triton versions byte-for-byte.
+The standard `add_(update, alpha=...)` signature is compatible with `torch.compile`; its
+`rounding_seed` extension is intended for eager merge code because Dynamo enforces the built-in
+`Tensor.add_` keyword schema while tracing.
 
 The operator selects its Triton implementation on supported CUDA devices and otherwise
 uses the portable PyTorch reference. Install the tensor format and optimized backend with

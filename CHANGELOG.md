@@ -7,6 +7,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added exact-shape in-place `add_` updates to ConvRot INT8 and NVFP4 tensors for full-rank
+  adapter merges. Dense logical updates are rotated into the packed storage basis and reuse the
+  existing seeded requantization paths while preserving wrapper and storage identities.
 - Extended standard and ConvRot NVFP4 sparse-Piper projection fusion to valid-front padded K64
   storage and fused coarse residuals. NVFP4 Q/K/V projection epilogues now consume
   `block_lengths`, represented-input means exclude padded rows, and the compiler recognizes every
