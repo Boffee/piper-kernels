@@ -188,7 +188,7 @@ def _padded_arguments(
         if coarse
         else None
     )
-    compression_gate = (
+    coarse_gate = (
         torch.randn(
             (1, sequence_length, _HEADS, _HEAD_DIM),
             device="cuda",
@@ -201,11 +201,11 @@ def _padded_arguments(
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
         assert block_mean is not None
-        assert compression_gate is not None
+        assert coarse_gate is not None
         materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *attention_arguments[:10],
             block_mean,
-            compression_gate,
+            coarse_gate,
             *attention_arguments[10:],
             coarse_scale,
             block_lengths,
@@ -242,10 +242,84 @@ def _padded_arguments(
         128,
         block_lengths,
         block_mean,
-        compression_gate,
+        coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+    ), expected
+
+
+def _projected_gate_arguments(
+    *,
+    sequence_length: int,
+    weight_global_scale: bool,
+) -> tuple[tuple[object, ...], torch.Tensor]:
+    arguments, _sparse_only = _arguments(sequence_length=sequence_length, bias=True)
+    hidden = torch.randn(
+        (1, sequence_length, _HEADS * _HEAD_DIM),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    activation_scale = per_tensor_amax_to_scale(hidden.abs().amax())
+    gate_dense = torch.randn(
+        (_HEADS * _HEAD_DIM, hidden.shape[-1]),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate_weight = TorchAONVFP4Tensor.to_nvfp4(
+        gate_dense,
+        per_tensor_scale=(
+            per_tensor_amax_to_scale(gate_dense.abs().amax()) if weight_global_scale else None
+        ),
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    gate_bias = torch.randn(
+        _HEADS * _HEAD_DIM,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate_input = _ops.prepare_input(hidden, activation_scale, False)
+    with torch.no_grad():
+        coarse_gate = _ops.linear_prepared(
+            *gate_input,
+            gate_weight.qdata,
+            gate_weight.scale,
+            gate_weight.per_tensor_scale,
+            gate_bias,
+            torch.bfloat16,
+        ).view(1, sequence_length, _HEADS, _HEAD_DIM)
+    coarse_key_blocks = (sequence_length + 63) // 64
+    block_mean = torch.randn(
+        (1, _HEADS, coarse_key_blocks, _HEAD_DIM),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        expected = output._attention_output_op(
+            *arguments,
+            128,
+            None,
+            block_mean,
+            coarse_gate,
+            0.125,
+            coarse_key_blocks,
+            None,
+        )
+    return (
+        *arguments,
+        128,
+        None,
+        block_mean,
+        None,
+        0.125,
+        coarse_key_blocks,
+        None,
+        *gate_input,
+        gate_weight.qdata,
+        gate_weight.scale,
+        gate_weight.per_tensor_scale,
+        gate_bias,
     ), expected
 
 
@@ -324,6 +398,23 @@ def test_attention_output_supports_blockwise_only_weight_scale() -> None:
         actual = output._attention_output_op(*arguments, 128)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("weight_global_scale", [False, True])
+def test_attention_output_projects_a_bounded_coarse_gate(
+    weight_global_scale: bool,
+) -> None:
+    arguments, expected = _projected_gate_arguments(
+        sequence_length=1_024,
+        weight_global_scale=weight_global_scale,
+    )
+
+    with torch.no_grad():
+        actual = output._attention_output_op(*arguments)
+
+    torch.testing.assert_close(actual, expected, atol=2**-7, rtol=2**-7)
 
 
 @pytest.mark.gpu

@@ -34,7 +34,7 @@ def _coarse_residual_from_mode(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    compression_gate: torch.Tensor,
+    coarse_gate: torch.Tensor,
     *,
     coarse_key_blocks: int | None,
     coarse_scale: float,
@@ -43,7 +43,7 @@ def _coarse_residual_from_mode(
 ) -> torch.Tensor:
     """Return one policy-selected coarse branch while preserving its graph boundary."""
     validate_routing_mode(routing_mode)
-    if _preserve_coarse_residual_in_graph(query, key, value, compression_gate):
+    if _preserve_coarse_residual_in_graph(query, key, value, coarse_gate):
         resolved_coarse_key_blocks = (
             (
                 block_lengths.numel()
@@ -57,7 +57,7 @@ def _coarse_residual_from_mode(
             query,
             key,
             value,
-            compression_gate,
+            coarse_gate,
             resolved_coarse_key_blocks,
             coarse_scale,
             routing_mode,
@@ -67,7 +67,7 @@ def _coarse_residual_from_mode(
         query,
         key,
         value,
-        compression_gate,
+        coarse_gate,
         coarse_key_blocks=coarse_key_blocks,
         coarse_scale=coarse_scale,
         routing_mode=routing_mode,
@@ -79,7 +79,7 @@ def coarse_residual_impl(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    compression_gate: torch.Tensor,
+    coarse_gate: torch.Tensor,
     *,
     coarse_key_blocks: int | None,
     coarse_scale: float,
@@ -92,7 +92,7 @@ def coarse_residual_impl(
         query,
         key,
         value,
-        compression_gate,
+        coarse_gate,
         coarse_key_blocks,
         coarse_scale,
         block_lengths,
@@ -109,7 +109,7 @@ def coarse_residual_impl(
     pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :coarse_key_blocks]
     return _apply_chunked_coarse_residual(
         pooled_value,
-        compression_gate,
+        coarse_gate,
         score_chunks(
             query_summary,
             key_primary,

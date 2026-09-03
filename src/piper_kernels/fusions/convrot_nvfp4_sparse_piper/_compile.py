@@ -19,7 +19,7 @@ from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_triton
 
 from . import _output_compile, output
 
-_COMPILE_PASS_VERSION = "convrot-nvfp4-sparse-piper-compile-v2"
+_COMPILE_PASS_VERSION = "convrot-nvfp4-sparse-piper-compile-v4"
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):

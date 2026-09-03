@@ -60,27 +60,19 @@ def _valid_attention_output(match: Match) -> bool:
 
 
 def _replace_attention_output(match: Match, **_unused: object) -> None:
-    original = match.output_node()
-    graph = match.graph
-    with graph.inserting_before(original):
-        replacement = graph.call_function(
-            torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default,
-            args=(
-                *sparse_piper_pattern.quantized_attention_arguments(match),
-                match.kwargs["output_weight_qdata"],
-                match.kwargs["output_weight_scale"],
-                match.kwargs["output_weight_per_tensor_scale"],
-                match.kwargs["output_activation_scale"],
-                match.kwargs["output_bias"],
-                match.kwargs["output_group_size"],
-                output._DEFAULT_QUERY_CHUNK_ROWS,
-                *sparse_piper_pattern.bounded_attention_arguments(match),
-            ),
-        )
-    replacement.meta = original.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    original.replace_all_uses_with(replacement)
-    match.erase_nodes()
+    nvfp4_output_compile._replace_attention_output_with_target(
+        match,
+        torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default,
+        (
+            match.kwargs["output_weight_qdata"],
+            match.kwargs["output_weight_scale"],
+            match.kwargs["output_weight_per_tensor_scale"],
+            match.kwargs["output_activation_scale"],
+            match.kwargs["output_bias"],
+            match.kwargs["output_group_size"],
+        ),
+        output._DEFAULT_QUERY_CHUNK_ROWS,
+    )
 
 
 _patterns = PatternMatcherPass("convrot_nvfp4_sparse_piper_attention_output")

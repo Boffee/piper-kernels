@@ -46,7 +46,7 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
 from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v6"
+_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v8"
 _HEAD_DIM = layout.HEAD_DIM
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
@@ -227,7 +227,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     sparse_routing_mode: int,
     sparse_block_lengths: torch.fx.Node | None = None,
     sparse_query_blocks: Argument | None = None,
-    coarse_compression_gate: torch.fx.Node | None = None,
+    coarse_gate: torch.fx.Node | None = None,
     coarse_key_blocks: Argument | None = None,
     coarse_scale: float | None = None,
     **_unused: object,
@@ -332,7 +332,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             args=(value_mean_flat, (1, heads, _HEAD_DIM)),
         )
         value_mean.meta["val"] = input_value.new_empty((1, heads, _HEAD_DIM), dtype=torch.float32)
-        with_coarse_residual = coarse_compression_gate is not None
+        with_coarse_residual = coarse_gate is not None
         value_values = (
             input_value.new_empty((1, heads, _HEAD_DIM, storage_sequence_length), dtype=torch.int8),
             input_value.new_empty(
@@ -379,7 +379,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             block_lengths=sparse_block_lengths,
             sparse_query_blocks=sparse_query_blocks,
             block_mean=value_nodes[2] if with_coarse_residual else None,
-            compression_gate=coarse_compression_gate,
+            coarse_gate=coarse_gate,
             coarse_scale=coarse_scale,
             coarse_key_blocks=coarse_key_blocks,
         )

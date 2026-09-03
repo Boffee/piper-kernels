@@ -111,7 +111,7 @@ def _padded_arguments(
         if coarse
         else None
     )
-    compression_gate = (
+    coarse_gate = (
         torch.randn(
             (1, sequence_length, _HEADS, _HEAD_DIM),
             device="cuda",
@@ -124,11 +124,11 @@ def _padded_arguments(
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
         assert block_mean is not None
-        assert compression_gate is not None
+        assert coarse_gate is not None
         materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *attention_arguments[:10],
             block_mean,
-            compression_gate,
+            coarse_gate,
             *attention_arguments[10:],
             coarse_scale,
             block_lengths,
@@ -154,7 +154,7 @@ def _padded_arguments(
         64,
         block_lengths,
         block_mean,
-        compression_gate,
+        coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
@@ -217,6 +217,100 @@ def test_attention_output_supports_bounded_attention_features(
         actual = output_fusion._attention_output_op(*arguments)
 
     assert actual.shape == expected.shape == (1, 192, _OUTPUT_FEATURES)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(
+    ("sequence_length", "nondefault_stream"),
+    [(128, False), (193, False), (512, True)],
+)
+def test_attention_output_projects_a_bounded_coarse_gate(
+    sequence_length: int,
+    nondefault_stream: bool,
+) -> None:
+    arguments, _fine_expected = _arguments(
+        batch=1,
+        sequence_length=sequence_length,
+        bias=False,
+    )
+    attention_arguments = arguments[:14]
+    output_arguments = arguments[14:]
+    gate_features = _HEADS * _HEAD_DIM
+    gate_input_qdata = torch.randint(
+        -127,
+        128,
+        (1, sequence_length, gate_features),
+        device="cuda",
+        dtype=torch.int8,
+    )
+    gate_input_scale = torch.rand(
+        (1, sequence_length),
+        device="cuda",
+        dtype=torch.float32,
+    ).mul_(0.01)
+    gate_weight, gate_scale, gate_bias = _projection(bias=True)
+    gate_weight = gate_weight[:gate_features, :gate_features].contiguous()
+    gate_scale = gate_scale[:gate_features].contiguous()
+    assert gate_bias is not None
+    gate_bias = gate_bias[:gate_features].contiguous()
+    coarse_gate = convrot_backend._execute_prepared_linear(
+        gate_input_qdata,
+        gate_input_scale,
+        gate_weight,
+        gate_scale,
+        gate_bias,
+        torch.bfloat16,
+        convrot_backend.default_execution_plan(gate_weight),
+    ).unflatten(-1, (_HEADS, _HEAD_DIM))
+    query_blocks = (sequence_length + 63) // 64
+    block_mean = torch.randn(
+        (1, _HEADS, query_blocks, _HEAD_DIM),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    coarse_scale = _HEAD_DIM**-0.5
+    coarse_key_blocks = query_blocks
+    materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+        *attention_arguments[:10],
+        block_mean,
+        coarse_gate,
+        *attention_arguments[10:],
+        coarse_scale,
+        None,
+        coarse_key_blocks,
+        None,
+    )
+    output_weight, output_scale, output_bias, output_group_size = output_arguments
+    expected = convrot_backend.run_linear(
+        materialized_attention.flatten(2),
+        output_weight,
+        output_scale,
+        output_bias,
+        output_group_size,
+    )
+
+    stream = torch.cuda.Stream() if nondefault_stream else torch.cuda.current_stream()
+    with torch.cuda.stream(stream):
+        actual = output_fusion._attention_output_op(
+            *attention_arguments,
+            *output_arguments,
+            64,
+            None,
+            block_mean,
+            None,
+            coarse_scale,
+            coarse_key_blocks,
+            None,
+            gate_input_qdata,
+            gate_input_scale,
+            gate_weight,
+            gate_scale,
+            gate_bias,
+        )
+    stream.synchronize()
+
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

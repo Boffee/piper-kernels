@@ -13,6 +13,11 @@ from piper_kernels.attention.sparse_piper_attention import _budget
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
+_SHAPE_ONLY_VIEW_TARGETS = (
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.view.default,
+)
+
 
 def static_int(value: object) -> int | None:
     """Return a non-boolean static integer."""
@@ -39,6 +44,18 @@ def integer_scalar_argument(value: object) -> Argument | None:
     return value if isinstance(value, (int, torch.SymInt, torch.fx.Node)) else None
 
 
+def unwrap_shape_only_views(value: object) -> torch.fx.Node | None:
+    """Return the first non-view producer beneath contiguous reshape/view calls."""
+    if not isinstance(value, torch.fx.Node):
+        return None
+    node = value
+    while node.target in _SHAPE_ONLY_VIEW_TARGETS:
+        if node.kwargs or len(node.args) != 2 or not isinstance(node.args[0], torch.fx.Node):
+            return None
+        node = node.args[0]
+    return node
+
+
 def _positive_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -55,7 +72,7 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
     """Validate projection-independent operands for a matched coarse residual."""
     if match.kwargs["sparse_routing_mode"] != match.kwargs["coarse_routing_mode"]:
         return False
-    gate_node = match.kwargs["coarse_compression_gate"]
+    gate_node = match.kwargs["coarse_gate"]
     if not isinstance(gate_node, torch.fx.Node):
         return False
     gate = preparation_sharing.tensor_metadata(gate_node)
@@ -95,12 +112,12 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     block_lengths: Argument | None = None,
     sparse_query_blocks: Argument | None = None,
     block_mean: Argument | None = None,
-    compression_gate: Argument | None = None,
+    coarse_gate: Argument | None = None,
     coarse_scale: Argument | None = None,
     coarse_key_blocks: Argument | None = None,
 ) -> torch.fx.Node:
     """Emit the shared fine or coarse quantized sparse-attention call."""
-    coarse_arguments = block_mean, compression_gate, coarse_scale, coarse_key_blocks
+    coarse_arguments = block_mean, coarse_gate, coarse_scale, coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
     if with_coarse:
         if any(argument is None for argument in coarse_arguments):
@@ -110,7 +127,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
             args=(
                 *attention_arguments,
                 block_mean,
-                compression_gate,
+                coarse_gate,
                 head_keep_ratio_units,
                 sparse_key_blocks,
                 logical_sequence_length,

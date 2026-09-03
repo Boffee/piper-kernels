@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol, cast
 
 import torch
@@ -24,6 +25,131 @@ class PreparationBackend(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare an attention chunk into reusable standard NVFP4 storage."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGateProjection:
+    """One NVFP4 gate projected from shared prepared hidden states."""
+
+    input_qdata: torch.Tensor
+    input_scale: torch.Tensor
+    global_scale: torch.Tensor
+    weight_qdata: torch.Tensor
+    weight_scale: torch.Tensor
+    bias: torch.Tensor | None
+
+    def project(self, output: torch.Tensor, start: int, rows: int) -> None:
+        """Project one sequence window into caller-owned token-major gate storage."""
+        output_chunk = output[0, :rows].reshape(rows, self.weight_qdata.shape[0])
+        projected = _projection.matmul_prepared_chunk_out(
+            self.input_qdata,
+            self.input_scale,
+            self.weight_qdata,
+            self.weight_scale,
+            start,
+            start + rows,
+            output_chunk,
+        )
+        nvfp4_backend.apply_projection_epilogue(
+            projected,
+            self.global_scale,
+            self.bias,
+            projected,
+        )
+
+
+def prepare_gate_projection(
+    query: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    input_per_tensor_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> PreparedGateProjection:
+    """Validate a prepared NVFP4 gate that produces one D128 vector per head."""
+    if query.shape[0] != 1:
+        raise ValueError("fused NVFP4 gate projection currently requires batch size one")
+    shape = _validation.validate_prepared_linear(
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight_qdata,
+        weight_scale,
+        weight_per_tensor_scale,
+        bias,
+        torch.bfloat16,
+        "fused sparse Piper NVFP4 gate",
+    )
+    sequence_length = output_common.output_sequence_length(
+        query,
+        logical_sequence_length,
+        block_lengths,
+    )
+    if shape.rows != sequence_length:
+        raise ValueError("fused NVFP4 gate input must match the attention output rows")
+    if shape.output_features != query.shape[1] * query.shape[3]:
+        raise ValueError("fused NVFP4 gate must produce one D128 vector per head")
+    differentiable_tensors = (
+        input_scale,
+        input_per_tensor_scale,
+        weight_scale,
+        *(tensor for tensor in (weight_per_tensor_scale, bias) if tensor is not None),
+    )
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in differentiable_tensors):
+        raise RuntimeError("fused NVFP4 gate projection is inference-only")
+    return PreparedGateProjection(
+        input_qdata,
+        input_scale,
+        (
+            input_per_tensor_scale
+            if weight_per_tensor_scale is None
+            else input_per_tensor_scale * weight_per_tensor_scale
+        ),
+        weight_qdata,
+        weight_scale,
+        bias,
+    )
+
+
+def prepare_optional_gate_projection(
+    query: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    input_qdata: torch.Tensor | None,
+    input_scale: torch.Tensor | None,
+    input_per_tensor_scale: torch.Tensor | None,
+    weight_qdata: torch.Tensor | None,
+    weight_scale: torch.Tensor | None,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> PreparedGateProjection | None:
+    """Resolve an absent or complete prepared NVFP4 gate operand set."""
+    required = input_qdata, input_scale, input_per_tensor_scale, weight_qdata, weight_scale
+    if not any(value is not None for value in (*required, weight_per_tensor_scale, bias)):
+        return None
+    if any(value is None for value in required):
+        raise ValueError("projected NVFP4 gate requires every prepared storage operand")
+    assert input_qdata is not None
+    assert input_scale is not None
+    assert input_per_tensor_scale is not None
+    assert weight_qdata is not None
+    assert weight_scale is not None
+    return prepare_gate_projection(
+        query,
+        logical_sequence_length,
+        block_lengths,
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight_qdata,
+        weight_scale,
+        weight_per_tensor_scale,
+        bias,
+    )
 
 
 def _validate_output_projection(
@@ -157,10 +283,11 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     preparation: PreparationBackend,
     block_lengths: torch.Tensor | None = None,
     block_mean: torch.Tensor | None = None,
-    compression_gate: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    gate_projection: PreparedGateProjection | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into a static NVFP4 output."""
     input_features, output_features = _validate_output_projection(
@@ -190,10 +317,11 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         routing_mode,
         block_lengths,
         block_mean,
-        compression_gate,
+        coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+        has_projected_coarse_gate=gate_projection is not None,
     )
     sequence_length = prepared.sequence_length
     capacity = min(sequence_length, query_chunk_rows)
@@ -235,7 +363,15 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         project_chunk,
         (prepared_input, prepared_scale),
+        project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
     )
 
 
-__all__ = ["DEFAULT_QUERY_CHUNK_ROWS", "PreparationBackend", "run_attention_output"]
+__all__ = [
+    "DEFAULT_QUERY_CHUNK_ROWS",
+    "PreparationBackend",
+    "PreparedGateProjection",
+    "prepare_gate_projection",
+    "prepare_optional_gate_projection",
+    "run_attention_output",
+]

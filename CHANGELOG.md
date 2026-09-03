@@ -7,6 +7,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Lifetime-chunked learned coarse-gate projections in complete ConvRot INT8, NVFP4, and
+  ConvRot NVFP4 sparse-attention compiler fusions. Compatible gates project only the active query
+  window into reusable bounded storage instead of materializing the full token/head BF16 tensor.
+  Long sequences pipeline the next gate window alongside the current attention launch; existing
+  materialized gates remain supported as the reference and fallback path.
 - Replaced the pooling-specific Sparse Piper coarse-residual helpers with the routing-selectable
   `sparse_piper_coarse_residual`. The new helper returns an independent gated branch for callers
   to compose with fine attention, while compatible compiler rewrites continue to fuse it.
@@ -29,11 +34,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Extended bounded sparse-attention output projection fusion to valid-front padded K64 storage and
   fused coarse residuals. ConvRot INT8, standard NVFP4, and ConvRot NVFP4 now share ranged
   attention launches that pass `block_lengths`, block-level coarse output, and the token-level
-  compression gate directly into each projection chunk instead of materializing the full BF16
+  coarse gate directly into each projection chunk instead of materializing the full BF16
   attention result.
 - Added a policy-independent Sparse Piper coarse-attention residual. Caller-provided FP32 block
   scores from mean pooling, min/max pooling, or learned policies attend over padding-aware pooled
-  V, expand over physical K64 query blocks, and apply a token-level compression gate before the
+  V, expand over physical K64 query blocks, and apply a token-level coarse gate before the
   residual add. The `mean_pool_coarse_residual` and `minmax_pool_coarse_residual` convenience paths
   derive bounded-workspace scores directly from Q/K/V, including valid-front padded block
   summaries. Their optional `coarse_key_blocks` scope can extend beyond the sparse-routing prefix

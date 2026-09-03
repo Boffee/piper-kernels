@@ -41,9 +41,11 @@ from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
 from piper_kernels.linear.convrot.nvfp4._compile import (
     compile_pass as convrot_nvfp4_compile_pass,
 )
+from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from ..nvfp4_sparse_piper.test_compile import (
+    _ProjectedGateCoarseSparseAttentionOutput,
     _quantized_attention_output_graph,
     _semantic_attention_graph,
     _SparseProjectionAttentionOutput,
@@ -283,6 +285,34 @@ class _ConvRotSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
             )
 
 
+class _ConvRotProjectedGateCoarseAttentionOutput(_ProjectedGateCoarseSparseAttentionOutput):
+    """Coarse sparse attention with ConvRot NVFP4 Q/K/V/gate/output linears."""
+
+    def __init__(self, *, dynamic: bool, routing: str) -> None:
+        super().__init__(dynamic=dynamic, routing=routing)
+        for projection in (self.query, self.key, self.value, self.gate, self.output):
+            projection.weight = torch.nn.Parameter(
+                _convert_weight(projection.weight),
+                requires_grad=False,
+            )
+
+
+def _prepared_input(
+    input: torch.Tensor,  # noqa: A002
+    projection: torch.nn.Linear,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    weight = projection.weight
+    assert isinstance(weight, ConvRotNVFP4Tensor)
+    quantization = weight.act_quant_kwargs
+    assert quantization is not None
+    return convrot_nvfp4_ops.prepare_input(
+        input,
+        weight.act_per_tensor_scale,
+        quantization.use_dynamic_per_tensor_scale,
+        weight.group_size,
+    )
+
+
 def _explicit_fused(
     model: _ConvRotSparseProjectionAttentionOutput,
     input: torch.Tensor,  # noqa: A002
@@ -373,6 +403,108 @@ def _explicit_fused(
     )
 
 
+def _explicit_fused_projected_gate(
+    model: _ConvRotProjectedGateCoarseAttentionOutput,
+    input: torch.Tensor,  # noqa: A002
+    block_lengths: torch.Tensor,
+    sparse_query_blocks: int,
+) -> torch.Tensor:
+    q_input, k_input, v_input, gate_input = (
+        _prepared_input(input, projection)
+        for projection in (model.query, model.key, model.value, model.gate)
+    )
+    q_weight = model.query.weight
+    k_weight = model.key.weight
+    v_weight = model.value.weight
+    gate_weight = model.gate.weight
+    output_weight = model.output.weight
+    assert isinstance(q_weight, ConvRotNVFP4Tensor)
+    assert isinstance(k_weight, ConvRotNVFP4Tensor)
+    assert isinstance(v_weight, ConvRotNVFP4Tensor)
+    assert isinstance(gate_weight, ConvRotNVFP4Tensor)
+    assert isinstance(output_weight, ConvRotNVFP4Tensor)
+    query = fused_query.project_query(
+        *q_input,
+        q_weight.qdata,
+        q_weight.scale,
+        q_weight.per_tensor_scale,
+        model.query.bias,
+        model.query_norm,
+        model.cos,
+        model.sin,
+        1e-5,
+        model.head_dim**-0.5,
+        4_096,
+        model.sparse_attention._routing_mode,
+        block_lengths,
+    )
+    key = fused_key.project_key(
+        *k_input,
+        k_weight.qdata,
+        k_weight.scale,
+        k_weight.per_tensor_scale,
+        model.key.bias,
+        model.key_norm,
+        model.cos,
+        model.sin,
+        1e-5,
+        4_096,
+        model.sparse_attention._routing_mode,
+        block_lengths,
+    )
+    value_mean = linear_mean(
+        *v_input,
+        v_weight.qdata,
+        v_weight.scale,
+        v_weight.per_tensor_scale,
+        model.value.bias,
+        model.batch,
+        model.sequence_length,
+        block_lengths,
+    ).view(model.batch, model.heads, model.head_dim)
+    value = fused_value.project_value_with_block_means(
+        *v_input,
+        v_weight.qdata,
+        v_weight.scale,
+        v_weight.per_tensor_scale,
+        model.value.bias,
+        value_mean,
+        4_096,
+        block_lengths,
+    )
+    coarse_gate = nvfp4_ops.linear_prepared(
+        *gate_input,
+        gate_weight.qdata,
+        gate_weight.scale,
+        gate_weight.per_tensor_scale,
+        model.gate.bias,
+        torch.bfloat16,
+    ).view(model.batch, model.sequence_length, model.heads, model.head_dim)
+    return _attention_output_op(
+        *query,
+        *key,
+        *value[:2],
+        value_mean,
+        list(model.sparse_attention._head_keep_ratio_units),
+        model.sparse_key_blocks,
+        model.sequence_length,
+        model.sparse_attention._routing_mode,
+        output_weight.qdata,
+        output_weight.scale,
+        output_weight.per_tensor_scale,
+        output_weight.act_per_tensor_scale,
+        model.output.bias,
+        output_weight.group_size,
+        8_192,
+        block_lengths,
+        value[2],
+        coarse_gate,
+        model.coarse_scale,
+        model.coarse_key_blocks,
+        sparse_query_blocks,
+    )
+
+
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
     def __init__(self) -> None:
         self.targets: list[object] = []
@@ -428,3 +560,59 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
         assert capture.targets.count(target) == 1
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in capture.targets
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(
+    ("dynamic", "routing", "preparation_count"),
+    [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
+)
+def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
+    dynamic: bool,
+    routing: str,
+    preparation_count: int,
+) -> None:
+    torch.manual_seed(977 + dynamic)
+    model = _ConvRotProjectedGateCoarseAttentionOutput(
+        dynamic=dynamic,
+        routing=routing,
+    ).eval()
+    input = torch.randn(  # noqa: A001
+        (model.batch, model.sequence_length, model.input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    capture = _TargetCapturePass()
+    options = convrot_nvfp4_sparse_piper_compile_options()
+    passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
+    with torch.no_grad():
+        expected = _explicit_fused_projected_gate(model, input, block_lengths, 2)
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=options)(
+            input,
+            block_lengths,
+            2,
+        )
+
+    torch.testing.assert_close(
+        actual[:, valid_rows],
+        expected[:, valid_rows],
+        atol=0,
+        rtol=0,
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default)
+        == preparation_count
+    )
+    assert (
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
+        )
+        == 1
+    )
+    assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in capture.targets

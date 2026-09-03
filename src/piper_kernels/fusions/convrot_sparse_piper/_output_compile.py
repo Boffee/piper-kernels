@@ -13,10 +13,19 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _layout, output
+
+type _PreparedGateProjectionNodes = tuple[
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node | None,
+]
 
 
 def _attention_output_pattern(
@@ -52,6 +61,34 @@ def _static_int(value: object) -> int | None:
 
 def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
     return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
+
+
+def _prepared_gate_projection(
+    gate: object,
+) -> _PreparedGateProjectionNodes | None:
+    """Extract a reshaped prepared ConvRot gate for bounded projection."""
+    if not isinstance(gate, torch.fx.Node):
+        return None
+    linear = sparse_piper_compile.unwrap_shape_only_views(gate)
+    if (
+        not isinstance(linear, torch.fx.Node)
+        or linear is gate
+        or linear.target is not torch.ops.piper_kernels.convrot_int8_linear_prepared.default
+        or linear.kwargs
+        or len(linear.args) != 6
+        or linear.args[5] is not torch.bfloat16
+    ):
+        return None
+    input_qdata, input_scale, weight_qdata, weight_scale, bias, _logical_dtype = linear.args
+    if (
+        not isinstance(input_qdata, torch.fx.Node)
+        or not isinstance(input_scale, torch.fx.Node)
+        or not isinstance(weight_qdata, torch.fx.Node)
+        or not isinstance(weight_scale, torch.fx.Node)
+        or (bias is not None and not isinstance(bias, torch.fx.Node))
+    ):
+        return None
+    return input_qdata, input_scale, weight_qdata, weight_scale, bias
 
 
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
@@ -189,30 +226,50 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
 ) -> None:
     original = match.output_node()
     graph = match.graph
+    bounded_arguments = sparse_piper_pattern.bounded_attention_arguments(match)
+    block_lengths, block_mean, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
+        bounded_arguments
+    )
+    gate_projection = _prepared_gate_projection(coarse_gate)
+    gate_arguments: tuple[Argument, ...] = ()
+    if gate_projection is not None:
+        bounded_arguments = (
+            block_lengths,
+            block_mean,
+            None,
+            coarse_scale,
+            coarse_key_blocks,
+            query_blocks,
+        )
+        gate_arguments = gate_projection
     with graph.inserting_before(original):
+        common_arguments = (
+            output_query,
+            output_query_scale,
+            output_query_summary,
+            output_key,
+            output_key_scale,
+            output_key_summary,
+            output_key_aux,
+            output_value,
+            output_value_scale_multiplier,
+            output_value_mean,
+            output_head_keep_ratio_units,
+            output_sparse_key_blocks,
+            output_logical_sequence_length,
+            output_routing_mode,
+            output_weight_qdata,
+            output_weight_scale,
+            output_bias,
+            output_group_size,
+        )
         replacement = graph.call_function(
             torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default,
             args=(
-                output_query,
-                output_query_scale,
-                output_query_summary,
-                output_key,
-                output_key_scale,
-                output_key_summary,
-                output_key_aux,
-                output_value,
-                output_value_scale_multiplier,
-                output_value_mean,
-                output_head_keep_ratio_units,
-                output_sparse_key_blocks,
-                output_logical_sequence_length,
-                output_routing_mode,
-                output_weight_qdata,
-                output_weight_scale,
-                output_bias,
-                output_group_size,
+                *common_arguments,
                 output._DEFAULT_QUERY_CHUNK_ROWS,
-                *sparse_piper_pattern.bounded_attention_arguments(match),
+                *bounded_arguments,
+                *gate_arguments,
             ),
         )
     replacement.meta = original.meta.copy()

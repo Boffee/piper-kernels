@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import torch
 from torch._inductor.pattern_matcher import (
     CallFunction,
@@ -10,14 +13,26 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
+from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.nvfp4 import _compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 from . import output
+
+type _PreparedGateProjectionNodes = tuple[
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node | None,
+    torch.fx.Node | None,
+]
 
 
 def _attention_output_pattern(
@@ -64,6 +79,53 @@ def _shape_dimensions(value: object) -> tuple[int | torch.SymInt, ...] | None:
 
 def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
     return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
+
+
+def _prepared_gate_projection(
+    gate: object,
+) -> _PreparedGateProjectionNodes | None:
+    """Extract a reshaped prepared NVFP4 gate for bounded projection."""
+    if not isinstance(gate, torch.fx.Node):
+        return None
+    linear = sparse_piper_compile.unwrap_shape_only_views(gate)
+    if (
+        linear is None
+        or linear is gate
+        or linear.target is not torch.ops.piper_kernels.nvfp4_linear_prepared.default
+    ):
+        return None
+    operands = _compile_fx.PreparedLinearNodes.from_call(linear)
+    if operands is None or operands.logical_dtype is not torch.bfloat16:
+        return None
+    shape = _compile_fx.validated_prepared_linear(
+        operands,
+        "fused sparse Piper NVFP4 compiler gate",
+    )
+    gate_value = preparation_sharing.tensor_metadata(gate)
+    if (
+        shape is None
+        or gate_value is None
+        or gate_value.ndim != 4
+        or gate_value.dtype is not torch.bfloat16
+        or gate_value.shape[0] != 1
+        or not _same_dimension(gate_value.shape[1], shape.rows)
+        or not _same_dimension(
+            gate_value.shape[2] * gate_value.shape[3],
+            shape.output_features,
+        )
+        or gate_value.layout is not torch.strided
+        or not gate_value.is_contiguous()
+    ):
+        return None
+    return (
+        operands.input_qdata,
+        operands.input_scale,
+        operands.input_per_tensor_scale,
+        operands.weight_qdata,
+        operands.weight_scale,
+        operands.weight_per_tensor_scale,
+        operands.bias,
+    )
 
 
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
@@ -176,27 +238,61 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
     )
 
 
-def _replace_attention_output(match: Match, **_unused: object) -> None:
+def _replace_attention_output_with_target(
+    match: Match,
+    target: Callable[..., torch.Tensor],
+    projection_arguments: tuple[Argument, ...],
+    query_chunk_rows: int,
+) -> None:
+    """Emit one NVFP4 output operator with a materialized or deferred gate."""
     original = match.output_node()
     graph = match.graph
+    bounded_arguments = sparse_piper_pattern.bounded_attention_arguments(match)
+    block_lengths, block_mean, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
+        bounded_arguments
+    )
+    gate_projection = _prepared_gate_projection(coarse_gate)
+    gate_arguments: tuple[Argument, ...] = ()
+    if gate_projection is not None:
+        bounded_arguments = (
+            block_lengths,
+            block_mean,
+            None,
+            coarse_scale,
+            coarse_key_blocks,
+            query_blocks,
+        )
+        gate_arguments = cast(tuple[Argument, ...], gate_projection)
     with graph.inserting_before(original):
         replacement = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default,
+            target,
             args=(
                 *sparse_piper_pattern.quantized_attention_arguments(match),
-                match.kwargs["output_weight_qdata"],
-                match.kwargs["output_weight_scale"],
-                match.kwargs["output_weight_per_tensor_scale"],
-                match.kwargs["output_activation_scale"],
-                match.kwargs["output_bias"],
-                output._DEFAULT_QUERY_CHUNK_ROWS,
-                *sparse_piper_pattern.bounded_attention_arguments(match),
+                *projection_arguments,
+                query_chunk_rows,
+                *bounded_arguments,
+                *gate_arguments,
             ),
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
     original.replace_all_uses_with(replacement)
     match.erase_nodes()
+
+
+def _replace_attention_output(match: Match, **_unused: object) -> None:
+    _replace_attention_output_with_target(
+        match,
+        torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default,
+        (
+            match.kwargs["output_weight_qdata"],
+            match.kwargs["output_weight_scale"],
+            match.kwargs["output_weight_per_tensor_scale"],
+            match.kwargs["output_activation_scale"],
+            match.kwargs["output_bias"],
+        ),
+        output._DEFAULT_QUERY_CHUNK_ROWS,
+    )
 
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_attention_output")

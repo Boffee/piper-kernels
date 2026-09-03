@@ -212,7 +212,7 @@ def _launch_quantized_sparse_piper_attention(
     query_block_offset: int = 0,
     query_block_count: int | None = None,
     coarse_output: torch.Tensor | None = None,
-    compression_gate: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch a prepared quantized sparse-Piper query range."""
     if _launch_sm120_attention is None:
@@ -223,7 +223,7 @@ def _launch_quantized_sparse_piper_attention(
         query_block_offset=query_block_offset,
         query_block_count=query_block_count,
         coarse_output=coarse_output,
-        compression_gate=compression_gate,
+        coarse_gate=coarse_gate,
     )
 
 
@@ -302,7 +302,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     block_mean: torch.Tensor,
-    compression_gate: torch.Tensor,
+    coarse_gate: torch.Tensor,
     head_keep_ratio_units: list[int],
     sparse_key_blocks: int,
     logical_sequence_length: int,
@@ -343,7 +343,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         prepared,
         output.transpose(1, 2),
         coarse_output=coarse_output,
-        compression_gate=compression_gate,
+        coarse_gate=coarse_gate,
     )
     return output
 
@@ -387,7 +387,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
     _block_mean: torch.Tensor,
-    _compression_gate: torch.Tensor,
+    _coarse_gate: torch.Tensor,
     _head_keep_ratio_units: list[int],
     _sparse_key_blocks: int,
     logical_sequence_length: int,
