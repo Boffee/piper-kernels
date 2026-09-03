@@ -235,7 +235,7 @@ def apply_coarse_attention_residual(
 
     expanded = coarse_output.permute(0, 2, 1, 3).repeat_interleave(_BLOCK_ROWS, dim=1)
     expanded = expanded[:, :sequence_length]
-    return (compression_gate.float() * expanded).to(compression_gate.dtype)
+    return (compression_gate.float() * expanded).to(compression_gate.dtype).contiguous()
 
 
 def _apply_chunked_coarse_residual(

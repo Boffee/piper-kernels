@@ -289,6 +289,20 @@ def test_residual_expands_each_coarse_row_over_its_fine_query_block() -> None:
     torch.testing.assert_close(actual[:, 64:], torch.tensor([3.0, 5.0]).expand(1, 1, 1, 2))
 
 
+def test_residual_canonicalizes_a_noncontiguous_gate_layout() -> None:
+    gate_storage = torch.arange(1 * 2 * 65 * 4, dtype=torch.bfloat16).reshape(1, 2, 65, 4)
+    compression_gate = gate_storage.transpose(1, 2)
+    coarse_output = torch.randn((1, 2, 2, 4), generator=torch.Generator().manual_seed(801))
+    assert not compression_gate.is_contiguous()
+
+    actual = apply_coarse_attention_residual(coarse_output, compression_gate)
+
+    expanded = coarse_output.permute(0, 2, 1, 3).repeat_interleave(64, dim=1)[:, :65]
+    expected = (compression_gate.float() * expanded).to(compression_gate.dtype).contiguous()
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+
+
 def test_zero_gate_produces_an_exact_bfloat16_zero_residual() -> None:
     generator = torch.Generator().manual_seed(802)
     compression_gate = torch.zeros((1, 65, 2, 8), dtype=torch.bfloat16)
