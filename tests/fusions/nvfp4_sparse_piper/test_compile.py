@@ -18,7 +18,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import (
+    SparsePiperAttention,
+    mean_pool_coarse_residual,
+    minmax_pool_coarse_residual,
+)
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._routes import (
     _MEAN_ROUTING,
@@ -167,6 +171,8 @@ def _semantic_attention_graph(
     output_dynamic: bool | None = None,
     escape_attention: bool = False,
     routing_mode: int = _MINMAX_ROUTING,
+    with_block_lengths: bool = False,
+    with_coarse: bool = False,
     with_sparse_query_blocks: bool = False,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
@@ -222,6 +228,20 @@ def _semantic_attention_graph(
             torch.ops.aten.reshape.default,
             args=(projected[2], (1, 192, 2, 128)),
         )
+        block_lengths = (
+            _placeholder(
+                graph,
+                "block_lengths",
+                torch.empty(3, device="cuda", dtype=torch.int32),
+            )
+            if with_block_lengths
+            else None
+        )
+        optional_attention_arguments = (
+            (block_lengths, 2)
+            if with_sparse_query_blocks
+            else ((block_lengths,) if with_block_lengths else ())
+        )
         output = graph.call_function(
             torch.ops.piper_kernels.sparse_piper_attention.default,
             args=(
@@ -232,7 +252,7 @@ def _semantic_attention_graph(
                 2,
                 128**-0.5,
                 routing_mode,
-                *((None, 2) if with_sparse_query_blocks else ()),
+                *optional_attention_arguments,
             ),
         )
         output.meta["val"] = torch.empty(
@@ -240,6 +260,32 @@ def _semantic_attention_graph(
             device="cuda",
             dtype=torch.bfloat16,
         )
+        if with_coarse:
+            compression_gate = _placeholder(
+                graph,
+                "compression_gate",
+                torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
+            )
+            output = graph.call_function(
+                torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
+                args=(
+                    output,
+                    query,
+                    key,
+                    value,
+                    compression_gate,
+                    2,
+                    3,
+                    0.125,
+                    routing_mode,
+                    *((block_lengths,) if with_block_lengths else ()),
+                ),
+            )
+            output.meta["val"] = torch.empty(
+                (1, 192, 2, 128),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
         attention_output = output
         if output_dynamic is not None:
             reshaped_output = graph.call_function(
@@ -536,6 +582,56 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
         return self.output(attention.flatten(2))
 
 
+class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
+    """NVFP4 projection with padding, coarse attention, and a mixed query scope."""
+
+    coarse_scale = 0.125
+    coarse_key_blocks = 3
+
+    def __init__(self, *, dynamic: bool, routing: str) -> None:
+        super().__init__(dynamic=dynamic, routing=routing)
+        self.routing = routing
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        compression_gate: torch.Tensor,
+        block_lengths: torch.Tensor,
+        sparse_query_blocks: int,
+    ) -> torch.Tensor:
+        query = self._norm_rope(self.query(hidden_states), self.query_norm)
+        key = self._norm_rope(self.key(hidden_states), self.key_norm)
+        value = self.value(hidden_states).view(
+            self.batch,
+            self.sequence_length,
+            self.heads,
+            self.head_dim,
+        )
+        fine_output = self.sparse_attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=self.sparse_key_blocks,
+            block_lengths=block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
+        )
+        residual = (
+            mean_pool_coarse_residual if self.routing == "mean" else minmax_pool_coarse_residual
+        )
+        attention = residual(
+            fine_output,
+            query,
+            key,
+            value,
+            compression_gate,
+            sparse_key_blocks=self.sparse_key_blocks,
+            coarse_key_blocks=self.coarse_key_blocks,
+            coarse_scale=self.coarse_scale,
+            block_lengths=block_lengths,
+        )
+        return self.output(attention.flatten(2))
+
+
 def _nvfp4_storage(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
     assert isinstance(weight, PiperNVFP4Tensor)
     return weight.qdata, weight.scale, weight.per_tensor_scale
@@ -558,6 +654,10 @@ def _prepare_nvfp4_input(
 def _run_explicit_attention_output(
     model: _SparseProjectionAttentionOutput,
     hidden_states: torch.Tensor,
+    *,
+    compression_gate: torch.Tensor | None = None,
+    block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     q_input = _prepare_nvfp4_input(hidden_states, model.query.weight)
     k_input = _prepare_nvfp4_input(hidden_states, model.key.weight)
@@ -573,6 +673,7 @@ def _run_explicit_attention_output(
         model.head_dim**-0.5,
         4_096,
         model.sparse_attention._routing_mode,
+        block_lengths,
     )
     key = fused_key.project_key(
         *k_input,
@@ -584,6 +685,7 @@ def _run_explicit_attention_output(
         1e-5,
         4_096,
         model.sparse_attention._routing_mode,
+        block_lengths,
     )
     value_mean = linear_mean(
         *v_input,
@@ -591,24 +693,53 @@ def _run_explicit_attention_output(
         model.value.bias,
         model.batch,
         model.sequence_length,
+        block_lengths,
     ).view(model.batch, model.heads, model.head_dim)
-    value = fused_value.project_value(
+    value = (
+        fused_value.project_value_with_block_means
+        if compression_gate is not None
+        else fused_value.project_value
+    )(
         *v_input,
         *_nvfp4_storage(model.value.weight),
         model.value.bias,
         value_mean,
         4_096,
+        block_lengths,
     )
-    attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
-        *query,
-        *key,
-        *value,
-        value_mean,
-        list(model.sparse_attention._head_keep_ratio_units),
-        model.sparse_key_blocks,
-        model.sequence_length,
-        model.sparse_attention._routing_mode,
-    )
+    attention_arguments = (*query, *key, *value[:2], value_mean)
+    if compression_gate is None:
+        optional_arguments = (
+            (block_lengths, sparse_query_blocks)
+            if sparse_query_blocks is not None
+            else ((block_lengths,) if block_lengths is not None else ())
+        )
+        attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
+            *attention_arguments,
+            list(model.sparse_attention._head_keep_ratio_units),
+            model.sparse_key_blocks,
+            model.sequence_length,
+            model.sparse_attention._routing_mode,
+            *optional_arguments,
+        )
+    else:
+        assert isinstance(model, _BoundedSparseProjectionAttentionOutput)
+        coarse_attention = (
+            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized
+        ).default
+        attention = coarse_attention(
+            *attention_arguments,
+            value[2],
+            compression_gate,
+            list(model.sparse_attention._head_keep_ratio_units),
+            model.sparse_key_blocks,
+            model.sequence_length,
+            model.sparse_attention._routing_mode,
+            model.coarse_scale,
+            block_lengths,
+            model.coarse_key_blocks,
+            sparse_query_blocks,
+        )
     output_weight = model.output.weight
     assert isinstance(output_weight, PiperNVFP4Tensor)
     quantization = output_weight.act_quant_kwargs
@@ -704,6 +835,50 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
+    graph.lint()
+
+
+@pytest.mark.parametrize("with_block_lengths", [False, True])
+@pytest.mark.parametrize("with_coarse", [False, True])
+@pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
+def test_projection_fold_supports_every_bounded_attention_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    with_block_lengths: bool,
+    with_coarse: bool,
+    with_sparse_query_blocks: bool,
+) -> None:
+    graph = _semantic_attention_graph(
+        dynamic=False,
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
+        with_sparse_query_blocks=with_sparse_query_blocks,
+    )
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    nvfp4_compile_pass(graph, is_inference=True)
+    compile_pass(graph, is_inference=True)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
+    expected_value = (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
+        if with_coarse
+        else torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default
+    )
+    assert targets.count(expected_value) == 1
+    expected_attention = (
+        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+        if with_coarse
+        else torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
+    )
+    assert targets.count(expected_attention) == 1
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
+    assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in targets
     graph.lint()
 
 
@@ -924,6 +1099,77 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
         capture.targets
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(
+    ("dynamic", "routing"),
+    [(False, "minmax"), (False, "mean"), (True, "minmax")],
+)
+def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
+    dynamic: bool,
+    routing: str,
+) -> None:
+    torch.manual_seed(831)
+    model = _BoundedSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
+    hidden_states = torch.randn(
+        (model.batch, model.sequence_length, model.input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    compression_gate = torch.randn(
+        (model.batch, model.sequence_length, model.heads, model.head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    capture = _TargetCapturePass()
+    with torch.no_grad():
+        expected = _run_explicit_attention_output(
+            model,
+            hidden_states,
+            compression_gate=compression_gate,
+            block_lengths=block_lengths,
+            sparse_query_blocks=2,
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=_options_with_capture(capture),
+        )(
+            hidden_states,
+            compression_gate,
+            block_lengths,
+            2,
+        )
+
+    torch.testing.assert_close(
+        actual[:, valid_rows],
+        expected[:, valid_rows],
+        atol=0,
+        rtol=0,
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
+    )
+    assert (
+        capture.targets.count(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
+        )
+        == 1
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default)
+        == 1
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
+    assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in capture.targets
 
 
 @pytest.mark.gpu

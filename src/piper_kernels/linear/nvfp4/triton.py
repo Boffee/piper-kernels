@@ -374,10 +374,12 @@ def _dequantized_input_mean_partial_kernel(
     input_ptr,
     input_scale_ptr,
     partial_ptr,
+    block_lengths_ptr,
     sequence_length,
     input_features: tl.constexpr,
     row_block_count: tl.constexpr,
     scale_column_blocks: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
 ):
@@ -390,6 +392,13 @@ def _dequantized_input_mean_partial_kernel(
     feature_offsets = feature_start + tl.arange(0, block_k)
     rows = batch * sequence_length + sequence_offsets
     valid_rows = sequence_offsets < sequence_length
+    if mask_block_lengths:
+        block_lengths = tl.load(
+            block_lengths_ptr + sequence_offsets // 64,
+            mask=valid_rows,
+            other=0,
+        )
+        valid_rows &= sequence_offsets % 64 < block_lengths
     packed_feature_offsets = feature_start // 2 + tl.arange(0, block_k // 2)
     valid_packed = valid_rows[:, None] & (packed_feature_offsets[None, :] * 2 < input_features)
     packed = tl.load(
@@ -437,10 +446,12 @@ def _dequantized_input_mean_reduce_kernel(
     partial_ptr,
     input_per_tensor_scale_ptr,
     mean_ptr,
+    valid_count_ptr,
     sequence_length,
     input_features: tl.constexpr,
     row_block_count: tl.constexpr,
     reduction_rows: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     block_k: tl.constexpr,
 ):
     """Reduce represented-activation partial sums into one FP32 mean per batch."""
@@ -456,7 +467,8 @@ def _dequantized_input_mean_reduce_kernel(
         other=0.0,
     )
     per_tensor_scale = tl.load(input_per_tensor_scale_ptr).to(tl.float32)
-    mean = tl.sum(values, axis=0) * per_tensor_scale / sequence_length
+    valid_count = tl.load(valid_count_ptr) if mask_block_lengths else sequence_length
+    mean = tl.sum(values, axis=0) * per_tensor_scale / valid_count
     tl.store(
         mean_ptr + batch * input_features + feature_offsets,
         mean,
@@ -526,7 +538,7 @@ def _project_input_mean_kernel(
     )
 
 
-def _validate_linear_mean(
+def _validate_linear_mean(  # noqa: PLR0912
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     input_per_tensor_scale: torch.Tensor,
@@ -536,6 +548,7 @@ def _validate_linear_mean(
     bias: torch.Tensor | None,
     batch: int,
     sequence_length: int,
+    block_lengths: torch.Tensor | None,
 ) -> tuple[int, int]:
     if input_qdata.ndim != 2 or input_qdata.dtype is not torch.uint8:
         raise ValueError("NVFP4 mean input must be a two-dimensional packed UINT8 tensor")
@@ -572,6 +585,14 @@ def _validate_linear_mean(
         raise ValueError("NVFP4 mean weight per-tensor scale must be an FP32 scalar")
     if bias is not None and (bias.shape != (output_features,) or bias.dtype is not torch.bfloat16):
         raise ValueError("NVFP4 mean bias must be one BF16 value per output feature")
+    if block_lengths is not None and (
+        sequence_length % 64
+        or block_lengths.shape != (sequence_length // 64,)
+        or block_lengths.dtype is not torch.int32
+        or block_lengths.device != input_qdata.device
+        or not block_lengths.is_contiguous()
+    ):
+        raise ValueError("NVFP4 mean block lengths must be one contiguous device INT32 per K64")
     operands = [
         input_qdata,
         input_scale,
@@ -580,6 +601,8 @@ def _validate_linear_mean(
         weight_scale,
     ]
     operands.extend(operand for operand in (weight_per_tensor_scale, bias) if operand is not None)
+    if block_lengths is not None:
+        operands.append(block_lengths)
     if input_qdata.device.type != "cuda" or any(
         operand.device != input_qdata.device for operand in operands
     ):
@@ -600,8 +623,9 @@ def linear_mean(
     bias: torch.Tensor | None,
     batch: int,
     sequence_length: int,
+    block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project the sequence mean represented by prepared NVFP4 storage."""
+    """Project the compact or valid-front padded mean represented by NVFP4 storage."""
     input_features, output_features = _validate_linear_mean(
         input_qdata,
         input_scale,
@@ -612,6 +636,7 @@ def linear_mean(
         bias,
         batch,
         sequence_length,
+        block_lengths,
     )
     row_block_count = int(triton.cdiv(sequence_length, _MEAN_BLOCK_M))
     partial = torch.empty(
@@ -630,16 +655,21 @@ def linear_mean(
         dtype=torch.float32,
     )
     scale_column_blocks = int(triton.cdiv(input_features, 64))
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else input_scale
+    valid_count = block_lengths.sum(dtype=torch.float32) if has_block_lengths else input_scale
     _dequantized_input_mean_partial_kernel[
         (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
     ](
         input_qdata,
         input_scale,
         partial,
+        block_lengths_ptr,
         sequence_length,
         input_features=input_features,
         row_block_count=row_block_count,
         scale_column_blocks=scale_column_blocks,
+        mask_block_lengths=has_block_lengths,
         block_m=_MEAN_BLOCK_M,
         block_k=_MEAN_BLOCK_K,
         num_warps=8,
@@ -648,10 +678,12 @@ def linear_mean(
         partial,
         input_per_tensor_scale,
         input_mean,
+        valid_count,
         sequence_length,
         input_features=input_features,
         row_block_count=row_block_count,
         reduction_rows=triton.next_power_of_2(row_block_count),
+        mask_block_lengths=has_block_lengths,
         block_k=_MEAN_BLOCK_K,
         num_warps=8,
     )
@@ -685,6 +717,7 @@ def _linear_mean_fake(
     _bias: torch.Tensor | None,
     batch: int,
     _sequence_length: int,
+    _block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return input_qdata.new_empty((batch, weight_qdata.shape[0]), dtype=torch.float32)
 

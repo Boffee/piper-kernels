@@ -16,7 +16,7 @@ from piper_kernels.linear.nvfp4._chunking import (
 )
 
 from . import _epilogue
-from ._validation import validate_projection
+from ._validation import validate_block_lengths, validate_projection
 
 
 def _launch_value(  # noqa: PLR0913
@@ -51,14 +51,12 @@ def _launch_value(  # noqa: PLR0913
         or not value_mean.is_contiguous()
     ):
         raise ValueError("V projection mean must be a contiguous [1,heads,D128] FP32 tensor")
-    if block_lengths is not None and (
-        sequence_length % TILE_ROWS
-        or block_lengths.shape != (sequence_length // TILE_ROWS,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != input_qdata.device
-        or not block_lengths.is_contiguous()
-    ):
-        raise ValueError("V projection block lengths must be one contiguous INT32 value per K64")
+    validate_block_lengths(
+        block_lengths,
+        sequence_length,
+        input_qdata.device,
+        "V projection",
+    )
     storage_sequence_length = padded_sequence_length(sequence_length)
     value = torch.empty(
         (1, heads, HEAD_DIM, storage_sequence_length),
@@ -130,6 +128,7 @@ def project_value(
     bias: torch.Tensor | None,
     value_mean: torch.Tensor,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     value, value_scale, _block_mean = _launch_value(
         input_qdata,
@@ -141,7 +140,7 @@ def project_value(
         bias,
         value_mean,
         chunk_rows,
-        None,
+        block_lengths,
         emit_block_mean=False,
     )
     return value, value_scale
@@ -178,6 +177,7 @@ def _project_value_fake(
     _bias: torch.Tensor | None,
     _value_mean: torch.Tensor,
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     value, value_scale, _block_mean = _fake_value_projection(input_qdata, weight_qdata)
     return value, value_scale

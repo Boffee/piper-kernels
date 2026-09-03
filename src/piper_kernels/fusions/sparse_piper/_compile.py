@@ -9,6 +9,7 @@ from torch._inductor.pattern_matcher import Match
 from torch.fx.node import Argument
 
 from piper_kernels.attention.sparse_piper_attention import _budget
+from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 
@@ -47,6 +48,87 @@ def _positive_float(value: object) -> float | None:
 def source_files() -> tuple[str, ...]:
     """Return sources that affect shared sparse-attention validation."""
     return tuple(file_name for file_name in (__file__, _budget.__file__) if file_name is not None)
+
+
+def valid_sparse_piper_coarse_residual(match: Match) -> bool:
+    """Validate projection-independent operands for a matched coarse residual."""
+    if match.kwargs["sparse_routing_mode"] != match.kwargs["coarse_routing_mode"]:
+        return False
+    gate_node = match.kwargs["coarse_compression_gate"]
+    if not isinstance(gate_node, torch.fx.Node):
+        return False
+    gate = preparation_sharing.tensor_metadata(gate_node)
+    output = preparation_sharing.tensor_metadata(match.output_node())
+    coarse_scale = _positive_float(match.kwargs["coarse_scale"])
+    return bool(
+        gate is not None
+        and output is not None
+        and gate.layout is torch.strided
+        and gate.ndim == 4
+        and gate.dtype is torch.bfloat16
+        and gate.device == output.device
+        and gate.stride(-1) == 1
+        and len(gate.shape) == len(output.shape)
+        and all(
+            preparation_sharing.dimension_key(gate_dimension)
+            == preparation_sharing.dimension_key(output_dimension)
+            for gate_dimension, output_dimension in zip(gate.shape, output.shape, strict=True)
+        )
+        and coarse_scale is not None
+    )
+
+
+def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
+    graph: torch.fx.Graph,
+    attention_arguments: tuple[Argument, ...],
+    *,
+    head_keep_ratio_units: Argument,
+    sparse_key_blocks: Argument,
+    logical_sequence_length: Argument,
+    routing_mode: Argument,
+    block_lengths: Argument | None = None,
+    sparse_query_blocks: Argument | None = None,
+    block_mean: Argument | None = None,
+    compression_gate: Argument | None = None,
+    coarse_scale: Argument | None = None,
+    coarse_key_blocks: Argument | None = None,
+) -> torch.fx.Node:
+    """Emit the shared fine or coarse quantized sparse-attention call."""
+    coarse_arguments = block_mean, compression_gate, coarse_scale, coarse_key_blocks
+    with_coarse = any(argument is not None for argument in coarse_arguments)
+    if with_coarse:
+        if any(argument is None for argument in coarse_arguments):
+            raise ValueError("coarse sparse attention requires every coarse operand")
+        return graph.call_function(
+            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
+            args=(
+                *attention_arguments,
+                block_mean,
+                compression_gate,
+                head_keep_ratio_units,
+                sparse_key_blocks,
+                logical_sequence_length,
+                routing_mode,
+                coarse_scale,
+                block_lengths,
+                coarse_key_blocks,
+                sparse_query_blocks,
+            ),
+        )
+    return graph.call_function(
+        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
+        args=(
+            *attention_arguments,
+            head_keep_ratio_units,
+            sparse_key_blocks,
+            logical_sequence_length,
+            routing_mode,
+            *sparse_piper_pattern.optional_attention_layout_arguments(
+                block_lengths,
+                sparse_query_blocks,
+            ),
+        ),
+    )
 
 
 def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
@@ -220,9 +302,11 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
 
 
 __all__ = [
+    "emit_quantized_sparse_piper_attention",
     "integer_scalar_argument",
     "integer_scalar_metadata",
     "source_files",
     "static_int",
     "valid_sparse_piper_attention",
+    "valid_sparse_piper_coarse_residual",
 ]

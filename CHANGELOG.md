@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Extended standard and ConvRot NVFP4 sparse-Piper projection fusion to valid-front padded K64
+  storage and fused coarse residuals. NVFP4 Q/K/V projection epilogues now consume
+  `block_lengths`, represented-input means exclude padded rows, and the compiler recognizes every
+  padding, coarse-residual, and sparse-query-boundary combination.
 - Added an optional `sparse_query_blocks` boundary to Sparse Piper attention. Leading K64 query
   blocks retain routed sparse-prefix attention while the remaining query blocks attend every key
   block densely. The boundary composes with valid-front padding, coarse residuals, ranged launches,

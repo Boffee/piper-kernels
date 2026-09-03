@@ -24,7 +24,7 @@ from piper_kernels.linear.nvfp4._chunking import (
 )
 
 from . import _epilogue
-from ._validation import validate_projection, validate_qk_epilogue
+from ._validation import validate_block_lengths, validate_projection, validate_qk_epilogue
 
 
 def _launch_query(  # noqa: PLR0913, PLR0917
@@ -42,6 +42,7 @@ def _launch_query(  # noqa: PLR0913, PLR0917
     softmax_scale: float,
     chunk_rows: int,
     routing_mode: int,
+    block_lengths: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     sequence_length, heads = validate_projection(
@@ -62,6 +63,12 @@ def _launch_query(  # noqa: PLR0913, PLR0917
         cos,
         sin,
         norm_epsilon,
+        "Q projection",
+    )
+    validate_block_lengths(
+        block_lengths,
+        sequence_length,
+        input_qdata.device,
         "Q projection",
     )
     operands = (norm_weight, cos, sin)
@@ -107,12 +114,15 @@ def _launch_query(  # noqa: PLR0913, PLR0917
             norm_epsilon,
             softmax_scale,
             routing_mode == _MEAN_ROUTING,
+            block_lengths,
         )
 
     consumer_tensors = [input_per_tensor_scale, *operands]
     consumer_tensors.extend(
         operand for operand in (weight_per_tensor_scale, bias) if operand is not None
     )
+    if block_lengths is not None:
+        consumer_tensors.append(block_lengths)
     run_chunked_projection(
         projection,
         chunk_rows,
@@ -138,6 +148,7 @@ def project_query(  # noqa: PLR0913, PLR0917
     softmax_scale: float,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     routing_mode: int = _MINMAX_ROUTING,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_query(
         input_qdata,
@@ -154,6 +165,7 @@ def project_query(  # noqa: PLR0913, PLR0917
         softmax_scale,
         chunk_rows,
         routing_mode,
+        block_lengths,
     )
 
 
@@ -173,6 +185,7 @@ def _project_query_fake(
     _softmax_scale: float,
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
     _routing_mode: int = _MINMAX_ROUTING,
+    _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)

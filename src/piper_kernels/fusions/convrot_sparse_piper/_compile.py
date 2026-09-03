@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 
 import torch
@@ -186,36 +185,9 @@ def _valid_sparse_piper_coarse_residual_projection(
     match: Match,
 ) -> bool:
     """Validate the extra operands and routing policy of a coarse residual."""
-    if match.kwargs["sparse_routing_mode"] != match.kwargs[
-        "coarse_routing_mode"
-    ] or not _valid_sparse_piper_projection(match):
+    if not _valid_sparse_piper_projection(match):
         return False
-    gate_node = match.kwargs["coarse_compression_gate"]
-    if not isinstance(gate_node, torch.fx.Node):
-        return False
-    gate = preparation_sharing.tensor_metadata(gate_node)
-    output = preparation_sharing.tensor_metadata(match.output_node())
-    coarse_scale = match.kwargs["coarse_scale"]
-    if (
-        gate is None
-        or output is None
-        or gate.layout is not torch.strided
-        or gate.ndim != 4
-        or gate.dtype is not torch.bfloat16
-        or gate.device != output.device
-        or gate.stride(-1) != 1
-        or len(gate.shape) != len(output.shape)
-        or any(
-            preparation_sharing.dimension_key(gate_dimension)
-            != preparation_sharing.dimension_key(output_dimension)
-            for gate_dimension, output_dimension in zip(gate.shape, output.shape, strict=True)
-        )
-        or isinstance(coarse_scale, bool)
-        or not isinstance(coarse_scale, (int, float))
-    ):
-        return False
-    converted_scale = float(coarse_scale)
-    return math.isfinite(converted_scale) and converted_scale > 0
+    return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
 
 
 def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
@@ -257,10 +229,6 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     head_dim = _HEAD_DIM
     storage_sequence_length = _layout.padded_sequence_length(sequence_length)
     block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
-    attention_layout_arguments = sparse_piper_pattern.optional_attention_layout_arguments(
-        sparse_block_lengths,
-        sparse_query_blocks,
-    )
     with graph.inserting_before(original):
         logical_sequence_length = graph.call_function(
             torch.ops.aten.sym_size.int,
@@ -402,37 +370,20 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             value_scale_multiplier,
             value_mean,
         )
-        if with_coarse_residual:
-            assert coarse_scale is not None
-            assert coarse_key_blocks is not None
-            replacement = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
-                args=(
-                    *attention_arguments,
-                    value_projection[3],
-                    coarse_compression_gate,
-                    sparse_head_keep_ratio_units,
-                    sparse_key_blocks,
-                    logical_sequence_length,
-                    sparse_routing_mode,
-                    coarse_scale,
-                    sparse_block_lengths,
-                    coarse_key_blocks,
-                    sparse_query_blocks,
-                ),
-            )
-        else:
-            replacement = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-                args=(
-                    *attention_arguments,
-                    sparse_head_keep_ratio_units,
-                    sparse_key_blocks,
-                    logical_sequence_length,
-                    sparse_routing_mode,
-                    *attention_layout_arguments,
-                ),
-            )
+        replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
+            graph,
+            attention_arguments,
+            head_keep_ratio_units=sparse_head_keep_ratio_units,
+            sparse_key_blocks=sparse_key_blocks,
+            logical_sequence_length=logical_sequence_length,
+            routing_mode=sparse_routing_mode,
+            block_lengths=sparse_block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
+            block_mean=value_projection[3] if with_coarse_residual else None,
+            compression_gate=coarse_compression_gate,
+            coarse_scale=coarse_scale,
+            coarse_key_blocks=coarse_key_blocks,
+        )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
     original.replace_all_uses_with(replacement)

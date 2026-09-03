@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._routes import _MEAN_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routes import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
+)
 from piper_kernels.fusions.nvfp4_sparse_piper import key, query, value
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
@@ -196,12 +199,106 @@ def test_value_block_means_respect_internal_block_lengths() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
+def test_qkv_projection_respects_internal_block_lengths(routing_mode: int) -> None:
+    operands = make_operands(sequence_length=128)
+    q_projection = operands.projection(0)
+    k_projection = operands.projection(1)
+    v_projection = operands.projection(2)
+    block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
+    valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    transformed_query = materialize_qk(
+        q_projection,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        norm_epsilon=1e-5,
+    )
+    transformed_key = materialize_qk(
+        k_projection,
+        operands.key_norm,
+        operands.cos,
+        operands.sin,
+        norm_epsilon=1e-5,
+    )
+    value_mean = linear_mean(
+        *v_projection.as_tuple(),
+        None,
+        1,
+        128,
+        block_lengths,
+    ).view(1, 2, 128)
+
+    actual_query = query.project_query(
+        *q_projection.as_tuple(),
+        None,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        1e-5,
+        128**-0.5,
+        128,
+        routing_mode,
+        block_lengths,
+    )
+    actual_key = key.project_key(
+        *k_projection.as_tuple(),
+        None,
+        operands.key_norm,
+        operands.cos,
+        operands.sin,
+        1e-5,
+        128,
+        routing_mode,
+        block_lengths,
+    )
+    actual_value = value.project_value(
+        *v_projection.as_tuple(),
+        None,
+        value_mean,
+        128,
+        block_lengths,
+    )
+
+    assert not bool(actual_query[0][:, :, ~valid_rows].any())
+    assert not bool(actual_key[0][:, :, ~valid_rows].any())
+    assert not bool(actual_value[0][..., ~valid_rows].any())
+
+    valid = valid_rows.unflatten(0, (2, 64))
+    mask = valid[None, None, :, :, None]
+    query_blocks = transformed_query.unflatten(2, (2, 64))
+    key_blocks = transformed_key.unflatten(2, (2, 64))
+    if routing_mode == _MEAN_ROUTING:
+        denominator = block_lengths[None, None, :, None]
+        expected_query_summary = query_blocks.masked_fill(~mask, 0).sum(dim=3) / denominator
+        expected_key_summary = key_blocks.masked_fill(~mask, 0).sum(dim=3) / denominator
+        assert actual_key[3].numel() == 0
+    else:
+        expected_query_summary = query_blocks.masked_fill(~mask, -torch.inf).amax(
+            dim=3
+        ) + query_blocks.masked_fill(~mask, torch.inf).amin(dim=3)
+        expected_key_summary = key_blocks.masked_fill(~mask, -torch.inf).amax(dim=3)
+        expected_key_aux = key_blocks.masked_fill(~mask, torch.inf).amin(dim=3)
+        torch.testing.assert_close(actual_key[3], expected_key_aux, atol=0.125, rtol=0.01)
+    torch.testing.assert_close(actual_query[2], expected_query_summary, atol=0.125, rtol=0.01)
+    torch.testing.assert_close(actual_key[2], expected_key_summary, atol=0.125, rtol=0.01)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
     operands = make_operands(sequence_length=128)
     q_projection = operands.projection(0)
     k_projection = operands.projection(1)
     v_projection = operands.projection(2)
-    value_mean = linear_mean(*v_projection.as_tuple(), None, 1, 128).view(1, 2, 128)
+    block_lengths = torch.tensor([64, 31], device="cuda", dtype=torch.int32)
+    value_mean = linear_mean(
+        *v_projection.as_tuple(),
+        None,
+        1,
+        128,
+        block_lengths,
+    ).view(1, 2, 128)
     cases = (
         (
             query.project_query,
@@ -214,6 +311,8 @@ def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
                 1e-5,
                 128**-0.5,
                 128,
+                _MINMAX_ROUTING,
+                block_lengths,
             ),
         ),
         (
@@ -226,11 +325,13 @@ def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
                 operands.sin,
                 1e-5,
                 128,
+                _MINMAX_ROUTING,
+                block_lengths,
             ),
         ),
         (
             value.project_value,
-            (*v_projection.as_tuple(), None, value_mean, 128),
+            (*v_projection.as_tuple(), None, value_mean, 128, block_lengths),
         ),
         (
             value.project_value_with_block_means,
@@ -239,7 +340,7 @@ def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
                 None,
                 value_mean,
                 128,
-                torch.tensor([64, 64], device="cuda", dtype=torch.int32),
+                block_lengths,
             ),
         ),
     )

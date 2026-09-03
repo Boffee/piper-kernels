@@ -62,11 +62,17 @@ def _convrot_graph(
     dynamic: bool,
     output_dynamic: bool | None = None,
     routing_mode: int = _MINMAX_ROUTING,
+    with_block_lengths: bool = False,
+    with_coarse: bool = False,
+    with_sparse_query_blocks: bool = False,
 ) -> torch.fx.Graph:
     graph = _semantic_attention_graph(
         dynamic=dynamic,
         output_dynamic=output_dynamic,
         routing_mode=routing_mode,
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
+        with_sparse_query_blocks=with_sparse_query_blocks,
     )
     for node in graph.nodes:
         if (
@@ -162,6 +168,44 @@ def test_static_convrot_output_fuses_after_sparse_projection(
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     output_node = next(node for node in call_nodes if node.target is fused)
     assert output_node.args[19:21] == (_GROUP_SIZE, 8_192)
+    graph.lint()
+
+
+@pytest.mark.parametrize("with_block_lengths", [False, True])
+@pytest.mark.parametrize("with_coarse", [False, True])
+@pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
+def test_complete_convrot_fold_supports_every_bounded_attention_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    with_block_lengths: bool,
+    with_coarse: bool,
+    with_sparse_query_blocks: bool,
+) -> None:
+    graph = _convrot_graph(
+        dynamic=False,
+        output_dynamic=False,
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
+        with_sparse_query_blocks=with_sparse_query_blocks,
+    )
+
+    _run_passes(graph, monkeypatch)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
+    expected_value = (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
+        if with_coarse
+        else torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default
+    )
+    assert targets.count(expected_value) == 1
+    assert (
+        targets.count(torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default)
+        == 1
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
+    assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
 
 

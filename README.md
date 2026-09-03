@@ -301,7 +301,8 @@ internally padded storage when supplied. The `minmax_pool_coarse_residual` conve
 derives extrema-based scores under the same layout contract, while
 `coarse_attention_residual` remains available for learned or already-materialized block scores.
 These composable implementations are the correctness and training contract; compatible compiled
-ConvRot INT8 graphs fuse the shared route scores, wider coarse attention, and gated residual.
+ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
+and gated residual, including valid-front padded storage.
 When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
 quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
 residual together with `sparse_query_blocks`. It passes the coarse result and compression gate into

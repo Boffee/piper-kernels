@@ -82,6 +82,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
     query_ptr,
     query_scale_ptr,
     query_summary_ptr,
+    block_lengths_ptr,
     chunk_rows,
     chunk_start,
     logical_sequence_length,
@@ -98,6 +99,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
     norm_epsilon: tl.constexpr,
     softmax_scale: tl.constexpr,
     mean_pool_summary: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
 ):
@@ -142,7 +144,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
         query_ptr,
         query_scale_ptr,
         query_summary_ptr,
-        query_scale_ptr,
+        block_lengths_ptr,
         batch,
         heads,
         head_offsets,
@@ -152,7 +154,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
         query_block,
         softmax_scale,
         mean_pool_summary,
-        False,
+        mask_block_lengths,
         mask_ragged_tail,
         heads_per_program,
         head_dim,
@@ -174,6 +176,7 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
     key_scale_ptr,
     key_summary_ptr,
     key_aux_ptr,
+    block_lengths_ptr,
     chunk_rows,
     chunk_start,
     logical_sequence_length,
@@ -189,6 +192,7 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
     rotary_dim: tl.constexpr,
     norm_epsilon: tl.constexpr,
     mean_pool_summary: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
 ):
@@ -234,7 +238,7 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
         key_scale_ptr,
         key_summary_ptr,
         key_aux_ptr,
-        key_scale_ptr,
+        block_lengths_ptr,
         batch,
         heads,
         head_offsets,
@@ -243,7 +247,7 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
         storage_sequence_length,
         row_block,
         mean_pool_summary,
-        False,
+        mask_block_lengths,
         heads_per_program,
         head_dim,
         block_m,
@@ -339,10 +343,13 @@ def launch_query(  # noqa: PLR0913, PLR0917
     norm_epsilon: float,
     softmax_scale: float,
     mean_pool_summary: bool,
+    block_lengths,
 ) -> None:
     chunk_rows, output_features = projection.shape
     heads = output_features // HEAD_DIM
     storage_sequence_length = query.shape[2]
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else query_scale
 
     def launch(row_blocks: int, row_block_offset: int, *, ragged: bool) -> None:
         _query_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
@@ -356,6 +363,7 @@ def launch_query(  # noqa: PLR0913, PLR0917
             query,
             query_scale,
             query_summary,
+            block_lengths_ptr,
             chunk_rows,
             chunk_start,
             logical_sequence_length,
@@ -372,6 +380,7 @@ def launch_query(  # noqa: PLR0913, PLR0917
             norm_epsilon=norm_epsilon,
             softmax_scale=softmax_scale,
             mean_pool_summary=mean_pool_summary,
+            mask_block_lengths=has_block_lengths,
             mask_ragged_tail=ragged,
             block_m=_QUERY_BLOCK_M,
             num_warps=8,
@@ -400,10 +409,13 @@ def launch_key(  # noqa: PLR0913, PLR0917
     logical_sequence_length: int,
     norm_epsilon: float,
     mean_pool_summary: bool,
+    block_lengths,
 ) -> None:
     chunk_rows, output_features = projection.shape
     heads = output_features // HEAD_DIM
     storage_sequence_length = key.shape[2]
+    has_block_lengths = block_lengths is not None
+    block_lengths_ptr = block_lengths if has_block_lengths else key_scale
 
     def launch(row_blocks: int, row_block_offset: int, *, ragged: bool) -> None:
         _key_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
@@ -418,6 +430,7 @@ def launch_key(  # noqa: PLR0913, PLR0917
             key_scale,
             key_summary,
             key_aux,
+            block_lengths_ptr,
             chunk_rows,
             chunk_start,
             logical_sequence_length,
@@ -433,6 +446,7 @@ def launch_key(  # noqa: PLR0913, PLR0917
             rotary_dim=cos.shape[1],
             norm_epsilon=norm_epsilon,
             mean_pool_summary=mean_pool_summary,
+            mask_block_lengths=has_block_lengths,
             mask_ragged_tail=ragged,
             block_m=_KEY_VALUE_BLOCK_M,
             num_warps=8,
