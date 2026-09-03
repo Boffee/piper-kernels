@@ -230,6 +230,20 @@ def test_dequantize_returns_the_unrotated_logical_weight() -> None:
     assert torch.equal(weight.dequantize(), expected)
 
 
+def test_dequantize_accepts_an_output_dtype() -> None:
+    torch.manual_seed(612)
+    logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
+    rotated_weight = rotate_groups(logical_weight, 16)
+    source = TorchAONVFP4Tensor.to_nvfp4(rotated_weight)
+    weight = ConvRotNVFP4Tensor.from_torchao(source, group_size=16)
+
+    actual = weight.dequantize(torch.float32)
+    expected = rotate_groups(source.dequantize(torch.float32), 16)
+
+    assert actual.dtype is torch.float32
+    assert torch.equal(actual, expected)
+
+
 def _cpu_weight_case(
     *,
     group_size: int = 16,

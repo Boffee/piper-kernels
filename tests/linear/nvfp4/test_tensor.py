@@ -47,6 +47,17 @@ def test_from_torchao_reuses_storage_and_metadata() -> None:
     assert PiperNVFP4Tensor.from_torchao(wrapped) is wrapped
 
 
+def test_dequantize_accepts_an_output_dtype() -> None:
+    source = torch.randn(32, 256, dtype=torch.bfloat16)
+    weight = PiperNVFP4Tensor.from_hp(source)
+
+    actual = weight.dequantize(torch.float32)
+    expected = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
+
+    assert actual.dtype is torch.float32
+    assert torch.equal(actual, expected)
+
+
 def test_from_hp_matches_torchao_quantization_with_computed_global_scale() -> None:
     torch.manual_seed(418)
     source = torch.randn(128, 256, dtype=torch.bfloat16).requires_grad_()
