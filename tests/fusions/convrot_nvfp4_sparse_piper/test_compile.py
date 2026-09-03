@@ -167,14 +167,17 @@ def test_static_convrot_output_fuses_after_sparse_projection(
 
 @pytest.mark.parametrize("with_block_lengths", [False, True])
 @pytest.mark.parametrize("with_coarse", [False, True])
+@pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
 def test_convrot_output_fold_supports_every_bounded_attention_variant(
     monkeypatch: pytest.MonkeyPatch,
     with_block_lengths: bool,
     with_coarse: bool,
+    with_sparse_query_blocks: bool,
 ) -> None:
     graph = _quantized_attention_output_graph(
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
+        with_sparse_query_blocks=with_sparse_query_blocks,
     )
     for node in graph.nodes:
         if (

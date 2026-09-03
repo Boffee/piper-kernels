@@ -68,6 +68,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     compression_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     return _output.run_attention_output(
         query,
@@ -96,6 +97,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         compression_gate,
         coarse_scale,
         coarse_key_blocks,
+        sparse_query_blocks,
     )
 
 
@@ -127,6 +129,7 @@ def _attention_output_op_fake(
     _compression_gate: torch.Tensor | None = None,
     _coarse_scale: float | None = None,
     _coarse_key_blocks: int | None = None,
+    _sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     validate_group_size(group_size)
     input_features = 2 * weight_qdata.shape[1]

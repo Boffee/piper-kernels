@@ -99,6 +99,7 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     compression_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> _PreparedAttentionOutput:
     """Prepare fine routing and, when requested, one shared coarse result."""
     if (block_mean is None) != (compression_gate is None):
@@ -122,6 +123,7 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
             logical_sequence_length,
             routing_mode,
             block_lengths,
+            sparse_query_blocks,
         )
         coarse_output = None
     else:
@@ -147,6 +149,7 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
                 coarse_scale,
                 block_lengths,
                 coarse_key_blocks,
+                sparse_query_blocks,
             )
         )
     return _PreparedAttentionOutput(

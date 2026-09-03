@@ -167,6 +167,7 @@ def _semantic_attention_graph(
     output_dynamic: bool | None = None,
     escape_attention: bool = False,
     routing_mode: int = _MINMAX_ROUTING,
+    with_sparse_query_blocks: bool = False,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
@@ -223,7 +224,16 @@ def _semantic_attention_graph(
         )
         output = graph.call_function(
             torch.ops.piper_kernels.sparse_piper_attention.default,
-            args=(query, key, value, [5000, 10000], 2, 128**-0.5, routing_mode),
+            args=(
+                query,
+                key,
+                value,
+                [5000, 10000],
+                2,
+                128**-0.5,
+                routing_mode,
+                *((None, 2) if with_sparse_query_blocks else ()),
+            ),
         )
         output.meta["val"] = torch.empty(
             (1, 192, 2, 128),
@@ -267,6 +277,7 @@ def _quantized_attention_output_graph(
     *,
     with_block_lengths: bool,
     with_coarse: bool,
+    with_sparse_query_blocks: bool,
 ) -> torch.fx.Graph:
     """Build an already-prepared attention boundary for output-only folding."""
     graph = torch.fx.Graph()
@@ -317,13 +328,19 @@ def _quantized_attention_output_graph(
                     0.125,
                     block_lengths,
                     3,
+                    *((2,) if with_sparse_query_blocks else ()),
                 ),
             )
         else:
             arguments = (*operands, [5_000, 10_000], 2, 192, _MINMAX_ROUTING)
+            optional_arguments = (
+                (block_lengths, 2)
+                if with_sparse_query_blocks
+                else ((block_lengths,) if with_block_lengths else ())
+            )
             attention = graph.call_function(
                 torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-                args=(*arguments, block_lengths) if with_block_lengths else arguments,
+                args=(*arguments, *optional_arguments),
             )
         attention.meta["val"] = torch.empty(
             (1, 192, 2, 128),
@@ -692,16 +709,19 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
+@pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
 def test_static_output_fuses_after_prepared_sparse_projection(
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
     preparation_count: int,
     routing_mode: int,
+    with_sparse_query_blocks: bool,
 ) -> None:
     graph = _semantic_attention_graph(
         dynamic=dynamic,
         output_dynamic=False,
         routing_mode=routing_mode,
+        with_sparse_query_blocks=with_sparse_query_blocks,
     )
     monkeypatch.setattr(
         AcceleratorTarget,
@@ -724,19 +744,23 @@ def test_static_output_fuses_after_prepared_sparse_projection(
         if node.target is torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
     )
     assert output_node.args[19] == 8_192
+    assert output_node.args[-1] == (2 if with_sparse_query_blocks else None)
     graph.lint()
 
 
 @pytest.mark.parametrize("with_block_lengths", [False, True])
 @pytest.mark.parametrize("with_coarse", [False, True])
+@pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
 def test_output_fold_supports_every_bounded_attention_variant(
     monkeypatch: pytest.MonkeyPatch,
     with_block_lengths: bool,
     with_coarse: bool,
+    with_sparse_query_blocks: bool,
 ) -> None:
     graph = _quantized_attention_output_graph(
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
+        with_sparse_query_blocks=with_sparse_query_blocks,
     )
     monkeypatch.setattr(
         AcceleratorTarget,

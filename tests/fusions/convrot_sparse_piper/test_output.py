@@ -91,6 +91,7 @@ def _arguments(
 def _padded_arguments(
     *,
     coarse: bool,
+    sparse_query_blocks: int | None,
 ) -> tuple[tuple[object, ...], torch.Tensor]:
     sequence_length = 192
     arguments, _unbounded_expected = _arguments(
@@ -132,11 +133,13 @@ def _padded_arguments(
             coarse_scale,
             block_lengths,
             coarse_key_blocks,
+            sparse_query_blocks,
         )
     else:
         materialized_attention = _sparse_piper_attention_from_quantized_op(
             *attention_arguments,
             block_lengths,
+            sparse_query_blocks,
         )
     weight, scale, bias, group_size = projection_arguments
     expected = convrot_backend.run_linear(
@@ -154,6 +157,7 @@ def _padded_arguments(
         compression_gate,
         coarse_scale,
         coarse_key_blocks,
+        sparse_query_blocks,
     ), expected
 
 
@@ -199,8 +203,15 @@ def test_attention_output_obeys_a_nondefault_current_stream() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("coarse", [False, True])
-def test_attention_output_supports_padded_and_coarse_attention(coarse: bool) -> None:
-    arguments, expected = _padded_arguments(coarse=coarse)
+@pytest.mark.parametrize("sparse_query_blocks", [None, 2])
+def test_attention_output_supports_bounded_attention_features(
+    coarse: bool,
+    sparse_query_blocks: int | None,
+) -> None:
+    arguments, expected = _padded_arguments(
+        coarse=coarse,
+        sparse_query_blocks=sparse_query_blocks,
+    )
 
     with torch.no_grad():
         actual = output_fusion._attention_output_op(*arguments)

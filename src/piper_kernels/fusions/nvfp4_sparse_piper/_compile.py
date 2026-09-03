@@ -219,6 +219,7 @@ def _replace_projection(
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
     sparse_routing_mode: int,
+    sparse_query_blocks: Argument | None = None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -345,6 +346,10 @@ def _replace_projection(
                 sparse_key_blocks,
                 logical_sequence_length,
                 sparse_routing_mode,
+                *sparse_piper_pattern.optional_attention_layout_arguments(
+                    None,
+                    sparse_query_blocks,
+                ),
             ),
         )
     replacement.meta = original.meta.copy()
@@ -354,11 +359,15 @@ def _replace_projection(
 
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_projection")
-register_graph_pattern(
-    sparse_piper_pattern.sparse_piper_projection_pattern(_linear_pattern),
-    extra_check=_valid_projection,
-    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-)(_replace_projection)
+for _with_sparse_query_blocks in (True, False):
+    register_graph_pattern(
+        sparse_piper_pattern.sparse_piper_projection_pattern(
+            _linear_pattern,
+            with_sparse_query_blocks=_with_sparse_query_blocks,
+        ),
+        extra_check=_valid_projection,
+        pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+    )(_replace_projection)
 
 
 def _fold_projection(graph: torch.fx.Graph) -> bool:

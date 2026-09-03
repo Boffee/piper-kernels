@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added an optional `sparse_query_blocks` boundary to Sparse Piper attention. Leading K64 query
+  blocks retain routed sparse-prefix attention while the remaining query blocks attend every key
+  block densely. The boundary composes with valid-front padding, coarse residuals, ranged launches,
+  and bounded ConvRot INT8, NVFP4, and ConvRot NVFP4 output fusion without a per-block mask tensor.
 - Extended bounded sparse-attention output projection fusion to valid-front padded K64 storage and
   fused coarse residuals. ConvRot INT8, standard NVFP4, and ConvRot NVFP4 now share ranged
   attention launches that pass `block_lengths`, block-level coarse output, and the token-level

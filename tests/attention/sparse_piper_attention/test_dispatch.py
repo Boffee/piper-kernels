@@ -89,6 +89,54 @@ def test_dense_suffix_is_included_for_prefix_and_suffix_queries() -> None:
     torch.testing.assert_close(output[0, -1, :, 0], expected_by_head)
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("sparse_query_blocks", [0, 2, 3])
+def test_dense_query_suffix_bypasses_sparse_routes(
+    device: str,
+    sparse_query_blocks: int,
+) -> None:
+    if device == "cuda" and (
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
+    ):
+        pytest.skip("requires exact NVIDIA SM120")
+    shape = (1, 3 * 64, 1, 128)
+    query = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+    key = torch.zeros_like(query)
+    value = torch.empty_like(query)
+    value[:, :64] = 1
+    value[:, 64:128] = 3
+    value[:, 128:] = 10
+    attention = _attention((0.5,))
+
+    with torch.no_grad():
+        output = attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=2,
+            sparse_query_blocks=sparse_query_blocks,
+        )
+
+    expected = torch.full_like(output, (1 + 3 + 10) / 3)
+    expected[:, : sparse_query_blocks * 64] = 5.5
+    torch.testing.assert_close(output, expected, atol=0.015625, rtol=0)
+
+
+@pytest.mark.parametrize("sparse_query_blocks", [-1, 4, True, 1.5])
+def test_sparse_query_block_boundary_is_validated(sparse_query_blocks: object) -> None:
+    query, key, value = _inputs()
+    attention = _attention((0.5, 1.0))
+
+    with pytest.raises((TypeError, ValueError), match="sparse_query_blocks"):
+        attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=2,
+            sparse_query_blocks=sparse_query_blocks,  # type: ignore[arg-type]
+        )
+
+
 def test_backend_accepts_sparse_prefix_length_changes_without_derived_state() -> None:
     query, key, value = _inputs()
     attention = _attention((0.5, 0.5))

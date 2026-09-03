@@ -192,6 +192,20 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
             != preparation_sharing.dimension_key(sequence_length)
         ):
             return False
+    sparse_query_blocks_value = match.kwargs.get("sparse_query_blocks")
+    if sparse_query_blocks_value is not None:
+        sparse_query_blocks = integer_scalar_metadata(sparse_query_blocks_value)
+        if sparse_query_blocks is None:
+            return False
+        static_sparse_query_blocks = static_int(sparse_query_blocks)
+        if static_sparse_query_blocks is not None and (
+            static_sparse_query_blocks < 0
+            or (
+                isinstance(sequence_length, int)
+                and static_sparse_query_blocks > (sequence_length + tile_rows - 1) // tile_rows
+            )
+        ):
+            return False
     head_keep_ratio_units = match.kwargs["sparse_head_keep_ratio_units"]
     return bool(
         isinstance(head_keep_ratio_units, (list, tuple))
