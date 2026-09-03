@@ -366,7 +366,7 @@ def quantize_rows_kernel(
 
 
 @triton.jit
-def _requantize_addmm_rows_kernel(
+def _requantize_update_rows_kernel(
     q_ptr,
     scale_ptr,
     update_ptr,
@@ -977,7 +977,6 @@ def addmm_(
     rounding_seed: int | None = None,
 ) -> None:
     """Apply an addmm update in the rotated basis and requantize the weight in place."""
-    out_features, in_features = qdata.shape
     has_update = alpha != 0 and mat1.shape[1] != 0
     if has_update:
         mat2_contiguous = mat2.contiguous()
@@ -992,9 +991,33 @@ def addmm_(
     else:
         update = qdata
 
-    logical_dtype_code = dtype_code(mat1.dtype)
+    _requantize_update_(
+        qdata,
+        scale,
+        update,
+        mat1.dtype,
+        beta,
+        alpha,
+        rounding_seed,
+        has_update=has_update,
+    )
+
+
+def _requantize_update_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    update: torch.Tensor,
+    logical_dtype: torch.dtype,
+    beta: float,
+    alpha: float,
+    rounding_seed: int | None,
+    *,
+    has_update: bool,
+) -> None:
+    """Merge one rotated update while refilling the existing rowwise storage."""
+    out_features, in_features = qdata.shape
     requant_block = max(128, triton.next_power_of_2(in_features))
-    _requantize_addmm_rows_kernel[(out_features,)](
+    _requantize_update_rows_kernel[(out_features,)](
         qdata,
         scale,
         update,
@@ -1008,7 +1031,7 @@ def addmm_(
         alpha,
         seed_argument(rounding_seed),
         block_size=requant_block,
-        logical_dtype_code=logical_dtype_code,
+        logical_dtype_code=dtype_code(logical_dtype),
         has_base=beta != 0,
         has_update=has_update,
         stochastic=rounding_seed is not None,
@@ -1024,6 +1047,55 @@ def _addmm_fake(
     _mat2: torch.Tensor,
     _group_size: int,
     _beta: float,
+    _alpha: float,
+    _rounding_seed: int | None = None,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_add_",
+    mutates_args=("qdata", "scale"),
+)
+def add_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    update: torch.Tensor,
+    group_size: int,
+    alpha: float,
+    rounding_seed: int | None = None,
+) -> None:
+    """Apply a dense logical update and requantize the ConvRot weight in place."""
+    has_update = alpha != 0
+    if has_update:
+        update_contiguous = update.contiguous()
+        rotated_update = torch.empty_like(update_contiguous)
+        rotate_input(
+            update_contiguous,
+            rotated_update,
+            group_size,
+            num_warps=4,
+        )
+    else:
+        rotated_update = qdata
+    _requantize_update_(
+        qdata,
+        scale,
+        rotated_update,
+        update.dtype,
+        1.0,
+        alpha,
+        rounding_seed,
+        has_update=has_update,
+    )
+
+
+@add_.register_fake
+def _add_fake(
+    _qdata: torch.Tensor,
+    _scale: torch.Tensor,
+    _update: torch.Tensor,
+    _group_size: int,
     _alpha: float,
     _rounding_seed: int | None = None,
 ) -> None:

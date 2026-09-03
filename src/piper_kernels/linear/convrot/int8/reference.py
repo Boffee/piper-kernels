@@ -123,6 +123,31 @@ def addmm_(
         rotated_weight = qdata.to(mat1.dtype) * scale.to(mat1.dtype)
     rotated_mat2 = rotate_groups(mat2, group_size)
     merged = torch.addmm(rotated_weight, mat1, rotated_mat2, beta=beta, alpha=alpha)
+    _requantize_(qdata, scale, merged, rounding_seed)
+
+
+def add_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    update: torch.Tensor,
+    group_size: int,
+    alpha: float,
+    rounding_seed: int | None = None,
+) -> None:
+    """Add a dense logical update to a ConvRot weight and requantize it in place."""
+    rotated_weight = qdata.to(update.dtype) * scale.to(update.dtype)
+    rotated_update = rotate_groups(update, group_size)
+    merged = torch.add(rotated_weight, rotated_update, alpha=alpha)
+    _requantize_(qdata, scale, merged, rounding_seed)
+
+
+def _requantize_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    merged: torch.Tensor,
+    rounding_seed: int | None,
+) -> None:
+    """Refill existing rowwise INT8 storage from one merged rotated weight."""
     merged_qdata, merged_scale = dynamic_quantize_rows(
         merged,
         rounding_seed=rounding_seed,

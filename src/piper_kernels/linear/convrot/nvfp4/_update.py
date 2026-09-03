@@ -18,6 +18,7 @@ from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot._update import (
     validate_real_scalar,
     validate_rounding_seed,
+    validate_update_operands,
 )
 from piper_kernels.linear.nvfp4 import _layout
 from piper_kernels.linear.nvfp4.tensor import (
@@ -26,20 +27,19 @@ from piper_kernels.linear.nvfp4.tensor import (
 )
 
 
-def _validate_storage(weight: PiperNVFP4Tensor) -> None:
+def _validate_storage(weight: PiperNVFP4Tensor, *, operation: str) -> None:
     if weight.device.type == "meta":
-        raise ValueError("ConvRot NVFP4 addmm_ cannot update a meta tensor without values")
+        raise ValueError(f"{operation} cannot update a meta tensor without values")
     rows, features = weight.shape
     expected_qdata_shape = _layout.qdata_shape(rows, features)
     if weight.qdata.dtype is not torch.uint8 or tuple(weight.qdata.shape) != expected_qdata_shape:
         raise ValueError(
-            "ConvRot NVFP4 addmm_ requires packed uint8 qdata with shape "
+            f"{operation} requires packed uint8 qdata with shape "
             f"{expected_qdata_shape}, got {weight.qdata.dtype} {tuple(weight.qdata.shape)}"
         )
     if weight.block_size != _layout.BLOCK_SIZE:
         raise ValueError(
-            f"ConvRot NVFP4 addmm_ requires block size {_layout.BLOCK_SIZE}, "
-            f"got {weight.block_size}"
+            f"{operation} requires block size {_layout.BLOCK_SIZE}, got {weight.block_size}"
         )
     expected_scale_shape = (
         _layout.scale_shape(rows, features)
@@ -51,16 +51,16 @@ def _validate_storage(weight: PiperNVFP4Tensor) -> None:
         or tuple(weight.scale.shape) != expected_scale_shape
     ):
         raise ValueError(
-            "ConvRot NVFP4 addmm_ requires canonical block-16 FP8 scales with shape "
+            f"{operation} requires canonical block-16 FP8 scales with shape "
             f"{expected_scale_shape}, got {weight.scale.dtype} {tuple(weight.scale.shape)}"
         )
     if not weight.qdata.is_contiguous() or not weight.scale.is_contiguous():
         raise ValueError(
-            "ConvRot NVFP4 addmm_ requires contiguous packed storage; "
+            f"{operation} requires contiguous packed storage; "
             "a transposed weight cannot be updated in place"
         )
     if weight.per_tensor_scale is not None and weight.per_tensor_scale.numel() != 1:
-        raise ValueError("ConvRot NVFP4 addmm_ requires a scalar per-tensor weight scale")
+        raise ValueError(f"{operation} requires a scalar per-tensor weight scale")
     storage = (
         weight.qdata,
         weight.scale,
@@ -68,7 +68,7 @@ def _validate_storage(weight: PiperNVFP4Tensor) -> None:
         weight.act_per_tensor_scale,
     )
     if any(value is not None and value.device != weight.device for value in storage):
-        raise ValueError("ConvRot NVFP4 storage tensors must share a device")
+        raise ValueError(f"{operation} storage tensors must share a device")
 
 
 def _validate_addmm(
@@ -76,7 +76,8 @@ def _validate_addmm(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
 ) -> None:
-    _validate_storage(weight)
+    operation = "ConvRot NVFP4 addmm_"
+    _validate_storage(weight, operation=operation)
     if mat1.ndim != 2 or mat2.ndim != 2:
         raise ValueError(
             "ConvRot NVFP4 addmm_ matrices must be 2-D, "
@@ -90,30 +91,33 @@ def _validate_addmm(
             f"mat1 {expected_mat1} and mat2 {expected_mat2} for weight "
             f"{tuple(weight.shape)}, got {tuple(mat1.shape)} and {tuple(mat2.shape)}"
         )
-    if mat1.device != weight.device or mat2.device != weight.device:
-        raise ValueError(
-            "ConvRot NVFP4 addmm_ weight and matrices must share a device, "
-            f"got {weight.device}/{mat1.device}/{mat2.device}"
-        )
-    if mat1.dtype is not weight.orig_dtype or mat2.dtype is not weight.orig_dtype:
-        raise ValueError(
-            "ConvRot NVFP4 addmm_ matrices must match the weight's logical dtype, "
-            f"got {weight.orig_dtype}/{mat1.dtype}/{mat2.dtype}"
-        )
-    if mat1.layout is not torch.strided or mat2.layout is not torch.strided:
-        raise ValueError("ConvRot NVFP4 addmm_ matrices must use strided layout")
-    differentiable = (
-        weight.scale,
-        weight.per_tensor_scale,
-        mat1,
-        mat2,
+    validate_update_operands(
+        (mat1, mat2),
+        device=weight.device,
+        dtype=weight.orig_dtype,
+        differentiable_storage=(weight.scale, weight.per_tensor_scale),
+        operation=operation,
     )
-    if torch.is_grad_enabled() and any(
-        value is not None and value.requires_grad for value in differentiable
-    ):
-        raise RuntimeError(
-            "ConvRot NVFP4 addmm_ does not support autograd; detach its inputs or use no_grad"
+
+
+def _validate_add(
+    weight: PiperNVFP4Tensor,
+    update: torch.Tensor,
+) -> None:
+    operation = "ConvRot NVFP4 add_"
+    _validate_storage(weight, operation=operation)
+    if tuple(update.shape) != tuple(weight.shape):
+        raise ValueError(
+            f"{operation} shape mismatch: expected update {tuple(weight.shape)}, "
+            f"got {tuple(update.shape)}"
         )
+    validate_update_operands(
+        (update,),
+        device=weight.device,
+        dtype=weight.orig_dtype,
+        differentiable_storage=(weight.scale, weight.per_tensor_scale),
+        operation=operation,
+    )
 
 
 def _stochastic_recode_(
@@ -182,6 +186,40 @@ def addmm_(
         alpha=alpha_float,
     )
 
+    _refill_(weight, merged, rounding_seed)
+
+
+def add_(
+    weight: PiperNVFP4Tensor,
+    group_size: int,
+    update: torch.Tensor,
+    *,
+    alpha: int | float | complex = 1,
+    rounding_seed: int | None = None,
+) -> None:
+    """Apply a logical dense update and refill the existing packed storage."""
+    _validate_add(weight, update)
+    operation = "ConvRot NVFP4 add_"
+    alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
+    validate_rounding_seed(rounding_seed, operation=operation)
+    if alpha_float == 0:
+        return
+
+    # Stay in the physical rotated basis used by the packed storage. Rotation
+    # is linear, so this equals rotating the logical sum before requantization.
+    rotated_weight = TorchAONVFP4Tensor.dequantize(weight, weight.orig_dtype)
+    rotated_update = rotate_groups(update, group_size)
+    merged = torch.add(rotated_weight, rotated_update, alpha=alpha_float)
+    _refill_(weight, merged, rounding_seed)
+
+
+def _refill_(
+    weight: PiperNVFP4Tensor,
+    merged: torch.Tensor,
+    rounding_seed: int | None,
+) -> None:
+    """Encode one merged rotated weight into the existing NVFP4 storage."""
+
     per_tensor_scale = None
     if weight.per_tensor_scale is not None:
         per_tensor_scale = per_tensor_amax_to_scale(merged.detach().abs().amax()).clamp_min(
@@ -212,4 +250,4 @@ def addmm_(
         weight.per_tensor_scale.copy_(encoded.per_tensor_scale)
 
 
-__all__ = ["addmm_"]
+__all__ = ["add_", "addmm_"]

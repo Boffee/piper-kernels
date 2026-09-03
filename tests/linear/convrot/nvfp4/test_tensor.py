@@ -230,12 +230,12 @@ def test_dequantize_returns_the_unrotated_logical_weight() -> None:
     assert torch.equal(weight.dequantize(), expected)
 
 
-def _cpu_addmm_case(
+def _cpu_weight_case(
     *,
     group_size: int = 16,
     seed: int = 620,
     two_level_scaling: bool = True,
-) -> tuple[ConvRotNVFP4Tensor, torch.Tensor, torch.Tensor]:
+) -> ConvRotNVFP4Tensor:
     generator = torch.Generator().manual_seed(seed)
     logical_weight = torch.randn(32, 256, dtype=torch.bfloat16, generator=generator)
     rotated_weight = rotate_groups(logical_weight, group_size)
@@ -250,10 +250,35 @@ def _cpu_addmm_case(
         use_triton_kernel=False,
         act_quant_kwargs=_quantization(False),
     )
-    weight = ConvRotNVFP4Tensor.from_torchao(source, group_size=group_size)
-    mat1 = torch.randn(32, 4, dtype=torch.bfloat16, generator=generator)
-    mat2 = torch.randn(4, 256, dtype=torch.bfloat16, generator=generator)
+    return ConvRotNVFP4Tensor.from_torchao(source, group_size=group_size)
+
+
+def _cpu_addmm_case(
+    *,
+    group_size: int = 16,
+    seed: int = 620,
+    two_level_scaling: bool = True,
+) -> tuple[ConvRotNVFP4Tensor, torch.Tensor, torch.Tensor]:
+    weight = _cpu_weight_case(
+        group_size=group_size,
+        seed=seed,
+        two_level_scaling=two_level_scaling,
+    )
+    generator = torch.Generator().manual_seed(seed + 1)
+    mat1 = torch.randn(weight.shape[0], 4, dtype=weight.orig_dtype, generator=generator)
+    mat2 = torch.randn(4, weight.shape[1], dtype=weight.orig_dtype, generator=generator)
     return weight, mat1, mat2
+
+
+def _cpu_add_case(
+    *,
+    group_size: int = 16,
+    seed: int = 620,
+) -> tuple[ConvRotNVFP4Tensor, torch.Tensor]:
+    weight = _cpu_weight_case(group_size=group_size, seed=seed)
+    generator = torch.Generator().manual_seed(seed + 2)
+    update = torch.randn(weight.shape, dtype=weight.orig_dtype, generator=generator)
+    return weight, update
 
 
 @pytest.mark.parametrize("group_size", [16, 64, 256])
@@ -302,6 +327,58 @@ def test_addmm_updates_rotated_storage_in_place(
     assert torch.equal(weight.per_tensor_scale, expected.per_tensor_scale)
 
 
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+@pytest.mark.parametrize("alpha", [1, 0.25, -0.5])
+def test_add_updates_rotated_storage_in_place(group_size: int, alpha: float) -> None:
+    weight, update = _cpu_add_case(group_size=group_size, seed=623)
+    rotated_before = TorchAONVFP4Tensor.dequantize(weight, weight.orig_dtype)
+    expected_dense = torch.add(
+        rotated_before,
+        rotate_groups(update, group_size),
+        alpha=alpha,
+    )
+    expected = TorchAONVFP4Tensor.to_nvfp4(
+        expected_dense,
+        block_size=weight.block_size,
+        per_tensor_scale=per_tensor_amax_to_scale(expected_dense.abs().amax()).clamp_min(
+            torch.finfo(torch.float32).tiny
+        ),
+        act_per_tensor_scale=weight.act_per_tensor_scale,
+        is_swizzled_scales=weight.is_swizzled_scales,
+        use_triton_kernel=False,
+        act_quant_kwargs=weight.act_quant_kwargs,
+    )
+    qdata = weight.qdata
+    scale = weight.scale
+    per_tensor_scale = weight.per_tensor_scale
+    act_per_tensor_scale = weight.act_per_tensor_scale
+
+    result = weight.add_(update, alpha=alpha)
+
+    assert result is weight
+    assert weight.qdata is qdata
+    assert weight.scale is scale
+    assert weight.per_tensor_scale is per_tensor_scale
+    assert weight.act_per_tensor_scale is act_per_tensor_scale
+    assert torch.equal(weight.qdata, expected.qdata)
+    assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+    assert weight.per_tensor_scale is not None
+    assert expected.per_tensor_scale is not None
+    assert torch.equal(weight.per_tensor_scale, expected.per_tensor_scale)
+
+
+def test_aten_add_tensor_dispatches_to_convrot_nvfp4_update() -> None:
+    weight, update = _cpu_add_case()
+    expected = weight.clone()
+
+    expected.add_(update, alpha=0.25)
+    result = torch.ops.aten.add_.Tensor(weight, update, alpha=0.25)
+
+    assert result is weight
+    assert torch.equal(weight.qdata, expected.qdata)
+    assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
+
 def test_addmm_preserves_one_level_weight_scaling() -> None:
     weight, mat1, mat2 = _cpu_addmm_case(two_level_scaling=False)
 
@@ -322,6 +399,29 @@ def test_addmm_no_op_does_not_requantize_storage() -> None:
     )
 
     weight.addmm_(mat1, mat2, alpha=0)
+
+    assert torch.equal(weight.qdata, qdata_before)
+    assert torch.equal(weight.scale, scale_before)
+    assert torch.equal(weight.per_tensor_scale, per_tensor_scale_before)
+    assert versions == (
+        weight.qdata._version,
+        weight.scale._version,
+        weight.per_tensor_scale._version,
+    )
+
+
+def test_add_no_op_does_not_requantize_storage() -> None:
+    weight, update = _cpu_add_case()
+    qdata_before = weight.qdata.clone()
+    scale_before = weight.scale.clone()
+    per_tensor_scale_before = weight.per_tensor_scale.clone()
+    versions = (
+        weight.qdata._version,
+        weight.scale._version,
+        weight.per_tensor_scale._version,
+    )
+
+    weight.add_(update, alpha=0)
 
     assert torch.equal(weight.qdata, qdata_before)
     assert torch.equal(weight.scale, scale_before)
@@ -357,6 +457,28 @@ def test_addmm_stochastic_rounding_replays_without_consuming_global_rng() -> Non
     replay.addmm_(mat1, mat2, rounding_seed=seed)
     other.addmm_(mat1, mat2, rounding_seed=seed - 1)
     deterministic.addmm_(mat1, mat2)
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert torch.equal(first.qdata, replay.qdata)
+    assert torch.equal(first.scale.view(torch.uint8), replay.scale.view(torch.uint8))
+    assert not torch.equal(first.qdata, other.qdata)
+    assert torch.equal(first.scale.view(torch.uint8), other.scale.view(torch.uint8))
+    assert not torch.equal(first.qdata, deterministic.qdata)
+
+
+def test_add_stochastic_rounding_replays_without_consuming_global_rng() -> None:
+    seed = (1 << 64) - 1
+    first, update = _cpu_add_case(seed=624)
+    replay = first.clone()
+    other = first.clone()
+    deterministic = first.clone()
+    torch.manual_seed(1703)
+    rng_before = torch.random.get_rng_state()
+
+    first.add_(update, rounding_seed=seed)
+    replay.add_(update, rounding_seed=seed)
+    other.add_(update, rounding_seed=seed - 1)
+    deterministic.add_(update)
 
     assert torch.equal(torch.random.get_rng_state(), rng_before)
     assert torch.equal(first.qdata, replay.qdata)
@@ -434,10 +556,25 @@ def test_addmm_rejects_invalid_matrices(
     mat2: torch.Tensor,
     message: str,
 ) -> None:
-    weight, _mat1, _mat2 = _cpu_addmm_case()
+    weight = _cpu_weight_case()
 
     with pytest.raises(ValueError, match=message):
         weight.addmm_(mat1, mat2)
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        (torch.empty(31, 256, dtype=torch.bfloat16), "shape mismatch"),
+        (torch.empty(32, 256, dtype=torch.float16), "logical dtype"),
+        (torch.ones(32, 256, dtype=torch.bfloat16).to_sparse(), "strided layout"),
+    ],
+)
+def test_add_rejects_invalid_update(update: torch.Tensor, message: str) -> None:
+    weight = _cpu_weight_case()
+
+    with pytest.raises(ValueError, match=message):
+        weight.add_(update)
 
 
 def test_addmm_rejects_autograd_inputs() -> None:
@@ -449,6 +586,17 @@ def test_addmm_rejects_autograd_inputs() -> None:
 
     with torch.no_grad():
         assert weight.addmm_(mat1, mat2) is weight
+
+
+def test_add_rejects_autograd_inputs() -> None:
+    weight = _cpu_weight_case()
+    update = torch.randn(weight.shape, dtype=weight.orig_dtype, requires_grad=True)
+
+    with pytest.raises(RuntimeError, match="does not support autograd"):
+        weight.add_(update)
+
+    with torch.no_grad():
+        assert weight.add_(update) is weight
 
 
 def test_meta_linear_supports_functional_and_keyword_forms() -> None:
