@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc1] - 2026-09-02
+
 ### Added
 
 - Added exact-shape in-place `add_` updates to ConvRot INT8 and NVFP4 tensors for full-rank
@@ -353,7 +355,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...HEAD
+[0.7.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...v0.7.0rc1
 [0.6.1]: https://github.com/Boffee/piper-kernels/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Boffee/piper-kernels/compare/v0.4.1...v0.5.0
