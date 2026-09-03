@@ -144,6 +144,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
+        sparse_query_blocks: int | None = None,
     ) -> torch.Tensor:
         query, key, value = self._project_inputs(hidden_states)
         return self.sparse_attention(
@@ -152,6 +153,7 @@ class _SparseProjectionAttention(torch.nn.Module):
             value,
             sparse_key_blocks=self.sparse_key_blocks,
             block_lengths=block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
         )
 
 
@@ -173,6 +175,7 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
         hidden_states: torch.Tensor,
         compression_gate: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
+        sparse_query_blocks: int | None = None,
     ) -> torch.Tensor:
         query, key, value = self._project_inputs(hidden_states)
         fine_output = self.sparse_attention(
@@ -181,6 +184,7 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             value,
             sparse_key_blocks=self.sparse_key_blocks,
             block_lengths=block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
         )
         residual = (
             mean_pool_coarse_residual
@@ -367,8 +371,9 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
         self,
         hidden_states: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
+        sparse_query_blocks: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        attention = super().forward(hidden_states, block_lengths)
+        attention = super().forward(hidden_states, block_lengths, sparse_query_blocks)
         projected = self.output(
             attention.reshape(
                 self.batch,
@@ -401,8 +406,14 @@ class _CoarseSparseProjectionAttentionOutput(_CoarseSparseProjectionAttention):
         hidden_states: torch.Tensor,
         compression_gate: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
+        sparse_query_blocks: int | None = None,
     ) -> torch.Tensor:
-        attention = super().forward(hidden_states, compression_gate, block_lengths)
+        attention = super().forward(
+            hidden_states,
+            compression_gate,
+            block_lengths,
+            sparse_query_blocks,
+        )
         return self.output(
             attention.reshape(
                 self.batch,
@@ -451,6 +462,7 @@ def _run_explicit_fused_projection(
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     input_qdata, input_scale = convrot_backend.prepare_input(
         hidden_states,
@@ -505,6 +517,7 @@ def _run_explicit_fused_projection(
             hidden_states.shape[1],
             routing_mode,
             block_lengths,
+            sparse_query_blocks,
         )
     assert coarse_scale is not None
     assert coarse_key_blocks is not None
@@ -524,6 +537,7 @@ def _run_explicit_fused_projection(
         coarse_scale,
         block_lengths,
         coarse_key_blocks,
+        sparse_query_blocks,
     )
 
 
@@ -538,6 +552,7 @@ def _run_explicit_attention_output(
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     attention = _run_explicit_fused_projection(
         model,
@@ -549,6 +564,7 @@ def _run_explicit_attention_output(
         coarse_scale=coarse_scale,
         coarse_key_blocks=coarse_key_blocks,
         block_lengths=block_lengths,
+        sparse_query_blocks=sparse_query_blocks,
     )
     projected = convrot_backend.run_linear(
         attention.reshape(
@@ -1011,7 +1027,7 @@ def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_cuda_compile_fuses_padded_attention_output() -> None:
+def test_cuda_compile_fuses_padded_mixed_query_attention_output() -> None:
     torch.manual_seed(722)
     model = _SparseProjectionAttentionOutput().eval()
     hidden_states = torch.randn(
@@ -1036,13 +1052,14 @@ def test_cuda_compile_fuses_padded_attention_output() -> None:
             model.sin,
             model.sparse_key_blocks,
             block_lengths=block_lengths,
+            sparse_query_blocks=2,
         )
         torch._dynamo.reset()
         actual = torch.compile(
             model,
             fullgraph=True,
             options=options,
-        )(hidden_states, block_lengths)
+        )(hidden_states, block_lengths, 2)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert (
@@ -1115,7 +1132,7 @@ def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_cuda_compile_fuses_padded_coarse_attention_output(routing: str) -> None:
+def test_cuda_compile_fuses_every_bounded_attention_feature(routing: str) -> None:
     torch.manual_seed(721)
     model = _CoarseSparseProjectionAttentionOutput(routing=routing).eval()
     hidden_states = torch.randn(
@@ -1154,8 +1171,9 @@ def test_cuda_compile_fuses_padded_coarse_attention_output(routing: str) -> None
                 coarse_scale=model.coarse_scale,
                 coarse_key_blocks=model.coarse_key_blocks,
                 block_lengths=block_lengths,
+                sparse_query_blocks=2,
             )
-            actual = compiled(hidden_states, compression_gate, block_lengths)
+            actual = compiled(hidden_states, compression_gate, block_lengths, 2)
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     assert capture.calls == 1

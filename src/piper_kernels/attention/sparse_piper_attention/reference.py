@@ -28,13 +28,18 @@ def _active_indices(
     sequence_length: int,
     route_head_offsets: list[int],
     block_lengths: torch.Tensor | None,
+    use_sparse_routes: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     route_start, route_stop = route_head_offsets[head : head + 2]
-    selected_blocks = routes.indices[
-        batch,
-        query_block,
-        route_start:route_stop,
-    ].long()
+    selected_blocks = (
+        routes.indices[
+            batch,
+            query_block,
+            route_start:route_stop,
+        ].long()
+        if use_sparse_routes
+        else torch.arange(sparse_key_blocks, device=routes.indices.device)
+    )
     row_offsets = torch.arange(_BLOCK_ROWS, device=routes.indices.device)
     sparse_rows = (selected_blocks[:, None] * _BLOCK_ROWS + row_offsets).flatten()
     sparse_key_rows = sparse_key_blocks * _BLOCK_ROWS
@@ -104,6 +109,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     sparse_key_blocks: int,
     scale: float,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     """Evaluate the selected quantized Sparse Piper algorithm in PyTorch.
 
@@ -148,6 +154,9 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
+                    use_sparse_routes=(
+                        sparse_query_blocks is None or query_block < sparse_query_blocks
+                    ),
                 )
                 selected_key = key_int8[batch_index, head].index_select(0, key_indices)
                 selected_value = value_int8[batch_index, head].index_select(0, key_indices)
@@ -239,6 +248,7 @@ def reference_exact_sparse_attention(
     sparse_key_blocks: int,
     scale: float,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     """Apply the same routes with exact BF16 inputs and FP32 attention math."""
     batch, sequence, heads, _head_dim = query.shape
@@ -258,6 +268,9 @@ def reference_exact_sparse_attention(
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
+                    use_sparse_routes=(
+                        sparse_query_blocks is None or query_block < sparse_query_blocks
+                    ),
                 )
                 query_start = query_block * _BLOCK_ROWS
                 query_stop = min(query_start + _BLOCK_ROWS, sequence)

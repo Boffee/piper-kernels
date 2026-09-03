@@ -265,3 +265,61 @@ def test_linear_mean_matches_batched_represented_projection() -> None:
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_linear_mean_ignores_valid_front_padding() -> None:
+    torch.manual_seed(507)
+    batch, sequence_length = 2, 128
+    input_features, output_features = 80, 128
+    source = torch.randn(
+        batch * sequence_length,
+        input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    dense_weight = torch.randn(
+        output_features,
+        input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    input_scale = per_tensor_amax_to_scale(source.abs().amax())
+    weight_scale = per_tensor_amax_to_scale(dense_weight.abs().amax())
+    prepared_input = TorchAONVFP4Tensor.to_nvfp4(
+        source,
+        per_tensor_scale=input_scale,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    prepared_weight = TorchAONVFP4Tensor.to_nvfp4(
+        dense_weight,
+        per_tensor_scale=weight_scale,
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    block_lengths = torch.tensor([37, 19], device="cuda", dtype=torch.int32)
+    valid = torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]
+    valid = valid.flatten()
+    represented = prepared_input.dequantize(torch.float32).view(
+        batch,
+        sequence_length,
+        input_features,
+    )
+    expected = represented[:, valid].mean(dim=1) @ prepared_weight.dequantize(torch.float32).t()
+
+    actual = nvfp4_triton.linear_mean(
+        prepared_input.qdata,
+        prepared_input.scale,
+        input_scale,
+        prepared_weight.qdata,
+        prepared_weight.scale,
+        weight_scale,
+        None,
+        batch,
+        sequence_length,
+        block_lengths,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)

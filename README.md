@@ -248,6 +248,7 @@ output = attention(
     key,
     value,
     sparse_key_blocks=1036,
+    sparse_query_blocks=1024,  # optional leading routed-query K64 blocks
     block_lengths=block_lengths,  # optional valid-front padded K64 storage
 )
 ```
@@ -261,9 +262,11 @@ layout so the caller can apply its existing gather; padded query rows are unspec
 compact partial final tile belongs to the dense suffix. Routing defaults to FP32 min/max pooling;
 passing `routing="mean"` instead scores FP32 Q64/K64 mean summaries. Both policies select the
 same per-head block budget over the sparse prefix, after which every query attends to every
-remaining K/V row in the same softmax. This makes text,
-generated audio, or other globally retained sections an optional dense suffix while keeping their
-queries sparse over the packed media prefix. Engine owns only the semantic per-layer ratio profile.
+remaining K/V row in the same softmax. By default every query block uses that policy. Supplying
+`sparse_query_blocks` makes only that many leading K64 query blocks routed; later query blocks
+attend every K/V block densely. This supports packed video-first layouts followed by dense
+non-video queries using one runtime scalar rather than a per-block mask. Engine owns only the
+semantic per-layer ratio profile.
 Each opaque attention call derives its temporary physical keep counts, packed offsets, and exact
 route storage from that immutable model configuration and the current prefix length. Dynamic
 compiled graphs accept changed prefix lengths and their resulting route capacities without compiling
@@ -298,11 +301,13 @@ internally padded storage when supplied. The `minmax_pool_coarse_residual` conve
 derives extrema-based scores under the same layout contract, while
 `coarse_attention_residual` remains available for learned or already-materialized block scores.
 These composable implementations are the correctness and training contract; compatible compiled
-ConvRot INT8 graphs fuse the shared route scores, wider coarse attention, and gated residual.
+ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
+and gated residual, including valid-front padded storage.
 When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
 quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
-residual. It passes the coarse result and compression gate into each ranged attention launch and
-projects that chunk directly, so the full BF16 attention output is not materialized.
+residual together with `sparse_query_blocks`. It passes the coarse result and compression gate into
+each ranged attention launch and projects that chunk directly, so the full BF16 attention output is
+not materialized.
 
 The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and

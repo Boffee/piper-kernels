@@ -247,8 +247,10 @@ def test_quantized_coarse_residual_matches_explicit_composition(
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("sequence_length", [65, 193, 256])
+@pytest.mark.parametrize("mixed_query_scope", [False, True])
 def test_query_block_ranges_match_full_launch_and_preserve_guards(
     sequence_length: int,
+    mixed_query_scope: bool,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(91 + sequence_length)
     shape = (1, sequence_length, 2, 128)
@@ -269,6 +271,8 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
         key_head_major[:, :, : sparse_key_blocks * 64],
         layout,
     )
+    query_block_count = (sequence_length + 63) // 64
+    sparse_query_blocks = query_block_count - 1 if mixed_query_scope else None
     prepared = _prepare_sparse_piper_attention(
         query_head_major,
         routes.indices,
@@ -278,9 +282,9 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
         route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
+        sparse_query_blocks=sparse_query_blocks,
     )
 
-    query_block_count = (sequence_length + 63) // 64
     coarse_output = torch.randn(
         (shape[0], shape[2], query_block_count, shape[3]),
         dtype=torch.float32,
@@ -439,14 +443,16 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
         expected = _sparse_piper_attention_from_quantized_op(
             *partial_arguments,
             block_lengths,
+            2,
         )
         actual = _sparse_piper_attention_from_quantized_op(
             *corrupted_arguments,
             block_lengths,
+            2,
         )
         opcheck = torch.library.opcheck(
             _sparse_piper_attention_from_quantized_op,
-            (*partial_arguments, block_lengths),
+            (*partial_arguments, block_lengths, 2),
         )
 
         captured_graphs = []
@@ -527,12 +533,14 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         coarse_scale,
         block_lengths,
         coarse_key_blocks,
+        2,
     )
 
     with torch.no_grad():
         fine_output = _sparse_piper_attention_from_quantized_op(
             *fine_arguments,
             block_lengths,
+            2,
         )
         expected = apply_coarse_attention_residual(
             fine_output,

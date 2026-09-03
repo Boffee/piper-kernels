@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 
 import torch
@@ -186,36 +185,9 @@ def _valid_sparse_piper_coarse_residual_projection(
     match: Match,
 ) -> bool:
     """Validate the extra operands and routing policy of a coarse residual."""
-    if match.kwargs["sparse_routing_mode"] != match.kwargs[
-        "coarse_routing_mode"
-    ] or not _valid_sparse_piper_projection(match):
+    if not _valid_sparse_piper_projection(match):
         return False
-    gate_node = match.kwargs["coarse_compression_gate"]
-    if not isinstance(gate_node, torch.fx.Node):
-        return False
-    gate = preparation_sharing.tensor_metadata(gate_node)
-    output = preparation_sharing.tensor_metadata(match.output_node())
-    coarse_scale = match.kwargs["coarse_scale"]
-    if (
-        gate is None
-        or output is None
-        or gate.layout is not torch.strided
-        or gate.ndim != 4
-        or gate.dtype is not torch.bfloat16
-        or gate.device != output.device
-        or gate.stride(-1) != 1
-        or len(gate.shape) != len(output.shape)
-        or any(
-            preparation_sharing.dimension_key(gate_dimension)
-            != preparation_sharing.dimension_key(output_dimension)
-            for gate_dimension, output_dimension in zip(gate.shape, output.shape, strict=True)
-        )
-        or isinstance(coarse_scale, bool)
-        or not isinstance(coarse_scale, (int, float))
-    ):
-        return False
-    converted_scale = float(coarse_scale)
-    return math.isfinite(converted_scale) and converted_scale > 0
+    return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
 
 
 def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
@@ -239,6 +211,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_softmax_scale: float,
     sparse_routing_mode: int,
     sparse_block_lengths: torch.fx.Node | None = None,
+    sparse_query_blocks: Argument | None = None,
     coarse_compression_gate: torch.fx.Node | None = None,
     coarse_key_blocks: Argument | None = None,
     coarse_scale: float | None = None,
@@ -397,36 +370,20 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             value_scale_multiplier,
             value_mean,
         )
-        if with_coarse_residual:
-            assert coarse_scale is not None
-            assert coarse_key_blocks is not None
-            replacement = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
-                args=(
-                    *attention_arguments,
-                    value_projection[3],
-                    coarse_compression_gate,
-                    sparse_head_keep_ratio_units,
-                    sparse_key_blocks,
-                    logical_sequence_length,
-                    sparse_routing_mode,
-                    coarse_scale,
-                    sparse_block_lengths,
-                    coarse_key_blocks,
-                ),
-            )
-        else:
-            replacement = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-                args=(
-                    *attention_arguments,
-                    sparse_head_keep_ratio_units,
-                    sparse_key_blocks,
-                    logical_sequence_length,
-                    sparse_routing_mode,
-                    *block_length_arguments,
-                ),
-            )
+        replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
+            graph,
+            attention_arguments,
+            head_keep_ratio_units=sparse_head_keep_ratio_units,
+            sparse_key_blocks=sparse_key_blocks,
+            logical_sequence_length=logical_sequence_length,
+            routing_mode=sparse_routing_mode,
+            block_lengths=sparse_block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
+            block_mean=value_projection[3] if with_coarse_residual else None,
+            compression_gate=coarse_compression_gate,
+            coarse_scale=coarse_scale,
+            coarse_key_blocks=coarse_key_blocks,
+        )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
     original.replace_all_uses_with(replacement)
@@ -434,29 +391,23 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
 
 
 _patterns = PatternMatcherPass("convrot_sparse_piper_projection")
-for pattern, extra_check in (
-    (
-        sparse_piper_pattern.sparse_piper_coarse_residual_block_lengths_projection_pattern,
-        _valid_sparse_piper_coarse_residual_projection,
-    ),
-    (
-        sparse_piper_pattern.sparse_piper_coarse_residual_projection_pattern,
-        _valid_sparse_piper_coarse_residual_projection,
-    ),
-    (
-        sparse_piper_pattern.sparse_piper_block_lengths_projection_pattern,
-        _valid_sparse_piper_projection,
-    ),
-    (
-        sparse_piper_pattern.sparse_piper_projection_pattern,
-        _valid_sparse_piper_projection,
-    ),
-):
-    register_graph_pattern(
-        pattern(_linear_pattern),
-        extra_check=extra_check,
-        pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-    )(_replace_sparse_piper_projection)
+for _with_coarse in (True, False):
+    for _with_block_lengths in (True, False):
+        for _with_sparse_query_blocks in (True, False):
+            register_graph_pattern(
+                sparse_piper_pattern.sparse_piper_projection_pattern(
+                    _linear_pattern,
+                    with_block_lengths=_with_block_lengths,
+                    with_coarse=_with_coarse,
+                    with_sparse_query_blocks=_with_sparse_query_blocks,
+                ),
+                extra_check=(
+                    _valid_sparse_piper_coarse_residual_projection
+                    if _with_coarse
+                    else _valid_sparse_piper_projection
+                ),
+                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_sparse_piper_projection)
 
 
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:

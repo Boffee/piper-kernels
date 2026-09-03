@@ -125,6 +125,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     compression_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into the final ConvRot output."""
     input_features, output_features = _validate_output_projection(
@@ -156,6 +157,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         compression_gate,
         coarse_scale,
         coarse_key_blocks,
+        sparse_query_blocks,
     )
     sequence_length = prepared.sequence_length
     capacity = min(sequence_length, query_chunk_rows)
@@ -227,6 +229,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     compression_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     return _run_attention_output(
         query,
@@ -253,6 +256,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         compression_gate,
         coarse_scale,
         coarse_key_blocks,
+        sparse_query_blocks,
     )
 
 
@@ -282,6 +286,7 @@ def _attention_output_op_fake(
     _compression_gate: torch.Tensor | None = None,
     _coarse_scale: float | None = None,
     _coarse_key_blocks: int | None = None,
+    _sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     return output_common.new_projected_output(
         query,

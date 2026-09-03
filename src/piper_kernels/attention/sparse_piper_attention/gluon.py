@@ -271,13 +271,16 @@ def _piper_pv_pair(
 def _native_tile_start(
     route_base,
     tile_position,
+    routed_sparse_tile_count,
     selected_sparse_tile_count,
     sparse_key_blocks,
     stride_rr,
+    use_sparse_routes,
 ):
-    safe_route_position = gl.minimum(tile_position, selected_sparse_tile_count - 1)
+    safe_route_position = gl.minimum(tile_position, routed_sparse_tile_count - 1)
     route = gl.load(route_base + safe_route_position * stride_rr).to(gl.int32)
-    sparse_start = route * _GL_BLOCK_N
+    sparse_tile = gl.where(use_sparse_routes, route, tile_position)
+    sparse_start = sparse_tile * _GL_BLOCK_N
     dense_start = (
         sparse_key_blocks * _GL_BLOCK_N + (tile_position - selected_sparse_tile_count) * _GL_BLOCK_N
     )
@@ -289,6 +292,7 @@ def _native_tile_start(
         "logical_sequence_length",
         "query_block_offset",
         "sparse_key_blocks",
+        "sparse_query_blocks",
         "stride_rb",
         "stride_rq",
     ]
@@ -312,6 +316,7 @@ def _sparse_piper_attention_kernel(
     storage_sequence_length,
     logical_sequence_length,
     sparse_key_blocks,
+    sparse_query_blocks,
     stride_rb,
     stride_rq,
     stride_rr,
@@ -327,6 +332,7 @@ def _sparse_piper_attention_kernel(
     heads,
     mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
+    has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
     kernel_warps: gl.constexpr,
 ):
@@ -377,7 +383,17 @@ def _sparse_piper_attention_kernel(
     mbarrier.init(key_barrier, count=1)
     mbarrier.init(value_barrier, count=1)
 
-    selected_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
+    routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
+    if has_dense_query_suffix:
+        use_sparse_routes = query_block < sparse_query_blocks
+        selected_sparse_tile_count = gl.where(
+            use_sparse_routes,
+            routed_sparse_tile_count,
+            sparse_key_blocks,
+        )
+    else:
+        use_sparse_routes = True
+        selected_sparse_tile_count = routed_sparse_tile_count
     sequence_tiles = storage_sequence_length // _GL_BLOCK_N
     dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
@@ -386,16 +402,20 @@ def _sparse_piper_attention_kernel(
     initial_n_0 = _native_tile_start(
         route_base,
         0,
+        routed_sparse_tile_count,
         selected_sparse_tile_count,
         sparse_key_blocks,
         stride_rr,
+        use_sparse_routes,
     )
     initial_n_1 = _native_tile_start(
         route_base,
         initial_position_1,
+        routed_sparse_tile_count,
         selected_sparse_tile_count,
         sparse_key_blocks,
         stride_rr,
+        use_sparse_routes,
     )
 
     _issue_tma(
@@ -474,16 +494,20 @@ def _sparse_piper_attention_kernel(
         next_n_0 = _native_tile_start(
             route_base,
             next_position_0,
+            routed_sparse_tile_count,
             selected_sparse_tile_count,
             sparse_key_blocks,
             stride_rr,
+            use_sparse_routes,
         )
         next_n_1 = _native_tile_start(
             route_base,
             next_position_1,
+            routed_sparse_tile_count,
             selected_sparse_tile_count,
             sparse_key_blocks,
             stride_rr,
+            use_sparse_routes,
         )
         gl.barrier()
         _issue_tma_pair(
@@ -685,6 +709,7 @@ def _launch_sparse_piper_attention(
     ):
         raise ValueError("paired Gluon routed Piper requires padded M64/D128 query storage")
     total_query_blocks = storage_sequence_length // _BLOCK_M
+    sparse_query_blocks = prepared.sparse_query_blocks
     if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
         raise TypeError("sparse Piper query block offset must be an integer")
     if query_block_count is not None and (
@@ -783,6 +808,7 @@ def _launch_sparse_piper_attention(
         storage_sequence_length,
         logical_sequence_length,
         prepared.sparse_key_blocks,
+        total_query_blocks if sparse_query_blocks is None else sparse_query_blocks,
         stride_rb,
         stride_rq,
         stride_rr,
@@ -794,6 +820,7 @@ def _launch_sparse_piper_attention(
         heads,
         has_block_lengths,
         not has_block_lengths and logical_sequence_length != storage_sequence_length,
+        sparse_query_blocks is not None,
         has_coarse_residual,
         4,
         num_warps=4,

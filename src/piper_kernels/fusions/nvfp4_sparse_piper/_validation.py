@@ -8,6 +8,9 @@ from typing import cast
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM, TILE_ROWS
+from piper_kernels.attention.sparse_piper_attention._block_layout import (
+    validate_block_lengths as validate_k64_block_lengths,
+)
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 
@@ -75,4 +78,22 @@ def validate_qk_epilogue(
         raise ValueError(f"{name} norm epsilon must be finite and positive")
 
 
-__all__ = ["validate_projection", "validate_qk_epilogue"]
+def validate_block_lengths(
+    block_lengths: torch.Tensor | None,
+    sequence_length: int,
+    device: torch.device,
+    name: str,
+) -> None:
+    """Validate optional trusted valid-prefix metadata for one NVFP4 projection."""
+    if block_lengths is not None:
+        validate_k64_block_lengths(
+            block_lengths,
+            sequence_length=sequence_length,
+            device=device,
+            context=name,
+            require_contiguous=True,
+            check_values=False,
+        )
+
+
+__all__ = ["validate_block_lengths", "validate_projection", "validate_qk_epilogue"]

@@ -19,7 +19,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
 )
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
-from ._block_layout import valid_block_rows
+from ._block_layout import valid_block_rows, validate_sparse_query_blocks
 
 _BLOCK_M = 64
 _BLOCK_N = 64
@@ -108,6 +108,7 @@ class _PreparedSparsePiperAttention:
     head_keep_blocks: torch.Tensor
     block_lengths: torch.Tensor | None
     sparse_key_blocks: int
+    sparse_query_blocks: int | None
     logical_sequence_length: int
 
 
@@ -122,6 +123,7 @@ def _prepare_sparse_piper_attention(
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> _PreparedSparsePiperAttention:
     """Prepare grouped Q/K and one folded V scale per logical K64 tile."""
     if (
@@ -150,6 +152,11 @@ def _prepare_sparse_piper_attention(
         combined_value = torch.where(valid_rows, combined_value, 0)
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
     storage_sequence_length = tile_count * _BLOCK_N
+    validate_sparse_query_blocks(
+        sparse_query_blocks,
+        query_blocks=tile_count,
+        context="sparse Piper",
+    )
 
     key_mean, value_mean = piper_quantization.compute_kv_means(
         combined_key,
@@ -210,6 +217,7 @@ def _prepare_sparse_piper_attention(
         head_keep_blocks=head_keep_blocks,
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
+        sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
     )
 
@@ -230,6 +238,7 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     routes_per_query: int,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> _PreparedSparsePiperAttention:
     """Construct sparse Piper launch state from already-quantized operands.
 
@@ -310,6 +319,11 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         if block_lengths is not None
         else (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M
     )
+    validate_sparse_query_blocks(
+        sparse_query_blocks,
+        query_blocks=query_block_count,
+        context="quantized sparse Piper",
+    )
     if routes.shape != (batch, query_block_count, routes_per_query):
         raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
     if routes.dtype is not torch.uint16:
@@ -332,5 +346,6 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         head_keep_blocks=head_keep_blocks,
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
+        sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
     )

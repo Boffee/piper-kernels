@@ -46,7 +46,7 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
 from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v4"
+_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v5"
 _HEAD_DIM = layout.HEAD_DIM
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
@@ -204,13 +204,19 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
     )
 
 
+def _valid_coarse_projection(match: Match) -> bool:
+    if not _valid_projection(match):
+        return False
+    return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
+
+
 def _matched_node(match: Match, name: str) -> torch.fx.Node:
     node = match.kwargs[name]
     assert isinstance(node, torch.fx.Node)
     return node
 
 
-def _replace_projection(
+def _replace_projection(  # noqa: PLR0913, PLR0917
     match: Match,
     sparse_attention_shape: list[Argument],
     sparse_head_keep_ratio_units: list[int],
@@ -219,6 +225,11 @@ def _replace_projection(
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
     sparse_routing_mode: int,
+    sparse_block_lengths: torch.fx.Node | None = None,
+    sparse_query_blocks: Argument | None = None,
+    coarse_compression_gate: torch.fx.Node | None = None,
+    coarse_key_blocks: Argument | None = None,
+    coarse_scale: float | None = None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -244,6 +255,7 @@ def _replace_projection(
         sparse_attention_shape[1]
     )
     assert logical_sequence_length is not None
+    block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
     with graph.inserting_before(original):
         query_values = (
             input_value.new_empty((1, heads, storage_sequence_length, _HEAD_DIM), dtype=torch.int8),
@@ -268,6 +280,7 @@ def _replace_projection(
                 sparse_softmax_scale,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
                 sparse_routing_mode,
+                *block_length_arguments,
             ),
             query_values,
         )
@@ -298,6 +311,7 @@ def _replace_projection(
                 sparse_k_norm_epsilon,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
                 sparse_routing_mode,
+                *block_length_arguments,
             ),
             key_values,
         )
@@ -307,6 +321,7 @@ def _replace_projection(
                 *value_projection.storage_arguments(),
                 1,
                 logical_sequence_length,
+                *block_length_arguments,
             ),
         )
         value_mean_flat.meta["val"] = input_value.new_empty(
@@ -317,6 +332,7 @@ def _replace_projection(
             args=(value_mean_flat, (1, heads, _HEAD_DIM)),
         )
         value_mean.meta["val"] = input_value.new_empty((1, heads, _HEAD_DIM), dtype=torch.float32)
+        with_coarse_residual = coarse_compression_gate is not None
         value_values = (
             input_value.new_empty((1, heads, _HEAD_DIM, storage_sequence_length), dtype=torch.int8),
             input_value.new_empty(
@@ -324,28 +340,48 @@ def _replace_projection(
                 dtype=torch.float32,
             ),
         )
+        if with_coarse_residual:
+            value_values = (
+                *value_values,
+                input_value.new_empty(
+                    (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
+                    dtype=torch.float32,
+                ),
+            )
         value_nodes = linear_compile_fx.emit_tuple_result(
             graph,
-            torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default,
+            (
+                torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
+                if with_coarse_residual
+                else torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default
+            ),
             (
                 *value_projection.storage_arguments(),
                 value_mean,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
+                *block_length_arguments,
             ),
             value_values,
         )
-        replacement = graph.call_function(
-            torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-            args=(
-                *query_nodes,
-                *key_nodes,
-                *value_nodes,
-                value_mean,
-                sparse_head_keep_ratio_units,
-                sparse_key_blocks,
-                logical_sequence_length,
-                sparse_routing_mode,
-            ),
+        attention_arguments = (
+            *query_nodes,
+            *key_nodes,
+            *value_nodes[:2],
+            value_mean,
+        )
+        replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
+            graph,
+            attention_arguments,
+            head_keep_ratio_units=sparse_head_keep_ratio_units,
+            sparse_key_blocks=sparse_key_blocks,
+            logical_sequence_length=logical_sequence_length,
+            routing_mode=sparse_routing_mode,
+            block_lengths=sparse_block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
+            block_mean=value_nodes[2] if with_coarse_residual else None,
+            compression_gate=coarse_compression_gate,
+            coarse_scale=coarse_scale,
+            coarse_key_blocks=coarse_key_blocks,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -354,11 +390,19 @@ def _replace_projection(
 
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_projection")
-register_graph_pattern(
-    sparse_piper_pattern.sparse_piper_projection_pattern(_linear_pattern),
-    extra_check=_valid_projection,
-    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-)(_replace_projection)
+for _with_coarse in (True, False):
+    for _with_block_lengths in (True, False):
+        for _with_sparse_query_blocks in (True, False):
+            register_graph_pattern(
+                sparse_piper_pattern.sparse_piper_projection_pattern(
+                    _linear_pattern,
+                    with_block_lengths=_with_block_lengths,
+                    with_coarse=_with_coarse,
+                    with_sparse_query_blocks=_with_sparse_query_blocks,
+                ),
+                extra_check=_valid_coarse_projection if _with_coarse else _valid_projection,
+                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_projection)
 
 
 def _fold_projection(graph: torch.fx.Graph) -> bool:

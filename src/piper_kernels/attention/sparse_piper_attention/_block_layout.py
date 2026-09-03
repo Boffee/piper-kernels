@@ -1,4 +1,4 @@
-"""Shared valid-prefix K64 layout helpers for sparse Piper attention."""
+"""Shared K64 layout and query-scope helpers for sparse Piper attention."""
 
 from __future__ import annotations
 
@@ -42,7 +42,35 @@ def valid_block_rows(block_lengths: torch.Tensor) -> torch.Tensor:
     return torch.arange(TILE_ROWS, device=block_lengths.device)[None, :] < block_lengths[:, None]
 
 
+def validate_sparse_query_blocks(
+    sparse_query_blocks: int | None,
+    *,
+    query_blocks: int,
+    context: str,
+) -> None:
+    """Validate an optional leading sparse-query block count."""
+    if sparse_query_blocks is None:
+        return
+    if isinstance(sparse_query_blocks, bool):
+        raise TypeError(f"{context} sparse_query_blocks must be an integer or None")
+    if torch.compiler.is_compiling():
+        torch._check(
+            sparse_query_blocks >= 0,
+            lambda: f"{context} sparse_query_blocks must be nonnegative",
+        )
+        torch._check(
+            sparse_query_blocks <= query_blocks,
+            lambda: f"{context} sparse_query_blocks cannot exceed the query block count",
+        )
+        return
+    if not isinstance(sparse_query_blocks, int):
+        raise TypeError(f"{context} sparse_query_blocks must be an integer or None")
+    if not 0 <= sparse_query_blocks <= query_blocks:
+        raise ValueError(f"{context} sparse_query_blocks must fit the query block count")
+
+
 __all__ = [
     "valid_block_rows",
     "validate_block_lengths",
+    "validate_sparse_query_blocks",
 ]

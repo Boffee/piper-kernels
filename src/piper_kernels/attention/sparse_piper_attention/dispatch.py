@@ -10,7 +10,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
-from ._block_layout import validate_block_lengths
+from ._block_layout import validate_block_lengths, validate_sparse_query_blocks
 from ._budget import (
     _RATIO_SCALE,
     _normalize_head_keep_ratios,
@@ -72,15 +72,18 @@ class SparsePiperAttention(torch.nn.Module):
         value: torch.Tensor,
         *,
         sparse_key_blocks: int,
+        sparse_query_blocks: int | None = None,
         scale: float | None = None,
         block_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Route every query row over a complete-K64 prefix and dense suffix.
+        """Route leading query blocks over a sparse K64 prefix and dense suffix.
 
         Without ``block_lengths``, Q/K/V use compact BF16
         ``[batch, sequence, heads, 128]`` storage. Supplying one valid-prefix
         length per physical K64 block selects internally padded storage and
         returns that same physical layout; padded query outputs are unspecified.
+        ``sparse_query_blocks`` optionally limits routing to the leading query
+        blocks; all later query blocks attend every key block densely.
         """
         converted_scale = _validate_inputs(
             query,
@@ -88,6 +91,7 @@ class SparsePiperAttention(torch.nn.Module):
             value,
             self._head_keep_ratio_units,
             sparse_key_blocks=sparse_key_blocks,
+            sparse_query_blocks=sparse_query_blocks,
             scale=scale,
             block_lengths=block_lengths,
         )
@@ -100,6 +104,7 @@ class SparsePiperAttention(torch.nn.Module):
             converted_scale,
             self._routing_mode,
             block_lengths,
+            sparse_query_blocks,
         )
 
 
@@ -133,6 +138,7 @@ def _validate_inputs(
     head_keep_ratio_units: tuple[int, ...],
     *,
     sparse_key_blocks: int,
+    sparse_query_blocks: int | None,
     scale: float | None,
     block_lengths: torch.Tensor | None,
 ) -> float:
@@ -172,6 +178,11 @@ def _validate_inputs(
         sparse_key_blocks,
         available_sparse_key_blocks=sequence // _BLOCK_ROWS,
     )
+    validate_sparse_query_blocks(
+        sparse_query_blocks,
+        query_blocks=(sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
+        context="sparse Piper",
+    )
     converted_scale = head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(converted_scale) or converted_scale <= 0:
         raise ValueError("sparse Piper scale must be finite and positive")
@@ -185,6 +196,7 @@ def _run_sparse_piper_attention(
     layout: _ResolvedRouteLayout,
     *,
     sparse_key_blocks: int,
+    sparse_query_blocks: int | None,
     scale: float,
     target_is_sm120: bool,
     routing_mode: int,
@@ -213,6 +225,7 @@ def _run_sparse_piper_attention(
             sparse_key_blocks=sparse_key_blocks,
             scale=scale,
             block_lengths=block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
         )
 
     assert _launch_sm120_attention is not None
@@ -229,6 +242,7 @@ def _run_sparse_piper_attention(
         combined_key=key_head_major,
         combined_value=value_head_major,
         block_lengths=block_lengths,
+        sparse_query_blocks=sparse_query_blocks,
     )
     _launch_sm120_attention(prepared, output.transpose(1, 2))
     return output
@@ -244,6 +258,7 @@ def _sparse_piper_attention_op(
     scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     layout = _resolve_route_layout(
         tuple(head_keep_ratio_units),
@@ -257,6 +272,7 @@ def _sparse_piper_attention_op(
         value,
         layout,
         sparse_key_blocks=sparse_key_blocks,
+        sparse_query_blocks=sparse_query_blocks,
         scale=scale,
         target_is_sm120=_supports_sm120(target),
         routing_mode=routing_mode,
@@ -274,5 +290,6 @@ def _sparse_piper_attention_op_fake(
     _scale: float,
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
+    _sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)
