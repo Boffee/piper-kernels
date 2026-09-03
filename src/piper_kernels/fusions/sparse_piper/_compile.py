@@ -6,6 +6,7 @@ import math
 
 import torch
 from torch._inductor.pattern_matcher import Match
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
 from piper_kernels.attention.sparse_piper_attention import _budget
@@ -79,11 +80,7 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
         and coarse_scale is not None
         and sparse_key_blocks is not None
         and coarse_key_blocks is not None
-        and (
-            not isinstance(sparse_key_blocks, int)
-            or not isinstance(coarse_key_blocks, int)
-            or coarse_key_blocks >= sparse_key_blocks
-        )
+        and guard_or_false(coarse_key_blocks >= sparse_key_blocks)
     )
 
 
