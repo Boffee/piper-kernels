@@ -98,10 +98,12 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         qdata, scale = quantize_weight(source, group_size)
         return cls(qdata.contiguous(), scale.contiguous(), group_size, source.dtype)
 
-    def dequantize(self) -> torch.Tensor:
-        """Recover the logical weight in the unrotated basis."""
+    def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Recover the logical weight in the unrotated basis and requested dtype."""
         validate_storage(self.qdata, self.scale, self.group_size, self.dtype)
-        rotated = self.qdata.to(self.dtype) * self.scale.to(self.dtype)
+        if output_dtype is None:
+            output_dtype = self.dtype
+        rotated = self.qdata.to(output_dtype) * self.scale.to(output_dtype)
         return rotate_groups(rotated, self.group_size)
 
     def addmm_(

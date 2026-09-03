@@ -20,6 +20,27 @@ def test_dequantize_unrotates_the_stored_weight() -> None:
     assert torch.equal(wrapped.dequantize(), expected)
 
 
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_dequantize_accepts_an_output_dtype(output_dtype: torch.dtype) -> None:
+    qdata = torch.arange(-128, 128, dtype=torch.int8).reshape(16, 16)
+    scale = torch.linspace(0.001, 0.016, 16).reshape(16, 1)
+    wrapped = ConvRotInt8Tensor.from_quantized(
+        qdata,
+        scale,
+        group_size=16,
+        logical_dtype=torch.bfloat16,
+    )
+
+    actual = wrapped.dequantize(output_dtype)
+    expected = rotate_groups(
+        qdata.to(output_dtype) * scale.to(output_dtype),
+        16,
+    )
+
+    assert actual.dtype is output_dtype
+    assert torch.equal(actual, expected)
+
+
 def test_meta_tensor_preserves_storage_and_rotation_metadata() -> None:
     wrapped = ConvRotInt8Tensor.from_quantized(
         torch.empty(8, 64, dtype=torch.int8, device="meta"),
