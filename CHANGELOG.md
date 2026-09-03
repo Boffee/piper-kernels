@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the pooling-specific Sparse Piper coarse-residual helpers with the routing-selectable
+  `sparse_piper_coarse_residual`. The new helper returns an independent gated branch for callers
+  to compose with fine attention, while compatible compiler rewrites continue to fuse it.
+
 ## [0.7.0rc1] - 2026-09-02
 
 ### Added

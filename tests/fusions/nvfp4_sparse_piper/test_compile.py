@@ -20,8 +20,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels import (
     SparsePiperAttention,
-    mean_pool_coarse_residual,
-    minmax_pool_coarse_residual,
+    sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._routes import (
@@ -266,20 +265,22 @@ def _semantic_attention_graph(
                 "compression_gate",
                 torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
             )
-            output = graph.call_function(
+            coarse_output = graph.call_function(
                 torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
                 args=(
-                    output,
                     query,
                     key,
                     value,
                     compression_gate,
-                    2,
                     3,
                     0.125,
                     routing_mode,
                     *((block_lengths,) if with_block_lengths else ()),
                 ),
+            )
+            output = graph.call_function(
+                torch.ops.aten.add.Tensor,
+                args=(output, coarse_output),
             )
             output.meta["val"] = torch.empty(
                 (1, 192, 2, 128),
@@ -615,21 +616,17 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
         )
-        residual = (
-            mean_pool_coarse_residual if self.routing == "mean" else minmax_pool_coarse_residual
-        )
-        attention = residual(
-            fine_output,
+        coarse_output = sparse_piper_coarse_residual(
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks=self.sparse_key_blocks,
+            routing=self.routing,
             coarse_key_blocks=self.coarse_key_blocks,
             coarse_scale=self.coarse_scale,
             block_lengths=block_lengths,
         )
-        return self.output(attention.flatten(2))
+        return self.output((fine_output + coarse_output).flatten(2))
 
 
 def _nvfp4_storage(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:

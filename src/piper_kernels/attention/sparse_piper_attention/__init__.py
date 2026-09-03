@@ -8,8 +8,7 @@ from .coarse import (
     mean_pool_block_values,
 )
 from .dispatch import SparsePiperAttention
-from .mean_pool import mean_pool_coarse_residual
-from .minmax_pool import minmax_pool_coarse_residual
+from .residual import sparse_piper_coarse_residual
 
 __all__ = [
     "SparsePiperAttention",
@@ -17,6 +16,5 @@ __all__ = [
     "coarse_attention",
     "coarse_attention_residual",
     "mean_pool_block_values",
-    "mean_pool_coarse_residual",
-    "minmax_pool_coarse_residual",
+    "sparse_piper_coarse_residual",
 ]

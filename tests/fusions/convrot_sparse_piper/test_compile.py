@@ -9,8 +9,7 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import (
     SparsePiperAttention,
-    mean_pool_coarse_residual,
-    minmax_pool_coarse_residual,
+    sparse_piper_coarse_residual,
 )
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -186,22 +185,17 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
         )
-        residual = (
-            mean_pool_coarse_residual
-            if self.coarse_routing == "mean"
-            else minmax_pool_coarse_residual
-        )
-        return residual(
-            fine_output,
+        coarse_output = sparse_piper_coarse_residual(
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks=self.sparse_key_blocks,
+            routing=self.coarse_routing,
             coarse_key_blocks=self.coarse_key_blocks,
             coarse_scale=self.coarse_scale,
             block_lengths=block_lengths,
         )
+        return fine_output + coarse_output
 
 
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
@@ -285,6 +279,7 @@ class _DynamicCoarseSparseProjectionAttention(_DynamicSparseProjectionAttention)
         sin: torch.Tensor,
         sparse_key_blocks: int,
         compression_gate: torch.Tensor,
+        coarse_key_blocks: int | None = None,
     ) -> torch.Tensor:
         batch, sequence, _features = hidden_states.shape
         query = self._dynamic_norm_rope(
@@ -306,16 +301,18 @@ class _DynamicCoarseSparseProjectionAttention(_DynamicSparseProjectionAttention)
             value,
             sparse_key_blocks=sparse_key_blocks,
         )
-        return mean_pool_coarse_residual(
-            fine_output,
+        coarse_output = sparse_piper_coarse_residual(
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks=sparse_key_blocks,
-            coarse_key_blocks=(sequence + 63) // 64,
+            routing="mean",
+            coarse_key_blocks=(
+                (sequence + 63) // 64 if coarse_key_blocks is None else coarse_key_blocks
+            ),
             coarse_scale=self.coarse_scale,
         )
+        return fine_output + coarse_output
 
 
 def _make_output_projection(
@@ -1376,6 +1373,81 @@ def test_cuda_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
         )
         == 1
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
+    torch.manual_seed(712)
+    model = _DynamicCoarseSparseProjectionAttention().eval()
+    sequence = 192
+    hidden_states = torch.randn(
+        model.batch,
+        sequence,
+        model.input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    compression_gate = torch.randn(
+        model.batch,
+        sequence,
+        model.heads,
+        model.head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    angles = torch.rand(
+        sequence,
+        model.rotary_dim,
+        device="cuda",
+        dtype=torch.float32,
+    ).mul_(2 * torch.pi)
+    cos = angles.cos().contiguous()
+    sin = angles.sin().contiguous()
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+
+    with torch.no_grad():
+        expected_narrow = model(
+            hidden_states,
+            cos,
+            sin,
+            3,
+            compression_gate,
+            2,
+        )
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            model,
+            dynamic=True,
+            fullgraph=True,
+            options=options,
+        )
+        wide = compiled(hidden_states, cos, sin, 2, compression_gate, 3)
+        assert bool(torch.isfinite(wide).all())
+        assert capture.calls == 1
+        assert (
+            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+            in capture.targets
+        )
+
+        narrow = compiled(hidden_states, cos, sin, 3, compression_gate, 2)
+
+    relative_l2 = (narrow.float() - expected_narrow.float()).norm() / expected_narrow.float().norm()
+    assert relative_l2 < 0.025
+    assert capture.calls == 2
+    assert (
+        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+        not in capture.targets
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention.default in capture.targets
+    assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default in capture.targets
 
 
 @pytest.mark.gpu

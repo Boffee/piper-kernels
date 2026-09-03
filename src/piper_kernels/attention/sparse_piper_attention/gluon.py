@@ -619,7 +619,7 @@ def _sparse_piper_attention_kernel(
         else:
             gate = gl.load(compression_gate_ptr + gate_offsets).to(gl.float32)
         fine_output = output.to(gl.bfloat16).to(gl.float32)
-        residual = _mul_fp32(gate, coarse[None, :])
+        residual = _mul_fp32(gate, coarse[None, :]).to(gl.bfloat16).to(gl.float32)
         output = _add_fp32(fine_output, residual)
     output_offsets = (
         batch * stride_ob

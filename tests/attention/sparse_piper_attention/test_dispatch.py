@@ -67,7 +67,7 @@ def test_backend_owns_only_an_immutable_semantic_ratio_profile() -> None:
 
 
 def test_routing_policy_is_validated_at_construction() -> None:
-    with pytest.raises(ValueError, match="'minmax' or 'mean'"):
+    with pytest.raises(ValueError, match="'mean' or 'minmax'"):
         SparsePiperAttention((1.0,), routing="unknown")
 
 

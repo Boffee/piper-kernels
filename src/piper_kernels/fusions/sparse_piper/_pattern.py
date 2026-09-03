@@ -193,18 +193,17 @@ def sparse_piper_projection_pattern(
         return fine_output
     coarse_arguments = (
         torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
-        fine_output,
         query,
         key,
         value,
         KeywordArg("coarse_compression_gate"),
-        sparse_key_blocks,
         KeywordArg("coarse_key_blocks"),
         KeywordArg("coarse_scale"),
         KeywordArg("coarse_routing_mode"),
         *((block_lengths,) if block_lengths is not None else ()),
     )
-    return CallFunction(*coarse_arguments)
+    coarse_output = CallFunction(*coarse_arguments, _users=1)
+    return CallFunction(torch.ops.aten.add.Tensor, fine_output, coarse_output)
 
 
 def reshaped_quantized_attention_pattern(

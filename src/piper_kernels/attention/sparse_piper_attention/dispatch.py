@@ -17,7 +17,7 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
-from ._routes import _ROUTING_MODE_BY_NAME, _ROUTING_NAME_BY_MODE, validate_routing_mode
+from ._routes import _ROUTING_NAME_BY_MODE, routing_mode_from_name, validate_routing_mode
 from ._routing import packed_routes_from_sequences
 from .reference import reference_sparse_piper_attention
 
@@ -50,10 +50,7 @@ class SparsePiperAttention(torch.nn.Module):
     ) -> None:
         super().__init__()
         self._head_keep_ratio_units = _normalize_head_keep_ratios(head_keep_ratios)
-        try:
-            self._routing_mode = _ROUTING_MODE_BY_NAME[routing]
-        except (KeyError, TypeError) as exc:
-            raise ValueError("sparse Piper routing must be 'minmax' or 'mean'") from exc
+        self._routing_mode = routing_mode_from_name(routing)
 
     @property
     def head_keep_ratios(self) -> tuple[float, ...]:

@@ -281,32 +281,32 @@ another graph or SM120 attention kernel. Routes remain call-local because both p
 the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler rewrites preserve
 the selected policy while producing its summaries directly from fused projections.
 
-Sparse Piper also exposes a policy-independent coarse-attention residual:
+Sparse Piper also exposes a routing-selectable Q/K/V-derived coarse-attention residual:
 
 ```python
-from piper_kernels import mean_pool_coarse_residual
+from piper_kernels import sparse_piper_coarse_residual
 
-output = mean_pool_coarse_residual(
-    fine_output,
+coarse_output = sparse_piper_coarse_residual(
     query,
     key,
     value,
     compression_gate,
-    sparse_key_blocks=sparse_key_blocks,
+    routing="mean",  # or "minmax"
     coarse_key_blocks=total_key_blocks,
     coarse_scale=coarse_scale,
     block_lengths=block_lengths,
 )
+output = fine_output + coarse_output
 ```
 
-This convenience path mean-pools Q and K/V blocks, applies dense coarse attention, expands each
-result over its physical K64 query block, multiplies the caller-provided gate directly without an
-implicit activation, and adds it to fine attention. `coarse_key_blocks` may include blocks after the
-sparse-routing prefix, including a partial compact tail; omitting it preserves the original
-`sparse_key_blocks` scope. `block_lengths` is optional for compact storage and selects valid-front
-internally padded storage when supplied. The `minmax_pool_coarse_residual` convenience API
-derives extrema-based scores under the same layout contract, while
-`coarse_attention_residual` remains available for learned or already-materialized block scores.
+The selected policy derives mean- or extrema-based Q/K block scores, mean-pools V blocks, applies
+dense coarse attention, expands each result over its physical K64 query block, multiplies the
+caller-provided gate directly without an implicit activation, and returns the independent residual
+for the caller to compose. The optional `coarse_key_blocks` prefix may include a partial compact
+tail and defaults to every available block.
+`block_lengths` is optional for compact storage and selects valid-front internally padded storage
+when supplied. `coarse_attention_residual` remains available for learned or already-materialized
+block scores.
 These composable implementations are the correctness and training contract; compatible compiled
 ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
 and gated residual, including valid-front padded storage.

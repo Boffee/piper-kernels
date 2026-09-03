@@ -7,7 +7,7 @@ import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
     coarse_attention_residual,
     mean_pool_block_values,
-    minmax_pool_coarse_residual,
+    sparse_piper_coarse_residual,
 )
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
@@ -233,15 +233,14 @@ def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
         assert torch.equal(routes.indices, expected_routes.indices)
 
 
-def test_minmax_pool_coarse_residual_matches_padded_sparse_prefix_composition(monkeypatch) -> None:
+def test_sparse_piper_coarse_residual_matches_padded_minmax_composition(monkeypatch) -> None:
     monkeypatch.setattr(routing_module, "_QUERY_CHUNK_BLOCKS", 2)
     generator = torch.Generator().manual_seed(642)
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
     shape = (1, 3 * 64, 2, 8)
-    fine_output, query, key, value, compression_gate = [
-        torch.randn(shape, generator=generator) for _ in range(5)
+    query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(4)
     ]
-    sparse_key_blocks = 2
     coarse_key_blocks = 3
     coarse_scale = shape[-1] ** -0.5
     query_summary, key_max, key_min = _sequence_block_summaries(
@@ -251,18 +250,16 @@ def test_minmax_pool_coarse_residual_matches_padded_sparse_prefix_composition(mo
     )
     pooled_value = mean_pool_block_values(value, block_lengths)[:, :, :coarse_key_blocks]
     expected = coarse_attention_residual(
-        fine_output,
         _minmax_pool_scores(query_summary, key_max, key_min) * coarse_scale,
         pooled_value,
         compression_gate,
     )
-    actual = minmax_pool_coarse_residual(
-        fine_output,
+    actual = sparse_piper_coarse_residual(
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks=sparse_key_blocks,
+        routing="minmax",
         coarse_key_blocks=coarse_key_blocks,
         coarse_scale=coarse_scale,
         block_lengths=block_lengths,
@@ -271,11 +268,11 @@ def test_minmax_pool_coarse_residual_matches_padded_sparse_prefix_composition(mo
     torch.testing.assert_close(actual, expected)
 
 
-def test_minmax_pool_coarse_residual_can_include_a_partial_block_after_sparse_prefix() -> None:
+def test_sparse_piper_coarse_residual_minmax_can_include_a_partial_block() -> None:
     generator = torch.Generator().manual_seed(645)
     shape = (1, 129, 1, 4)
-    fine_output, query, key, value, compression_gate = [
-        torch.randn(shape, generator=generator) for _ in range(5)
+    query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(4)
     ]
     coarse_scale = shape[-1] ** -0.5
     query_summary, key_max, key_min = _sequence_block_summaries(
@@ -283,18 +280,16 @@ def test_minmax_pool_coarse_residual_can_include_a_partial_block_after_sparse_pr
         key.transpose(1, 2),
     )
     expected = coarse_attention_residual(
-        fine_output,
         _minmax_pool_scores(query_summary, key_max, key_min) * coarse_scale,
         mean_pool_block_values(value),
         compression_gate,
     )
-    actual = minmax_pool_coarse_residual(
-        fine_output,
+    actual = sparse_piper_coarse_residual(
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks=2,
+        routing="minmax",
         coarse_key_blocks=3,
         coarse_scale=coarse_scale,
     )
@@ -303,26 +298,25 @@ def test_minmax_pool_coarse_residual_can_include_a_partial_block_after_sparse_pr
 
 
 @pytest.mark.parametrize("compile_function", [False, True])
-def test_minmax_pool_coarse_residual_preserves_composed_gradients(
+def test_sparse_piper_coarse_residual_minmax_preserves_gradients(
     compile_function: bool,
 ) -> None:
     generator = torch.Generator().manual_seed(643)
     shape = (1, 129, 1, 4)
-    tensors = [torch.randn(shape, generator=generator, requires_grad=True) for _ in range(5)]
-    fine_output, query, key, value, compression_gate = tensors
+    tensors = [torch.randn(shape, generator=generator, requires_grad=True) for _ in range(4)]
+    query, key, value, compression_gate = tensors
 
     residual = (
-        torch.compile(minmax_pool_coarse_residual, backend="eager", fullgraph=True)
+        torch.compile(sparse_piper_coarse_residual, backend="eager", fullgraph=True)
         if compile_function
-        else minmax_pool_coarse_residual
+        else sparse_piper_coarse_residual
     )
     output = residual(
-        fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks=2,
+        routing="minmax",
         coarse_scale=shape[-1] ** -0.5,
     )
     output.square().sum().backward()
@@ -332,11 +326,11 @@ def test_minmax_pool_coarse_residual_preserves_composed_gradients(
         assert bool(torch.all(torch.isfinite(tensor.grad)))
 
 
-def test_minmax_pool_coarse_residual_compiles_with_dynamic_block_lengths() -> None:
+def test_sparse_piper_coarse_residual_minmax_compiles_with_dynamic_block_lengths() -> None:
     generator = torch.Generator().manual_seed(644)
     shape = (1, 2 * 64, 1, 4)
-    fine_output, query, key, value, compression_gate = [
-        torch.randn(shape, generator=generator) for _ in range(5)
+    query, key, value, compression_gate = [
+        torch.randn(shape, generator=generator) for _ in range(4)
     ]
     captured_graphs = []
 
@@ -345,13 +339,12 @@ def test_minmax_pool_coarse_residual_compiles_with_dynamic_block_lengths() -> No
         return graph.forward
 
     def run(candidate_block_lengths):
-        return minmax_pool_coarse_residual(
-            fine_output,
+        return sparse_piper_coarse_residual(
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks=2,
+            routing="minmax",
             coarse_scale=shape[-1] ** -0.5,
             block_lengths=candidate_block_lengths,
         )

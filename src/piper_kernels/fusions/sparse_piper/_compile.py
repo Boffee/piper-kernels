@@ -6,6 +6,7 @@ import math
 
 import torch
 from torch._inductor.pattern_matcher import Match
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
 from piper_kernels.attention.sparse_piper_attention import _budget
@@ -60,6 +61,8 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
     gate = preparation_sharing.tensor_metadata(gate_node)
     output = preparation_sharing.tensor_metadata(match.output_node())
     coarse_scale = _positive_float(match.kwargs["coarse_scale"])
+    sparse_key_blocks = integer_scalar_metadata(match.kwargs["sparse_key_blocks"])
+    coarse_key_blocks = integer_scalar_metadata(match.kwargs["coarse_key_blocks"])
     return bool(
         gate is not None
         and output is not None
@@ -75,6 +78,9 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
             for gate_dimension, output_dimension in zip(gate.shape, output.shape, strict=True)
         )
         and coarse_scale is not None
+        and sparse_key_blocks is not None
+        and coarse_key_blocks is not None
+        and guard_or_false(coarse_key_blocks >= sparse_key_blocks)
     )
 
 
