@@ -30,45 +30,45 @@ from .coarse import (
 _QUERY_CHUNK_BLOCKS = 384
 
 
-def coarse_residual(
-    fine_output: torch.Tensor,
+def _coarse_residual_from_mode(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     compression_gate: torch.Tensor,
     *,
-    sparse_key_blocks: int,
     coarse_key_blocks: int | None,
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Add one policy-selected coarse branch while preserving its graph boundary."""
+    """Return one policy-selected coarse branch while preserving its graph boundary."""
     validate_routing_mode(routing_mode)
-    resolved_coarse_key_blocks = (
-        sparse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
-    )
-    if _preserve_coarse_residual_in_graph(fine_output, query, key, value, compression_gate):
+    if _preserve_coarse_residual_in_graph(query, key, value, compression_gate):
+        resolved_coarse_key_blocks = (
+            (
+                block_lengths.numel()
+                if block_lengths is not None
+                else (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+            )
+            if coarse_key_blocks is None
+            else coarse_key_blocks
+        )
         return torch.ops.piper_kernels.sparse_piper_coarse_residual.default(
-            fine_output,
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks,
             resolved_coarse_key_blocks,
             coarse_scale,
             routing_mode,
             block_lengths,
         )
     return coarse_residual_impl(
-        fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks=sparse_key_blocks,
-        coarse_key_blocks=resolved_coarse_key_blocks,
+        coarse_key_blocks=coarse_key_blocks,
         coarse_scale=coarse_scale,
         routing_mode=routing_mode,
         block_lengths=block_lengths,
@@ -76,14 +76,12 @@ def coarse_residual(
 
 
 def coarse_residual_impl(
-    fine_output: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     compression_gate: torch.Tensor,
     *,
-    sparse_key_blocks: int,
-    coarse_key_blocks: int,
+    coarse_key_blocks: int | None,
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
@@ -91,12 +89,10 @@ def coarse_residual_impl(
     """Apply the common Q/K/V-derived coarse residual implementation."""
     validate_routing_mode(routing_mode)
     coarse_key_blocks = validate_coarse_residual_inputs(
-        fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks,
         coarse_key_blocks,
         coarse_scale,
         block_lengths,
@@ -112,7 +108,6 @@ def coarse_residual_impl(
     )
     pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :coarse_key_blocks]
     return _apply_chunked_coarse_residual(
-        fine_output,
         pooled_value,
         compression_gate,
         score_chunks(
@@ -316,7 +311,6 @@ def _validate_summaries(
 
 
 __all__ = [
-    "coarse_residual",
     "coarse_residual_impl",
     "packed_routes_and_coarse_from_summaries",
     "packed_routes_from_sequences",

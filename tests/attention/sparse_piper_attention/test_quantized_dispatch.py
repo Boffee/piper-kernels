@@ -218,8 +218,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
             scores * coarse_scale,
             block_mean[:, :, :coarse_key_blocks],
         )
-        expected = apply_coarse_attention_residual(
-            fine_output,
+        expected = fine_output + apply_coarse_attention_residual(
             expected_coarse,
             compression_gate,
         )
@@ -303,8 +302,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     query_block_offset = 0
     with torch.no_grad():
         _launch_sparse_piper_attention(prepared, fine_output.transpose(1, 2))
-        expected = apply_coarse_attention_residual(
-            fine_output,
+        expected = fine_output + apply_coarse_attention_residual(
             coarse_output,
             compression_gate,
         )
@@ -342,7 +340,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
             query_block_offset += range_block_count
 
     ranged_output = torch.cat(chunks, dim=1)
-    assert torch.equal(full_output, expected)
+    torch.testing.assert_close(full_output, expected, atol=0.0078125, rtol=0.0078125)
     assert torch.equal(ranged_output, full_output)
 
 
@@ -542,8 +540,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
             block_lengths,
             2,
         )
-        expected = apply_coarse_attention_residual(
-            fine_output,
+        expected = fine_output + apply_coarse_attention_residual(
             coarse_attention(
                 scores * coarse_scale,
                 block_mean[:, :, :coarse_key_blocks],

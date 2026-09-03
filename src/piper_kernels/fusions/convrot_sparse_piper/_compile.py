@@ -32,8 +32,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     _summaries,
     coarse,
     dispatch,
-    mean_pool,
-    minmax_pool,
+    residual,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
     _MEAN_ROUTING,
@@ -51,7 +50,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v19"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v20"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -83,8 +82,7 @@ def _source_files() -> tuple[str, ...]:
             dispatch.__file__,
             _routing.__file__,
             _summaries.__file__,
-            mean_pool.__file__,
-            minmax_pool.__file__,
+            residual.__file__,
             _compile_fx.__file__,
         )
         if file_name is not None

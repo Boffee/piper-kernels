@@ -24,10 +24,9 @@ from piper_kernels import (
     coarse_attention,
     coarse_attention_residual,
     mean_pool_block_values,
-    mean_pool_coarse_residual,
-    minmax_pool_coarse_residual,
     piper_attention,
     sage_attention_2pp,
+    sparse_piper_coarse_residual,
 )
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
     convrot_nvfp4_sparse_piper_compile_options,
@@ -153,19 +152,17 @@ def test_public_packages_import() -> None:
     assert piper_kernels.apply_coarse_attention_residual is apply_coarse_attention_residual
     assert piper_kernels.coarse_attention is coarse_attention
     assert piper_kernels.coarse_attention_residual is coarse_attention_residual
-    assert piper_kernels.minmax_pool_coarse_residual is minmax_pool_coarse_residual
     assert piper_kernels.mean_pool_block_values is mean_pool_block_values
-    assert piper_kernels.mean_pool_coarse_residual is mean_pool_coarse_residual
+    assert piper_kernels.sparse_piper_coarse_residual is sparse_piper_coarse_residual
     assert piper_kernels.__all__ == [
         "SparsePiperAttention",
         "apply_coarse_attention_residual",
         "coarse_attention",
         "coarse_attention_residual",
         "mean_pool_block_values",
-        "mean_pool_coarse_residual",
-        "minmax_pool_coarse_residual",
         "piper_attention",
         "sage_attention_2pp",
+        "sparse_piper_coarse_residual",
     ]
     assert piper_kernels.attention.__name__ == "piper_kernels.attention"
     assert piper_kernels.attention.piper_attention.__name__ == (

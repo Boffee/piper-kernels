@@ -239,6 +239,14 @@ def validate_routing_mode(routing_mode: int) -> None:
         raise ValueError("sparse Piper routing mode must be minmax or mean")
 
 
+def routing_mode_from_name(routing: str) -> int:
+    """Resolve a public routing name to its static operator mode."""
+    try:
+        return _ROUTING_MODE_BY_NAME[routing]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("sparse Piper routing must be 'mean' or 'minmax'") from exc
+
+
 def is_valid_routing_mode(routing_mode: int) -> bool:
     """Return whether a value names a supported static routing policy."""
     return routing_mode in _ROUTING_NAME_BY_MODE
@@ -247,12 +255,12 @@ def is_valid_routing_mode(routing_mode: int) -> bool:
 __all__ = [
     "_MEAN_ROUTING",
     "_MINMAX_ROUTING",
-    "_ROUTING_MODE_BY_NAME",
     "_ROUTING_NAME_BY_MODE",
     "PackedRouteAndCoarseBuilder",
     "PackedRouteBuilder",
     "PackedRoutes",
     "PackedRoutesAndCoarseOutput",
     "is_valid_routing_mode",
+    "routing_mode_from_name",
     "validate_routing_mode",
 ]

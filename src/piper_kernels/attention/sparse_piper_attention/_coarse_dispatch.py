@@ -19,12 +19,10 @@ def _routing_label(routing_mode: int) -> str:
     mutates_args=(),
 )
 def _sparse_piper_coarse_residual_op(
-    fine_output: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     compression_gate: torch.Tensor,
-    sparse_key_blocks: int,
     coarse_key_blocks: int,
     coarse_scale: float,
     routing_mode: int,
@@ -32,12 +30,10 @@ def _sparse_piper_coarse_residual_op(
 ) -> torch.Tensor:
     """Preserve a Q/K/V-derived coarse residual as one semantic operation."""
     return coarse_residual_impl(
-        fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks=sparse_key_blocks,
         coarse_key_blocks=coarse_key_blocks,
         coarse_scale=coarse_scale,
         routing_mode=routing_mode,
@@ -47,27 +43,23 @@ def _sparse_piper_coarse_residual_op(
 
 @_sparse_piper_coarse_residual_op.register_fake
 def _sparse_piper_coarse_residual_op_fake(
-    fine_output: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     compression_gate: torch.Tensor,
-    sparse_key_blocks: int,
     coarse_key_blocks: int,
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     validate_coarse_residual_inputs(
-        fine_output,
         query,
         key,
         value,
         compression_gate,
-        sparse_key_blocks,
         coarse_key_blocks,
         coarse_scale,
         block_lengths,
         routing_label=_routing_label(routing_mode),
     )
-    return torch.empty_like(fine_output, memory_format=torch.contiguous_format)
+    return torch.empty_like(query, memory_format=torch.contiguous_format)

@@ -25,13 +25,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   attention launches that pass `block_lengths`, block-level coarse output, and the token-level
   compression gate directly into each projection chunk instead of materializing the full BF16
   attention result.
-- Added a policy-independent Sparse Piper coarse-attention residual. Caller-provided FP32 block
-  scores from mean pooling, min/max pooling, or learned policies attend over padding-aware pooled
-  V, expand over physical K64 query blocks, and apply a token-level compression gate before the
-  residual add. The `mean_pool_coarse_residual` and `minmax_pool_coarse_residual` convenience paths
-  derive bounded-workspace scores directly from Q/K/V, including valid-front padded block
-  summaries. Their optional `coarse_key_blocks` scope can extend beyond the sparse-routing prefix
-  and is preserved by the compatible ConvRot INT8 compiler fusion.
+- Added policy-independent Sparse Piper coarse-attention residual primitives. Caller-provided FP32
+  block scores from mean pooling, min/max pooling, or learned policies attend over padding-aware
+  pooled V, expand over physical K64 query blocks, and apply a token-level compression gate before
+  the caller's residual add. The `sparse_piper_coarse_residual` convenience path selects mean or
+  min/max routing and returns that independent gated branch while deriving bounded-workspace
+  scores directly from Q/K/V, including valid-front padded block summaries. Its optional
+  `coarse_key_blocks` scope can extend beyond the sparse-routing prefix and is preserved by the
+  compatible ConvRot INT8 compiler fusion.
 - Added high-precision constructors for ordinary and ConvRot NVFP4 weights. They can derive a
   finite global scale in the stored basis, including well-defined all-zero storage, while ConvRot
   owns rotation before quantization.

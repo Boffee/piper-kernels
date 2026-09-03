@@ -9,8 +9,7 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import (
     SparsePiperAttention,
-    mean_pool_coarse_residual,
-    minmax_pool_coarse_residual,
+    sparse_piper_coarse_residual,
 )
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -186,22 +185,17 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
         )
-        residual = (
-            mean_pool_coarse_residual
-            if self.coarse_routing == "mean"
-            else minmax_pool_coarse_residual
-        )
-        return residual(
-            fine_output,
+        coarse_output = sparse_piper_coarse_residual(
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks=self.sparse_key_blocks,
+            routing=self.coarse_routing,
             coarse_key_blocks=self.coarse_key_blocks,
             coarse_scale=self.coarse_scale,
             block_lengths=block_lengths,
         )
+        return fine_output + coarse_output
 
 
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
@@ -306,16 +300,16 @@ class _DynamicCoarseSparseProjectionAttention(_DynamicSparseProjectionAttention)
             value,
             sparse_key_blocks=sparse_key_blocks,
         )
-        return mean_pool_coarse_residual(
-            fine_output,
+        coarse_output = sparse_piper_coarse_residual(
             query,
             key,
             value,
             compression_gate,
-            sparse_key_blocks=sparse_key_blocks,
+            routing="mean",
             coarse_key_blocks=(sequence + 63) // 64,
             coarse_scale=self.coarse_scale,
         )
+        return fine_output + coarse_output
 
 
 def _make_output_projection(
