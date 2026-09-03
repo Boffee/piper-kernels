@@ -221,7 +221,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     query_chunk_rows: int,
     block_lengths: torch.Tensor | None = None,
     block_mean: torch.Tensor | None = None,
-    compression_gate: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
@@ -254,11 +254,11 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         routing_mode,
         block_lengths,
         block_mean,
-        compression_gate,
+        coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
-        has_projected_compression_gate=gate_projection is not None,
+        has_projected_coarse_gate=gate_projection is not None,
     )
     sequence_length = prepared.sequence_length
     capacity = min(sequence_length, query_chunk_rows)
@@ -298,7 +298,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         project_chunk,
         (prepared_input, prepared_scale),
-        project_gate_chunk=(None if gate_projection is None else gate_projection.project),
+        project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
     )
 
 
@@ -328,7 +328,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
     block_lengths: torch.Tensor | None = None,
     block_mean: torch.Tensor | None = None,
-    compression_gate: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
@@ -384,7 +384,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         block_lengths,
         block_mean,
-        compression_gate,
+        coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
@@ -415,7 +415,7 @@ def _attention_output_op_fake(
     _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
     block_lengths: torch.Tensor | None = None,
     _block_mean: torch.Tensor | None = None,
-    _compression_gate: torch.Tensor | None = None,
+    _coarse_gate: torch.Tensor | None = None,
     _coarse_scale: float | None = None,
     _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,

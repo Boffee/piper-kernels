@@ -260,9 +260,9 @@ def _semantic_attention_graph(
             dtype=torch.bfloat16,
         )
         if with_coarse:
-            compression_gate = _placeholder(
+            coarse_gate = _placeholder(
                 graph,
-                "compression_gate",
+                "coarse_gate",
                 torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
             )
             coarse_output = graph.call_function(
@@ -271,7 +271,7 @@ def _semantic_attention_graph(
                     query,
                     key,
                     value,
-                    compression_gate,
+                    coarse_gate,
                     3,
                     0.125,
                     routing_mode,
@@ -357,9 +357,9 @@ def _quantized_attention_output_graph(
                 "block_mean",
                 torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
             )
-            compression_gate = _placeholder(
+            coarse_gate = _placeholder(
                 graph,
-                "compression_gate",
+                "coarse_gate",
                 torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
             )
             attention = graph.call_function(
@@ -367,7 +367,7 @@ def _quantized_attention_output_graph(
                 args=(
                     *operands,
                     block_mean,
-                    compression_gate,
+                    coarse_gate,
                     [5_000, 10_000],
                     2,
                     192,
@@ -596,7 +596,7 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        compression_gate: torch.Tensor,
+        coarse_gate: torch.Tensor,
         block_lengths: torch.Tensor,
         sparse_query_blocks: int,
     ) -> torch.Tensor:
@@ -620,7 +620,7 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
             query,
             key,
             value,
-            compression_gate,
+            coarse_gate,
             routing=self.routing,
             coarse_key_blocks=self.coarse_key_blocks,
             coarse_scale=self.coarse_scale,
@@ -666,7 +666,7 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
         block_lengths: torch.Tensor,
         sparse_query_blocks: int,
     ) -> torch.Tensor:
-        compression_gate = self.gate(hidden_states).view(
+        coarse_gate = self.gate(hidden_states).view(
             self.batch,
             self.sequence_length,
             self.heads,
@@ -674,7 +674,7 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
         )
         return super().forward(
             hidden_states,
-            compression_gate,
+            coarse_gate,
             block_lengths,
             sparse_query_blocks,
         )
@@ -703,7 +703,7 @@ def _run_explicit_attention_output(
     model: _SparseProjectionAttentionOutput,
     hidden_states: torch.Tensor,
     *,
-    compression_gate: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
@@ -745,7 +745,7 @@ def _run_explicit_attention_output(
     ).view(model.batch, model.heads, model.head_dim)
     value = (
         fused_value.project_value_with_block_means
-        if compression_gate is not None
+        if coarse_gate is not None
         else fused_value.project_value
     )(
         *v_input,
@@ -756,7 +756,7 @@ def _run_explicit_attention_output(
         block_lengths,
     )
     attention_arguments = (*query, *key, *value[:2], value_mean)
-    if compression_gate is None:
+    if coarse_gate is None:
         optional_arguments = (
             (block_lengths, sparse_query_blocks)
             if sparse_query_blocks is not None
@@ -778,7 +778,7 @@ def _run_explicit_attention_output(
         attention = coarse_attention(
             *attention_arguments,
             value[2],
-            compression_gate,
+            coarse_gate,
             list(model.sparse_attention._head_keep_ratio_units),
             model.sparse_key_blocks,
             model.sequence_length,
@@ -1166,7 +1166,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    compression_gate = torch.randn(
+    coarse_gate = torch.randn(
         (model.batch, model.sequence_length, model.heads, model.head_dim),
         device="cuda",
         dtype=torch.bfloat16,
@@ -1178,7 +1178,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         expected = _run_explicit_attention_output(
             model,
             hidden_states,
-            compression_gate=compression_gate,
+            coarse_gate=coarse_gate,
             block_lengths=block_lengths,
             sparse_query_blocks=2,
         )
@@ -1189,7 +1189,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
             options=_options_with_capture(capture),
         )(
             hidden_states,
-            compression_gate,
+            coarse_gate,
             block_lengths,
             2,
         )
@@ -1226,7 +1226,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
-def test_cuda_compile_lifetime_chunks_a_projected_compression_gate(
+def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
     dynamic: bool,
     routing: str,
     preparation_count: int,
@@ -1246,7 +1246,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_compression_gate(
     capture = _TargetCapturePass()
     with torch.no_grad():
         gate_input = _prepare_nvfp4_input(hidden_states, model.gate.weight)
-        compression_gate = nvfp4_ops.linear_prepared(
+        coarse_gate = nvfp4_ops.linear_prepared(
             *gate_input,
             *_nvfp4_storage(model.gate.weight),
             model.gate.bias,
@@ -1260,7 +1260,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_compression_gate(
         expected = _run_explicit_attention_output(
             model,
             hidden_states,
-            compression_gate=compression_gate,
+            coarse_gate=coarse_gate,
             block_lengths=block_lengths,
             sparse_query_blocks=2,
         )

@@ -472,7 +472,7 @@ def _explicit_fused_projected_gate(
         4_096,
         block_lengths,
     )
-    compression_gate = nvfp4_ops.linear_prepared(
+    coarse_gate = nvfp4_ops.linear_prepared(
         *gate_input,
         gate_weight.qdata,
         gate_weight.scale,
@@ -498,7 +498,7 @@ def _explicit_fused_projected_gate(
         8_192,
         block_lengths,
         value[2],
-        compression_gate,
+        coarse_gate,
         model.coarse_scale,
         model.coarse_key_blocks,
         sparse_query_blocks,

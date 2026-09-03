@@ -306,7 +306,7 @@ def _sparse_piper_attention_kernel(
     value_scale_multiplier_ptr,
     value_mean_ptr,
     coarse_output_ptr,
-    compression_gate_ptr,
+    coarse_gate_ptr,
     block_lengths_ptr,
     routes_ptr,
     head_keep_blocks_ptr,
@@ -612,12 +612,12 @@ def _sparse_piper_attention_kernel(
         )
         if mask_ragged_tail:
             gate = gl.load(
-                compression_gate_ptr + gate_offsets,
+                coarse_gate_ptr + gate_offsets,
                 mask=valid_queries[:, None],
                 other=0.0,
             ).to(gl.float32)
         else:
-            gate = gl.load(compression_gate_ptr + gate_offsets).to(gl.float32)
+            gate = gl.load(coarse_gate_ptr + gate_offsets).to(gl.float32)
         fine_output = output.to(gl.bfloat16).to(gl.float32)
         residual = _mul_fp32(gate, coarse[None, :]).to(gl.bfloat16).to(gl.float32)
         output = _add_fp32(fine_output, residual)
@@ -691,11 +691,11 @@ def _launch_sparse_piper_attention(
     query_block_offset: int = 0,
     query_block_count: int | None = None,
     coarse_output: torch.Tensor | None = None,
-    compression_gate: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch one caller-owned query-block range over the complete K/V sequence.
 
-    When present, ``compression_gate`` contains exactly the local output rows
+    When present, ``coarse_gate`` contains exactly the local output rows
     covered by this launch. ``coarse_output`` remains globally indexed by query
     block because it is compact block-level state shared across launches.
     """
@@ -748,12 +748,12 @@ def _launch_sparse_piper_attention(
         raise ValueError("paired Gluon routed Piper output must match the query block range")
     if prepared.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
-    has_coarse_residual = coarse_output is not None or compression_gate is not None
-    if (coarse_output is None) != (compression_gate is None):
-        raise ValueError("coarse output and compression gate must be supplied together")
+    has_coarse_residual = coarse_output is not None or coarse_gate is not None
+    if (coarse_output is None) != (coarse_gate is None):
+        raise ValueError("coarse output and coarse gate must be supplied together")
     if has_coarse_residual:
         assert coarse_output is not None
-        assert compression_gate is not None
+        assert coarse_gate is not None
         if (
             coarse_output.shape != (batch, heads, total_query_blocks, head_dim)
             or coarse_output.dtype is not torch.float32
@@ -762,12 +762,12 @@ def _launch_sparse_piper_attention(
         ):
             raise ValueError("Gluon coarse output must be FP32 [batch,heads,Q64,D128]")
         if (
-            compression_gate.shape != (batch, output_sequence_length, heads, head_dim)
-            or compression_gate.dtype is not torch.bfloat16
-            or compression_gate.device != prepared.query.device
-            or compression_gate.stride(-1) != 1
+            coarse_gate.shape != (batch, output_sequence_length, heads, head_dim)
+            or coarse_gate.dtype is not torch.bfloat16
+            or coarse_gate.device != prepared.query.device
+            or coarse_gate.stride(-1) != 1
         ):
-            raise ValueError("Gluon compression gate must match the local attention output")
+            raise ValueError("Gluon coarse gate must match the local attention output")
     with torch.cuda.device(prepared.query.device):
         install_uint8_int8_dot_hook()
 
@@ -778,15 +778,15 @@ def _launch_sparse_piper_attention(
     stride_rq = routes.stride(1)
     stride_rr = routes.stride(2)
     coarse_tensor = prepared.value_mean if coarse_output is None else coarse_output
-    gate_tensor = output if compression_gate is None else compression_gate
+    gate_tensor = output if coarse_gate is None else coarse_gate
     coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
     gate_strides = (
         (0, 0, 0)
-        if compression_gate is None
+        if coarse_gate is None
         else (
-            compression_gate.stride(0),
-            compression_gate.stride(2),
-            compression_gate.stride(1),
+            coarse_gate.stride(0),
+            coarse_gate.stride(2),
+            coarse_gate.stride(1),
         )
     )
     _sparse_piper_attention_kernel[(resolved_query_block_count, heads, batch)](

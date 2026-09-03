@@ -50,7 +50,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v21"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v22"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -260,7 +260,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_routing_mode: int,
     sparse_block_lengths: torch.fx.Node | None = None,
     sparse_query_blocks: Argument | None = None,
-    coarse_compression_gate: torch.fx.Node | None = None,
+    coarse_gate: torch.fx.Node | None = None,
     coarse_key_blocks: Argument | None = None,
     coarse_scale: float | None = None,
     **_unused: object,
@@ -290,10 +290,10 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             None,
             tuple(input_value.shape),
         )
-        prepared_compression_gate = coarse_compression_gate
-        if coarse_compression_gate is not None:
+        prepared_coarse_gate = coarse_gate
+        if coarse_gate is not None:
             gate_projection = _semantic_gate_projection(
-                coarse_compression_gate,
+                coarse_gate,
                 sparse_input,
                 sparse_group_size,
             )
@@ -311,11 +311,11 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                     ),
                 )
                 prepared_gate_linear.meta = gate_linear.meta.copy()
-                prepared_compression_gate = graph.call_function(
+                prepared_coarse_gate = graph.call_function(
                     torch.ops.aten.reshape.default,
-                    args=(prepared_gate_linear, coarse_compression_gate.args[1]),
+                    args=(prepared_gate_linear, coarse_gate.args[1]),
                 )
-                prepared_compression_gate.meta = coarse_compression_gate.meta.copy()
+                prepared_coarse_gate.meta = coarse_gate.meta.copy()
         query_values = (
             input_value.new_empty(
                 (batch, heads, storage_sequence_length, head_dim),
@@ -405,7 +405,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             ),
             input_value.new_empty((batch, heads, head_dim), dtype=torch.float32),
         )
-        with_coarse_residual = coarse_compression_gate is not None
+        with_coarse_residual = coarse_gate is not None
         if with_coarse_residual:
             value_values = (
                 *value_values,
@@ -454,7 +454,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             block_lengths=sparse_block_lengths,
             sparse_query_blocks=sparse_query_blocks,
             block_mean=value_projection[3] if with_coarse_residual else None,
-            compression_gate=prepared_compression_gate,
+            coarse_gate=prepared_coarse_gate,
             coarse_scale=coarse_scale,
             coarse_key_blocks=coarse_key_blocks,
         )

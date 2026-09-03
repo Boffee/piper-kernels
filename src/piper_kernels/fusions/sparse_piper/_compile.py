@@ -72,7 +72,7 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
     """Validate projection-independent operands for a matched coarse residual."""
     if match.kwargs["sparse_routing_mode"] != match.kwargs["coarse_routing_mode"]:
         return False
-    gate_node = match.kwargs["coarse_compression_gate"]
+    gate_node = match.kwargs["coarse_gate"]
     if not isinstance(gate_node, torch.fx.Node):
         return False
     gate = preparation_sharing.tensor_metadata(gate_node)
@@ -112,12 +112,12 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     block_lengths: Argument | None = None,
     sparse_query_blocks: Argument | None = None,
     block_mean: Argument | None = None,
-    compression_gate: Argument | None = None,
+    coarse_gate: Argument | None = None,
     coarse_scale: Argument | None = None,
     coarse_key_blocks: Argument | None = None,
 ) -> torch.fx.Node:
     """Emit the shared fine or coarse quantized sparse-attention call."""
-    coarse_arguments = block_mean, compression_gate, coarse_scale, coarse_key_blocks
+    coarse_arguments = block_mean, coarse_gate, coarse_scale, coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
     if with_coarse:
         if any(argument is None for argument in coarse_arguments):
@@ -127,7 +127,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
             args=(
                 *attention_arguments,
                 block_mean,
-                compression_gate,
+                coarse_gate,
                 head_keep_ratio_units,
                 sparse_key_blocks,
                 logical_sequence_length,

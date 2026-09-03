@@ -188,7 +188,7 @@ def _padded_arguments(
         if coarse
         else None
     )
-    compression_gate = (
+    coarse_gate = (
         torch.randn(
             (1, sequence_length, _HEADS, _HEAD_DIM),
             device="cuda",
@@ -201,11 +201,11 @@ def _padded_arguments(
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
         assert block_mean is not None
-        assert compression_gate is not None
+        assert coarse_gate is not None
         materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *attention_arguments[:10],
             block_mean,
-            compression_gate,
+            coarse_gate,
             *attention_arguments[10:],
             coarse_scale,
             block_lengths,
@@ -242,7 +242,7 @@ def _padded_arguments(
         128,
         block_lengths,
         block_mean,
-        compression_gate,
+        coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
@@ -281,7 +281,7 @@ def _projected_gate_arguments(
     )
     gate_input = _ops.prepare_input(hidden, activation_scale, False)
     with torch.no_grad():
-        compression_gate = _ops.linear_prepared(
+        coarse_gate = _ops.linear_prepared(
             *gate_input,
             gate_weight.qdata,
             gate_weight.scale,
@@ -301,7 +301,7 @@ def _projected_gate_arguments(
             128,
             None,
             block_mean,
-            compression_gate,
+            coarse_gate,
             0.125,
             coarse_key_blocks,
             None,
@@ -403,11 +403,11 @@ def test_attention_output_supports_blockwise_only_weight_scale() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("weight_global_scale", [False, True])
-def test_attention_output_projects_a_bounded_compression_gate(
+def test_attention_output_projects_a_bounded_coarse_gate(
     weight_global_scale: bool,
 ) -> None:
     arguments, expected = _projected_gate_arguments(
-        sequence_length=256,
+        sequence_length=1_024,
         weight_global_scale=weight_global_scale,
     )
 

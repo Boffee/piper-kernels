@@ -144,7 +144,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
     query = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
     key = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
     value = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
-    compression_gate = torch.randn(
+    coarse_gate = torch.randn(
         shape,
         dtype=torch.bfloat16,
         device="cuda",
@@ -205,7 +205,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
     coarse_arguments = (
         *fine_arguments[:10],
         block_mean,
-        compression_gate,
+        coarse_gate,
         *fine_arguments[10:],
         coarse_scale,
         None,
@@ -220,13 +220,13 @@ def test_quantized_coarse_residual_matches_explicit_composition(
         )
         expected = fine_output + apply_coarse_attention_residual(
             expected_coarse,
-            compression_gate,
+            coarse_gate,
         )
         actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *coarse_arguments,
         )
         zero_gate_arguments = list(coarse_arguments)
-        zero_gate_arguments[11] = torch.zeros_like(compression_gate)
+        zero_gate_arguments[11] = torch.zeros_like(coarse_gate)
         zero_gate_output = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *zero_gate_arguments,
         )
@@ -290,7 +290,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
         device=query.device,
         generator=generator,
     )
-    compression_gate = torch.randn(
+    coarse_gate = torch.randn(
         shape,
         dtype=torch.bfloat16,
         device=query.device,
@@ -304,13 +304,13 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
         _launch_sparse_piper_attention(prepared, fine_output.transpose(1, 2))
         expected = fine_output + apply_coarse_attention_residual(
             coarse_output,
-            compression_gate,
+            coarse_gate,
         )
         _launch_sparse_piper_attention(
             prepared,
             full_output.transpose(1, 2),
             coarse_output=coarse_output,
-            compression_gate=compression_gate,
+            coarse_gate=coarse_gate,
         )
         while query_block_offset < query_block_count:
             remaining_blocks = query_block_count - query_block_offset
@@ -332,7 +332,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 query_block_offset=query_block_offset,
                 query_block_count=range_block_count,
                 coarse_output=coarse_output,
-                compression_gate=compression_gate[
+                coarse_gate=coarse_gate[
                     :,
                     query_block_offset * 64 : query_block_offset * 64 + range_rows,
                 ],
@@ -507,7 +507,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
     fine_arguments = list(arguments)
     fine_arguments[-2] = logical_sequence_length
     generator = torch.Generator(device="cuda").manual_seed(1223 + routing_mode)
-    compression_gate = torch.randn(
+    coarse_gate = torch.randn(
         value.shape,
         dtype=torch.bfloat16,
         device=value.device,
@@ -529,7 +529,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
     coarse_arguments = (
         *fine_arguments[:10],
         block_mean,
-        compression_gate,
+        coarse_gate,
         *fine_arguments[10:],
         coarse_scale,
         block_lengths,
@@ -548,7 +548,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
                 scores * coarse_scale,
                 block_mean[:, :, :coarse_key_blocks],
             ),
-            compression_gate,
+            coarse_gate,
         )
         actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *coarse_arguments,

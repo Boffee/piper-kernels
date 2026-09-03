@@ -248,10 +248,10 @@ def _replace_attention_output_with_target(
     original = match.output_node()
     graph = match.graph
     bounded_arguments = sparse_piper_pattern.bounded_attention_arguments(match)
-    block_lengths, block_mean, compression_gate, coarse_scale, coarse_key_blocks, query_blocks = (
+    block_lengths, block_mean, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
         bounded_arguments
     )
-    gate_projection = _prepared_gate_projection(compression_gate)
+    gate_projection = _prepared_gate_projection(coarse_gate)
     gate_arguments: tuple[Argument, ...] = ()
     if gate_projection is not None:
         bounded_arguments = (

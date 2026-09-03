@@ -290,7 +290,7 @@ coarse_output = sparse_piper_coarse_residual(
     query,
     key,
     value,
-    compression_gate,
+    coarse_gate,
     routing="mean",  # or "minmax"
     coarse_key_blocks=total_key_blocks,
     coarse_scale=coarse_scale,
@@ -312,7 +312,7 @@ ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wide
 and gated residual, including valid-front padded storage.
 When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
 quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
-residual together with `sparse_query_blocks`. It passes the coarse result and compression gate into
+residual together with `sparse_query_blocks`. It passes the coarse result and coarse gate into
 each ranged attention launch and projects that chunk directly, so the full BF16 attention output is
 not materialized.
 
