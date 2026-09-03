@@ -58,7 +58,26 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    gate_input_qdata: torch.Tensor | None = None,
+    gate_input_scale: torch.Tensor | None = None,
+    gate_input_per_tensor_scale: torch.Tensor | None = None,
+    gate_weight_qdata: torch.Tensor | None = None,
+    gate_weight_scale: torch.Tensor | None = None,
+    gate_weight_per_tensor_scale: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    gate_projection = _output.prepare_optional_gate_projection(
+        query,
+        logical_sequence_length,
+        block_lengths,
+        gate_input_qdata,
+        gate_input_scale,
+        gate_input_per_tensor_scale,
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_weight_per_tensor_scale,
+        gate_bias,
+    )
     return _output.run_attention_output(
         query,
         query_scale,
@@ -87,6 +106,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+        gate_projection,
     )
 
 
@@ -118,6 +138,13 @@ def _attention_output_op_fake(
     _coarse_scale: float | None = None,
     _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,
+    _gate_input_qdata: torch.Tensor | None = None,
+    _gate_input_scale: torch.Tensor | None = None,
+    _gate_input_per_tensor_scale: torch.Tensor | None = None,
+    _gate_weight_qdata: torch.Tensor | None = None,
+    _gate_weight_scale: torch.Tensor | None = None,
+    _gate_weight_per_tensor_scale: torch.Tensor | None = None,
+    _gate_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return output_common.new_projected_output(
         query,

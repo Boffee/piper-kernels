@@ -13,6 +13,11 @@ from piper_kernels.attention.sparse_piper_attention import _budget
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
+_SHAPE_ONLY_VIEW_TARGETS = (
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.view.default,
+)
+
 
 def static_int(value: object) -> int | None:
     """Return a non-boolean static integer."""
@@ -37,6 +42,18 @@ def integer_scalar_argument(value: object) -> Argument | None:
     if integer_scalar_metadata(value) is None:
         return None
     return value if isinstance(value, (int, torch.SymInt, torch.fx.Node)) else None
+
+
+def unwrap_shape_only_views(value: object) -> torch.fx.Node | None:
+    """Return the first non-view producer beneath contiguous reshape/view calls."""
+    if not isinstance(value, torch.fx.Node):
+        return None
+    node = value
+    while node.target in _SHAPE_ONLY_VIEW_TARGETS:
+        if node.kwargs or len(node.args) != 2 or not isinstance(node.args[0], torch.fx.Node):
+            return None
+        node = node.args[0]
+    return node
 
 
 def _positive_float(value: object) -> float | None:

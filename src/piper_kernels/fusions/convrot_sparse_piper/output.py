@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -10,6 +12,103 @@ from piper_kernels.linear.convrot.int8 import _policy, reference
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
 _DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedGateProjection:
+    """One ConvRot INT8 gate projected from shared prepared hidden states."""
+
+    input_qdata: torch.Tensor
+    input_scale: torch.Tensor
+    weight_qdata: torch.Tensor
+    weight_scale: torch.Tensor
+    bias: torch.Tensor | None
+    execution_plan: _policy.LinearExecutionPlan
+
+    def project(self, output: torch.Tensor, start: int, rows: int) -> None:
+        """Project one sequence window into caller-owned token-major gate storage."""
+        output_features = self.weight_qdata.shape[0]
+        for batch_index in range(self.input_qdata.shape[0]):
+            convrot_backend._execute_prepared_linear(
+                self.input_qdata[batch_index, start : start + rows],
+                self.input_scale[batch_index, start : start + rows],
+                self.weight_qdata,
+                self.weight_scale,
+                self.bias,
+                torch.bfloat16,
+                self.execution_plan,
+                out=output[batch_index, :rows].reshape(rows, output_features),
+            )
+
+
+def _prepare_gate_projection(
+    query: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> _PreparedGateProjection:
+    """Validate shared prepared input and one D128-per-head gate weight."""
+    sequence_length = output_common.output_sequence_length(
+        query,
+        logical_sequence_length,
+        block_lengths,
+    )
+    batch, heads, _storage_sequence_length, head_dim = query.shape
+    if (
+        input_qdata.ndim != 3
+        or input_qdata.shape[:2] != (batch, sequence_length)
+        or input_qdata.dtype is not torch.int8
+        or input_qdata.device != query.device
+        or not input_qdata.is_contiguous()
+    ):
+        raise ValueError("fused ConvRot gate input must be contiguous batch/sequence INT8 storage")
+    if (
+        input_scale.shape != (batch, sequence_length)
+        or input_scale.dtype is not torch.float32
+        or input_scale.device != query.device
+        or not input_scale.is_contiguous()
+    ):
+        raise ValueError("fused ConvRot gate input scale must match its prepared rows")
+    output_features = heads * head_dim
+    if (
+        weight_qdata.shape != (output_features, input_qdata.shape[-1])
+        or weight_qdata.dtype is not torch.int8
+        or weight_qdata.device != query.device
+        or not weight_qdata.is_contiguous()
+    ):
+        raise ValueError("fused ConvRot gate weight must produce one D128 vector per head")
+    if (
+        weight_scale.shape != (output_features, 1)
+        or weight_scale.dtype is not torch.float32
+        or weight_scale.device != query.device
+        or not weight_scale.is_contiguous()
+    ):
+        raise ValueError("fused ConvRot gate weight scale must contain one FP32 value per row")
+    if bias is not None and (
+        bias.shape != (output_features,)
+        or bias.dtype is not torch.bfloat16
+        or bias.device != query.device
+        or not bias.is_contiguous()
+    ):
+        raise ValueError("fused ConvRot gate bias must be contiguous BF16 per output feature")
+    if torch.is_grad_enabled() and (
+        input_scale.requires_grad
+        or weight_scale.requires_grad
+        or (bias is not None and bias.requires_grad)
+    ):
+        raise RuntimeError("fused ConvRot gate projection is inference-only")
+    return _PreparedGateProjection(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        convrot_backend.default_execution_plan(weight_qdata),
+    )
 
 
 def _validate_output_projection(
@@ -126,6 +225,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    gate_projection: _PreparedGateProjection | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into the final ConvRot output."""
     input_features, output_features = _validate_output_projection(
@@ -158,6 +258,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+        has_projected_compression_gate=gate_projection is not None,
     )
     sequence_length = prepared.sequence_length
     capacity = min(sequence_length, query_chunk_rows)
@@ -197,6 +298,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         project_chunk,
         (prepared_input, prepared_scale),
+        project_gate_chunk=(None if gate_projection is None else gate_projection.project),
     )
 
 
@@ -230,7 +332,36 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    gate_input_qdata: torch.Tensor | None = None,
+    gate_input_scale: torch.Tensor | None = None,
+    gate_weight_qdata: torch.Tensor | None = None,
+    gate_weight_scale: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    gate_operands = (
+        gate_input_qdata,
+        gate_input_scale,
+        gate_weight_qdata,
+        gate_weight_scale,
+    )
+    gate_projection = None
+    if any(operand is not None for operand in (*gate_operands, gate_bias)):
+        if any(operand is None for operand in gate_operands):
+            raise ValueError("projected ConvRot gate requires every prepared storage operand")
+        assert gate_input_qdata is not None
+        assert gate_input_scale is not None
+        assert gate_weight_qdata is not None
+        assert gate_weight_scale is not None
+        gate_projection = _prepare_gate_projection(
+            query,
+            logical_sequence_length,
+            block_lengths,
+            gate_input_qdata,
+            gate_input_scale,
+            gate_weight_qdata,
+            gate_weight_scale,
+            gate_bias,
+        )
     return _run_attention_output(
         query,
         query_scale,
@@ -257,6 +388,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+        gate_projection,
     )
 
 
@@ -287,6 +419,11 @@ def _attention_output_op_fake(
     _coarse_scale: float | None = None,
     _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,
+    _gate_input_qdata: torch.Tensor | None = None,
+    _gate_input_scale: torch.Tensor | None = None,
+    _gate_weight_qdata: torch.Tensor | None = None,
+    _gate_weight_scale: torch.Tensor | None = None,
+    _gate_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return output_common.new_projected_output(
         query,

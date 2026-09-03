@@ -420,6 +420,39 @@ class _CoarseSparseProjectionAttentionOutput(_CoarseSparseProjectionAttention):
         )
 
 
+class _ProjectedGateCoarseSparseAttentionOutput(_CoarseSparseProjectionAttentionOutput):
+    """Canonical VSA region whose compression gate is another ConvRot linear."""
+
+    def __init__(self, *, routing: str) -> None:
+        super().__init__(routing=routing)
+        self.gate = _make_output_projection(
+            self.input_features,
+            self.heads * self.head_dim,
+            bias=False,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        block_lengths: torch.Tensor | None = None,
+        sparse_query_blocks: int | None = None,
+    ) -> torch.Tensor:
+        compression_gate = self.gate(hidden_states).reshape(
+            self.batch,
+            self.sequence_length,
+            self.heads,
+            self.head_dim,
+        )
+        attention = _CoarseSparseProjectionAttention.forward(
+            self,
+            hidden_states,
+            compression_gate,
+            block_lengths,
+            sparse_query_blocks,
+        )
+        return self.output(attention.flatten(2))
+
+
 class _DynamicSparseProjectionAttentionOutput(_DynamicSparseProjectionAttention):
     output_features = 320
 
@@ -1181,6 +1214,66 @@ def test_cuda_compile_fuses_every_bounded_attention_feature(routing: str) -> Non
     absent_targets = (
         torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
         torch.ops.piper_kernels.convrot_int8_linear.default,
+    )
+    assert all(target not in capture.targets for target in absent_targets)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+def test_cuda_compile_lifetime_chunks_a_projected_compression_gate(routing: str) -> None:
+    torch.manual_seed(725)
+    model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
+    hidden_states = torch.randn(
+        model.batch,
+        model.sequence_length,
+        model.input_features,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    compression_gate = model.gate(hidden_states).reshape(
+        model.batch,
+        model.sequence_length,
+        model.heads,
+        model.head_dim,
+    )
+    expected, _attention = _run_explicit_attention_output(
+        model,
+        hidden_states,
+        model.cos,
+        model.sin,
+        model.sparse_key_blocks,
+        compression_gate=compression_gate,
+        coarse_scale=model.coarse_scale,
+        coarse_key_blocks=model.coarse_key_blocks,
+    )
+    capture = _TargetCapturePass()
+    options = convrot_sparse_piper_compile_options()
+    compiler_passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(compiler_passes, tuple)
+    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+
+    with torch.no_grad():
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=options,
+        )(hidden_states)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        == 1
+    )
+    absent_targets = (
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        torch.ops.piper_kernels.convrot_int8_linear_prepared.default,
+        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
     )
     assert all(target not in capture.targets for target in absent_targets)
 

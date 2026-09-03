@@ -629,6 +629,57 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
         return self.output((fine_output + coarse_output).flatten(2))
 
 
+class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentionOutput):
+    """Bounded coarse attention whose gate is projected from hidden states."""
+
+    def __init__(self, *, dynamic: bool, routing: str) -> None:
+        super().__init__(dynamic=dynamic, routing=routing)
+        query_weight = self.query.weight
+        assert isinstance(query_weight, PiperNVFP4Tensor)
+        dense = torch.randn(
+            (self.heads * self.head_dim, self.input_features),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+            dense,
+            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+            act_per_tensor_scale=query_weight.act_per_tensor_scale,
+            is_swizzled_scales=True,
+            act_quant_kwargs=query_weight.act_quant_kwargs,
+        )
+        self.gate = torch.nn.Linear(
+            self.input_features,
+            self.heads * self.head_dim,
+            bias=True,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        self.gate.weight = torch.nn.Parameter(
+            PiperNVFP4Tensor.from_torchao(torchao_weight),
+            requires_grad=False,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        block_lengths: torch.Tensor,
+        sparse_query_blocks: int,
+    ) -> torch.Tensor:
+        compression_gate = self.gate(hidden_states).view(
+            self.batch,
+            self.sequence_length,
+            self.heads,
+            self.head_dim,
+        )
+        return super().forward(
+            hidden_states,
+            compression_gate,
+            block_lengths,
+            sparse_query_blocks,
+        )
+
+
 def _nvfp4_storage(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
     assert isinstance(weight, PiperNVFP4Tensor)
     return weight.qdata, weight.scale, weight.per_tensor_scale
@@ -1167,6 +1218,75 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     )
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
     assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(
+    ("dynamic", "routing", "preparation_count"),
+    [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
+)
+def test_cuda_compile_lifetime_chunks_a_projected_compression_gate(
+    dynamic: bool,
+    routing: str,
+    preparation_count: int,
+) -> None:
+    torch.manual_seed(839)
+    model = _ProjectedGateCoarseSparseAttentionOutput(
+        dynamic=dynamic,
+        routing=routing,
+    ).eval()
+    hidden_states = torch.randn(
+        (model.batch, model.sequence_length, model.input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    capture = _TargetCapturePass()
+    with torch.no_grad():
+        gate_input = _prepare_nvfp4_input(hidden_states, model.gate.weight)
+        compression_gate = nvfp4_ops.linear_prepared(
+            *gate_input,
+            *_nvfp4_storage(model.gate.weight),
+            model.gate.bias,
+            torch.bfloat16,
+        ).view(
+            model.batch,
+            model.sequence_length,
+            model.heads,
+            model.head_dim,
+        )
+        expected = _run_explicit_attention_output(
+            model,
+            hidden_states,
+            compression_gate=compression_gate,
+            block_lengths=block_lengths,
+            sparse_query_blocks=2,
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=_options_with_capture(capture),
+        )(hidden_states, block_lengths, 2)
+
+    torch.testing.assert_close(
+        actual[:, valid_rows],
+        expected[:, valid_rows],
+        atol=0,
+        rtol=0,
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
+        == preparation_count
+    )
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default)
+        == 1
+    )
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+    assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in capture.targets
 
 
 @pytest.mark.gpu

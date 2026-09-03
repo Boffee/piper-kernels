@@ -607,7 +607,7 @@ def _sparse_piper_attention_kernel(
         gate_offsets = (
             batch * stride_gb
             + head * stride_gh
-            + (start_m + offsets_m[:, None]) * stride_gn
+            + (output_start_m + offsets_m[:, None]) * stride_gn
             + offsets_d[None, :]
         )
         if mask_ragged_tail:
@@ -693,7 +693,12 @@ def _launch_sparse_piper_attention(
     coarse_output: torch.Tensor | None = None,
     compression_gate: torch.Tensor | None = None,
 ) -> None:
-    """Launch one caller-owned query-block range over the complete K/V sequence."""
+    """Launch one caller-owned query-block range over the complete K/V sequence.
+
+    When present, ``compression_gate`` contains exactly the local output rows
+    covered by this launch. ``coarse_output`` remains globally indexed by query
+    block because it is compact block-level state shared across launches.
+    """
     batch, heads, _, head_dim = prepared.query.shape
     logical_sequence_length = prepared.logical_sequence_length
     storage_sequence_length = prepared.query.shape[2]
@@ -746,7 +751,6 @@ def _launch_sparse_piper_attention(
     has_coarse_residual = coarse_output is not None or compression_gate is not None
     if (coarse_output is None) != (compression_gate is None):
         raise ValueError("coarse output and compression gate must be supplied together")
-    gate_sequence_length = storage_sequence_length if has_block_lengths else logical_sequence_length
     if has_coarse_residual:
         assert coarse_output is not None
         assert compression_gate is not None
@@ -758,12 +762,12 @@ def _launch_sparse_piper_attention(
         ):
             raise ValueError("Gluon coarse output must be FP32 [batch,heads,Q64,D128]")
         if (
-            compression_gate.shape != (batch, gate_sequence_length, heads, head_dim)
+            compression_gate.shape != (batch, output_sequence_length, heads, head_dim)
             or compression_gate.dtype is not torch.bfloat16
             or compression_gate.device != prepared.query.device
             or compression_gate.stride(-1) != 1
         ):
-            raise ValueError("Gluon compression gate must match token-major attention output")
+            raise ValueError("Gluon compression gate must match the local attention output")
     with torch.cuda.device(prepared.query.device):
         install_uint8_int8_dot_hook()
 

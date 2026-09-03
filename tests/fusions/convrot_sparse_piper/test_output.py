@@ -222,6 +222,93 @@ def test_attention_output_supports_bounded_attention_features(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("sequence_length", [128, 193])
+def test_attention_output_projects_a_bounded_compression_gate(
+    sequence_length: int,
+) -> None:
+    arguments, _fine_expected = _arguments(
+        batch=1,
+        sequence_length=sequence_length,
+        bias=False,
+    )
+    attention_arguments = arguments[:14]
+    output_arguments = arguments[14:]
+    gate_features = _HEADS * _HEAD_DIM
+    gate_input_qdata = torch.randint(
+        -127,
+        128,
+        (1, sequence_length, gate_features),
+        device="cuda",
+        dtype=torch.int8,
+    )
+    gate_input_scale = torch.rand(
+        (1, sequence_length),
+        device="cuda",
+        dtype=torch.float32,
+    ).mul_(0.01)
+    gate_weight, gate_scale, gate_bias = _projection(bias=True)
+    gate_weight = gate_weight[:gate_features, :gate_features].contiguous()
+    gate_scale = gate_scale[:gate_features].contiguous()
+    assert gate_bias is not None
+    gate_bias = gate_bias[:gate_features].contiguous()
+    compression_gate = convrot_backend._execute_prepared_linear(
+        gate_input_qdata,
+        gate_input_scale,
+        gate_weight,
+        gate_scale,
+        gate_bias,
+        torch.bfloat16,
+        convrot_backend.default_execution_plan(gate_weight),
+    ).unflatten(-1, (_HEADS, _HEAD_DIM))
+    query_blocks = (sequence_length + 63) // 64
+    block_mean = torch.randn(
+        (1, _HEADS, query_blocks, _HEAD_DIM),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    coarse_scale = _HEAD_DIM**-0.5
+    coarse_key_blocks = query_blocks
+    materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+        *attention_arguments[:10],
+        block_mean,
+        compression_gate,
+        *attention_arguments[10:],
+        coarse_scale,
+        None,
+        coarse_key_blocks,
+        None,
+    )
+    output_weight, output_scale, output_bias, output_group_size = output_arguments
+    expected = convrot_backend.run_linear(
+        materialized_attention.flatten(2),
+        output_weight,
+        output_scale,
+        output_bias,
+        output_group_size,
+    )
+
+    actual = output_fusion._attention_output_op(
+        *attention_arguments,
+        *output_arguments,
+        64,
+        None,
+        block_mean,
+        None,
+        coarse_scale,
+        coarse_key_blocks,
+        None,
+        gate_input_qdata,
+        gate_input_scale,
+        gate_weight,
+        gate_scale,
+        gate_bias,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_attention_output_custom_op_passes_opcheck() -> None:
     arguments, _expected = _arguments(batch=1, sequence_length=128, bias=True)
 

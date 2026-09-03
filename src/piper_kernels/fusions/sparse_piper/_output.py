@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 DEFAULT_QUERY_CHUNK_ROWS = 4_096
 
 type ChunkProjector = Callable[[torch.Tensor, torch.Tensor, int, int], None]
+type GateChunkProjector = Callable[[torch.Tensor, int, int], None]
 
-_output_sequence_length = _quantized_dispatch._quantized_attention_output_sequence_length
+output_sequence_length = _quantized_dispatch._quantized_attention_output_sequence_length
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +45,7 @@ def new_projected_output(
     return query.new_empty(
         (
             query.shape[0],
-            _output_sequence_length(query, logical_sequence_length, block_lengths),
+            output_sequence_length(query, logical_sequence_length, block_lengths),
             output_features,
         ),
         dtype=torch.bfloat16,
@@ -100,9 +101,14 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    *,
+    has_projected_compression_gate: bool = False,
 ) -> _PreparedAttentionOutput:
     """Prepare fine routing and, when requested, one shared coarse result."""
-    if (block_mean is None) != (compression_gate is None):
+    if compression_gate is not None and has_projected_compression_gate:
+        raise ValueError("compression gate cannot be both materialized and projected")
+    has_compression_gate = compression_gate is not None or has_projected_compression_gate
+    if (block_mean is not None) != has_compression_gate:
         raise ValueError("block means and compression gate must be supplied together")
     if block_mean is None:
         if coarse_scale is not None or coarse_key_blocks is not None:
@@ -154,7 +160,7 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
         )
     return _PreparedAttentionOutput(
         attention=prepared,
-        sequence_length=_output_sequence_length(
+        sequence_length=output_sequence_length(
             query,
             logical_sequence_length,
             block_lengths,
@@ -164,12 +170,14 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     )
 
 
-def run_chunked_attention_output(
+def run_chunked_attention_output(  # noqa: PLR0915
     prepared: _PreparedAttentionOutput,
     output_features: int,
     query_chunk_rows: int,
     project_chunk: ChunkProjector,
     projector_tensors: Sequence[torch.Tensor],
+    *,
+    project_gate_chunk: GateChunkProjector | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into one format-specific projection."""
     prepared_attention = prepared.attention
@@ -185,11 +193,37 @@ def run_chunked_attention_output(
         device=query.device,
         dtype=torch.bfloat16,
     )
+    has_coarse_residual = prepared.coarse_output is not None
+    if has_coarse_residual and (prepared.compression_gate is None) == (project_gate_chunk is None):
+        raise ValueError("coarse attention requires exactly one compression gate source")
+    if not has_coarse_residual and (
+        prepared.compression_gate is not None or project_gate_chunk is not None
+    ):
+        raise ValueError("compression gate source requires coarse attention")
+    compression_gate_buffer = (
+        torch.empty(
+            (batch, capacity, heads, head_dim),
+            device=query.device,
+            dtype=torch.bfloat16,
+        )
+        if project_gate_chunk is not None
+        else None
+    )
     output = torch.empty(
         (batch, sequence_length, output_features),
         device=query.device,
         dtype=torch.bfloat16,
     )
+
+    def compression_gate_chunk(start: int, rows: int) -> torch.Tensor | None:
+        if prepared.compression_gate is not None:
+            return prepared.compression_gate[:, start : start + rows]
+        if project_gate_chunk is None:
+            return None
+        assert compression_gate_buffer is not None
+        chunk = compression_gate_buffer[:, :rows]
+        project_gate_chunk(chunk, start, rows)
+        return chunk
 
     if chunk_count == 1:
         attention_chunk = attention_buffers[0]
@@ -197,7 +231,7 @@ def run_chunked_attention_output(
             prepared_attention,
             attention_chunk.transpose(1, 2),
             coarse_output=prepared.coarse_output,
-            compression_gate=prepared.compression_gate,
+            compression_gate=compression_gate_chunk(0, sequence_length),
         )
         project_chunk(attention_chunk, output, 0, sequence_length)
         return output
@@ -223,7 +257,7 @@ def run_chunked_attention_output(
                 query_block_offset=block_start,
                 query_block_count=block_count,
                 coarse_output=prepared.coarse_output,
-                compression_gate=prepared.compression_gate,
+                compression_gate=compression_gate_chunk(start, rows),
             )
             ready[slot].record(producer)
             with torch.cuda.stream(consumer):
@@ -241,6 +275,7 @@ def run_chunked_attention_output(
 __all__ = [
     "DEFAULT_QUERY_CHUNK_ROWS",
     "new_projected_output",
+    "output_sequence_length",
     "prepare_attention",
     "run_chunked_attention_output",
     "validate_attention_output",

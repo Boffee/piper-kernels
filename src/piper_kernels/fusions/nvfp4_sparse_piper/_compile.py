@@ -46,7 +46,7 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
 from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v6"
+_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v7"
 _HEAD_DIM = layout.HEAD_DIM
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS

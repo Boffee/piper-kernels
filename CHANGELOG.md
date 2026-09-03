@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Lifetime-chunked learned compression-gate projections in complete ConvRot INT8, NVFP4, and
+  ConvRot NVFP4 sparse-attention compiler fusions. Compatible gates project only the active query
+  window into reusable bounded storage instead of materializing the full token/head BF16 tensor;
+  existing materialized gates remain supported as the reference and fallback path.
 - Replaced the pooling-specific Sparse Piper coarse-residual helpers with the routing-selectable
   `sparse_piper_coarse_residual`. The new helper returns an independent gated branch for callers
   to compose with fine attention, while compatible compiler rewrites continue to fuse it.

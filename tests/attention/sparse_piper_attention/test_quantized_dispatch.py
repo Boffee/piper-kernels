@@ -332,7 +332,10 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 query_block_offset=query_block_offset,
                 query_block_count=range_block_count,
                 coarse_output=coarse_output,
-                compression_gate=compression_gate,
+                compression_gate=compression_gate[
+                    :,
+                    query_block_offset * 64 : query_block_offset * 64 + range_rows,
+                ],
             )
             assert bool(torch.all(guarded[:, 0] == 123.0))
             assert bool(torch.all(guarded[:, -1] == 123.0))
