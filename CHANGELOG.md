@@ -5,8 +5,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc2] - 2026-09-03
+
 ### Changed
 
+- Lifetime-chunked compatible Q projections in complete ConvRot INT8, NVFP4, and ConvRot NVFP4
+  sparse-attention compiler fusions. The output fusion now projects, routes, attends, and consumes
+  one bounded query window at a time instead of retaining full-sequence quantized Q, scale,
+  summary, and route storage. Materialized Q remains available as the standalone and fail-closed
+  fallback path, and the bounded path composes with mean/minmax routing, valid-front padding,
+  sparse query boundaries, coarse residuals, and projected coarse gates.
 - Lifetime-chunked learned coarse-gate projections in complete ConvRot INT8, NVFP4, and
   ConvRot NVFP4 sparse-attention compiler fusions. Compatible gates project only the active query
   window into reusable bounded storage instead of materializing the full token/head BF16 tensor.
@@ -15,6 +23,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Replaced the pooling-specific Sparse Piper coarse-residual helpers with the routing-selectable
   `sparse_piper_coarse_residual`. The new helper returns an independent gated branch for callers
   to compose with fine attention, while compatible compiler rewrites continue to fuse it.
+- Standardized `dequantize(output_dtype=None)` across ConvRot INT8, NVFP4, and ConvRot NVFP4
+  tensor wrappers. Callers can request an explicit output dtype while omission preserves each
+  wrapper's existing logical-dtype behavior.
 
 ## [0.7.0rc1] - 2026-09-02
 
