@@ -171,6 +171,81 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             group_size=group_size,
         )
 
+    @classmethod
+    def from_gguf(  # noqa: PLR0913
+        cls,
+        data: torch.Tensor,
+        *,
+        quant_type: int | None = None,
+        logical_dtype: torch.dtype = torch.bfloat16,
+        block_size: int = 16,
+        per_tensor_scale: torch.Tensor | None = None,
+        compute_per_tensor_scale: bool = False,
+        act_per_tensor_scale: torch.Tensor | None = None,
+        is_swizzled_scales: bool = False,
+        use_triton_kernel: bool = False,
+        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        group_size: int | None = None,
+    ) -> ConvRotNVFP4Tensor:
+        """Decode packed GGUF storage directly into ConvRot NVFP4 storage.
+
+        Exact SM120 conversion keeps decoded values in registers. Deriving a
+        per-tensor scale performs one small amax pass followed by the packing
+        pass, without allocating a dense weight.
+        """
+        if group_size is None:
+            raise TypeError("ConvRot NVFP4 GGUF conversion requires a group size")
+        if block_size != 16:
+            raise ValueError("ConvRot NVFP4 GGUF conversion requires block size 16")
+        from ._gguf import convert  # noqa: PLC0415
+
+        qdata, scale, effective_per_tensor_scale = convert(
+            data,
+            quant_type=quant_type,
+            logical_dtype=logical_dtype,
+            group_size=group_size,
+            per_tensor_scale=per_tensor_scale,
+            compute_per_tensor_scale=compute_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+        )
+        return cls(
+            qdata,
+            scale,
+            block_size,
+            logical_dtype,
+            group_size,
+            effective_per_tensor_scale,
+            act_per_tensor_scale,
+            is_swizzled_scales,
+            use_triton_kernel,
+            act_quant_kwargs,
+        )
+
+    def copy_from_gguf_(
+        self,
+        data: torch.Tensor,
+        *,
+        quant_type: int | None = None,
+        compute_per_tensor_scale: bool = False,
+    ) -> ConvRotNVFP4Tensor:
+        """Refill this tensor from compatible packed GGUF storage in place."""
+        if compute_per_tensor_scale and self.per_tensor_scale is None:
+            raise ValueError("recomputing the NVFP4 scale requires existing scale storage")
+        from ._gguf import convert  # noqa: PLC0415
+
+        convert(
+            data,
+            quant_type=quant_type,
+            logical_dtype=self.orig_dtype,
+            group_size=self.group_size,
+            per_tensor_scale=None if compute_per_tensor_scale else self.per_tensor_scale,
+            compute_per_tensor_scale=compute_per_tensor_scale,
+            is_swizzled_scales=self.is_swizzled_scales,
+            out=(self.qdata, self.scale),
+            per_tensor_scale_out=self.per_tensor_scale if compute_per_tensor_scale else None,
+        )
+        return self
+
     def _stable_hash_for_caching(self) -> str:
         """Include the rotation group in AOTAutograd's persistent-cache key."""
         return repr((super()._stable_hash_for_caching(), self.group_size))

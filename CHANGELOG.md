@@ -5,6 +5,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added parser-independent GGUF layout metadata and register decoding for F32, F16, BF16, Q4_0,
+  Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. ConvRot
+  INT8 and NVFP4 tensors can convert or refill directly from packed GGUF rows; CUDA conversion
+  decodes into the existing rotation and terminal quantization kernels without a dense weight
+  allocation. Computed NVFP4 global scales use a bounded row-amax pass before packing.
+
 ## [0.7.0rc2] - 2026-09-03
 
 ### Changed
