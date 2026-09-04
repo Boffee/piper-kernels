@@ -11,7 +11,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor, nvfp4_compile_options
 
 
 def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
@@ -172,3 +172,39 @@ def test_cuda_semantic_linear_matches_torchao(dynamic: bool, with_bias: bool) ->
 
     assert torch.equal(actual, expected)
     assert torch.ops.piper_kernels.nvfp4_linear.default is not None
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
+    torch.manual_seed(419)
+    input = torch.randn(17, 256, device="cuda", dtype=torch.float32) * 0.01  # noqa: A001
+    source = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16) * 0.01
+    weight = PiperNVFP4Tensor.from_hp(
+        source,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(True),
+    )
+    bias = torch.randn(128, device="cuda", dtype=torch.float32) * 0.01
+
+    def projection(value: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        return F.linear(value, weight, offset)
+
+    call = (
+        torch.compile(projection, fullgraph=True, options=nvfp4_compile_options())
+        if compiled
+        else projection
+    )
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        actual = call(input, bias)
+    with torch.no_grad():
+        expected = F.linear(input.half(), weight.to(dtype=torch.float16), bias.half())
+
+    assert actual.dtype is torch.float16
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)

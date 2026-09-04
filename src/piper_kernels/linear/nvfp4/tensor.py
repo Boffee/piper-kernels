@@ -17,7 +17,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_linear as torchao_nvfp4_linear
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.linear._dispatch import bind_linear_arguments
+from piper_kernels.linear._dispatch import (
+    apply_linear_autocast,
+    bind_linear_arguments,
+    linear_autocast_dtype,
+)
 
 from . import _layout, _ops
 from ._typing import NVFP4Storage
@@ -230,19 +234,29 @@ def _nvfp4_linear_dispatch(
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
     input, weight, bias = bind_linear_arguments(args, kwargs)  # noqa: A001
-    if (
-        not torch.compiler.is_compiling()
-        or not isinstance(weight, PiperNVFP4Tensor)
-        or not supports_semantic_linear(input, weight)
-    ):
+    if not isinstance(input, torch.Tensor) or not isinstance(weight, PiperNVFP4Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)
     if bias is not None and not isinstance(bias, torch.Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)
-    assert isinstance(input, torch.Tensor)
+
+    requires_semantic_linear = (
+        input.dtype is torch.float16
+        or linear_autocast_dtype(input) is not None
+        or input.dtype is not weight.orig_dtype
+    )
+    converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
+    assert isinstance(converted_weight, PiperNVFP4Tensor)
+    weight = converted_weight
+    normalized_args = (converted_input, weight, bias)
+    if (
+        not torch.compiler.is_compiling() and not requires_semantic_linear
+    ) or not supports_semantic_linear(converted_input, weight):
+        return torchao_nvfp4_linear(func, types, normalized_args, {})
+
     quantization = weight.act_quant_kwargs
     assert quantization is not None
     return _ops.linear(
-        input,
+        converted_input,
         weight.qdata,
         weight.scale,
         weight.per_tensor_scale,

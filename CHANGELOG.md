@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Made ConvRot INT8, NVFP4, and ConvRot NVFP4 semantic linears honor autocast without changing
+  packed weight storage. FP16 NVFP4 execution now retains a BF16 pre-rescale result to avoid
+  overflow before applying the global scale.
+
 ## [0.7.0rc3] - 2026-09-03
 
 ### Added

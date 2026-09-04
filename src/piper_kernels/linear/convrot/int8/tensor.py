@@ -1,13 +1,14 @@
 """Rotated INT8 W8A8 tensor subclass."""
 
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self, cast
 
 import torch
 from torch.types import Number
+from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.linear._dispatch import bind_linear_arguments
+from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
 from piper_kernels.linear._input_activations import InputActivation
 
 from .._rotation import rotate_groups
@@ -220,6 +221,46 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             )
         )
 
+    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> Self:
+        """Rebuild the semantic wrapper without converting quantized storage."""
+        return type(self)(self.qdata, self.scale, self.group_size, dtype)
+
+
+@ConvRotInt8Tensor.implements(torch.ops.aten._to_copy.default)
+def _convrot_int8_to_copy(
+    func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> ConvRotInt8Tensor:
+    """Preserve quantized storage across logical dtype and device conversion."""
+    tensor = args[0]
+    assert isinstance(tensor, ConvRotInt8Tensor)
+    arguments = dict(kwargs)
+    dtype = arguments.pop("dtype", tensor.dtype)
+    device = arguments.pop("device", tensor.device)
+    non_blocking = arguments.pop("non_blocking", False)
+    arguments.pop("copy", None)
+    arguments.pop("memory_format", None)
+    arguments.pop("layout", None)
+    arguments.pop("pin_memory", None)
+    if arguments:
+        raise NotImplementedError(f"unsupported ConvRot INT8 conversion arguments: {arguments}")
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"ConvRot INT8 logical dtype must be floating point, got {dtype}")
+    moved = cast(
+        ConvRotInt8Tensor,
+        tensor._apply_fn_to_data(
+            lambda value: func(value, device=device, non_blocking=non_blocking)
+        ),
+    )
+    if dtype is not moved.dtype:
+        moved = moved._rebuild_with_logical_dtype(dtype)
+    return cast(
+        ConvRotInt8Tensor,
+        return_and_correct_aliasing(func, args, kwargs, moved),
+    )
+
 
 def convrot_int8_linear(
     input: torch.Tensor,  # noqa: A002
@@ -229,12 +270,14 @@ def convrot_int8_linear(
     activation_fn: InputActivation | None = None,
 ) -> torch.Tensor:
     """Apply an optional input activation followed by a ConvRot INT8 linear."""
+    converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
+    assert isinstance(converted_weight, ConvRotInt8Tensor)
     return dispatch.linear(
-        input,
-        weight.qdata,
-        weight.scale,
-        weight.dtype,
-        weight.group_size,
+        converted_input,
+        converted_weight.qdata,
+        converted_weight.scale,
+        converted_weight.dtype,
+        converted_weight.group_size,
         bias,
         activation_fn=activation_fn,
     )
@@ -255,14 +298,7 @@ def _convrot_linear_dispatch(
         )
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")
-    return dispatch.linear(
-        linear_input,
-        weight.qdata,
-        weight.scale,
-        weight.dtype,
-        weight.group_size,
-        bias,
-    )
+    return convrot_int8_linear(linear_input, weight, bias)
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten.addmm_.default)

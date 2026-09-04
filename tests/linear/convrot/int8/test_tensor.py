@@ -55,6 +55,20 @@ def test_meta_tensor_preserves_storage_and_rotation_metadata() -> None:
     assert wrapped.scale.shape == (8, 1)
 
 
+def test_dtype_copy_changes_only_the_logical_dtype() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(8, 64), group_size=64)
+
+    converted = wrapped.to(dtype=torch.float16)
+
+    assert type(converted) is ConvRotInt8Tensor
+    assert converted.dtype is torch.float16
+    assert converted.group_size == wrapped.group_size
+    assert converted.qdata.dtype is torch.int8
+    assert converted.scale.dtype is torch.float32
+    assert torch.equal(converted.qdata, wrapped.qdata)
+    assert torch.equal(converted.scale, wrapped.scale)
+
+
 def test_from_quantized_canonicalizes_storage_and_names_logical_dtype() -> None:
     qdata = torch.randint(-128, 128, (8, 128), dtype=torch.int8)[:, ::2]
     scale = torch.arange(1, 17, dtype=torch.float32).reshape(16, 1)[::2]

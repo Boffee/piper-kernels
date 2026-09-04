@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 
 def bind_linear_arguments(
     args: tuple[Any, ...],
@@ -29,4 +31,47 @@ def bind_linear_arguments(
     return bound["input"], bound["weight"], bound.get("bias")
 
 
-__all__ = ["bind_linear_arguments"]
+def linear_autocast_dtype(input: torch.Tensor) -> torch.dtype | None:  # noqa: A002
+    """Return the active autocast dtype for a linear input, if any."""
+    device_type = input.device.type
+    if not torch.amp.autocast_mode.is_autocast_available(device_type):
+        return None
+    if not torch.is_autocast_enabled(device_type):
+        return None
+    return torch.get_autocast_dtype(device_type)
+
+
+def apply_linear_autocast(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Apply the active autocast dtype at a semantic linear boundary.
+
+    PyTorch may invoke a public semantic function directly or redispatch ``linear``
+    after converting its operands. Quantized wrappers implement ``_to_copy`` so either
+    route changes only their logical compute dtype, not their quantized storage dtype.
+    """
+    dtype = linear_autocast_dtype(input)
+    if dtype is None:
+        return input, weight, bias
+
+    device_type = input.device.type
+
+    def cast_if_eligible(tensor: torch.Tensor) -> torch.Tensor:
+        if (
+            tensor.is_floating_point()
+            and tensor.device.type == device_type
+            and tensor.dtype is not torch.float64
+        ):
+            return tensor.to(dtype=dtype)
+        return tensor
+
+    return (
+        cast_if_eligible(input),
+        cast_if_eligible(weight),
+        None if bias is None else cast_if_eligible(bias),
+    )
+
+
+__all__ = ["apply_linear_autocast", "bind_linear_arguments", "linear_autocast_dtype"]

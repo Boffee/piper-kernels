@@ -17,7 +17,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels.linear.convrot._rotation import rotate_groups
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor, convrot_nvfp4_linear
+from piper_kernels.linear.convrot.nvfp4 import (
+    ConvRotNVFP4Tensor,
+    convrot_nvfp4_compile_options,
+    convrot_nvfp4_linear,
+)
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 
@@ -729,3 +733,37 @@ def test_cuda_compile_preserves_semantic_linear(dynamic: bool) -> None:
 
     assert torch.equal(actual, expected)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
+    torch.manual_seed(614)
+    input = torch.randn(17, 256, device="cuda", dtype=torch.float32) * 0.01  # noqa: A001
+    source = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16) * 0.01
+    weight = ConvRotNVFP4Tensor.from_hp(
+        source,
+        group_size=16,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(True),
+    )
+    bias = torch.randn(128, device="cuda", dtype=torch.float32) * 0.01
+
+    def projection(value: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        return F.linear(value, weight, offset)
+
+    call = (
+        torch.compile(projection, fullgraph=True, options=convrot_nvfp4_compile_options())
+        if compiled
+        else projection
+    )
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        actual = call(input, bias)
+    with torch.no_grad():
+        expected = F.linear(input.half(), weight.to(dtype=torch.float16), bias.half())
+
+    assert actual.dtype is torch.float16
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
