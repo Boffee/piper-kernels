@@ -27,6 +27,18 @@ type _PreparedGateProjectionNodes = tuple[
     torch.fx.Node | None,
 ]
 
+type _PreparedQueryProjectionNodes = tuple[
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    torch.fx.Node,
+    float,
+    float,
+]
+
 
 def _attention_output_pattern(
     *,
@@ -89,6 +101,35 @@ def _prepared_gate_projection(
     ):
         return None
     return input_qdata, input_scale, weight_qdata, weight_scale, bias
+
+
+def _prepared_query_projection(
+    query: torch.fx.Node,
+    query_scale: torch.fx.Node,
+    query_summary: torch.fx.Node,
+    routing_mode: int,
+    block_lengths: Argument | None,
+) -> _PreparedQueryProjectionNodes | None:
+    """Recover one shared ConvRot Q producer from its three tuple outputs."""
+    producer = sparse_piper_compile.ordered_tuple_output_producer(
+        (query, query_scale, query_summary),
+        torch.ops.piper_kernels.convrot_sparse_piper_project_query.default,
+    )
+    if (
+        producer is None
+        or len(producer.args) not in (10, 11)
+        or producer.args[9] != routing_mode
+        or (producer.args[10] if len(producer.args) == 11 else None) is not block_lengths
+    ):
+        return None
+    projection = producer.args[:9]
+    if (
+        any(not isinstance(value, torch.fx.Node) for value in projection[:7])
+        or not isinstance(projection[7], float)
+        or not isinstance(projection[8], float)
+    ):
+        return None
+    return projection  # type: ignore[return-value]
 
 
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
@@ -242,11 +283,15 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
             query_blocks,
         )
         gate_arguments = gate_projection
+    query_projection = _prepared_query_projection(
+        output_query,
+        output_query_scale,
+        output_query_summary,
+        output_routing_mode,
+        block_lengths,
+    )
     with graph.inserting_before(original):
-        common_arguments = (
-            output_query,
-            output_query_scale,
-            output_query_summary,
+        attention_tail = (
             output_key,
             output_key_scale,
             output_key_summary,
@@ -263,8 +308,22 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
             output_bias,
             output_group_size,
         )
+        if query_projection is None:
+            target = torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default
+            common_arguments = (
+                output_query,
+                output_query_scale,
+                output_query_summary,
+                *attention_tail,
+            )
+        else:
+            projected_query_output = (
+                torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output
+            )
+            target = projected_query_output.default
+            common_arguments = (*query_projection, *attention_tail)
         replacement = graph.call_function(
-            torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default,
+            target,
             args=(
                 *common_arguments,
                 output._DEFAULT_QUERY_CHUNK_ROWS,

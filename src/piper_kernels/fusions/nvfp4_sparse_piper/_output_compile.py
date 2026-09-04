@@ -33,6 +33,7 @@ type _PreparedGateProjectionNodes = tuple[
     torch.fx.Node | None,
     torch.fx.Node | None,
 ]
+type _PreparedQueryProjectionNodes = tuple[Argument, ...]
 
 
 def _attention_output_pattern(
@@ -126,6 +127,28 @@ def _prepared_gate_projection(
         operands.weight_per_tensor_scale,
         operands.bias,
     )
+
+
+def _prepared_query_projection(
+    query: object,
+    query_scale: object,
+    query_summary: object,
+    routing_mode: object,
+    block_lengths: object,
+) -> _PreparedQueryProjectionNodes | None:
+    """Recover one shared NVFP4 Q producer from its tuple outputs."""
+    producer = sparse_piper_compile.ordered_tuple_output_producer(
+        (query, query_scale, query_summary),
+        torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default,
+    )
+    if (
+        producer is None
+        or len(producer.args) not in (14, 15)
+        or producer.args[13] != routing_mode
+        or (producer.args[14] if len(producer.args) == 15 else None) is not block_lengths
+    ):
+        return None
+    return cast(tuple[Argument, ...], producer.args[:12])
 
 
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
@@ -241,6 +264,7 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
 def _replace_attention_output_with_target(
     match: Match,
     target: Callable[..., torch.Tensor],
+    projected_query_target: Callable[..., torch.Tensor],
     projection_arguments: tuple[Argument, ...],
     query_chunk_rows: int,
 ) -> None:
@@ -263,11 +287,22 @@ def _replace_attention_output_with_target(
             query_blocks,
         )
         gate_arguments = cast(tuple[Argument, ...], gate_projection)
+    attention_arguments = sparse_piper_pattern.quantized_attention_arguments(match)
+    query_projection = _prepared_query_projection(
+        attention_arguments[0],
+        attention_arguments[1],
+        attention_arguments[2],
+        attention_arguments[-1],
+        block_lengths,
+    )
+    if query_projection is not None:
+        target = projected_query_target
+        attention_arguments = (*query_projection, *attention_arguments[3:])
     with graph.inserting_before(original):
         replacement = graph.call_function(
             target,
             args=(
-                *sparse_piper_pattern.quantized_attention_arguments(match),
+                *attention_arguments,
                 *projection_arguments,
                 query_chunk_rows,
                 *bounded_arguments,
@@ -284,6 +319,7 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
     _replace_attention_output_with_target(
         match,
         torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default,
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default,
         (
             match.kwargs["output_weight_qdata"],
             match.kwargs["output_weight_scale"],

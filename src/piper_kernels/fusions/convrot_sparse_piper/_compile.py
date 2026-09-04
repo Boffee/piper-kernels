@@ -50,7 +50,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v22"
+_COMPILE_PASS_VERSION = "convrot-sparse-piper-compile-v23"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS

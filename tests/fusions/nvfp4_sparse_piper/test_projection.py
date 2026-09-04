@@ -174,6 +174,48 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
+def test_query_projection_range_uses_compact_storage_and_global_rows(
+    routing_mode: int,
+) -> None:
+    operands = make_operands(sequence_length=193)
+    projection = operands.projection(0)
+    start, rows = 128, 65
+    actual = query._launch_query_range(
+        *projection.as_tuple(),
+        None,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        1e-5,
+        128**-0.5,
+        128,
+        routing_mode,
+        None,
+        chunk_start=start,
+        chunk_rows=rows,
+    )
+    transformed = materialize_qk(
+        projection,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        norm_epsilon=1e-5,
+    )[:, :, start : start + rows]
+    expected = query_reference(transformed, 128**-0.5)
+
+    assert int((actual[0].to(torch.int16) - expected[0]).abs().max()) <= 1
+    torch.testing.assert_close(actual[1], expected[1], atol=1e-5, rtol=2e-3)
+    expected_summary = (
+        torch.stack((transformed[:, :, :64].mean(dim=2), transformed[:, :, 64:].mean(dim=2)), 2)
+        if routing_mode == _MEAN_ROUTING
+        else expected[2]
+    )
+    torch.testing.assert_close(actual[2], expected_summary, atol=0.125, rtol=0.01)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_value_block_means_respect_internal_block_lengths() -> None:
     operands = make_operands(sequence_length=128)
     projection = operands.projection(2)

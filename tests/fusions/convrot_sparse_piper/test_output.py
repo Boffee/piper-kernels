@@ -189,6 +189,50 @@ def test_attention_output_matches_materialized_boundary(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_projected_query_attention_output_matches_multiple_materialized_q_windows() -> None:
+    sequence_length = 193
+    operands = _operands(batch=1, sequence_length=sequence_length)
+    prepared_query, prepared_key, prepared_value = _prepare(operands)
+    attention = SparsePiperAttention((0.5, 1.0))
+    sparse_key_blocks = sequence_length // 64
+    weight, scale, bias = _projection(bias=True)
+    attention_tail = (
+        *prepared_key,
+        *prepared_value,
+        list(attention._head_keep_ratio_units),
+        sparse_key_blocks,
+        sequence_length,
+        attention._routing_mode,
+        weight,
+        scale,
+        bias,
+        _HEADS * _HEAD_DIM,
+        64,
+    )
+
+    with torch.no_grad():
+        expected = output_fusion._attention_output_op(
+            *prepared_query,
+            *attention_tail,
+        )
+        actual = output_fusion._projected_query_attention_output_op(
+            operands.input_qdata,
+            operands.input_scale,
+            operands.query_weight,
+            operands.query_weight_scale,
+            operands.query_norm,
+            operands.cos,
+            operands.sin,
+            1e-5,
+            _HEAD_DIM**-0.5,
+            *attention_tail,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_attention_output_obeys_a_nondefault_current_stream() -> None:
     arguments, expected = _arguments(batch=1, sequence_length=193, bias=False)
     stream = torch.cuda.Stream()

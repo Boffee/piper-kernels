@@ -22,12 +22,13 @@ from piper_kernels.linear.nvfp4._chunking import (
     PreparedProjection,
     run_chunked_projection,
 )
+from piper_kernels.linear.nvfp4._projection import matmul_prepared_chunk_out
 
 from . import _epilogue
 from ._validation import validate_block_lengths, validate_projection, validate_qk_epilogue
 
 
-def _launch_query(  # noqa: PLR0913, PLR0917
+def _launch_query_range(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     input_per_tensor_scale: torch.Tensor,
@@ -40,9 +41,12 @@ def _launch_query(  # noqa: PLR0913, PLR0917
     sin: torch.Tensor,
     norm_epsilon: float,
     softmax_scale: float,
-    chunk_rows: int,
+    projection_chunk_rows: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None,
+    *,
+    chunk_start: int = 0,
+    chunk_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     sequence_length, heads = validate_projection(
@@ -53,7 +57,7 @@ def _launch_query(  # noqa: PLR0913, PLR0917
         weight_scale,
         weight_per_tensor_scale,
         bias,
-        chunk_rows,
+        projection_chunk_rows,
         "Q projection",
     )
     validate_qk_epilogue(
@@ -74,7 +78,20 @@ def _launch_query(  # noqa: PLR0913, PLR0917
     operands = (norm_weight, cos, sin)
     if not math.isfinite(softmax_scale) or softmax_scale <= 0:
         raise ValueError("Q projection softmax scale must be finite and positive")
-    storage_sequence_length = padded_sequence_length(sequence_length)
+    if chunk_rows is None:
+        chunk_rows = sequence_length
+    if (
+        isinstance(chunk_start, bool)
+        or not isinstance(chunk_start, int)
+        or isinstance(chunk_rows, bool)
+        or not isinstance(chunk_rows, int)
+        or chunk_start < 0
+        or chunk_rows < 1
+        or chunk_start % TILE_ROWS
+        or chunk_start + chunk_rows > sequence_length
+    ):
+        raise ValueError("Q projection range must be a nonempty aligned sequence window")
+    storage_sequence_length = padded_sequence_length(chunk_rows)
     query = torch.empty(
         (1, heads, storage_sequence_length, HEAD_DIM),
         device=input_qdata.device,
@@ -90,12 +107,6 @@ def _launch_query(  # noqa: PLR0913, PLR0917
         device=input_qdata.device,
         dtype=torch.float32,
     )
-    projection = PreparedProjection(
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-    )
 
     def consume(chunk: torch.Tensor, start: int) -> None:
         _epilogue.launch_query(
@@ -109,12 +120,12 @@ def _launch_query(  # noqa: PLR0913, PLR0917
             query,
             query_scale,
             query_summary,
-            start,
-            sequence_length,
+            chunk_start + start,
             norm_epsilon,
             softmax_scale,
             routing_mode == _MEAN_ROUTING,
             block_lengths,
+            storage_chunk_start=start,
         )
 
     consumer_tensors = [input_per_tensor_scale, *operands]
@@ -123,13 +134,77 @@ def _launch_query(  # noqa: PLR0913, PLR0917
     )
     if block_lengths is not None:
         consumer_tensors.append(block_lengths)
-    run_chunked_projection(
-        projection,
-        chunk_rows,
-        consume,
-        (*consumer_tensors, query, query_scale, query_summary),
-    )
+    # ``run_chunked_projection`` assumes row-zero scale addressing. A local
+    # query range therefore projects from the original prepared storage with
+    # explicit global row bounds while retaining its bounded BF16 temporary.
+    if chunk_start == 0 and chunk_rows == sequence_length:
+        run_chunked_projection(
+            PreparedProjection(
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+            ),
+            projection_chunk_rows,
+            consume,
+            (*consumer_tensors, query, query_scale, query_summary),
+        )
+    else:
+        projection_buffer = torch.empty(
+            (min(chunk_rows, projection_chunk_rows), weight_qdata.shape[0]),
+            device=input_qdata.device,
+            dtype=torch.bfloat16,
+        )
+        for local_start in range(0, chunk_rows, projection_chunk_rows):
+            local_rows = min(projection_chunk_rows, chunk_rows - local_start)
+            projected = matmul_prepared_chunk_out(
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                chunk_start + local_start,
+                chunk_start + local_start + local_rows,
+                projection_buffer,
+            )
+            consume(projected, local_start)
     return query, query_scale, query_summary
+
+
+def _launch_query(  # noqa: PLR0913, PLR0917
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    input_per_tensor_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    softmax_scale: float,
+    chunk_rows: int,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project complete query storage for the public standalone boundary."""
+    return _launch_query_range(
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight_qdata,
+        weight_scale,
+        weight_per_tensor_scale,
+        bias,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        softmax_scale,
+        chunk_rows,
+        routing_mode,
+        block_lengths,
+    )
 
 
 @torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_query", mutates_args=())

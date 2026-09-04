@@ -87,6 +87,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
     chunk_start,
     logical_sequence_length,
     storage_sequence_length,
+    storage_chunk_start,
     row_block_offset,
     batch,
     output_features: tl.constexpr,
@@ -104,10 +105,12 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
     block_m: tl.constexpr,
 ):
     local_block = row_block_offset + tl.program_id(0)
-    query_block = chunk_start // block_m + local_block
+    global_query_block = chunk_start // block_m + local_block
     head_block = tl.program_id(1)
     local_sequence_offsets = local_block * block_m + tl.arange(0, block_m)
-    sequence_offsets = chunk_start + local_sequence_offsets
+    global_sequence_offsets = chunk_start + local_sequence_offsets
+    storage_sequence_offsets = storage_chunk_start + local_sequence_offsets
+    storage_query_block = storage_chunk_start // block_m + local_block
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
     projection = _load_projection_tile(
         projection_ptr,
@@ -130,7 +133,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
         norm_weight_ptr,
         cos_ptr,
         sin_ptr,
-        sequence_offsets,
+        global_sequence_offsets,
         logical_sequence_length,
         heads_per_program,
         head_dim,
@@ -148,10 +151,12 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
         batch,
         heads,
         head_offsets,
-        sequence_offsets,
+        global_sequence_offsets,
+        storage_sequence_offsets,
         logical_sequence_length,
         storage_sequence_length,
-        query_block,
+        global_query_block,
+        storage_query_block,
         softmax_scale,
         mean_pool_summary,
         mask_block_lengths,
@@ -339,15 +344,18 @@ def launch_query(  # noqa: PLR0913, PLR0917
     query_scale,
     query_summary,
     chunk_start: int,
-    logical_sequence_length: int,
     norm_epsilon: float,
     softmax_scale: float,
     mean_pool_summary: bool,
     block_lengths,
+    *,
+    storage_chunk_start: int | None = None,
 ) -> None:
     chunk_rows, output_features = projection.shape
     heads = output_features // HEAD_DIM
     storage_sequence_length = query.shape[2]
+    if storage_chunk_start is None:
+        storage_chunk_start = chunk_start
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else query_scale
 
@@ -366,8 +374,9 @@ def launch_query(  # noqa: PLR0913, PLR0917
             block_lengths_ptr,
             chunk_rows,
             chunk_start,
-            logical_sequence_length,
+            chunk_start + chunk_rows,
             storage_sequence_length,
+            storage_chunk_start,
             row_block_offset,
             0,
             output_features=output_features,

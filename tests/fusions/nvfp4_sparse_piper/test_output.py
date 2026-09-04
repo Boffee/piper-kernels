@@ -249,6 +249,30 @@ def _padded_arguments(
     ), expected
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_projected_query_attention_output_matches_multiple_materialized_q_windows() -> None:
+    sequence_length = 193
+    arguments, expected = _arguments(sequence_length=sequence_length, bias=True)
+    operands = make_operands(sequence_length=sequence_length)
+    query_projection = operands.projection(0)
+
+    with torch.no_grad():
+        actual = output._projected_query_attention_output_op(
+            *query_projection.as_tuple(),
+            None,
+            operands.query_norm,
+            operands.cos,
+            operands.sin,
+            1e-5,
+            _HEAD_DIM**-0.5,
+            *arguments[3:],
+            128,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def _projected_gate_arguments(
     *,
     sequence_length: int,

@@ -55,7 +55,10 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     query_summary_ptr,
     block_lengths_ptr,
     rows,
+    chunk_start,
+    chunk_rows,
     logical_sequence_length,
+    query_sequence_end,
     storage_sequence_length,
     input_features: tl.constexpr,
     heads: tl.constexpr,
@@ -80,13 +83,15 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     tl.static_assert(rotary_dim <= head_dim)
     tl.static_assert(rotary_dim % 2 == 0)
 
-    query_block = tl.program_id(0)
+    storage_query_block = tl.program_id(0)
     if mask_ragged_tail:
-        query_block = logical_sequence_length // block_m
+        storage_query_block = chunk_rows // block_m
+    global_query_block = chunk_start // block_m + storage_query_block
     head_block = tl.program_id(1)
     batch = tl.program_id(2)
-    sequence_offsets = query_block * block_m + tl.arange(0, block_m)
-    row_offsets = batch * logical_sequence_length + sequence_offsets
+    storage_sequence_offsets = storage_query_block * block_m + tl.arange(0, block_m)
+    global_sequence_offsets = chunk_start + storage_sequence_offsets
+    row_offsets = batch * logical_sequence_length + global_sequence_offsets
     projection_feature_offsets = tl.arange(0, block_n)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
     weight_offsets = head_block * block_n + projection_feature_offsets
@@ -100,9 +105,9 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         sin_ptr,
         row_offsets,
         weight_offsets,
-        sequence_offsets,
+        global_sequence_offsets,
         rows,
-        logical_sequence_length,
+        query_sequence_end,
         input_features,
         heads * head_dim,
         heads_per_program,
@@ -125,10 +130,12 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         batch,
         heads,
         head_offsets,
-        sequence_offsets,
-        logical_sequence_length,
+        global_sequence_offsets,
+        storage_sequence_offsets,
+        query_sequence_end,
         storage_sequence_length,
-        query_block,
+        global_query_block,
+        storage_query_block,
         softmax_scale,
         mean_pool_summary,
         mask_block_lengths,
@@ -170,7 +177,7 @@ def _validate_inputs(
     return result
 
 
-def _launch_query_projection(  # noqa: PLR0913, PLR0917
+def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -182,6 +189,9 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
     softmax_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    *,
+    chunk_start: int = 0,
+    chunk_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     batch, sequence_length, heads, rotary_dim = _validate_inputs(
@@ -195,7 +205,20 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
         norm_epsilon=norm_epsilon,
         softmax_scale=softmax_scale,
     )
-    storage_sequence_length = padded_sequence_length(sequence_length)
+    if chunk_rows is None:
+        chunk_rows = sequence_length
+    if (
+        isinstance(chunk_start, bool)
+        or not isinstance(chunk_start, int)
+        or isinstance(chunk_rows, bool)
+        or not isinstance(chunk_rows, int)
+        or chunk_start < 0
+        or chunk_rows < 1
+        or chunk_start % TILE_ROWS
+        or chunk_start + chunk_rows > sequence_length
+    ):
+        raise ValueError("Q projection range must be a nonempty aligned sequence window")
+    storage_sequence_length = padded_sequence_length(chunk_rows)
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     query = torch.empty(
         (batch, heads, storage_sequence_length, HEAD_DIM),
@@ -232,7 +255,10 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
             query_summary,
             block_lengths_ptr,
             batch * sequence_length,
+            chunk_start,
+            chunk_rows,
             sequence_length,
+            chunk_start + chunk_rows,
             storage_sequence_length,
             input_features=input_qdata.shape[2],
             heads=heads,
@@ -256,12 +282,41 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
             num_stages=3,
         )
 
-    full_row_blocks = sequence_length // _BLOCK_M
+    full_row_blocks = chunk_rows // _BLOCK_M
     if full_row_blocks:
         launch(full_row_blocks, mask_ragged_tail=False)
-    if sequence_length % _BLOCK_M:
+    if chunk_rows % _BLOCK_M:
         launch(1, mask_ragged_tail=True)
     return query, query_scale, query_summary
+
+
+def _launch_query_projection(  # noqa: PLR0913, PLR0917
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    softmax_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project the complete query storage for the public standalone boundary."""
+    return _launch_query_projection_range(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        softmax_scale,
+        routing_mode,
+        block_lengths,
+    )
 
 
 @torch.library.custom_op("piper_kernels::convrot_sparse_piper_project_query", mutates_args=())

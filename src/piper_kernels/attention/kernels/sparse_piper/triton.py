@@ -82,10 +82,12 @@ def store_query_tile(
     batch,
     heads,
     head_offsets,
-    sequence_offsets,
+    global_sequence_offsets,
+    storage_sequence_offsets,
     logical_sequence_length,
     storage_sequence_length,
-    query_block,
+    global_query_block,
+    storage_query_block,
     softmax_scale: tl.constexpr,
     mean_pool_summary: tl.constexpr,
     mask_block_lengths: tl.constexpr,
@@ -97,11 +99,11 @@ def store_query_tile(
 ):
     """Quantize and store one transformed sparse-Piper query tile and route summary."""
     feature_offsets = tl.arange(0, head_dim)
-    valid_rows = sequence_offsets < logical_sequence_length
+    valid_rows = global_sequence_offsets < logical_sequence_length
     block_length = block_m
     if mask_block_lengths:
-        block_length = tl.load(block_lengths_ptr + query_block)
-        valid_rows = sequence_offsets - query_block * block_m < block_length
+        block_length = tl.load(block_lengths_ptr + global_query_block)
+        valid_rows = global_sequence_offsets - global_query_block * block_m < block_length
     if mask_block_lengths or mask_ragged_tail:
         values = tl.where(valid_rows[:, None, None], values, 0.0)
     summary_values = tl.reshape(
@@ -116,7 +118,8 @@ def store_query_tile(
     )
     summary = tl.reshape(summary, (heads_per_program, head_dim))
     summary_offsets = (
-        (batch * heads + head_offsets[:, None]) * (storage_sequence_length // block_m) + query_block
+        (batch * heads + head_offsets[:, None]) * (storage_sequence_length // block_m)
+        + storage_query_block
     ) * head_dim + feature_offsets[None, :]
     tl.store(
         query_summary_ptr + summary_offsets,
@@ -130,7 +133,7 @@ def store_query_tile(
         group_starts = group_offsets * scale_rows
         group_valid = group_valid & (group_starts[None, :] < block_length)
     elif mask_ragged_tail:
-        group_starts = query_block * block_m + group_offsets * scale_rows
+        group_starts = global_query_block * block_m + group_offsets * scale_rows
         group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
     quantized, stored_scale = qk_quantization.quantize_query_tile(
         values,
@@ -144,7 +147,7 @@ def store_query_tile(
     query_offsets = (
         batch * heads * storage_sequence_length * head_dim
         + head_offsets[:, None, None] * storage_sequence_length * head_dim
-        + sequence_offsets[None, :, None] * head_dim
+        + storage_sequence_offsets[None, :, None] * head_dim
         + feature_offsets[None, None, :]
     )
     tl.store(
@@ -154,7 +157,7 @@ def store_query_tile(
     )
     scale_offsets = (
         (batch * heads + head_offsets[:, None]) * (storage_sequence_length // scale_rows)
-        + query_block * (block_m // scale_rows)
+        + storage_query_block * (block_m // scale_rows)
         + group_offsets[None, :]
     )
     tl.store(

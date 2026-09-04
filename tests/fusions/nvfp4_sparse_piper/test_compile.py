@@ -958,15 +958,14 @@ def test_static_output_fuses_after_prepared_sparse_projection(
     call_nodes = [node for node in graph.nodes if node.op == "call_function"]
     targets = [node.target for node in call_nodes]
     assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == preparation_count
-    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default) == 1
+    projected_output = (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+    )
+    assert targets.count(projected_output) == 1
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
-    output_node = next(
-        node
-        for node in call_nodes
-        if node.target is torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
-    )
-    assert output_node.args[19] == 8_192
+    output_node = next(node for node in call_nodes if node.target is projected_output)
+    assert output_node.args[28] == 8_192
     assert output_node.args[-1] == (2 if with_sparse_query_blocks else None)
     graph.lint()
 
@@ -1130,9 +1129,7 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
         capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
         == preparation_count
     )
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
-    )
+    assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     )
@@ -1140,7 +1137,9 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     )
     assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in (
@@ -1200,9 +1199,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         atol=0,
         rtol=0,
     )
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
-    )
+    assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     )
@@ -1213,7 +1210,9 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         == 1
     )
     assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
@@ -1282,7 +1281,9 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         == preparation_count
     )
     assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
