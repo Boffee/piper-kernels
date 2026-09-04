@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
+from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
@@ -34,6 +35,8 @@ from piper_kernels.attention.sparse_piper_attention.gluon import (
 )
 from piper_kernels.attention.sparse_piper_attention.triton import (
     _prepare_sparse_piper_attention,
+    _prepare_sparse_piper_query_from_quantized,
+    _PreparedSparsePiperAttention,
 )
 
 
@@ -96,16 +99,16 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
     )
 
     quantized_arguments = (
-        prepared.query,
-        prepared.query_scale,
+        prepared.query.data,
+        prepared.query.scale,
         query_summary,
-        prepared.key,
-        prepared.key_scale,
+        prepared.context.key,
+        prepared.context.key_scale,
         key_max,
         key_min,
-        prepared.value,
-        prepared.value_scale_multiplier,
-        prepared.value_mean,
+        prepared.context.value,
+        prepared.context.value_scale_multiplier,
+        prepared.context.value_mean,
         list(ratio_units),
         sparse_key_blocks,
         sequence_length,
@@ -128,6 +131,30 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
     assert actual.is_contiguous()
     assert torch.equal(actual, expected)
     assert set(opcheck.values()) == {"SUCCESS"}
+
+
+def _local_query_range(
+    prepared: _PreparedSparsePiperAttention,
+    global_block_offset: int,
+    block_count: int,
+) -> _PreparedSparsePiperAttention:
+    storage_start = global_block_offset * TILE_ROWS
+    storage_stop = storage_start + block_count * TILE_ROWS
+    scale_start = storage_start // QUERY_SCALE_ROWS
+    scale_stop = storage_stop // QUERY_SCALE_ROWS
+    return _PreparedSparsePiperAttention(
+        context=prepared.context,
+        query=_prepare_sparse_piper_query_from_quantized(
+            prepared.query.data[:, :, storage_start:storage_stop].contiguous(),
+            prepared.query.scale[:, :, scale_start:scale_stop].contiguous(),
+            prepared.query.routes[
+                :,
+                global_block_offset : global_block_offset + block_count,
+            ].contiguous(),
+            prepared.context,
+            global_block_offset=global_block_offset,
+        ),
+    )
 
 
 @pytest.mark.gpu
@@ -185,16 +212,16 @@ def test_quantized_coarse_residual_matches_explicit_composition(
         )
         scores = _minmax_pool_scores(query_summary, key_summary, key_aux)
     fine_arguments = (
-        prepared.query,
-        prepared.query_scale,
+        prepared.query.data,
+        prepared.query.scale,
         query_summary,
-        prepared.key,
-        prepared.key_scale,
+        prepared.context.key,
+        prepared.context.key_scale,
         key_summary,
         key_aux,
-        prepared.value,
-        prepared.value_scale_multiplier,
-        prepared.value_mean,
+        prepared.context.value,
+        prepared.context.value_scale_multiplier,
+        prepared.context.value_mean,
         list(ratio_units),
         sparse_key_blocks,
         shape[1],
@@ -337,8 +364,28 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                     query_block_offset * 64 : query_block_offset * 64 + range_rows,
                 ],
             )
+            local_prepared = _local_query_range(
+                prepared,
+                query_block_offset,
+                range_block_count,
+            )
+            local_output = torch.empty_like(output)
+            _launch_sparse_piper_attention(
+                local_prepared,
+                local_output.transpose(1, 2),
+                coarse_output=coarse_output[
+                    :,
+                    :,
+                    query_block_offset : query_block_offset + range_block_count,
+                ].contiguous(),
+                coarse_gate=coarse_gate[
+                    :,
+                    query_block_offset * 64 : query_block_offset * 64 + range_rows,
+                ],
+            )
             assert bool(torch.all(guarded[:, 0] == 123.0))
             assert bool(torch.all(guarded[:, -1] == 123.0))
+            assert torch.equal(local_output, output)
             chunks.append(output.clone())
             query_block_offset += range_block_count
 
@@ -385,16 +432,16 @@ def _block_length_case(routing_mode: int):
         combined_value=value_head_major,
     )
     arguments = (
-        prepared.query,
-        prepared.query_scale,
+        prepared.query.data,
+        prepared.query.scale,
         query_summary,
-        prepared.key,
-        prepared.key_scale,
+        prepared.context.key,
+        prepared.context.key_scale,
         key_summary,
         key_aux,
-        prepared.value,
-        prepared.value_scale_multiplier,
-        prepared.value_mean,
+        prepared.context.value,
+        prepared.context.value_scale_multiplier,
+        prepared.context.value_mean,
         list(ratio_units),
         sparse_key_blocks,
         storage_sequence_length,
@@ -424,8 +471,8 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
     valid_rows = torch.arange(
         storage_sequence_length, device=query.device
     ) % 64 < block_lengths.repeat_interleave(64)
-    corrupted_key = prepared.key.clone()
-    corrupted_value = prepared.value.clone()
+    corrupted_key = prepared.context.key.clone()
+    corrupted_value = prepared.context.value.clone()
     corrupted_key[:, :, ~valid_rows] = 127
     corrupted_value[..., ~valid_rows] = -127
     corrupted_arguments = list(arguments)
@@ -598,16 +645,16 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
     query_mean = _sequence_block_means(query_head_major)
     key_mean = _sequence_block_means(key_head_major)
     arguments = (
-        prepared.query,
-        prepared.query_scale,
+        prepared.query.data,
+        prepared.query.scale,
         query_mean,
-        prepared.key,
-        prepared.key_scale,
+        prepared.context.key,
+        prepared.context.key_scale,
         key_mean,
         key_mean[:, :, :0],
-        prepared.value,
-        prepared.value_scale_multiplier,
-        prepared.value_mean,
+        prepared.context.value,
+        prepared.context.value_scale_multiplier,
+        prepared.context.value_mean,
         list(ratio_units),
         sparse_key_blocks,
         shape[1],

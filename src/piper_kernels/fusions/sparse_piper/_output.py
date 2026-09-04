@@ -37,10 +37,9 @@ class _PreparedAttentionOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class _PingPongBuffers:
-    """Two reusable chunk slots synchronized by produced and consumed events."""
+class _PingPongSlots:
+    """Synchronize two reusable caller-owned chunk slots."""
 
-    buffers: torch.Tensor
     produced: tuple[torch.cuda.Event, torch.cuda.Event]
     consumed: tuple[torch.cuda.Event, torch.cuda.Event]
 
@@ -48,13 +47,12 @@ class _PingPongBuffers:
         self,
         stream: torch.cuda.Stream,
         chunk_index: int,
-        rows: int,
-    ) -> torch.Tensor:
+    ) -> int:
         """Wait until a slot's previous reader has released it."""
         slot = chunk_index % 2
         if chunk_index >= 2:
             stream.wait_event(self.consumed[slot])
-        return self.buffers[slot, :, :rows]
+        return slot
 
     def publish(self, stream: torch.cuda.Stream, chunk_index: int) -> None:
         """Publish one completed write to readers."""
@@ -64,12 +62,11 @@ class _PingPongBuffers:
         self,
         stream: torch.cuda.Stream,
         chunk_index: int,
-        rows: int,
-    ) -> torch.Tensor:
-        """Wait for a slot's current contents and return its local view."""
+    ) -> int:
+        """Wait for a slot's current contents and return its index."""
         slot = chunk_index % 2
         stream.wait_event(self.produced[slot])
-        return self.buffers[slot, :, :rows]
+        return slot
 
     def release(self, stream: torch.cuda.Stream, chunk_index: int) -> None:
         """Mark one consumed slot reusable by its writer."""
@@ -77,7 +74,8 @@ class _PingPongBuffers:
 
 
 def _enqueue_gate_chunk(
-    slots: _PingPongBuffers,
+    slots: _PingPongSlots,
+    buffers: torch.Tensor,
     stream: torch.cuda.Stream,
     project_chunk: CoarseGateChunkProjector,
     chunk_index: int,
@@ -86,7 +84,8 @@ def _enqueue_gate_chunk(
 ) -> None:
     """Project and publish one gate chunk on its side stream."""
     with torch.cuda.stream(stream):
-        chunk = slots.acquire_for_write(stream, chunk_index, rows)
+        slot = slots.acquire_for_write(stream, chunk_index)
+        chunk = buffers[slot, :, :rows]
         project_chunk(chunk, start, rows)
         slots.publish(stream, chunk_index)
 
@@ -237,7 +236,7 @@ def run_chunked_attention_output(  # noqa: PLR0915
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into one format-specific projection."""
     prepared_attention = prepared.attention
-    query = prepared_attention.query
+    query = prepared_attention.query.data
     chunk_blocks = query_chunk_rows // TILE_ROWS
     sequence_length = prepared.sequence_length
     total_blocks = (sequence_length + TILE_ROWS - 1) // TILE_ROWS
@@ -306,8 +305,7 @@ def run_chunked_attention_output(  # noqa: PLR0915
     with torch.cuda.device(query.device):
         producer = torch.cuda.current_stream(query.device)
         consumer = torch.cuda.Stream(device=query.device)
-        attention_slots = _PingPongBuffers(
-            attention_buffers,
+        attention_slots = _PingPongSlots(
             (torch.cuda.Event(), torch.cuda.Event()),
             (torch.cuda.Event(), torch.cuda.Event()),
         )
@@ -317,14 +315,14 @@ def run_chunked_attention_output(  # noqa: PLR0915
             assert coarse_gate_buffers is not None
             assert project_coarse_gate_chunk is not None
             gate_stream = torch.cuda.Stream(device=query.device)
-            gate_slots = _PingPongBuffers(
-                coarse_gate_buffers,
+            gate_slots = _PingPongSlots(
                 (torch.cuda.Event(), torch.cuda.Event()),
                 attention_slots.produced,
             )
             gate_stream.wait_stream(producer)
             _enqueue_gate_chunk(
                 gate_slots,
+                coarse_gate_buffers,
                 gate_stream,
                 project_coarse_gate_chunk,
                 0,
@@ -333,11 +331,14 @@ def run_chunked_attention_output(  # noqa: PLR0915
             )
 
         for chunk_index, (block_start, block_count, start, rows) in enumerate(chunk_ranges):
-            attention_chunk = attention_slots.acquire_for_write(producer, chunk_index, rows)
+            attention_slot = attention_slots.acquire_for_write(producer, chunk_index)
+            attention_chunk = attention_buffers[attention_slot, :, :rows]
             if gate_slots is None:
                 gate_chunk = coarse_gate_chunk(start, rows)
             else:
-                gate_chunk = gate_slots.acquire_for_read(producer, chunk_index, rows)
+                gate_slot = gate_slots.acquire_for_read(producer, chunk_index)
+                assert coarse_gate_buffers is not None
+                gate_chunk = coarse_gate_buffers[gate_slot, :, :rows]
             _quantized_dispatch._launch_quantized_sparse_piper_attention(
                 prepared_attention,
                 attention_chunk.transpose(1, 2),
@@ -351,9 +352,11 @@ def run_chunked_attention_output(  # noqa: PLR0915
             if gate_slots is not None and next_chunk_index < chunk_count:
                 _, _, next_start, next_rows = chunk_ranges[next_chunk_index]
                 assert gate_stream is not None
+                assert coarse_gate_buffers is not None
                 assert project_coarse_gate_chunk is not None
                 _enqueue_gate_chunk(
                     gate_slots,
+                    coarse_gate_buffers,
                     gate_stream,
                     project_coarse_gate_chunk,
                     next_chunk_index,
@@ -361,21 +364,19 @@ def run_chunked_attention_output(  # noqa: PLR0915
                     next_rows,
                 )
             with torch.cuda.stream(consumer):
-                ready_attention = attention_slots.acquire_for_read(
-                    consumer,
-                    chunk_index,
-                    rows,
-                )
+                ready_slot = attention_slots.acquire_for_read(consumer, chunk_index)
+                ready_attention = attention_buffers[ready_slot, :, :rows]
                 project_chunk(ready_attention, output, start, rows)
                 attention_slots.release(consumer, chunk_index)
         producer.wait_event(attention_slots.consumed[(chunk_count - 1) % 2])
-        attention_slots.buffers.record_stream(consumer)
+        attention_buffers.record_stream(consumer)
         output.record_stream(consumer)
         for tensor in projector_tensors:
             tensor.record_stream(consumer)
         if gate_slots is not None:
             assert gate_stream is not None
-            gate_slots.buffers.record_stream(gate_stream)
+            assert coarse_gate_buffers is not None
+            coarse_gate_buffers.record_stream(gate_stream)
     return output
 
 
