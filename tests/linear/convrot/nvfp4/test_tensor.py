@@ -17,7 +17,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels.linear.convrot._rotation import rotate_groups
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor, convrot_nvfp4_linear
+from piper_kernels.linear.convrot.nvfp4 import (
+    ConvRotNVFP4Tensor,
+    convrot_nvfp4_compile_options,
+    convrot_nvfp4_linear,
+)
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 
@@ -171,6 +175,33 @@ def test_device_and_dtype_copies_preserve_wrapper_and_group_size() -> None:
     assert moved.device.type == "meta"
     assert moved.orig_dtype is torch.float16
     assert moved.group_size == 64
+
+
+def test_dtype_copy_reuses_packed_storage() -> None:
+    source = _meta_weight(group_size=64)
+
+    moved = source.to(dtype=torch.float16)
+
+    assert type(moved) is ConvRotNVFP4Tensor
+    assert moved.orig_dtype is torch.float16
+    assert moved.group_size == source.group_size
+    assert moved.qdata is source.qdata
+    assert moved.scale is source.scale
+    assert moved.per_tensor_scale is source.per_tensor_scale
+    assert moved.act_per_tensor_scale is source.act_per_tensor_scale
+
+
+def test_explicit_dtype_copy_duplicates_packed_storage() -> None:
+    source = _meta_weight(group_size=64)
+
+    moved = source.to(dtype=torch.float16, copy=True)
+
+    assert type(moved) is ConvRotNVFP4Tensor
+    assert moved.orig_dtype is torch.float16
+    assert moved.group_size == source.group_size
+    assert moved.qdata is not source.qdata
+    assert moved.scale is not source.scale
+    assert moved.per_tensor_scale is not source.per_tensor_scale
 
 
 def test_tensor_flatten_round_trip_preserves_storage_and_metadata() -> None:
@@ -729,3 +760,37 @@ def test_cuda_compile_preserves_semantic_linear(dynamic: bool) -> None:
 
     assert torch.equal(actual, expected)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
+    torch.manual_seed(614)
+    input = torch.randn(17, 256, device="cuda", dtype=torch.float32) * 0.01  # noqa: A001
+    source = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16) * 0.01
+    weight = ConvRotNVFP4Tensor.from_hp(
+        source,
+        group_size=16,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(True),
+    )
+    bias = torch.randn(128, device="cuda", dtype=torch.float32) * 0.01
+
+    def projection(value: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        return F.linear(value, weight, offset)
+
+    call = (
+        torch.compile(projection, fullgraph=True, options=convrot_nvfp4_compile_options())
+        if compiled
+        else projection
+    )
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        actual = call(input, bias)
+    with torch.no_grad():
+        expected = F.linear(input.half(), weight.to(dtype=torch.float16), bias.half())
+
+    assert actual.dtype is torch.float16
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)

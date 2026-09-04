@@ -14,7 +14,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     QuantizeTensorToNVFP4Kwargs,
 )
 
-from piper_kernels.linear._dispatch import bind_linear_arguments
+from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
 from piper_kernels.linear.convrot._rotation import (
     rotate_groups,
     validate_group_size,
@@ -343,12 +343,15 @@ def convrot_nvfp4_linear(
         raise TypeError(
             f"ConvRot NVFP4 linear bias must be a tensor or None, got {type(bias).__name__}"
         )
-    if not _supports_convrot_linear(input, weight):
+    converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
+    assert isinstance(converted_weight, ConvRotNVFP4Tensor)
+    weight = converted_weight
+    if not _supports_convrot_linear(converted_input, weight):
         raise ValueError("ConvRot NVFP4 linear requires canonical SM120 NVFP4 operands")
     quantization = weight.act_quant_kwargs
     assert quantization is not None
     return _ops.linear(
-        input,
+        converted_input,
         weight.qdata,
         weight.scale,
         weight.per_tensor_scale,

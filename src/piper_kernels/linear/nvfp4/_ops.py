@@ -97,11 +97,28 @@ def _compiled_prepare_dynamic(
     return _compiled_prepare_dynamic_gelu_tanh(input)
 
 
+def _scale_result_to(
+    result: torch.Tensor,
+    global_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return (result.float() * global_scale.float()).to(output_dtype)
+
+
+def _scale_result_and_add_bias_to(
+    result: torch.Tensor,
+    global_scale: torch.Tensor,
+    bias: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return (result.float() * global_scale.float() + bias.float()).to(output_dtype)
+
+
 def _scale_result(
     result: torch.Tensor,
     global_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return (result.float() * global_scale.float()).to(result.dtype)
+    return _scale_result_to(result, global_scale, result.dtype)
 
 
 def _scale_result_and_add_bias(
@@ -109,12 +126,32 @@ def _scale_result_and_add_bias(
     global_scale: torch.Tensor,
     bias: torch.Tensor,
 ) -> torch.Tensor:
-    return (result.float() * global_scale.float() + bias.float()).to(result.dtype)
+    return _scale_result_and_add_bias_to(result, global_scale, bias, result.dtype)
+
+
+def _scale_fp16_result(
+    result: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    return _scale_result_to(result, global_scale, torch.float16)
+
+
+def _scale_fp16_result_and_add_bias(
+    result: torch.Tensor,
+    global_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    return _scale_result_and_add_bias_to(result, global_scale, bias, torch.float16)
 
 
 _compiled_scale_result = torch.compile(_scale_result, fullgraph=True)
 _compiled_scale_result_and_add_bias = torch.compile(
     _scale_result_and_add_bias,
+    fullgraph=True,
+)
+_compiled_scale_fp16_result = torch.compile(_scale_fp16_result, fullgraph=True)
+_compiled_scale_fp16_result_and_add_bias = torch.compile(
+    _scale_fp16_result_and_add_bias,
     fullgraph=True,
 )
 
@@ -149,16 +186,21 @@ def _execute_prepared(
     bias: torch.Tensor | None,
     logical_dtype: torch.dtype,
 ) -> torch.Tensor:
+    accumulator_dtype = torch.bfloat16 if logical_dtype is torch.float16 else logical_dtype
     result = torch._scaled_mm(
         input_qdata.view(torch.float4_e2m1fn_x2),
         weight_qdata.t().view(torch.float4_e2m1fn_x2),
         input_scale.view(torch.float8_e4m3fn),
         weight_scale.view(torch.float8_e4m3fn),
-        out_dtype=logical_dtype,
+        out_dtype=accumulator_dtype,
     )
     global_scale = input_per_tensor_scale
     if weight_per_tensor_scale is not None:
         global_scale = global_scale * weight_per_tensor_scale
+    if logical_dtype is torch.float16:
+        if bias is None:
+            return _compiled_scale_fp16_result(result, global_scale)
+        return _compiled_scale_fp16_result_and_add_bias(result, global_scale, bias)
     if bias is None:
         return _compiled_scale_result(result, global_scale)
     return _compiled_scale_result_and_add_bias(result, global_scale, bias)
