@@ -241,18 +241,29 @@ def _convrot_int8_to_copy(
     device = arguments.pop("device", tensor.device)
     non_blocking = arguments.pop("non_blocking", False)
     arguments.pop("copy", None)
-    arguments.pop("memory_format", None)
-    arguments.pop("layout", None)
-    arguments.pop("pin_memory", None)
+    memory_format = arguments.pop("memory_format", None)
+    layout = arguments.pop("layout", None)
+    pin_memory = arguments.pop("pin_memory", None)
     if arguments:
         raise NotImplementedError(f"unsupported ConvRot INT8 conversion arguments: {arguments}")
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"ConvRot INT8 logical dtype must be floating point, got {dtype}")
-    moved = cast(
-        ConvRotInt8Tensor,
-        tensor._apply_fn_to_data(
-            lambda value: func(value, device=device, non_blocking=non_blocking)
-        ),
+    metadata_only = (
+        torch.device(device) == tensor.device
+        and dtype is not tensor.dtype
+        and memory_format in (None, torch.preserve_format)
+        and layout in (None, tensor.layout)
+        and pin_memory is None
+    )
+    moved = (
+        tensor
+        if metadata_only
+        else cast(
+            ConvRotInt8Tensor,
+            tensor._apply_fn_to_data(
+                lambda value: func(value, device=device, non_blocking=non_blocking)
+            ),
+        )
     )
     if dtype is not moved.dtype:
         moved = moved._rebuild_with_logical_dtype(dtype)

@@ -143,6 +143,10 @@ def test_dtype_copy_preserves_concrete_piper_subclass() -> None:
 
     assert type(moved) is DerivedPiperNVFP4Tensor
     assert moved.orig_dtype is torch.float16
+    assert moved.qdata is source.qdata
+    assert moved.scale is source.scale
+    assert moved.per_tensor_scale is source.per_tensor_scale
+    assert moved.act_per_tensor_scale is source.act_per_tensor_scale
 
 
 @pytest.mark.gpu

@@ -65,8 +65,8 @@ def test_dtype_copy_changes_only_the_logical_dtype() -> None:
     assert converted.group_size == wrapped.group_size
     assert converted.qdata.dtype is torch.int8
     assert converted.scale.dtype is torch.float32
-    assert torch.equal(converted.qdata, wrapped.qdata)
-    assert torch.equal(converted.scale, wrapped.scale)
+    assert converted.qdata is wrapped.qdata
+    assert converted.scale is wrapped.scale
 
 
 def test_from_quantized_canonicalizes_storage_and_names_logical_dtype() -> None:
