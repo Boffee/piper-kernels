@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc4] - 2026-09-04
+
 ### Fixed
 
 - Made ConvRot INT8, NVFP4, and ConvRot NVFP4 semantic linears honor autocast without changing
