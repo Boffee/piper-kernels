@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc3] - 2026-09-03
+
 ### Added
 
 - Added parser-independent GGUF layout metadata and register decoding for F32, F16, BF16, Q4_0,
