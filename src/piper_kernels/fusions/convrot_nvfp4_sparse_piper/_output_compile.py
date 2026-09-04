@@ -63,6 +63,7 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
     nvfp4_output_compile._replace_attention_output_with_target(
         match,
         torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default,
+        torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_projected_query_attention_output.default,
         (
             match.kwargs["output_weight_qdata"],
             match.kwargs["output_weight_scale"],

@@ -15,6 +15,7 @@ from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
+from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
 
 from .triton import _PreparedSparsePiperAttention
 
@@ -26,6 +27,7 @@ _LOG2_255 = 7.994353436858858
 _GL_BLOCK_M = gl.constexpr(_BLOCK_M)
 _GL_BLOCK_N = gl.constexpr(_BLOCK_N)
 _GL_HEAD_DIM = gl.constexpr(_HEAD_DIM)
+_GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
 _GL_LOG2_255 = gl.constexpr(_LOG2_255)
 _GL_VALUE_LOG_BOUND_CORRECTION = gl.constexpr(0.086085)
 
@@ -291,6 +293,7 @@ def _native_tile_start(
     do_not_specialize=[
         "logical_sequence_length",
         "query_block_offset",
+        "global_query_block_offset",
         "sparse_key_blocks",
         "sparse_query_blocks",
         "stride_rb",
@@ -313,6 +316,8 @@ def _sparse_piper_attention_kernel(
     route_head_offsets_ptr,
     output_ptr,
     query_block_offset,
+    global_query_block_offset,
+    query_storage_sequence_length,
     storage_sequence_length,
     logical_sequence_length,
     sparse_key_blocks,
@@ -339,6 +344,7 @@ def _sparse_piper_attention_kernel(
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
     local_query_block = gl.program_id(0)
     query_block = query_block_offset + local_query_block
+    global_query_block = global_query_block_offset + local_query_block
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
@@ -385,7 +391,7 @@ def _sparse_piper_attention_kernel(
 
     routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
     if has_dense_query_suffix:
-        use_sparse_routes = query_block < sparse_query_blocks
+        use_sparse_routes = global_query_block < sparse_query_blocks
         selected_sparse_tile_count = gl.where(
             use_sparse_routes,
             routed_sparse_tile_count,
@@ -420,7 +426,7 @@ def _sparse_piper_attention_kernel(
 
     _issue_tma(
         query_desc,
-        [batch_head * storage_sequence_length + start_m, 0],
+        [batch_head * query_storage_sequence_length + start_m, 0],
         query_shared,
         query_barrier,
     )
@@ -444,9 +450,11 @@ def _sparse_piper_attention_kernel(
     query = query_shared.load(query_layout)
 
     offsets_m = gl.arange(0, _GL_BLOCK_M, row_layout)
-    query_scale_stride = storage_sequence_length // 32
+    query_scale_stride = query_storage_sequence_length // _GL_QUERY_SCALE_ROWS
     query_scale = gl.load(
-        query_scale_ptr + batch_head * query_scale_stride + (start_m + offsets_m) // 32
+        query_scale_ptr
+        + batch_head * query_scale_stride
+        + (start_m + offsets_m) // _GL_QUERY_SCALE_ROWS
     )
     accumulator = gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.float32, mma_layout)
     denominator = gl.zeros([_GL_BLOCK_M], gl.float32, row_layout)
@@ -595,7 +603,7 @@ def _sparse_piper_attention_kernel(
     value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + offsets_d).to(gl.float32)
     output += value_mean[None, :]
     if mask_ragged_tail:
-        valid_queries = start_m + offsets_m < logical_sequence_length
+        valid_queries = global_query_block * _GL_BLOCK_M + offsets_m < logical_sequence_length
     if apply_coarse_residual:
         coarse = gl.load(
             coarse_output_ptr
@@ -644,25 +652,31 @@ def _sparse_piper_attention_kernel(
 def _make_gluon_descriptors(
     prepared: _PreparedSparsePiperAttention,
 ) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor]:
-    query = prepared.query
-    key = prepared.key
-    value = prepared.value
+    query = prepared.query.data
+    key = prepared.context.key
+    value = prepared.context.value
     query_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_M, _HEAD_DIM], gl.int8)
     key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, _HEAD_DIM], gl.int8)
     value_layout = gl.NVMMASharedLayout.get_default_for([_HEAD_DIM, _BLOCK_N], gl.int8)
     batch_heads = int(query.shape[0] * query.shape[1])
-    storage_sequence_length = int(query.shape[2])
-    if key.shape != query.shape or value.shape != (
-        query.shape[0],
-        query.shape[1],
-        query.shape[3],
-        storage_sequence_length,
+    query_storage_sequence_length = int(query.shape[2])
+    storage_sequence_length = int(key.shape[2])
+    if (
+        key.shape[:2] != query.shape[:2]
+        or key.shape[3] != query.shape[3]
+        or value.shape
+        != (
+            query.shape[0],
+            query.shape[1],
+            query.shape[3],
+            storage_sequence_length,
+        )
     ):
-        raise ValueError("paired Gluon routed Piper requires equal Q/K/V sequence lengths")
+        raise ValueError("paired Gluon routed Piper requires compatible Q and K/V storage")
     return (
         TensorDescriptor(
             query,
-            [batch_heads * storage_sequence_length, _HEAD_DIM],
+            [batch_heads * query_storage_sequence_length, _HEAD_DIM],
             [_HEAD_DIM, 1],
             [_BLOCK_M, _HEAD_DIM],
             query_layout,
@@ -684,6 +698,37 @@ def _make_gluon_descriptors(
     )
 
 
+def _resolve_query_block_range(
+    prepared: _PreparedSparsePiperAttention,
+    query_block_offset: int,
+    query_block_count: int | None,
+) -> tuple[int, int, int]:
+    """Validate a local launch range and return its size and global offset."""
+    query_state = prepared.query
+    stored_query_blocks = query_state.data.shape[2] // _BLOCK_M
+    if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
+        raise TypeError("sparse Piper query block offset must be an integer")
+    if query_block_count is not None and (
+        isinstance(query_block_count, bool) or not isinstance(query_block_count, int)
+    ):
+        raise TypeError("sparse Piper query block count must be an integer or None")
+    if not 0 <= query_block_offset < stored_query_blocks:
+        raise ValueError("sparse Piper query block offset must fit the prepared query storage")
+    resolved_query_block_count = (
+        stored_query_blocks - query_block_offset if query_block_count is None else query_block_count
+    )
+    if (
+        resolved_query_block_count < 1
+        or query_block_offset + resolved_query_block_count > stored_query_blocks
+    ):
+        raise ValueError("sparse Piper query block range must fit the prepared query storage")
+    return (
+        stored_query_blocks,
+        resolved_query_block_count,
+        query_state.global_block_offset + query_block_offset,
+    )
+
+
 def _launch_sparse_piper_attention(
     prepared: _PreparedSparsePiperAttention,
     output: torch.Tensor,
@@ -696,57 +741,54 @@ def _launch_sparse_piper_attention(
     """Launch one caller-owned query-block range over the complete K/V sequence.
 
     When present, ``coarse_gate`` contains exactly the local output rows
-    covered by this launch. ``coarse_output`` remains globally indexed by query
-    block because it is compact block-level state shared across launches.
+    covered by this launch. ``coarse_output`` is indexed within the prepared
+    query storage, whose ``global_block_offset`` locates it in the sequence.
     """
-    batch, heads, _, head_dim = prepared.query.shape
-    logical_sequence_length = prepared.logical_sequence_length
-    storage_sequence_length = prepared.query.shape[2]
-    has_block_lengths = prepared.block_lengths is not None
+    query_state = prepared.query
+    context = prepared.context
+    query = query_state.data
+    batch, heads, query_storage_sequence_length, head_dim = query.shape
+    logical_sequence_length = context.logical_sequence_length
+    storage_sequence_length = context.key.shape[2]
+    has_block_lengths = context.block_lengths is not None
     if (
         head_dim != _HEAD_DIM
-        or storage_sequence_length % _BLOCK_M
+        or query_storage_sequence_length < _BLOCK_M
+        or query_storage_sequence_length % _BLOCK_M
+        or storage_sequence_length < _BLOCK_N
+        or storage_sequence_length % _BLOCK_N
         or (
             not has_block_lengths
             and (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
             != storage_sequence_length
         )
     ):
-        raise ValueError("paired Gluon routed Piper requires padded M64/D128 query storage")
+        raise ValueError("paired Gluon routed Piper requires padded M64/D128 storage")
     total_query_blocks = storage_sequence_length // _BLOCK_M
-    sparse_query_blocks = prepared.sparse_query_blocks
-    if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
-        raise TypeError("sparse Piper query block offset must be an integer")
-    if query_block_count is not None and (
-        isinstance(query_block_count, bool) or not isinstance(query_block_count, int)
-    ):
-        raise TypeError("sparse Piper query block count must be an integer or None")
-    if not 0 <= query_block_offset < total_query_blocks:
-        raise ValueError("sparse Piper query block offset must fit the logical sequence")
-    resolved_query_block_count = (
-        total_query_blocks - query_block_offset if query_block_count is None else query_block_count
+    sparse_query_blocks = context.sparse_query_blocks
+    stored_query_blocks, resolved_query_block_count, global_query_block_offset = (
+        _resolve_query_block_range(
+            prepared,
+            query_block_offset,
+            query_block_count,
+        )
     )
-    if (
-        resolved_query_block_count < 1
-        or query_block_offset + resolved_query_block_count > total_query_blocks
-    ):
-        raise ValueError("sparse Piper query block range must fit the logical sequence")
     output_sequence_length = (
         resolved_query_block_count * _BLOCK_M
         if has_block_lengths
         else min(
             resolved_query_block_count * _BLOCK_M,
-            logical_sequence_length - query_block_offset * _BLOCK_M,
+            logical_sequence_length - global_query_block_offset * _BLOCK_M,
         )
     )
     if (
         output.shape != (batch, heads, output_sequence_length, head_dim)
         or output.dtype is not torch.bfloat16
-        or output.device != prepared.query.device
+        or output.device != query.device
         or output.stride(-1) != 1
     ):
         raise ValueError("paired Gluon routed Piper output must match the query block range")
-    if prepared.value_scale_multiplier.shape[-1] != 1:
+    if context.value_scale_multiplier.shape[-1] != 1:
         raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
     has_coarse_residual = coarse_output is not None or coarse_gate is not None
     if (coarse_output is None) != (coarse_gate is None):
@@ -755,29 +797,29 @@ def _launch_sparse_piper_attention(
         assert coarse_output is not None
         assert coarse_gate is not None
         if (
-            coarse_output.shape != (batch, heads, total_query_blocks, head_dim)
+            coarse_output.shape != (batch, heads, stored_query_blocks, head_dim)
             or coarse_output.dtype is not torch.float32
-            or coarse_output.device != prepared.query.device
+            or coarse_output.device != query.device
             or coarse_output.stride(-1) != 1
         ):
             raise ValueError("Gluon coarse output must be FP32 [batch,heads,Q64,D128]")
         if (
             coarse_gate.shape != (batch, output_sequence_length, heads, head_dim)
             or coarse_gate.dtype is not torch.bfloat16
-            or coarse_gate.device != prepared.query.device
+            or coarse_gate.device != query.device
             or coarse_gate.stride(-1) != 1
         ):
             raise ValueError("Gluon coarse gate must match the local attention output")
-    with torch.cuda.device(prepared.query.device):
+    with torch.cuda.device(query.device):
         install_uint8_int8_dot_hook()
 
     query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared)
-    routes = prepared.routes
-    route_head_offsets = prepared.route_head_offsets
+    routes = query_state.routes
+    route_head_offsets = context.route_head_offsets
     stride_rb = routes.stride(0)
     stride_rq = routes.stride(1)
     stride_rr = routes.stride(2)
-    coarse_tensor = prepared.value_mean if coarse_output is None else coarse_output
+    coarse_tensor = context.value_mean if coarse_output is None else coarse_output
     gate_tensor = output if coarse_gate is None else coarse_gate
     coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
     gate_strides = (
@@ -793,25 +835,23 @@ def _launch_sparse_piper_attention(
         query_desc,
         key_desc,
         value_desc,
-        prepared.query_scale,
-        prepared.key_scale,
-        prepared.value_scale_multiplier,
-        prepared.value_mean,
+        query_state.scale,
+        context.key_scale,
+        context.value_scale_multiplier,
+        context.value_mean,
         coarse_tensor,
         gate_tensor,
-        (
-            prepared.block_lengths
-            if prepared.block_lengths is not None
-            else prepared.head_keep_blocks
-        ),
+        (context.block_lengths if context.block_lengths is not None else context.head_keep_blocks),
         routes,
-        prepared.head_keep_blocks,
+        context.head_keep_blocks,
         route_head_offsets,
         output,
         query_block_offset,
+        global_query_block_offset,
+        query_storage_sequence_length,
         storage_sequence_length,
         logical_sequence_length,
-        prepared.sparse_key_blocks,
+        context.sparse_key_blocks,
         total_query_blocks if sparse_query_blocks is None else sparse_query_blocks,
         stride_rb,
         stride_rq,

@@ -17,6 +17,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
+from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
 from ._block_layout import valid_block_rows, validate_sparse_query_blocks
@@ -93,23 +94,39 @@ def _quantize_value_per_tile_kernel(
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedSparsePiperAttention:
-    """Quantized inputs and routing metadata consumed by the Gluon launch."""
+class _PreparedSparsePiperContext:
+    """Sequence-global K/V storage and sparse-attention policy metadata."""
 
-    query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
-    query_scale: torch.Tensor
     key_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
-    routes: torch.Tensor
     route_head_offsets: torch.Tensor
     head_keep_blocks: torch.Tensor
+    routes_per_query: int
     block_lengths: torch.Tensor | None
     sparse_key_blocks: int
     sparse_query_blocks: int | None
     logical_sequence_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSparsePiperQuery:
+    """Query-local quantized storage and routes at one global block offset."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    routes: torch.Tensor
+    global_block_offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSparsePiperAttention:
+    """Sequence-global context paired with one full or local query range."""
+
+    context: _PreparedSparsePiperContext
+    query: _PreparedSparsePiperQuery
 
 
 def _prepare_sparse_piper_attention(
@@ -204,33 +221,37 @@ def _prepare_sparse_piper_attention(
         num_warps=4,
     )
 
-    return _PreparedSparsePiperAttention(
-        query=prepared_qk.query,
+    context = _PreparedSparsePiperContext(
         key=prepared_qk.key,
         value=value_int8,
-        query_scale=prepared_qk.query_scale,
         key_scale=prepared_qk.key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,
-        routes=routes,
         route_head_offsets=route_head_offsets,
         head_keep_blocks=head_keep_blocks,
+        routes_per_query=routes.shape[2],
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
     )
+    return _PreparedSparsePiperAttention(
+        context=context,
+        query=_prepare_sparse_piper_query_from_quantized(
+            prepared_qk.query,
+            prepared_qk.query_scale,
+            routes,
+            context,
+        ),
+    )
 
 
-def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
-    query: torch.Tensor,
-    query_scale: torch.Tensor,
+def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912
     key: torch.Tensor,
     key_scale: torch.Tensor,
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    routes: torch.Tensor,
     head_keep_blocks: torch.Tensor,
     route_head_offsets: torch.Tensor,
     *,
@@ -239,20 +260,19 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
-) -> _PreparedSparsePiperAttention:
-    """Construct sparse Piper launch state from already-quantized operands.
+) -> _PreparedSparsePiperContext:
+    """Validate sequence-global quantized K/V storage and routing policy.
 
     ``block_lengths`` opts into internally padded K64 storage. Each entry gives
     the valid prefix length in ``[1, 64]`` of one physical block and supersedes
-    ``logical_sequence_length`` for masking. Output then retains the full storage
-    sequence for a later layout gather. Without it, the established compact
-    logical sequence plus one possible ragged tail remains unchanged.
+    ``logical_sequence_length`` for masking. Without it, storage is the padded
+    form of the compact logical sequence with at most one ragged tail.
     """
-    if query.ndim != 4 or query.dtype is not torch.int8:
+    if key.ndim != 4 or key.dtype is not torch.int8:
         raise ValueError(
-            "quantized sparse Piper Q must be [batch,heads,storage_sequence,D128] INT8"
+            "quantized sparse Piper K must be [batch,heads,storage_sequence,D128] INT8"
         )
-    batch, heads, storage_sequence_length, head_dim = query.shape
+    batch, heads, storage_sequence_length, head_dim = key.shape
     if (
         head_dim != _HEAD_DIM
         or storage_sequence_length < _BLOCK_M
@@ -269,8 +289,6 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
             raise ValueError("quantized sparse Piper storage must be the padded logical sequence")
     elif not 1 <= logical_sequence_length <= storage_sequence_length:
         raise ValueError("quantized sparse Piper logical length must fit block-length storage")
-    if key.shape != query.shape or key.dtype is not torch.int8:
-        raise ValueError("quantized sparse Piper K must match Q and use INT8")
     if (
         value.shape != (batch, heads, head_dim, storage_sequence_length)
         or value.dtype is not torch.int8
@@ -279,8 +297,6 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
             "quantized sparse Piper V must be transposed INT8 [B,H,D,storage_sequence]"
         )
     tile_count = storage_sequence_length // _BLOCK_N
-    if query_scale.shape != (batch, heads, storage_sequence_length // 32):
-        raise ValueError("quantized sparse Piper Q scales must contain one value per Q32")
     if key_scale.shape != (batch, heads, tile_count):
         raise ValueError("quantized sparse Piper K scales must contain one value per K64")
     if value_scale_multiplier.shape != (batch, heads, tile_count, 1):
@@ -295,57 +311,146 @@ def _prepare_sparse_piper_attention_from_quantized(  # noqa: PLR0912
         block_lengths.shape != (tile_count,) or block_lengths.dtype is not torch.int32
     ):
         raise ValueError("quantized sparse Piper block lengths must be one INT32 value per K64")
-    scales = query_scale, key_scale, value_scale_multiplier, value_mean
+    scales = key_scale, value_scale_multiplier, value_mean
     if any(scale.dtype is not torch.float32 for scale in scales):
         raise ValueError("quantized sparse Piper scales and V mean must use FP32")
     tensors = (
-        query,
         key,
         value,
         *scales,
-        routes,
         head_keep_blocks,
         route_head_offsets,
         *((block_lengths,) if block_lengths is not None else ()),
     )
-    if any(tensor.device != query.device for tensor in tensors):
+    if any(tensor.device != key.device for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must share a device")
     if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
     if not 1 <= sparse_key_blocks <= tile_count:
         raise ValueError("quantized sparse Piper prefix must fit the K64 tile count")
-    query_block_count = (
+    total_query_blocks = (
         tile_count
         if block_lengths is not None
         else (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M
     )
     validate_sparse_query_blocks(
         sparse_query_blocks,
-        query_blocks=query_block_count,
+        query_blocks=total_query_blocks,
         context="quantized sparse Piper",
     )
-    if routes.shape != (batch, query_block_count, routes_per_query):
-        raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
-    if routes.dtype is not torch.uint16:
-        raise ValueError("quantized sparse Piper routes must use UINT16")
     if head_keep_blocks.shape != (heads,) or head_keep_blocks.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper head keep blocks must be one INT32 value per head")
     if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
 
-    return _PreparedSparsePiperAttention(
-        query=query,
+    return _PreparedSparsePiperContext(
         key=key,
         value=value,
-        query_scale=query_scale,
         key_scale=key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,
-        routes=routes,
         route_head_offsets=route_head_offsets,
         head_keep_blocks=head_keep_blocks,
+        routes_per_query=routes_per_query,
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
+    )
+
+
+def _prepare_sparse_piper_query_from_quantized(
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    routes: torch.Tensor,
+    context: _PreparedSparsePiperContext,
+    *,
+    global_block_offset: int = 0,
+) -> _PreparedSparsePiperQuery:
+    """Validate query-local quantized storage and locate it globally."""
+    if query.ndim != 4 or query.dtype is not torch.int8:
+        raise ValueError(
+            "quantized sparse Piper Q must be [batch,heads,storage_sequence,D128] INT8"
+        )
+    batch, heads, storage_sequence_length, head_dim = query.shape
+    if (
+        query.shape[:2] != context.key.shape[:2]
+        or head_dim != _HEAD_DIM
+        or storage_sequence_length < _BLOCK_M
+        or storage_sequence_length % _BLOCK_M
+    ):
+        raise ValueError("quantized sparse Piper requires compatible K64-aligned D128 Q storage")
+    query_block_count = storage_sequence_length // _BLOCK_M
+    total_query_blocks = context.key.shape[2] // _BLOCK_N
+    if (
+        isinstance(global_block_offset, bool)
+        or not isinstance(global_block_offset, int)
+        or global_block_offset < 0
+        or global_block_offset + query_block_count > total_query_blocks
+    ):
+        raise ValueError("quantized sparse Piper Q storage must fit the global sequence")
+    if query_scale.shape != (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS):
+        raise ValueError("quantized sparse Piper Q scales must contain one value per Q32")
+    if routes.shape != (batch, query_block_count, context.routes_per_query):
+        raise ValueError("quantized sparse Piper routes must match batch/query/packed budgets")
+    if query_scale.dtype is not torch.float32:
+        raise ValueError("quantized sparse Piper Q scales must use FP32")
+    if routes.dtype is not torch.uint16:
+        raise ValueError("quantized sparse Piper routes must use UINT16")
+    tensors = query, query_scale, routes
+    if any(tensor.device != context.key.device for tensor in tensors):
+        raise ValueError("quantized sparse Piper operands must share a device")
+    if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
+    return _PreparedSparsePiperQuery(
+        data=query,
+        scale=query_scale,
+        routes=routes,
+        global_block_offset=global_block_offset,
+    )
+
+
+def _prepare_sparse_piper_attention_from_quantized(
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    key: torch.Tensor,
+    key_scale: torch.Tensor,
+    value: torch.Tensor,
+    value_scale_multiplier: torch.Tensor,
+    value_mean: torch.Tensor,
+    routes: torch.Tensor,
+    head_keep_blocks: torch.Tensor,
+    route_head_offsets: torch.Tensor,
+    *,
+    sparse_key_blocks: int,
+    routes_per_query: int,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None = None,
+    sparse_query_blocks: int | None = None,
+    query_block_offset: int = 0,
+) -> _PreparedSparsePiperAttention:
+    """Construct one full or local query state over shared quantized K/V."""
+    context = _prepare_sparse_piper_context_from_quantized(
+        key,
+        key_scale,
+        value,
+        value_scale_multiplier,
+        value_mean,
+        head_keep_blocks,
+        route_head_offsets,
+        sparse_key_blocks=sparse_key_blocks,
+        routes_per_query=routes_per_query,
+        logical_sequence_length=logical_sequence_length,
+        block_lengths=block_lengths,
+        sparse_query_blocks=sparse_query_blocks,
+    )
+    return _PreparedSparsePiperAttention(
+        context=context,
+        query=_prepare_sparse_piper_query_from_quantized(
+            query,
+            query_scale,
+            routes,
+            context,
+            global_block_offset=query_block_offset,
+        ),
     )

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
-from ._budget import _resolve_route_layout
-from ._routes import PackedRoutes, validate_routing_mode
+from ._budget import _resolve_route_layout, _ResolvedRouteLayout
+from ._routes import validate_routing_mode
 from ._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_summaries,
@@ -15,20 +16,155 @@ from ._routing import (
 from .coarse import _resolve_coarse_key_blocks
 
 if TYPE_CHECKING:
-    from .triton import _PreparedSparsePiperAttention
+    from .triton import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
 
 try:
     from .gluon import (
         _launch_sparse_piper_attention as _launch_sm120_attention,
     )
     from .triton import (
-        _prepare_sparse_piper_attention_from_quantized as _prepare_sm120_quantized_attention,
+        _prepare_sparse_piper_context_from_quantized as _prepare_sm120_quantized_context,
+    )
+    from .triton import (
+        _prepare_sparse_piper_query_from_quantized as _prepare_sm120_quantized_query,
+    )
+    from .triton import (
+        _PreparedSparsePiperAttention,
     )
 except ModuleNotFoundError as exc:
     if exc.name is None or not exc.name.startswith("triton"):
         raise
     _launch_sm120_attention = None
-    _prepare_sm120_quantized_attention = None
+    _prepare_sm120_quantized_context = None
+    _prepare_sm120_quantized_query = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedQuantizedSparsePiperContext:
+    """Global sparse-attention state used by independently produced Q chunks."""
+
+    kernel_context: _PreparedSparsePiperContext
+    route_layout: _ResolvedRouteLayout
+    key_summary: torch.Tensor
+    key_aux: torch.Tensor
+    routing_mode: int
+    pooled_value: torch.Tensor | None = None
+    coarse_scale: float | None = None
+
+
+def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
+    key: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_summary: torch.Tensor,
+    key_aux: torch.Tensor,
+    value: torch.Tensor,
+    value_scale_multiplier: torch.Tensor,
+    value_mean: torch.Tensor,
+    head_keep_ratio_units: list[int],
+    sparse_key_blocks: int,
+    logical_sequence_length: int,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
+    sparse_query_blocks: int | None = None,
+) -> _PreparedQuantizedSparsePiperContext:
+    """Prepare global K/V and routing state without requiring materialized Q."""
+    if _prepare_sm120_quantized_context is None:
+        raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
+    layout = _resolve_route_layout(
+        tuple(head_keep_ratio_units),
+        sparse_key_blocks,
+        key.device,
+    )
+    validate_routing_mode(routing_mode)
+    pooled_value = None
+    if block_mean is None:
+        if coarse_scale is not None or coarse_key_blocks is not None:
+            raise ValueError("coarse output metadata requires block means")
+        route_key_blocks = sparse_key_blocks
+    else:
+        if coarse_scale is None:
+            raise ValueError("coarse output requires a scale")
+        route_key_blocks = _resolve_coarse_key_blocks(
+            sparse_key_blocks,
+            coarse_key_blocks,
+            available_coarse_key_blocks=block_mean.shape[2],
+        )
+        pooled_value = block_mean[:, :, :route_key_blocks]
+    kernel_context = _prepare_sm120_quantized_context(
+        key,
+        key_scale,
+        value,
+        value_scale_multiplier,
+        value_mean,
+        layout.head_keep_blocks,
+        layout.route_head_offsets,
+        sparse_key_blocks=sparse_key_blocks,
+        routes_per_query=layout.routes_per_query,
+        logical_sequence_length=logical_sequence_length,
+        block_lengths=block_lengths,
+        sparse_query_blocks=sparse_query_blocks,
+    )
+    return _PreparedQuantizedSparsePiperContext(
+        kernel_context=kernel_context,
+        route_layout=layout,
+        key_summary=key_summary[:, :, :route_key_blocks],
+        key_aux=key_aux[:, :, :route_key_blocks],
+        routing_mode=routing_mode,
+        pooled_value=pooled_value,
+        coarse_scale=coarse_scale,
+    )
+
+
+def _prepare_quantized_sparse_piper_query(
+    context: _PreparedQuantizedSparsePiperContext,
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    query_summary: torch.Tensor,
+    *,
+    global_block_offset: int,
+) -> tuple[_PreparedSparsePiperAttention, torch.Tensor | None]:
+    """Route and prepare one compact Q chunk against global K/V state."""
+    if _prepare_sm120_quantized_query is None:
+        raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
+    if context.pooled_value is None:
+        routed = packed_routes_from_summaries(
+            query_summary,
+            context.key_summary,
+            context.key_aux,
+            context.route_layout,
+            context.routing_mode,
+        )
+        coarse_output = None
+    else:
+        assert context.coarse_scale is not None
+        routed_with_coarse = packed_routes_and_coarse_from_summaries(
+            query_summary,
+            context.key_summary,
+            context.key_aux,
+            context.pooled_value,
+            context.route_layout,
+            sparse_key_blocks=context.kernel_context.sparse_key_blocks,
+            coarse_scale=context.coarse_scale,
+            routing_mode=context.routing_mode,
+        )
+        routed = routed_with_coarse.routes
+        coarse_output = routed_with_coarse.coarse_output
+    return (
+        _PreparedSparsePiperAttention(
+            context=context.kernel_context,
+            query=_prepare_sm120_quantized_query(
+                query,
+                query_scale,
+                routed.indices,
+                context.kernel_context,
+                global_block_offset=global_block_offset,
+            ),
+        ),
+        coarse_output,
+    )
 
 
 def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
@@ -50,69 +186,28 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
 ) -> _PreparedSparsePiperAttention:
     """Build the validated SM120 launch state for quantized sparse Piper."""
-    layout = _resolve_route_layout(
-        tuple(head_keep_ratio_units),
-        sparse_key_blocks,
-        query.device,
-    )
-    validate_routing_mode(routing_mode)
-    routes = packed_routes_from_summaries(
-        query_summary,
-        key_summary[:, :, :sparse_key_blocks],
-        key_aux[:, :, :sparse_key_blocks],
-        layout,
-        routing_mode,
-    )
-    return _prepare_quantized_sparse_piper_attention_from_routes(
-        query,
-        query_scale,
+    context = _prepare_quantized_sparse_piper_context(
         key,
         key_scale,
+        key_summary,
+        key_aux,
         value,
         value_scale_multiplier,
         value_mean,
-        routes,
+        head_keep_ratio_units,
         sparse_key_blocks,
         logical_sequence_length,
+        routing_mode,
         block_lengths,
-        sparse_query_blocks,
-    )
-
-
-def _prepare_quantized_sparse_piper_attention_from_routes(  # noqa: PLR0913, PLR0917
-    query: torch.Tensor,
-    query_scale: torch.Tensor,
-    key: torch.Tensor,
-    key_scale: torch.Tensor,
-    value: torch.Tensor,
-    value_scale_multiplier: torch.Tensor,
-    value_mean: torch.Tensor,
-    routes: PackedRoutes,
-    sparse_key_blocks: int,
-    logical_sequence_length: int,
-    block_lengths: torch.Tensor | None = None,
-    sparse_query_blocks: int | None = None,
-) -> _PreparedSparsePiperAttention:
-    """Build validated SM120 launch state from an already-resolved route policy."""
-    if _prepare_sm120_quantized_attention is None:
-        raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
-    return _prepare_sm120_quantized_attention(
-        query,
-        query_scale,
-        key,
-        key_scale,
-        value,
-        value_scale_multiplier,
-        value_mean,
-        routes.indices,
-        routes.head_keep_blocks,
-        routes.route_head_offsets,
-        sparse_key_blocks=sparse_key_blocks,
-        routes_per_query=routes.indices.shape[2],
-        logical_sequence_length=logical_sequence_length,
-        block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
     )
+    return _prepare_quantized_sparse_piper_query(
+        context,
+        query,
+        query_scale,
+        query_summary,
+        global_block_offset=0,
+    )[0]
 
 
 def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR0917
@@ -137,43 +232,33 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     sparse_query_blocks: int | None = None,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor]:
     """Prepare fine routes and a potentially wider coarse K/V prefix."""
-    layout = _resolve_route_layout(
-        tuple(head_keep_ratio_units),
-        sparse_key_blocks,
-        query.device,
-    )
-    validate_routing_mode(routing_mode)
-    coarse_key_blocks = _resolve_coarse_key_blocks(
-        sparse_key_blocks,
-        coarse_key_blocks,
-        available_coarse_key_blocks=block_mean.shape[2],
-    )
-    pooled_value = block_mean[:, :, :coarse_key_blocks]
-    routed = packed_routes_and_coarse_from_summaries(
-        query_summary,
-        key_summary[:, :, :coarse_key_blocks],
-        key_aux[:, :, :coarse_key_blocks],
-        pooled_value,
-        layout,
-        sparse_key_blocks=sparse_key_blocks,
-        coarse_scale=coarse_scale,
-        routing_mode=routing_mode,
-    )
-    prepared = _prepare_quantized_sparse_piper_attention_from_routes(
-        query,
-        query_scale,
+    context = _prepare_quantized_sparse_piper_context(
         key,
         key_scale,
+        key_summary,
+        key_aux,
         value,
         value_scale_multiplier,
         value_mean,
-        routed.routes,
+        head_keep_ratio_units,
         sparse_key_blocks,
         logical_sequence_length,
+        routing_mode,
         block_lengths,
+        block_mean,
+        coarse_scale,
+        coarse_key_blocks,
         sparse_query_blocks,
     )
-    return prepared, routed.coarse_output
+    prepared, coarse_output = _prepare_quantized_sparse_piper_query(
+        context,
+        query,
+        query_scale,
+        query_summary,
+        global_block_offset=0,
+    )
+    assert coarse_output is not None
+    return prepared, coarse_output
 
 
 def _quantized_attention_output_sequence_length(

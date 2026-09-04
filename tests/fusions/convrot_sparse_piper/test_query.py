@@ -185,6 +185,38 @@ def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
+def test_query_projection_range_uses_local_storage_and_global_rope_positions(
+    routing_mode: int,
+) -> None:
+    operands = _random_operands(sequence_length=193)
+    start, rows = 64, 65
+    actual = query_fusion._launch_query_projection_range(
+        *operands.as_tuple(),
+        1e-6,
+        128**-0.5,
+        routing_mode,
+        chunk_start=start,
+        chunk_rows=rows,
+    )
+    expected = query_fusion._project_query_op(
+        operands.input_qdata[:, start : start + rows],
+        operands.input_scale[:, start : start + rows],
+        operands.weight_qdata,
+        operands.weight_scale,
+        operands.norm_weight,
+        operands.cos[start : start + rows],
+        operands.sin[start : start + rows],
+        1e-6,
+        128**-0.5,
+        routing_mode,
+    )
+
+    assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
 def test_fused_query_projection_ignores_internal_padding(routing_mode: int) -> None:
     operands = _random_operands(sequence_length=192)
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)

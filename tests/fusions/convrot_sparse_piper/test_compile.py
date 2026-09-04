@@ -1043,7 +1043,9 @@ def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     assert (
@@ -1093,7 +1095,9 @@ def test_cuda_compile_fuses_padded_mixed_query_attention_output() -> None:
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     assert (
@@ -1139,15 +1143,14 @@ def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
         )(hidden_states)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_project_query.default)
-        == 1
-    )
+    assert torch.ops.piper_kernels.convrot_sparse_piper_project_query.default not in capture.targets
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_project_key.default) == 1
     )
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     assert (
@@ -1208,7 +1211,9 @@ def test_cuda_compile_fuses_every_bounded_attention_feature(routing: str) -> Non
 
     assert capture.calls == 1
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     absent_targets = (
@@ -1267,7 +1272,9 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(routing: str) -> N
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
     absent_targets = (
@@ -1317,7 +1324,8 @@ def test_cuda_attention_output_fusion_fails_closed_when_attention_escapes() -> N
     torch.testing.assert_close(actual_projected, expected_projected, atol=0, rtol=0)
     torch.testing.assert_close(actual_attention, expected_attention, atol=0, rtol=0)
     assert (
-        torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default not in capture.targets
+        torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        not in capture.targets
     )
     assert (
         capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
@@ -1592,7 +1600,9 @@ def test_cuda_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
 
     assert capture.calls == 1
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_sparse_piper_attention_output.default)
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_sparse_piper_projected_query_attention_output.default
+        )
         == 1
     )
 
