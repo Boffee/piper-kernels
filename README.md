@@ -187,6 +187,42 @@ quantization in one package-owned operation and prevents callers from accidental
 logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported from
 `piper_kernels.linear.convrot` for format-policy validation.
 
+### Packed GGUF weights
+
+Both ConvRot formats accept a two-dimensional tensor of packed GGUF bytes. Pass the GGML
+quantization type explicitly, or omit it when the tensor has a `quant_type` attribute:
+
+```python
+int8_weight = ConvRotInt8Tensor.from_gguf(
+    packed_gguf,
+    quant_type=ggml_quant_type,
+    group_size=64,
+)
+nvfp4_weight = ConvRotNVFP4Tensor.from_gguf(
+    packed_gguf,
+    quant_type=ggml_quant_type,
+    group_size=64,
+    compute_per_tensor_scale=True,
+    is_swizzled_scales=True,
+    act_quant_kwargs=activation_quantization,
+)
+
+# Streaming runtimes can refill the same device allocations.
+int8_weight.copy_from_gguf_(next_packed_gguf, quant_type=ggml_quant_type)
+nvfp4_weight.copy_from_gguf_(
+    next_packed_gguf,
+    quant_type=ggml_quant_type,
+    compute_per_tensor_scale=True,
+)
+```
+
+CUDA INT8 conversion and exact-SM120 NVFP4 conversion decode GGUF values in registers and feed
+the existing ConvRot quantization epilogues, so no dense weight is allocated. Computing an NVFP4
+global scale requires one row-amax pass and one packing pass. Unsupported devices fail closed
+instead of allocating a dense fallback: INT8 requires CUDA, while NVFP4 requires exact SM120.
+Piper Kernels does not parse GGUF files and does not require a GGUF parser at runtime; the caller
+owns file loading, tensor-name mapping, and the packed bytes plus quant-type metadata.
+
 ## Piper Attention
 
 Piper Attention is the package's key-scaled integer-PV attention algorithm:

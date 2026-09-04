@@ -16,6 +16,7 @@ from piper_kernels._triton.stochastic_quantization import (
     stochastic_round_to_int,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.gguf import triton as gguf_backend
 from piper_kernels.linear._input_activations import (
     apply_input_activation,
     input_activation_width,
@@ -232,6 +233,50 @@ def _store_quantized_chunk(
 
 
 @triton.jit
+def _load_weight_chunk(
+    x_ptr,
+    input_row_offset,
+    packed_row_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    chunk_size: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    gguf_quant_type: tl.constexpr,
+):
+    if gguf_quant_type >= 0:
+        return gguf_backend.load_rotated_chunk(
+            x_ptr,
+            packed_row_offset,
+            row_width,
+            chunk_start,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            logical_dtype_code,
+            gguf_quant_type,
+        )
+    return convrot_backend.load_activated_rotated_chunk(
+        x_ptr,
+        input_row_offset,
+        row_width,
+        chunk_start,
+        chunk_offsets,
+        chunk_size,
+        group_size,
+        inverse_sqrt_group,
+        logical_dtype_code,
+        activation_fn,
+        accelerator_backend,
+    )
+
+
+@triton.jit
 def rotate_quantize_rows_kernel(
     x_ptr,
     q_ptr,
@@ -244,6 +289,7 @@ def rotate_quantize_rows_kernel(
     logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
+    gguf_quant_type: tl.constexpr,
 ):
     """Rotate and quantize a row held as one, two, or three equal chunks.
 
@@ -255,11 +301,18 @@ def rotate_quantize_rows_kernel(
     chunk_offsets = tl.arange(0, chunk_size)
     input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
     input_row_offset = row_i64 * input_row_width
+    packed_row_offset = 0
+    if gguf_quant_type >= 0:
+        packed_row_offset = row_i64 * gguf_backend.packed_row_size(
+            row_width,
+            gguf_quant_type,
+        )
     output_row_offset = row_i64 * row_width
 
-    values0 = convrot_backend.load_activated_rotated_chunk(
+    values0 = _load_weight_chunk(
         x_ptr,
         input_row_offset,
+        packed_row_offset,
         row_width,
         0,
         chunk_offsets,
@@ -269,12 +322,14 @@ def rotate_quantize_rows_kernel(
         logical_dtype_code,
         activation_fn,
         accelerator_backend,
+        gguf_quant_type,
     )
     row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
     if chunk_count >= 2:
-        values1 = convrot_backend.load_activated_rotated_chunk(
+        values1 = _load_weight_chunk(
             x_ptr,
             input_row_offset,
+            packed_row_offset,
             row_width,
             chunk_size,
             chunk_offsets,
@@ -284,15 +339,17 @@ def rotate_quantize_rows_kernel(
             logical_dtype_code,
             activation_fn,
             accelerator_backend,
+            gguf_quant_type,
         )
         row_max = tl.maximum(
             row_max,
             tl.max(tl.abs(values1).to(tl.float32), axis=0),
         )
     if chunk_count >= 3:
-        values2 = convrot_backend.load_activated_rotated_chunk(
+        values2 = _load_weight_chunk(
             x_ptr,
             input_row_offset,
+            packed_row_offset,
             row_width,
             2 * chunk_size,
             chunk_offsets,
@@ -302,6 +359,7 @@ def rotate_quantize_rows_kernel(
             logical_dtype_code,
             activation_fn,
             accelerator_backend,
+            gguf_quant_type,
         )
         row_max = tl.maximum(
             row_max,
@@ -568,7 +626,39 @@ def fused_rotate_quantize_input(
         logical_dtype_code=logical_dtype_code,
         activation_fn=activation_fn,
         accelerator_backend=target.backend,
+        gguf_quant_type=-1,
         num_warps=num_warps,
+    )
+
+
+def _convert_gguf_out(
+    data: torch.Tensor,
+    quant_type: int,
+    group_size: int,
+    logical_dtype: torch.dtype,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    """Decode packed GGUF rows through the existing ConvRot INT8 epilogue."""
+    rows, row_width = qdata.shape
+    chunks = _policy.select_fused_preparation_chunks(row_width)
+    if chunks is None:
+        raise ValueError(f"fused GGUF conversion does not support row width {row_width}")
+    chunk_count, chunk_size = chunks
+    rotate_quantize_rows_kernel[(rows,)](
+        data,
+        qdata,
+        scale,
+        row_width,
+        chunk_size=chunk_size,
+        chunk_count=chunk_count,
+        group_size=group_size,
+        inverse_sqrt_group=group_size**-0.5,
+        logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
+        activation_fn=None,
+        accelerator_backend=AcceleratorTarget.from_device(data.device).backend,
+        gguf_quant_type=quant_type,
+        num_warps=4,
     )
 
 

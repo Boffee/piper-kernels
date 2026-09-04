@@ -98,6 +98,50 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         qdata, scale = quantize_weight(source, group_size)
         return cls(qdata.contiguous(), scale.contiguous(), group_size, source.dtype)
 
+    @classmethod
+    def from_gguf(
+        cls,
+        data: torch.Tensor,
+        *,
+        quant_type: int | None = None,
+        group_size: int,
+        logical_dtype: torch.dtype = torch.bfloat16,
+    ) -> "ConvRotInt8Tensor":
+        """Decode packed GGUF storage directly into ConvRot INT8 storage.
+
+        ``quant_type`` may be omitted when ``data`` exposes a ``quant_type``
+        attribute, as piper-offload's GGUF tensor wrapper does. CUDA conversion
+        fuses GGUF decoding, grouped rotation, and rowwise INT8 quantization
+        without allocating a dense weight.
+        """
+        from ._gguf import convert  # noqa: PLC0415
+
+        qdata, scale = convert(
+            data,
+            quant_type=quant_type,
+            group_size=group_size,
+            logical_dtype=logical_dtype,
+        )
+        return cls(qdata, scale, group_size, logical_dtype)
+
+    def copy_from_gguf_(
+        self,
+        data: torch.Tensor,
+        *,
+        quant_type: int | None = None,
+    ) -> "ConvRotInt8Tensor":
+        """Refill this tensor from compatible packed GGUF storage in place."""
+        from ._gguf import convert  # noqa: PLC0415
+
+        convert(
+            data,
+            quant_type=quant_type,
+            group_size=self.group_size,
+            logical_dtype=self.dtype,
+            out=(self.qdata, self.scale),
+        )
+        return self
+
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis and requested dtype."""
         validate_storage(self.qdata, self.scale, self.group_size, self.dtype)
