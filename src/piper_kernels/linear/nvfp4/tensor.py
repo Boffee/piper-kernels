@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
@@ -18,6 +18,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_linear as torchao_nv
 from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.linear._dispatch import (
+    _explicit_to_copy_args,
     apply_linear_autocast,
     bind_linear_arguments,
     linear_autocast_dtype,
@@ -165,6 +166,35 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
             self.act_quant_kwargs,
         )
 
+    def to(self, *args: object, **kwargs: object) -> Self:
+        """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
+        explicit_copy_args = _explicit_to_copy_args(args, kwargs)
+        if explicit_copy_args is None:
+            return cast(
+                Self,
+                super().to(*args, **kwargs),  # pyright: ignore[reportCallIssue, reportArgumentType]
+            )
+        to_args, to_kwargs = explicit_copy_args
+        options = self._get_to_kwargs(*to_args, **to_kwargs)
+        dtype = options["dtype"]
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError(f"NVFP4 logical dtype must be floating point, got {dtype}")
+        device = options["device"]
+        non_blocking = options["non_blocking"]
+        copied = cast(
+            Self,
+            self._apply_fn_to_data(
+                lambda value: value.to(
+                    device=device,
+                    non_blocking=non_blocking,
+                    copy=True,
+                )
+            ),
+        )
+        if dtype is not copied.orig_dtype:
+            copied = cast(Self, copied._rebuild_with_orig_dtype(dtype))
+        return copied
+
 
 @PiperNVFP4Tensor.implements(torch.ops.aten._to_copy.default)
 def _nvfp4_to_copy(
@@ -180,7 +210,7 @@ def _nvfp4_to_copy(
     dtype = arguments.pop("dtype", tensor.orig_dtype)
     device = arguments.pop("device", tensor.device)
     non_blocking = arguments.pop("non_blocking", False)
-    arguments.pop("copy", None)
+    copy = arguments.pop("copy", False)
     memory_format = arguments.pop("memory_format", None)
     layout = arguments.pop("layout", None)
     pin_memory = arguments.pop("pin_memory", None)
@@ -191,6 +221,7 @@ def _nvfp4_to_copy(
     metadata_only = (
         torch.device(device) == tensor.device
         and dtype is not tensor.orig_dtype
+        and not copy
         and memory_format in (None, torch.preserve_format)
         and layout in (None, tensor.layout)
         and pin_memory is None

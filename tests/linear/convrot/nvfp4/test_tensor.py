@@ -191,6 +191,19 @@ def test_dtype_copy_reuses_packed_storage() -> None:
     assert moved.act_per_tensor_scale is source.act_per_tensor_scale
 
 
+def test_explicit_dtype_copy_duplicates_packed_storage() -> None:
+    source = _meta_weight(group_size=64)
+
+    moved = source.to(dtype=torch.float16, copy=True)
+
+    assert type(moved) is ConvRotNVFP4Tensor
+    assert moved.orig_dtype is torch.float16
+    assert moved.group_size == source.group_size
+    assert moved.qdata is not source.qdata
+    assert moved.scale is not source.scale
+    assert moved.per_tensor_scale is not source.per_tensor_scale
+
+
 def test_tensor_flatten_round_trip_preserves_storage_and_metadata() -> None:
     source = _meta_weight(group_size=64)
     names, metadata = source.__tensor_flatten__()

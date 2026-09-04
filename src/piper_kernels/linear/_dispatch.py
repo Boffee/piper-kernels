@@ -7,6 +7,26 @@ from typing import Any
 import torch
 
 
+def _explicit_to_copy_args(
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> tuple[tuple[object, ...], dict[str, object]] | None:
+    """Remove an explicit true ``copy`` before TorchAO parses ``Tensor.to``."""
+    parsed_args = args
+    parsed_kwargs = dict(kwargs)
+    if "copy" in parsed_kwargs:
+        copy = parsed_kwargs.pop("copy")
+    else:
+        copy_index = 2 if args and isinstance(args[0], (torch.Tensor, torch.dtype)) else 3
+        if len(args) <= copy_index:
+            return None
+        copy = args[copy_index]
+        parsed_args = (*args[:copy_index], *args[copy_index + 1 :])
+    if copy is not True:
+        return None
+    return parsed_args, parsed_kwargs
+
+
 def bind_linear_arguments(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],

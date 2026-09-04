@@ -69,6 +69,23 @@ def test_dtype_copy_changes_only_the_logical_dtype() -> None:
     assert converted.scale is wrapped.scale
 
 
+@pytest.mark.parametrize("positional", [False, True])
+def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(8, 64), group_size=64)
+
+    converted = (
+        wrapped.to(torch.float16, False, True)
+        if positional
+        else wrapped.to(dtype=torch.float16, copy=True)
+    )
+
+    assert converted.dtype is torch.float16
+    assert converted.qdata is not wrapped.qdata
+    assert converted.scale is not wrapped.scale
+    assert torch.equal(converted.qdata, wrapped.qdata)
+    assert torch.equal(converted.scale, wrapped.scale)
+
+
 def test_from_quantized_canonicalizes_storage_and_names_logical_dtype() -> None:
     qdata = torch.randint(-128, 128, (8, 128), dtype=torch.int8)[:, ::2]
     scale = torch.arange(1, 17, dtype=torch.float32).reshape(16, 1)[::2]

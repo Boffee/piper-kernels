@@ -149,6 +149,33 @@ def test_dtype_copy_preserves_concrete_piper_subclass() -> None:
     assert moved.act_per_tensor_scale is source.act_per_tensor_scale
 
 
+@pytest.mark.parametrize("positional", [False, True])
+def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
+    source = PiperNVFP4Tensor(
+        torch.empty(128, 128, dtype=torch.uint8),
+        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        16,
+        torch.bfloat16,
+        torch.empty(()),
+        torch.empty(()),
+        True,
+        False,
+        _quantization(False),
+    )
+
+    moved = (
+        source.to(torch.float16, False, True)
+        if positional
+        else source.to(dtype=torch.float16, copy=True)
+    )
+
+    assert moved.orig_dtype is torch.float16
+    assert moved.qdata is not source.qdata
+    assert moved.scale is not source.scale
+    assert moved.per_tensor_scale is not source.per_tensor_scale
+    assert moved.act_per_tensor_scale is not source.act_per_tensor_scale
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
