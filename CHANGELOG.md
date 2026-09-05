@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc5] - 2026-09-04
+
+### Added
+
+- Added FP16, BF16, and FP32 bias support across ConvRot INT8, NVFP4, and ConvRot NVFP4
+  semantic linears and compatible SwiGLU and sparse-Piper compiler fusions. Mixed NVFP4 biases
+  use the projection epilogue when the backend GEMM cannot fuse them, preserving logical output
+  dtype and bounded workspaces.
+
 ## [0.7.0rc4] - 2026-09-04
 
 ### Fixed
