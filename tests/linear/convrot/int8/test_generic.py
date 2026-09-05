@@ -11,6 +11,7 @@ from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import ConvRotInt8Tensor
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops, reference
 from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 
@@ -37,6 +38,11 @@ def test_generic_update_selection_does_not_query_architecture(monkeypatch, devic
     assert _backend.select_add(value) is _generic.add_
     assert _backend.select_addmm(value) is _generic.addmm_
     assert _backend.select_preparation_backend(value) is _generic
+
+
+@pytest.mark.parametrize("operation", ["prepare_input", "add_", "addmm_"])
+def test_generic_package_reexports_dispatch(operation):
+    assert getattr(_generic, operation) is getattr(generic_dispatch, operation)
 
 
 def test_backend_update_exports_are_shared():
@@ -95,7 +101,7 @@ def test_rocm_uses_shared_triton_without_a_tuned_backend(monkeypatch):
     monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
     value = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
-    assert _generic._use_triton(value)
+    assert generic_dispatch._use_triton(value)
     prepare = Mock(wraps=generic_triton.prepare_input)
     add = Mock(wraps=generic_triton.add_)
     addmm = Mock(wraps=generic_triton.addmm_)
@@ -162,7 +168,7 @@ def test_updates_work_without_tuned_backends(monkeypatch, device, operation, fal
     monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
     if fallback:
-        monkeypatch.setattr(_generic, "_triton_backend", None)
+        monkeypatch.setattr(generic_dispatch, "_triton_backend", None)
     torch.manual_seed(671)
     value = torch.randn(17, 256, device=device, dtype=dtype)
     weight = ConvRotInt8Tensor.from_hp(value, group_size=64)
@@ -248,7 +254,7 @@ def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
         raise RuntimeError("kernel execution failed")
 
     fallback = Mock(side_effect=AssertionError("unsafe retry"))
-    monkeypatch.setattr(_generic, "_use_triton", lambda value: True)
+    monkeypatch.setattr(generic_dispatch, "_use_triton", lambda value: True)
     monkeypatch.setattr(generic_triton, "add_", partial_update)
     monkeypatch.setattr(reference, "add_", fallback)
     with pytest.raises(RuntimeError, match="kernel execution failed"):
