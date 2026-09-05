@@ -131,7 +131,6 @@ def _validate_inputs(
         down.weight_per_tensor_scale,
         down.bias,
         input_features=intermediate_features,
-        logical_dtype=input.dtype,
         device=input.device,
         name="chunked NVFP4 FFN down projection",
     )

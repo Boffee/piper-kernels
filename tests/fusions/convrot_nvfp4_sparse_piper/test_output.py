@@ -31,8 +31,13 @@ def _exact_sm120_available() -> bool:
 def _arguments(
     sequence_length: int,
     group_size: int = _GROUP_SIZE,
+    bias_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[tuple[object, ...], torch.Tensor]:
-    standard, _unused = standard_arguments(sequence_length=sequence_length, bias=True)
+    standard, _unused = standard_arguments(
+        sequence_length=sequence_length,
+        bias=True,
+        bias_dtype=bias_dtype,
+    )
     attention_arguments = standard[:14]
     activation_scale = standard[-2]
     bias = standard[-1]
@@ -61,6 +66,7 @@ def _arguments(
         False,
     )
     assert weight.per_tensor_scale is not None
+    fused_bias = bias if bias.dtype is torch.bfloat16 else None
     expected = F.scaled_mm(
         input_qdata.view(torch.float4_e2m1fn_x2),
         weight.qdata.t().view(torch.float4_e2m1fn_x2),
@@ -70,9 +76,12 @@ def _arguments(
         [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
         [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
         [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-        bias=bias,
+        bias=fused_bias,
         output_dtype=torch.bfloat16,
-    ).reshape(1, sequence_length, _OUTPUT_FEATURES)
+    )
+    if fused_bias is None:
+        expected = (expected.float() + bias.float()).to(expected.dtype)
+    expected = expected.reshape(1, sequence_length, _OUTPUT_FEATURES)
     return (
         *attention_arguments,
         weight.qdata,
@@ -149,6 +158,7 @@ def _padded_arguments(
         None,
         False,
     )
+    fused_bias = bias if bias.dtype is torch.bfloat16 else None
     expected = F.scaled_mm(
         input_qdata.view(torch.float4_e2m1fn_x2),
         weight_qdata.t().view(torch.float4_e2m1fn_x2),
@@ -158,9 +168,12 @@ def _padded_arguments(
         [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
         [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
         [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-        bias=bias,
+        bias=fused_bias,
         output_dtype=torch.bfloat16,
-    ).reshape(1, sequence_length, _OUTPUT_FEATURES)
+    )
+    if fused_bias is None:
+        expected = (expected.float() + bias.float()).to(expected.dtype)
+    expected = expected.reshape(1, sequence_length, _OUTPUT_FEATURES)
     return (
         *arguments,
         128,
@@ -197,7 +210,7 @@ def _projected_gate_arguments(
         is_swizzled_scales=True,
         use_triton_kernel=False,
     )
-    gate_bias = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    gate_bias = torch.randn(256, device="cuda", dtype=torch.float32)
     gate_input = convrot_nvfp4_ops.prepare_input(
         hidden,
         activation_scale,
@@ -268,6 +281,21 @@ def test_attention_output_matches_materialized_convrot_linear(
     with torch.no_grad():
         actual = output._attention_output_op(*arguments, chunk_rows)
 
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+def test_attention_output_supports_mixed_precision_bias(
+    bias_dtype: torch.dtype,
+) -> None:
+    arguments, expected = _arguments(193, 64, bias_dtype)
+
+    with torch.no_grad():
+        actual = output._attention_output_op(*arguments, 128)
+
+    assert actual.dtype is torch.bfloat16
     assert torch.equal(actual, expected)
 
 

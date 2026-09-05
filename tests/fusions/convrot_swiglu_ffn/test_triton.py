@@ -126,6 +126,46 @@ def test_chunked_ffn_matches_materialized_rows(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+def test_chunked_ffn_supports_mixed_precision_bias(bias_dtype: torch.dtype) -> None:
+    torch.manual_seed(205)
+    rows = 129
+    input_features, intermediate_features, output_features = 256, 512, 384
+    activation = torch.randn(rows, input_features, dtype=torch.bfloat16, device="cuda")
+    up_qdata, up_scale = _weight(2 * intermediate_features, input_features)
+    down_qdata, down_scale = _weight(output_features, intermediate_features)
+    up_bias = torch.randn(2 * intermediate_features, dtype=bias_dtype, device="cuda")
+    down_bias = torch.randn(output_features, dtype=bias_dtype, device="cuda")
+
+    expected = _materialized_ffn(
+        activation,
+        up_qdata,
+        up_scale,
+        up_bias,
+        down_qdata,
+        down_scale,
+        down_bias,
+        256,
+    )
+    actual = _chunked_swiglu_ffn_op(
+        activation,
+        up_qdata,
+        up_scale,
+        up_bias,
+        256,
+        down_qdata,
+        down_scale,
+        down_bias,
+        256,
+        128,
+    )
+
+    assert actual.dtype is torch.bfloat16
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_chunked_ffn_rejects_noncontiguous_input() -> None:
     torch.manual_seed(202)
     input_features, intermediate_features, output_features = 256, 512, 384

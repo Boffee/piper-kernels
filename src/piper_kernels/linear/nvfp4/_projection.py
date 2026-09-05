@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import torch
 
+from . import triton as nvfp4_backend
+
 _SWIZZLE_ROWS = 128
 _SWIZZLE_COLUMNS = 64
 _SCALE_ELEMENTS_PER_TILE = 32 * 16
@@ -108,6 +110,7 @@ def matmul_prepared_chunk_affine_out(
         row_end,
         output,
     )
+    fused_bias = bias if bias is None or bias.dtype is output.dtype else None
     torch.ops.aten._scaled_mm_v2.out(
         input_chunk.view(torch.float4_e2m1fn_x2),
         weight_qdata.t().view(torch.float4_e2m1fn_x2),
@@ -117,10 +120,12 @@ def matmul_prepared_chunk_affine_out(
         [weight_scale.view(torch.float8_e4m3fn), weight_per_tensor_scale],
         [_BLOCKWISE_RECIPE, _TENSORWISE_RECIPE],
         [_SCALE_SWIZZLE, _NO_SWIZZLE],
-        bias,
+        fused_bias,
         output.dtype,
         out=output_chunk,
     )
+    if bias is not None and fused_bias is None:
+        nvfp4_backend.apply_projection_epilogue(output_chunk, None, bias, output_chunk)
     return output_chunk
 
 

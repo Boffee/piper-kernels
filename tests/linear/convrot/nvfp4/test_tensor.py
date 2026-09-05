@@ -763,6 +763,33 @@ def test_cuda_linear_matches_materialized_rotation(dynamic: bool, group_size: in
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_cuda_linear_supports_mixed_precision_bias(
+    bias_dtype: torch.dtype,
+    compiled: bool,
+) -> None:
+    torch.manual_seed(616)
+    activation, _torchao_weight, weight, original_bias = _cuda_case(False, 64)
+    bias = original_bias.to(bias_dtype)
+
+    def projection(value: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        return F.linear(value, weight, offset)
+
+    expected = convrot_nvfp4_linear(activation, weight, bias)
+    call = (
+        torch.compile(projection, fullgraph=True, options=convrot_nvfp4_compile_options())
+        if compiled
+        else projection
+    )
+    actual = call(activation, bias)
+
+    assert actual.dtype is torch.bfloat16
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_cuda_high_first_linear_matches_low_first() -> None:
     torch.manual_seed(615)
     activation, _torchao_weight, low, bias = _cuda_case(False, 64)

@@ -15,6 +15,7 @@ from torch.fx.node import Argument
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
+from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _layout, output
@@ -236,7 +237,7 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
     return bool(
         bias is not None
         and bias.shape == (output_features,)
-        and bias.dtype is torch.bfloat16
+        and _bias.is_supported_dtype(bias.dtype)
         and bias.device == query.device
         and bias.layout is torch.strided
         and bias.is_contiguous()

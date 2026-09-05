@@ -56,6 +56,7 @@ def _affine_nvfp4_linear(
     assert weight.per_tensor_scale is not None
     scaling_type = F.ScalingType
     swizzle_type = F.SwizzleType
+    fused_bias = bias if bias is None or bias.dtype is input.dtype else None
     result = F.scaled_mm(
         input_qdata.view(torch.float4_e2m1fn_x2),
         weight.qdata.t().view(torch.float4_e2m1fn_x2),
@@ -65,9 +66,11 @@ def _affine_nvfp4_linear(
         [scaling_type.BlockWise1x16, scaling_type.TensorWise],
         [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
         [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        bias=bias,
+        bias=fused_bias,
         output_dtype=input.dtype,
     )
+    if bias is not None and fused_bias is None:
+        result = (result.float() + bias.float()).to(result.dtype)
     return result.reshape(*input.shape[:-1], weight.shape[0])
 
 
@@ -75,6 +78,7 @@ def _arguments(
     *,
     sequence_length: int,
     bias: bool,
+    bias_dtype: torch.dtype = torch.bfloat16,
     weight_global_scale: bool = True,
 ) -> tuple[tuple[object, ...], torch.Tensor]:
     operands = make_operands(sequence_length=sequence_length)
@@ -132,7 +136,7 @@ def _arguments(
         torch.tensor(3.0, device="cuda", dtype=torch.float32)
     )
     projected_bias = (
-        torch.randn(_OUTPUT_FEATURES, device="cuda", dtype=torch.bfloat16) if bias else None
+        torch.randn(_OUTPUT_FEATURES, device="cuda", dtype=bias_dtype) if bias else None
     )
     arguments = (
         *prepared_query,
@@ -304,7 +308,7 @@ def _projected_gate_arguments(
     gate_bias = torch.randn(
         _HEADS * _HEAD_DIM,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
     )
     gate_input = _ops.prepare_input(hidden, activation_scale, False, None, False)
     with torch.no_grad():
@@ -368,6 +372,25 @@ def test_attention_output_matches_accumulator_affine_boundary(
 
     assert actual.shape == (1, sequence_length, _OUTPUT_FEATURES)
     assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+def test_attention_output_supports_mixed_precision_bias(
+    bias_dtype: torch.dtype,
+) -> None:
+    arguments, expected = _arguments(
+        sequence_length=193,
+        bias=True,
+        bias_dtype=bias_dtype,
+    )
+
+    with torch.no_grad():
+        actual = output._attention_output_op(*arguments, 128)
+
+    assert actual.dtype is torch.bfloat16
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

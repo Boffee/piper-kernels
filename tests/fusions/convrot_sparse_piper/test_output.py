@@ -28,7 +28,11 @@ def _exact_sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
-def _projection(*, bias: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+def _projection(
+    *,
+    bias: bool,
+    bias_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     weight = torch.randint(
         -127,
         128,
@@ -40,7 +44,7 @@ def _projection(*, bias: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor
         torch.rand((_OUTPUT_FEATURES, 1), device="cuda", dtype=torch.float32).mul_(0.01).add_(0.001)
     )
     projected_bias = (
-        torch.randn(_OUTPUT_FEATURES, device="cuda", dtype=torch.bfloat16) if bias else None
+        torch.randn(_OUTPUT_FEATURES, device="cuda", dtype=bias_dtype) if bias else None
     )
     return weight, scale, projected_bias
 
@@ -50,12 +54,13 @@ def _arguments(
     batch: int,
     sequence_length: int,
     bias: bool,
+    bias_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[tuple[object, ...], torch.Tensor]:
     operands = _operands(batch=batch, sequence_length=sequence_length)
     prepared_query, prepared_key, prepared_value = _prepare(operands)
     attention = SparsePiperAttention((0.5, 1.0))
     sparse_key_blocks = max(1, sequence_length // 64)
-    weight, scale, projected_bias = _projection(bias=bias)
+    weight, scale, projected_bias = _projection(bias=bias, bias_dtype=bias_dtype)
     arguments = (
         *prepared_query,
         *prepared_key,
@@ -189,6 +194,26 @@ def test_attention_output_matches_materialized_boundary(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+def test_attention_output_supports_mixed_precision_bias(
+    bias_dtype: torch.dtype,
+) -> None:
+    arguments, expected = _arguments(
+        batch=1,
+        sequence_length=65,
+        bias=True,
+        bias_dtype=bias_dtype,
+    )
+
+    with torch.no_grad():
+        actual = output_fusion._attention_output_op(*arguments, 64)
+
+    assert actual.dtype is torch.bfloat16
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_projected_query_attention_output_matches_multiple_materialized_q_windows() -> None:
     sequence_length = 193
     operands = _operands(batch=1, sequence_length=sequence_length)
@@ -294,7 +319,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         device="cuda",
         dtype=torch.float32,
     ).mul_(0.01)
-    gate_weight, gate_scale, gate_bias = _projection(bias=True)
+    gate_weight, gate_scale, gate_bias = _projection(bias=True, bias_dtype=torch.float32)
     gate_weight = gate_weight[:gate_features, :gate_features].contiguous()
     gate_scale = gate_scale[:gate_features].contiguous()
     assert gate_bias is not None

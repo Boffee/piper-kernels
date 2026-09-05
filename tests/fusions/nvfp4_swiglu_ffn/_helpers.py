@@ -120,6 +120,8 @@ def down_affine_reference(operands: Operands) -> torch.Tensor:
     assert weight_per_tensor_scale is not None
     scaling_type = F.ScalingType
     swizzle_type = F.SwizzleType
+    bias = operands.down.bias
+    fused_bias = bias if bias is None or bias.dtype is operands.input.dtype else None
     result = F.scaled_mm(
         input_qdata.view(torch.float4_e2m1fn_x2),
         operands.down.weight.qdata.t().view(torch.float4_e2m1fn_x2),
@@ -129,9 +131,11 @@ def down_affine_reference(operands: Operands) -> torch.Tensor:
         [scaling_type.BlockWise1x16, scaling_type.TensorWise],
         [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
         [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        bias=operands.down.bias,
+        bias=fused_bias,
         output_dtype=operands.input.dtype,
     )
+    if bias is not None and fused_bias is None:
+        result = (result.float() + bias.float()).to(result.dtype)
     return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
 
 
@@ -148,7 +152,7 @@ def make_operands(
     intermediate_features: int = 512,
     output_features: int = 384,
     dynamic: bool,
-    with_bias: bool = True,
+    bias_dtype: torch.dtype | None = torch.bfloat16,
     high_first: bool = False,
     seed: int = 901,
 ) -> Operands:
@@ -167,12 +171,14 @@ def make_operands(
         dtype=torch.bfloat16,
     )
     up_bias = (
-        torch.randn(2 * intermediate_features, device="cuda", dtype=torch.bfloat16)
-        if with_bias
+        torch.randn(2 * intermediate_features, device="cuda", dtype=bias_dtype)
+        if bias_dtype is not None
         else None
     )
     down_bias = (
-        torch.randn(output_features, device="cuda", dtype=torch.bfloat16) if with_bias else None
+        torch.randn(output_features, device="cuda", dtype=bias_dtype)
+        if bias_dtype is not None
+        else None
     )
     up_activation_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
     up_weight = _weight(dense_up, up_activation_scale, dynamic, high_first)

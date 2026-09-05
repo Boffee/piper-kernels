@@ -87,6 +87,43 @@ def test_triton_linear_matches_gpu_reference(group_size: int) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_triton_linear_supports_mixed_precision_bias(
+    bias_dtype: torch.dtype,
+    compiled: bool,
+) -> None:
+    torch.manual_seed(154)
+    in_features, out_features = 256, 96
+    qdata = torch.randint(
+        -127,
+        128,
+        (out_features, in_features),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
+    weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
+    activation = torch.randn(37, in_features, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(out_features, dtype=bias_dtype, device="cuda")
+
+    def projection(value: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(value, weight, offset)
+
+    expected = linear(activation, qdata, scale, 256, bias)
+    call = (
+        torch.compile(projection, fullgraph=True, options=convrot_int8_compile_options())
+        if compiled
+        else projection
+    )
+    actual = call(activation, bias)
+
+    assert actual.dtype is torch.bfloat16
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_scaled_projection_tile_supports_specialized_epilogues() -> None:
     torch.manual_seed(153)
     rows, out_features, in_features = 19, 23, 48
