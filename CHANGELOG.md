@@ -26,6 +26,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Use eight packing warps for selected wide group-16 ConvRot NVFP4 layouts, reducing
+  synthetic H3-shape fused FFN latency by approximately 1–4% on RTX 5090 without changing
+  outputs, peak tensor allocation, or the fixed 1,536-row FFN chunk size.
 - Unified supported eager/compiled NVFP4, ConvRot NVFP4, FFN and sparse-attention affine
   projections. Compatible scale/bias epilogues run inside GEMM; mixed bias retains its precision
   through FP32 accumulation and addition in bounded row workspaces before the final output cast.

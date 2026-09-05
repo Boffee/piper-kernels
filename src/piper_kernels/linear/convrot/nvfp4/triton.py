@@ -412,6 +412,12 @@ def _preparation_num_warps(
     chunk_count = sum(chunk_size > 0 for chunk_size in chunk_sizes)
     amax_num_warps = 2 if chunk_count > 1 and chunk_sizes[0] <= 4_096 else 4
     packing_num_warps = 4 if group_size == 16 else amax_num_warps
+    if (
+        group_size == 16
+        and chunk_sizes[0] >= 4_096
+        and (chunk_count == 1 or (chunk_count == 3 and chunk_sizes[2] >= 2_048))
+    ):
+        packing_num_warps = 8
     return amax_num_warps, packing_num_warps
 
 
