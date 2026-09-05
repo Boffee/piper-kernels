@@ -31,7 +31,7 @@ from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from . import _core
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v1"
+_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +40,7 @@ class _MatchedFfn:
     down: nvfp4_compile_fx.PreparedLinearNodes
     down_activation_per_tensor_scale: torch.fx.Node | None
     down_dynamic_activation_scale: bool
+    down_high_first: bool
 
     @classmethod
     def from_match(cls, match: Match) -> _MatchedFfn | None:
@@ -75,17 +76,20 @@ class _MatchedFfn:
             prepared.op != "call_function"
             or prepared.target != torch.ops.piper_kernels.nvfp4_prepare_input.default
             or prepared.kwargs
-            or len(prepared.args) != 4
+            or len(prepared.args) not in (4, 5)
             or prepared.args[0] is not up_calls[0]
             or prepared.args[3] != "swiglu"
         ):
             return None
         activation_scale, dynamic = prepared.args[1:3]
+        high_first = False if len(prepared.args) == 4 else prepared.args[4]
         if (
-            activation_scale is not None and not isinstance(activation_scale, torch.fx.Node)
-        ) or not isinstance(dynamic, bool):
+            (activation_scale is not None and not isinstance(activation_scale, torch.fx.Node))
+            or not isinstance(dynamic, bool)
+            or not isinstance(high_first, bool)
+        ):
             return None
-        return cls(up, down, activation_scale, dynamic)
+        return cls(up, down, activation_scale, dynamic, high_first)
 
     def arguments(self) -> tuple[Argument, ...]:
         """Return custom-op operands in canonical up/down order."""
@@ -97,16 +101,23 @@ class _MatchedFfn:
             self.up.activation_per_tensor_scale,
             self.up.bias,
             self.up.dynamic_activation_scale,
+            self.up.high_first,
             self.down.weight_qdata,
             self.down.weight_scale,
             self.down.weight_per_tensor_scale,
             self.down_activation_per_tensor_scale,
             self.down.bias,
             self.down_dynamic_activation_scale,
+            self.down_high_first,
         )
 
 
-def _normalized_ffn_pattern(*, reshape_output: bool) -> CallFunction:
+def _normalized_ffn_pattern(
+    *,
+    reshape_output: bool,
+    with_up_high_first: bool,
+    with_down_high_first: bool,
+) -> CallFunction:
     """Match the stable graph produced by NVFP4 activation folding."""
     packed = CallFunction(
         torch.ops.piper_kernels.nvfp4_linear.default,
@@ -117,6 +128,7 @@ def _normalized_ffn_pattern(*, reshape_output: bool) -> CallFunction:
         KeywordArg("up_activation_per_tensor_scale"),
         KeywordArg("up_bias"),
         KeywordArg("up_dynamic_activation_scale"),
+        *((KeywordArg("up_high_first"),) if with_up_high_first else ()),
         _users=1,
     )
     prepared = CallFunction(
@@ -125,6 +137,7 @@ def _normalized_ffn_pattern(*, reshape_output: bool) -> CallFunction:
         KeywordArg("down_activation_per_tensor_scale"),
         KeywordArg("down_dynamic_activation_scale"),
         "swiglu",
+        *((KeywordArg("down_high_first"),) if with_down_high_first else ()),
         _users=3,
     )
     projected_arguments = (
@@ -265,22 +278,28 @@ def _replace_normalized_ffn_gated_updates(match: Match, **_unused: object) -> No
 
 _gated_updates_patterns = PatternMatcherPass("nvfp4_swiglu_ffn_gated_updates")
 _patterns = PatternMatcherPass("nvfp4_swiglu_ffn")
-for _reshape_output in (False, True):
-    _ffn_pattern = _normalized_ffn_pattern(reshape_output=_reshape_output)
-    for _use_aten_index in (False, True):
-        register_graph_pattern(
-            swiglu_ffn_pattern.gated_updates_pattern(
+for _with_up_high_first in (False, True):
+    for _with_down_high_first in (False, True):
+        for _reshape_output in (False, True):
+            _ffn_pattern = _normalized_ffn_pattern(
+                reshape_output=_reshape_output,
+                with_up_high_first=_with_up_high_first,
+                with_down_high_first=_with_down_high_first,
+            )
+            for _use_aten_index in (False, True):
+                register_graph_pattern(
+                    swiglu_ffn_pattern.gated_updates_pattern(
+                        _ffn_pattern,
+                        use_aten_index=_use_aten_index,
+                    ),
+                    extra_check=_valid_gated_updates,
+                    pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
+                )(_replace_normalized_ffn_gated_updates)
+            register_graph_pattern(
                 _ffn_pattern,
-                use_aten_index=_use_aten_index,
-            ),
-            extra_check=_valid_gated_updates,
-            pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
-        )(_replace_normalized_ffn_gated_updates)
-    register_graph_pattern(
-        _ffn_pattern,
-        extra_check=_valid_normalized_ffn,
-        pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-    )(_replace_normalized_ffn)
+                extra_check=_valid_normalized_ffn,
+                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_normalized_ffn)
 
 
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:

@@ -27,6 +27,7 @@ class LinearOperands:
     activation_per_tensor_scale: torch.Tensor | None
     bias: torch.Tensor | None
     dynamic_activation_scale: bool
+    high_first: bool
 
 
 class PreparationBackend(Protocol):
@@ -75,6 +76,7 @@ def linear_operands(
     activation_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     dynamic_activation_scale: bool,
+    high_first: bool,
 ) -> LinearOperands:
     """Group one projection's public custom-op schema into canonical operands."""
     return LinearOperands(
@@ -84,6 +86,7 @@ def linear_operands(
         activation_per_tensor_scale,
         bias,
         dynamic_activation_scale,
+        high_first,
     )
 
 

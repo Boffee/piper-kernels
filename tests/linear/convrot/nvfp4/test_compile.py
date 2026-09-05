@@ -53,6 +53,7 @@ def _linear(
             None,
             dynamic,
             group_size,
+            False,
         ),
     )
     input_value = input.meta.get("val")

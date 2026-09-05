@@ -36,6 +36,7 @@ class Linear:
             self.bias,
             self.dynamic,
             self.weight.group_size,
+            self.weight.high_first,
         )
 
 
@@ -56,6 +57,7 @@ def _weight(
     activation_scale: torch.Tensor | None,
     dynamic: bool,
     group_size: int,
+    high_first: bool,
 ) -> ConvRotNVFP4Tensor:
     quantization = QuantizeTensorToNVFP4Kwargs(
         block_size=16,
@@ -71,7 +73,22 @@ def _weight(
         is_swizzled_scales=True,
         act_quant_kwargs=quantization,
     )
-    return ConvRotNVFP4Tensor.from_torchao(weight, group_size=group_size)
+    wrapped = ConvRotNVFP4Tensor.from_torchao(weight, group_size=group_size)
+    if not high_first:
+        return wrapped
+    return ConvRotNVFP4Tensor(
+        ((wrapped.qdata & 0x0F) << 4) | (wrapped.qdata >> 4),
+        wrapped.scale,
+        wrapped.block_size,
+        wrapped.orig_dtype,
+        wrapped.group_size,
+        wrapped.per_tensor_scale,
+        wrapped.act_per_tensor_scale,
+        wrapped.is_swizzled_scales,
+        wrapped.use_triton_kernel,
+        wrapped.act_quant_kwargs,
+        high_first=True,
+    )
 
 
 def _activation_scale(input: torch.Tensor, group_size: int) -> torch.Tensor:  # noqa: A002
@@ -88,6 +105,7 @@ def materialized(operands: Operands) -> torch.Tensor:
         operands.down.dynamic,
         operands.down.weight.group_size,
         "swiglu",
+        operands.down.weight.high_first,
     )
     result = nvfp4_ops.linear_prepared(
         *prepared,
@@ -109,6 +127,7 @@ def down_affine_reference(operands: Operands) -> torch.Tensor:
         operands.down.dynamic,
         operands.down.weight.group_size,
         "swiglu",
+        operands.down.weight.high_first,
     )
     weight_per_tensor_scale = operands.down.weight.per_tensor_scale
     assert weight_per_tensor_scale is not None
@@ -145,6 +164,7 @@ def make_operands(
     with_bias: bool = True,
     up_group_size: int = 16,
     down_group_size: int = 64,
+    high_first: bool = False,
     seed: int = 931,
 ) -> Operands:
     torch.manual_seed(seed)
@@ -171,7 +191,7 @@ def make_operands(
     )
     up_activation_scale = None if dynamic else _activation_scale(input, up_group_size)
     up = Linear(
-        _weight(dense_up, up_activation_scale, dynamic, up_group_size),
+        _weight(dense_up, up_activation_scale, dynamic, up_group_size, high_first),
         up_activation_scale,
         up_bias,
         dynamic,
@@ -181,7 +201,13 @@ def make_operands(
     activated = packed_up * F.silu(packed_gate)
     down_activation_scale = None if dynamic else _activation_scale(activated, down_group_size)
     down = Linear(
-        _weight(dense_down, down_activation_scale, dynamic, down_group_size),
+        _weight(
+            dense_down,
+            down_activation_scale,
+            dynamic,
+            down_group_size,
+            high_first,
+        ),
         down_activation_scale,
         down_bias,
         dynamic,

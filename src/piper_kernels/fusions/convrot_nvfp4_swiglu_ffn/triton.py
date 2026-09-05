@@ -20,6 +20,8 @@ class _ConvRotPreparation:
 
     up_group_size: int
     down_group_size: int
+    up_high_first: bool
+    down_high_first: bool
 
     def __post_init__(self) -> None:
         validate_group_size(self.up_group_size)
@@ -42,6 +44,7 @@ class _ConvRotPreparation:
             per_tensor_scale,
             self.up_group_size,
             out,
+            high_first=self.up_high_first,
         )
 
     def dynamic_down_scale(
@@ -70,6 +73,7 @@ class _ConvRotPreparation:
             up_global_scale,
             up_bias,
             self.down_group_size,
+            high_first=self.down_high_first,
         )
 
 
@@ -83,6 +87,7 @@ def _chunked_swiglu_ffn_op(
     up_bias: torch.Tensor | None,
     up_dynamic_activation_scale: bool,
     up_group_size: int,
+    up_high_first: bool,
     down_weight_qdata: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_weight_per_tensor_scale: torch.Tensor | None,
@@ -90,6 +95,7 @@ def _chunked_swiglu_ffn_op(
     down_bias: torch.Tensor | None,
     down_dynamic_activation_scale: bool,
     down_group_size: int,
+    down_high_first: bool,
     chunk_rows: int,
 ) -> torch.Tensor:
     up = _core.linear_operands(
@@ -99,6 +105,7 @@ def _chunked_swiglu_ffn_op(
         up_activation_per_tensor_scale,
         up_bias,
         up_dynamic_activation_scale,
+        up_high_first,
     )
     down = _core.linear_operands(
         down_weight_qdata,
@@ -107,13 +114,19 @@ def _chunked_swiglu_ffn_op(
         down_activation_per_tensor_scale,
         down_bias,
         down_dynamic_activation_scale,
+        down_high_first,
     )
     return _core.run_chunked_swiglu_ffn(
         input,
         up,
         down,
         chunk_rows,
-        _ConvRotPreparation(up_group_size, down_group_size),
+        _ConvRotPreparation(
+            up_group_size,
+            down_group_size,
+            up_high_first,
+            down_high_first,
+        ),
     )
 
 
@@ -127,6 +140,7 @@ def _chunked_swiglu_ffn_op_fake(
     _up_bias: torch.Tensor | None,
     _up_dynamic_activation_scale: bool,
     _up_group_size: int,
+    _up_high_first: bool,
     down_weight_qdata: torch.Tensor,
     _down_weight_scale: torch.Tensor,
     _down_weight_per_tensor_scale: torch.Tensor | None,
@@ -134,6 +148,7 @@ def _chunked_swiglu_ffn_op_fake(
     _down_bias: torch.Tensor | None,
     _down_dynamic_activation_scale: bool,
     _down_group_size: int,
+    _down_high_first: bool,
     _chunk_rows: int,
 ) -> torch.Tensor:
     return input.new_empty((*input.shape[:-1], down_weight_qdata.shape[0]))
@@ -152,6 +167,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
     up_bias: torch.Tensor | None,
     up_dynamic_activation_scale: bool,
     up_group_size: int,
+    up_high_first: bool,
     down_weight_qdata: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_weight_per_tensor_scale: torch.Tensor | None,
@@ -159,6 +175,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
     down_bias: torch.Tensor | None,
     down_dynamic_activation_scale: bool,
     down_group_size: int,
+    down_high_first: bool,
     base: torch.Tensor,
     reusable_update: torch.Tensor,
     update_gate: torch.Tensor,
@@ -174,6 +191,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
         up_activation_per_tensor_scale,
         up_bias,
         up_dynamic_activation_scale,
+        up_high_first,
     )
     down = _core.linear_operands(
         down_weight_qdata,
@@ -182,13 +200,19 @@ def _chunked_swiglu_ffn_gated_updates_op(
         down_activation_per_tensor_scale,
         down_bias,
         down_dynamic_activation_scale,
+        down_high_first,
     )
     _core.run_chunked_swiglu_ffn(
         input,
         up,
         down,
         chunk_rows,
-        _ConvRotPreparation(up_group_size, down_group_size),
+        _ConvRotPreparation(
+            up_group_size,
+            down_group_size,
+            up_high_first,
+            down_high_first,
+        ),
         gated_updates=gated_updates_backend.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,
@@ -210,6 +234,7 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
     _up_bias: torch.Tensor | None,
     _up_dynamic_activation_scale: bool,
     _up_group_size: int,
+    _up_high_first: bool,
     _down_weight_qdata: torch.Tensor,
     _down_weight_scale: torch.Tensor,
     _down_weight_per_tensor_scale: torch.Tensor | None,
@@ -217,6 +242,7 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
     _down_bias: torch.Tensor | None,
     _down_dynamic_activation_scale: bool,
     _down_group_size: int,
+    _down_high_first: bool,
     _base: torch.Tensor,
     _reusable_update: torch.Tensor,
     _update_gate: torch.Tensor,

@@ -37,10 +37,13 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 128, 129])
 @pytest.mark.parametrize("activation_fn", [None, "swiglu"])
+@pytest.mark.parametrize("high_first", [False, True])
 def test_static_preparation_matches_portable_decomposition(
     rows: int,
     activation_fn: str | None,
+    high_first: bool,
 ) -> None:
+    torch._dynamo.reset()
     torch.manual_seed(501)
     output_features = 80
     input_features = output_features * (2 if activation_fn == "swiglu" else 1)
@@ -52,11 +55,17 @@ def test_static_preparation_matches_portable_decomposition(
     )
     per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
 
-    expected = nvfp4_ops._compiled_prepare_static(input, per_tensor_scale, activation_fn)
+    expected = nvfp4_ops._compiled_prepare_static(
+        input,
+        per_tensor_scale,
+        activation_fn,
+        high_first,
+    )
     actual = nvfp4_triton.prepare_static(
         input,
         per_tensor_scale,
         swiglu=activation_fn == "swiglu",
+        high_first=high_first,
     )
 
     for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
@@ -160,6 +169,7 @@ def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> No
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
 def test_static_projected_swiglu_matches_separate_epilogue(with_bias: bool) -> None:
+    torch._dynamo.reset()
     torch.manual_seed(502)
     raw = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
     source_scale = torch.tensor(0.01, device="cuda", dtype=torch.float32)

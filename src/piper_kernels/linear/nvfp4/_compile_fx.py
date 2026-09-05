@@ -32,15 +32,25 @@ class SemanticLinearNodes:
     activation_per_tensor_scale: torch.fx.Node | None
     bias: torch.fx.Node | None
     dynamic_activation_scale: bool
+    high_first: bool
 
     @classmethod
     def from_values(cls, values: tuple[object, ...]) -> SemanticLinearNodes | None:
         """Parse canonical semantic-linear operand values."""
-        if len(values) != 7:
+        if len(values) == 7:
+            values = (*values, False)
+        if len(values) != 8:
             return None
-        input_node, weight_qdata, weight_scale, weight_global, activation_scale, bias, dynamic = (
-            values
-        )
+        (
+            input_node,
+            weight_qdata,
+            weight_scale,
+            weight_global,
+            activation_scale,
+            bias,
+            dynamic,
+            high_first,
+        ) = values
         if (
             not isinstance(input_node, torch.fx.Node)
             or not isinstance(weight_qdata, torch.fx.Node)
@@ -50,6 +60,7 @@ class SemanticLinearNodes:
                 for value in (weight_global, activation_scale, bias)
             )
             or not isinstance(dynamic, bool)
+            or not isinstance(high_first, bool)
         ):
             return None
         return cls(
@@ -60,6 +71,7 @@ class SemanticLinearNodes:
             activation_scale,  # type: ignore[arg-type]
             bias,  # type: ignore[arg-type]
             dynamic,
+            high_first,
         )
 
     @classmethod
@@ -83,6 +95,7 @@ class SemanticLinearNodes:
                     "activation_per_tensor_scale",
                     "bias",
                     "dynamic_activation_scale",
+                    "high_first",
                 )
             )
         )
@@ -282,6 +295,7 @@ def emit_prepared_input(
     activation_per_tensor_scale: torch.fx.Node | None,
     dynamic_activation_scale: bool,
     activation_fn: str | None = None,
+    high_first: bool = False,
 ) -> PreparedInputNodes:
     """Emit shared NVFP4 activation preparation with complete fake metadata."""
     input_value = preparation_sharing.tensor_metadata(input_node)
@@ -300,6 +314,7 @@ def emit_prepared_input(
             activation_per_tensor_scale,
             dynamic_activation_scale,
             activation_fn,
+            high_first,
         ),
     )
     prepared.meta["val"] = values

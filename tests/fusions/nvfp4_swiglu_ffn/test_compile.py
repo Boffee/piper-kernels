@@ -153,8 +153,17 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_cuda_compile_options_fold_complete_swiglu_ffn(dynamic: bool) -> None:
-    operands = make_operands(rows=258, dynamic=dynamic, seed=911 + dynamic)
+@pytest.mark.parametrize("high_first", [False, True])
+def test_cuda_compile_options_fold_complete_swiglu_ffn(
+    dynamic: bool,
+    high_first: bool,
+) -> None:
+    operands = make_operands(
+        rows=258,
+        dynamic=dynamic,
+        high_first=high_first,
+        seed=911 + dynamic + 10 * high_first,
+    )
     activation = operands.input.reshape(2, 129, -1)
     model = _SwiGluFfn(operands).eval()
     capture = _TargetCapturePass()

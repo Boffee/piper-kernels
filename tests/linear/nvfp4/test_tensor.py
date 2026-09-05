@@ -12,6 +12,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor, nvfp4_compile_options
+from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 
 
 def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
@@ -45,6 +46,65 @@ def test_from_torchao_reuses_storage_and_metadata() -> None:
     assert wrapped.act_per_tensor_scale is source.act_per_tensor_scale
     assert wrapped.act_quant_kwargs == source.act_quant_kwargs
     assert PiperNVFP4Tensor.from_torchao(wrapped) is wrapped
+
+
+def test_high_first_preserves_storage_and_dequantizes_logically() -> None:
+    qdata = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]],
+        dtype=torch.uint8,
+    )
+    high_first = (((qdata & 0x0F) << 4) | (qdata >> 4)).to(torch.uint8)
+    scale = torch.ones(1, dtype=torch.float8_e4m3fn)
+
+    low = PiperNVFP4Tensor(qdata, scale, 16, torch.bfloat16)
+    high = PiperNVFP4Tensor(
+        high_first,
+        scale,
+        16,
+        torch.bfloat16,
+        high_first=True,
+    )
+
+    assert low.qdata is qdata
+    assert high.qdata is high_first
+    assert high.high_first is True
+    assert torch.equal(high.dequantize(), low.dequantize())
+    assert high.to(dtype=torch.float16).high_first is True
+
+
+def test_high_first_tensor_flatten_round_trip_preserves_metadata() -> None:
+    source = PiperNVFP4Tensor(
+        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
+        torch.empty(128, 16, dtype=torch.float8_e4m3fn, device="meta"),
+        16,
+        torch.bfloat16,
+        high_first=True,
+    )
+    names, metadata = source.__tensor_flatten__()
+    tensors = {name: getattr(source, name) for name in names}
+
+    rebuilt = PiperNVFP4Tensor.__tensor_unflatten__(
+        tensors,
+        metadata,
+        source.shape,
+        source.stride(),
+    )
+
+    assert type(rebuilt) is PiperNVFP4Tensor
+    assert rebuilt.qdata is source.qdata
+    assert rebuilt.scale is source.scale
+    assert rebuilt.high_first is True
+
+
+def test_high_first_requires_a_bool() -> None:
+    with pytest.raises(TypeError, match="high_first must be bool"):
+        PiperNVFP4Tensor(
+            torch.empty(1, 8, dtype=torch.uint8),
+            torch.empty(1, dtype=torch.float8_e4m3fn),
+            16,
+            torch.bfloat16,
+            high_first="yes",  # type: ignore[arg-type]
+        )
 
 
 def test_dequantize_accepts_an_output_dtype() -> None:
@@ -203,6 +263,50 @@ def test_cuda_semantic_linear_matches_torchao(dynamic: bool, with_bias: bool) ->
 
     assert torch.equal(actual, expected)
     assert torch.ops.piper_kernels.nvfp4_linear.default is not None
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="requires exact NVIDIA SM120",
+)
+def test_cuda_high_first_linear_matches_low_first() -> None:
+    torch.manual_seed(420)
+    input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    source = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    low = PiperNVFP4Tensor.from_hp(
+        source,
+        compute_per_tensor_scale=True,
+        act_per_tensor_scale=per_tensor_amax_to_scale(input.abs().amax()),
+        is_swizzled_scales=True,
+        act_quant_kwargs=_quantization(False),
+    )
+    high = PiperNVFP4Tensor(
+        ((low.qdata & 0x0F) << 4) | (low.qdata >> 4),
+        low.scale,
+        low.block_size,
+        low.orig_dtype,
+        low.per_tensor_scale,
+        low.act_per_tensor_scale,
+        low.is_swizzled_scales,
+        low.use_triton_kernel,
+        low.act_quant_kwargs,
+        high_first=True,
+    )
+
+    actual = F.linear(input, high)
+    expected = nvfp4_ops.linear(
+        input,
+        low.qdata,
+        low.scale,
+        low.per_tensor_scale,
+        low.act_per_tensor_scale,
+        None,
+        False,
+        False,
+    )
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 0.002
 
 
 @pytest.mark.gpu

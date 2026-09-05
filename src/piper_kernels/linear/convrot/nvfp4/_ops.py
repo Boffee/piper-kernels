@@ -19,9 +19,15 @@ def _prepare_input(
     dynamic_activation_scale: bool,
     group_size: int,
     activation_fn: str | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if dynamic_activation_scale:
-        return convrot_nvfp4.prepare_dynamic(input, group_size, activation_fn)
+        return convrot_nvfp4.prepare_dynamic(
+            input,
+            group_size,
+            activation_fn,
+            high_first=high_first,
+        )
     if activation_per_tensor_scale is None:
         raise ValueError("static ConvRot NVFP4 preparation requires a per-tensor scale")
     return convrot_nvfp4.prepare_static(
@@ -29,6 +35,7 @@ def _prepare_input(
         activation_per_tensor_scale,
         group_size,
         activation_fn,
+        high_first=high_first,
     )
 
 
@@ -42,6 +49,7 @@ def linear(
     bias: torch.Tensor | None,
     dynamic_activation_scale: bool,
     group_size: int,
+    high_first: bool = False,
 ) -> torch.Tensor:
     """Apply a standard NVFP4 weight and activation in the same ConvRot basis."""
     validate_group_size(group_size)
@@ -68,6 +76,7 @@ def linear(
         activation_per_tensor_scale,
         dynamic_activation_scale,
         group_size,
+        high_first=high_first,
     )
     result = nvfp4_ops._execute_prepared(
         input_qdata,
@@ -92,6 +101,7 @@ def _linear_fake(
     _bias: torch.Tensor | None,
     _dynamic_activation_scale: bool,
     group_size: int,
+    _high_first: bool = False,
 ) -> torch.Tensor:
     validate_group_size(group_size)
     input_features = input.shape[-1]
@@ -110,6 +120,7 @@ def prepare_input(
     dynamic_activation_scale: bool,
     group_size: int,
     activation_fn: str | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply an optional activation and prepare it in the ConvRot NVFP4 basis."""
     validate_group_size(group_size)
@@ -119,6 +130,7 @@ def prepare_input(
         dynamic_activation_scale,
         group_size,
         activation_fn,
+        high_first,
     )
 
 
@@ -129,6 +141,7 @@ def _prepare_input_fake(
     _dynamic_activation_scale: bool,
     group_size: int,
     activation_fn: str | None = None,
+    _high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_group_size(group_size)
     if input.ndim == 0:

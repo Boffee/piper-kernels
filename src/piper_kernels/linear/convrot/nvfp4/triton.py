@@ -239,6 +239,7 @@ def _rotate_quantize_chunk(
     gguf_quant_type: tl.constexpr,
     has_per_tensor_scale: tl.constexpr,
     swizzled_scales: tl.constexpr,
+    high_first: tl.constexpr,
 ):
     """Rotate and encode one power-of-two row chunk into standard NVFP4 storage."""
     chunk_offsets = tl.arange(0, chunk_size)
@@ -270,6 +271,7 @@ def _rotate_quantize_chunk(
         blocked,
         per_tensor_scale,
         block_count,
+        high_first,
     )
     packed_offsets = tl.arange(0, chunk_size // 2)
     logical_packed_offsets = chunk_start // 2 + packed_offsets
@@ -319,6 +321,7 @@ def _rotate_quantize_nvfp4_kernel(
     gguf_quant_type: tl.constexpr,
     has_per_tensor_scale: tl.constexpr,
     swizzled_scales: tl.constexpr,
+    high_first: tl.constexpr,
 ):
     """Apply the second exact rotation and write hardware-ready NVFP4 storage."""
     row = tl.program_id(0)
@@ -358,6 +361,7 @@ def _rotate_quantize_nvfp4_kernel(
         gguf_quant_type,
         has_per_tensor_scale,
         swizzled_scales,
+        high_first,
     )
     if chunk_count >= 2:
         _rotate_quantize_chunk(
@@ -385,6 +389,7 @@ def _rotate_quantize_nvfp4_kernel(
             gguf_quant_type,
             has_per_tensor_scale,
             swizzled_scales,
+            high_first,
         )
     if chunk_count >= 3:
         _rotate_quantize_chunk(
@@ -412,6 +417,7 @@ def _rotate_quantize_nvfp4_kernel(
             gguf_quant_type,
             has_per_tensor_scale,
             swizzled_scales,
+            high_first,
         )
 
 
@@ -594,6 +600,7 @@ def _prepare_static_storage(
     activation_fn: str | None = None,
     source_global_scale: torch.Tensor | None = None,
     source_bias: torch.Tensor | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     contiguous_input, rows, input_features, chunk_sizes, target = validated_input
     if (
@@ -636,6 +643,7 @@ def _prepare_static_storage(
         gguf_quant_type=-1,
         has_per_tensor_scale=True,
         swizzled_scales=True,
+        high_first=high_first,
         num_warps=packing_num_warps,
     )
     return qdata, scale
@@ -691,6 +699,7 @@ def _gguf_prepare_out(
     scale: torch.Tensor,
     *,
     is_swizzled_scales: bool,
+    high_first: bool,
 ) -> None:
     """Decode GGUF rows through the existing ConvRot NVFP4 packing kernel."""
     rows, packed_width = qdata.shape
@@ -724,6 +733,7 @@ def _gguf_prepare_out(
         gguf_quant_type=quant_type,
         has_per_tensor_scale=per_tensor_scale is not None,
         swizzled_scales=is_swizzled_scales,
+        high_first=high_first,
         num_warps=packing_num_warps,
     )
 
@@ -744,6 +754,7 @@ def prepare_static(
     per_tensor_scale: torch.Tensor,
     group_size: int,
     activation_fn: str | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply an optional activation, then rotate and pack using a supplied scale."""
     validated_input = _validate_input(input, group_size, activation_fn)
@@ -752,6 +763,7 @@ def prepare_static(
         per_tensor_scale,
         group_size,
         activation_fn=activation_fn,
+        high_first=high_first,
     )
     return qdata, scale, per_tensor_scale.clone()
 
@@ -761,10 +773,17 @@ def prepare_static_out(
     per_tensor_scale: torch.Tensor,
     group_size: int,
     out: tuple[torch.Tensor, torch.Tensor],
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate and pack into reusable caller-owned NVFP4 storage."""
     validated_input = _validate_input(input, group_size)
-    return _prepare_static_storage(validated_input, per_tensor_scale, group_size, out)
+    return _prepare_static_storage(
+        validated_input,
+        per_tensor_scale,
+        group_size,
+        out,
+        high_first=high_first,
+    )
 
 
 def prepare_dynamic(
@@ -773,6 +792,7 @@ def prepare_dynamic(
     activation_fn: str | None = None,
     *,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply an optional activation, then prepare exact dynamic ConvRot NVFP4 storage."""
     validated_input = _validate_input(input, group_size, activation_fn)
@@ -787,6 +807,7 @@ def prepare_dynamic(
         group_size,
         out,
         activation_fn=activation_fn,
+        high_first=high_first,
     )
     return qdata, scale, per_tensor_scale
 
@@ -819,6 +840,7 @@ def prepare_static_projected_swiglu(
     source_global_scale: torch.Tensor,
     source_bias: torch.Tensor | None,
     group_size: int,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply projection affine and SwiGLU, then rotate and pack without materializing."""
     validated_input = _validate_projected_swiglu(
@@ -834,6 +856,7 @@ def prepare_static_projected_swiglu(
         activation_fn="swiglu",
         source_global_scale=source_global_scale,
         source_bias=source_bias,
+        high_first=high_first,
     )
 
 

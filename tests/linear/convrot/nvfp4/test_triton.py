@@ -197,6 +197,24 @@ def test_dynamic_preparation_matches_zero_input_reference() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_high_first_dynamic_preparation_swaps_only_packed_pairs() -> None:
+    torch.manual_seed(606)
+    input = torch.randn((65, 5_376), device="cuda", dtype=torch.bfloat16)  # noqa: A001
+
+    low_qdata, low_scale, low_global = convrot_nvfp4.prepare_dynamic(input, 16)
+    high_qdata, high_scale, high_global = convrot_nvfp4.prepare_dynamic(
+        input,
+        16,
+        high_first=True,
+    )
+
+    assert torch.equal(high_qdata, ((low_qdata & 0x0F) << 4) | (low_qdata >> 4))
+    assert torch.equal(high_scale, low_scale)
+    assert torch.equal(high_global, low_global)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_preparation_runs_existing_nvfp4_gemm() -> None:
     torch.manual_seed(603)
     input = torch.randn((257, 256), device="cuda", dtype=torch.bfloat16)  # noqa: A001
@@ -234,6 +252,7 @@ def test_projected_swiglu_preparation_matches_materialized_reference(
     group_size: int,
     with_bias: bool,
 ) -> None:
+    torch._dynamo.reset()
     torch.manual_seed(606 + group_size + with_bias)
     rows, intermediate_features = 17, 256
     input = torch.randn(  # noqa: A001
@@ -300,6 +319,7 @@ def test_swiglu_preparation_matches_materialized_activation(
     group_size: int,
     dynamic: bool,
 ) -> None:
+    torch._dynamo.reset()
     torch.manual_seed(607 + group_size + dynamic)
     input = torch.randn(17, 512, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     activated = apply_input_activation(input, "swiglu")

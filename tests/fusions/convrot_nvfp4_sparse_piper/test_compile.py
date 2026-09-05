@@ -82,7 +82,7 @@ def _convrot_graph(
             and node.target == torch.ops.piper_kernels.nvfp4_linear.default
         ):
             node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
-            node.args = (*node.args, _GROUP_SIZE)
+            node.args = (*node.args[:-1], _GROUP_SIZE, node.args[-1])
     graph.lint()
     return graph
 
@@ -235,7 +235,7 @@ def test_convrot_output_fold_supports_every_bounded_attention_variant(
             and node.target == torch.ops.piper_kernels.nvfp4_linear.default
         ):
             node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
-            node.args = (*node.args, _GROUP_SIZE)
+            node.args = (*node.args[:-1], _GROUP_SIZE, node.args[-1])
 
     _run_passes(graph, monkeypatch)
 
@@ -248,6 +248,31 @@ def test_convrot_output_fold_supports_every_bounded_attention_variant(
         not in targets
     )
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
+    graph.lint()
+
+
+def test_high_first_convrot_output_fold_preserves_order_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _quantized_attention_output_graph(
+        with_block_lengths=False,
+        with_coarse=False,
+        with_sparse_query_blocks=False,
+        high_first=True,
+    )
+    for node in graph.nodes:
+        if (
+            node.op == "call_function"
+            and node.target == torch.ops.piper_kernels.nvfp4_linear.default
+        ):
+            node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
+            node.args = (*node.args[:-1], _GROUP_SIZE, node.args[-1])
+
+    _run_passes(graph, monkeypatch)
+
+    fused = torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
+    node = next(node for node in graph.nodes if node.target is fused)
+    assert node.kwargs == {"high_first": True}
     graph.lint()
 
 
@@ -314,6 +339,8 @@ def _prepared_input(
         weight.act_per_tensor_scale,
         quantization.use_dynamic_per_tensor_scale,
         weight.group_size,
+        None,
+        weight.high_first,
     )
 
 
@@ -333,6 +360,8 @@ def _explicit_fused(
                 weight.act_per_tensor_scale,
                 quantization.use_dynamic_per_tensor_scale,
                 weight.group_size,
+                None,
+                weight.high_first,
             )
         )
     q_weight = model.query.weight

@@ -77,8 +77,9 @@ def encode_nvfp4_blocks(
     values,
     per_tensor_scale,
     block_count: tl.constexpr,
+    high_first: tl.constexpr,
 ):
-    """Encode FP32 values into canonical E2M1 pairs and FP8 block scales."""
+    """Encode FP32 values into E2M1 pairs and FP8 block scales."""
     values = values.to(tl.float32)
     block_amax = tl.max(tl.abs(values), axis=1)
     encoded_scale = tl.clamp(
@@ -93,6 +94,8 @@ def encode_nvfp4_blocks(
         (block_count, _NVFP4_QDATA_BLOCK_SIZE_TL, 2),
     )
     low, high = tl.split(paired)
+    if high_first:
+        return pack_e2m1_pairs(high, low), encoded_scale
     return pack_e2m1_pairs(low, high), encoded_scale
 
 
@@ -112,6 +115,7 @@ def _prepare_static_kernel(
     apply_source_affine: tl.constexpr,
     has_source_bias: tl.constexpr,
     blocks_per_program: tl.constexpr,
+    high_first: tl.constexpr,
 ):
     """Quantize static-scale activations directly into both hardware layouts."""
     block_offsets = tl.program_id(0) * blocks_per_program + tl.arange(0, blocks_per_program)
@@ -158,6 +162,7 @@ def _prepare_static_kernel(
         values,
         per_tensor_scale,
         blocks_per_program,
+        high_first,
     )
     qdata_offsets = (
         rows[:, None] * (output_features // 2)
@@ -272,6 +277,7 @@ def _prepare_static_storage(
     source_global_scale: torch.Tensor | None,
     source_bias: torch.Tensor | None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     contiguous_input = input.contiguous()
     input_features = int(contiguous_input.shape[-1])
@@ -295,6 +301,7 @@ def _prepare_static_storage(
         apply_source_affine=source_global_scale is not None,
         has_source_bias=source_bias is not None,
         blocks_per_program=_PREPARE_BLOCKS,
+        high_first=high_first,
         num_warps=2,
     )
     return qdata, scale
@@ -304,6 +311,7 @@ def prepare_static(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
     swiglu: bool = False,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare a static-scale NVFP4 activation without intermediate tensors."""
     qdata, scale = _prepare_static_storage(
@@ -312,6 +320,7 @@ def prepare_static(
         swiglu=swiglu,
         source_global_scale=None,
         source_bias=None,
+        high_first=high_first,
     )
     return qdata, scale, per_tensor_scale.clone()
 
@@ -320,6 +329,7 @@ def prepare_static_out(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
     out: tuple[torch.Tensor, torch.Tensor],
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prepare static NVFP4 storage into reusable caller-owned buffers."""
     return _prepare_static_storage(
@@ -329,6 +339,7 @@ def prepare_static_out(
         source_global_scale=None,
         source_bias=None,
         out=out,
+        high_first=high_first,
     )
 
 
@@ -337,6 +348,7 @@ def prepare_static_projected_swiglu(
     per_tensor_scale: torch.Tensor,
     source_global_scale: torch.Tensor,
     source_bias: torch.Tensor | None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply a raw projection's affine result and prepare its packed SwiGLU output."""
     return _prepare_static_storage(
@@ -345,6 +357,7 @@ def prepare_static_projected_swiglu(
         swiglu=True,
         source_global_scale=source_global_scale,
         source_bias=source_bias,
+        high_first=high_first,
     )
 
 

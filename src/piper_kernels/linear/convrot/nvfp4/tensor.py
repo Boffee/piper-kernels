@@ -38,7 +38,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
     ]
     group_size: int
 
-    def __new__(
+    def __new__(  # noqa: PLR0913, PLR0917
         cls,
         qdata: torch.Tensor,
         scale: torch.Tensor,
@@ -50,6 +50,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         is_swizzled_scales: bool = False,
         use_triton_kernel: bool = False,
         act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        high_first: bool = False,
     ) -> ConvRotNVFP4Tensor:
         validate_group_size(group_size)
         if orig_dtype not in (torch.float16, torch.bfloat16):
@@ -65,6 +66,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             is_swizzled_scales,
             use_triton_kernel,
             act_quant_kwargs,
+            high_first,
         )
         if tensor.ndim != 2:
             raise ValueError("ConvRot NVFP4 weight must be two-dimensional")
@@ -75,7 +77,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             )
         return cast(ConvRotNVFP4Tensor, tensor)
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         qdata: torch.Tensor,
         scale: torch.Tensor,
@@ -87,6 +89,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         is_swizzled_scales: bool = False,
         use_triton_kernel: bool = False,
         act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        high_first: bool = False,
     ) -> None:
         super().__init__(
             qdata,
@@ -98,6 +101,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             is_swizzled_scales,
             use_triton_kernel,
             act_quant_kwargs,
+            high_first,
         )
         self.group_size = group_size
 
@@ -130,6 +134,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             storage.is_swizzled_scales,
             storage.use_triton_kernel,
             storage.act_quant_kwargs,
+            high_first=getattr(storage, "high_first", False),
         )
 
     @classmethod
@@ -186,6 +191,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         use_triton_kernel: bool = False,
         act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
         group_size: int | None = None,
+        high_first: bool = False,
     ) -> ConvRotNVFP4Tensor:
         """Decode packed GGUF storage directly into ConvRot NVFP4 storage.
 
@@ -207,6 +213,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             per_tensor_scale=per_tensor_scale,
             compute_per_tensor_scale=compute_per_tensor_scale,
             is_swizzled_scales=is_swizzled_scales,
+            high_first=high_first,
         )
         return cls(
             qdata,
@@ -219,6 +226,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             is_swizzled_scales,
             use_triton_kernel,
             act_quant_kwargs,
+            high_first,
         )
 
     def copy_from_gguf_(
@@ -241,6 +249,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             per_tensor_scale=None if compute_per_tensor_scale else self.per_tensor_scale,
             compute_per_tensor_scale=compute_per_tensor_scale,
             is_swizzled_scales=self.is_swizzled_scales,
+            high_first=self.high_first,
             out=(self.qdata, self.scale),
             per_tensor_scale_out=self.per_tensor_scale if compute_per_tensor_scale else None,
         )
@@ -263,6 +272,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             self.is_swizzled_scales,
             self.use_triton_kernel,
             self.act_quant_kwargs,
+            high_first=self.high_first,
         )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -359,6 +369,7 @@ def convrot_nvfp4_linear(
         bias,
         quantization.use_dynamic_per_tensor_scale,
         weight.group_size,
+        weight.high_first,
     )
 
 
