@@ -1,4 +1,4 @@
-"""Shared operands and references for ConvRot NVFP4 SwiGLU FFN tests."""
+"""Shared operands and references for semantic ConvRot NVFP4 FFN tests."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,13 +42,18 @@ class Linear:
 @dataclass(frozen=True, slots=True)
 class Operands:
     input: torch.Tensor
-    up: Linear
+    gate: Linear
+    value: Linear
     down: Linear
-    dense_up: torch.Tensor
-    dense_down: torch.Tensor
 
     def arguments(self, chunk_rows: int) -> tuple[object, ...]:
-        return self.input, *self.up.arguments(), *self.down.arguments(), chunk_rows
+        return (
+            self.input,
+            *self.gate.arguments(),
+            *self.value.arguments(),
+            *self.down.arguments(),
+            chunk_rows,
+        )
 
 
 def _weight(
@@ -66,99 +70,45 @@ def _weight(
         use_dynamic_per_tensor_scale=dynamic,
     )
     rotated = rotate_groups(dense, group_size)
-    weight = TorchAONVFP4Tensor.to_nvfp4(
-        rotated,
-        per_tensor_scale=per_tensor_amax_to_scale(rotated.abs().amax()),
-        act_per_tensor_scale=activation_scale,
-        is_swizzled_scales=True,
-        act_quant_kwargs=quantization,
+    weight = ConvRotNVFP4Tensor.from_torchao(
+        TorchAONVFP4Tensor.to_nvfp4(
+            rotated,
+            per_tensor_scale=per_tensor_amax_to_scale(rotated.abs().amax()),
+            act_per_tensor_scale=activation_scale,
+            is_swizzled_scales=True,
+            act_quant_kwargs=quantization,
+        ),
+        group_size=group_size,
     )
-    wrapped = ConvRotNVFP4Tensor.from_torchao(weight, group_size=group_size)
     if not high_first:
-        return wrapped
+        return weight
     return ConvRotNVFP4Tensor(
-        ((wrapped.qdata & 0x0F) << 4) | (wrapped.qdata >> 4),
-        wrapped.scale,
-        wrapped.block_size,
-        wrapped.orig_dtype,
-        wrapped.group_size,
-        wrapped.per_tensor_scale,
-        wrapped.act_per_tensor_scale,
-        wrapped.is_swizzled_scales,
-        wrapped.use_triton_kernel,
-        wrapped.act_quant_kwargs,
+        ((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4),
+        weight.scale,
+        weight.block_size,
+        weight.orig_dtype,
+        weight.group_size,
+        weight.per_tensor_scale,
+        weight.act_per_tensor_scale,
+        weight.is_swizzled_scales,
+        weight.use_triton_kernel,
+        weight.act_quant_kwargs,
         high_first=True,
     )
 
 
 def _activation_scale(input: torch.Tensor, group_size: int) -> torch.Tensor:  # noqa: A002
-    rotated = rotate_groups(input, group_size)
-    return per_tensor_amax_to_scale(rotated.abs().amax())
+    return per_tensor_amax_to_scale(rotate_groups(input, group_size).abs().amax())
 
 
 def materialized(operands: Operands) -> torch.Tensor:
-    """Run the materialized activation-folded ConvRot NVFP4 reference."""
-    packed = convrot_nvfp4_ops.linear(operands.input, *operands.up.arguments())
-    prepared = convrot_nvfp4_ops.prepare_input(
-        packed,
-        operands.down.activation_scale,
-        operands.down.dynamic,
-        operands.down.weight.group_size,
-        "swiglu",
-        operands.down.weight.high_first,
-    )
-    result = nvfp4_ops.linear_prepared(
-        *prepared,
-        operands.down.weight.qdata,
-        operands.down.weight.scale,
-        operands.down.weight.per_tensor_scale,
-        operands.down.bias,
-        operands.input.dtype,
-    )
-    return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
+    """Run the equivalent three-linear semantic graph."""
+    gate = convrot_nvfp4_ops.linear(operands.input, *operands.gate.arguments())
+    value = convrot_nvfp4_ops.linear(operands.input, *operands.value.arguments())
+    return convrot_nvfp4_ops.linear(value * F.silu(gate), *operands.down.arguments())
 
 
-def down_affine_reference(operands: Operands) -> torch.Tensor:
-    """Run the materialized reference with the down affine in its FP32 accumulator."""
-    packed = convrot_nvfp4_ops.linear(operands.input, *operands.up.arguments())
-    input_qdata, input_scale, input_per_tensor_scale = convrot_nvfp4_ops.prepare_input(
-        packed,
-        operands.down.activation_scale,
-        operands.down.dynamic,
-        operands.down.weight.group_size,
-        "swiglu",
-        operands.down.weight.high_first,
-    )
-    weight_per_tensor_scale = operands.down.weight.per_tensor_scale
-    assert weight_per_tensor_scale is not None
-    scaling_type = F.ScalingType
-    swizzle_type = F.SwizzleType
-    bias = operands.down.bias
-    fused_bias = bias if bias is None or bias.dtype is operands.input.dtype else None
-    result = F.scaled_mm(
-        input_qdata.view(torch.float4_e2m1fn_x2),
-        operands.down.weight.qdata.t().view(torch.float4_e2m1fn_x2),
-        [input_scale.view(torch.float8_e4m3fn), input_per_tensor_scale],
-        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
-        [operands.down.weight.scale.view(torch.float8_e4m3fn), weight_per_tensor_scale],
-        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
-        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        bias=fused_bias,
-        output_dtype=operands.input.dtype,
-    )
-    if bias is not None and fused_bias is None:
-        result = (result.float() + bias.float()).to(result.dtype)
-    return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
-
-
-def dense_reference(operands: Operands) -> torch.Tensor:
-    packed = F.linear(operands.input, operands.dense_up, operands.up.bias)
-    up, gate = packed.chunk(2, dim=-1)
-    return F.linear(up * F.silu(gate), operands.dense_down, operands.down.bias)
-
-
-def make_operands(
+def make_operands(  # noqa: PLR0913
     *,
     rows: int = 385,
     input_features: int = 256,
@@ -166,66 +116,61 @@ def make_operands(
     output_features: int = 384,
     dynamic: bool,
     bias_dtype: torch.dtype | None = torch.bfloat16,
-    up_group_size: int = 16,
+    source_group_size: int = 16,
     down_group_size: int = 64,
     high_first: bool = False,
-    seed: int = 931,
+    distinct_input_scales: bool = False,
+    seed: int = 951,
 ) -> Operands:
     torch.manual_seed(seed)
     input = torch.randn(rows, input_features, device="cuda", dtype=torch.bfloat16)  # noqa: A001
-    dense_up = torch.randn(
-        2 * intermediate_features,
+    gate_dense = torch.randn(
+        intermediate_features,
         input_features,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    dense_down = torch.randn(
+    value_dense = torch.randn_like(gate_dense)
+    down_dense = torch.randn(
         output_features,
         intermediate_features,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    up_bias = (
-        torch.randn(2 * intermediate_features, device="cuda", dtype=bias_dtype)
-        if bias_dtype is not None
-        else None
+    input_scale = None if dynamic else _activation_scale(input, source_group_size)
+    value_scale = (
+        input_scale * 0.875 if distinct_input_scales and input_scale is not None else input_scale
     )
-    down_bias = (
-        torch.randn(output_features, device="cuda", dtype=bias_dtype)
-        if bias_dtype is not None
-        else None
-    )
-    up_activation_scale = None if dynamic else _activation_scale(input, up_group_size)
-    up = Linear(
-        _weight(dense_up, up_activation_scale, dynamic, up_group_size, high_first),
-        up_activation_scale,
-        up_bias,
-        dynamic,
-    )
-    packed = convrot_nvfp4_ops.linear(input, *up.arguments())
-    packed_up, packed_gate = packed.chunk(2, dim=-1)
-    activated = packed_up * F.silu(packed_gate)
-    down_activation_scale = None if dynamic else _activation_scale(activated, down_group_size)
-    down = Linear(
-        _weight(
-            dense_down,
-            down_activation_scale,
+
+    def make_linear(
+        dense: torch.Tensor,
+        scale: torch.Tensor | None,
+        group_size: int,
+    ) -> Linear:
+        bias = (
+            torch.randn(dense.shape[0], device="cuda", dtype=bias_dtype)
+            if bias_dtype is not None
+            else None
+        )
+        return Linear(
+            _weight(dense, scale, dynamic, group_size, high_first),
+            scale,
+            bias,
             dynamic,
-            down_group_size,
-            high_first,
-        ),
-        down_activation_scale,
-        down_bias,
-        dynamic,
+        )
+
+    gate = make_linear(gate_dense, input_scale, source_group_size)
+    value = make_linear(value_dense, value_scale, source_group_size)
+    activated = convrot_nvfp4_ops.linear(input, *value.arguments()) * F.silu(
+        convrot_nvfp4_ops.linear(input, *gate.arguments())
     )
-    return Operands(input, up, down, dense_up, dense_down)
+    down_scale = None if dynamic else _activation_scale(activated, down_group_size)
+    return Operands(
+        input,
+        gate,
+        value,
+        make_linear(down_dense, down_scale, down_group_size),
+    )
 
 
-__all__ = [
-    "Linear",
-    "Operands",
-    "dense_reference",
-    "down_affine_reference",
-    "make_operands",
-    "materialized",
-]
+__all__ = ["Linear", "Operands", "make_operands", "materialized"]

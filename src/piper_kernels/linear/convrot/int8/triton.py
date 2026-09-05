@@ -498,20 +498,26 @@ def _int8_matmul_kernel(
     input_scale_ptr,
     weight_scale_ptr,
     bias_ptr,
+    second_weight_ptr,
+    second_scale_ptr,
+    second_bias_ptr,
     m,
     n,
     k,
+    output_row_stride,
     row_block_offset,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     has_bias: tl.constexpr,
+    paired: tl.constexpr,
+    second_has_bias: tl.constexpr,
     aligned_tiles: tl.constexpr,
     group_m: tl.constexpr,
 ):
     if group_m:
         pid = tl.program_id(0)
-        num_pid_n = tl.cdiv(n, block_n)
+        num_pid_n = tl.cdiv(n, block_n) * (2 if paired else 1)
         row_block_count = tl.num_programs(0) // num_pid_n
         num_pid_in_group = group_m * num_pid_n
         group_id = pid // num_pid_in_group
@@ -523,6 +529,11 @@ def _int8_matmul_kernel(
     else:
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
+    if paired:
+        second = pid_n >= tl.cdiv(n, block_n)
+        pid_n %= tl.cdiv(n, block_n)
+        weight_ptr = tl.where(second, second_weight_ptr, weight_ptr)
+        weight_scale_ptr = tl.where(second, second_scale_ptr, weight_scale_ptr)
     offsets_m = pid_m * block_m + tl.arange(0, block_m)
     offsets_n = pid_n * block_n + tl.arange(0, block_n)
     offsets_m_i64 = offsets_m.to(tl.int64)
@@ -542,14 +553,31 @@ def _int8_matmul_kernel(
         block_k,
         aligned_tiles,
     )
-    if has_bias:
+    if paired and (has_bias or second_has_bias):
+        # Select FP32 values rather than pointers: biases may have different dtypes.
+        bias = tl.full((block_n,), 0, tl.float32)
+        second_bias = tl.full((block_n,), 0, tl.float32)
+        if has_bias:
+            bias = tl.load(bias_ptr + offsets_n, (offsets_n < n) & ~second, other=0.0).to(
+                tl.float32
+            )
+        if second_has_bias:
+            second_bias = tl.load(
+                second_bias_ptr + offsets_n, (offsets_n < n) & second, other=0.0
+            ).to(tl.float32)
+        result += tl.where(second, second_bias, bias)[None, :]
+    elif has_bias:
         if aligned_tiles:
             bias = tl.load(bias_ptr + offsets_n)
         else:
             bias = tl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0)
         result += bias[None, :]
 
-    output_pointers = output_ptr + offsets_m_i64[:, None] * n + offsets_n_i64[None, :]
+    output_pointers = (
+        output_ptr + offsets_m_i64[:, None] * output_row_stride + offsets_n_i64[None, :]
+    )
+    if paired:
+        output_pointers += second * n
     if aligned_tiles:
         tl.store(output_pointers, result)
     else:
@@ -762,26 +790,40 @@ def _execute_prepared_linear(
     execution_plan: _policy.LinearExecutionPlan,
     *,
     out: torch.Tensor | None = None,
+    second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
-    """Run one prepared INT8 GEMM, optionally into caller-owned storage."""
+    """Project prepared INT8 input, optionally to two equal-width independent weights.
+
+    Paired projections share a launch and write adjacent output columns without
+    packing weights. ``out`` may provide caller-owned, row-strided storage.
+    """
     leading_shape = input_qdata.shape[:-1]
     m = math.prod(leading_shape)
     k = input_qdata.shape[-1]
     n = weight_qdata.shape[0]
+    paired = second_projection is not None
+    second_weight, second_scale, second_bias = (
+        (weight_qdata, weight_scale, None) if second_projection is None else second_projection
+    )
+    if second_weight.shape != weight_qdata.shape:
+        raise ValueError("paired INT8 projections must have matching weight shapes")
+    output_features = n * (2 if paired else 1)
     if out is None:
         output = torch.empty(
-            (m, n),
+            (m, output_features),
             device=input_qdata.device,
             dtype=logical_dtype,
         )
-        result = output.reshape(*leading_shape, n)
+        result = output.reshape(*leading_shape, output_features)
     else:
         result = out
     input_qdata_2d = input_qdata.reshape(m, k)
     input_scale_1d = input_scale.reshape(m)
-    output = result.reshape(m, n)
+    output = result.reshape(m, output_features)
+    if output.stride(1) != 1:
+        raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     plan = execution_plan
-    num_n_tiles = triton.cdiv(n, plan.matmul_block_n)
+    num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
     # Cache grouping and the M-tail split are intrinsic to the selected large-tile family,
     # rather than additional execution-plan axes.
     group_m = (
@@ -800,14 +842,20 @@ def _execute_prepared_linear(
             input_scale_1d,
             weight_scale,
             bias_pointer,
+            second_weight,
+            second_scale,
+            second_bias if second_bias is not None else output,
             m,
             n,
             k,
+            output.stride(0),
             row_block_offset,
             block_m=plan.matmul_block_m,
             block_n=plan.matmul_block_n,
             block_k=plan.matmul_block_k,
             has_bias=bias is not None,
+            paired=paired,
+            second_has_bias=second_bias is not None,
             aligned_tiles=aligned_m
             and (n % plan.matmul_block_n == 0)
             and (k % plan.matmul_block_k == 0),

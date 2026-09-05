@@ -18,13 +18,12 @@ from torch._inductor.pattern_matcher import (
 )
 
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
-from piper_kernels.linear import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot import triton as convrot_triton
 
 from . import _compile_fx
 
-_COMPILE_PASS_VERSION = "convrot-compile-v5"
+_COMPILE_PASS_VERSION = "convrot-compile-v6"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -133,7 +132,7 @@ class _PreparationRule:
 _PREPARATION_RULES = (_PreparationRule(),)
 
 
-_input_activation_patterns = PatternMatcherPass("convrot_input_activations")
+_gelu_tanh_patterns = PatternMatcherPass("convrot_gelu_tanh_inputs")
 
 
 def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
@@ -145,98 +144,6 @@ def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
         KeywordArg("bias"),
         KeywordArg("group_size"),
     )
-
-
-def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
-    weight_qdata = match.kwargs["weight_qdata"]
-    if not isinstance(weight_qdata, torch.fx.Node):
-        return False
-    weight_value = preparation_sharing.tensor_metadata(weight_qdata)
-    if weight_value is None or weight_value.ndim != 2:
-        return False
-    return input_activation_compile.valid_packed_swiglu(
-        match,
-        promote_gate=promote_gate,
-        input_features=weight_value.shape[1],
-    )
-
-
-def _replace_input_activation_and_linear(
-    match: Match,
-    input_node: torch.fx.Node,
-    weight_qdata: torch.fx.Node,
-    weight_scale: torch.fx.Node,
-    bias: torch.fx.Node | None,
-    group_size: int,
-    activation_fn: str,
-) -> None:
-    """Replace an input activation plus linear with activated preparation."""
-    original = match.output_node()
-    graph = match.graph
-    input_value = preparation_sharing.tensor_metadata(input_node)
-    assert input_value is not None
-    input_shape = (
-        *input_value.shape[:-1],
-        input_value.shape[-1] // input_activations.input_activation_width(activation_fn),
-    )
-    with graph.inserting_before(original):
-        prepared = _compile_fx.emit_prepared_input(
-            graph,
-            input_node,
-            group_size,
-            activation_fn,
-            input_shape,
-        )
-        replacement = _emit_linear_prepared(
-            graph,
-            prepared,
-            weight_qdata,
-            weight_scale,
-            bias,
-        )
-    replacement.meta = original.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    original.replace_all_uses_with(replacement)
-    match.erase_nodes()
-
-
-def _replace_packed_swiglu(
-    match: Match,
-    packed: torch.fx.Node,
-    weight_qdata: torch.fx.Node,
-    weight_scale: torch.fx.Node,
-    bias: torch.fx.Node | None,
-    group_size: int,
-    **_unused: object,
-) -> None:
-    _replace_input_activation_and_linear(
-        match,
-        packed,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        "swiglu",
-    )
-
-
-# SiLU may remain direct, lower without casts for FP32, or lower through FP32
-# for FP16/BF16. Multiplication is commutative, so accept either operand order.
-for _promote_gate in (None, False, True):
-    for _reverse_multiply in (False, True):
-        register_graph_pattern(
-            input_activation_compile.packed_swiglu_pattern(
-                _linear_pattern,
-                promote_gate=_promote_gate,
-                reverse_multiply=_reverse_multiply,
-            ),
-            extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
-                match,
-                promote_gate=promote_gate,
-            ),
-            # PyTorch's concrete pass has a parameter-name-only protocol mismatch.
-            pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
-        )(_replace_packed_swiglu)
 
 
 def _valid_gelu_tanh(match: Match, *, promote_input: bool) -> bool:
@@ -262,15 +169,29 @@ def _replace_gelu_tanh(
     group_size: int,
     **_unused: object,
 ) -> None:
-    _replace_input_activation_and_linear(
-        match,
-        input,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        "gelu_tanh",
-    )
+    original = match.output_node()
+    graph = match.graph
+    input_value = preparation_sharing.tensor_metadata(input)
+    assert input_value is not None
+    with graph.inserting_before(original):
+        prepared = _compile_fx.emit_prepared_input(
+            graph,
+            input,
+            group_size,
+            "gelu_tanh",
+            tuple(input_value.shape),
+        )
+        replacement = _emit_linear_prepared(
+            graph,
+            prepared,
+            weight_qdata,
+            weight_scale,
+            bias,
+        )
+    replacement.meta = original.meta.copy()
+    replacement.meta.pop("eager_input_vals", None)
+    original.replace_all_uses_with(replacement)
+    match.erase_nodes()
 
 
 for _promote_input in (False, True):
@@ -283,12 +204,12 @@ for _promote_input in (False, True):
             match,
             promote_input=promote_input,
         ),
-        pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+        pass_dict=_gelu_tanh_patterns,  # pyright: ignore[reportArgumentType]
     )(_replace_gelu_tanh)
 
 
-def _fold_input_activations(graph: torch.fx.Graph) -> bool:
-    changed = _input_activation_patterns.apply(graph) > 0
+def _fold_gelu_tanh_inputs(graph: torch.fx.Graph) -> bool:
+    changed = _gelu_tanh_patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()
@@ -296,12 +217,12 @@ def _fold_input_activations(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold activations before sharing ordinary ConvRot input preparation."""
+    """Fold GELU-tanh before sharing ordinary ConvRot input preparation."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
-        _fold_input_activations(graph)
+        _fold_gelu_tanh_inputs(graph)
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
@@ -309,7 +230,6 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             (
                 __file__,
                 input_activation_compile.__file__,
-                input_activations.__file__,
                 preparation_sharing.__file__,
                 convrot_triton.__file__,
                 _compile_fx.__file__,

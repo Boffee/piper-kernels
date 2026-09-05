@@ -2,8 +2,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch._inductor.pattern_matcher import CallFunction, KeywordArg
+
+from piper_kernels.linear import _input_activation_compile as input_activation_compile
+
+type ProjectionPattern = Callable[[object, str, int | None], CallFunction]
+
+
+def semantic_ffn_pattern(
+    gate_projection: ProjectionPattern,
+    value_projection: ProjectionPattern,
+    down_projection: ProjectionPattern,
+    *,
+    promote_gate: bool | None,
+    reverse_multiply: bool,
+) -> CallFunction:
+    """Build a semantic gate/value SwiGLU FFN independent of projection storage."""
+    input = KeywordArg("ffn_input")  # noqa: A001 - graph operand name
+    gate_users = 2 if promote_gate is False else 1
+    gate = gate_projection(input, "gate", gate_users)
+    value = value_projection(input, "value", 1)
+    activated = input_activation_compile.swiglu_product_pattern(
+        value,
+        gate,
+        promote_gate=promote_gate,
+        reverse_multiply=reverse_multiply,
+    )
+    return down_projection(activated, "down", None)
 
 
 def _indexed_gate_pattern(
@@ -35,7 +63,7 @@ def gated_updates_pattern(
     *,
     use_aten_index: bool,
 ) -> CallFunction:
-    """Wrap an exclusive FFN pattern in H3's two indexed gated updates."""
+    """Wrap an exclusive FFN pattern in two indexed gated updates."""
     update_gate = _indexed_gate_pattern(
         gate_name="update_gate",
         indices_name="gate_indices",
@@ -66,4 +94,4 @@ def gated_updates_pattern(
     )
 
 
-__all__ = ["gated_updates_pattern"]
+__all__ = ["ProjectionPattern", "gated_updates_pattern", "semantic_ffn_pattern"]

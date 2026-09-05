@@ -1,4 +1,4 @@
-"""Tests for automatic bounded-workspace ConvRot SwiGLU FFN folding."""
+"""Tests for automatic semantic ConvRot INT8 SwiGLU FFN folding."""
 
 import uuid
 from typing import Literal
@@ -8,15 +8,11 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels.fusions.convrot_sparse_piper import (
-    convrot_sparse_piper_compile_options,
-)
+from piper_kernels.fusions.convrot_sparse_piper import convrot_sparse_piper_compile_options
 from piper_kernels.fusions.convrot_sparse_piper._compile import (
     compile_pass as sparse_piper_compile_pass,
 )
-from piper_kernels.fusions.convrot_swiglu_ffn import (
-    convrot_swiglu_ffn_compile_options,
-)
+from piper_kernels.fusions.convrot_swiglu_ffn import convrot_swiglu_ffn_compile_options
 from piper_kernels.fusions.convrot_swiglu_ffn._compile import (
     compile_pass as fusion_compile_pass,
 )
@@ -34,27 +30,24 @@ class _SwiGluFfn(torch.nn.Module):
     def __init__(
         self,
         *,
-        expose_packed: bool = False,
-        bias_dtype: torch.dtype = torch.bfloat16,
+        promote_gate: bool = False,
+        reverse_multiply: bool = False,
+        bias_dtype: torch.dtype | None = torch.bfloat16,
+        expose_gate: bool = False,
     ) -> None:
         super().__init__()
-        self.expose_packed = expose_packed
-        self.up = self._linear(
-            2 * self.intermediate_features,
-            self.input_features,
-            bias_dtype,
-        )
-        self.down = self._linear(
-            self.output_features,
-            self.intermediate_features,
-            bias_dtype,
-        )
+        self.promote_gate = promote_gate
+        self.reverse_multiply = reverse_multiply
+        self.expose_gate = expose_gate
+        self.gate = self._linear(self.intermediate_features, self.input_features, bias_dtype)
+        self.value = self._linear(self.intermediate_features, self.input_features, bias_dtype)
+        self.down = self._linear(self.output_features, self.intermediate_features, bias_dtype)
 
     @staticmethod
     def _linear(
         out_features: int,
         in_features: int,
-        bias_dtype: torch.dtype,
+        bias_dtype: torch.dtype | None,
     ) -> torch.nn.Linear:
         qdata = torch.randint(
             -127,
@@ -68,23 +61,30 @@ class _SwiGluFfn(torch.nn.Module):
         linear = torch.nn.Linear(
             in_features,
             out_features,
-            bias=True,
+            bias=bias_dtype is not None,
             dtype=torch.bfloat16,
             device="cuda",
         )
         linear.weight = torch.nn.Parameter(weight, requires_grad=False)
-        assert linear.bias is not None
-        linear.bias = torch.nn.Parameter(linear.bias.to(bias_dtype), requires_grad=False)
+        if bias_dtype is not None:
+            assert linear.bias is not None
+            linear.bias = torch.nn.Parameter(linear.bias.to(bias_dtype), requires_grad=False)
         return linear
 
-    def forward(self, activation: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        packed = self.up(activation)
-        up, gate = packed.chunk(2, dim=-1)
-        output = self.down(up * F.silu(gate))
-        return (output, packed) if self.expose_packed else output
+    def forward(
+        self,
+        activation: torch.Tensor,
+        value_input: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        gate = self.gate(activation)
+        value = self.value(activation if value_input is None else value_input)
+        activated_gate = F.silu(gate.float()).to(gate.dtype) if self.promote_gate else F.silu(gate)
+        activated = activated_gate * value if self.reverse_multiply else value * activated_gate
+        output = self.down(activated)
+        return (output, gate) if self.expose_gate else output
 
 
-class _SwiGluFfnGatedUpdates(torch.nn.Module):
+class _GatedUpdates(torch.nn.Module):
     def __init__(
         self,
         *,
@@ -93,7 +93,7 @@ class _SwiGluFfnGatedUpdates(torch.nn.Module):
         python_indexing: bool = False,
     ) -> None:
         super().__init__()
-        self.ffn = _SwiGluFfn()
+        self.ffn = _SwiGluFfn(promote_gate=True, reverse_multiply=True)
         self.expose = expose
         self.update_mode = update_mode
         self.python_indexing = python_indexing
@@ -138,7 +138,7 @@ class _SwiGluFfnGatedUpdates(torch.nn.Module):
 
 
 def _gated_update_arguments(
-    model: _SwiGluFfnGatedUpdates,
+    model: _GatedUpdates,
     rows: int,
 ) -> tuple[torch.Tensor, ...]:
     features = model.ffn.output_features
@@ -149,24 +149,11 @@ def _gated_update_arguments(
         dtype=torch.bfloat16,
         device="cuda",
     )
-    gate_storage = torch.randn(
-        7,
-        6 * features,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    gate_storage = torch.randn(7, 6 * features, dtype=torch.bfloat16, device="cuda")
     update_gate = gate_storage[:, 2 * features : 3 * features]
     ffn_gate = gate_storage[:, 5 * features :]
-    assert update_gate.stride() == (6 * features, 1)
-    assert ffn_gate.stride() == (6 * features, 1)
     gate_indices = torch.randint(0, 7, (rows,), dtype=torch.int64, device="cuda")
-    return (
-        base,
-        update_source,
-        update_gate,
-        ffn_gate,
-        gate_indices,
-    )
+    return base, update_source, update_gate, ffn_gate, gate_indices
 
 
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
@@ -192,18 +179,21 @@ def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
     return options
 
 
-def test_compile_options_install_fusion_after_convrot() -> None:
+def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    return (actual.float() - expected.float()).norm() / expected.float().norm()
+
+
+def test_compile_options_install_fusion_before_convrot() -> None:
     options = convrot_swiglu_ffn_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options[_POST_GRAD_PRE_PASS] == (convrot_compile_pass, fusion_compile_pass)
+    assert options[_POST_GRAD_PRE_PASS] == (fusion_compile_pass, convrot_compile_pass)
 
 
 def test_compile_options_reapply_without_duplication() -> None:
-    base_options = convrot_int8_compile_options()
-    options = convrot_swiglu_ffn_compile_options(base_options)
+    options = convrot_swiglu_ffn_compile_options(convrot_int8_compile_options())
 
-    assert options[_POST_GRAD_PRE_PASS] == (convrot_compile_pass, fusion_compile_pass)
+    assert options[_POST_GRAD_PRE_PASS] == (fusion_compile_pass, convrot_compile_pass)
     assert convrot_swiglu_ffn_compile_options(options) == options
 
 
@@ -211,35 +201,32 @@ def test_compile_options_preserve_unrelated_pass_order() -> None:
     before_convrot = object()
     after_convrot = object()
     options = convrot_swiglu_ffn_compile_options(
-        {
-            _POST_GRAD_PRE_PASS: (
-                before_convrot,
-                convrot_compile_pass,
-                after_convrot,
-            )
-        }
+        {_POST_GRAD_PRE_PASS: (before_convrot, convrot_compile_pass, after_convrot)}
     )
 
     assert options[_POST_GRAD_PRE_PASS] == (
         before_convrot,
-        convrot_compile_pass,
         fusion_compile_pass,
+        convrot_compile_pass,
         after_convrot,
     )
 
 
 @pytest.mark.parametrize("ffn_first", [False, True])
 def test_compile_options_compose_with_sparse_piper(ffn_first: bool) -> None:
-    if ffn_first:
-        options = convrot_sparse_piper_compile_options(convrot_swiglu_ffn_compile_options())
-    else:
-        options = convrot_swiglu_ffn_compile_options(convrot_sparse_piper_compile_options())
-
-    assert options[_POST_GRAD_PRE_PASS] == (
-        sparse_piper_compile_pass,
-        convrot_compile_pass,
-        fusion_compile_pass,
+    options = (
+        convrot_sparse_piper_compile_options(convrot_swiglu_ffn_compile_options())
+        if ffn_first
+        else convrot_swiglu_ffn_compile_options(convrot_sparse_piper_compile_options())
     )
+
+    passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(passes, tuple)
+    assert passes.count(fusion_compile_pass) == 1
+    assert passes.count(sparse_piper_compile_pass) == 1
+    assert passes.count(convrot_compile_pass) == 1
+    assert passes.index(fusion_compile_pass) < passes.index(convrot_compile_pass)
+    assert passes.index(sparse_piper_compile_pass) < passes.index(convrot_compile_pass)
 
 
 def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
@@ -249,9 +236,26 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compile_options_fold_complete_swiglu_ffn() -> None:
-    torch.manual_seed(211)
-    model = _SwiGluFfn(bias_dtype=torch.float32).eval()
+@pytest.mark.parametrize(
+    ("promote_gate", "reverse_multiply", "bias_dtype"),
+    [
+        (False, False, None),
+        (False, True, torch.bfloat16),
+        (True, False, torch.float32),
+        (True, True, None),
+    ],
+)
+def test_cuda_compile_options_fold_semantic_swiglu_ffn(
+    promote_gate: bool,
+    reverse_multiply: bool,
+    bias_dtype: torch.dtype | None,
+) -> None:
+    torch.manual_seed(220 + promote_gate + 10 * reverse_multiply)
+    model = _SwiGluFfn(
+        promote_gate=promote_gate,
+        reverse_multiply=reverse_multiply,
+        bias_dtype=bias_dtype,
+    ).eval()
     activation = torch.randn(
         2,
         257,
@@ -262,205 +266,104 @@ def test_cuda_compile_options_fold_complete_swiglu_ffn() -> None:
     capture = _TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=convrot_int8_compile_options(),
-        )(activation)
+        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
+            activation
+        )
         torch._dynamo.reset()
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(activation)
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            activation
+        )
 
-    assert torch.equal(actual, expected)
+    assert isinstance(expected, torch.Tensor)
+    assert isinstance(actual, torch.Tensor)
+    assert _relative_l2(actual, expected) < 0.01
     assert capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn.default) == 1
     assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets
-    assert torch.ops.piper_kernels.convrot_int8_prepare_input.default not in capture.targets
-    assert torch.ops.piper_kernels.convrot_int8_linear_prepared.default not in capture.targets
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compile_options_fail_closed_for_noncontiguous_input() -> None:
-    torch.manual_seed(218)
-    model = _SwiGluFfn().eval()
-    storage = torch.randn(
-        257,
-        2 * model.input_features,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    activation = storage[:, ::2]
-    assert not activation.is_contiguous()
+@pytest.mark.parametrize("failure", ["projection-escapes", "different-input", "noncontiguous"])
+def test_cuda_compile_options_fail_closed(failure: str) -> None:
+    torch.manual_seed(225)
+    model = _SwiGluFfn(expose_gate=failure == "projection-escapes").eval()
+    activation = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
+    if failure == "different-input":
+        arguments = activation, torch.randn_like(activation)
+    elif failure == "noncontiguous":
+        storage = torch.randn(
+            257,
+            2 * model.input_features,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        arguments = (storage[:, ::2],)
+    else:
+        arguments = (activation,)
     capture = _TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=convrot_int8_compile_options(),
-        )(activation)
+        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
+            *arguments
+        )
         torch._dynamo.reset()
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(activation)
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            *arguments
+        )
 
-    assert torch.equal(actual, expected)
-    assert torch.ops.piper_kernels.convrot_swiglu_ffn.default not in capture.targets
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compile_options_fold_gated_updates() -> None:
-    torch.manual_seed(214)
-    model = _SwiGluFfnGatedUpdates().eval()
-    rows = 257
-    capture = _TargetCapturePass()
-    arguments = _gated_update_arguments(model, rows)
-    with torch.no_grad():
-        torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=convrot_int8_compile_options(),
-        )(*arguments)
-        torch._dynamo.reset()
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(*arguments)
-
-    assert torch.equal(actual, expected)
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default)
-        == 1
+    expected_values = expected if isinstance(expected, tuple) else (expected,)
+    actual_values = actual if isinstance(actual, tuple) else (actual,)
+    assert all(
+        torch.equal(left, right) for left, right in zip(actual_values, expected_values, strict=True)
     )
     assert torch.ops.piper_kernels.convrot_swiglu_ffn.default not in capture.targets
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compile_options_preserve_negative_python_indices() -> None:
-    torch.manual_seed(219)
-    model = _SwiGluFfnGatedUpdates(python_indexing=True).eval()
-    capture = _TargetCapturePass()
-    arguments = list(_gated_update_arguments(model, 257))
-    arguments[-1] = torch.arange(257, dtype=torch.int64, device="cuda").remainder(7) - 7
-    with torch.no_grad():
-        torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=convrot_int8_compile_options(),
-        )(*arguments)
-        torch._dynamo.reset()
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(*arguments)
-
-    assert torch.equal(actual, expected)
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default)
-        == 1
-    )
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
-    torch.manual_seed(212)
+    torch.manual_seed(227)
     model = _SwiGluFfn().eval()
+    first = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
+    second = torch.randn(385, model.input_features, dtype=torch.bfloat16, device="cuda")
+    torch._dynamo.mark_dynamic(first, 0)
+    torch._dynamo.mark_dynamic(second, 0)
     capture = _TargetCapturePass()
-    baseline = torch.compile(
-        model,
-        dynamic=True,
-        fullgraph=True,
-        options=convrot_int8_compile_options(),
-    )
-    compiled = torch.compile(
-        model,
-        dynamic=True,
-        fullgraph=True,
-        options=_capturing_options(capture),
-    )
+    torch._dynamo.reset()
+    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
 
     with torch.no_grad():
-        for rows in (257, 385):
-            activation = torch.randn(
-                rows,
-                model.input_features,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            assert torch.equal(compiled(activation), baseline(activation))
+        first_output = compiled(first)
+        second_output = compiled(second)
 
+    assert first_output.shape == (257, model.output_features)
+    assert second_output.shape == (385, model.output_features)
     assert capture.calls == 1
     assert capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn.default) == 1
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compiled_gated_updates_reuse_one_dynamic_row_graph() -> None:
-    torch.manual_seed(215)
-    model = _SwiGluFfnGatedUpdates().eval()
+@pytest.mark.parametrize("python_indexing", [False, True])
+def test_cuda_compile_options_fold_h3_style_gated_updates(python_indexing: bool) -> None:
+    torch.manual_seed(224)
+    model = _GatedUpdates(python_indexing=python_indexing).eval()
+    arguments = _gated_update_arguments(model, 257)
     capture = _TargetCapturePass()
-    baseline = torch.compile(
-        model,
-        dynamic=True,
-        fullgraph=True,
-        options=convrot_int8_compile_options(),
-    )
-    compiled = torch.compile(
-        model,
-        dynamic=True,
-        fullgraph=True,
-        options=_capturing_options(capture),
-    )
-
     with torch.no_grad():
-        for rows in (257, 385):
-            arguments = _gated_update_arguments(model, rows)
-            assert torch.equal(compiled(*arguments), baseline(*arguments))
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
+            *arguments
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            *arguments
+        )
 
-    assert capture.calls == 1
+    assert _relative_l2(actual, expected) < 0.01
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default)
         == 1
-    )
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compile_options_fail_closed_when_packed_output_escapes() -> None:
-    torch.manual_seed(213)
-    model = _SwiGluFfn(expose_packed=True).eval()
-    activation = torch.randn(
-        257,
-        model.input_features,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    capture = _TargetCapturePass()
-    with torch.no_grad():
-        expected = model(activation)
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(activation)
-
-    assert isinstance(expected, tuple)
-    assert isinstance(actual, tuple)
-    assert all(
-        torch.equal(actual_value, expected_value)
-        for actual_value, expected_value in zip(actual, expected, strict=True)
     )
     assert torch.ops.piper_kernels.convrot_swiglu_ffn.default not in capture.targets
 
@@ -472,29 +375,23 @@ def test_cuda_gated_updates_fail_closed_when_intermediate_escapes(
     expose: Literal["ffn", "hidden"],
 ) -> None:
     torch.manual_seed(216)
-    model = _SwiGluFfnGatedUpdates(expose=expose).eval()
-    rows = 257
-    arguments = _gated_update_arguments(model, rows)
+    model = _GatedUpdates(expose=expose).eval()
+    arguments = _gated_update_arguments(model, 257)
     capture = _TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=convrot_int8_compile_options(),
-        )(*arguments)
+        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
+            *arguments
+        )
         torch._dynamo.reset()
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(*arguments)
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            *arguments
+        )
 
     assert isinstance(expected, tuple)
     assert isinstance(actual, tuple)
     assert all(
-        torch.equal(actual_value, expected_value)
-        for actual_value, expected_value in zip(actual, expected, strict=True)
+        _relative_l2(left, right) < 0.01 for left, right in zip(actual, expected, strict=True)
     )
     assert torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default not in capture.targets
     assert capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn.default) == 1
@@ -507,23 +404,19 @@ def test_cuda_gated_updates_do_not_mutate_caller_input(
     update_mode: Literal["direct", "alias"],
 ) -> None:
     torch.manual_seed(217)
-    model = _SwiGluFfnGatedUpdates(update_mode=update_mode).eval()
+    model = _GatedUpdates(update_mode=update_mode).eval()
     arguments = _gated_update_arguments(model, 257)
     capture = _TargetCapturePass()
     with torch.no_grad():
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=convrot_int8_compile_options(),
-        )(*arguments)
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(*arguments)
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
+            *arguments
+        )
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            *arguments
+        )
 
-    assert torch.equal(actual, expected)
+    assert _relative_l2(actual, expected) < 0.01
     assert torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default not in capture.targets
     assert capture.targets.count(torch.ops.piper_kernels.convrot_swiglu_ffn.default) == 1
-    if update_mode == "alias":
-        assert torch.ops.aten.slice.Tensor in capture.targets

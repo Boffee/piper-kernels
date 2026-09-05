@@ -25,7 +25,7 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from . import _compile_fx, _layout, _ops, _validation
 from . import triton as nvfp4_triton
 
-_COMPILE_PASS_VERSION = "nvfp4-compile-v3"
+_COMPILE_PASS_VERSION = "nvfp4-compile-v4"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -87,7 +87,7 @@ class _PreparationRule:
 _PREPARATION_RULES = (_PreparationRule(),)
 
 
-_input_activation_patterns = PatternMatcherPass("nvfp4_input_activations")
+_gelu_tanh_patterns = PatternMatcherPass("nvfp4_gelu_tanh_inputs")
 
 
 def _linear_pattern(
@@ -122,18 +122,6 @@ def _activation_input_features(match: Match) -> int | torch.SymInt | None:
     return shape.input_features
 
 
-def _valid_packed_swiglu(match: Match, *, promote_gate: bool | None) -> bool:
-    input_features = _activation_input_features(match)
-    return bool(
-        input_features is not None
-        and input_activation_compile.valid_packed_swiglu(
-            match,
-            promote_gate=promote_gate,
-            input_features=input_features,
-        )
-    )
-
-
 def _valid_gelu_tanh(match: Match, *, promote_input: bool) -> bool:
     input_features = _activation_input_features(match)
     return bool(
@@ -146,10 +134,10 @@ def _valid_gelu_tanh(match: Match, *, promote_input: bool) -> bool:
     )
 
 
-def _replace_input_activation_and_linear(
+def _replace_gelu_tanh(
     match: Match,
-    input_node: torch.fx.Node,
-    activation_fn: str,
+    input: torch.fx.Node,  # noqa: A002 - pattern keyword
+    **_unused: object,
 ) -> None:
     original = match.output_node()
     graph = match.graph
@@ -158,10 +146,10 @@ def _replace_input_activation_and_linear(
     with graph.inserting_before(original):
         prepared = _compile_fx.emit_prepared_input(
             graph,
-            input_node,
+            input,
             operands.activation_per_tensor_scale,
             operands.dynamic_activation_scale,
-            activation_fn,
+            "gelu_tanh",
             operands.high_first,
         )
         replacement = _compile_fx.emit_prepared_linear(graph, prepared, operands)
@@ -169,51 +157,6 @@ def _replace_input_activation_and_linear(
     replacement.meta.pop("eager_input_vals", None)
     original.replace_all_uses_with(replacement)
     match.erase_nodes()
-
-
-def _replace_packed_swiglu(
-    match: Match,
-    packed: torch.fx.Node,
-    **_unused: object,
-) -> None:
-    _replace_input_activation_and_linear(
-        match,
-        packed,
-        "swiglu",
-    )
-
-
-for _with_high_first in (False, True):
-    _linear_pattern_variant = partial(
-        _linear_pattern,
-        with_high_first=_with_high_first,
-    )
-    for _promote_gate in (None, False, True):
-        for _reverse_multiply in (False, True):
-            register_graph_pattern(
-                input_activation_compile.packed_swiglu_pattern(
-                    _linear_pattern_variant,
-                    promote_gate=_promote_gate,
-                    reverse_multiply=_reverse_multiply,
-                ),
-                extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
-                    match,
-                    promote_gate=promote_gate,
-                ),
-                pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
-            )(_replace_packed_swiglu)
-
-
-def _replace_gelu_tanh(
-    match: Match,
-    input: torch.fx.Node,  # noqa: A002 - pattern keyword
-    **_unused: object,
-) -> None:
-    _replace_input_activation_and_linear(
-        match,
-        input,
-        "gelu_tanh",
-    )
 
 
 for _with_high_first in (False, True):
@@ -231,12 +174,12 @@ for _with_high_first in (False, True):
                 match,
                 promote_input=promote_input,
             ),
-            pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+            pass_dict=_gelu_tanh_patterns,  # pyright: ignore[reportArgumentType]
         )(_replace_gelu_tanh)
 
 
-def _fold_input_activations(graph: torch.fx.Graph) -> bool:
-    changed = _input_activation_patterns.apply(graph) > 0
+def _fold_gelu_tanh_inputs(graph: torch.fx.Graph) -> bool:
+    changed = _gelu_tanh_patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()
@@ -244,12 +187,12 @@ def _fold_input_activations(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold input activations before sharing compatible NVFP4 preparation."""
+    """Fold GELU-tanh before sharing compatible NVFP4 preparation."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
-        _fold_input_activations(graph)
+        _fold_gelu_tanh_inputs(graph)
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:

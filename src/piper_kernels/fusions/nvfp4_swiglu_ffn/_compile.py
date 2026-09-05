@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import operator
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -29,212 +29,125 @@ from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
-from . import _core
+from . import _compile_validation, _core, _preparation
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v2"
+_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v3"
 
 
 @dataclass(frozen=True, slots=True)
 class _MatchedFfn:
-    up: nvfp4_compile_fx.SemanticLinearNodes
-    down: nvfp4_compile_fx.PreparedLinearNodes
-    down_activation_per_tensor_scale: torch.fx.Node | None
-    down_dynamic_activation_scale: bool
-    down_high_first: bool
+    gate: nvfp4_compile_fx.SemanticLinearNodes
+    value: nvfp4_compile_fx.SemanticLinearNodes
+    down: nvfp4_compile_fx.SemanticLinearNodes
 
     @classmethod
     def from_match(cls, match: Match) -> _MatchedFfn | None:
-        up_calls = [
+        calls = [
             node
             for node in match.nodes
             if node.op == "call_function"
             and node.target == torch.ops.piper_kernels.nvfp4_linear.default
         ]
-        down_calls = [
-            node
-            for node in match.nodes
-            if node.op == "call_function"
-            and node.target == torch.ops.piper_kernels.nvfp4_linear_prepared.default
-        ]
-        if len(up_calls) != 1 or len(down_calls) != 1:
+        if len(calls) != 3:
             return None
-        up = nvfp4_compile_fx.SemanticLinearNodes.from_call(up_calls[0])
-        down = nvfp4_compile_fx.PreparedLinearNodes.from_call(down_calls[0])
-        if up is None or down is None:
-            return None
-        prepared_getitem = down.input_qdata
-        if (
-            prepared_getitem.op != "call_function"
-            or prepared_getitem.target != operator.getitem
-            or len(prepared_getitem.args) != 2
-            or prepared_getitem.args[1] != 0
-            or not isinstance(prepared_getitem.args[0], torch.fx.Node)
-        ):
-            return None
-        prepared = prepared_getitem.args[0]
-        if (
-            prepared.op != "call_function"
-            or prepared.target != torch.ops.piper_kernels.nvfp4_prepare_input.default
-            or prepared.kwargs
-            or len(prepared.args) not in (4, 5)
-            or prepared.args[0] is not up_calls[0]
-            or prepared.args[3] != "swiglu"
-        ):
-            return None
-        activation_scale, dynamic = prepared.args[1:3]
-        high_first = False if len(prepared.args) == 4 else prepared.args[4]
-        if (
-            (activation_scale is not None and not isinstance(activation_scale, torch.fx.Node))
-            or not isinstance(dynamic, bool)
-            or not isinstance(high_first, bool)
-        ):
-            return None
-        return cls(up, down, activation_scale, dynamic, high_first)
+        parsed: list[nvfp4_compile_fx.SemanticLinearNodes] = []
+        for prefix in ("gate", "value", "down"):
+            call = next(
+                (
+                    node
+                    for node in calls
+                    if _compile_validation.projection_call_matches(node, match, prefix)
+                ),
+                None,
+            )
+            if call is None:
+                return None
+            operands = nvfp4_compile_fx.SemanticLinearNodes.from_call(call)
+            if operands is None:
+                return None
+            parsed.append(operands)
+        return cls(*parsed)
 
     def arguments(self) -> tuple[Argument, ...]:
-        """Return custom-op operands in canonical up/down order."""
+        """Return custom-op operands in semantic gate/value/down order."""
         return (
-            self.up.input,
-            self.up.weight_qdata,
-            self.up.weight_scale,
-            self.up.weight_per_tensor_scale,
-            self.up.activation_per_tensor_scale,
-            self.up.bias,
-            self.up.dynamic_activation_scale,
-            self.up.high_first,
+            self.gate.input,
+            self.gate.weight_qdata,
+            self.gate.weight_scale,
+            self.gate.weight_per_tensor_scale,
+            self.gate.activation_per_tensor_scale,
+            self.gate.bias,
+            self.gate.dynamic_activation_scale,
+            self.gate.high_first,
+            self.value.weight_qdata,
+            self.value.weight_scale,
+            self.value.weight_per_tensor_scale,
+            self.value.activation_per_tensor_scale,
+            self.value.bias,
+            self.value.dynamic_activation_scale,
+            self.value.high_first,
             self.down.weight_qdata,
             self.down.weight_scale,
             self.down.weight_per_tensor_scale,
-            self.down_activation_per_tensor_scale,
+            self.down.activation_per_tensor_scale,
             self.down.bias,
-            self.down_dynamic_activation_scale,
-            self.down_high_first,
+            self.down.dynamic_activation_scale,
+            self.down.high_first,
         )
 
 
-def _normalized_ffn_pattern(
+def _semantic_linear_pattern(
+    input_pattern: object,
+    prefix: str,
+    users: int | None,
     *,
-    reshape_output: bool,
-    with_up_high_first: bool,
-    with_down_high_first: bool,
+    with_high_first: bool,
 ) -> CallFunction:
-    """Match the stable graph produced by NVFP4 activation folding."""
-    packed = CallFunction(
-        torch.ops.piper_kernels.nvfp4_linear.default,
-        KeywordArg("ffn_input"),
-        KeywordArg("up_weight_qdata"),
-        KeywordArg("up_weight_scale"),
-        KeywordArg("up_weight_per_tensor_scale"),
-        KeywordArg("up_activation_per_tensor_scale"),
-        KeywordArg("up_bias"),
-        KeywordArg("up_dynamic_activation_scale"),
-        *((KeywordArg("up_high_first"),) if with_up_high_first else ()),
-        _users=1,
+    arguments = (
+        input_pattern,
+        KeywordArg(f"{prefix}_weight_qdata"),
+        KeywordArg(f"{prefix}_weight_scale"),
+        KeywordArg(f"{prefix}_weight_per_tensor_scale"),
+        KeywordArg(f"{prefix}_activation_per_tensor_scale"),
+        KeywordArg(f"{prefix}_bias"),
+        KeywordArg(f"{prefix}_dynamic_activation_scale"),
+        *((KeywordArg(f"{prefix}_high_first"),) if with_high_first else ()),
     )
-    prepared = CallFunction(
-        torch.ops.piper_kernels.nvfp4_prepare_input.default,
-        packed,
-        KeywordArg("down_activation_per_tensor_scale"),
-        KeywordArg("down_dynamic_activation_scale"),
-        "swiglu",
-        *((KeywordArg("down_high_first"),) if with_down_high_first else ()),
-        _users=3,
-    )
-    projected_arguments = (
-        CallFunction(operator.getitem, prepared, 0, _users=1),
-        CallFunction(operator.getitem, prepared, 1, _users=1),
-        CallFunction(operator.getitem, prepared, 2, _users=1),
-        KeywordArg("down_weight_qdata"),
-        KeywordArg("down_weight_scale"),
-        KeywordArg("down_weight_per_tensor_scale"),
-        KeywordArg("down_bias"),
-        KeywordArg("logical_dtype"),
-    )
-    projected = (
-        CallFunction(
-            torch.ops.piper_kernels.nvfp4_linear_prepared.default,
-            *projected_arguments,
-            _users=1,
-        )
-        if reshape_output
-        else CallFunction(
-            torch.ops.piper_kernels.nvfp4_linear_prepared.default,
-            *projected_arguments,
-        )
-    )
-    if not reshape_output:
-        return projected
+    if users is None:
+        return CallFunction(torch.ops.piper_kernels.nvfp4_linear.default, *arguments)
     return CallFunction(
-        torch.ops.aten.reshape.default,
-        projected,
-        KeywordArg("output_shape"),
+        torch.ops.piper_kernels.nvfp4_linear.default,
+        *arguments,
+        _users=users,
     )
 
 
-def _valid_normalized_ffn(match: Match) -> bool:
+def _valid_semantic_ffn(match: Match, *, promote_gate: bool | None) -> bool:
     operands = _MatchedFfn.from_match(match)
     if operands is None:
         return False
-    validated_up = nvfp4_compile_fx.validated_semantic_linear(
-        operands.up,
-        "NVFP4 FFN compiler up projection",
-    )
-    down_shape = nvfp4_compile_fx.validated_prepared_linear(
+    return _compile_validation.valid_semantic_ffn(
+        match,
+        operands.gate,
+        operands.value,
         operands.down,
-        "NVFP4 FFN compiler down projection",
-    )
-    if validated_up is None or down_shape is None:
-        return False
-    input_value, up_shape = validated_up
-    output_value = preparation_sharing.tensor_metadata(match.output_node())
-    if output_value is None:
-        return False
-    down_activation_scale = (
-        None
-        if operands.down_activation_per_tensor_scale is None
-        else preparation_sharing.tensor_metadata(operands.down_activation_per_tensor_scale)
-    )
-    if operands.down_activation_per_tensor_scale is not None and down_activation_scale is None:
-        return False
-    try:
-        nvfp4_validation.validate_activation_scale(
-            down_activation_scale,
-            operands.down_dynamic_activation_scale,
-            input_value.device,
-            "NVFP4 FFN compiler down projection",
-        )
-    except ValueError:
-        return False
-    return bool(
-        input_value.dtype is torch.bfloat16
-        and operands.down.logical_dtype is input_value.dtype
-        and output_value.dtype is input_value.dtype
-        and output_value.device == input_value.device
-        and output_value.ndim == input_value.ndim
-        and all(
-            preparation_sharing.dimension_key(output_dimension)
-            == preparation_sharing.dimension_key(input_dimension)
-            for output_dimension, input_dimension in zip(
-                output_value.shape[:-1],
-                input_value.shape[:-1],
-                strict=True,
-            )
-        )
-        and preparation_sharing.dimension_key(output_value.shape[-1])
-        == preparation_sharing.dimension_key(down_shape.output_features)
-        and preparation_sharing.dimension_key(up_shape.rows)
-        == preparation_sharing.dimension_key(down_shape.rows)
-        and preparation_sharing.dimension_key(up_shape.output_features)
-        == preparation_sharing.dimension_key(2 * down_shape.input_features)
+        promote_gate=promote_gate,
     )
 
 
-def _valid_gated_updates(match: Match) -> bool:
-    return swiglu_ffn_compile.valid_gated_updates(match, _valid_normalized_ffn)
+def _valid_semantic_gated_updates(
+    match: Match,
+    *,
+    promote_gate: bool | None,
+) -> bool:
+    return swiglu_ffn_compile.valid_gated_updates(
+        match,
+        partial(_valid_semantic_ffn, promote_gate=promote_gate),
+    )
 
 
-def _replace_normalized_ffn(match: Match, **_unused: object) -> None:
+def _replace_semantic_ffn(match: Match, **_unused: object) -> None:
     original = match.output_node()
     graph = match.graph
     operands = _MatchedFfn.from_match(match)
@@ -250,7 +163,7 @@ def _replace_normalized_ffn(match: Match, **_unused: object) -> None:
     match.erase_nodes()
 
 
-def _replace_normalized_ffn_gated_updates(match: Match, **_unused: object) -> None:
+def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None:
     original = match.output_node()
     graph = match.graph
     operands = _MatchedFfn.from_match(match)
@@ -279,28 +192,46 @@ def _replace_normalized_ffn_gated_updates(match: Match, **_unused: object) -> No
 
 _gated_updates_patterns = PatternMatcherPass("nvfp4_swiglu_ffn_gated_updates")
 _patterns = PatternMatcherPass("nvfp4_swiglu_ffn")
-for _with_up_high_first in (False, True):
+for _with_source_high_first in (False, True):
     for _with_down_high_first in (False, True):
-        for _reshape_output in (False, True):
-            _ffn_pattern = _normalized_ffn_pattern(
-                reshape_output=_reshape_output,
-                with_up_high_first=_with_up_high_first,
-                with_down_high_first=_with_down_high_first,
-            )
-            for _use_aten_index in (False, True):
+        _source_projection_pattern = partial(
+            _semantic_linear_pattern,
+            with_high_first=_with_source_high_first,
+        )
+        _down_projection_pattern = partial(
+            _semantic_linear_pattern,
+            with_high_first=_with_down_high_first,
+        )
+        for _promote_gate in (None, False, True):
+            for _reverse_multiply in (False, True):
+                _semantic_ffn_pattern = swiglu_ffn_pattern.semantic_ffn_pattern(
+                    _source_projection_pattern,
+                    _source_projection_pattern,
+                    _down_projection_pattern,
+                    promote_gate=_promote_gate,
+                    reverse_multiply=_reverse_multiply,
+                )
                 register_graph_pattern(
-                    swiglu_ffn_pattern.gated_updates_pattern(
-                        _ffn_pattern,
-                        use_aten_index=_use_aten_index,
+                    _semantic_ffn_pattern,
+                    extra_check=lambda match, promote_gate=_promote_gate: _valid_semantic_ffn(
+                        match, promote_gate=promote_gate
                     ),
-                    extra_check=_valid_gated_updates,
-                    pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
-                )(_replace_normalized_ffn_gated_updates)
-            register_graph_pattern(
-                _ffn_pattern,
-                extra_check=_valid_normalized_ffn,
-                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-            )(_replace_normalized_ffn)
+                    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+                )(_replace_semantic_ffn)
+                for _use_aten_index in (False, True):
+                    register_graph_pattern(
+                        swiglu_ffn_pattern.gated_updates_pattern(
+                            _semantic_ffn_pattern,
+                            use_aten_index=_use_aten_index,
+                        ),
+                        extra_check=lambda match, promote_gate=_promote_gate: (
+                            _valid_semantic_gated_updates(
+                                match,
+                                promote_gate=promote_gate,
+                            )
+                        ),
+                        pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
+                    )(_replace_semantic_ffn_gated_updates)
 
 
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
@@ -314,7 +245,7 @@ def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold normalized NVFP4 SwiGLU FFNs after ordinary NVFP4 rewriting."""
+    """Fold semantic gate/value FFNs before ordinary NVFP4 normalization."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
@@ -328,6 +259,8 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     __file__,
                     _bias.__file__,
                     _core.__file__,
+                    _preparation.__file__,
+                    _compile_validation.__file__,
                     ffn_backend.__file__,
                     nvfp4_compile_fx.__file__,
                     nvfp4_validation.__file__,
@@ -347,10 +280,10 @@ compile_pass = _CompilePass()
 def nvfp4_swiglu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Install chunked FFN folding immediately after ordinary NVFP4 folding."""
+    """Install semantic FFN folding before ordinary NVFP4 folding."""
     return preparation_sharing.add_ordered_post_grad_passes(
         options,
-        (nvfp4_compile.compile_pass, compile_pass),
+        (compile_pass, nvfp4_compile.compile_pass),
     )
 
 

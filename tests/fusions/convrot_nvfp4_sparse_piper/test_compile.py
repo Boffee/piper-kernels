@@ -42,6 +42,7 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
     compile_pass as convrot_nvfp4_compile_pass,
 )
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from ..nvfp4_sparse_piper.test_compile import (
@@ -123,8 +124,12 @@ def test_compile_options_compose_with_convrot_nvfp4_ffn(sparse_first: bool) -> N
 
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
-    assert passes[0] is convrot_nvfp4_compile_pass
-    assert set(passes[1:]) == {fusion_compile_pass, ffn_compile_pass}
+    assert passes == (
+        ffn_compile_pass,
+        nvfp4_compile_pass,
+        convrot_nvfp4_compile_pass,
+        fusion_compile_pass,
+    )
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])

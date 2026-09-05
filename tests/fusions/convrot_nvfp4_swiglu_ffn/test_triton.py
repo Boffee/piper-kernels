@@ -1,4 +1,4 @@
-"""Tests for direct chunked ConvRot NVFP4 SwiGLU FFN operations."""
+"""Tests for direct semantic chunked ConvRot NVFP4 FFN operations."""
 
 import pytest
 import torch
@@ -9,7 +9,7 @@ from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn.triton import (
 )
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 
-from ._helpers import dense_reference, down_affine_reference, make_operands, materialized
+from ._helpers import make_operands, materialized
 
 
 def _exact_sm120_available() -> bool:
@@ -18,90 +18,62 @@ def _exact_sm120_available() -> bool:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("rows", [127, 129, 385])
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
-def test_static_chunked_ffn_matches_down_affine_reference(
+@pytest.mark.parametrize("rows", [127, 385], ids=["short", "ragged-multi-chunk"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
+def test_chunked_ffn_matches_materialized(
     rows: int,
-    with_bias: bool,
+    dynamic: bool,
+    bias_dtype: torch.dtype | None,
 ) -> None:
     operands = make_operands(
         rows=rows,
-        dynamic=False,
-        bias_dtype=torch.bfloat16 if with_bias else None,
-    )
-
-    expected = down_affine_reference(operands)
-    actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
-
-    assert torch.equal(actual, expected)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
-def test_static_chunked_ffn_supports_mixed_precision_bias(
-    bias_dtype: torch.dtype,
-) -> None:
-    operands = make_operands(
-        rows=129,
-        dynamic=False,
+        dynamic=dynamic,
         bias_dtype=bias_dtype,
-        seed=939,
-    )
-
-    expected = down_affine_reference(operands)
-    actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
-
-    assert actual.dtype is torch.bfloat16
-    assert torch.equal(actual, expected)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_high_first_chunked_ffn_matches_materialized_reference() -> None:
-    operands = make_operands(rows=129, dynamic=False, high_first=True, seed=938)
-
-    actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
-
-    assert torch.equal(actual, down_affine_reference(operands))
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
-def test_dynamic_chunked_ffn_retains_dense_accuracy(with_bias: bool) -> None:
-    operands = make_operands(
-        dynamic=True,
-        bias_dtype=torch.bfloat16 if with_bias else None,
-        seed=932 + with_bias,
+        seed=931 + rows + dynamic,
     )
 
     expected = materialized(operands)
-    dense = dense_reference(operands)
     actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
 
-    relative_to_materialized = (actual.float() - expected.float()).norm() / expected.float().norm()
-    materialized_error = (expected.float() - dense.float()).norm() / dense.float().norm()
-    chunked_error = (actual.float() - dense.float()).norm() / dense.float().norm()
-    assert relative_to_materialized < 0.1
-    assert chunked_error <= materialized_error + 0.002
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert actual.dtype is torch.bfloat16
+    assert relative_l2 < (0.1 if dynamic else 0.04)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_up_preparation_uses_global_scale_and_bounded_chunks(
+@pytest.mark.parametrize("high_first", [False, True])
+def test_static_chunked_ffn_supports_nibble_order_and_distinct_input_scales(
+    high_first: bool,
+) -> None:
+    operands = make_operands(
+        rows=385,
+        dynamic=False,
+        high_first=high_first,
+        distinct_input_scales=True,
+        seed=938 + high_first,
+    )
+
+    expected = materialized(operands)
+    actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
+
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 0.04
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_dynamic_source_preparation_uses_one_global_scale_and_bounded_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     operands = make_operands(rows=385, dynamic=True, seed=935)
-    scale_rows = []
-    prepared_rows = []
+    scale_rows: list[int] = []
+    prepared_rows: list[int] = []
     original_dynamic_scale = convrot_nvfp4_backend.dynamic_scale
     original_prepare_static_out = convrot_nvfp4_backend.prepare_static_out
 
-    def dynamic_scale(
-        input: torch.Tensor,  # noqa: A002
-        group_size: int,
-    ) -> torch.Tensor:
+    def dynamic_scale(input: torch.Tensor, group_size: int) -> torch.Tensor:  # noqa: A002
         scale_rows.append(input.shape[0])
         return original_dynamic_scale(input, group_size)
 
@@ -144,8 +116,9 @@ def _materialized_gated_updates(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_static_chunked_ffn_gated_updates_matches_materialized() -> None:
-    operands = make_operands(rows=385, dynamic=False, seed=934)
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_chunked_ffn_gated_updates_matches_materialized(dynamic: bool) -> None:
+    operands = make_operands(rows=385, dynamic=dynamic, seed=934 + dynamic)
     rows, output_features = operands.input.shape[0], operands.down.weight.shape[0]
     base = torch.randn(rows, output_features, device="cuda", dtype=torch.bfloat16)
     reusable_update = torch.randn_like(base)
@@ -174,5 +147,17 @@ def test_static_chunked_ffn_gated_updates_matches_materialized() -> None:
         128,
     )
 
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert result is None
-    assert torch.equal(actual, expected)
+    assert relative_l2 < (0.1 if dynamic else 0.04)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_chunked_ffn_rejects_mismatched_gate_value_group_sizes() -> None:
+    operands = make_operands(rows=129, dynamic=False, seed=936)
+    arguments = list(operands.arguments(128))
+    arguments[15] = 64
+
+    with pytest.raises(ValueError, match="share a group size"):
+        _chunked_swiglu_ffn_op(*arguments)

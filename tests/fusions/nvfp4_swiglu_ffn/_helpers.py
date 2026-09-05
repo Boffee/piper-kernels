@@ -1,4 +1,4 @@
-"""Shared operands and references for NVFP4 SwiGLU FFN tests."""
+"""Shared operands and references for semantic NVFP4 SwiGLU FFN tests."""
 
 from __future__ import annotations
 
@@ -40,13 +40,18 @@ class Linear:
 @dataclass(frozen=True, slots=True)
 class Operands:
     input: torch.Tensor
-    up: Linear
+    gate: Linear
+    value: Linear
     down: Linear
-    dense_up: torch.Tensor
-    dense_down: torch.Tensor
 
     def arguments(self, chunk_rows: int) -> tuple[object, ...]:
-        return self.input, *self.up.arguments(), *self.down.arguments(), chunk_rows
+        return (
+            self.input,
+            *self.gate.arguments(),
+            *self.value.arguments(),
+            *self.down.arguments(),
+            chunk_rows,
+        )
 
 
 def _weight(
@@ -61,88 +66,70 @@ def _weight(
         use_triton_kernel=False,
         use_dynamic_per_tensor_scale=dynamic,
     )
-    weight = TorchAONVFP4Tensor.to_nvfp4(
-        dense,
-        per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
-        act_per_tensor_scale=activation_scale,
-        is_swizzled_scales=True,
-        act_quant_kwargs=quantization,
+    weight = PiperNVFP4Tensor.from_torchao(
+        TorchAONVFP4Tensor.to_nvfp4(
+            dense,
+            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+            act_per_tensor_scale=activation_scale,
+            is_swizzled_scales=True,
+            act_quant_kwargs=quantization,
+        )
     )
-    wrapped = PiperNVFP4Tensor.from_torchao(weight)
     if not high_first:
-        return wrapped
+        return weight
     return PiperNVFP4Tensor(
-        ((wrapped.qdata & 0x0F) << 4) | (wrapped.qdata >> 4),
-        wrapped.scale,
-        wrapped.block_size,
-        wrapped.orig_dtype,
-        wrapped.per_tensor_scale,
-        wrapped.act_per_tensor_scale,
-        wrapped.is_swizzled_scales,
-        wrapped.use_triton_kernel,
-        wrapped.act_quant_kwargs,
+        ((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4),
+        weight.scale,
+        weight.block_size,
+        weight.orig_dtype,
+        weight.per_tensor_scale,
+        weight.act_per_tensor_scale,
+        weight.is_swizzled_scales,
+        weight.use_triton_kernel,
+        weight.act_quant_kwargs,
         high_first=True,
     )
 
 
 def materialized(operands: Operands) -> torch.Tensor:
-    """Run the materialized activation-folded NVFP4 reference."""
-    packed = nvfp4_ops.linear(operands.input, *operands.up.arguments())
-    prepared = nvfp4_ops.prepare_input(
-        packed,
-        operands.down.activation_scale,
-        operands.down.dynamic,
-        "swiglu",
-        operands.down.weight.high_first,
-    )
-    result = nvfp4_ops.linear_prepared(
-        *prepared,
-        operands.down.weight.qdata,
-        operands.down.weight.scale,
-        operands.down.weight.per_tensor_scale,
-        operands.down.bias,
-        operands.input.dtype,
-    )
-    return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
+    """Run separate projections with the fused path's affine precision semantics."""
+
+    def project(linear: Linear) -> torch.Tensor:
+        if linear.bias is None or linear.bias.dtype is operands.input.dtype:
+            return precise_linear(operands.input, linear)
+        return nvfp4_ops.linear(operands.input, *linear.arguments())
+
+    gate = project(operands.gate)
+    value = project(operands.value)
+    return nvfp4_ops.linear(value * F.silu(gate), *operands.down.arguments())
 
 
-def down_affine_reference(operands: Operands) -> torch.Tensor:
-    """Run the materialized reference with the down affine in its FP32 accumulator."""
-    packed = nvfp4_ops.linear(operands.input, *operands.up.arguments())
-    input_qdata, input_scale, input_per_tensor_scale = nvfp4_ops.prepare_input(
-        packed,
-        operands.down.activation_scale,
-        operands.down.dynamic,
-        "swiglu",
-        operands.down.weight.high_first,
+def precise_linear(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
+    """Reference affine accumulation in FP32 using the represented NVFP4 operands."""
+    qdata, scale, global_scale = nvfp4_ops._prepare_compiled(
+        input,
+        linear.activation_scale,
+        linear.dynamic,
+        high_first=linear.weight.high_first,
     )
-    weight_per_tensor_scale = operands.down.weight.per_tensor_scale
-    assert weight_per_tensor_scale is not None
-    scaling_type = F.ScalingType
-    swizzle_type = F.SwizzleType
-    bias = operands.down.bias
-    fused_bias = bias if bias is None or bias.dtype is operands.input.dtype else None
-    result = F.scaled_mm(
-        input_qdata.view(torch.float4_e2m1fn_x2),
-        operands.down.weight.qdata.t().view(torch.float4_e2m1fn_x2),
-        [input_scale.view(torch.float8_e4m3fn), input_per_tensor_scale],
-        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
-        [operands.down.weight.scale.view(torch.float8_e4m3fn), weight_per_tensor_scale],
-        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
-        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        bias=fused_bias,
-        output_dtype=operands.input.dtype,
+    prepared = PiperNVFP4Tensor(
+        qdata,
+        scale,
+        16,
+        input.dtype,
+        global_scale,
+        is_swizzled_scales=True,
+        high_first=linear.weight.high_first,
     )
-    if bias is not None and fused_bias is None:
-        result = (result.float() + bias.float()).to(result.dtype)
-    return result.reshape(*operands.input.shape[:-1], operands.down.weight.shape[0])
-
-
-def dense_reference(operands: Operands) -> torch.Tensor:
-    packed = F.linear(operands.input, operands.dense_up, operands.up.bias)
-    up, gate = packed.chunk(2, dim=-1)
-    return F.linear(up * F.silu(gate), operands.dense_down, operands.down.bias)
+    return (
+        F.linear(
+            prepared.dequantize(torch.float32),
+            linear.weight.dequantize(torch.float32),
+            None if linear.bias is None else linear.bias.float(),
+        )
+        .to(input.dtype)
+        .reshape(*input.shape[:-1], linear.weight.shape[0])
+    )
 
 
 def make_operands(
@@ -154,53 +141,44 @@ def make_operands(
     dynamic: bool,
     bias_dtype: torch.dtype | None = torch.bfloat16,
     high_first: bool = False,
-    seed: int = 901,
+    distinct_input_scales: bool = False,
+    seed: int = 951,
 ) -> Operands:
     torch.manual_seed(seed)
     input = torch.randn(rows, input_features, device="cuda", dtype=torch.bfloat16)  # noqa: A001
-    dense_up = torch.randn(
-        2 * intermediate_features,
+    gate_dense = torch.randn(
+        intermediate_features,
         input_features,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    dense_down = torch.randn(
+    value_dense = torch.randn_like(gate_dense)
+    down_dense = torch.randn(
         output_features,
         intermediate_features,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    up_bias = (
-        torch.randn(2 * intermediate_features, device="cuda", dtype=bias_dtype)
-        if bias_dtype is not None
-        else None
+    input_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
+    value_scale = (
+        input_scale * 0.875 if distinct_input_scales and input_scale is not None else input_scale
     )
-    down_bias = (
-        torch.randn(output_features, device="cuda", dtype=bias_dtype)
-        if bias_dtype is not None
-        else None
+
+    def make_linear(dense: torch.Tensor, scale: torch.Tensor | None) -> Linear:
+        bias = (
+            torch.randn(dense.shape[0], device="cuda", dtype=bias_dtype)
+            if bias_dtype is not None
+            else None
+        )
+        return Linear(_weight(dense, scale, dynamic, high_first), scale, bias, dynamic)
+
+    gate = make_linear(gate_dense, input_scale)
+    value = make_linear(value_dense, value_scale)
+    activated = nvfp4_ops.linear(input, *value.arguments()) * F.silu(
+        nvfp4_ops.linear(input, *gate.arguments())
     )
-    up_activation_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
-    up_weight = _weight(dense_up, up_activation_scale, dynamic, high_first)
-    up = Linear(up_weight, up_activation_scale, up_bias, dynamic)
-    packed = nvfp4_ops.linear(input, *up.arguments())
-    packed_up, packed_gate = packed.chunk(2, dim=-1)
-    activated = packed_up * F.silu(packed_gate)
-    down_activation_scale = None if dynamic else per_tensor_amax_to_scale(activated.abs().amax())
-    down = Linear(
-        _weight(dense_down, down_activation_scale, dynamic, high_first),
-        down_activation_scale,
-        down_bias,
-        dynamic,
-    )
-    return Operands(input, up, down, dense_up, dense_down)
+    down_scale = None if dynamic else per_tensor_amax_to_scale(activated.abs().amax())
+    return Operands(input, gate, value, make_linear(down_dense, down_scale))
 
 
-__all__ = [
-    "Linear",
-    "Operands",
-    "dense_reference",
-    "down_affine_reference",
-    "make_operands",
-    "materialized",
-]
+__all__ = ["Linear", "Operands", "make_operands", "materialized"]

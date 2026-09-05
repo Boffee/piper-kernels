@@ -44,7 +44,7 @@ def _operator_returns_fresh_tensor(node: torch.fx.Node) -> bool:
 
 
 def valid_gated_updates(match: Match, valid_ffn: FfnValidator) -> bool:
-    """Validate H3 gated updates and prove their intermediate safe to reuse."""
+    """Validate indexed gated updates and prove their intermediate safe to reuse."""
     if not valid_ffn(match):
         return False
     input_value = _metadata(match, "ffn_input")

@@ -5,6 +5,25 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Redesigned ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU FFN fusion around separate
+  gate and value projections followed by `silu(gate) * value` and a down projection.
+  Compiler matching is architecture-independent and retains bounded workspaces and compatible
+  indexed gated updates. Compatible standard/ConvRot NVFP4 source and down projections can mix.
+- Replaced the old packed-projection FFN schemas and compiler patterns without backward
+  compatibility. Callers must expose separate gate/value linears to use the new fusion;
+  ordinary SwiGLU activation preparation remains supported. Removed unused packed-projection
+  affine preparation helpers.
+- Shared one INT8 GEMM launch between independent gate/value weights without packing or copying
+  them. NVFP4 source projections reuse affine GEMMs where bias precision permits, and dynamic
+  SwiGLU scale reduction runs as a compiled FP32 operation.
+
+### Fixed
+
+- Match NVFP4 FFN projections by their complete operands so shared weights do not conflate
+  distinct biases or quantization scales.
+
 ## [0.7.0rc5] - 2026-09-04
 
 ### Added

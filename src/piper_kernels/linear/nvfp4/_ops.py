@@ -98,8 +98,6 @@ def _compiled_prepare_dynamic(
             input,
             per_tensor_scale,
             swiglu=False,
-            source_global_scale=None,
-            source_bias=None,
             high_first=high_first,
         )
         return qdata, scale, per_tensor_scale
