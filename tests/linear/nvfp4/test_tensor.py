@@ -13,6 +13,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor, nvfp4_compile_options
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 
 
 def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
@@ -238,6 +239,7 @@ def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize(
     "bias_dtype",
     [None, torch.float16, torch.bfloat16, torch.float32],
@@ -247,10 +249,12 @@ def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_cuda_semantic_linear_matches_torchao(
+def test_cuda_semantic_linear_matches_portable_reference(
     dynamic: bool,
+    compiled: bool,
     bias_dtype: torch.dtype | None,
 ) -> None:
+    torch._dynamo.reset()
     torch.manual_seed(417)
     input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
@@ -265,10 +269,23 @@ def test_cuda_semantic_linear_matches_torchao(
     piper_weight = PiperNVFP4Tensor.from_torchao(torchao_weight)
     bias = torch.randn(128, device="cuda", dtype=bias_dtype) if bias_dtype is not None else None
 
-    expected = F.linear(input, torchao_weight, bias)
-    actual = F.linear(input, piper_weight, bias)
+    expected = nvfp4_reference.linear(
+        input,
+        piper_weight.qdata,
+        piper_weight.scale,
+        piper_weight.per_tensor_scale,
+        activation_scale,
+        bias,
+        dynamic,
+    )
+    run = torch.compile(F.linear, fullgraph=True) if compiled else F.linear
+    actual = run(input, piper_weight, bias)
 
-    assert torch.equal(actual, expected)
+    # Portable division and optimized reciprocal arithmetic can choose adjacent
+    # activation codes at FP4 boundaries. Prepared GEMM precision is tested separately.
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 0.02
+    assert torch.equal(actual, F.linear(input, piper_weight, bias))
     assert torch.ops.piper_kernels.nvfp4_linear.default is not None
 
 

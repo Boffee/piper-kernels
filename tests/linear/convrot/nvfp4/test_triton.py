@@ -15,10 +15,11 @@ def _exact_sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
-def _materialized_reference(
+def _materialized_optimized_preparation(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compare fused preparation with separate optimized rotation and packing."""
     flattened = input.reshape(-1, input.shape[-1]).contiguous()
     rotated = torch.empty_like(flattened)
     convrot_backend.rotate_input(
@@ -76,7 +77,7 @@ def test_dynamic_preparation_matches_materialized_rotation_exactly(
         dtype=dtype,
     )
 
-    expected = _materialized_reference(input, group_size)
+    expected = _materialized_optimized_preparation(input, group_size)
     actual = convrot_nvfp4.prepare_dynamic(input, group_size)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
@@ -94,7 +95,7 @@ def test_padded_chunks_match_materialized_rotation_exactly(input_features: int) 
         dtype=torch.bfloat16,
     )
 
-    expected = _materialized_reference(input, 16)
+    expected = _materialized_optimized_preparation(input, 16)
     actual = convrot_nvfp4.prepare_dynamic(input, 16)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
@@ -154,7 +155,7 @@ def test_dynamic_preparation_preserves_noncontiguous_logical_order() -> None:
     ).transpose(0, 1)
     assert not input.is_contiguous()
 
-    expected = _materialized_reference(input, 16)
+    expected = _materialized_optimized_preparation(input, 16)
     actual = convrot_nvfp4.prepare_dynamic(input, 16)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
@@ -163,10 +164,10 @@ def test_dynamic_preparation_preserves_noncontiguous_logical_order() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_dynamic_preparation_matches_zero_input_reference() -> None:
+def test_dynamic_preparation_matches_materialized_zero_input() -> None:
     input = torch.zeros((130, 256), device="cuda", dtype=torch.bfloat16)  # noqa: A001
 
-    expected = _materialized_reference(input, 16)
+    expected = _materialized_optimized_preparation(input, 16)
     actual = convrot_nvfp4.prepare_dynamic(input, 16)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
@@ -203,7 +204,7 @@ def test_dynamic_preparation_runs_existing_nvfp4_gemm() -> None:
     )
 
     expected = nvfp4_ops._execute_prepared(
-        *_materialized_reference(input, 16),
+        *_materialized_optimized_preparation(input, 16),
         weight_qdata,
         weight_scale,
         weight_per_tensor_scale,

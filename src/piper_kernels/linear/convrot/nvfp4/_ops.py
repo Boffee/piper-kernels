@@ -9,6 +9,7 @@ from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 
 from . import triton as convrot_nvfp4
 
@@ -21,6 +22,15 @@ def _prepare_input(
     activation_fn: str | None = None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if input.numel() == 0:
+        return nvfp4_reference.prepare_input(
+            input,
+            activation_per_tensor_scale,
+            dynamic_activation_scale,
+            activation_fn,
+            high_first,
+            group_size=group_size,
+        )
     if dynamic_activation_scale:
         return convrot_nvfp4.prepare_dynamic(
             input,
@@ -62,6 +72,7 @@ def linear(
         bias,
         dynamic_activation_scale,
         "ConvRot NVFP4 linear",
+        allow_empty=True,
     )
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("ConvRot NVFP4 linear input must be FP16 or BF16")
@@ -70,6 +81,9 @@ def linear(
             f"ConvRot NVFP4 input features {shape.input_features} must be divisible "
             f"by group size {group_size}"
         )
+
+    if shape.rows == 0:
+        return input.new_empty((*input.shape[:-1], shape.output_features))
 
     input_qdata, input_scale, input_per_tensor_scale = _prepare_input(
         input,

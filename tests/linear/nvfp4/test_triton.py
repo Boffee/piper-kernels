@@ -1,4 +1,4 @@
-"""Tests for direct NVFP4 Triton preparation."""
+"""Tests for direct NVFP4 preparation and projection epilogues."""
 
 import pytest
 import torch
@@ -7,6 +7,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
+from piper_kernels.linear.nvfp4 import _layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
@@ -38,7 +39,7 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
 @pytest.mark.parametrize("rows", [127, 128, 129])
 @pytest.mark.parametrize("activation_fn", [None, "swiglu"])
 @pytest.mark.parametrize("high_first", [False, True])
-def test_static_preparation_matches_portable_decomposition(
+def test_static_preparation_matches_compiled_decomposition(
     rows: int,
     activation_fn: str | None,
     high_first: bool,
@@ -167,34 +168,104 @@ def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> No
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
-def test_projection_epilogue_matches_portable_decomposition(
-    with_bias: bool,
+def test_add_bias_out_matches_pytorch(
+    bias_dtype: torch.dtype,
+    output_dtype: torch.dtype,
     strided: bool,
 ) -> None:
     torch.manual_seed(503)
     raw = (
-        torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)[:, :80]
+        torch.randn(129, 160, device="cuda", dtype=torch.float32)[:, :80]
         if strided
-        else torch.randn(129, 80, device="cuda", dtype=torch.bfloat16)
+        else torch.randn(129, 80, device="cuda", dtype=torch.float32)
     )
-    global_scale = torch.tensor(0.01, device="cuda", dtype=torch.float32)
-    bias = torch.randn(80, device="cuda", dtype=torch.bfloat16) if with_bias else None
-    expected = (
-        nvfp4_ops._compiled_scale_result(raw, global_scale)
-        if bias is None
-        else nvfp4_ops._compiled_scale_result_and_add_bias(raw, global_scale, bias)
-    )
-    actual = (
-        torch.empty((129, 160), device="cuda", dtype=torch.bfloat16)[:, :80]
+    bias = (
+        torch.randn(160, device="cuda", dtype=bias_dtype)[::2]
         if strided
-        else torch.empty_like(raw)
+        else torch.randn(80, device="cuda", dtype=bias_dtype)
     )
+    expected = raw + bias.float()
+    if output_dtype is torch.float32:
+        actual = raw
+    else:
+        actual = (
+            torch.empty((129, 160), device="cuda", dtype=output_dtype)[:, :80]
+            if strided
+            else torch.empty_like(raw, dtype=output_dtype)
+        )
 
-    nvfp4_triton.apply_projection_epilogue(raw, global_scale, bias, actual)
+    nvfp4_triton.add_bias_out(raw, bias, actual)
 
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected.to(output_dtype))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("two_level", [False, True])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16])
+def test_prepared_linear_bounds_workspace(
+    bias_dtype: torch.dtype | None,
+    two_level: bool,
+    output_dtype: torch.dtype,
+) -> None:
+    rows, features, outputs = 8192, 256, 8192
+    # Each packed 0x22 byte represents two ones, so the raw GEMM result is features.
+    input_qdata = torch.full((rows, features // 2), 0x22, device="cuda", dtype=torch.uint8)
+    weight_qdata = torch.full((outputs, features // 2), 0x22, device="cuda", dtype=torch.uint8)
+    input_scale = torch.ones(_layout.scale_shape(rows, features), device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.ones(_layout.scale_shape(outputs, features), device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    input_global = torch.tensor(1 / 16, device="cuda")
+    weight_global = torch.tensor(1 / 8, device="cuda") if two_level else None
+    bias = torch.ones(outputs, device="cuda", dtype=bias_dtype) if bias_dtype is not None else None
+    operands = (
+        input_qdata,
+        input_scale,
+        input_global,
+        weight_qdata,
+        weight_scale,
+        weight_global,
+        bias,
+        output_dtype,
+    )
+    warm = nvfp4_ops._execute_prepared(*operands)
+    torch.cuda.synchronize()
+    del warm
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    actual = nvfp4_ops._execute_prepared(*operands)
+    torch.cuda.synchronize()
+
+    peak = torch.cuda.max_memory_allocated() - baseline
+    # Above the 128 MiB output, mixed bias gets at most 32 MiB of FP32 row workspace.
+    mixed_bias = bias_dtype is not None and bias_dtype is not output_dtype
+    workspace_limit = (33 if mixed_bias else 1) * 1024 * 1024
+    assert peak < actual.numel() * actual.element_size() + workspace_limit
+    expected_value = features / 16 * (1 / 8 if two_level else 1) + (bias is not None)
+    assert (actual == expected_value).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_inplace_bias_addition_crosses_int32_element_boundary() -> None:
+    if torch.cuda.mem_get_info()[0] < 5 * 1024**3:
+        pytest.skip("requires 5 GiB of free CUDA memory")
+    features = 4096
+    rows = 2**31 // features + 1
+    raw = torch.full((rows, features), 4.0, device="cuda", dtype=torch.bfloat16)
+    bias = torch.ones(features, device="cuda", dtype=torch.bfloat16)
+
+    nvfp4_triton.add_bias_out(raw, bias, raw)
+
+    assert (raw[[0, rows - 2, rows - 1]] == 5.0).all()
 
 
 @pytest.mark.gpu

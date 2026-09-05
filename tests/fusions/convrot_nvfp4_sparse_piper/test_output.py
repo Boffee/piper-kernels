@@ -17,6 +17,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import output
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference
 
 from ..nvfp4_sparse_piper.test_output import _arguments as standard_arguments
 
@@ -65,22 +66,16 @@ def _arguments(
         None,
         False,
     )
-    assert weight.per_tensor_scale is not None
-    fused_bias = bias if bias.dtype is torch.bfloat16 else None
-    expected = F.scaled_mm(
-        input_qdata.view(torch.float4_e2m1fn_x2),
-        weight.qdata.t().view(torch.float4_e2m1fn_x2),
-        [input_scale.view(torch.float8_e4m3fn), input_per_tensor_scale],
-        [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-        [weight.scale.view(torch.float8_e4m3fn), weight.per_tensor_scale],
-        [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-        [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-        [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-        bias=fused_bias,
-        output_dtype=torch.bfloat16,
+    expected = reference.linear_prepared(
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight.qdata,
+        weight.scale,
+        weight.per_tensor_scale,
+        bias,
+        torch.bfloat16,
     )
-    if fused_bias is None:
-        expected = (expected.float() + bias.float()).to(expected.dtype)
     expected = expected.reshape(1, sequence_length, _OUTPUT_FEATURES)
     return (
         *attention_arguments,
@@ -281,7 +276,8 @@ def test_attention_output_matches_materialized_convrot_linear(
     with torch.no_grad():
         actual = output._attention_output_op(*arguments, chunk_rows)
 
-    assert torch.equal(actual, expected)
+    # GEMM can fuse FP32 multiply-add where the PyTorch reference rounds separately.
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.gpu
@@ -296,7 +292,7 @@ def test_attention_output_supports_mixed_precision_bias(
         actual = output._attention_output_op(*arguments, 128)
 
     assert actual.dtype is torch.bfloat16
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.gpu
@@ -315,7 +311,7 @@ def test_high_first_attention_output_matches_low_first() -> None:
             high_first=True,
         )
 
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.gpu
@@ -340,15 +336,16 @@ def test_attention_output_supports_bounded_attention_features(
     torch.testing.assert_close(
         actual[:, valid_rows.flatten()],
         expected[:, valid_rows.flatten()],
-        atol=0,
-        rtol=0,
+        atol=1e-5,
+        rtol=2**-7,
     )
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_attention_output_projects_a_bounded_coarse_gate() -> None:
-    arguments, expected = _projected_gate_arguments(1_024, _GROUP_SIZE)
+@pytest.mark.parametrize("sequence_length", [384, 1_024])
+def test_attention_output_projects_a_bounded_coarse_gate(sequence_length: int) -> None:
+    arguments, expected = _projected_gate_arguments(sequence_length, _GROUP_SIZE)
 
     with torch.no_grad():
         actual = output._attention_output_op(*arguments)

@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
 import torch
-from torch.types import Number
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -25,8 +24,6 @@ from piper_kernels.linear.nvfp4.tensor import (
     _quantize_hp,
     supports_semantic_linear,
 )
-
-from . import _ops, _update
 
 
 class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
@@ -279,54 +276,9 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """Recover the logical weight in the unrotated basis."""
         return rotate_groups(super().dequantize(output_dtype), self.group_size)
 
-    def addmm_(
-        self,
-        mat1: torch.Tensor,
-        mat2: torch.Tensor,
-        *,
-        beta: int | float | complex = 1,
-        alpha: int | float | complex = 1,
-        rounding_seed: int | None = None,
-    ) -> ConvRotNVFP4Tensor:
-        """Update and requantize in place, optionally using stochastic rounding.
-
-        ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
-        makes terminal E2M1 code selection reproducible for a fixed device and
-        backend without consuming the process-global random-number generator.
-        """
-        if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
-            raise TypeError("ConvRot NVFP4 addmm_ matrices must be tensors")
-        _update.addmm_(
-            self,
-            self.group_size,
-            mat1,
-            mat2,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
-        )
-        return self
-
-    def add_(
-        self,
-        other: object,
-        *,
-        alpha: Number | complex | None = 1,
-        rounding_seed: int | None = None,
-    ) -> ConvRotNVFP4Tensor:
-        """Add a dense logical update and requantize in place."""
-        if not isinstance(other, torch.Tensor):
-            raise TypeError("ConvRot NVFP4 add_ update must be a tensor")
-        if alpha is None:
-            raise TypeError("ConvRot NVFP4 add_ alpha must be a real number, got None")
-        _update.add_(
-            self,
-            self.group_size,
-            other,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
-        )
-        return self
+    def _update_group_size(self) -> int:
+        """Merge updates in this weight's stored ConvRot basis."""
+        return self.group_size
 
 
 def _supports_convrot_linear(input: object, weight: ConvRotNVFP4Tensor) -> bool:  # noqa: A002
@@ -360,6 +312,8 @@ def convrot_nvfp4_linear(
         raise ValueError("ConvRot NVFP4 linear requires canonical SM120 NVFP4 operands")
     quantization = weight.act_quant_kwargs
     assert quantization is not None
+    from . import _ops  # noqa: PLC0415
+
     return _ops.linear(
         converted_input,
         weight.qdata,
@@ -391,52 +345,6 @@ def _convrot_nvfp4_linear_dispatch(
             f"ConvRot NVFP4 linear bias must be a tensor or None, got {type(bias).__name__}"
         )
     return convrot_nvfp4_linear(input, weight, bias)
-
-
-@ConvRotNVFP4Tensor.implements(torch.ops.aten.addmm_.default)
-def _convrot_nvfp4_addmm_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> ConvRotNVFP4Tensor:
-    weight, mat1, mat2 = args
-    if not isinstance(weight, ConvRotNVFP4Tensor):
-        raise TypeError(
-            f"ConvRot NVFP4 addmm_ weight must be ConvRotNVFP4Tensor, got {type(weight)}"
-        )
-    if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
-        raise TypeError("ConvRot NVFP4 addmm_ matrices must be tensors")
-    _update.addmm_(
-        weight,
-        weight.group_size,
-        mat1,
-        mat2,
-        beta=kwargs.get("beta", 1),
-        alpha=kwargs.get("alpha", 1),
-    )
-    return weight
-
-
-@ConvRotNVFP4Tensor.implements(torch.ops.aten.add_.Tensor)
-def _convrot_nvfp4_add_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> ConvRotNVFP4Tensor:
-    weight, update = args
-    if not isinstance(weight, ConvRotNVFP4Tensor):
-        raise TypeError(f"ConvRot NVFP4 add_ weight must be ConvRotNVFP4Tensor, got {type(weight)}")
-    if not isinstance(update, torch.Tensor):
-        raise TypeError("ConvRot NVFP4 add_ update must be a tensor")
-    _update.add_(
-        weight,
-        weight.group_size,
-        update,
-        alpha=kwargs.get("alpha", 1),
-    )
-    return weight
 
 
 __all__ = ["ConvRotNVFP4Tensor", "convrot_nvfp4_linear"]

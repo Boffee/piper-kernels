@@ -9,7 +9,6 @@ import torch
 
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.nvfp4 import _layout, _projection, _validation
-from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 from . import query as query_projection
 
@@ -43,20 +42,17 @@ class PreparedGateProjection:
     def project(self, output: torch.Tensor, start: int, rows: int) -> None:
         """Project one sequence window into caller-owned token-major gate storage."""
         output_chunk = output[0, :rows].reshape(rows, self.weight_qdata.shape[0])
-        projected = _projection.matmul_prepared_chunk_out(
+        _projection.matmul_prepared_chunk_affine_out(
             self.input_qdata,
             self.input_scale,
+            self.global_scale,
             self.weight_qdata,
             self.weight_scale,
+            None,
+            self.bias,
             start,
             start + rows,
             output_chunk,
-        )
-        nvfp4_backend.apply_projection_epilogue(
-            projected,
-            self.global_scale,
-            self.bias,
-            projected,
         )
 
 
@@ -229,35 +225,18 @@ def _project_attention_chunk(  # noqa: PLR0913, PLR0917
             (prepared_input, prepared_scale),
         )
         output_chunk = output[batch_index, start : start + rows]
-        if weight_per_tensor_scale is not None:
-            _projection.matmul_prepared_chunk_affine_out(
-                input_qdata,
-                input_scale,
-                activation_per_tensor_scale,
-                weight_qdata,
-                weight_scale,
-                weight_per_tensor_scale,
-                bias,
-                0,
-                rows,
-                output_chunk,
-            )
-        else:
-            projected = _projection.matmul_prepared_chunk_out(
-                input_qdata,
-                input_scale,
-                weight_qdata,
-                weight_scale,
-                0,
-                rows,
-                output_chunk,
-            )
-            nvfp4_backend.apply_projection_epilogue(
-                projected,
-                activation_per_tensor_scale,
-                bias,
-                projected,
-            )
+        _projection.matmul_prepared_chunk_affine_out(
+            input_qdata,
+            input_scale,
+            activation_per_tensor_scale,
+            weight_qdata,
+            weight_scale,
+            weight_per_tensor_scale,
+            bias,
+            0,
+            rows,
+            output_chunk,
+        )
 
 
 def _prepare_output_chunk_projector(
@@ -392,6 +371,9 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
+        # PyTorch 2.13 stages NVFP4 GEMM alpha in a shared device scalar.
+        # Keep affine GEMMs ordered while attention runs on the producer stream.
+        share_projection_stream=True,
     )
 
 
@@ -502,6 +484,7 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
+        share_projection_stream=True,
     )
 
 

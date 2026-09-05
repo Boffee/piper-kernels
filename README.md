@@ -230,6 +230,51 @@ quantization in one package-owned operation and prevents callers from accidental
 logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported from
 `piper_kernels.linear.convrot` for format-policy validation.
 
+Supported eager and compiled NVFP4 linears share the same prepared projection backend,
+including ConvRot and the affine projections used by fused SwiGLU FFNs and sparse attention.
+Global scales and bias are applied in FP32 before the final FP16/BF16 output conversion.
+No-bias and matching-dtype-bias projections fuse this epilogue into GEMM. Mixed bias retains
+its dtype until FP32 addition and uses a reusable FP32 workspace bounded by 32 MiB or one
+128-row scale block, whichever is larger. This avoids a full-size FP32 FFN intermediate,
+although small mixed-bias projections can be slower. FP32 outputs reuse their output buffer
+for bias addition. Autocast converts eligible operands at the public linear boundary.
+
+PyTorch 2.13's native two-level NVFP4 GEMM uses a
+[shared device scalar for scaling](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/cuda/detail/BLASConstants.cu#L36), so
+independent affine NVFP4 calls must not run concurrently on different CUDA streams.
+Sparse-attention fusions order gate and output GEMMs on one projection stream while
+overlapping attention on another stream.
+
+`piper_kernels.linear.nvfp4.reference` provides independent PyTorch-only activation preparation,
+prepared projections, and ordinary/ConvRot projections. It does not invoke the optimized
+preparation or GEMM operators. Its portable quantization can choose neighboring FP8 block scales
+or FP4 values at rounding boundaries compared with the optimized quantizer; prepared-projection
+tests separately check affine precision using identical packed operands.
+
+Both NVFP4 wrappers support in-place adapter merges:
+
+```python
+weight.add_(dense_update, alpha=adapter_strength, rounding_seed=seed)
+rotated_weight.addmm_(lora_b, lora_a, alpha=lora_strength, rounding_seed=seed)
+```
+
+On NVIDIA compute capability 10.0 or newer with Triton installed, these updates fuse
+dequantization, optional ConvRot rotation, merging, and NVFP4 packing in tiles. `addmm_`
+accumulates the matrix product in FP32 without allocating a dense product. Stochastic E2M1
+rounding runs in registers during packing and requires no per-element temporary tensors.
+Two-level weight scaling uses a read-only tile-amax pass, a small reduction, and a second pass
+that recomputes and packs each tile into the existing buffers. One-level scaling needs only the
+packing pass. Other devices use the portable PyTorch implementation.
+
+Updates preserve the wrapper, packed data, block scales, global-scale buffer, activation
+calibration, and packed-pair order. `add_` requires an exact-shape dense update; both operations
+require inputs matching the weight's logical dtype and device and do not support autograd.
+An unsigned 64-bit `rounding_seed` enables reproducible stochastic rounding without consuming
+the global RNG or changing scale selection. Omit it for nearest rounding. Kernel reduction
+orders and random samples can differ from the PyTorch backend. Standard signatures support
+`torch.compile`; the `add_` seed extension is intended for eager updates. Repeated requantization
+is lossy, so restore pristine weights before replacing or removing an adapter.
+
 ### Packed GGUF weights
 
 Both ConvRot formats accept a two-dimensional tensor of packed GGUF bytes. Pass the GGML

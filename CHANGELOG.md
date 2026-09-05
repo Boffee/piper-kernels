@@ -7,6 +7,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added `add_` and `addmm_` adapter merges to plain `PiperNVFP4Tensor`, sharing validation,
+  rounding, and packed-storage mutation behavior with ConvRot NVFP4.
+- Added fused Triton updates for plain and ConvRot NVFP4 on NVIDIA compute capability 10.0+.
+  Rotation, dequantization, FP32 matrix-product accumulation, merging, scale selection, and
+  stochastic E2M1 packing run in tiles without full-size weight or product intermediates.
+  Two-level scaling recomputes tiles after reducing their maxima; stochastic rounding adds no
+  per-element workspace. Existing storage identities and activation calibration are preserved.
+- Added independent PyTorch-only NVFP4 activation preparation and FP32 affine projection
+  references, also used by the ordinary and ConvRot NVFP4 FFN correctness tests.
+
 - Added a modular Linux ROCm backend for base ConvRot INT8 preparation, linear and
   prepared/paired projections, dense and low-rank updates, and compiler preparation sharing.
   RX 9070 XT (`gfx1201`) has on-device validation; `gfx942`, `gfx1100`, `gfx1151`, and
@@ -16,6 +26,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Unified supported eager/compiled NVFP4, ConvRot NVFP4, FFN and sparse-attention affine
+  projections. Compatible scale/bias epilogues run inside GEMM; mixed bias retains its precision
+  through FP32 accumulation and addition in bounded row workspaces before the final output cast.
+  This removes early BF16 rounding and changes results relative to the former TorchAO eager path.
+  Mixed-bias workspaces are bounded by 32 MiB or one 128-row scale block; small mixed-bias
+  projections can trade latency for the improved precision.
 - Shared base INT8 preparation and weight updates independently of tuned matrix support.
   AMD and NVIDIA use the same update launchers; standalone preparation and updates can
   use a generic Triton path or PyTorch fallback without an architecture allowlist.
@@ -50,6 +66,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Return correctly shaped empty outputs for plain and ConvRot NVFP4 linears, including
+  static/dynamic activation scales and compiled preparation/projection paths.
+- Avoid a second full-size NVFP4 output allocation for scaling/bias, including supported eager
+  linears that previously delegated to TorchAO. FP16 projections no longer need a full BF16
+  intermediate, and FFN gate/value/down projections share the same mixed-bias behavior.
+- Compute NVFP4 projection epilogue offsets in 64 bits before multiplication so outputs larger
+  than 2^31 elements do not overflow their indices.
+- Honor noncontiguous bias strides in both native NVFP4 GEMM and mixed-bias addition.
+- Order sparse-attention gate and output NVFP4 GEMMs on one projection stream to avoid
+  concurrent scaling-buffer overwrites in PyTorch 2.13. Attention still overlaps projection.
 - Match NVFP4 FFN projections by their complete operands so shared weights do not conflate
   distinct biases or quantization scales.
 

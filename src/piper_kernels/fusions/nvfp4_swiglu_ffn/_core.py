@@ -13,10 +13,8 @@ from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
-from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 DEFAULT_CHUNK_ROWS = 1_536
-_SCALE_ROW_BLOCK = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,34 +122,6 @@ def linear_operands(  # noqa: PLR0913, PLR0917 - explicit custom-op projection o
     )
 
 
-def _project_chunk_out(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    linear: LinearOperands,
-    start: int,
-    stop: int,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    return nvfp4_projection.matmul_prepared_chunk_out(
-        input_qdata,
-        input_scale,
-        linear.weight_qdata,
-        linear.weight_scale,
-        start,
-        stop,
-        output,
-    )
-
-
-def _projection_global_scale(
-    input_per_tensor_scale: torch.Tensor,
-    weight_per_tensor_scale: torch.Tensor | None,
-) -> torch.Tensor:
-    if weight_per_tensor_scale is None:
-        return input_per_tensor_scale
-    return input_per_tensor_scale * weight_per_tensor_scale
-
-
 def _same_tensor_storage(left: torch.Tensor | None, right: torch.Tensor | None) -> bool:
     if left is None or right is None:
         return left is right
@@ -197,8 +167,8 @@ def _validate_inputs(
     if (
         isinstance(chunk_rows, bool)
         or not isinstance(chunk_rows, int)
-        or chunk_rows < _SCALE_ROW_BLOCK
-        or chunk_rows % _SCALE_ROW_BLOCK
+        or chunk_rows < nvfp4_layout.SCALE_ROW_TILE
+        or chunk_rows % nvfp4_layout.SCALE_ROW_TILE
     ):
         raise ValueError("NVFP4 FFN chunk_rows must be a positive multiple of 128")
     if gate.high_first != value.high_first:
@@ -255,30 +225,6 @@ def _validate_inputs(
     return gate_shape.rows, intermediate_features, output_features
 
 
-def _project_affine_source_chunk(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_per_tensor_scale: torch.Tensor,
-    linear: LinearOperands,
-    rows: int,
-    output: torch.Tensor,
-) -> None:
-    # Mixed-dtype bias needs the original combined FP32 scale/bias epilogue;
-    # the affine GEMM helper would round to BF16 before adding that bias.
-    if linear.bias is None or linear.bias.dtype is output.dtype:
-        _project_affine_chunk(
-            input_qdata, input_scale, input_per_tensor_scale, linear, rows, output
-        )
-        return
-    projected = _project_chunk_out(input_qdata, input_scale, linear, 0, rows, output)
-    nvfp4_backend.apply_projection_epilogue(
-        projected,
-        _projection_global_scale(input_per_tensor_scale, linear.weight_per_tensor_scale),
-        linear.bias,
-        projected,
-    )
-
-
 def _project_affine_chunk(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -287,34 +233,17 @@ def _project_affine_chunk(
     rows: int,
     output: torch.Tensor,
 ) -> None:
-    weight_per_tensor_scale = linear.weight_per_tensor_scale
-    if weight_per_tensor_scale is not None:
-        nvfp4_projection.matmul_prepared_chunk_affine_out(
-            input_qdata,
-            input_scale,
-            input_per_tensor_scale,
-            linear.weight_qdata,
-            linear.weight_scale,
-            weight_per_tensor_scale,
-            linear.bias,
-            0,
-            rows,
-            output,
-        )
-        return
-    projected = _project_chunk_out(
+    nvfp4_projection.matmul_prepared_chunk_affine_out(
         input_qdata,
         input_scale,
-        linear,
+        input_per_tensor_scale,
+        linear.weight_qdata,
+        linear.weight_scale,
+        linear.weight_per_tensor_scale,
+        linear.bias,
         0,
         rows,
         output,
-    )
-    nvfp4_backend.apply_projection_epilogue(
-        projected,
-        input_per_tensor_scale,
-        linear.bias,
-        projected,
     )
 
 
@@ -413,7 +342,7 @@ def run_chunked_swiglu_ffn(
         projections = projection_workspace[:chunk_row_count]
         value_output = projections[:, :intermediate_features]
         gate_output = projections[:, intermediate_features:]
-        _project_affine_source_chunk(
+        _project_affine_chunk(
             value_input_qdata,
             value_input_scale,
             value_per_tensor_scale,
@@ -430,7 +359,7 @@ def run_chunked_swiglu_ffn(
                 source_storage,
             )
         )
-        _project_affine_source_chunk(
+        _project_affine_chunk(
             gate_input_qdata,
             gate_input_scale,
             gate_per_tensor_scale,
@@ -456,17 +385,14 @@ def run_chunked_swiglu_ffn(
         assert projected_workspace is not None
         assert base_2d is not None
         assert gate_layout is not None
-        projected = _project_chunk_out(
+        projected = projected_workspace[:chunk_row_count]
+        _project_affine_chunk(
             down_qdata,
             down_scale,
-            down,
-            0,
-            chunk_row_count,
-            projected_workspace,
-        )
-        down_global_scale = _projection_global_scale(
             down_per_tensor_scale,
-            down.weight_per_tensor_scale,
+            down,
+            chunk_row_count,
+            projected,
         )
         gated_updates_backend.apply_indexed_gated_updates(
             projected,
@@ -475,8 +401,6 @@ def run_chunked_swiglu_ffn(
             gated_updates,
             gate_layout,
             start,
-            ffn_scale=down_global_scale,
-            ffn_bias=down.bias,
         )
     return output
 
