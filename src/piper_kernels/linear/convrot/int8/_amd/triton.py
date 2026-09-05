@@ -1,190 +1,85 @@
-"""NVIDIA kernels and launchers for ConvRot INT8; custom ops live in ``.._ops``."""
+"""ROCm ConvRot INT8 preparation, projection, and weight-update launchers."""
 
-# Triton's JIT launcher accepts compile-time options not represented in its
-# Python call signature.
 # pyright: reportCallIssue=false
-# ruff: noqa: PLC0414 - preserve the established low-level exports
 
+import importlib
 import math
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
-from piper_kernels._triton.stochastic_quantization import (
-    seed_argument,
-)
+from piper_kernels._triton.stochastic_quantization import seed_argument
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.gguf import triton as gguf_backend
-from piper_kernels.linear._input_activations import (
-    apply_input_activation,
-    input_activation_width,
-)
+from piper_kernels.linear._input_activations import apply_input_activation, input_activation_width
+from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 from piper_kernels.linear.convrot import triton as convrot_backend
 
-from .._kernels.triton import _int8_matmul_kernel as _int8_matmul_kernel
-from .._kernels.triton import _normalize_for_int8 as _normalize_for_int8
-from .._kernels.triton import _quantize_int8 as _quantize_int8
-from .._kernels.triton import _requantize_update_rows_kernel as _requantize_update_rows_kernel
-from .._kernels.triton import quantize_rows_kernel as quantize_rows_kernel
-from .._kernels.triton import scaled_int8_matmul as scaled_int8_matmul
+from .._kernels.triton import (
+    _int8_matmul_kernel,
+    _normalize_for_int8,
+    _requantize_update_rows_kernel,
+    int8_scale_from_max,
+    quantize_rows_kernel,
+)
 from . import policy as _policy
 
-_LARGE_MATMUL_GROUP_M_TILES = 16
-_MEAN_BLOCK_M = 256
-_MEAN_BLOCK_K = 128
-
-# Preserve the established INT8 module-level utility surface while the
-# implementations live at the format-independent ConvRot boundary.
+# Smaller row groups improve cache reuse at the validated large/wide RDNA4 shapes.
+_LARGE_MATMUL_GROUP_M_TILES = 8
 dtype_code = convrot_backend.logical_dtype_code
-rotate_groups_kernel = convrot_backend.rotate_groups_kernel
 rotate_input = convrot_backend.rotate_input
+_rotate_hadamard_groups = convrot_backend.rotate_hadamard_groups
 
 
 @triton.jit
-def _dequantized_input_mean_partial_kernel(
-    input_ptr,
-    input_scale_ptr,
-    partial_ptr,
-    block_lengths_ptr,
-    sequence_length,
-    input_features: tl.constexpr,
-    row_block_count: tl.constexpr,
-    mask_block_lengths: tl.constexpr,
-    block_m: tl.constexpr,
-    block_k: tl.constexpr,
-):
-    """Sum one row block of the activation represented by prepared ConvRot storage."""
-    row_block = tl.program_id(0)
-    feature_block = tl.program_id(1)
-    batch = tl.program_id(2)
-    sequence_offsets = row_block * block_m + tl.arange(0, block_m)
-    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
-    valid = (sequence_offsets[:, None] < sequence_length) & (
-        feature_offsets[None, :] < input_features
-    )
-    if mask_block_lengths:
-        block_lengths = tl.load(
-            block_lengths_ptr + sequence_offsets // 64,
-            mask=sequence_offsets < sequence_length,
-            other=0,
-        )
-        valid &= sequence_offsets[:, None] % 64 < block_lengths[:, None]
-    values = tl.load(
-        input_ptr
-        + (batch * sequence_length + sequence_offsets[:, None]) * input_features
-        + feature_offsets[None, :],
-        mask=valid,
-        other=0,
-    ).to(tl.float32)
-    scales = tl.load(
-        input_scale_ptr + batch * sequence_length + sequence_offsets,
-        mask=sequence_offsets < sequence_length,
-        other=0.0,
-    )
-    partial = tl.sum(values * scales[:, None], axis=0)
-    tl.store(
-        partial_ptr + (batch * row_block_count + row_block) * input_features + feature_offsets,
-        partial,
-        mask=feature_offsets < input_features,
-    )
-
-
-@triton.jit
-def _dequantized_input_mean_reduce_kernel(
-    partial_ptr,
-    output_ptr,
-    valid_count_ptr,
-    sequence_length,
-    input_features: tl.constexpr,
-    row_block_count: tl.constexpr,
-    reduction_rows: tl.constexpr,
-    mask_block_lengths: tl.constexpr,
-    block_k: tl.constexpr,
-):
-    """Reduce prepared-input partial sums to one FP32 feature mean per batch."""
-    feature_block = tl.program_id(0)
-    batch = tl.program_id(1)
-    row_offsets = tl.arange(0, reduction_rows)
-    feature_offsets = feature_block * block_k + tl.arange(0, block_k)
-    partial = tl.load(
-        partial_ptr
-        + (batch * row_block_count + row_offsets[:, None]) * input_features
-        + feature_offsets[None, :],
-        mask=(row_offsets[:, None] < row_block_count) & (feature_offsets[None, :] < input_features),
-        other=0.0,
-    )
-    valid_count = tl.load(valid_count_ptr) if mask_block_lengths else sequence_length
-    mean = tl.sum(partial, axis=0) / valid_count
-    tl.store(
-        output_ptr + batch * input_features + feature_offsets,
-        mean,
-        mask=feature_offsets < input_features,
-    )
-
-
-@triton.jit
-def _store_quantized_chunk(
-    q_ptr,
-    output_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
+def _normalize_rotated_values(
     values,
-    scale,
-    logical_dtype_code: tl.constexpr,
-):
-    offsets = chunk_start + chunk_offsets
-    quantized = _quantize_int8(values, scale, logical_dtype_code)
-    tl.store(
-        q_ptr + output_row_offset + offsets,
-        quantized,
-        mask=offsets < row_width,
-    )
-
-
-@triton.jit
-def _load_weight_chunk(
-    x_ptr,
-    input_row_offset,
-    packed_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    chunk_size: tl.constexpr,
-    group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-    gguf_quant_type: tl.constexpr,
 ):
-    if gguf_quant_type >= 0:
-        return gguf_backend.load_rotated_chunk(
-            x_ptr,
-            packed_row_offset,
-            row_width,
-            chunk_start,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            logical_dtype_code,
-            gguf_quant_type,
-        )
-    return convrot_backend.load_activated_rotated_chunk(
-        x_ptr,
-        input_row_offset,
-        row_width,
-        chunk_start,
-        chunk_offsets,
-        chunk_size,
-        group_size,
-        inverse_sqrt_group,
-        logical_dtype_code,
-        activation_fn,
-        accelerator_backend,
+    """Apply the portable group normalization and construct an INT8 row scale."""
+    values *= inverse_sqrt_group
+    if logical_dtype_code == 1:
+        values = values.to(tl.float16)
+    elif logical_dtype_code == 2:
+        values = values.to(tl.bfloat16)
+    scale = tl.maximum(
+        int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), True), 1e-30
     )
+    return _normalize_for_int8(values, scale, logical_dtype_code), scale
+
+
+@triton.jit
+def _amd_normalization_scale(
+    absolute_max,
+    inverse_sqrt_group: tl.constexpr,
+):
+    """Construct the value scale used by AMD's folded normalization."""
+    return tl.maximum(
+        int8_scale_from_max(absolute_max, True),
+        1e-30 / inverse_sqrt_group,
+    )
+
+
+@triton.jit
+def _normalize_rotated_values_amd_wide(
+    values,
+    inverse_sqrt_group: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+):
+    """Fold wide AMD group normalization into the stored row scale."""
+    if logical_dtype_code == 2:
+        values = values.to(tl.bfloat16)
+    # Every supported group has an exact power-of-two normalization factor.
+    # Wide HIP BF16/FP32 quantization is invariant to that common factor, so
+    # apply it once to the stored row scale instead of every rotated value.
+    normalization_scale = _amd_normalization_scale(
+        tl.max(tl.abs(values).to(tl.float32), axis=0),
+        inverse_sqrt_group,
+    )
+    scale = normalization_scale * inverse_sqrt_group
+    return _normalize_for_int8(values, normalization_scale, logical_dtype_code), scale
 
 
 @triton.jit
@@ -193,143 +88,258 @@ def rotate_quantize_rows_kernel(
     q_ptr,
     scale_ptr,
     row_width,
-    chunk_size: tl.constexpr,
-    chunk_count: tl.constexpr,
+    block_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
-    gguf_quant_type: tl.constexpr,
 ):
-    """Rotate and quantize a row held as one, two, or three equal chunks.
-
-    Keep every rotated chunk live until the shared row scale is known, avoiding
-    both recomputation and a global-memory intermediate.
-    """
+    """Rotate and quantize one complete row without a global-memory intermediate."""
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
-    chunk_offsets = tl.arange(0, chunk_size)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < row_width
     input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
     input_row_offset = row_i64 * input_row_width
-    packed_row_offset = 0
-    if gguf_quant_type >= 0:
-        packed_row_offset = row_i64 * gguf_backend.packed_row_size(
-            row_width,
-            gguf_quant_type,
-        )
     output_row_offset = row_i64 * row_width
 
-    values0 = _load_weight_chunk(
-        x_ptr,
-        input_row_offset,
-        packed_row_offset,
-        row_width,
-        0,
-        chunk_offsets,
-        chunk_size,
-        group_size,
-        inverse_sqrt_group,
-        logical_dtype_code,
-        activation_fn,
-        accelerator_backend,
-        gguf_quant_type,
-    )
-    row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
-    if chunk_count >= 2:
-        values1 = _load_weight_chunk(
-            x_ptr,
-            input_row_offset,
-            packed_row_offset,
-            row_width,
-            chunk_size,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            logical_dtype_code,
-            activation_fn,
-            accelerator_backend,
-            gguf_quant_type,
-        )
-        row_max = tl.maximum(
-            row_max,
-            tl.max(tl.abs(values1).to(tl.float32), axis=0),
-        )
-    if chunk_count >= 3:
-        values2 = _load_weight_chunk(
-            x_ptr,
-            input_row_offset,
-            packed_row_offset,
-            row_width,
-            2 * chunk_size,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            logical_dtype_code,
-            activation_fn,
-            accelerator_backend,
-            gguf_quant_type,
-        )
-        row_max = tl.maximum(
-            row_max,
-            tl.max(tl.abs(values2).to(tl.float32), axis=0),
-        )
+    if activation_fn == "swiglu":
+        up = tl.load(
+            x_ptr + input_row_offset + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.load(
+            x_ptr + input_row_offset + row_width + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        values = swiglu(up, gate, logical_dtype_code)
+    else:
+        values = tl.load(
+            x_ptr + input_row_offset + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if activation_fn == "gelu_tanh":
+            values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
 
-    scale = tl.maximum(row_max / 127.0, 1e-30)
-    _store_quantized_chunk(
-        q_ptr,
-        output_row_offset,
-        row_width,
-        0,
-        chunk_offsets,
-        values0,
-        scale,
-        logical_dtype_code,
-    )
-    if chunk_count >= 2:
-        _store_quantized_chunk(
-            q_ptr,
-            output_row_offset,
-            row_width,
-            chunk_size,
-            chunk_offsets,
-            values1,
-            scale,
+    values = _rotate_hadamard_groups(values, block_size, group_size)
+    if accelerator_backend != "hip" or logical_dtype_code == 1 or block_size <= 8_192:
+        scaled, scale = _normalize_rotated_values(
+            values,
+            inverse_sqrt_group,
             logical_dtype_code,
         )
-    if chunk_count >= 3:
-        _store_quantized_chunk(
-            q_ptr,
-            output_row_offset,
-            row_width,
-            2 * chunk_size,
-            chunk_offsets,
-            values2,
-            scale,
+    else:
+        scaled, scale = _normalize_rotated_values_amd_wide(
+            values,
+            inverse_sqrt_group,
             logical_dtype_code,
         )
+    quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+    tl.store(q_ptr + output_row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
 
 
-def quantize_input(
-    rotated: torch.Tensor,
+@triton.jit
+def _load_activated_input_chunk(
+    x_ptr,
+    input_row_offset,
+    row_width,
+    offsets,
+    mask,
+    logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+):
+    """Load one group-aligned chunk and apply the optional input activation."""
+    if activation_fn == "swiglu":
+        up = tl.load(x_ptr + input_row_offset + offsets, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(
+            x_ptr + input_row_offset + row_width + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        return swiglu(up, gate, logical_dtype_code)
+
+    values = tl.load(x_ptr + input_row_offset + offsets, mask=mask, other=0.0).to(tl.float32)
+    if activation_fn == "gelu_tanh":
+        values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
+    return values
+
+
+@triton.jit
+def rotate_quantize_rows_chunked_kernel(
+    x_ptr,
+    q_ptr,
+    scale_ptr,
+    row_width,
+    block0: tl.constexpr,
+    block1: tl.constexpr,
+    block2: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+):
+    """Rotate a BF16 row as up to three power-of-two chunks before quantizing.
+
+    ConvRot groups never cross a chunk boundary. Avoiding a single next-power-
+    of-two pad substantially reduces work and live storage for wide ragged rows.
+    """
+    row = tl.program_id(0)
+    row_i64 = row.to(tl.int64)
+    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
+    input_row_offset = row_i64 * input_row_width
+    output_row_offset = row_i64 * row_width
+
+    offsets0 = tl.arange(0, block0)
+    mask0 = offsets0 < row_width
+    values0 = _load_activated_input_chunk(
+        x_ptr,
+        input_row_offset,
+        row_width,
+        offsets0,
+        mask0,
+        logical_dtype_code,
+        activation_fn,
+        accelerator_backend,
+    )
+    values0 = _rotate_hadamard_groups(values0, block0, group_size).to(tl.bfloat16)
+    max0 = tl.max(tl.abs(values0).to(tl.float32), axis=0)
+
+    offsets1 = block0 + tl.arange(0, block1)
+    mask1 = offsets1 < row_width
+    values1 = _load_activated_input_chunk(
+        x_ptr,
+        input_row_offset,
+        row_width,
+        offsets1,
+        mask1,
+        logical_dtype_code,
+        activation_fn,
+        accelerator_backend,
+    )
+    values1 = _rotate_hadamard_groups(values1, block1, group_size).to(tl.bfloat16)
+    max1 = tl.max(tl.abs(values1).to(tl.float32), axis=0)
+    absolute_max = tl.maximum(max0, max1)
+
+    if block2:
+        offsets2 = block0 + block1 + tl.arange(0, block2)
+        mask2 = offsets2 < row_width
+        values2 = _load_activated_input_chunk(
+            x_ptr,
+            input_row_offset,
+            row_width,
+            offsets2,
+            mask2,
+            logical_dtype_code,
+            activation_fn,
+            accelerator_backend,
+        )
+        values2 = _rotate_hadamard_groups(values2, block2, group_size).to(tl.bfloat16)
+        max2 = tl.max(tl.abs(values2).to(tl.float32), axis=0)
+        absolute_max = tl.maximum(absolute_max, max2)
+
+    # All supported group normalizations are exact powers of two. Quantizing
+    # the unnormalized BF16 values and applying that factor once to the scale
+    # preserves the logical result while avoiding a vector multiply per chunk.
+    normalization_scale = _amd_normalization_scale(
+        absolute_max,
+        inverse_sqrt_group,
+    )
+    quantized0 = tl.clamp(
+        libdevice.rint(
+            _normalize_for_int8(values0, normalization_scale, logical_dtype_code).to(tl.float32)
+        ),
+        -128.0,
+        127.0,
+    ).to(tl.int8)
+    quantized1 = tl.clamp(
+        libdevice.rint(
+            _normalize_for_int8(values1, normalization_scale, logical_dtype_code).to(tl.float32)
+        ),
+        -128.0,
+        127.0,
+    ).to(tl.int8)
+    tl.store(q_ptr + output_row_offset + offsets0, quantized0, mask=mask0)
+    tl.store(q_ptr + output_row_offset + offsets1, quantized1, mask=mask1)
+    if block2:
+        quantized2 = tl.clamp(
+            libdevice.rint(
+                _normalize_for_int8(values2, normalization_scale, logical_dtype_code).to(tl.float32)
+            ),
+            -128.0,
+            127.0,
+        ).to(tl.int8)
+        tl.store(q_ptr + output_row_offset + offsets2, quantized2, mask=mask2)
+    tl.store(scale_ptr + row_i64, normalization_scale * inverse_sqrt_group)
+
+
+def _uses_amd_chunked_preparation(
+    target: AcceleratorTarget,
+    logical_dtype_code: int,
+    blocks: tuple[int, int, int],
+) -> bool:
+    """Return whether AMD uses the lower-live-range BF16 preparation kernel."""
+    return target.is_amd_hip and logical_dtype_code == 2 and blocks[1] != 0
+
+
+def _launch_amd_chunked_preparation(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
+    group_size: int,
     logical_dtype_code: int,
-    *,
+    activation_fn: str | None,
     num_warps: int,
+    blocks: tuple[int, int, int],
 ) -> None:
-    """Apply the portable split-path rowwise quantization."""
-    m, k = rotated.shape
-    quantize_rows_kernel[(m,)](
-        rotated,
+    """Launch AMD's chunked fused rotation and quantization path."""
+    m, k = input_qdata.shape
+    rotate_quantize_rows_chunked_kernel[(m,)](
+        input,
+        input_qdata,
+        input_scale,
+        k,
+        block0=blocks[0],
+        block1=blocks[1],
+        block2=blocks[2],
+        group_size=group_size,
+        inverse_sqrt_group=group_size**-0.5,
+        logical_dtype_code=logical_dtype_code,
+        activation_fn=activation_fn,
+        accelerator_backend="hip",
+        num_warps=num_warps,
+    )
+
+
+def _launch_full_row_preparation(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    group_size: int,
+    logical_dtype_code: int,
+    activation_fn: str | None,
+    num_warps: int,
+    target: AcceleratorTarget,
+) -> None:
+    """Launch the shared full-row fused rotation and quantization path."""
+    m, k = input_qdata.shape
+    rotate_quantize_rows_kernel[(m,)](
+        input,
         input_qdata,
         input_scale,
         k,
         block_size=max(128, triton.next_power_of_2(k)),
+        group_size=group_size,
+        inverse_sqrt_group=group_size**-0.5,
         logical_dtype_code=logical_dtype_code,
+        activation_fn=activation_fn,
+        accelerator_backend=target.backend,
         num_warps=num_warps,
     )
 
@@ -363,56 +373,71 @@ def fused_rotate_quantize_input(
             f"got {tuple(input.shape)}"
         )
     target = AcceleratorTarget.from_device(input.device) if target is None else target
-    fused_chunks = _policy.select_fused_preparation_chunks(target, k)
-    if fused_chunks is None:
+    if not _policy.select_execution_plan(target, in_features=k).fuse_rotation_quantization:
         raise ValueError(f"fused preparation does not support row width {k}")
-    chunk_count, chunk_size = fused_chunks
-    rotate_quantize_rows_kernel[(m,)](
+    blocks = _policy.preparation_blocks(k)
+    if _uses_amd_chunked_preparation(target, logical_dtype_code, blocks):
+        _launch_amd_chunked_preparation(
+            input,
+            input_qdata,
+            input_scale,
+            group_size,
+            logical_dtype_code,
+            activation_fn,
+            num_warps,
+            blocks,
+        )
+        return
+    _launch_full_row_preparation(
         input,
         input_qdata,
         input_scale,
-        k,
-        chunk_size=chunk_size,
-        chunk_count=chunk_count,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=logical_dtype_code,
-        activation_fn=activation_fn,
-        accelerator_backend=target.backend,
-        gguf_quant_type=-1,
-        num_warps=num_warps,
+        group_size,
+        logical_dtype_code,
+        activation_fn,
+        num_warps,
+        target,
     )
 
 
-def _convert_gguf_out(
-    data: torch.Tensor,
-    quant_type: int,
-    group_size: int,
-    logical_dtype: torch.dtype,
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
+def _amd_matmul_compiler_options(
+    target: AcceleratorTarget,
+) -> dict[str, object]:
+    """Return optional AMD compiler controls supported by the installed Triton."""
+    if not target.is_architecture("gfx1200", "gfx1201"):
+        return {}
+    # llvm_fn_attrs was added to Triton's HIP options after the initial gfx12
+    # backend. Older compatible releases retain the portable schedule.
+    try:
+        hip_compiler = importlib.import_module("triton.backends.amd.compiler")
+    except ImportError:
+        return {}
+    hip_options = getattr(hip_compiler, "HIPOptions", None)
+    hip_option_fields = getattr(hip_options, "__dataclass_fields__", {})
+    if "llvm_fn_attrs" not in hip_option_fields:
+        return {}
+    return {"llvm_fn_attrs": "amdgpu-sched-strategy=iterative-ilp"}
+
+
+def quantize_input(
+    rotated: torch.Tensor,
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    logical_dtype_code: int,
+    *,
+    num_warps: int,
 ) -> None:
-    """Decode packed GGUF rows through the existing ConvRot INT8 epilogue."""
-    rows, row_width = qdata.shape
-    target = AcceleratorTarget.from_device(data.device)
-    chunks = _policy.select_fused_preparation_chunks(target, row_width)
-    if chunks is None:
-        raise ValueError(f"fused GGUF conversion does not support row width {row_width}")
-    chunk_count, chunk_size = chunks
-    rotate_quantize_rows_kernel[(rows,)](
-        data,
-        qdata,
-        scale,
-        row_width,
-        chunk_size=chunk_size,
-        chunk_count=chunk_count,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
-        activation_fn=None,
-        accelerator_backend=target.backend,
-        gguf_quant_type=quant_type,
-        num_warps=4,
+    """Apply the portable split-path rowwise quantization."""
+    m, k = rotated.shape
+    quantize_rows_kernel[(m,)](
+        rotated,
+        input_qdata,
+        input_scale,
+        k,
+        block_size=max(128, triton.next_power_of_2(k)),
+        logical_dtype_code=logical_dtype_code,
+        reciprocal_scale=True,
+        num_warps=num_warps,
     )
 
 
@@ -564,6 +589,9 @@ def _execute_prepared_linear(
         if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
         else 0
     )
+    compiler_options = _amd_matmul_compiler_options(
+        AcceleratorTarget.from_device(input_qdata.device)
+    )
     bias_pointer = bias if bias is not None else output
 
     def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
@@ -593,6 +621,7 @@ def _execute_prepared_linear(
             and (n % plan.matmul_block_n == 0)
             and (k % plan.matmul_block_k == 0),
             group_m=group_m,
+            **compiler_options,
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
         )
@@ -691,73 +720,6 @@ def prepare_input(
     )
 
 
-def dequantized_input_mean(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    block_lengths: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return the FP32 compact or valid-front padded prepared-input mean."""
-    if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
-        raise ValueError("ConvRot mean input must be [batch,sequence,features] INT8")
-    batch, sequence_length, input_features = input_qdata.shape
-    if input_scale.shape != (batch, sequence_length) or input_scale.dtype is not torch.float32:
-        raise ValueError("ConvRot mean scale must be a batch/sequence FP32 matrix")
-    if input_qdata.device.type != "cuda" or input_scale.device != input_qdata.device:
-        raise ValueError("ConvRot mean operands must share a CUDA device")
-    if not input_qdata.is_contiguous() or not input_scale.is_contiguous():
-        raise ValueError("ConvRot mean operands must be contiguous")
-    if block_lengths is not None and (
-        sequence_length % 64
-        or block_lengths.shape != (sequence_length // 64,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != input_qdata.device
-        or not block_lengths.is_contiguous()
-    ):
-        raise ValueError("ConvRot mean block lengths must be one contiguous device INT32 per K64")
-    row_block_count = int(triton.cdiv(sequence_length, _MEAN_BLOCK_M))
-    partial = torch.empty(
-        (batch, row_block_count, input_features),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    output = torch.empty(
-        (batch, input_features),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    has_block_lengths = block_lengths is not None
-    block_lengths_ptr = block_lengths if has_block_lengths else input_scale
-    valid_count = block_lengths.sum(dtype=torch.float32) if has_block_lengths else input_scale
-    _dequantized_input_mean_partial_kernel[
-        (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
-    ](
-        input_qdata,
-        input_scale,
-        partial,
-        block_lengths_ptr,
-        sequence_length,
-        input_features=input_features,
-        row_block_count=row_block_count,
-        mask_block_lengths=has_block_lengths,
-        block_m=_MEAN_BLOCK_M,
-        block_k=_MEAN_BLOCK_K,
-        num_warps=8,
-    )
-    _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
-        partial,
-        output,
-        valid_count,
-        sequence_length,
-        input_features=input_features,
-        row_block_count=row_block_count,
-        reduction_rows=triton.next_power_of_2(row_block_count),
-        mask_block_lengths=has_block_lengths,
-        block_k=_MEAN_BLOCK_K,
-        num_warps=8,
-    )
-    return output
-
-
 def linear_prepared(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -853,6 +815,7 @@ def _requantize_update_(
         has_base=beta != 0,
         has_update=has_update,
         stochastic=rounding_seed is not None,
+        reciprocal_scale=True,
         num_warps=8,
     )
 

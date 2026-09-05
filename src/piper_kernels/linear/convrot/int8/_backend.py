@@ -4,6 +4,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from ._amd import policy as amd_policy
 from ._interfaces import Add, Addmm, DequantizedMean, GGUFConvert, LinearBackend
 from ._nvidia import policy as nvidia_policy
 
@@ -14,13 +15,22 @@ except ModuleNotFoundError as error:
         raise
     _nvidia_backend = None
 
+try:
+    from ._amd import triton as _amd_backend
+except ModuleNotFoundError as error:
+    if error.name != "triton":
+        raise
+    _amd_backend = None
+
 
 def select_linear_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
     """Select compatible linear/preparation/projection operations, or a portable fallback."""
-    if _nvidia_backend is None:
+    if _nvidia_backend is None and _amd_backend is None:
         return None
     target = AcceleratorTarget.from_device(input.device)
-    return _nvidia_backend if nvidia_policy.supports_target(target) else None
+    if nvidia_policy.supports_target(target):
+        return _nvidia_backend
+    return _amd_backend if amd_policy.supports_target(target) else None
 
 
 def require_linear_backend(input: torch.Tensor) -> LinearBackend:  # noqa: A002
@@ -33,18 +43,26 @@ def require_linear_backend(input: torch.Tensor) -> LinearBackend:  # noqa: A002
 
 def select_add(input: torch.Tensor) -> Add | None:  # noqa: A002
     """Select dense weight updates independently of linear execution."""
-    if _nvidia_backend is None:
+    if _nvidia_backend is None and _amd_backend is None:
         return None
     target = AcceleratorTarget.from_device(input.device)
-    return _nvidia_backend.add_ if nvidia_policy.supports_target(target) else None
+    if _nvidia_backend is not None and nvidia_policy.supports_target(target):
+        return _nvidia_backend.add_
+    if _amd_backend is not None and amd_policy.supports_target(target):
+        return _amd_backend.add_
+    return None
 
 
 def select_addmm(input: torch.Tensor) -> Addmm | None:  # noqa: A002
     """Select low-rank weight updates independently of linear execution."""
-    if _nvidia_backend is None:
+    if _nvidia_backend is None and _amd_backend is None:
         return None
     target = AcceleratorTarget.from_device(input.device)
-    return _nvidia_backend.addmm_ if nvidia_policy.supports_target(target) else None
+    if _nvidia_backend is not None and nvidia_policy.supports_target(target):
+        return _nvidia_backend.addmm_
+    if _amd_backend is not None and amd_policy.supports_target(target):
+        return _amd_backend.addmm_
+    return None
 
 
 def select_gguf_converter(input: torch.Tensor) -> GGUFConvert | None:  # noqa: A002

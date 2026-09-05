@@ -656,7 +656,6 @@ nvfp4 = [
     { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 triton = [
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 
@@ -689,7 +688,6 @@ requires-dist = [
     { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'nvfp4') or (sys_platform == 'win32' and extra == 'nvfp4')", specifier = ">=0.18", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'convrot'", specifier = ">=0.17" },
     { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'nvfp4'", specifier = ">=0.18" },
-    { name = "triton", marker = "sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.7,<3.8" },
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'triton'", specifier = ">=3.7,<3.8" },
 ]
 provides-extras = ["convrot", "nvfp4", "triton"]

@@ -32,6 +32,7 @@ from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 def test_select_backend_preserves_supported_targets(monkeypatch, target, supported):
     implementation = ModuleType("test_convrot_implementation")
     monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
+    monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
 
     selected = _backend.select_linear_backend(torch.empty(1))
@@ -42,6 +43,7 @@ def test_select_backend_preserves_supported_targets(monkeypatch, target, support
 def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
     resolve_target = Mock(side_effect=AssertionError("unexpected hardware query"))
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
+    monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", resolve_target)
 
     assert _backend.select_linear_backend(torch.empty(1)) is None
