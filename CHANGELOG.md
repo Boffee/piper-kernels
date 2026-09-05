@@ -5,6 +5,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added `add_` and `addmm_` adapter merges to plain `PiperNVFP4Tensor`, sharing validation,
+  rounding, and packed-storage mutation behavior with ConvRot NVFP4.
+- Added fused Triton updates for plain and ConvRot NVFP4 on NVIDIA compute capability 10.0+.
+  Rotation, dequantization, FP32 matrix-product accumulation, merging, scale selection, and
+  stochastic E2M1 packing run in tiles without full-size weight or product intermediates.
+  Two-level scaling recomputes tiles after reducing their maxima; stochastic rounding adds no
+  per-element workspace. Existing storage identities and activation calibration are preserved.
+
 ### Changed
 
 - Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar, Self, cast
 
 import torch
+from torch.types import Number
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -214,6 +215,65 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         swapped = moved.reshape(*moved.shape[:-1], -1, 2).flip(-1).reshape(moved.shape)
         return swapped.movedim(-1, packed_dimension)
 
+    def _update_group_size(self) -> int:
+        """Use the unrotated basis for ordinary NVFP4 updates."""
+        return 0
+
+    def addmm_(
+        self,
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        *,
+        beta: int | float | complex = 1,
+        alpha: int | float | complex = 1,
+        rounding_seed: int | None = None,
+    ) -> Self:
+        """Update and requantize in place, optionally using stochastic rounding.
+
+        ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
+        makes terminal E2M1 code selection reproducible for a fixed device and
+        backend without consuming the process-global random-number generator.
+        """
+        from . import _update  # noqa: PLC0415 - update validation depends on this tensor
+
+        operation = _update._operation(self, "addmm_")
+        if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
+            raise TypeError(f"{operation} matrices must be tensors")
+        _update.addmm_(
+            self,
+            self._update_group_size(),
+            mat1,
+            mat2,
+            beta=beta,
+            alpha=alpha,
+            rounding_seed=rounding_seed,
+        )
+        return self
+
+    def add_(
+        self,
+        other: object,
+        *,
+        alpha: Number | complex | None = 1,
+        rounding_seed: int | None = None,
+    ) -> Self:
+        """Add a dense logical update and requantize in place."""
+        from . import _update  # noqa: PLC0415 - update validation depends on this tensor
+
+        operation = _update._operation(self, "add_")
+        if not isinstance(other, torch.Tensor):
+            raise TypeError(f"{operation} update must be a tensor")
+        if alpha is None:
+            raise TypeError(f"{operation} alpha must be a real number, got None")
+        _update.add_(
+            self,
+            self._update_group_size(),
+            other,
+            alpha=alpha,
+            rounding_seed=rounding_seed,
+        )
+        return self
+
     def to(self, *args: object, **kwargs: object) -> Self:
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
         explicit_copy_args = _explicit_to_copy_args(args, kwargs)
@@ -358,6 +418,32 @@ def _nvfp4_linear_dispatch(
         quantization.use_dynamic_per_tensor_scale,
         weight.high_first,
     )
+
+
+@PiperNVFP4Tensor.implements(torch.ops.aten.addmm_.default)
+def _nvfp4_addmm_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> PiperNVFP4Tensor:
+    weight, mat1, mat2 = args
+    if not isinstance(weight, PiperNVFP4Tensor):
+        raise TypeError(f"NVFP4 addmm_ weight must be PiperNVFP4Tensor, got {type(weight)}")
+    return weight.addmm_(mat1, mat2, beta=kwargs.get("beta", 1), alpha=kwargs.get("alpha", 1))
+
+
+@PiperNVFP4Tensor.implements(torch.ops.aten.add_.Tensor)
+def _nvfp4_add_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> PiperNVFP4Tensor:
+    weight, update = args
+    if not isinstance(weight, PiperNVFP4Tensor):
+        raise TypeError(f"NVFP4 add_ weight must be PiperNVFP4Tensor, got {type(weight)}")
+    return weight.add_(update, alpha=kwargs.get("alpha", 1))
 
 
 __all__ = ["PiperNVFP4Tensor"]

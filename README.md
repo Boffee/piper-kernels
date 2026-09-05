@@ -200,6 +200,30 @@ quantization in one package-owned operation and prevents callers from accidental
 logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported from
 `piper_kernels.linear.convrot` for format-policy validation.
 
+Both NVFP4 wrappers support in-place adapter merges:
+
+```python
+weight.add_(dense_update, alpha=adapter_strength, rounding_seed=seed)
+rotated_weight.addmm_(lora_b, lora_a, alpha=lora_strength, rounding_seed=seed)
+```
+
+On NVIDIA compute capability 10.0 or newer with Triton installed, these updates fuse
+dequantization, optional ConvRot rotation, merging, and NVFP4 packing in tiles. `addmm_`
+accumulates the matrix product in FP32 without allocating a dense product. Stochastic E2M1
+rounding runs in registers during packing and requires no per-element temporary tensors.
+Two-level weight scaling uses a read-only tile-amax pass, a small reduction, and a second pass
+that recomputes and packs each tile into the existing buffers. One-level scaling needs only the
+packing pass. Other devices use the portable PyTorch implementation.
+
+Updates preserve the wrapper, packed data, block scales, global-scale buffer, activation
+calibration, and packed-pair order. `add_` requires an exact-shape dense update; both operations
+require inputs matching the weight's logical dtype and device and do not support autograd.
+An unsigned 64-bit `rounding_seed` enables reproducible stochastic rounding without consuming
+the global RNG or changing scale selection. Omit it for nearest rounding. Kernel reduction
+orders and random samples can differ from the PyTorch backend. Standard signatures support
+`torch.compile`; the `add_` seed extension is intended for eager updates. Repeated requantization
+is lossy, so restore pristine weights before replacing or removing an adapter.
+
 ### Packed GGUF weights
 
 Both ConvRot formats accept a two-dimensional tensor of packed GGUF bytes. Pass the GGML
