@@ -33,6 +33,7 @@ class Linear:
             self.activation_scale,
             self.bias,
             self.dynamic,
+            self.weight.high_first,
         )
 
 
@@ -52,6 +53,7 @@ def _weight(
     dense: torch.Tensor,
     activation_scale: torch.Tensor | None,
     dynamic: bool,
+    high_first: bool,
 ) -> PiperNVFP4Tensor:
     quantization = QuantizeTensorToNVFP4Kwargs(
         block_size=16,
@@ -66,7 +68,21 @@ def _weight(
         is_swizzled_scales=True,
         act_quant_kwargs=quantization,
     )
-    return PiperNVFP4Tensor.from_torchao(weight)
+    wrapped = PiperNVFP4Tensor.from_torchao(weight)
+    if not high_first:
+        return wrapped
+    return PiperNVFP4Tensor(
+        ((wrapped.qdata & 0x0F) << 4) | (wrapped.qdata >> 4),
+        wrapped.scale,
+        wrapped.block_size,
+        wrapped.orig_dtype,
+        wrapped.per_tensor_scale,
+        wrapped.act_per_tensor_scale,
+        wrapped.is_swizzled_scales,
+        wrapped.use_triton_kernel,
+        wrapped.act_quant_kwargs,
+        high_first=True,
+    )
 
 
 def materialized(operands: Operands) -> torch.Tensor:
@@ -77,6 +93,7 @@ def materialized(operands: Operands) -> torch.Tensor:
         operands.down.activation_scale,
         operands.down.dynamic,
         "swiglu",
+        operands.down.weight.high_first,
     )
     result = nvfp4_ops.linear_prepared(
         *prepared,
@@ -97,6 +114,7 @@ def down_affine_reference(operands: Operands) -> torch.Tensor:
         operands.down.activation_scale,
         operands.down.dynamic,
         "swiglu",
+        operands.down.weight.high_first,
     )
     weight_per_tensor_scale = operands.down.weight.per_tensor_scale
     assert weight_per_tensor_scale is not None
@@ -131,6 +149,7 @@ def make_operands(
     output_features: int = 384,
     dynamic: bool,
     with_bias: bool = True,
+    high_first: bool = False,
     seed: int = 901,
 ) -> Operands:
     torch.manual_seed(seed)
@@ -156,14 +175,14 @@ def make_operands(
         torch.randn(output_features, device="cuda", dtype=torch.bfloat16) if with_bias else None
     )
     up_activation_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
-    up_weight = _weight(dense_up, up_activation_scale, dynamic)
+    up_weight = _weight(dense_up, up_activation_scale, dynamic, high_first)
     up = Linear(up_weight, up_activation_scale, up_bias, dynamic)
     packed = nvfp4_ops.linear(input, *up.arguments())
     packed_up, packed_gate = packed.chunk(2, dim=-1)
     activated = packed_up * F.silu(packed_gate)
     down_activation_scale = None if dynamic else per_tensor_amax_to_scale(activated.abs().amax())
     down = Linear(
-        _weight(dense_down, down_activation_scale, dynamic),
+        _weight(dense_down, down_activation_scale, dynamic, high_first),
         down_activation_scale,
         down_bias,
         dynamic,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import partial
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -28,7 +29,7 @@ from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from . import _compile_fx, _ops
 from . import triton as convrot_nvfp4_triton
 
-_COMPILE_PASS_VERSION = "convrot-nvfp4-compile-v2"
+_COMPILE_PASS_VERSION = "convrot-nvfp4-compile-v3"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -61,6 +62,7 @@ class _PreparationRule:
         preparation_key = (
             operands.linear.activation_per_tensor_scale,
             operands.linear.dynamic_activation_scale,
+            operands.linear.high_first,
         )
         return family_key, preparation_key
 
@@ -90,7 +92,11 @@ _PREPARATION_RULES = (_PreparationRule(),)
 _swiglu_patterns = PatternMatcherPass("convrot_nvfp4_swiglu_inputs")
 
 
-def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
+def _linear_pattern(
+    input_pattern: CallFunction,
+    *,
+    with_high_first: bool,
+) -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.convrot_nvfp4_linear.default,
         input_pattern,
@@ -101,6 +107,7 @@ def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
         KeywordArg("bias"),
         KeywordArg("dynamic_activation_scale"),
         KeywordArg("group_size"),
+        *((KeywordArg("high_first"),) if with_high_first else ()),
     )
 
 
@@ -154,20 +161,25 @@ def _replace_packed_swiglu(
     match.erase_nodes()
 
 
-for _promote_gate in (None, False, True):
-    for _reverse_multiply in (False, True):
-        register_graph_pattern(
-            input_activation_compile.packed_swiglu_pattern(
-                _linear_pattern,
-                promote_gate=_promote_gate,
-                reverse_multiply=_reverse_multiply,
-            ),
-            extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
-                match,
-                promote_gate=promote_gate,
-            ),
-            pass_dict=_swiglu_patterns,  # pyright: ignore[reportArgumentType]
-        )(_replace_packed_swiglu)
+for _with_high_first in (False, True):
+    _linear_pattern_variant = partial(
+        _linear_pattern,
+        with_high_first=_with_high_first,
+    )
+    for _promote_gate in (None, False, True):
+        for _reverse_multiply in (False, True):
+            register_graph_pattern(
+                input_activation_compile.packed_swiglu_pattern(
+                    _linear_pattern_variant,
+                    promote_gate=_promote_gate,
+                    reverse_multiply=_reverse_multiply,
+                ),
+                extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
+                    match,
+                    promote_gate=promote_gate,
+                ),
+                pass_dict=_swiglu_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_packed_swiglu)
 
 
 def _fold_swiglu_inputs(graph: torch.fx.Graph) -> bool:

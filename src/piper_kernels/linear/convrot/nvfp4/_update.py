@@ -176,7 +176,7 @@ def addmm_(
     else:
         # Bypass ConvRot's logical dequantize override and remain in the
         # physical rotated basis used by the packed storage.
-        rotated_weight = TorchAONVFP4Tensor.dequantize(weight, weight.orig_dtype)
+        rotated_weight = PiperNVFP4Tensor.dequantize(weight, weight.orig_dtype)
     rotated_update = rotate_groups(mat2, group_size)
     merged = torch.addmm(
         rotated_weight,
@@ -207,7 +207,7 @@ def add_(
 
     # Stay in the physical rotated basis used by the packed storage. Rotation
     # is linear, so this equals rotating the logical sum before requantization.
-    rotated_weight = TorchAONVFP4Tensor.dequantize(weight, weight.orig_dtype)
+    rotated_weight = PiperNVFP4Tensor.dequantize(weight, weight.orig_dtype)
     rotated_update = rotate_groups(update, group_size)
     merged = torch.add(rotated_weight, rotated_update, alpha=alpha_float)
     _refill_(weight, merged, rounding_seed)
@@ -243,7 +243,10 @@ def _refill_(
             rounding_seed=rounding_seed,
         )
 
-    weight.qdata.copy_(encoded.qdata)
+    encoded_qdata = encoded.qdata
+    if weight.high_first:
+        encoded_qdata = _layout.swap_packed_pairs(encoded_qdata)
+    weight.qdata.copy_(encoded_qdata)
     weight.scale.copy_(encoded.scale)
     if weight.per_tensor_scale is not None:
         assert encoded.per_tensor_scale is not None

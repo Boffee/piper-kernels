@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Self, cast
+from typing import Any, ClassVar, Self, cast
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
@@ -67,6 +67,10 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
     """TorchAO NVFP4 storage whose standard W4A4 linears remain semantic in FX."""
 
     __torch_function__ = classmethod(TorchAOBaseTensor.__torch_function__.__func__)
+    optional_tensor_attribute_names: ClassVar[list[str]] = [
+        *TorchAONVFP4Tensor.optional_tensor_attribute_names,
+        "high_first",
+    ]
     qdata: torch.Tensor
     scale: torch.Tensor
     block_size: int
@@ -76,6 +80,37 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
     is_swizzled_scales: bool
     use_triton_kernel: bool
     act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None
+    high_first: bool
+
+    def __new__(
+        cls,
+        qdata: torch.Tensor,
+        scale: torch.Tensor,
+        block_size: int,
+        orig_dtype: torch.dtype,
+        per_tensor_scale: torch.Tensor | None = None,
+        act_per_tensor_scale: torch.Tensor | None = None,
+        is_swizzled_scales: bool = False,
+        use_triton_kernel: bool = False,
+        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        high_first: bool = False,
+    ) -> PiperNVFP4Tensor:
+        if type(high_first) is not bool:
+            raise TypeError(f"NVFP4 high_first must be bool, got {type(high_first).__name__}")
+        tensor = super().__new__(
+            cls,
+            qdata,
+            scale,
+            block_size,
+            orig_dtype,
+            per_tensor_scale,
+            act_per_tensor_scale,
+            is_swizzled_scales,
+            use_triton_kernel,
+            act_quant_kwargs,
+        )
+        tensor.high_first = high_first
+        return cast(PiperNVFP4Tensor, tensor)
 
     @classmethod
     def from_hp(
@@ -126,6 +161,7 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
             storage.is_swizzled_scales,
             storage.use_triton_kernel,
             storage.act_quant_kwargs,
+            high_first=getattr(storage, "high_first", False),
         )
 
     def _stable_hash_for_caching(self) -> str:
@@ -145,6 +181,7 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
                 self.is_swizzled_scales,
                 self.use_triton_kernel,
                 self.act_quant_kwargs,
+                self.high_first,
                 None if self.per_tensor_scale is None else tuple(self.per_tensor_scale.shape),
                 None
                 if self.act_per_tensor_scale is None
@@ -164,7 +201,18 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
             self.is_swizzled_scales,
             self.use_triton_kernel,
             self.act_quant_kwargs,
+            high_first=self.high_first,
         )
+
+    def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Dequantize either packed-pair order to the logical weight."""
+        result = super().dequantize(output_dtype)
+        if not self.high_first:
+            return result
+        packed_dimension = -2 if self.qdata.stride(-2) < self.qdata.stride(-1) else -1
+        moved = result.movedim(packed_dimension, -1)
+        swapped = moved.reshape(*moved.shape[:-1], -1, 2).flip(-1).reshape(moved.shape)
+        return swapped.movedim(-1, packed_dimension)
 
     def to(self, *args: object, **kwargs: object) -> Self:
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
@@ -290,9 +338,12 @@ def _nvfp4_linear_dispatch(
     assert isinstance(converted_weight, PiperNVFP4Tensor)
     weight = converted_weight
     normalized_args = (converted_input, weight, bias)
-    if (
-        not torch.compiler.is_compiling() and not requires_semantic_linear
-    ) or not supports_semantic_linear(converted_input, weight):
+    supported = supports_semantic_linear(converted_input, weight)
+    if not supported:
+        if weight.high_first:
+            return torch.nn.functional.linear(converted_input, weight.dequantize(), bias)
+        return torchao_nvfp4_linear(func, types, normalized_args, {})
+    if not weight.high_first and not torch.compiler.is_compiling() and not requires_semantic_linear:
         return torchao_nvfp4_linear(func, types, normalized_args, {})
 
     quantization = weight.act_quant_kwargs
@@ -305,6 +356,7 @@ def _nvfp4_linear_dispatch(
         weight.act_per_tensor_scale,
         bias,
         quantization.use_dynamic_per_tensor_scale,
+        weight.high_first,
     )
 
 

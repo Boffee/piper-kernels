@@ -21,6 +21,7 @@ def _prepare_static_tensors(
     input: torch.Tensor,  # noqa: A002
     per_tensor_scale: torch.Tensor,
     activation_fn: str | None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     activated = input_activations.apply_input_activation(input, activation_fn)
     prepared = cast(
@@ -33,12 +34,16 @@ def _prepare_static_tensors(
             use_triton_kernel=False,
         ),
     )
-    return prepared.qdata, prepared.scale, per_tensor_scale.clone()
+    qdata = prepared.qdata
+    if high_first:
+        qdata = _layout.swap_packed_pairs(qdata)
+    return qdata, prepared.scale, per_tensor_scale.clone()
 
 
 def _prepare_dynamic_tensors(
     input: torch.Tensor,  # noqa: A002
     activation_fn: str | None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     activated = input_activations.apply_input_activation(input, activation_fn)
     flattened = activated.reshape(-1, activated.shape[-1])
@@ -53,19 +58,24 @@ def _prepare_dynamic_tensors(
             use_triton_kernel=False,
         ),
     )
-    return prepared.qdata, prepared.scale, per_tensor_scale
+    qdata = prepared.qdata
+    if high_first:
+        qdata = _layout.swap_packed_pairs(qdata)
+    return qdata, prepared.scale, per_tensor_scale
 
 
 def _prepare_dynamic_swiglu_tensors(
     input: torch.Tensor,  # noqa: A002
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _prepare_dynamic_tensors(input, "swiglu")
+    return _prepare_dynamic_tensors(input, "swiglu", high_first)
 
 
 def _prepare_dynamic_gelu_tanh_tensors(
     input: torch.Tensor,  # noqa: A002
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _prepare_dynamic_tensors(input, "gelu_tanh")
+    return _prepare_dynamic_tensors(input, "gelu_tanh", high_first)
 
 
 _compiled_prepare_static = torch.compile(_prepare_static_tensors, fullgraph=True)
@@ -79,6 +89,7 @@ _compiled_prepare_dynamic_gelu_tanh = torch.compile(
 def _compiled_prepare_dynamic(
     input: torch.Tensor,  # noqa: A002
     activation_fn: str | None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare dynamic activations without generalizing across unrelated layouts."""
     if activation_fn is None:
@@ -89,12 +100,13 @@ def _compiled_prepare_dynamic(
             swiglu=False,
             source_global_scale=None,
             source_bias=None,
+            high_first=high_first,
         )
         return qdata, scale, per_tensor_scale
     if activation_fn == "swiglu":
-        return _compiled_prepare_dynamic_swiglu(input)
+        return _compiled_prepare_dynamic_swiglu(input, high_first)
     assert activation_fn == "gelu_tanh"
-    return _compiled_prepare_dynamic_gelu_tanh(input)
+    return _compiled_prepare_dynamic_gelu_tanh(input, high_first)
 
 
 def _scale_result_to(
@@ -161,10 +173,11 @@ def _prepare_compiled(
     activation_per_tensor_scale: torch.Tensor | None,
     dynamic_activation_scale: bool,
     activation_fn: str | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_activations.validate_input_activation(activation_fn)
     if dynamic_activation_scale:
-        return _compiled_prepare_dynamic(input, activation_fn)
+        return _compiled_prepare_dynamic(input, activation_fn, high_first)
     if activation_per_tensor_scale is None:
         raise ValueError("static NVFP4 activation preparation requires a per-tensor scale")
     if activation_fn in (None, "swiglu"):
@@ -172,8 +185,14 @@ def _prepare_compiled(
             input,
             activation_per_tensor_scale,
             swiglu=activation_fn == "swiglu",
+            high_first=high_first,
         )
-    return _compiled_prepare_static(input, activation_per_tensor_scale, activation_fn)
+    return _compiled_prepare_static(
+        input,
+        activation_per_tensor_scale,
+        activation_fn,
+        high_first,
+    )
 
 
 def _execute_prepared(
@@ -215,12 +234,14 @@ def linear(
     activation_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     dynamic_activation_scale: bool,
+    high_first: bool = False,
 ) -> torch.Tensor:
     """Quantize an activation and apply a standard swizzled NVFP4 W4A4 weight."""
     input_qdata, input_scale, input_per_tensor_scale = _prepare_compiled(
         input,
         activation_per_tensor_scale,
         dynamic_activation_scale,
+        high_first=high_first,
     )
     result = _execute_prepared(
         input_qdata,
@@ -244,6 +265,7 @@ def _linear_fake(
     _activation_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
     _dynamic_activation_scale: bool,
+    _high_first: bool = False,
 ) -> torch.Tensor:
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
@@ -254,6 +276,7 @@ def prepare_input(
     activation_per_tensor_scale: torch.Tensor | None,
     dynamic_activation_scale: bool,
     activation_fn: str | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply an optional portable activation and prepare it for NVFP4 projections."""
     return _prepare_compiled(
@@ -261,6 +284,7 @@ def prepare_input(
         activation_per_tensor_scale,
         dynamic_activation_scale,
         activation_fn,
+        high_first,
     )
 
 
@@ -270,6 +294,7 @@ def _prepare_input_fake(
     activation_per_tensor_scale: torch.Tensor | None,
     _dynamic_activation_scale: bool,
     activation_fn: str | None = None,
+    _high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows = input.numel() // input.shape[-1]
     features = input.shape[-1] // input_activations.input_activation_width(activation_fn)

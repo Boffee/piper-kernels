@@ -27,12 +27,14 @@ class SemanticLinearNodes:
     @classmethod
     def from_call(cls, node: torch.fx.Node) -> SemanticLinearNodes | None:
         """Parse one positional ConvRot NVFP4 semantic-linear call."""
-        if node.kwargs or len(node.args) != 8:
+        if node.kwargs or len(node.args) not in (8, 9):
             return None
-        group_size = node.args[-1]
+        group_size = node.args[-1] if len(node.args) == 8 else node.args[-2]
+        high_first = False if len(node.args) == 8 else node.args[-1]
         if not isinstance(group_size, int) or isinstance(group_size, bool):
             return None
-        linear = nvfp4_compile_fx.SemanticLinearNodes.from_values(node.args[:-1])
+        linear_values = node.args[:-1] if len(node.args) == 8 else (*node.args[:-2], high_first)
+        linear = nvfp4_compile_fx.SemanticLinearNodes.from_values(linear_values)
         return None if linear is None else cls(linear, group_size)
 
 
@@ -92,6 +94,7 @@ def emit_prepared_input(
             operands.linear.dynamic_activation_scale,
             operands.group_size,
             activation_fn,
+            operands.linear.high_first,
         ),
     )
     prepared.meta["val"] = values

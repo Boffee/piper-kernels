@@ -65,6 +65,7 @@ def _semantic_linear(
     *,
     dynamic: bool,
     output_features: int = 256,
+    high_first: bool = False,
 ) -> torch.fx.Node:
     weight_qdata = _placeholder(
         graph,
@@ -95,6 +96,7 @@ def _semantic_linear(
             activation_scale,
             None,
             dynamic,
+            high_first,
         ),
     )
     projected.meta["val"] = torch.empty(
@@ -173,6 +175,7 @@ def _semantic_attention_graph(
     with_block_lengths: bool = False,
     with_coarse: bool = False,
     with_sparse_query_blocks: bool = False,
+    high_first: bool = False,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
@@ -198,6 +201,7 @@ def _semantic_attention_graph(
                 prefix,
                 activation_scale,
                 dynamic=dynamic,
+                high_first=high_first,
             )
             for prefix, activation_scale in zip(("q", "k", "v"), activation_scales, strict=True)
         )
@@ -314,6 +318,7 @@ def _semantic_attention_graph(
                 output_activation_scale,
                 dynamic=output_dynamic,
                 output_features=320,
+                high_first=high_first,
             )
         graph.output((output, attention_output) if escape_attention else output)
     torch.fx.GraphModule({}, graph)
@@ -325,6 +330,7 @@ def _quantized_attention_output_graph(
     with_block_lengths: bool,
     with_coarse: bool,
     with_sparse_query_blocks: bool,
+    high_first: bool = False,
 ) -> torch.fx.Graph:
     """Build an already-prepared attention boundary for output-only folding."""
     graph = torch.fx.Graph()
@@ -415,6 +421,7 @@ def _quantized_attention_output_graph(
             activation_scale,
             dynamic=False,
             output_features=320,
+            high_first=high_first,
         )
         graph.output(output)
     torch.fx.GraphModule({}, graph)
@@ -696,6 +703,8 @@ def _prepare_nvfp4_input(
         hidden_states,
         weight.act_per_tensor_scale,
         quantization.use_dynamic_per_tensor_scale,
+        None,
+        weight.high_first,
     )
 
 
@@ -796,6 +805,8 @@ def _run_explicit_attention_output(
         attention.flatten(2),
         output_weight.act_per_tensor_scale,
         quantization.use_dynamic_per_tensor_scale,
+        None,
+        output_weight.high_first,
     )
     assert output_weight.per_tensor_scale is not None
     scaling_type = F.ScalingType
@@ -1000,6 +1011,29 @@ def test_output_fold_supports_every_bounded_attention_variant(
         not in targets
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    graph.lint()
+
+
+def test_high_first_output_fold_preserves_order_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _quantized_attention_output_graph(
+        with_block_lengths=False,
+        with_coarse=False,
+        with_sparse_query_blocks=False,
+        high_first=True,
+    )
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    assert _fold_attention_output(graph)
+
+    fused = torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
+    node = next(node for node in graph.nodes if node.target is fused)
+    assert node.kwargs == {"high_first": True}
     graph.lint()
 
 

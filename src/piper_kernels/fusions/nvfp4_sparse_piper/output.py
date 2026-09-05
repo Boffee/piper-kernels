@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from piper_kernels.fusions.sparse_piper import _output as output_common
@@ -12,19 +14,24 @@ from . import _output
 _DEFAULT_QUERY_CHUNK_ROWS = _output.DEFAULT_QUERY_CHUNK_ROWS
 
 
+@dataclass(frozen=True, slots=True)
 class _StandardPreparation:
     """Ordinary NVFP4 preparation for the shared attention-output runner."""
 
-    @staticmethod
+    high_first: bool
+
     def prepare_static_out(
+        self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
         per_tensor_scale: torch.Tensor,
         out: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_backend.prepare_static_out(input, per_tensor_scale, out)
-
-
-_STANDARD_PREPARATION = _StandardPreparation()
+        return nvfp4_backend.prepare_static_out(
+            input,
+            per_tensor_scale,
+            out,
+            high_first=self.high_first,
+        )
 
 
 @torch.library.custom_op(
@@ -74,6 +81,8 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_weight_per_tensor_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         key,
@@ -117,7 +126,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _STANDARD_PREPARATION,
+        _StandardPreparation(high_first),
         block_lengths,
         block_mean,
         coarse_gate,
@@ -172,7 +181,10 @@ def _projected_query_attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_weight_per_tensor_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
+    del high_first
     return output_common.new_projected_output(
         key,
         logical_sequence_length,
@@ -219,6 +231,8 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_weight_per_tensor_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         query,
@@ -253,7 +267,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _STANDARD_PREPARATION,
+        _StandardPreparation(high_first),
         block_lengths,
         block_mean,
         coarse_gate,
@@ -299,7 +313,10 @@ def _attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_weight_per_tensor_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
+    del high_first
     return output_common.new_projected_output(
         query,
         logical_sequence_length,

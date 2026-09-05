@@ -12,6 +12,11 @@ SCALE_ROW_TILE = 128
 SCALE_COLUMN_TILE = 64
 
 
+def swap_packed_pairs(qdata: torch.Tensor) -> torch.Tensor:
+    """Exchange the two E2M1 values stored in every packed byte."""
+    return ((qdata & 0x0F) << 4) | (qdata >> 4)
+
+
 def qdata_shape(
     rows: int | torch.SymInt,
     features: int | torch.SymInt,
@@ -89,4 +94,5 @@ __all__ = [
     "prepare_activation_storage",
     "qdata_shape",
     "scale_shape",
+    "swap_packed_pairs",
 ]

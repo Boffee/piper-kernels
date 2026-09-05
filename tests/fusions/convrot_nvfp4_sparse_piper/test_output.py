@@ -57,6 +57,8 @@ def _arguments(
         activation_scale,
         False,
         group_size,
+        None,
+        False,
     )
     assert weight.per_tensor_scale is not None
     expected = F.scaled_mm(
@@ -144,6 +146,8 @@ def _padded_arguments(
         activation_scale,
         False,
         group_size,
+        None,
+        False,
     )
     expected = F.scaled_mm(
         input_qdata.view(torch.float4_e2m1fn_x2),
@@ -199,6 +203,8 @@ def _projected_gate_arguments(
         activation_scale,
         False,
         group_size,
+        None,
+        False,
     )
     with torch.no_grad():
         coarse_gate = convrot_nvfp4_ops.linear(
@@ -210,6 +216,7 @@ def _projected_gate_arguments(
             gate_bias,
             False,
             group_size,
+            False,
         ).view(1, sequence_length, 2, 128)
     coarse_key_blocks = (sequence_length + 63) // 64
     block_mean = torch.randn(
@@ -260,6 +267,25 @@ def test_attention_output_matches_materialized_convrot_linear(
 
     with torch.no_grad():
         actual = output._attention_output_op(*arguments, chunk_rows)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_high_first_attention_output_matches_low_first() -> None:
+    arguments, expected = _arguments(193, 64)
+    high_arguments = list(arguments)
+    qdata = high_arguments[14]
+    assert isinstance(qdata, torch.Tensor)
+    high_arguments[14] = ((qdata & 0x0F) << 4) | (qdata >> 4)
+
+    with torch.no_grad():
+        actual = output._attention_output_op(
+            *high_arguments,
+            128,
+            high_first=True,
+        )
 
     assert torch.equal(actual, expected)
 

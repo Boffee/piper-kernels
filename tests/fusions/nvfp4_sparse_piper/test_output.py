@@ -44,10 +44,13 @@ def _affine_nvfp4_linear(
             activation_scale,
             bias,
             False,
+            False,
         )
     input_qdata, input_scale, input_per_tensor_scale = _ops.prepare_input(
         input,
         activation_scale,
+        False,
+        None,
         False,
     )
     assert weight.per_tensor_scale is not None
@@ -303,7 +306,7 @@ def _projected_gate_arguments(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    gate_input = _ops.prepare_input(hidden, activation_scale, False)
+    gate_input = _ops.prepare_input(hidden, activation_scale, False, None, False)
     with torch.no_grad():
         coarse_gate = _ops.linear_prepared(
             *gate_input,
@@ -365,6 +368,25 @@ def test_attention_output_matches_accumulator_affine_boundary(
 
     assert actual.shape == (1, sequence_length, _OUTPUT_FEATURES)
     assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_high_first_attention_output_matches_low_first() -> None:
+    arguments, expected = _arguments(sequence_length=193, bias=True)
+    high_arguments = list(arguments)
+    qdata = high_arguments[14]
+    assert isinstance(qdata, torch.Tensor)
+    high_arguments[14] = ((qdata & 0x0F) << 4) | (qdata >> 4)
+
+    with torch.no_grad():
+        actual = output._attention_output_op(
+            *high_arguments,
+            128,
+            high_first=True,
+        )
+
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

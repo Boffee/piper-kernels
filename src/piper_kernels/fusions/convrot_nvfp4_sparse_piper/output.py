@@ -19,6 +19,7 @@ class _ConvRotPreparation:
     """ConvRot preparation for the shared NVFP4 attention-output runner."""
 
     group_size: int
+    high_first: bool
 
     def __post_init__(self) -> None:
         validate_group_size(self.group_size)
@@ -34,6 +35,7 @@ class _ConvRotPreparation:
             per_tensor_scale,
             self.group_size,
             out,
+            high_first=self.high_first,
         )
 
 
@@ -85,6 +87,8 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_weight_per_tensor_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         key,
@@ -128,7 +132,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _ConvRotPreparation(group_size),
+        _ConvRotPreparation(group_size, high_first),
         block_lengths,
         block_mean,
         coarse_gate,
@@ -184,7 +188,10 @@ def _projected_query_attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_weight_per_tensor_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
+    del high_first
     validate_group_size(group_size)
     input_features = 2 * weight_qdata.shape[1]
     if isinstance(input_features, int) and input_features % group_size:
@@ -239,6 +246,8 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_weight_per_tensor_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         query,
@@ -273,7 +282,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _ConvRotPreparation(group_size),
+        _ConvRotPreparation(group_size, high_first),
         block_lengths,
         block_mean,
         coarse_gate,
@@ -320,7 +329,10 @@ def _attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_weight_per_tensor_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    *,
+    high_first: bool = False,
 ) -> torch.Tensor:
+    del high_first
     validate_group_size(group_size)
     input_features = 2 * weight_qdata.shape[1]
     if isinstance(input_features, int) and input_features % group_size:

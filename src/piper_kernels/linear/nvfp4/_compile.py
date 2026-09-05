@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import partial
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -23,7 +24,7 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from . import _compile_fx, _layout, _ops, _validation
 from . import triton as nvfp4_triton
 
-_COMPILE_PASS_VERSION = "nvfp4-compile-v2"
+_COMPILE_PASS_VERSION = "nvfp4-compile-v3"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -52,6 +53,7 @@ class _PreparationRule:
         preparation_key = (
             operands.activation_per_tensor_scale,
             operands.dynamic_activation_scale,
+            operands.high_first,
         )
         return family_key, preparation_key
 
@@ -67,6 +69,7 @@ class _PreparationRule:
             operands.input,
             operands.activation_per_tensor_scale,
             operands.dynamic_activation_scale,
+            high_first=operands.high_first,
         )
 
     def replace(
@@ -86,7 +89,11 @@ _PREPARATION_RULES = (_PreparationRule(),)
 _input_activation_patterns = PatternMatcherPass("nvfp4_input_activations")
 
 
-def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
+def _linear_pattern(
+    input_pattern: CallFunction,
+    *,
+    with_high_first: bool,
+) -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.nvfp4_linear.default,
         input_pattern,
@@ -96,6 +103,7 @@ def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
         KeywordArg("activation_per_tensor_scale"),
         KeywordArg("bias"),
         KeywordArg("dynamic_activation_scale"),
+        *((KeywordArg("high_first"),) if with_high_first else ()),
     )
 
 
@@ -153,6 +161,7 @@ def _replace_input_activation_and_linear(
             operands.activation_per_tensor_scale,
             operands.dynamic_activation_scale,
             activation_fn,
+            operands.high_first,
         )
         replacement = _compile_fx.emit_prepared_linear(graph, prepared, operands)
     replacement.meta = original.meta.copy()
@@ -173,20 +182,25 @@ def _replace_packed_swiglu(
     )
 
 
-for _promote_gate in (None, False, True):
-    for _reverse_multiply in (False, True):
-        register_graph_pattern(
-            input_activation_compile.packed_swiglu_pattern(
-                _linear_pattern,
-                promote_gate=_promote_gate,
-                reverse_multiply=_reverse_multiply,
-            ),
-            extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
-                match,
-                promote_gate=promote_gate,
-            ),
-            pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
-        )(_replace_packed_swiglu)
+for _with_high_first in (False, True):
+    _linear_pattern_variant = partial(
+        _linear_pattern,
+        with_high_first=_with_high_first,
+    )
+    for _promote_gate in (None, False, True):
+        for _reverse_multiply in (False, True):
+            register_graph_pattern(
+                input_activation_compile.packed_swiglu_pattern(
+                    _linear_pattern_variant,
+                    promote_gate=_promote_gate,
+                    reverse_multiply=_reverse_multiply,
+                ),
+                extra_check=lambda match, promote_gate=_promote_gate: _valid_packed_swiglu(
+                    match,
+                    promote_gate=promote_gate,
+                ),
+                pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_packed_swiglu)
 
 
 def _replace_gelu_tanh(
@@ -201,18 +215,23 @@ def _replace_gelu_tanh(
     )
 
 
-for _promote_input in (False, True):
-    register_graph_pattern(
-        input_activation_compile.gelu_tanh_pattern(
-            _linear_pattern,
-            promote_input=_promote_input,
-        ),
-        extra_check=lambda match, promote_input=_promote_input: _valid_gelu_tanh(
-            match,
-            promote_input=promote_input,
-        ),
-        pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
-    )(_replace_gelu_tanh)
+for _with_high_first in (False, True):
+    _linear_pattern_variant = partial(
+        _linear_pattern,
+        with_high_first=_with_high_first,
+    )
+    for _promote_input in (False, True):
+        register_graph_pattern(
+            input_activation_compile.gelu_tanh_pattern(
+                _linear_pattern_variant,
+                promote_input=_promote_input,
+            ),
+            extra_check=lambda match, promote_input=_promote_input: _valid_gelu_tanh(
+                match,
+                promote_input=promote_input,
+            ),
+            pass_dict=_input_activation_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_gelu_tanh)
 
 
 def _fold_input_activations(graph: torch.fx.Graph) -> bool:

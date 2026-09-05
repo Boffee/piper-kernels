@@ -22,6 +22,7 @@ def convert(
     per_tensor_scale: torch.Tensor | None,
     compute_per_tensor_scale: bool,
     is_swizzled_scales: bool,
+    high_first: bool,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
     per_tensor_scale_out: torch.Tensor | None = None,
 ) -> _Conversion:
@@ -107,6 +108,7 @@ def convert(
         qdata,
         scale,
         is_swizzled_scales=is_swizzled_scales,
+        high_first=high_first,
     )
     return qdata, scale, per_tensor_scale
 

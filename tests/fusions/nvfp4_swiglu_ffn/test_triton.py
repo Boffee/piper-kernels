@@ -36,6 +36,16 @@ def test_static_chunked_ffn_matches_down_affine_reference(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_high_first_chunked_ffn_matches_materialized_reference() -> None:
+    operands = make_operands(rows=129, dynamic=False, high_first=True, seed=908)
+
+    actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
+
+    assert torch.equal(actual, down_affine_reference(operands))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("chunk_rows", [128, 256])
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
 def test_dynamic_chunked_ffn_retains_dense_accuracy(
@@ -74,9 +84,15 @@ def test_up_preparation_uses_global_scale_and_bounded_chunks(
         input: torch.Tensor,  # noqa: A002
         per_tensor_scale: torch.Tensor,
         out: tuple[torch.Tensor, torch.Tensor],
+        high_first: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prepared_rows.append(input.shape[0])
-        return original_prepare_static_out(input, per_tensor_scale, out)
+        return original_prepare_static_out(
+            input,
+            per_tensor_scale,
+            out,
+            high_first=high_first,
+        )
 
     monkeypatch.setattr(nvfp4_backend, "dynamic_scale", dynamic_scale)
     monkeypatch.setattr(nvfp4_backend, "prepare_static_out", prepare_static_out)

@@ -77,6 +77,25 @@ def test_from_torchao_reuses_storage_and_attaches_rotation_metadata() -> None:
         ConvRotNVFP4Tensor.from_torchao(source)
 
 
+def test_high_first_preserves_storage_and_rotation_metadata() -> None:
+    canonical = torch.arange(32, dtype=torch.uint8).reshape(1, 32)
+    high_first = (((canonical & 0x0F) << 4) | (canonical >> 4)).to(torch.uint8)
+
+    weight = ConvRotNVFP4Tensor(
+        high_first,
+        torch.ones(4, dtype=torch.float8_e4m3fn),
+        16,
+        torch.bfloat16,
+        64,
+        high_first=True,
+    )
+
+    assert type(weight) is ConvRotNVFP4Tensor
+    assert weight.group_size == 64
+    assert weight.qdata is high_first
+    assert weight.high_first is True
+
+
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: int) -> None:
     torch.manual_seed(610 + group_size)
@@ -206,6 +225,7 @@ def test_explicit_dtype_copy_duplicates_packed_storage() -> None:
 
 def test_tensor_flatten_round_trip_preserves_storage_and_metadata() -> None:
     source = _meta_weight(group_size=64)
+    source.high_first = True
     names, metadata = source.__tensor_flatten__()
     tensors = {name: getattr(source, name) for name in names}
 
@@ -227,6 +247,7 @@ def test_tensor_flatten_round_trip_preserves_storage_and_metadata() -> None:
     assert rebuilt.is_swizzled_scales is source.is_swizzled_scales
     assert rebuilt.use_triton_kernel is source.use_triton_kernel
     assert rebuilt.act_quant_kwargs == source.act_quant_kwargs
+    assert rebuilt.high_first is True
 
 
 def test_stable_hash_distinguishes_rotation_groups() -> None:
@@ -738,6 +759,31 @@ def test_cuda_linear_matches_materialized_rotation(dynamic: bool, group_size: in
         actual.float() - torchao_reference.float()
     ).norm() / torchao_reference.float().norm()
     assert relative_l2 < 0.02
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_high_first_linear_matches_low_first() -> None:
+    torch.manual_seed(615)
+    activation, _torchao_weight, low, bias = _cuda_case(False, 64)
+    high = ConvRotNVFP4Tensor(
+        ((low.qdata & 0x0F) << 4) | (low.qdata >> 4),
+        low.scale,
+        low.block_size,
+        low.orig_dtype,
+        low.group_size,
+        low.per_tensor_scale,
+        low.act_per_tensor_scale,
+        low.is_swizzled_scales,
+        low.use_triton_kernel,
+        low.act_quant_kwargs,
+        high_first=True,
+    )
+
+    actual = F.linear(activation, high, bias)
+    expected = F.linear(activation, low, bias)
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 0.002
 
 
 @pytest.mark.gpu

@@ -35,7 +35,7 @@ def _linear(
 ) -> torch.fx.Node:
     node = graph.call_function(
         torch.ops.piper_kernels.nvfp4_linear.default,
-        args=(input, qdata, scale, global_scale, activation_scale, None, False),
+        args=(input, qdata, scale, global_scale, activation_scale, None, False, False),
     )
     input_value = input.meta["val"]
     qdata_value = qdata.meta["val"]
@@ -163,6 +163,7 @@ def test_pass_folds_packed_swiglu_into_activated_preparation(dynamic: bool) -> N
             activation_scale,
             None,
             dynamic,
+            False,
         ),
     )
     projected.meta["val"] = torch.empty(17, 128, device="meta", dtype=torch.bfloat16)
@@ -178,7 +179,7 @@ def test_pass_folds_packed_swiglu_into_activated_preparation(dynamic: bool) -> N
     prepare = next(
         node for node in calls if node.target == torch.ops.piper_kernels.nvfp4_prepare_input.default
     )
-    assert prepare.args == (packed, activation_scale, dynamic, "swiglu")
+    assert prepare.args == (packed, activation_scale, dynamic, "swiglu", False)
     graph.lint()
 
 

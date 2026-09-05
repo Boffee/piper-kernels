@@ -41,6 +41,7 @@ def _attention_output_pattern(
     with_block_lengths: bool,
     with_coarse: bool,
     with_sparse_query_blocks: bool,
+    with_high_first: bool,
 ) -> CallFunction:
     return CallFunction(
         torch.ops.piper_kernels.nvfp4_linear.default,
@@ -55,6 +56,7 @@ def _attention_output_pattern(
         KeywordArg("output_activation_scale"),
         KeywordArg("output_bias"),
         False,
+        *((KeywordArg("output_high_first"),) if with_high_first else ()),
     )
 
 
@@ -267,6 +269,7 @@ def _replace_attention_output_with_target(
     projected_query_target: Callable[..., torch.Tensor],
     projection_arguments: tuple[Argument, ...],
     query_chunk_rows: int,
+    high_first: Argument,
 ) -> None:
     """Emit one NVFP4 output operator with a materialized or deferred gate."""
     original = match.output_node()
@@ -308,6 +311,7 @@ def _replace_attention_output_with_target(
                 *bounded_arguments,
                 *gate_arguments,
             ),
+            kwargs={"high_first": high_first},
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -328,22 +332,25 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
             match.kwargs["output_bias"],
         ),
         output._DEFAULT_QUERY_CHUNK_ROWS,
+        match.kwargs.get("output_high_first", False),
     )
 
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_attention_output")
-for _with_block_lengths in (False, True):
-    for _with_coarse in (False, True):
-        for _with_sparse_query_blocks in (False, True):
-            register_graph_pattern(
-                _attention_output_pattern(
-                    with_block_lengths=_with_block_lengths,
-                    with_coarse=_with_coarse,
-                    with_sparse_query_blocks=_with_sparse_query_blocks,
-                ),
-                extra_check=_valid_attention_output,
-                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-            )(_replace_attention_output)
+for _with_high_first in (False, True):
+    for _with_block_lengths in (False, True):
+        for _with_coarse in (False, True):
+            for _with_sparse_query_blocks in (False, True):
+                register_graph_pattern(
+                    _attention_output_pattern(
+                        with_block_lengths=_with_block_lengths,
+                        with_coarse=_with_coarse,
+                        with_sparse_query_blocks=_with_sparse_query_blocks,
+                        with_high_first=_with_high_first,
+                    ),
+                    extra_check=_valid_attention_output,
+                    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+                )(_replace_attention_output)
 
 
 def _fold_attention_output(graph: torch.fx.Graph) -> bool:
