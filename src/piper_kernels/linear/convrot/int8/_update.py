@@ -8,8 +8,7 @@ from piper_kernels.linear.convrot._update import (
     validate_update_operands,
 )
 
-from . import reference
-from ._backend import supports_triton, triton_backend
+from . import _backend, _ops, reference
 
 
 def _validate_storage(
@@ -106,9 +105,8 @@ def add_(
     if alpha_float == 0:
         return
     seed = _seed_argument(rounding_seed)
-    if supports_triton(qdata):
-        assert triton_backend is not None
-        triton_backend.add_(
+    if _backend.select_add(qdata) is not None:
+        _ops.add_(
             qdata,
             scale,
             update,
@@ -148,9 +146,8 @@ def addmm_(
     if beta_float == 1 and alpha_float == 0:
         return
     seed = _seed_argument(rounding_seed)
-    if supports_triton(qdata):
-        assert triton_backend is not None
-        triton_backend.addmm_(
+    if _backend.select_addmm(qdata) is not None:
+        _ops.addmm_(
             qdata,
             scale,
             mat1,

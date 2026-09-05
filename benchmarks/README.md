@@ -7,6 +7,11 @@ it is not part of the installed `piper_kernels` API.
 
 ## Common provider and timing model
 
+For the modular AMD ConvRot INT8 backend, use `benchmark_convrot_int8_rocm.py`
+with ROCm PyTorch. It reports allocation-free preparation/GEMM, full linear,
+dense INT8 TOPS, and separate cache-flushed/graph timings.
+The older ConvRot phase/tuning utilities below still expose NVIDIA launch policy.
+
 A provider has two explicit callables:
 
 - `prepare()` performs per-invocation preprocessing such as quantization, packing, or
