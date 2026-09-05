@@ -248,7 +248,9 @@ def test_fused_rotation_quantization_matches_split_path_exactly(
         actual_scale,
         256,
         dtype_code,
-        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
+        num_warps=select_execution_plan(
+            AcceleratorTarget.from_device(activation.device), in_features=in_features
+        ).fused_num_warps,
     )
 
     assert torch.equal(actual_qdata, expected_qdata)
@@ -296,7 +298,9 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
         256,
         dtype_code,
         activation_fn="swiglu",
-        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
+        num_warps=select_execution_plan(
+            AcceleratorTarget.from_device(activation.device), in_features=in_features
+        ).fused_num_warps,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -349,7 +353,9 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
         256,
         dtype_code,
         activation_fn="gelu_tanh",
-        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
+        num_warps=select_execution_plan(
+            AcceleratorTarget.from_device(raw_input.device), in_features=in_features
+        ).fused_num_warps,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -374,10 +380,10 @@ def test_dtype_code(dtype: torch.dtype, expected: int) -> None:
     assert triton_backend.dtype_code(dtype) == expected
 
 
-def test_default_linear_execution_plan_supports_meta_weight() -> None:
+def test_default_linear_execution_plan_accepts_explicit_target_for_meta_weight() -> None:
     qdata = torch.empty((96, 512), dtype=torch.int8, device="meta")
 
-    plan = triton_backend.default_execution_plan(qdata)
+    plan = triton_backend.default_execution_plan(qdata, target=AcceleratorTarget("cuda", "sm120"))
 
     assert plan.fuse_rotation_quantization
     assert plan.matmul_block_m == 128
@@ -669,6 +675,7 @@ def test_fused_preparation_rejects_unsupported_row_width() -> None:
             256,
             triton_backend.dtype_code(activation.dtype),
             num_warps=4,
+            target=AcceleratorTarget("cuda", "sm120"),
         )
 
 

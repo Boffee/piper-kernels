@@ -7,6 +7,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Separated base ConvRot INT8 custom-op registration from NVIDIA kernels and launch policy.
+  Eager and compiler-emitted operations resolve implementations through the same boundary;
+  weight updates, GGUF conversion, and prepared-input means select support independently.
+  NVIDIA launch constraints are separate from shared plan values. Existing custom-op names,
+  NVIDIA schedules, and portable fallbacks are preserved; no ROCm backend is enabled.
+
 - Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from
   `convrot_swiglu_ffn`, `convrot_sparse_piper`, and `convrot_sage_qk` to their explicit
   `convrot_int8_*` counterparts without compatibility aliases. INT8 benchmark entry points now

@@ -5,8 +5,7 @@ import torch
 from piper_kernels.linear import _bias
 from piper_kernels.linear._input_activations import input_activation_width
 
-from . import reference
-from ._backend import supports_triton, triton_backend
+from . import _backend, _ops, reference
 
 
 def _validate_linear(
@@ -74,9 +73,8 @@ def _run_linear(
     activation_fn: str | None,
 ) -> torch.Tensor:
     """Run a validated ConvRot linear through the selected backend."""
-    if supports_triton(input):
-        assert triton_backend is not None
-        return triton_backend.linear(
+    if _backend.select_linear_backend(input) is not None:
+        return _ops.linear(
             input,
             qdata,
             scale,

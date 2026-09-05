@@ -35,6 +35,7 @@ from lib.triton_inspection import (
     inspect_provider,
 )
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import (
     apply_input_activation,
 )
@@ -243,10 +244,12 @@ class _PreparationConfiguration(TypedDict):
 
 
 def _select_preparation_configuration(
+    target: AcceleratorTarget,
     in_features: int,
 ) -> _PreparationConfiguration:
     """Project preparation choices from the production execution plan."""
     plan = convrot_int8_policy.select_execution_plan(
+        target,
         in_features=in_features,
     )
     return {
@@ -546,10 +549,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     benchmark_output, compiler_output = _output_targets(args)
     _validate_args(args)
+    target = AcceleratorTarget.from_device(torch.device("cuda"))
     dtype = convrot_dtype(args.dtype)
     comfy_kitchen = _load_comfy_kitchen_cuda() if args.compare_comfy_kitchen else None
     inspection_configuration = (
         _select_preparation_configuration(
+            target,
             args.in_features[0],
         )
         if _compiler_requested(args)
@@ -574,6 +579,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     records: list[BenchmarkRecord] = []
     for in_features in args.in_features:
         preparation_configuration = _select_preparation_configuration(
+            target,
             in_features,
         )
         results = _benchmark_width(

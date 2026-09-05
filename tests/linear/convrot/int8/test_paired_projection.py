@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from piper_kernels.linear.convrot.int8 import triton as backend
+from piper_kernels.linear.convrot.int8._backend import require_linear_backend
 
 
 @pytest.mark.gpu
@@ -44,12 +45,13 @@ def test_paired_projection_matches_separate(shape, dtype, bias_dtypes) -> None:
     )
     arguments = (qdata, scale, weights[0], scales[0], biases[0], dtype, plan)
     second = (weights[1], scales[1], biases[1])
-    actual = backend._execute_prepared_linear(*arguments, second_projection=second)
+    implementation = require_linear_backend(qdata)
+    actual = implementation.linear_prepared(*arguments[:-1], second_projection=second)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     storage = torch.full((rows, 2 * width + 32), torch.nan, device="cuda", dtype=dtype)
     out = storage[:, 16:-16]
-    result = backend._execute_prepared_linear(*arguments, second_projection=second, out=out)
+    result = implementation.linear_prepared(*arguments[:-1], second_projection=second, out=out)
     assert result is out
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
     assert storage[:, :16].isnan().all()

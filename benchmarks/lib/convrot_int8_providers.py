@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _policy as convrot_int8_policy
 from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
@@ -53,11 +54,12 @@ def make_convrot_int8_workload(
     config: ConvRotConfig,
     *,
     device: torch.device,
+    target: AcceleratorTarget | None = None,
 ) -> ConvRotInt8Workload:
-    """Create shared tensors and resolve the production execution plan."""
+    """Create tensors and resolve policy; an explicit target permits offline inspection."""
     inputs = make_convrot_inputs(shape, config, device=device)
     qdata = inputs[1]
-    production_plan = convrot_int8_backend.default_execution_plan(qdata)
+    production_plan = convrot_int8_backend.default_execution_plan(qdata, target=target)
     return ConvRotInt8Workload(
         shape=shape,
         config=config,
