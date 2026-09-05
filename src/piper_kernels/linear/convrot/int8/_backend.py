@@ -4,8 +4,9 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from . import _generic
 from ._amd import policy as amd_policy
-from ._interfaces import Add, Addmm, DequantizedMean, GGUFConvert, LinearBackend
+from ._interfaces import Add, Addmm, DequantizedMean, GGUFConvert, LinearBackend, PreparationBackend
 from ._nvidia import policy as nvidia_policy
 
 try:
@@ -42,27 +43,18 @@ def require_linear_backend(input: torch.Tensor) -> LinearBackend:  # noqa: A002
 
 
 def select_add(input: torch.Tensor) -> Add | None:  # noqa: A002
-    """Select dense weight updates independently of linear execution."""
-    if _nvidia_backend is None and _amd_backend is None:
-        return None
-    target = AcceleratorTarget.from_device(input.device)
-    if _nvidia_backend is not None and nvidia_policy.supports_target(target):
-        return _nvidia_backend.add_
-    if _amd_backend is not None and amd_policy.supports_target(target):
-        return _amd_backend.add_
-    return None
+    """Use shared accelerator updates; CPU keeps its directly traced reference."""
+    return _generic.add_ if input.device.type not in ("cpu", "meta") else None
 
 
 def select_addmm(input: torch.Tensor) -> Addmm | None:  # noqa: A002
-    """Select low-rank weight updates independently of linear execution."""
-    if _nvidia_backend is None and _amd_backend is None:
-        return None
-    target = AcceleratorTarget.from_device(input.device)
-    if _nvidia_backend is not None and nvidia_policy.supports_target(target):
-        return _nvidia_backend.addmm_
-    if _amd_backend is not None and amd_policy.supports_target(target):
-        return _amd_backend.addmm_
-    return None
+    """Do not require an INT8 matrix policy for a floating-point update product."""
+    return _generic.addmm_ if input.device.type not in ("cpu", "meta") else None
+
+
+def select_preparation_backend(input: torch.Tensor) -> PreparationBackend:  # noqa: A002
+    """Prefer tuned preparation, with generic execution on other devices."""
+    return select_linear_backend(input) or _generic
 
 
 def select_gguf_converter(input: torch.Tensor) -> GGUFConvert | None:  # noqa: A002

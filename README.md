@@ -175,7 +175,14 @@ prepared/paired projections; caller-owned output buffers; dense and low-rank wei
 and base `torch.compile` preparation sharing. FP16, BF16, and FP32 are supported.
 The RX 9070 XT (`gfx1201`) has on-device validation. `gfx942`, `gfx1100`, `gfx1151`,
 and `gfx1200` have compiler coverage only, not hardware correctness or performance validation.
-Unknown AMD architectures retain the portable reference.
+Unknown AMD architectures retain the portable reference for linear execution.
+
+Rotation, quantization, dequantization, and weight-update arithmetic are shared.
+Standalone preparation and updates do not require a tuned INT8 GEMM target: they
+use conservative shared Triton launchers when the installed driver can handle the
+device, and PyTorch otherwise. Wide rows use the PyTorch path to bound kernel resources.
+These generic paths require the device's underlying operations and dtypes, not a GPU-model
+allowlist; tuned preparation and GEMM policies remain accelerator-specific.
 
 AMD fused preparation supports widths through 16,384; larger widths use separate rotation
 and quantization. RDNA4 uses BF16 ragged-row chunks and its own measured GEMM schedule.

@@ -16,6 +16,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Shared base INT8 preparation and weight updates independently of tuned matrix support.
+  AMD and NVIDIA use the same update launchers; standalone preparation and updates can
+  use a generic Triton path or PyTorch fallback without an architecture allowlist.
+
 - Separated base ConvRot INT8 custom-op registration from NVIDIA kernels and launch policy.
   Eager and compiler-emitted operations resolve implementations through the same boundary;
   weight updates, GGUF conversion, and prepared-input means select support independently.

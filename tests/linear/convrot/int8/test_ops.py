@@ -146,6 +146,7 @@ def test_fake_schemas_need_no_implementation(monkeypatch):
         raise AssertionError("fake propagation selected an implementation")
 
     monkeypatch.setattr(_backend, "select_linear_backend", unexpected_selection)
+    monkeypatch.setattr(_backend, "select_preparation_backend", unexpected_selection)
     monkeypatch.setattr(_backend, "select_add", unexpected_selection)
     monkeypatch.setattr(_backend, "select_addmm", unexpected_selection)
     value = torch.empty(2, 3, 64, device="meta", dtype=torch.bfloat16)

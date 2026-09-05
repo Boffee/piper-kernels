@@ -78,7 +78,7 @@ importlib.util.find_spec = find_spec
 
 import torch
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
-from piper_kernels.linear.convrot.int8 import _backend, _ops
+from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
 
 weight = ConvRotInt8Tensor.from_quantized(
     torch.ones(7, 32, dtype=torch.int8), torch.ones(7, 1),
@@ -89,6 +89,11 @@ assert result.shape == (2, 7)
 assert _backend.select_linear_backend(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
+assert _generic._triton_backend is None
+prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
+assert prepared.shape == (2, 32) and scales.shape == (2,)
+_generic.add_(weight.qdata, weight.scale, torch.ones(7, 32), 16, 1.0)
+assert torch.isfinite(weight.dequantize()).all()
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 

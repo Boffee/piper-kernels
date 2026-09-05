@@ -45,7 +45,9 @@ def prepare_input(
     activation_fn: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch the stable prepare_input operation to a supported implementation."""
-    return _backend.require_linear_backend(input).prepare_input(input, group_size, activation_fn)
+    return _backend.select_preparation_backend(input).prepare_input(
+        input, group_size, activation_fn
+    )
 
 
 @prepare_input.register_fake

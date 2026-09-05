@@ -1,4 +1,4 @@
-"""ROCm ConvRot INT8 preparation, projection, and weight-update launchers."""
+"""ROCm ConvRot INT8 preparation and projection; weight updates are shared."""
 
 # pyright: reportCallIssue=false
 
@@ -10,16 +10,16 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from piper_kernels._triton.stochastic_quantization import seed_argument
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation, input_activation_width
 from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 from piper_kernels.linear.convrot import triton as convrot_backend
 
+from .._generic import add_ as add_  # noqa: PLC0414 - preserve backend imports
+from .._generic import addmm_ as addmm_  # noqa: PLC0414
 from .._kernels.triton import (
     _int8_matmul_kernel,
     _normalize_for_int8,
-    _requantize_update_rows_kernel,
     int8_scale_from_max,
     quantize_rows_kernel,
 )
@@ -743,111 +743,4 @@ def linear_prepared(
         plan,
         out=out,
         second_projection=second_projection,
-    )
-
-
-def addmm_(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    group_size: int,
-    beta: float,
-    alpha: float,
-    rounding_seed: int | None = None,
-) -> None:
-    """Apply an addmm update in the rotated basis and requantize the weight in place."""
-    has_update = alpha != 0 and mat1.shape[1] != 0
-    if has_update:
-        mat2_contiguous = mat2.contiguous()
-        rotated_mat2 = torch.empty_like(mat2_contiguous)
-        rotate_input(
-            mat2_contiguous,
-            rotated_mat2,
-            group_size,
-            num_warps=4,
-        )
-        update = torch.mm(mat1, rotated_mat2)
-    else:
-        update = qdata
-
-    _requantize_update_(
-        qdata,
-        scale,
-        update,
-        mat1.dtype,
-        beta,
-        alpha,
-        rounding_seed,
-        has_update=has_update,
-    )
-
-
-def _requantize_update_(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    update: torch.Tensor,
-    logical_dtype: torch.dtype,
-    beta: float,
-    alpha: float,
-    rounding_seed: int | None,
-    *,
-    has_update: bool,
-) -> None:
-    """Merge one rotated update while refilling the existing rowwise storage."""
-    out_features, in_features = qdata.shape
-    requant_block = max(128, triton.next_power_of_2(in_features))
-    _requantize_update_rows_kernel[(out_features,)](
-        qdata,
-        scale,
-        update,
-        in_features,
-        qdata.stride(0),
-        qdata.stride(1),
-        scale.stride(0),
-        update.stride(0),
-        update.stride(1),
-        beta,
-        alpha,
-        seed_argument(rounding_seed),
-        block_size=requant_block,
-        logical_dtype_code=dtype_code(logical_dtype),
-        has_base=beta != 0,
-        has_update=has_update,
-        stochastic=rounding_seed is not None,
-        reciprocal_scale=True,
-        num_warps=8,
-    )
-
-
-def add_(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    update: torch.Tensor,
-    group_size: int,
-    alpha: float,
-    rounding_seed: int | None = None,
-) -> None:
-    """Apply a dense logical update and requantize the ConvRot weight in place."""
-    has_update = alpha != 0
-    if has_update:
-        update_contiguous = update.contiguous()
-        rotated_update = torch.empty_like(update_contiguous)
-        rotate_input(
-            update_contiguous,
-            rotated_update,
-            group_size,
-            num_warps=4,
-        )
-    else:
-        rotated_update = qdata
-    _requantize_update_(
-        qdata,
-        scale,
-        rotated_update,
-        update.dtype,
-        1.0,
-        alpha,
-        rounding_seed,
-        has_update=has_update,
     )

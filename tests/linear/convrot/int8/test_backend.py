@@ -1,6 +1,6 @@
 """Implementation selection preserves ConvRot INT8 dispatch and fallback contracts."""
 
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -54,12 +54,12 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
 def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architecture):
     target = AcceleratorTarget("cuda", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    value = torch.empty(1)
+    value = SimpleNamespace(device=torch.device("cuda"))
 
     assert _backend.select_gguf_converter(value) is nvidia._convert_gguf_out
     assert _backend.select_dequantized_mean(value) is nvidia.dequantized_input_mean
-    assert (_backend.select_add(value) is not None) == (architecture != "sm70")
-    assert (_backend.select_addmm(value) is not None) == (architecture != "sm70")
+    assert _backend.select_add(value) is not None
+    assert _backend.select_addmm(value) is not None
 
 
 def test_nvidia_interface_forwards_preparation_and_projection_buffers(monkeypatch):
@@ -113,9 +113,11 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
         assert actual is expected_output
         execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu")
     elif operation == "add_":
+        monkeypatch.setattr(_backend, "select_add", lambda value: execute)
         _update.add_(qdata, scale, torch.float32, 16, update, alpha=2, rounding_seed=2**64 - 1)
         execute.assert_called_once_with(qdata, scale, update, 16, 2.0, -1)
     else:
+        monkeypatch.setattr(_backend, "select_addmm", lambda value: execute)
         _update.addmm_(
             qdata, scale, torch.float32, 16, mat1, mat2, beta=3, alpha=2, rounding_seed=2**64 - 1
         )

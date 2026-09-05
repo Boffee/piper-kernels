@@ -9,7 +9,20 @@ type PreparedInput = tuple[torch.Tensor, torch.Tensor]
 type SecondProjection = tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
 
 
-class LinearBackend(Protocol):
+class PreparationBackend(Protocol):
+    """Input preparation can run without an optimized matrix implementation."""
+
+    def prepare_input(
+        self,
+        input: torch.Tensor,  # noqa: A002
+        group_size: int,
+        activation_fn: str | None = None,
+        *,
+        out: PreparedInput | None = None,
+    ) -> PreparedInput: ...
+
+
+class LinearBackend(PreparationBackend, Protocol):
     """A compatible linear, preparation, and projection implementation.
 
     Prepared inputs contain contiguous INT8 data of shape ``[..., K]`` and FP32
@@ -33,15 +46,6 @@ class LinearBackend(Protocol):
         group_size: int,
         activation_fn: str | None = None,
     ) -> torch.Tensor: ...
-
-    def prepare_input(
-        self,
-        input: torch.Tensor,  # noqa: A002
-        group_size: int,
-        activation_fn: str | None = None,
-        *,
-        out: PreparedInput | None = None,
-    ) -> PreparedInput: ...
 
     def linear_prepared(
         self,

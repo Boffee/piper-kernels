@@ -2,6 +2,7 @@
 
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -14,7 +15,7 @@ from piper_kernels.linear.convrot import (
     convrot_int8_compile_options,
     convrot_int8_linear,
 )
-from piper_kernels.linear.convrot.int8 import _backend, reference
+from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
 
@@ -30,7 +31,7 @@ _gpu = pytest.mark.skipif(
 def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architecture):
     target = AcceleratorTarget("hip", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    value = torch.empty(1)
+    value = SimpleNamespace(device=torch.device("cuda"))
     assert _backend.select_linear_backend(value) is amd
     assert _backend.select_add(value) is amd.add_
     assert _backend.select_addmm(value) is amd.addmm_
@@ -59,10 +60,11 @@ def test_amd_missing_runtime_falls_back(monkeypatch):
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
-    value = torch.empty(1)
+    value = SimpleNamespace(device=torch.device("cuda"))
     assert _backend.select_linear_backend(value) is None
-    assert _backend.select_add(value) is None
-    assert _backend.select_addmm(value) is None
+    assert _backend.select_preparation_backend(value) is _generic
+    assert _backend.select_add(value) is _generic.add_
+    assert _backend.select_addmm(value) is _generic.addmm_
 
 
 @pytest.mark.parametrize(
