@@ -5,13 +5,25 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added a modular Linux ROCm backend for base ConvRot INT8 preparation, linear and
+  prepared/paired projections, dense and low-rank updates, and compiler preparation sharing.
+  RX 9070 XT (`gfx1201`) has on-device validation; `gfx942`, `gfx1100`, `gfx1151`, and
+  `gfx1200` have offline compiler coverage only. Unknown AMD architectures use the reference.
+  GGUF conversion, prepared-input means, specialized FFN/attention fusions, attention, and
+  NVFP4 remain outside this ROCm integration.
+
 ### Changed
 
 - Separated base ConvRot INT8 custom-op registration from NVIDIA kernels and launch policy.
   Eager and compiler-emitted operations resolve implementations through the same boundary;
   weight updates, GGUF conversion, and prepared-input means select support independently.
   NVIDIA launch constraints are separate from shared plan values. Existing custom-op names,
-  NVIDIA schedules, and portable fallbacks are preserved; no ROCm backend is enabled.
+  NVIDIA schedules, and portable fallbacks are preserved. Portable INT8 arithmetic is shared
+  by accelerator-owned launchers; AMD retains its own preparation and group-8 RDNA4 policy.
+- Use the Linux PyTorch distribution's matching CUDA or ROCm Triton instead of pinning a
+  competing Linux Triton version in Piper's extra. Windows retains `triton-windows` 3.7.
 
 - Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from
   `convrot_swiglu_ffn`, `convrot_sparse_piper`, and `convrot_sage_qk` to their explicit
