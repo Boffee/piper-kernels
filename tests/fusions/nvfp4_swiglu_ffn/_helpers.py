@@ -15,7 +15,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,44 +92,15 @@ def _weight(
 
 
 def materialized(operands: Operands) -> torch.Tensor:
-    """Run separate projections with the fused path's affine precision semantics."""
-
-    def project(linear: Linear) -> torch.Tensor:
-        if linear.bias is None or linear.bias.dtype is operands.input.dtype:
-            return precise_linear(operands.input, linear)
-        return nvfp4_ops.linear(operands.input, *linear.arguments())
-
-    gate = project(operands.gate)
-    value = project(operands.value)
-    return nvfp4_ops.linear(value * F.silu(gate), *operands.down.arguments())
+    """Run the three projections using independent portable PyTorch operations."""
+    gate = precise_linear(operands.input, operands.gate)
+    value = precise_linear(operands.input, operands.value)
+    return precise_linear(value * F.silu(gate), operands.down)
 
 
 def precise_linear(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
     """Reference affine accumulation in FP32 using the represented NVFP4 operands."""
-    qdata, scale, global_scale = nvfp4_ops._prepare_compiled(
-        input,
-        linear.activation_scale,
-        linear.dynamic,
-        high_first=linear.weight.high_first,
-    )
-    prepared = PiperNVFP4Tensor(
-        qdata,
-        scale,
-        16,
-        input.dtype,
-        global_scale,
-        is_swizzled_scales=True,
-        high_first=linear.weight.high_first,
-    )
-    return (
-        F.linear(
-            prepared.dequantize(torch.float32),
-            linear.weight.dequantize(torch.float32),
-            None if linear.bias is None else linear.bias.float(),
-        )
-        .to(input.dtype)
-        .reshape(*input.shape[:-1], linear.weight.shape[0])
-    )
+    return nvfp4_reference.linear(input, *linear.arguments())
 
 
 def make_operands(
@@ -174,9 +145,7 @@ def make_operands(
 
     gate = make_linear(gate_dense, input_scale)
     value = make_linear(value_dense, value_scale)
-    activated = nvfp4_ops.linear(input, *value.arguments()) * F.silu(
-        nvfp4_ops.linear(input, *gate.arguments())
-    )
+    activated = precise_linear(input, value) * F.silu(precise_linear(input, gate))
     down_scale = None if dynamic else per_tensor_amax_to_scale(activated.abs().amax())
     return Operands(input, gate, value, make_linear(down_dense, down_scale))
 

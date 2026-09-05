@@ -22,10 +22,9 @@ from piper_kernels.linear._dispatch import (
     _explicit_to_copy_args,
     apply_linear_autocast,
     bind_linear_arguments,
-    linear_autocast_dtype,
 )
 
-from . import _layout, _ops
+from . import _layout
 from ._typing import NVFP4Storage
 
 # TorchAO divides the global reciprocal by the FP8 block scale. Keep that
@@ -389,11 +388,6 @@ def _nvfp4_linear_dispatch(
     if bias is not None and not isinstance(bias, torch.Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)
 
-    requires_semantic_linear = (
-        input.dtype is torch.float16
-        or linear_autocast_dtype(input) is not None
-        or input.dtype is not weight.orig_dtype
-    )
     converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
     assert isinstance(converted_weight, PiperNVFP4Tensor)
     weight = converted_weight
@@ -403,11 +397,10 @@ def _nvfp4_linear_dispatch(
         if weight.high_first:
             return torch.nn.functional.linear(converted_input, weight.dequantize(), bias)
         return torchao_nvfp4_linear(func, types, normalized_args, {})
-    if not weight.high_first and not torch.compiler.is_compiling() and not requires_semantic_linear:
-        return torchao_nvfp4_linear(func, types, normalized_args, {})
-
     quantization = weight.act_quant_kwargs
     assert quantization is not None
+    from . import _ops  # noqa: PLC0415
+
     return _ops.linear(
         converted_input,
         weight.qdata,

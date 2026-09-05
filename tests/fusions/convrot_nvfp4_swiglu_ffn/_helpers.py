@@ -16,7 +16,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
-from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,11 +101,26 @@ def _activation_scale(input: torch.Tensor, group_size: int) -> torch.Tensor:  # 
     return per_tensor_amax_to_scale(rotate_groups(input, group_size).abs().amax())
 
 
+def precise_linear(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
+    """Run portable rotation, quantization and FP32 affine accumulation."""
+    return nvfp4_reference.linear(
+        input,
+        linear.weight.qdata,
+        linear.weight.scale,
+        linear.weight.per_tensor_scale,
+        linear.activation_scale,
+        linear.bias,
+        linear.dynamic,
+        linear.weight.high_first,
+        group_size=linear.weight.group_size,
+    )
+
+
 def materialized(operands: Operands) -> torch.Tensor:
-    """Run the equivalent three-linear semantic graph."""
-    gate = convrot_nvfp4_ops.linear(operands.input, *operands.gate.arguments())
-    value = convrot_nvfp4_ops.linear(operands.input, *operands.value.arguments())
-    return convrot_nvfp4_ops.linear(value * F.silu(gate), *operands.down.arguments())
+    """Run the equivalent three-linear graph using only portable PyTorch operations."""
+    gate = precise_linear(operands.input, operands.gate)
+    value = precise_linear(operands.input, operands.value)
+    return precise_linear(value * F.silu(gate), operands.down)
 
 
 def make_operands(  # noqa: PLR0913
@@ -161,9 +176,7 @@ def make_operands(  # noqa: PLR0913
 
     gate = make_linear(gate_dense, input_scale, source_group_size)
     value = make_linear(value_dense, value_scale, source_group_size)
-    activated = convrot_nvfp4_ops.linear(input, *value.arguments()) * F.silu(
-        convrot_nvfp4_ops.linear(input, *gate.arguments())
-    )
+    activated = precise_linear(input, value) * F.silu(precise_linear(input, gate))
     down_scale = None if dynamic else _activation_scale(activated, down_group_size)
     return Operands(
         input,

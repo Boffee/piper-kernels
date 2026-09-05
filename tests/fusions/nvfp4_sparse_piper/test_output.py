@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -18,7 +17,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
-from piper_kernels.linear.nvfp4 import _ops
+from piper_kernels.linear.nvfp4 import _ops, _projection, reference
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from ._helpers import exact_sm120_available, make_operands
@@ -34,18 +33,7 @@ def _affine_nvfp4_linear(
     activation_scale: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Apply the best available NVFP4 affine reference for one weight."""
-    if weight.per_tensor_scale is None:
-        return _ops.linear(
-            input,
-            weight.qdata,
-            weight.scale,
-            None,
-            activation_scale,
-            bias,
-            False,
-            False,
-        )
+    """Compare affine arithmetic independently on the integration test's prepared input."""
     input_qdata, input_scale, input_per_tensor_scale = _ops.prepare_input(
         input,
         activation_scale,
@@ -53,24 +41,16 @@ def _affine_nvfp4_linear(
         None,
         False,
     )
-    assert weight.per_tensor_scale is not None
-    scaling_type = F.ScalingType
-    swizzle_type = F.SwizzleType
-    fused_bias = bias if bias is None or bias.dtype is input.dtype else None
-    result = F.scaled_mm(
-        input_qdata.view(torch.float4_e2m1fn_x2),
-        weight.qdata.t().view(torch.float4_e2m1fn_x2),
-        [input_scale.view(torch.float8_e4m3fn), input_per_tensor_scale],
-        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
-        [weight.scale.view(torch.float8_e4m3fn), weight.per_tensor_scale],
-        [scaling_type.BlockWise1x16, scaling_type.TensorWise],
-        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        bias=fused_bias,
-        output_dtype=input.dtype,
+    result = reference.linear_prepared(
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight.qdata,
+        weight.scale,
+        weight.per_tensor_scale,
+        bias,
+        input.dtype,
     )
-    if bias is not None and fused_bias is None:
-        result = (result.float() + bias.float()).to(result.dtype)
     return result.reshape(*input.shape[:-1], weight.shape[0])
 
 
@@ -372,7 +352,8 @@ def test_attention_output_matches_accumulator_affine_boundary(
 
     assert actual.shape == (1, sequence_length, _OUTPUT_FEATURES)
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # GEMM can fuse FP32 multiply-add where the PyTorch reference rounds separately.
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.gpu
@@ -391,7 +372,7 @@ def test_attention_output_supports_mixed_precision_bias(
         actual = output._attention_output_op(*arguments, 128)
 
     assert actual.dtype is torch.bfloat16
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.gpu
@@ -449,8 +430,8 @@ def test_attention_output_supports_bounded_attention_features(
     torch.testing.assert_close(
         actual[:, valid_rows.flatten()],
         expected[:, valid_rows.flatten()],
-        atol=0,
-        rtol=0,
+        atol=1e-5,
+        rtol=2**-7,
     )
 
 
@@ -466,23 +447,45 @@ def test_attention_output_supports_blockwise_only_weight_scale() -> None:
     with torch.no_grad():
         actual = output._attention_output_op(*arguments, 128)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("weight_global_scale", [False, True])
+@pytest.mark.parametrize("sequence_length", [384, 1_024])
 def test_attention_output_projects_a_bounded_coarse_gate(
     weight_global_scale: bool,
+    sequence_length: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arguments, expected = _projected_gate_arguments(
-        sequence_length=1_024,
+        sequence_length=sequence_length,
         weight_global_scale=weight_global_scale,
     )
+    streams = set()
+    matmul = _projection._matmul_affine_out
+
+    def record_stream(*args, **kwargs):
+        streams.add(torch.cuda.current_stream().cuda_stream)
+        return matmul(*args, **kwargs)
+
+    monkeypatch.setattr(_projection, "_matmul_affine_out", record_stream)
+    # GPU contention exposes the native shared-alpha race between gate and
+    # output GEMMs; they must remain ordered even for short pipelines.
+    load_input = torch.randn((4096, 4096), device="cuda", dtype=torch.bfloat16)
+    load_output = torch.empty_like(load_input)
+    load_stream = torch.cuda.Stream()
+    load_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(load_stream):
+        for _ in range(8):
+            torch.mm(load_input, load_input, out=load_output)
 
     with torch.no_grad():
         actual = output._attention_output_op(*arguments)
+    torch.cuda.current_stream().wait_stream(load_stream)
 
+    assert len(streams) == 1
     torch.testing.assert_close(actual, expected, atol=2**-7, rtol=2**-7)
 
 

@@ -21,7 +21,7 @@ _NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_QDATA_BLOCK_SIZE)
 _PREPARE_BLOCKS = 32
-_EPILOGUE_BLOCK_SIZE = 256
+_BIAS_BLOCK_SIZE = 1_024
 _MEAN_BLOCK_M = 256
 _MEAN_BLOCK_K = 128
 _PROJECTION_BLOCK_N = 64
@@ -175,20 +175,18 @@ def _prepare_static_kernel(
 
 
 @triton.jit
-def _projection_epilogue_kernel(
+def _add_bias_kernel(
     input_ptr,
-    global_scale_ptr,
     bias_ptr,
     output_ptr,
     elements,
     features: tl.constexpr,
     input_row_stride: tl.constexpr,
+    bias_stride: tl.constexpr,
     output_row_stride: tl.constexpr,
-    apply_scale: tl.constexpr,
-    has_bias: tl.constexpr,
     block_size: tl.constexpr,
 ):
-    offsets = (tl.program_id(0) * block_size + tl.arange(0, block_size)).to(tl.int64)
+    offsets = tl.program_id(0).to(tl.int64) * block_size + tl.arange(0, block_size)
     valid = offsets < elements
     rows = offsets // features
     columns = offsets % features
@@ -197,10 +195,7 @@ def _projection_epilogue_kernel(
         mask=valid,
         other=0.0,
     ).to(tl.float32)
-    if apply_scale:
-        values *= tl.load(global_scale_ptr).to(tl.float32)
-    if has_bias:
-        values += tl.load(bias_ptr + columns, mask=valid, other=0.0).to(tl.float32)
+    values += tl.load(bias_ptr + columns * bias_stride, mask=valid, other=0.0).to(tl.float32)
     tl.store(output_ptr + rows * output_row_stride + columns, values, mask=valid)
 
 
@@ -508,33 +503,32 @@ def prepare_static_out(
     )
 
 
-def apply_projection_epilogue(
+def add_bias_out(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    global_scale: torch.Tensor | None,
-    bias: torch.Tensor | None,
+    bias: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
-    """Apply optional FP32 scale and bias terms into caller-owned storage."""
+    """Add bias in FP32 and cast into caller-owned storage, which may alias input."""
     if (
         input.ndim != 2
         or output.shape != input.shape
         or input.stride(1) != 1
         or output.stride(1) != 1
+        or bias.ndim != 1
+        or bias.shape[0] != input.shape[1]
     ):
-        raise ValueError("NVFP4 projection epilogue requires matching row-major matrices")
+        raise ValueError("NVFP4 bias addition requires matching row-major matrices and bias width")
     elements = input.numel()
-    _projection_epilogue_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
+    _add_bias_kernel[(triton.cdiv(elements, _BIAS_BLOCK_SIZE),)](
         input,
-        global_scale if global_scale is not None else input,
-        bias if bias is not None else input,
+        bias,
         output,
         elements,
         features=input.shape[-1],
         input_row_stride=input.stride(0),
+        bias_stride=bias.stride(0),
         output_row_stride=output.stride(0),
-        apply_scale=global_scale is not None,
-        has_bias=bias is not None,
-        block_size=_EPILOGUE_BLOCK_SIZE,
+        block_size=_BIAS_BLOCK_SIZE,
         num_warps=4,
     )
 
@@ -1082,8 +1076,8 @@ def _add_fake(
 
 __all__ = [
     "add_",
+    "add_bias_out",
     "addmm_",
-    "apply_projection_epilogue",
     "dynamic_scale",
     "encode_nvfp4_blocks",
     "linear_mean",

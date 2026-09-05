@@ -14,9 +14,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   stochastic E2M1 packing run in tiles without full-size weight or product intermediates.
   Two-level scaling recomputes tiles after reducing their maxima; stochastic rounding adds no
   per-element workspace. Existing storage identities and activation calibration are preserved.
+- Added independent PyTorch-only NVFP4 activation preparation and FP32 affine projection
+  references, also used by the ordinary and ConvRot NVFP4 FFN correctness tests.
 
 ### Changed
 
+- Unified supported eager/compiled NVFP4, ConvRot NVFP4, FFN and sparse-attention affine
+  projections. Compatible scale/bias epilogues run inside GEMM; mixed bias retains its precision
+  through FP32 accumulation and addition in bounded row workspaces before the final output cast.
+  This removes early BF16 rounding and changes results relative to the former TorchAO eager path.
+  Mixed-bias workspaces are bounded by 32 MiB or one 128-row scale block; small mixed-bias
+  projections can trade latency for the improved precision.
 - Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from
   `convrot_swiglu_ffn`, `convrot_sparse_piper`, and `convrot_sage_qk` to their explicit
   `convrot_int8_*` counterparts without compatibility aliases. INT8 benchmark entry points now
@@ -38,6 +46,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Avoid a second full-size NVFP4 output allocation for scaling/bias, including supported eager
+  linears that previously delegated to TorchAO. FP16 projections no longer need a full BF16
+  intermediate, and FFN gate/value/down projections share the same mixed-bias behavior.
+- Compute NVFP4 projection epilogue offsets in 64 bits before multiplication so outputs larger
+  than 2^31 elements do not overflow their indices.
+- Honor noncontiguous bias strides in both native NVFP4 GEMM and mixed-bias addition.
+- Order sparse-attention gate and output NVFP4 GEMMs on one projection stream to avoid
+  concurrent scaling-buffer overwrites in PyTorch 2.13. Attention still overlaps projection.
 - Match NVFP4 FFN projections by their complete operands so shared weights do not conflate
   distinct biases or quantization scales.
 

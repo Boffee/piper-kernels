@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import torch
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.linear import _input_activations as input_activations
 
-from . import _layout
+from . import _layout, _projection, reference
 from . import triton as nvfp4_triton
-from ._typing import NVFP4Storage
 
 
 def _prepare_static_tensors(
@@ -23,59 +16,25 @@ def _prepare_static_tensors(
     activation_fn: str | None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    activated = input_activations.apply_input_activation(input, activation_fn)
-    prepared = cast(
-        NVFP4Storage,
-        TorchAONVFP4Tensor.to_nvfp4(
-            activated.reshape(-1, activated.shape[-1]),
-            block_size=_layout.BLOCK_SIZE,
-            per_tensor_scale=per_tensor_scale,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-        ),
+    qdata, scale, global_scale = reference.prepare_input(
+        input, per_tensor_scale, False, activation_fn, high_first
     )
-    qdata = prepared.qdata
-    if high_first:
-        qdata = _layout.swap_packed_pairs(qdata)
-    return qdata, prepared.scale, per_tensor_scale.clone()
-
-
-def _prepare_dynamic_tensors(
-    input: torch.Tensor,  # noqa: A002
-    activation_fn: str | None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    activated = input_activations.apply_input_activation(input, activation_fn)
-    flattened = activated.reshape(-1, activated.shape[-1])
-    per_tensor_scale = per_tensor_amax_to_scale(flattened.abs().amax())
-    prepared = cast(
-        NVFP4Storage,
-        TorchAONVFP4Tensor.to_nvfp4(
-            flattened,
-            block_size=_layout.BLOCK_SIZE,
-            per_tensor_scale=per_tensor_scale,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-        ),
-    )
-    qdata = prepared.qdata
-    if high_first:
-        qdata = _layout.swap_packed_pairs(qdata)
-    return qdata, prepared.scale, per_tensor_scale
+    # Custom-op outputs must not alias their input scale.
+    return qdata, scale, global_scale.clone()
 
 
 def _prepare_dynamic_swiglu_tensors(
     input: torch.Tensor,  # noqa: A002
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _prepare_dynamic_tensors(input, "swiglu", high_first)
+    return reference.prepare_input(input, None, True, "swiglu", high_first)
 
 
 def _prepare_dynamic_gelu_tanh_tensors(
     input: torch.Tensor,  # noqa: A002
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _prepare_dynamic_tensors(input, "gelu_tanh", high_first)
+    return reference.prepare_input(input, None, True, "gelu_tanh", high_first)
 
 
 _compiled_prepare_static = torch.compile(_prepare_static_tensors, fullgraph=True)
@@ -107,65 +66,6 @@ def _compiled_prepare_dynamic(
     return _compiled_prepare_dynamic_gelu_tanh(input, high_first)
 
 
-def _scale_result_to(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    return (result.float() * global_scale.float()).to(output_dtype)
-
-
-def _scale_result_and_add_bias_to(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-    bias: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    return (result.float() * global_scale.float() + bias.float()).to(output_dtype)
-
-
-def _scale_result(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-) -> torch.Tensor:
-    return _scale_result_to(result, global_scale, result.dtype)
-
-
-def _scale_result_and_add_bias(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-    bias: torch.Tensor,
-) -> torch.Tensor:
-    return _scale_result_and_add_bias_to(result, global_scale, bias, result.dtype)
-
-
-def _scale_fp16_result(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-) -> torch.Tensor:
-    return _scale_result_to(result, global_scale, torch.float16)
-
-
-def _scale_fp16_result_and_add_bias(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-    bias: torch.Tensor,
-) -> torch.Tensor:
-    return _scale_result_and_add_bias_to(result, global_scale, bias, torch.float16)
-
-
-_compiled_scale_result = torch.compile(_scale_result, fullgraph=True)
-_compiled_scale_result_and_add_bias = torch.compile(
-    _scale_result_and_add_bias,
-    fullgraph=True,
-)
-_compiled_scale_fp16_result = torch.compile(_scale_fp16_result, fullgraph=True)
-_compiled_scale_fp16_result_and_add_bias = torch.compile(
-    _scale_fp16_result_and_add_bias,
-    fullgraph=True,
-)
-
-
 def _prepare_compiled(
     input: torch.Tensor,  # noqa: A002
     activation_per_tensor_scale: torch.Tensor | None,
@@ -193,20 +93,6 @@ def _prepare_compiled(
     )
 
 
-def _apply_mixed_bias_epilogue(
-    result: torch.Tensor,
-    global_scale: torch.Tensor,
-    bias: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Apply a mixed-dtype affine without specializing a shared compiled graph."""
-    output = (
-        result if result.dtype is output_dtype else torch.empty_like(result, dtype=output_dtype)
-    )
-    nvfp4_triton.apply_projection_epilogue(result, global_scale, bias, output)
-    return output
-
-
 def _execute_prepared(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -217,26 +103,23 @@ def _execute_prepared(
     bias: torch.Tensor | None,
     logical_dtype: torch.dtype,
 ) -> torch.Tensor:
-    accumulator_dtype = torch.bfloat16 if logical_dtype is torch.float16 else logical_dtype
-    result = torch._scaled_mm(
-        input_qdata.view(torch.float4_e2m1fn_x2),
-        weight_qdata.t().view(torch.float4_e2m1fn_x2),
-        input_scale.view(torch.float8_e4m3fn),
-        weight_scale.view(torch.float8_e4m3fn),
-        out_dtype=accumulator_dtype,
+    output = torch.empty(
+        (input_qdata.shape[0], weight_qdata.shape[0]),
+        device=input_qdata.device,
+        dtype=logical_dtype,
     )
-    global_scale = input_per_tensor_scale
-    if weight_per_tensor_scale is not None:
-        global_scale = global_scale * weight_per_tensor_scale
-    if bias is not None and bias.dtype is not logical_dtype:
-        return _apply_mixed_bias_epilogue(result, global_scale, bias, logical_dtype)
-    if logical_dtype is torch.float16:
-        if bias is None:
-            return _compiled_scale_fp16_result(result, global_scale)
-        return _compiled_scale_fp16_result_and_add_bias(result, global_scale, bias)
-    if bias is None:
-        return _compiled_scale_result(result, global_scale)
-    return _compiled_scale_result_and_add_bias(result, global_scale, bias)
+    return _projection.matmul_prepared_chunk_affine_out(
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight_qdata,
+        weight_scale,
+        weight_per_tensor_scale,
+        bias,
+        0,
+        input_qdata.shape[0],
+        output,
+    )
 
 
 @torch.library.custom_op("piper_kernels::nvfp4_linear", mutates_args=())

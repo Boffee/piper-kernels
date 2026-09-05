@@ -38,7 +38,8 @@ def test_chunked_ffn_matches_materialized(
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert actual.dtype is torch.bfloat16
-    assert relative_l2 < (0.1 if dynamic else 0.04)
+    # The independent reference includes portable rotation and FP4 preparation.
+    assert relative_l2 < (0.1 if dynamic else 0.06)
 
 
 @pytest.mark.gpu
@@ -59,7 +60,7 @@ def test_static_chunked_ffn_supports_nibble_order_and_distinct_input_scales(
     actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
-    assert relative_l2 < 0.04
+    assert relative_l2 < 0.06
 
 
 @pytest.mark.gpu
@@ -149,7 +150,7 @@ def test_chunked_ffn_gated_updates_matches_materialized(dynamic: bool) -> None:
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert result is None
-    assert relative_l2 < (0.1 if dynamic else 0.04)
+    assert relative_l2 < (0.1 if dynamic else 0.06)
 
 
 @pytest.mark.gpu

@@ -1,9 +1,23 @@
 """NVFP4 tensors and activation preparation in the ConvRot basis."""
 
 from collections.abc import Mapping
+from importlib import import_module
+from typing import TYPE_CHECKING
 
 from .tensor import ConvRotNVFP4Tensor, convrot_nvfp4_linear
-from .triton import dynamic_scale, prepare_dynamic, prepare_static, prepare_static_out
+
+if TYPE_CHECKING:
+    from .triton import dynamic_scale, prepare_dynamic, prepare_static, prepare_static_out
+
+
+def __getattr__(name: str) -> object:
+    """Load optimized preparation only when its public entry points are requested."""
+    if name in ("dynamic_scale", "prepare_dynamic", "prepare_static", "prepare_static_out"):
+        backend = import_module(".triton", __name__)
+        value = getattr(backend, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def convrot_nvfp4_compile_options(

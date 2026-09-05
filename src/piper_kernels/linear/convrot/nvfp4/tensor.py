@@ -25,8 +25,6 @@ from piper_kernels.linear.nvfp4.tensor import (
     supports_semantic_linear,
 )
 
-from . import _ops
-
 
 class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
     """Standard NVFP4 weight storage carrying its grouped rotation metadata."""
@@ -314,6 +312,8 @@ def convrot_nvfp4_linear(
         raise ValueError("ConvRot NVFP4 linear requires canonical SM120 NVFP4 operands")
     quantization = weight.act_quant_kwargs
     assert quantization is not None
+    from . import _ops  # noqa: PLC0415
+
     return _ops.linear(
         converted_input,
         weight.qdata,
