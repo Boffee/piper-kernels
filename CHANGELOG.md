@@ -7,6 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from
+  `convrot_swiglu_ffn`, `convrot_sparse_piper`, and `convrot_sage_qk` to their explicit
+  `convrot_int8_*` counterparts without compatibility aliases. INT8 benchmark entry points now
+  use `benchmark_convrot_int8.py` and `benchmark_convrot_int8_preparation.py`. Shared rotation
+  infrastructure and existing ConvRot INT8 linear/NVFP4 APIs are unchanged. Downstream callers
+  must update fusion imports, helper names, and direct custom-op references.
+
 - Redesigned ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU FFN fusion around separate
   gate and value projections followed by `silu(gate) * value` and a down projection.
   Compiler matching is architecture-independent and retains bounded workspaces and compatible

@@ -5,7 +5,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._compile import (
-    compile_pass as convrot_compile_pass,
+    compile_pass as convrot_int8_compile_pass,
 )
 from piper_kernels.specializations.minimax_h3_vae import (
     minimax_h3_vae_convrot_int8_compile_options,
@@ -74,7 +74,7 @@ def _run_passes(
     target: AcceleratorTarget = _SM120,
 ) -> None:
     torch.fx.GraphModule({}, graph)
-    convrot_compile_pass(graph, is_inference=is_inference)
+    convrot_int8_compile_pass(graph, is_inference=is_inference)
     if is_inference:
         _specialize_linears(graph, target=target)
     else:
@@ -219,7 +219,7 @@ def test_compile_options_install_generic_then_specialized_pass() -> None:
 
     assert options["max_autotune"] is True
     assert options["post_grad_custom_pre_pass"] == (
-        convrot_compile_pass,
+        convrot_int8_compile_pass,
         specialization_compile_pass,
     )
 
@@ -229,7 +229,7 @@ def test_compile_options_are_idempotent() -> None:
     options = minimax_h3_vae_convrot_int8_compile_options(options)
 
     assert options["post_grad_custom_pre_pass"] == (
-        convrot_compile_pass,
+        convrot_int8_compile_pass,
         specialization_compile_pass,
     )
 

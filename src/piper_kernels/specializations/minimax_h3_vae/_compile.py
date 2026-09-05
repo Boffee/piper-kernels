@@ -13,9 +13,9 @@ from torch._inductor.custom_graph_pass import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
-from piper_kernels.linear.convrot.int8 import _compile_fx as convrot_compile_fx
-from piper_kernels.linear.convrot.int8 import triton as convrot_backend
+from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
+from piper_kernels.linear.convrot.int8 import _compile_fx as convrot_int8_compile_fx
+from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
 
 from . import _ops
 
@@ -123,7 +123,7 @@ def _specialize_linears(
                 assert bias is None or isinstance(bias, torch.fx.Node)
                 assert isinstance(group_size, int)
                 assert activation_fn is None or isinstance(activation_fn, str)
-                prepared = convrot_compile_fx.emit_prepared_input(
+                prepared = convrot_int8_compile_fx.emit_prepared_input(
                     graph,
                     input_node,
                     group_size,
@@ -168,8 +168,8 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             (
                 __file__,
                 _ops.__file__,
-                convrot_backend.__file__,
-                convrot_compile_fx.__file__,
+                convrot_int8_backend.__file__,
+                convrot_int8_compile_fx.__file__,
             ),
             extra=_COMPILE_PASS_VERSION,
         )
@@ -184,7 +184,7 @@ def minimax_h3_vae_convrot_int8_compile_options(
     """Install ordinary ConvRot rewriting followed by the H3 VAE schedules."""
     return preparation_sharing.add_ordered_post_grad_passes(
         options,
-        (convrot_compile.compile_pass, compile_pass),
+        (convrot_int8_compile.compile_pass, compile_pass),
     )
 
 

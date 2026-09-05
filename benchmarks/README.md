@@ -396,7 +396,7 @@ on field names. A shortened record looks like:
 Run the ConvRot provider comparison with:
 
 ```shell
-uv run python benchmarks/benchmark_convrot.py
+uv run python benchmarks/benchmark_convrot_int8.py
 ```
 
 The default comparison samples both primary M anchors at the lower-width corner: BF16, group 256,
@@ -404,7 +404,7 @@ no bias, `M=8192/32768`, `N=4096`, and `K=6144`. The three dimension options acc
 a Cartesian product. Run the complete eight-cell primary matrix with:
 
 ```shell
-uv run python benchmarks/benchmark_convrot.py \
+uv run python benchmarks/benchmark_convrot_int8.py \
   --rows 8192 32768 \
   --out-features 4096 16384 \
   --in-features 6144 14336 \
@@ -438,7 +438,7 @@ Compare against the optional Comfy Kitchen CUDA provider with:
 
 ```shell
 uv run --with comfy-kitchen==0.2.28 \
-  python benchmarks/benchmark_convrot.py \
+  python benchmarks/benchmark_convrot_int8.py \
   --rows 8192 --out-features 4096 --in-features 6144 \
   --compare-comfy-kitchen
 ```
@@ -451,16 +451,16 @@ metadata records the adapter and the installed package version under `installed_
 Diagnose activation preparation independently, using preallocated outputs, with:
 
 ```shell
-uv run python benchmarks/benchmark_convrot_preparation.py
+uv run python benchmarks/benchmark_convrot_int8_preparation.py
 
-uv run python benchmarks/benchmark_convrot_preparation.py \
+uv run python benchmarks/benchmark_convrot_int8_preparation.py \
   --rows 32768 --in-features 6144 --input-activation swiglu
 
-uv run python benchmarks/benchmark_convrot_preparation.py \
+uv run python benchmarks/benchmark_convrot_int8_preparation.py \
   --rows 32768 --in-features 6144 --input-activation gelu_tanh
 
 uv run --with comfy-kitchen==0.2.28 \
-  python benchmarks/benchmark_convrot_preparation.py \
+  python benchmarks/benchmark_convrot_int8_preparation.py \
   --rows 32768 --in-features 6144 --compare-comfy-kitchen
 ```
 
@@ -485,7 +485,7 @@ compiler records must use different output paths.
 The common compiler-report adapter can inspect one width per fresh process:
 
 ```shell
-uv run python benchmarks/benchmark_convrot_preparation.py \
+uv run python benchmarks/benchmark_convrot_int8_preparation.py \
   --rows 32768 --in-features 6144 \
   --compiler-report --no-sass \
   --compiler-json artifacts/convrot-preparation-6144.json

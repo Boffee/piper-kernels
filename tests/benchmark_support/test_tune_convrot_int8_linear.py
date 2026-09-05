@@ -3,7 +3,7 @@
 import pytest
 import torch
 from lib.convrot import ConvRotConfig, ConvRotShape
-from lib.convrot_providers import make_convrot_workload
+from lib.convrot_int8_providers import make_convrot_int8_workload
 from lib.providers import ProviderPhase
 from tune_convrot_int8_linear import (
     _candidate_plans,
@@ -12,7 +12,7 @@ from tune_convrot_int8_linear import (
     _validate_args,
 )
 
-from piper_kernels.linear.convrot.int8 import triton as convrot_backend
+from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
 from piper_kernels.linear.convrot.int8._policy import select_execution_plan
 
 
@@ -23,7 +23,7 @@ def _production_plan():
 
 
 def _workload(*, rows: int = 2, out_features: int = 96, in_features: int = 512):
-    return make_convrot_workload(
+    return make_convrot_int8_workload(
         ConvRotShape("custom", rows, out_features, in_features),
         ConvRotConfig(torch.bfloat16, 256, 0),
         device=torch.device("cpu"),
@@ -202,7 +202,7 @@ def test_candidate_provider_injects_plan_into_complete_operator(
         calls.append((args, kwargs))
         return torch.empty((2, 96), device="meta")
 
-    monkeypatch.setattr(convrot_backend, "run_linear", fake_run)
+    monkeypatch.setattr(convrot_int8_backend, "run_linear", fake_run)
     provider = _make_candidate(plan, workload).make_provider()
 
     prepared = provider.prepare()

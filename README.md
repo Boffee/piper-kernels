@@ -33,6 +33,19 @@ portable and does not require either Triton distribution.
 
 ## ConvRot INT8
 
+INT8-only fusion packages use the explicit `convrot_int8` prefix:
+
+| Previous package/helper prefix | Current prefix |
+| --- | --- |
+| `convrot_swiglu_ffn` | `convrot_int8_swiglu_ffn` |
+| `convrot_sparse_piper` | `convrot_int8_sparse_piper` |
+| `convrot_sage_qk` | `convrot_int8_sage_qk` |
+
+Update imports under `piper_kernels.fusions`, compile-option helper names, and any direct
+`torch.ops.piper_kernels` calls using these prefixes. The old names are not retained as aliases.
+Shared rotation code remains under `linear.convrot`; `ConvRotInt8Tensor`,
+`convrot_int8_linear`, `convrot_int8_compile_options`, and all NVFP4 names are unchanged.
+
 Quantize a dense weight, or wrap existing checkpoint storage without dequantizing it,
 then use the resulting tensor as a normal linear weight:
 
@@ -107,8 +120,8 @@ options mapping are preserved. Pass the result through `torch.compile(options=..
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
 The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
-`convrot_sparse_piper_compile_options` from
-`piper_kernels.fusions.convrot_sparse_piper`. It installs the fusion pass before the ordinary
+`convrot_int8_sparse_piper_compile_options` from
+`piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
 bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
 `sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
@@ -125,7 +138,7 @@ redundant FP32-to-BF16-to-FP32 round trips without materializing FP32 activation
 The internal `piper_kernels.fusions.projected_qk` layer owns projection-independent RMSNorm and
 RoPE. The existing Sage Q/K quantization layer owns signed-Hadamard grouped Q/K encoding shared
 with dense Piper, while `piper_kernels.attention.kernels.sparse_piper` owns only sparse Piper's
-tile-scaled V encoding. `piper_kernels.fusions.convrot_sage_qk` adapts ConvRot projection tiles
+tile-scaled V encoding. `piper_kernels.fusions.convrot_int8_sage_qk` adapts ConvRot projection tiles
 to those boundaries and owns ConvRot validation; the explicit sparse fusion adds routing summaries,
 storage, and graph rewriting. Another projection backend can therefore compose the same pieces
 without depending on ConvRot internals or adding a backend protocol to attention.
