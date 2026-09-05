@@ -194,8 +194,9 @@ def test_pass_leaves_exact_h3_shape_unchanged_off_sm120() -> None:
     assert str(graph) == original
 
 
-def test_operator_builds_the_emitted_schedule_over_the_portable_plan() -> None:
+def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch) -> None:
     weight = torch.empty(16_384, 2_048, dtype=torch.int8, device="meta")
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: _SM120)
 
     plan = _execution_plan(weight, [128, 128, 64, 8, 3])
 

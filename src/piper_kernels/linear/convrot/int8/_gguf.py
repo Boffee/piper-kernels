@@ -7,6 +7,8 @@ import torch
 from piper_kernels.gguf._tensor import prepare_packed_matrix
 from piper_kernels.linear.convrot._rotation import validate_group_size
 
+from . import _backend
+
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -27,6 +29,9 @@ def convert(
     raw, normalized, rows, features = prepare_packed_matrix(data, quant_type)
     if raw.device.type != "cuda":
         raise ValueError("ConvRot INT8 GGUF conversion requires CUDA")
+    convert_out = _backend.select_gguf_converter(raw)
+    if convert_out is None:
+        raise ValueError(f"ConvRot INT8 GGUF conversion is unavailable on {raw.device}")
     if features % group_size:
         raise ValueError(
             f"GGUF in_features {features} is not divisible by ConvRot group size {group_size}"
@@ -51,9 +56,7 @@ def convert(
         ):
             raise ValueError("ConvRot INT8 GGUF output storage is incompatible")
 
-    from .triton import _convert_gguf_out  # noqa: PLC0415
-
-    _convert_gguf_out(
+    convert_out(
         raw,
         int(normalized),
         group_size,

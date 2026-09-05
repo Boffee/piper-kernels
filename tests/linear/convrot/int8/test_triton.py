@@ -1,4 +1,4 @@
-"""Tests for the Triton ConvRot backend."""
+"""Shared custom-op tests and NVIDIA-only legacy low-level utility tests."""
 
 from dataclasses import replace
 
@@ -69,7 +69,7 @@ def _scaled_projection_epilogue_probe(  # noqa: PLR0913, PLR0917
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 def test_triton_linear_matches_gpu_reference(group_size: int) -> None:
     torch.manual_seed(9)
@@ -86,7 +86,7 @@ def test_triton_linear_matches_gpu_reference(group_size: int) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_triton_linear_supports_mixed_precision_bias(
@@ -123,7 +123,7 @@ def test_triton_linear_supports_mixed_precision_bias(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_scaled_projection_tile_supports_specialized_epilogues() -> None:
     torch.manual_seed(153)
     rows, out_features, in_features = 19, 23, 48
@@ -170,7 +170,7 @@ def test_scaled_projection_tile_supports_specialized_epilogues() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_factorized_h4_rotation_matches_gpu_reference(
@@ -188,7 +188,7 @@ def test_factorized_h4_rotation_matches_gpu_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_factorized_h4_rotation_handles_rounding_boundary_values(
@@ -220,6 +220,7 @@ def test_factorized_h4_rotation_handles_rounding_boundary_values(
     ("dtype", "dtype_code"),
     [(torch.float16, 1), (torch.bfloat16, 2)],
 )
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_fused_rotation_quantization_matches_split_path_exactly(
     in_features: int,
     dtype: torch.dtype,
@@ -248,7 +249,9 @@ def test_fused_rotation_quantization_matches_split_path_exactly(
         actual_scale,
         256,
         dtype_code,
-        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
+        num_warps=select_execution_plan(
+            AcceleratorTarget.from_device(activation.device), in_features=in_features
+        ).fused_num_warps,
     )
 
     assert torch.equal(actual_qdata, expected_qdata)
@@ -265,6 +268,7 @@ def test_fused_rotation_quantization_matches_split_path_exactly(
     ("dtype", "dtype_code"),
     [(torch.float16, 1), (torch.bfloat16, 2)],
 )
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
     in_features: int,
     dtype: torch.dtype,
@@ -296,7 +300,9 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
         256,
         dtype_code,
         activation_fn="swiglu",
-        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
+        num_warps=select_execution_plan(
+            AcceleratorTarget.from_device(activation.device), in_features=in_features
+        ).fused_num_warps,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -319,6 +325,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
     ("dtype", "dtype_code"),
     [(torch.float16, 1), (torch.bfloat16, 2), (torch.float32, 0)],
 )
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_fused_gelu_tanh_preparation_matches_materialized_path(
     in_features: int,
     dtype: torch.dtype,
@@ -349,7 +356,9 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
         256,
         dtype_code,
         activation_fn="gelu_tanh",
-        num_warps=select_execution_plan(in_features=in_features).fused_num_warps,
+        num_warps=select_execution_plan(
+            AcceleratorTarget.from_device(raw_input.device), in_features=in_features
+        ).fused_num_warps,
     )
 
     qdata_error = (actual_qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
@@ -374,10 +383,10 @@ def test_dtype_code(dtype: torch.dtype, expected: int) -> None:
     assert triton_backend.dtype_code(dtype) == expected
 
 
-def test_default_linear_execution_plan_supports_meta_weight() -> None:
+def test_default_linear_execution_plan_accepts_explicit_target_for_meta_weight() -> None:
     qdata = torch.empty((96, 512), dtype=torch.int8, device="meta")
 
-    plan = triton_backend.default_execution_plan(qdata)
+    plan = triton_backend.default_execution_plan(qdata, target=AcceleratorTarget("cuda", "sm120"))
 
     assert plan.fuse_rotation_quantization
     assert plan.matmul_block_m == 128
@@ -387,6 +396,7 @@ def test_default_linear_execution_plan_supports_meta_weight() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_injected_linear_execution_plan_matches_reference(activation_fn: str | None) -> None:
     torch.manual_seed(129)
     rows, in_features, out_features = 17, 256, 96
@@ -441,6 +451,7 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("activation_fn", [None, "swiglu"])
 @pytest.mark.parametrize("fused", [False, True], ids=["split", "fused"])
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_input_preparation_populates_caller_owned_storage(
     activation_fn: str | None,
     fused: bool,
@@ -504,6 +515,7 @@ def test_input_preparation_populates_caller_owned_storage(
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
     torch.manual_seed(132)
     rows, in_features, out_features = 129, 256, 257
@@ -586,6 +598,7 @@ def _exact_sm120_available() -> bool:
     ],
 )
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_sm120_large_matmul_matches_reference(
     rows: int,
     out_features: int,
@@ -669,11 +682,12 @@ def test_fused_preparation_rejects_unsupported_row_width() -> None:
             256,
             triton_backend.dtype_code(activation.dtype),
             num_warps=4,
+            target=AcceleratorTarget("cuda", "sm120"),
         )
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
 def test_fused_up_gate_swiglu_linear_matches_materialized_path(
@@ -765,7 +779,7 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize(
     ("activation_fn", "rows", "in_features", "group_size", "input_factor"),
     [
@@ -807,7 +821,7 @@ def test_cuda_semantic_linear_custom_ops_pass_opcheck(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
     torch.manual_seed(126)
     qdata = torch.randint(-127, 128, (32, 64), dtype=torch.int8, device="cuda")
@@ -824,7 +838,7 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_cuda_semantic_add_custom_op_passes_opcheck() -> None:
     torch.manual_seed(127)
     qdata = torch.randint(-127, 128, (32, 64), dtype=torch.int8, device="cuda")
@@ -840,7 +854,7 @@ def test_cuda_semantic_add_custom_op_passes_opcheck() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_cuda_linear_accepts_noncontiguous_vector_bias(
     input_activation: str | None,
@@ -887,7 +901,7 @@ def test_cuda_linear_accepts_noncontiguous_vector_bias(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_triton_linear_runs_under_fullgraph_compile_with_noncontiguous_input() -> None:
     module = nn.Linear(64, 96, bias=True, device="meta", dtype=torch.bfloat16)
     module.weight = nn.Parameter(
@@ -911,7 +925,7 @@ def test_triton_linear_runs_under_fullgraph_compile_with_noncontiguous_input() -
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
     torch.manual_seed(126)
     input = torch.randn(17, 256, device="cuda", dtype=torch.float32) * 0.01  # noqa: A001
@@ -942,7 +956,7 @@ def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("rows", [17, 512], ids=["split", "fused"])
 def test_swiglu_linear_runs_under_fullgraph_compile_with_noncontiguous_input(rows: int) -> None:
     torch.manual_seed(97)
@@ -976,7 +990,7 @@ def test_swiglu_linear_runs_under_fullgraph_compile_with_noncontiguous_input(row
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(("beta", "alpha"), [(0.25, 1.5), (0, 1.5), (0.25, 0)])
 def test_triton_addmm_matches_gpu_reference(
@@ -1006,7 +1020,7 @@ def test_triton_addmm_matches_gpu_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("alpha", [1.5, -0.25])
 def test_triton_add_matches_gpu_reference(dtype: torch.dtype, alpha: float) -> None:
@@ -1031,7 +1045,7 @@ def test_triton_add_matches_gpu_reference(dtype: torch.dtype, alpha: float) -> N
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_triton_addmm_runs_under_torch_compile() -> None:
     torch.manual_seed(30)
     weight = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
@@ -1062,7 +1076,7 @@ def test_triton_addmm_runs_under_torch_compile() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_triton_add_runs_under_torch_compile() -> None:
     torch.manual_seed(31)
     weight = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
@@ -1085,7 +1099,7 @@ def test_triton_add_runs_under_torch_compile() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_triton_addmm_stochastic_rounding_replays_and_is_unbiased() -> None:
     rows, cols = 32, 8192
     rotated_update = torch.ones(rows, cols, dtype=torch.bfloat16, device="cuda")
@@ -1119,7 +1133,7 @@ def test_triton_addmm_stochastic_rounding_replays_and_is_unbiased() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_triton_addmm_handles_underflowing_float16_scale() -> None:
     rotated_update = torch.zeros(1, 16, dtype=torch.float16, device="cuda")
     rotated_update[0, 0] = 1e-6
@@ -1145,7 +1159,7 @@ def test_triton_addmm_handles_underflowing_float16_scale() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_triton_linear_handles_underflowing_float16_input_scale() -> None:
     rotated_activation = torch.zeros(1, 16, dtype=torch.float16, device="cuda")
     rotated_activation[0, 0] = 1e-6

@@ -17,6 +17,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Added independent PyTorch-only NVFP4 activation preparation and FP32 affine projection
   references, also used by the ordinary and ConvRot NVFP4 FFN correctness tests.
 
+- Added a modular Linux ROCm backend for base ConvRot INT8 preparation, linear and
+  prepared/paired projections, dense and low-rank updates, and compiler preparation sharing.
+  RX 9070 XT (`gfx1201`) has on-device validation; `gfx942`, `gfx1100`, `gfx1151`, and
+  `gfx1200` have offline compiler coverage only. Unknown AMD architectures use the reference.
+  GGUF conversion, prepared-input means, specialized FFN/attention fusions, attention, and
+  NVFP4 remain outside this ROCm integration.
+
 ### Changed
 
 - Unified supported eager/compiled NVFP4, ConvRot NVFP4, FFN and sparse-attention affine
@@ -25,6 +32,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   This removes early BF16 rounding and changes results relative to the former TorchAO eager path.
   Mixed-bias workspaces are bounded by 32 MiB or one 128-row scale block; small mixed-bias
   projections can trade latency for the improved precision.
+- Shared base INT8 preparation and weight updates independently of tuned matrix support.
+  AMD and NVIDIA use the same update launchers; standalone preparation and updates can
+  use a generic Triton path or PyTorch fallback without an architecture allowlist.
+
+- Separated base ConvRot INT8 custom-op registration from NVIDIA kernels and launch policy.
+  Eager and compiler-emitted operations resolve implementations through the same boundary;
+  weight updates, GGUF conversion, and prepared-input means select support independently.
+  NVIDIA launch constraints are separate from shared plan values. Existing custom-op names,
+  NVIDIA schedules, and portable fallbacks are preserved. Portable INT8 arithmetic is shared
+  by accelerator-owned launchers; AMD retains its own preparation and group-8 RDNA4 policy.
+- Use the Linux PyTorch distribution's matching CUDA or ROCm Triton instead of pinning a
+  competing Linux Triton version in Piper's extra. Windows retains `triton-windows` 3.7.
+
 - Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from
   `convrot_swiglu_ffn`, `convrot_sparse_piper`, and `convrot_sage_qk` to their explicit
   `convrot_int8_*` counterparts without compatibility aliases. INT8 benchmark entry points now

@@ -441,7 +441,7 @@ def test_add_rejects_autograd_inputs() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 def test_from_hp_quantizes_cuda_weight() -> None:
     weight = torch.randn(9, 64, dtype=torch.bfloat16, device="cuda")
 

@@ -28,7 +28,7 @@ Changelog = "https://github.com/Boffee/piper-kernels/blob/main/CHANGELOG.md"
 convrot = ["torchao>=0.17"]
 nvfp4 = ["numpy>=2", "torchao>=0.18"]
 triton = [
-    "triton>=3.7,<3.8; sys_platform == 'linux'",
+    # Linux PyTorch distributions supply their matching CUDA or ROCm Triton.
     "triton-windows>=3.7,<3.8; sys_platform == 'win32'",
 ]
 
@@ -57,7 +57,7 @@ dev = [
 
 [tool.pytest.ini_options]
 markers = [
-    "gpu: requires a CUDA-capable GPU",
+    "gpu: requires a compatible accelerator (CUDA or ROCm, depending on the test)",
 ]
 pythonpath = ["benchmarks"]
 

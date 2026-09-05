@@ -49,6 +49,7 @@ from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
 from lib.timing import ClockDomain, PhaseTimings, Timing
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation
 
 
@@ -208,6 +209,7 @@ def test_shared_public_provider_and_reference_use_the_same_workload() -> None:
         ConvRotShape("custom", 2, 3, 256, has_bias=False),
         ConvRotConfig(torch.float32, 256, 7),
         device=torch.device("cpu"),
+        target=AcceleratorTarget("cuda", "sm120"),
     )
     public = make_public_convrot_int8_provider(workload)
     public_output = public.run(workload.inputs)
@@ -262,7 +264,9 @@ def test_comfy_adapter_changes_up_gate_to_gate_up() -> None:
 def test_main_provider_configuration_distinguishes_logical_and_provider_layouts() -> None:
     shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     config = ConvRotConfig(torch.bfloat16, 256, 7)
-    workload = make_convrot_int8_workload(shape, config, device=torch.device("cpu"))
+    workload = make_convrot_int8_workload(
+        shape, config, device=torch.device("cpu"), target=AcceleratorTarget("cuda", "sm120")
+    )
 
     common = workload.common_configuration()
     comfy = _comfy_provider_configuration(common, shape, "0.2.28")
@@ -284,6 +288,7 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
         shape,
         ConvRotConfig(torch.bfloat16, 256, 7),
         device=torch.device("cpu"),
+        target=AcceleratorTarget("cuda", "sm120"),
     )
     configuration = {
         **workload.common_configuration(),
@@ -326,6 +331,7 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
         shape,
         ConvRotConfig(torch.bfloat16, 256, 7),
         device=torch.device("cpu"),
+        target=AcceleratorTarget("cuda", "sm120"),
     )
     common = workload.common_configuration()
     piper = ProviderMeasurement(
