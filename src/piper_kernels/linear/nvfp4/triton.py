@@ -10,6 +10,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels.linear import _bias
+
 from . import _layout
 
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
@@ -186,13 +188,15 @@ def _projection_epilogue_kernel(
     output_ptr,
     elements,
     features: tl.constexpr,
+    apply_scale: tl.constexpr,
     has_bias: tl.constexpr,
     block_size: tl.constexpr,
 ):
     offsets = (tl.program_id(0) * block_size + tl.arange(0, block_size)).to(tl.int64)
     valid = offsets < elements
     values = tl.load(input_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
-    values *= tl.load(global_scale_ptr).to(tl.float32)
+    if apply_scale:
+        values *= tl.load(global_scale_ptr).to(tl.float32)
     if has_bias:
         values += tl.load(bias_ptr + offsets % features, mask=valid, other=0.0).to(tl.float32)
     tl.store(output_ptr + offsets, values, mask=valid)
@@ -363,19 +367,20 @@ def prepare_static_projected_swiglu(
 
 def apply_projection_epilogue(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    global_scale: torch.Tensor,
+    global_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     output: torch.Tensor,
 ) -> None:
-    """Apply a raw NVFP4 projection's affine result into caller-owned storage."""
+    """Apply optional FP32 scale and bias terms into caller-owned storage."""
     elements = input.numel()
     _projection_epilogue_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
         input,
-        global_scale,
+        global_scale if global_scale is not None else input,
         bias if bias is not None else input,
         output,
         elements,
         features=input.shape[-1],
+        apply_scale=global_scale is not None,
         has_bias=bias is not None,
         block_size=_EPILOGUE_BLOCK_SIZE,
         num_warps=4,
@@ -596,8 +601,10 @@ def _validate_linear_mean(  # noqa: PLR0912
         weight_per_tensor_scale.shape != () or weight_per_tensor_scale.dtype is not torch.float32
     ):
         raise ValueError("NVFP4 mean weight per-tensor scale must be an FP32 scalar")
-    if bias is not None and (bias.shape != (output_features,) or bias.dtype is not torch.bfloat16):
-        raise ValueError("NVFP4 mean bias must be one BF16 value per output feature")
+    if bias is not None:
+        if bias.shape != (output_features,):
+            raise ValueError("NVFP4 mean bias must contain one value per output feature")
+        _bias.validate_dtype(bias, "NVFP4 mean")
     if block_lengths is not None and (
         sequence_length % 64
         or block_lengths.shape != (sequence_length // 64,)

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear import _bias
 
 from . import _layout
 
@@ -89,7 +90,6 @@ def validate_weight(
     bias: torch.Tensor | None,
     *,
     input_features: int | torch.SymInt,
-    logical_dtype: torch.dtype,
     device: torch.device,
     name: str,
 ) -> int | torch.SymInt:
@@ -112,10 +112,10 @@ def validate_weight(
         raise ValueError(f"{name} weight scale has an incompatible swizzled layout")
     if not _valid_scalar(weight_per_tensor_scale):
         raise ValueError(f"{name} weight per-tensor scale must be an FP32 scalar")
-    if bias is not None and (
-        not _shape_matches(bias.shape, (output_features,)) or bias.dtype is not logical_dtype
-    ):
-        raise ValueError(f"{name} bias must contain one {logical_dtype} value per output feature")
+    if bias is not None:
+        if not _shape_matches(bias.shape, (output_features,)):
+            raise ValueError(f"{name} bias must contain one value per output feature")
+        _bias.validate_dtype(bias, name)
     operands = [weight_qdata, weight_scale]
     operands.extend(operand for operand in (weight_per_tensor_scale, bias) if operand is not None)
     if any(operand.device != device for operand in operands):
@@ -157,7 +157,6 @@ def validate_semantic_linear(
         weight_per_tensor_scale,
         bias,
         input_features=input_features,
-        logical_dtype=input.dtype,
         device=input.device,
         name=name,
     )
@@ -202,7 +201,6 @@ def validate_prepared_linear(
         weight_per_tensor_scale,
         bias,
         input_features=input_features,
-        logical_dtype=logical_dtype,
         device=input_qdata.device,
         name=name,
     )

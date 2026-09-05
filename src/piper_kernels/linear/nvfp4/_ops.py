@@ -195,6 +195,20 @@ def _prepare_compiled(
     )
 
 
+def _apply_mixed_bias_epilogue(
+    result: torch.Tensor,
+    global_scale: torch.Tensor,
+    bias: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply a mixed-dtype affine without specializing a shared compiled graph."""
+    output = (
+        result if result.dtype is output_dtype else torch.empty_like(result, dtype=output_dtype)
+    )
+    nvfp4_triton.apply_projection_epilogue(result, global_scale, bias, output)
+    return output
+
+
 def _execute_prepared(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -216,6 +230,8 @@ def _execute_prepared(
     global_scale = input_per_tensor_scale
     if weight_per_tensor_scale is not None:
         global_scale = global_scale * weight_per_tensor_scale
+    if bias is not None and bias.dtype is not logical_dtype:
+        return _apply_mixed_bias_epilogue(result, global_scale, bias, logical_dtype)
     if logical_dtype is torch.float16:
         if bias is None:
             return _compiled_scale_fp16_result(result, global_scale)

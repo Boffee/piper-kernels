@@ -11,6 +11,7 @@ import triton.language as tl
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import triton as gguf_backend
+from piper_kernels.linear import _bias
 from piper_kernels.linear._input_activations import input_activation_width
 from piper_kernels.linear.convrot import triton as convrot_backend
 from piper_kernels.linear.convrot._rotation import validate_group_size
@@ -532,15 +533,15 @@ def _validate_source_affine(
         )
     if source_bias is not None and (
         source_bias.shape != (contiguous_input.shape[-1],)
-        or source_bias.dtype is not contiguous_input.dtype
         or source_bias.device != contiguous_input.device
         or source_bias.layout is not torch.strided
         or not source_bias.is_contiguous()
     ):
         raise ValueError(
-            "ConvRot NVFP4 source bias must be a contiguous input-dtype vector "
-            "matching the source features"
+            "ConvRot NVFP4 source bias must be a contiguous vector matching the source features"
         )
+    if source_bias is not None:
+        _bias.validate_dtype(source_bias, "ConvRot NVFP4 source")
 
 
 def _validate_projected_swiglu(

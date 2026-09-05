@@ -189,7 +189,6 @@ def _validate_output_projection(
         weight_per_tensor_scale,
         bias,
         input_features=input_features,
-        logical_dtype=torch.bfloat16,
         device=attention_storage.device,
         name="fused sparse Piper NVFP4 output",
     )

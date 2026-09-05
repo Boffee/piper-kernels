@@ -320,6 +320,7 @@ def _make_output_projection(
     output_features: int,
     *,
     bias: bool,
+    bias_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.nn.Linear:
     projection = torch.nn.Linear(
         input_features,
@@ -348,19 +349,28 @@ def _make_output_projection(
     )
     projection.weight = torch.nn.Parameter(weight, requires_grad=False)
     if projection.bias is not None:
-        projection.bias.requires_grad_(False)
+        projection.bias = torch.nn.Parameter(
+            projection.bias.to(bias_dtype),
+            requires_grad=False,
+        )
     return projection
 
 
 class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
     output_features = 320
 
-    def __init__(self, *, escape_attention: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        escape_attention: bool = False,
+        bias_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         super().__init__()
         self.output = _make_output_projection(
             self.heads * self.head_dim,
             self.output_features,
             bias=True,
+            bias_dtype=bias_dtype,
         )
         self.escape_attention = escape_attention
 
@@ -1012,7 +1022,7 @@ def test_cuda_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> No
 )
 def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
     torch.manual_seed(719)
-    model = _SparseProjectionAttentionOutput().eval()
+    model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,

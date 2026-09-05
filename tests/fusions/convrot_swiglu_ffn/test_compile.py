@@ -31,14 +31,31 @@ class _SwiGluFfn(torch.nn.Module):
     intermediate_features = 512
     output_features = 384
 
-    def __init__(self, *, expose_packed: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        expose_packed: bool = False,
+        bias_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         super().__init__()
         self.expose_packed = expose_packed
-        self.up = self._linear(2 * self.intermediate_features, self.input_features)
-        self.down = self._linear(self.output_features, self.intermediate_features)
+        self.up = self._linear(
+            2 * self.intermediate_features,
+            self.input_features,
+            bias_dtype,
+        )
+        self.down = self._linear(
+            self.output_features,
+            self.intermediate_features,
+            bias_dtype,
+        )
 
     @staticmethod
-    def _linear(out_features: int, in_features: int) -> torch.nn.Linear:
+    def _linear(
+        out_features: int,
+        in_features: int,
+        bias_dtype: torch.dtype,
+    ) -> torch.nn.Linear:
         qdata = torch.randint(
             -127,
             128,
@@ -56,7 +73,8 @@ class _SwiGluFfn(torch.nn.Module):
             device="cuda",
         )
         linear.weight = torch.nn.Parameter(weight, requires_grad=False)
-        linear.bias.requires_grad_(False)
+        assert linear.bias is not None
+        linear.bias = torch.nn.Parameter(linear.bias.to(bias_dtype), requires_grad=False)
         return linear
 
     def forward(self, activation: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -233,7 +251,7 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_cuda_compile_options_fold_complete_swiglu_ffn() -> None:
     torch.manual_seed(211)
-    model = _SwiGluFfn().eval()
+    model = _SwiGluFfn(bias_dtype=torch.float32).eval()
     activation = torch.randn(
         2,
         257,

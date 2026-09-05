@@ -8,6 +8,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _output as output_common
+from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _policy, reference
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
@@ -92,11 +93,12 @@ def _prepare_gate_projection(
         raise ValueError("fused ConvRot gate weight scale must contain one FP32 value per row")
     if bias is not None and (
         bias.shape != (output_features,)
-        or bias.dtype is not torch.bfloat16
         or bias.device != attention_storage.device
         or not bias.is_contiguous()
     ):
-        raise ValueError("fused ConvRot gate bias must be contiguous BF16 per output feature")
+        raise ValueError("fused ConvRot gate bias must be contiguous per output feature")
+    if bias is not None:
+        _bias.validate_dtype(bias, "fused ConvRot gate")
     if torch.is_grad_enabled() and (
         input_scale.requires_grad
         or weight_scale.requires_grad
@@ -176,14 +178,15 @@ def _validate_output_projection(
         raise ValueError("fused sparse Piper attention and projection must share a CUDA device")
     if bias is not None and (
         bias.shape != (output_features,)
-        or bias.dtype is not torch.bfloat16
         or bias.device != attention_storage.device
         or bias.layout is not torch.strided
         or not bias.is_contiguous()
     ):
         raise ValueError(
-            "fused sparse Piper output bias must be contiguous BF16 with one value per output"
+            "fused sparse Piper output bias must be contiguous with one value per output"
         )
+    if bias is not None:
+        _bias.validate_dtype(bias, "fused sparse Piper output")
     if torch.is_grad_enabled() and (
         weight_scale.requires_grad or (bias is not None and bias.requires_grad)
     ):

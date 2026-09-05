@@ -2,6 +2,7 @@
 
 import torch
 
+from piper_kernels.linear import _bias
 from piper_kernels.linear._input_activations import input_activation_width
 
 from . import reference
@@ -51,10 +52,7 @@ def _validate_linear(
                 "ConvRot input, weight, and bias must share a device, "
                 f"got {input.device}/{qdata.device}/{bias.device}"
             )
-        if bias.dtype is not dtype:
-            raise ValueError(
-                f"ConvRot bias must match the weight's logical dtype, got {bias.dtype}/{dtype}"
-            )
+        _bias.validate_dtype(bias, "ConvRot linear")
         if bias.layout is not torch.strided:
             raise ValueError("ConvRot linear bias must use strided layout")
 

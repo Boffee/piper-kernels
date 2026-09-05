@@ -60,7 +60,7 @@ def test_linear_rejects_activation_weight_dtype_mismatch(
     [
         ("shape", "bias must have shape"),
         ("device", "must share a device"),
-        ("dtype", "logical dtype"),
+        ("dtype", "must be FP16, BF16, or FP32"),
         ("layout", "bias must use strided layout"),
     ],
 )
@@ -77,12 +77,30 @@ def test_linear_rejects_invalid_bias_contract(
     elif violation == "device":
         bias = torch.empty(7, device="meta")
     elif violation == "dtype":
-        bias = torch.empty(7, dtype=torch.float16)
+        bias = torch.empty(7, dtype=torch.float64)
     else:
         bias = torch.ones(7).to_sparse()
 
     with pytest.raises(ValueError, match=message):
         _call_linear(input_activation, activation, weight, bias)
+
+
+@pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_linear_accepts_independent_bias_dtype(
+    input_activation: str | None,
+    bias_dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(122)
+    weight = _weight(dtype=torch.bfloat16)
+    input_factor = 2 if input_activation == "swiglu" else 1
+    activation = torch.randn(3, input_factor * 32, dtype=torch.bfloat16)
+    bias = torch.randn(7, dtype=bias_dtype)
+
+    result = _call_linear(input_activation, activation, weight, bias)
+
+    assert result.shape == (3, 7)
+    assert result.dtype is torch.bfloat16
 
 
 @pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])

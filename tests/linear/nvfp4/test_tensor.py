@@ -238,12 +238,19 @@ def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dynamic", [False, True])
-@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize(
+    "bias_dtype",
+    [None, torch.float16, torch.bfloat16, torch.float32],
+    ids=["no-bias", "fp16", "bf16", "fp32"],
+)
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_cuda_semantic_linear_matches_torchao(dynamic: bool, with_bias: bool) -> None:
+def test_cuda_semantic_linear_matches_torchao(
+    dynamic: bool,
+    bias_dtype: torch.dtype | None,
+) -> None:
     torch.manual_seed(417)
     input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
@@ -256,7 +263,7 @@ def test_cuda_semantic_linear_matches_torchao(dynamic: bool, with_bias: bool) ->
         act_quant_kwargs=_quantization(dynamic),
     )
     piper_weight = PiperNVFP4Tensor.from_torchao(torchao_weight)
-    bias = torch.randn(128, device="cuda", dtype=torch.bfloat16) if with_bias else None
+    bias = torch.randn(128, device="cuda", dtype=bias_dtype) if bias_dtype is not None else None
 
     expected = F.linear(input, torchao_weight, bias)
     actual = F.linear(input, piper_weight, bias)

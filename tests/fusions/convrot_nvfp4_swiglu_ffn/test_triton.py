@@ -24,11 +24,35 @@ def test_static_chunked_ffn_matches_down_affine_reference(
     rows: int,
     with_bias: bool,
 ) -> None:
-    operands = make_operands(rows=rows, dynamic=False, with_bias=with_bias)
+    operands = make_operands(
+        rows=rows,
+        dynamic=False,
+        bias_dtype=torch.bfloat16 if with_bias else None,
+    )
 
     expected = down_affine_reference(operands)
     actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
 
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
+def test_static_chunked_ffn_supports_mixed_precision_bias(
+    bias_dtype: torch.dtype,
+) -> None:
+    operands = make_operands(
+        rows=129,
+        dynamic=False,
+        bias_dtype=bias_dtype,
+        seed=939,
+    )
+
+    expected = down_affine_reference(operands)
+    actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
+
+    assert actual.dtype is torch.bfloat16
     assert torch.equal(actual, expected)
 
 
@@ -46,7 +70,11 @@ def test_high_first_chunked_ffn_matches_materialized_reference() -> None:
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
 def test_dynamic_chunked_ffn_retains_dense_accuracy(with_bias: bool) -> None:
-    operands = make_operands(dynamic=True, with_bias=with_bias, seed=932 + with_bias)
+    operands = make_operands(
+        dynamic=True,
+        bias_dtype=torch.bfloat16 if with_bias else None,
+        seed=932 + with_bias,
+    )
 
     expected = materialized(operands)
     dense = dense_reference(operands)

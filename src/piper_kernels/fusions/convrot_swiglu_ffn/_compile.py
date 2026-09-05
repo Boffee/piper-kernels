@@ -22,6 +22,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
+from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 
@@ -94,7 +95,7 @@ def _valid_bias(
         value is not None
         and value.ndim == 1
         and _dimension_matches(value.shape[0], features)
-        and value.dtype is input_value.dtype
+        and _bias.is_supported_dtype(value.dtype)
         and value.device == input_value.device
         and value.layout is torch.strided
         and value.is_contiguous()
@@ -334,6 +335,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 file_name
                 for file_name in (
                     __file__,
+                    _bias.__file__,
                     ffn_backend.__file__,
                     swiglu_ffn_compile.__file__,
                     swiglu_ffn_triton.__file__,

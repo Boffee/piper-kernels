@@ -147,6 +147,7 @@ def test_cuda_compile_options_fold_complete_swiglu_ffn(
     operands = make_operands(
         rows=258,
         dynamic=dynamic,
+        bias_dtype=torch.float32,
         high_first=high_first,
         seed=941 + dynamic + 10 * high_first,
     )

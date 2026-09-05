@@ -30,7 +30,7 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
     q_projection = operands.projection(0)
     k_projection = operands.projection(1)
     v_projection = operands.projection(2)
-    biases = tuple(torch.randn(256, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    biases = tuple(torch.randn(256, device="cuda", dtype=torch.float32) for _ in range(3))
     expected_query = query_reference(
         materialize_qk(
             q_projection,

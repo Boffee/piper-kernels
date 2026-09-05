@@ -249,7 +249,6 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
             weight_global,
             bias,
             input_features=input_features,
-            logical_dtype=torch.bfloat16,
             device=query.device,
             name="fused sparse Piper NVFP4 compiler output",
         )

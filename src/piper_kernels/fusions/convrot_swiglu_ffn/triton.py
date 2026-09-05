@@ -8,6 +8,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
+from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import reference
 from piper_kernels.linear.convrot.int8 import triton as convrot_backend
 
@@ -25,15 +26,15 @@ def _validate_bias(
         return
     if (
         bias.shape != (features,)
-        or bias.dtype is not input.dtype
         or bias.device != input.device
         or bias.layout is not torch.strided
         or not bias.is_contiguous()
     ):
         raise ValueError(
-            f"chunked ConvRot {name} bias must be a strided {input.dtype} "
-            f"contiguous tensor with shape ({features},) on {input.device}"
+            f"chunked ConvRot {name} bias must be a contiguous strided tensor "
+            f"with shape ({features},) on {input.device}"
         )
+    _bias.validate_dtype(bias, f"chunked ConvRot {name}")
 
 
 def _validate_inputs(

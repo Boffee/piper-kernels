@@ -24,6 +24,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
 from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
+from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot import _rotation as convrot_rotation
 from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
@@ -337,6 +338,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 file_name
                 for file_name in (
                     __file__,
+                    _bias.__file__,
                     _core.__file__,
                     ffn_backend.__file__,
                     convrot_rotation.__file__,

@@ -43,6 +43,7 @@ from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _output as sparse_piper_output
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
+from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
@@ -69,6 +70,7 @@ def _source_files() -> tuple[str, ...]:
         file_name
         for file_name in (
             __file__,
+            _bias.__file__,
             _layout.__file__,
             _output_compile.__file__,
             qk_quantization.__file__,
