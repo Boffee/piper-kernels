@@ -43,7 +43,7 @@ from lib.tuning import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
-from piper_kernels.linear.convrot.int8 import _policy as convrot_int8_policy
+from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_plan
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -91,49 +91,49 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fused-num-warps",
         type=int,
-        choices=convrot_int8_policy._FUSED_NUM_WARPS_VALUES,
+        choices=convrot_int8_plan._FUSED_NUM_WARPS_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--rotation-num-warps",
         type=int,
-        choices=convrot_int8_policy._ROTATION_NUM_WARPS_VALUES,
+        choices=convrot_int8_plan._ROTATION_NUM_WARPS_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--quantization-num-warps",
         type=int,
-        choices=convrot_int8_policy._QUANTIZATION_NUM_WARPS_VALUES,
+        choices=convrot_int8_plan._QUANTIZATION_NUM_WARPS_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--matmul-block-m",
         type=int,
-        choices=convrot_int8_policy._MATMUL_BLOCK_M_VALUES,
+        choices=convrot_int8_plan._MATMUL_BLOCK_M_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--matmul-block-n",
         type=int,
-        choices=convrot_int8_policy._MATMUL_BLOCK_N_VALUES,
+        choices=convrot_int8_plan._MATMUL_BLOCK_N_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--matmul-block-k",
         type=int,
-        choices=convrot_int8_policy._MATMUL_BLOCK_K_VALUES,
+        choices=convrot_int8_plan._MATMUL_BLOCK_K_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--matmul-num-warps",
         type=int,
-        choices=convrot_int8_policy._MATMUL_NUM_WARPS_VALUES,
+        choices=convrot_int8_plan._MATMUL_NUM_WARPS_VALUES,
         nargs="+",
     )
     parser.add_argument(
         "--matmul-num-stages",
         type=int,
-        choices=convrot_int8_policy._MATMUL_NUM_STAGES_VALUES,
+        choices=convrot_int8_plan._MATMUL_NUM_STAGES_VALUES,
         nargs="+",
     )
     add_tuning_arguments(parser)
@@ -150,8 +150,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: convrot_int8_policy.LinearExecutionPlan,
-) -> tuple[convrot_int8_policy.LinearExecutionPlan, ...]:
+    production_plan: convrot_int8_plan.LinearExecutionPlan,
+) -> tuple[convrot_int8_plan.LinearExecutionPlan, ...]:
     """Build a bounded explicit search around the production execution plan."""
     fusion_axis = boolean_tuning_axis(
         args.fuse_rotation_quantization,
@@ -214,7 +214,7 @@ def _candidate_plans(
     )
 
 
-def _plan_name(plan: convrot_int8_policy.LinearExecutionPlan) -> str:
+def _plan_name(plan: convrot_int8_plan.LinearExecutionPlan) -> str:
     preparation = (
         f"fused-pw{plan.fused_num_warps}"
         if plan.fuse_rotation_quantization
@@ -228,7 +228,7 @@ def _plan_name(plan: convrot_int8_policy.LinearExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: convrot_int8_policy.LinearExecutionPlan,
+    plan: convrot_int8_plan.LinearExecutionPlan,
     workload: ConvRotInt8Workload,
 ) -> TuningCandidate[ConvRotInputs, torch.Tensor]:
     """Wrap one plan around the complete production-paid ConvRot device path."""

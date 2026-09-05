@@ -21,8 +21,9 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 ## Triton setup
 
 Install the optimized backends with `piper-kernels[triton]`, or include ConvRot's tensor
-format with `piper-kernels[convrot,triton]`. The extra selects Triton 3.7 on each supported
-platform: upstream `triton` on Linux and
+format with `piper-kernels[convrot,triton]`. On Linux, first install a CUDA or ROCm PyTorch
+distribution with its matching Triton; Piper does not pin a competing Linux Triton version.
+The extra selects Triton 3.7 via
 [`triton-windows`](https://github.com/triton-lang/triton-windows) on 64-bit Windows.
 
 Optimized Windows execution requires Windows 10 or 11, a supported NVIDIA GPU with a
@@ -99,9 +100,9 @@ always has shape `[..., out_features]`.
 `activation_fn="swiglu"` computes `up * silu(gate)` from `[up | gate]`. Portable paths use
 PyTorch operations; optimized NVIDIA preparation uses shared Triton activation primitives and
 native approximate tanh, so GELU preparation may differ from the portable path by one INT8 code
-rather than being bitwise identical. Optimized Triton preparation uses up to three equal
+rather than being bitwise identical. NVIDIA preparation uses up to three equal
 power-of-two chunks of at most 16,384 columns, fusing rows through 49,152 columns across every
-supported ConvRot group size, logical dtype, row count, and accelerator target. This selection is
+supported ConvRot group size, logical dtype, row count, and NVIDIA target. This selection is
 measured on exact SM120 and optimistic on other targets. Larger rows materialize the activation
 and retain the same semantics. Both
 `F.linear` with a ConvRot INT8 weight and the explicit INT8 entry point are inference-only and
@@ -158,10 +159,32 @@ The standard `add_(update, alpha=...)` signature is compatible with `torch.compi
 `rounding_seed` extension is intended for eager merge code because Dynamo enforces the built-in
 `Tensor.add_` keyword schema while tracing.
 
-The operator selects its Triton implementation on supported CUDA devices and otherwise
+The operator selects its Triton implementation on supported NVIDIA CUDA or Linux AMD HIP devices and otherwise
 uses the portable PyTorch reference. Install the tensor format and optimized backend with
 `piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, and
 attention-only consumers do not inherit the TorchAO dependency.
+
+### ROCm base INT8 support
+
+The AMD implementation lives in `linear/convrot/int8/_amd/`, alongside `_nvidia/`.
+Both implement the same preparation/projection interface; reusable INT8 arithmetic lives in
+`int8/_kernels/`. Public operators and compiler rewrites do not select launch schedules.
+
+ROCm coverage includes ordinary, GELU-tanh, and SwiGLU input preparation; INT8 linear and
+prepared/paired projections; caller-owned output buffers; dense and low-rank weight updates;
+and base `torch.compile` preparation sharing. FP16, BF16, and FP32 are supported.
+The RX 9070 XT (`gfx1201`) has on-device validation. `gfx942`, `gfx1100`, `gfx1151`,
+and `gfx1200` have compiler coverage only, not hardware correctness or performance validation.
+Unknown AMD architectures retain the portable reference.
+
+AMD fused preparation supports widths through 16,384; larger widths use separate rotation
+and quantization. RDNA4 uses BF16 ragged-row chunks and its own measured GEMM schedule.
+FP32 reduction ordering and fused activations can differ from the reference at INT8 rounding
+boundaries. This integration does not enable ROCm GGUF conversion, dequantized-input means,
+specialized FFN/attention fusions, attention kernels, or NVFP4 kernels.
+
+The repository's default `uv` development sources still select CUDA; use a separate
+ROCm environment rather than `uv sync` in that environment.
 
 ## NVFP4 construction
 
