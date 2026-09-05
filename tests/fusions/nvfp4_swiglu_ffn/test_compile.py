@@ -1,6 +1,7 @@
-"""Tests for automatic bounded-workspace NVFP4 SwiGLU FFN folding."""
+"""Tests for automatic semantic NVFP4 SwiGLU FFN folding."""
 
 import uuid
+from dataclasses import replace
 
 import pytest
 import torch
@@ -11,20 +12,15 @@ from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_
 from piper_kernels.fusions.nvfp4_sparse_piper._compile import (
     compile_pass as sparse_piper_compile_pass,
 )
-from piper_kernels.fusions.nvfp4_swiglu_ffn import (
-    nvfp4_swiglu_ffn_compile_options,
-)
+from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
 from piper_kernels.fusions.nvfp4_swiglu_ffn._compile import (
     compile_pass as fusion_compile_pass,
 )
-from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
-    _DEFAULT_CHUNK_ROWS,
-    _chunked_swiglu_ffn_op,
-)
+from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import _chunked_swiglu_ffn_op
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
-from ._helpers import Operands, down_affine_reference, make_operands
+from ._helpers import Linear, Operands, make_operands, materialized
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
@@ -34,14 +30,24 @@ def _exact_sm120_available() -> bool:
 
 
 class _SwiGluFfn(torch.nn.Module):
-    def __init__(self, operands: Operands, *, expose_packed: bool = False) -> None:
+    def __init__(
+        self,
+        operands: Operands,
+        *,
+        promote_gate: bool = False,
+        reverse_multiply: bool = False,
+        expose_gate: bool = False,
+    ) -> None:
         super().__init__()
-        self.expose_packed = expose_packed
-        self.up = self._linear(operands.up)
+        self.promote_gate = promote_gate
+        self.reverse_multiply = reverse_multiply
+        self.expose_gate = expose_gate
+        self.gate = self._linear(operands.gate)
+        self.value = self._linear(operands.value)
         self.down = self._linear(operands.down)
 
     @staticmethod
-    def _linear(operands) -> torch.nn.Linear:
+    def _linear(operands: Linear) -> torch.nn.Linear:
         out_features, in_features = operands.weight.shape
         linear = torch.nn.Linear(
             in_features,
@@ -55,19 +61,25 @@ class _SwiGluFfn(torch.nn.Module):
             linear.bias = torch.nn.Parameter(operands.bias, requires_grad=False)
         return linear
 
-    def forward(self, input: torch.Tensor):  # noqa: A002
-        packed = self.up(input)
-        up, gate = packed.chunk(2, dim=-1)
-        output = self.down(up * F.silu(gate))
-        return (output, packed) if self.expose_packed else output
+    def forward(
+        self,
+        input: torch.Tensor,  # noqa: A002
+        value_input: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        gate = self.gate(input)
+        value = self.value(input if value_input is None else value_input)
+        activated_gate = F.silu(gate.float()).to(gate.dtype) if self.promote_gate else F.silu(gate)
+        activated = activated_gate * value if self.reverse_multiply else value * activated_gate
+        output = self.down(activated)
+        return (output, gate) if self.expose_gate else output
 
 
-class _SwiGluFfnGatedUpdates(torch.nn.Module):
+class _GatedUpdates(torch.nn.Module):
     def __init__(self, operands: Operands) -> None:
         super().__init__()
-        self.ffn = _SwiGluFfn(operands)
+        self.ffn = _SwiGluFfn(operands, promote_gate=True, reverse_multiply=True)
         output_features = operands.down.weight.shape[0]
-        self.input_features = operands.up.weight.shape[1]
+        self.input_features = operands.gate.weight.shape[1]
         self.update = torch.nn.Linear(
             output_features,
             output_features,
@@ -115,33 +127,62 @@ def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
     return options
 
 
-def test_compile_options_install_fusion_after_nvfp4() -> None:
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("high_first", [False, True])
+def test_shared_projection_weights_preserve_distinct_biases(
+    dynamic: bool,
+    high_first: bool,
+) -> None:
+    operands = make_operands(rows=129, dynamic=dynamic, high_first=high_first)
+    operands = replace(
+        operands,
+        value=replace(operands.value, weight=operands.gate.weight),
+    )
+    assert operands.gate.bias is not operands.value.bias
+    model = _SwiGluFfn(operands).eval()
+    # Explicitly tie the module parameter too, so tracing sees one shared weight.
+    model.value.weight = model.gate.weight
+    capture = _TargetCapturePass()
+    with torch.no_grad():
+        expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            operands.input,
+        )
+    assert torch.ops.piper_kernels.nvfp4_swiglu_ffn.default in capture.targets
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_compile_options_install_fusion_before_nvfp4() -> None:
     options = nvfp4_swiglu_ffn_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options[_POST_GRAD_PRE_PASS] == (nvfp4_compile_pass, fusion_compile_pass)
+    assert options[_POST_GRAD_PRE_PASS] == (fusion_compile_pass, nvfp4_compile_pass)
 
 
 def test_compile_options_reapply_without_duplication() -> None:
     options = nvfp4_swiglu_ffn_compile_options(nvfp4_compile_options())
 
-    assert options[_POST_GRAD_PRE_PASS] == (nvfp4_compile_pass, fusion_compile_pass)
+    assert options[_POST_GRAD_PRE_PASS] == (fusion_compile_pass, nvfp4_compile_pass)
     assert nvfp4_swiglu_ffn_compile_options(options) == options
 
 
 @pytest.mark.parametrize("ffn_first", [False, True])
 def test_compile_options_compose_with_sparse_piper(ffn_first: bool) -> None:
-    if ffn_first:
-        options = nvfp4_sparse_piper_compile_options(nvfp4_swiglu_ffn_compile_options())
-    else:
-        options = nvfp4_swiglu_ffn_compile_options(nvfp4_sparse_piper_compile_options())
+    options = (
+        nvfp4_sparse_piper_compile_options(nvfp4_swiglu_ffn_compile_options())
+        if ffn_first
+        else nvfp4_swiglu_ffn_compile_options(nvfp4_sparse_piper_compile_options())
+    )
 
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
-    assert passes.count(nvfp4_compile_pass) == 1
     assert passes.count(fusion_compile_pass) == 1
+    assert passes.count(nvfp4_compile_pass) == 1
     assert passes.count(sparse_piper_compile_pass) == 1
-    assert passes.index(nvfp4_compile_pass) < passes.index(fusion_compile_pass)
+    assert passes.index(fusion_compile_pass) < passes.index(nvfp4_compile_pass)
     assert passes.index(nvfp4_compile_pass) < passes.index(sparse_piper_compile_pass)
 
 
@@ -152,45 +193,55 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("dynamic", [False, True])
-@pytest.mark.parametrize("high_first", [False, True])
-def test_cuda_compile_options_fold_complete_swiglu_ffn(
+@pytest.mark.parametrize(
+    ("dynamic", "promote_gate", "reverse_multiply", "bias_dtype", "high_first"),
+    [
+        (False, False, False, None, False),
+        (False, True, True, torch.float32, True),
+        (True, False, True, torch.bfloat16, False),
+        (True, True, False, torch.float32, True),
+    ],
+)
+def test_cuda_compile_options_fold_semantic_swiglu_ffn(
     dynamic: bool,
+    promote_gate: bool,
+    reverse_multiply: bool,
+    bias_dtype: torch.dtype | None,
     high_first: bool,
 ) -> None:
     operands = make_operands(
         rows=258,
         dynamic=dynamic,
-        bias_dtype=torch.float32,
+        bias_dtype=bias_dtype,
         high_first=high_first,
-        seed=911 + dynamic + 10 * high_first,
+        seed=971 + dynamic + 10 * promote_gate + 100 * reverse_multiply,
     )
     activation = operands.input.reshape(2, 129, -1)
-    model = _SwiGluFfn(operands).eval()
+    model = _SwiGluFfn(
+        operands,
+        promote_gate=promote_gate,
+        reverse_multiply=reverse_multiply,
+    ).eval()
     capture = _TargetCapturePass()
     with torch.no_grad():
-        if dynamic:
-            expected = _chunked_swiglu_ffn_op(*operands.arguments(_DEFAULT_CHUNK_ROWS)).reshape(
-                *activation.shape[:-1],
-                operands.down.weight.shape[0],
-            )
-        else:
-            expected = down_affine_reference(operands).reshape(
-                *activation.shape[:-1],
-                operands.down.weight.shape[0],
-            )
         torch._dynamo.reset()
-        actual = torch.compile(
-            model,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(activation)
+        expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(activation)
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+            activation
+        )
 
-    assert torch.equal(actual, expected)
+    assert isinstance(expected, torch.Tensor)
+    assert isinstance(actual, torch.Tensor)
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    # Ordinary linears round their raw GEMM before scaling. The fused affine
+    # preserves more precision, which can cross down-projection FP4 boundaries.
+    assert relative_l2 < (0.07 if dynamic else 0.04)
+    reference = materialized(operands).reshape_as(actual)
+    reference_error = (actual.float() - reference.float()).norm() / reference.float().norm()
+    assert reference_error < (0.07 if dynamic else 0.03)
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
-    assert torch.ops.piper_kernels.nvfp4_prepare_input.default not in capture.targets
-    assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in capture.targets
 
 
 @pytest.mark.gpu
@@ -204,11 +255,7 @@ def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     torch._dynamo.mark_dynamic(first, 0)
     torch._dynamo.mark_dynamic(second, 0)
     torch._dynamo.reset()
-    compiled = torch.compile(
-        model,
-        fullgraph=True,
-        options=_capturing_options(capture),
-    )
+    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
 
     with torch.no_grad():
         first_output = compiled(first)
@@ -222,74 +269,46 @@ def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_cuda_compile_options_fail_closed_when_packed_projection_escapes() -> None:
+@pytest.mark.parametrize("failure", ["projection-escapes", "different-input"])
+def test_cuda_compile_options_fail_closed(failure: str) -> None:
     operands = make_operands(rows=129, dynamic=False, seed=913)
-    model = _SwiGluFfn(operands, expose_packed=True).eval()
+    model = _SwiGluFfn(operands, expose_gate=failure == "projection-escapes").eval()
+    arguments = (
+        (operands.input, torch.randn_like(operands.input))
+        if failure == "different-input"
+        else (operands.input,)
+    )
     capture = _TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=nvfp4_compile_options(),
-        )(operands.input)
+        expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
             model,
             fullgraph=True,
             options=_capturing_options(capture),
-        )(operands.input)
+        )(*arguments)
 
-    assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+    expected_values = expected if isinstance(expected, tuple) else (expected,)
+    actual_values = actual if isinstance(actual, tuple) else (actual,)
+    assert all(
+        torch.equal(left, right) for left, right in zip(actual_values, expected_values, strict=True)
+    )
     assert torch.ops.piper_kernels.nvfp4_swiglu_ffn.default not in capture.targets
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_cuda_compile_options_preserve_output_reshape_when_it_changes_rank() -> None:
-    operands = make_operands(rows=258, dynamic=False, seed=916)
-    activation = operands.input.reshape(2, 129, -1)
-    model = _SwiGluFfn(operands).eval()
-    output_features = operands.down.weight.shape[0]
-
-    def flattened_ffn(value: torch.Tensor) -> torch.Tensor:
-        output = model(value.reshape(-1, value.shape[-1]))
-        assert isinstance(output, torch.Tensor)
-        return output.reshape(*value.shape[:-1], output_features)
-
-    capture = _TargetCapturePass()
-    with torch.no_grad():
-        torch._dynamo.reset()
-        expected = torch.compile(
-            flattened_ffn,
-            fullgraph=True,
-            options=nvfp4_compile_options(),
-        )(activation)
-        torch._dynamo.reset()
-        actual = torch.compile(
-            flattened_ffn,
-            fullgraph=True,
-            options=_capturing_options(capture),
-        )(activation)
-
-    assert actual.shape == (2, 129, output_features)
-    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
-    assert relative_l2 < 0.01
-    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn.default) == 1
-    assert capture.targets.count(torch.ops.aten.reshape.default) == 2
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_cuda_compile_options_fold_gated_updates() -> None:
+def test_cuda_compile_options_fold_h3_style_gated_updates() -> None:
     rows = 257
     operands = make_operands(
         rows=rows,
         output_features=384,
         dynamic=False,
-        seed=914,
+        bias_dtype=torch.float32,
+        seed=917,
     )
-    model = _SwiGluFfnGatedUpdates(operands).eval()
+    model = _GatedUpdates(operands).eval()
     output_features = operands.down.weight.shape[0]
     base = torch.randn(rows, output_features, device="cuda", dtype=torch.bfloat16)
     update_source = torch.randn_like(base)
@@ -301,11 +320,7 @@ def test_cuda_compile_options_fold_gated_updates() -> None:
     capture = _TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
-        expected = torch.compile(
-            model,
-            fullgraph=True,
-            options=nvfp4_compile_options(),
-        )(*arguments)
+        expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
             model,
@@ -313,7 +328,8 @@ def test_cuda_compile_options_fold_gated_updates() -> None:
             options=_capturing_options(capture),
         )(*arguments)
 
-    assert torch.equal(actual, expected)
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 0.03
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn_gated_updates_.default) == 1
     )

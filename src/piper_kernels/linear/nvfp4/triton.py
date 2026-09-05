@@ -105,8 +105,6 @@ def encode_nvfp4_blocks(
 def _prepare_static_kernel(
     input_ptr,
     per_tensor_scale_ptr,
-    source_global_scale_ptr,
-    source_bias_ptr,
     qdata_ptr,
     scale_ptr,
     block_count,
@@ -114,8 +112,6 @@ def _prepare_static_kernel(
     output_features: tl.constexpr,
     scale_column_blocks: tl.constexpr,
     swiglu: tl.constexpr,
-    apply_source_affine: tl.constexpr,
-    has_source_bias: tl.constexpr,
     blocks_per_program: tl.constexpr,
     high_first: tl.constexpr,
 ):
@@ -143,19 +139,6 @@ def _prepare_static_kernel(
             other=0.0,
             eviction_policy="evict_first",
         ).to(tl.float32)
-    if apply_source_affine:
-        source_global_scale = tl.load(source_global_scale_ptr).to(tl.float32)
-        values *= source_global_scale
-        if swiglu:
-            gate *= source_global_scale
-        if has_source_bias:
-            source_columns = scale_columns[:, None] * _NVFP4_BLOCK_SIZE_TL + element_offsets
-            values += tl.load(source_bias_ptr + source_columns).to(tl.float32)
-            if swiglu:
-                gate += tl.load(source_bias_ptr + source_columns + output_features).to(tl.float32)
-        values = values.to(tl.bfloat16).to(tl.float32)
-        if swiglu:
-            gate = gate.to(tl.bfloat16).to(tl.float32)
     if swiglu:
         values *= gate / (1.0 + libdevice.exp(-gate))  # pyright: ignore[reportOperatorIssue]
 
@@ -188,18 +171,26 @@ def _projection_epilogue_kernel(
     output_ptr,
     elements,
     features: tl.constexpr,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
     apply_scale: tl.constexpr,
     has_bias: tl.constexpr,
     block_size: tl.constexpr,
 ):
     offsets = (tl.program_id(0) * block_size + tl.arange(0, block_size)).to(tl.int64)
     valid = offsets < elements
-    values = tl.load(input_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    rows = offsets // features
+    columns = offsets % features
+    values = tl.load(
+        input_ptr + rows * input_row_stride + columns,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
     if apply_scale:
         values *= tl.load(global_scale_ptr).to(tl.float32)
     if has_bias:
-        values += tl.load(bias_ptr + offsets % features, mask=valid, other=0.0).to(tl.float32)
-    tl.store(output_ptr + offsets, values, mask=valid)
+        values += tl.load(bias_ptr + columns, mask=valid, other=0.0).to(tl.float32)
+    tl.store(output_ptr + rows * output_row_stride + columns, values, mask=valid)
 
 
 @triton.jit
@@ -278,8 +269,6 @@ def _prepare_static_storage(
     per_tensor_scale: torch.Tensor,
     *,
     swiglu: bool,
-    source_global_scale: torch.Tensor | None,
-    source_bias: torch.Tensor | None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -292,8 +281,6 @@ def _prepare_static_storage(
     _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
         contiguous_input,
         per_tensor_scale,
-        source_global_scale if source_global_scale is not None else per_tensor_scale,
-        source_bias if source_bias is not None else contiguous_input,
         qdata,
         scale,
         block_count,
@@ -302,8 +289,6 @@ def _prepare_static_storage(
         scale_column_blocks=(output_features + _layout.SCALE_COLUMN_TILE - 1)
         // _layout.SCALE_COLUMN_TILE,
         swiglu=swiglu,
-        apply_source_affine=source_global_scale is not None,
-        has_source_bias=source_bias is not None,
         blocks_per_program=_PREPARE_BLOCKS,
         high_first=high_first,
         num_warps=2,
@@ -322,8 +307,6 @@ def prepare_static(
         input,
         per_tensor_scale,
         swiglu=swiglu,
-        source_global_scale=None,
-        source_bias=None,
         high_first=high_first,
     )
     return qdata, scale, per_tensor_scale.clone()
@@ -340,27 +323,7 @@ def prepare_static_out(
         input,
         per_tensor_scale,
         swiglu=False,
-        source_global_scale=None,
-        source_bias=None,
         out=out,
-        high_first=high_first,
-    )
-
-
-def prepare_static_projected_swiglu(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    per_tensor_scale: torch.Tensor,
-    source_global_scale: torch.Tensor,
-    source_bias: torch.Tensor | None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply a raw projection's affine result and prepare its packed SwiGLU output."""
-    return _prepare_static_storage(
-        input,
-        per_tensor_scale,
-        swiglu=True,
-        source_global_scale=source_global_scale,
-        source_bias=source_bias,
         high_first=high_first,
     )
 
@@ -372,6 +335,13 @@ def apply_projection_epilogue(
     output: torch.Tensor,
 ) -> None:
     """Apply optional FP32 scale and bias terms into caller-owned storage."""
+    if (
+        input.ndim != 2
+        or output.shape != input.shape
+        or input.stride(1) != 1
+        or output.stride(1) != 1
+    ):
+        raise ValueError("NVFP4 projection epilogue requires matching row-major matrices")
     elements = input.numel()
     _projection_epilogue_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
         input,
@@ -380,6 +350,8 @@ def apply_projection_epilogue(
         output,
         elements,
         features=input.shape[-1],
+        input_row_stride=input.stride(0),
+        output_row_stride=output.stride(0),
         apply_scale=global_scale is not None,
         has_bias=bias is not None,
         block_size=_EPILOGUE_BLOCK_SIZE,
@@ -750,6 +722,5 @@ __all__ = [
     "pack_e2m1_pairs",
     "prepare_static",
     "prepare_static_out",
-    "prepare_static_projected_swiglu",
     "swizzled_scale_offsets",
 ]

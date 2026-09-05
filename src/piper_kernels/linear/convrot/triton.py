@@ -12,7 +12,6 @@ import triton.language as tl
 from piper_kernels.linear._triton_input_activations import (
     gelu_tanh,
     swiglu,
-    to_logical_dtype,
 )
 
 
@@ -70,10 +69,6 @@ def load_activated_rotated_chunk(
     logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
-    source_global_scale_ptr=None,
-    source_bias_ptr=None,
-    apply_source_affine=False,
-    has_source_bias=False,
 ):
     """Load, optionally activate, and rotate one group-aligned row slice."""
     offsets = chunk_start + chunk_offsets
@@ -97,27 +92,6 @@ def load_activated_rotated_chunk(
             other=0.0,
         ).to(tl.float32)
         gate = values
-
-    if apply_source_affine:
-        source_global_scale = tl.load(source_global_scale_ptr).to(tl.float32)
-        values *= source_global_scale
-        if activation_fn == "swiglu":
-            gate *= source_global_scale
-        if has_source_bias:
-            values += tl.load(
-                source_bias_ptr + offsets,
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            if activation_fn == "swiglu":
-                gate += tl.load(
-                    source_bias_ptr + row_width + offsets,
-                    mask=mask,
-                    other=0.0,
-                ).to(tl.float32)
-        values = to_logical_dtype(values, logical_dtype_code)
-        if activation_fn == "swiglu":
-            gate = to_logical_dtype(gate, logical_dtype_code)
 
     if activation_fn == "swiglu":
         values = swiglu(values, gate, logical_dtype_code)

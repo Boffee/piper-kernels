@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import operator
 from collections.abc import Callable
 
 import torch
@@ -14,23 +13,14 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 type LinearPattern = Callable[[CallFunction], CallFunction]
 
 
-def packed_swiglu_pattern(
-    linear: LinearPattern,
+def swiglu_product_pattern(
+    value: CallFunction,
+    gate: CallFunction,
     *,
     promote_gate: bool | None,
     reverse_multiply: bool,
 ) -> CallFunction:
-    """Build one exclusive packed-SwiGLU pattern feeding a linear."""
-    split = CallFunction(
-        torch.ops.aten.split.Tensor,
-        KeywordArg("packed"),
-        KeywordArg("split_size"),
-        -1,
-        _users=2,
-    )
-    up = CallFunction(operator.getitem, split, 0, _users=1)
-    gate_users = 2 if promote_gate is False else 1
-    gate = CallFunction(operator.getitem, split, 1, _users=gate_users)
+    """Build ``value * silu(gate)`` with the supported precision semantics."""
     if promote_gate is None:
         silu = CallFunction(torch.ops.aten.silu.default, gate, _users=1)
     else:
@@ -66,39 +56,8 @@ def packed_swiglu_pattern(
                 KeywordArg("logical_dtype"),
                 _users=1,
             )
-    multiply_args = (silu, up) if reverse_multiply else (up, silu)
-    return linear(CallFunction(torch.ops.aten.mul.Tensor, *multiply_args, _users=1))
-
-
-def valid_packed_swiglu(
-    match: Match,
-    *,
-    promote_gate: bool | None,
-    input_features: int | torch.SymInt,
-) -> bool:
-    """Validate the projection-independent dimensions and promotion of packed SwiGLU."""
-    packed = match.kwargs["packed"]
-    split_size = match.kwargs["split_size"]
-    if not isinstance(packed, torch.fx.Node):
-        return False
-    packed_value = preparation_sharing.tensor_metadata(packed)
-    if (
-        packed_value is None
-        or packed_value.ndim == 0
-        or isinstance(split_size, bool)
-        or not isinstance(split_size, (int, torch.SymInt))
-    ):
-        return False
-    dimensions_match = preparation_sharing.dimension_key(
-        split_size
-    ) == preparation_sharing.dimension_key(input_features) and preparation_sharing.dimension_key(
-        packed_value.shape[-1]
-    ) == preparation_sharing.dimension_key(2 * input_features)
-    if promote_gate is True:
-        return dimensions_match and match.kwargs["logical_dtype"] is packed_value.dtype
-    if promote_gate is False:
-        return dimensions_match and packed_value.dtype is torch.float32
-    return dimensions_match
+    multiply_args = (silu, value) if reverse_multiply else (value, silu)
+    return CallFunction(torch.ops.aten.mul.Tensor, *multiply_args, _users=1)
 
 
 def gelu_tanh_pattern(
@@ -173,7 +132,6 @@ def valid_gelu_tanh(
 __all__ = [
     "LinearPattern",
     "gelu_tanh_pattern",
-    "packed_swiglu_pattern",
+    "swiglu_product_pattern",
     "valid_gelu_tanh",
-    "valid_packed_swiglu",
 ]

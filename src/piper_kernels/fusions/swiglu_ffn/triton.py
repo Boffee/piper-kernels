@@ -17,7 +17,7 @@ _EPILOGUE_BLOCK_SIZE = 256
 
 @dataclass(frozen=True, slots=True)
 class IndexedGatedUpdates:
-    """Caller-owned tensors consumed by H3's indexed FFN update epilogue."""
+    """Caller-owned tensors consumed by the indexed FFN update epilogue."""
 
     base: torch.Tensor
     reusable_update: torch.Tensor

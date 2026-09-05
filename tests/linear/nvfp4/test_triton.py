@@ -168,45 +168,17 @@ def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> No
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
-def test_static_projected_swiglu_matches_separate_epilogue(with_bias: bool) -> None:
-    torch._dynamo.reset()
-    torch.manual_seed(502)
-    raw = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
-    source_scale = torch.tensor(0.01, device="cuda", dtype=torch.float32)
-    source_bias = torch.randn(160, device="cuda", dtype=torch.bfloat16) if with_bias else None
-    activation_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
-    projected = (
-        nvfp4_ops._compiled_scale_result(raw, source_scale)
-        if source_bias is None
-        else nvfp4_ops._compiled_scale_result_and_add_bias(raw, source_scale, source_bias)
-    )
-
-    expected_qdata, expected_scale, _ = nvfp4_ops._compiled_prepare_static(
-        projected,
-        activation_scale,
-        "swiglu",
-    )
-    actual = nvfp4_triton.prepare_static_projected_swiglu(
-        raw,
-        activation_scale,
-        source_scale,
-        source_bias,
-    )
-
-    for expected_tensor, actual_tensor in zip(
-        (expected_qdata, expected_scale),
-        actual,
-        strict=True,
-    ):
-        assert torch.equal(actual_tensor, expected_tensor)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no-bias", "bias"])
-def test_projection_epilogue_matches_portable_decomposition(with_bias: bool) -> None:
+@pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
+def test_projection_epilogue_matches_portable_decomposition(
+    with_bias: bool,
+    strided: bool,
+) -> None:
     torch.manual_seed(503)
-    raw = torch.randn(129, 80, device="cuda", dtype=torch.bfloat16)
+    raw = (
+        torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)[:, :80]
+        if strided
+        else torch.randn(129, 80, device="cuda", dtype=torch.bfloat16)
+    )
     global_scale = torch.tensor(0.01, device="cuda", dtype=torch.float32)
     bias = torch.randn(80, device="cuda", dtype=torch.bfloat16) if with_bias else None
     expected = (
@@ -214,7 +186,11 @@ def test_projection_epilogue_matches_portable_decomposition(with_bias: bool) -> 
         if bias is None
         else nvfp4_ops._compiled_scale_result_and_add_bias(raw, global_scale, bias)
     )
-    actual = torch.empty_like(raw)
+    actual = (
+        torch.empty((129, 160), device="cuda", dtype=torch.bfloat16)[:, :80]
+        if strided
+        else torch.empty_like(raw)
+    )
 
     nvfp4_triton.apply_projection_epilogue(raw, global_scale, bias, actual)
 

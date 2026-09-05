@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import operator
 from collections.abc import Mapping
+from functools import partial
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -28,42 +28,27 @@ from piper_kernels.linear.convrot.int8 import _compile as convrot_compile
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-swiglu-ffn-compile-v5"
+_COMPILE_PASS_VERSION = "convrot-swiglu-ffn-compile-v6"
 
 
-def _normalized_ffn_pattern(*, explicit_up_activation: bool) -> CallFunction:
-    """Match the stable ConvRot graph produced by input-activation folding."""
-    up_arguments: tuple[object, ...] = (
-        KeywordArg("ffn_input"),
-        KeywordArg("up_weight_qdata"),
-        KeywordArg("up_weight_scale"),
-        KeywordArg("up_bias"),
-        KeywordArg("up_group_size"),
+def _semantic_linear_pattern(
+    input_pattern: object,
+    prefix: str,
+    users: int | None,
+) -> CallFunction:
+    arguments = (
+        input_pattern,
+        KeywordArg(f"{prefix}_weight_qdata"),
+        KeywordArg(f"{prefix}_weight_scale"),
+        KeywordArg(f"{prefix}_bias"),
+        KeywordArg(f"{prefix}_group_size"),
     )
-    if explicit_up_activation:
-        up_arguments = (*up_arguments, None)
-    packed = CallFunction(
-        torch.ops.piper_kernels.convrot_int8_linear.default,
-        *up_arguments,
-        _users=1,
-    )
-    prepared = CallFunction(
-        torch.ops.piper_kernels.convrot_int8_prepare_input.default,
-        packed,
-        KeywordArg("down_group_size"),
-        "swiglu",
-        _users=2,
-    )
-    prepared_qdata = CallFunction(operator.getitem, prepared, 0, _users=1)
-    prepared_scale = CallFunction(operator.getitem, prepared, 1, _users=1)
+    if users is None:
+        return CallFunction(torch.ops.piper_kernels.convrot_int8_linear.default, *arguments)
     return CallFunction(
-        torch.ops.piper_kernels.convrot_int8_linear_prepared.default,
-        prepared_qdata,
-        prepared_scale,
-        KeywordArg("down_weight_qdata"),
-        KeywordArg("down_weight_scale"),
-        KeywordArg("down_bias"),
-        KeywordArg("logical_dtype"),
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        *arguments,
+        _users=users,
     )
 
 
@@ -102,10 +87,16 @@ def _valid_bias(
     )
 
 
-def _valid_normalized_ffn(match: Match) -> bool:
+def _valid_semantic_ffn(  # noqa: PLR0911
+    match: Match,
+    *,
+    promote_gate: bool | None,
+) -> bool:
     input_value = _metadata(match, "ffn_input")
-    up_weight = _metadata(match, "up_weight_qdata")
-    up_scale = _metadata(match, "up_weight_scale")
+    gate_weight = _metadata(match, "gate_weight_qdata")
+    gate_scale = _metadata(match, "gate_weight_scale")
+    value_weight = _metadata(match, "value_weight_qdata")
+    value_scale = _metadata(match, "value_weight_scale")
     down_weight = _metadata(match, "down_weight_qdata")
     down_scale = _metadata(match, "down_weight_scale")
     output_value = preparation_sharing.tensor_metadata(match.output_node())
@@ -113,8 +104,10 @@ def _valid_normalized_ffn(match: Match) -> bool:
         value is None
         for value in (
             input_value,
-            up_weight,
-            up_scale,
+            gate_weight,
+            gate_scale,
+            value_weight,
+            value_scale,
             down_weight,
             down_scale,
             output_value,
@@ -122,45 +115,52 @@ def _valid_normalized_ffn(match: Match) -> bool:
     ):
         return False
     assert input_value is not None
-    assert up_weight is not None
-    assert up_scale is not None
+    assert gate_weight is not None
+    assert gate_scale is not None
+    assert value_weight is not None
+    assert value_scale is not None
     assert down_weight is not None
     assert down_scale is not None
     assert output_value is not None
-
+    weights = gate_weight, value_weight, down_weight
+    scales = gate_scale, value_scale, down_scale
     if (
         input_value.ndim == 0
         or input_value.dtype is not torch.bfloat16
         or input_value.device.type != "cuda"
         or input_value.layout is not torch.strided
         or not input_value.is_contiguous()
-        or up_weight.ndim != 2
-        or down_weight.ndim != 2
-        or up_weight.dtype is not torch.int8
-        or down_weight.dtype is not torch.int8
-        or up_scale.dtype is not torch.float32
-        or down_scale.dtype is not torch.float32
-        or up_weight.device != input_value.device
-        or up_scale.device != input_value.device
-        or down_weight.device != input_value.device
-        or down_scale.device != input_value.device
         or any(
-            value.layout is not torch.strided or not value.is_contiguous()
-            for value in (up_weight, up_scale, down_weight, down_scale)
+            weight.ndim != 2
+            or weight.dtype is not torch.int8
+            or weight.device != input_value.device
+            or weight.layout is not torch.strided
+            or not weight.is_contiguous()
+            for weight in weights
         )
+        or any(
+            scale.dtype is not torch.float32
+            or scale.device != input_value.device
+            or scale.layout is not torch.strided
+            or not scale.is_contiguous()
+            for scale in scales
+        )
+        or not AcceleratorTarget.from_device(input_value.device).cuda_capability_at_least(7, 5)
     ):
         return False
-    target = AcceleratorTarget.from_device(input_value.device)
-    if not target.cuda_capability_at_least(7, 5):
-        return False
 
-    input_features = up_weight.shape[1]
-    intermediate_features = down_weight.shape[1]
+    input_features = gate_weight.shape[1]
+    intermediate_features = gate_weight.shape[0]
     output_features = down_weight.shape[0]
     if (
         not _dimension_matches(input_value.shape[-1], input_features)
-        or not _dimension_matches(up_weight.shape[0], 2 * intermediate_features)
-        or up_scale.shape != (up_weight.shape[0], 1)
+        or any(
+            not _dimension_matches(left, right)
+            for left, right in zip(gate_weight.shape, value_weight.shape, strict=True)
+        )
+        or not _dimension_matches(down_weight.shape[1], intermediate_features)
+        or gate_scale.shape != (intermediate_features, 1)
+        or value_scale.shape != (intermediate_features, 1)
         or down_scale.shape != (output_features, 1)
         or output_value.dtype is not input_value.dtype
         or output_value.device != input_value.device
@@ -174,47 +174,51 @@ def _valid_normalized_ffn(match: Match) -> bool:
             )
         )
         or not _dimension_matches(output_value.shape[-1], output_features)
-        or match.kwargs["logical_dtype"] is not input_value.dtype
     ):
         return False
-
-    up_group_size = match.kwargs["up_group_size"]
-    down_group_size = match.kwargs["down_group_size"]
+    if promote_gate is True and match.kwargs["logical_dtype"] is not input_value.dtype:
+        return False
+    group_sizes = tuple(
+        match.kwargs[f"{prefix}_group_size"] for prefix in ("gate", "value", "down")
+    )
+    if any(
+        isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 1
+        for group_size in group_sizes
+    ):
+        return False
+    gate_group_size, value_group_size, down_group_size = group_sizes
     if (
-        isinstance(up_group_size, bool)
-        or not isinstance(up_group_size, int)
-        or isinstance(down_group_size, bool)
-        or not isinstance(down_group_size, int)
-        or up_group_size < 1
-        or down_group_size < 1
-        or (isinstance(input_features, int) and input_features % up_group_size)
+        gate_group_size != value_group_size
+        or (isinstance(input_features, int) and input_features % gate_group_size)
         or (isinstance(intermediate_features, int) and intermediate_features % down_group_size)
     ):
         return False
-    return _valid_bias(
-        match,
-        "up_bias",
-        features=up_weight.shape[0],
-        input_value=input_value,
-    ) and _valid_bias(
-        match,
-        "down_bias",
-        features=output_features,
-        input_value=input_value,
+    return all(
+        _valid_bias(
+            match,
+            f"{prefix}_bias",
+            features=features,
+            input_value=input_value,
+        )
+        for prefix, features in (
+            ("gate", intermediate_features),
+            ("value", intermediate_features),
+            ("down", output_features),
+        )
     )
 
 
-def _valid_gated_updates(match: Match) -> bool:
-    return swiglu_ffn_compile.valid_gated_updates(match, _valid_normalized_ffn)
-
-
-def _replace_normalized_ffn(
+def _replace_semantic_ffn(  # noqa: PLR0913, PLR0917
     match: Match,
     ffn_input: torch.fx.Node,
-    up_weight_qdata: torch.fx.Node,
-    up_weight_scale: torch.fx.Node,
-    up_bias: torch.fx.Node | None,
-    up_group_size: int,
+    gate_weight_qdata: torch.fx.Node,
+    gate_weight_scale: torch.fx.Node,
+    gate_bias: torch.fx.Node | None,
+    gate_group_size: int,
+    value_weight_qdata: torch.fx.Node,
+    value_weight_scale: torch.fx.Node,
+    value_bias: torch.fx.Node | None,
+    value_group_size: int,
     down_weight_qdata: torch.fx.Node,
     down_weight_scale: torch.fx.Node,
     down_bias: torch.fx.Node | None,
@@ -228,10 +232,14 @@ def _replace_normalized_ffn(
             torch.ops.piper_kernels.convrot_swiglu_ffn.default,
             args=(
                 ffn_input,
-                up_weight_qdata,
-                up_weight_scale,
-                up_bias,
-                up_group_size,
+                gate_weight_qdata,
+                gate_weight_scale,
+                gate_bias,
+                gate_group_size,
+                value_weight_qdata,
+                value_weight_scale,
+                value_bias,
+                value_group_size,
                 down_weight_qdata,
                 down_weight_scale,
                 down_bias,
@@ -245,13 +253,17 @@ def _replace_normalized_ffn(
     match.erase_nodes()
 
 
-def _replace_normalized_ffn_gated_updates(  # noqa: PLR0913, PLR0917
+def _replace_semantic_ffn_gated_updates(  # noqa: PLR0913, PLR0917
     match: Match,
     ffn_input: torch.fx.Node,
-    up_weight_qdata: torch.fx.Node,
-    up_weight_scale: torch.fx.Node,
-    up_bias: torch.fx.Node | None,
-    up_group_size: int,
+    gate_weight_qdata: torch.fx.Node,
+    gate_weight_scale: torch.fx.Node,
+    gate_bias: torch.fx.Node | None,
+    gate_group_size: int,
+    value_weight_qdata: torch.fx.Node,
+    value_weight_scale: torch.fx.Node,
+    value_bias: torch.fx.Node | None,
+    value_group_size: int,
     down_weight_qdata: torch.fx.Node,
     down_weight_scale: torch.fx.Node,
     down_bias: torch.fx.Node | None,
@@ -271,10 +283,14 @@ def _replace_normalized_ffn_gated_updates(  # noqa: PLR0913, PLR0917
             torch.ops.piper_kernels.convrot_swiglu_ffn_gated_updates_.default,
             args=(
                 ffn_input,
-                up_weight_qdata,
-                up_weight_scale,
-                up_bias,
-                up_group_size,
+                gate_weight_qdata,
+                gate_weight_scale,
+                gate_bias,
+                gate_group_size,
+                value_weight_qdata,
+                value_weight_scale,
+                value_bias,
+                value_group_size,
                 down_weight_qdata,
                 down_weight_scale,
                 down_bias,
@@ -295,21 +311,37 @@ def _replace_normalized_ffn_gated_updates(  # noqa: PLR0913, PLR0917
 
 _gated_updates_patterns = PatternMatcherPass("convrot_swiglu_ffn_gated_updates")
 _patterns = PatternMatcherPass("convrot_swiglu_ffn")
-for _explicit_up_activation in (False, True):
-    for _use_aten_index in (False, True):
+for _promote_gate in (None, False, True):
+    for _reverse_multiply in (False, True):
+        _semantic_ffn_pattern = swiglu_ffn_pattern.semantic_ffn_pattern(
+            _semantic_linear_pattern,
+            _semantic_linear_pattern,
+            _semantic_linear_pattern,
+            promote_gate=_promote_gate,
+            reverse_multiply=_reverse_multiply,
+        )
+        for _use_aten_index in (False, True):
+            register_graph_pattern(
+                swiglu_ffn_pattern.gated_updates_pattern(
+                    _semantic_ffn_pattern,
+                    use_aten_index=_use_aten_index,
+                ),
+                extra_check=lambda match, promote_gate=_promote_gate: (
+                    swiglu_ffn_compile.valid_gated_updates(
+                        match,
+                        partial(_valid_semantic_ffn, promote_gate=promote_gate),
+                    )
+                ),
+                pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_semantic_ffn_gated_updates)
         register_graph_pattern(
-            swiglu_ffn_pattern.gated_updates_pattern(
-                _normalized_ffn_pattern(explicit_up_activation=_explicit_up_activation),
-                use_aten_index=_use_aten_index,
+            _semantic_ffn_pattern,
+            extra_check=lambda match, promote_gate=_promote_gate: _valid_semantic_ffn(
+                match,
+                promote_gate=promote_gate,
             ),
-            extra_check=_valid_gated_updates,
-            pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
-        )(_replace_normalized_ffn_gated_updates)
-    register_graph_pattern(
-        _normalized_ffn_pattern(explicit_up_activation=_explicit_up_activation),
-        extra_check=_valid_normalized_ffn,
-        pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-    )(_replace_normalized_ffn)
+            pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_semantic_ffn)
 
 
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
@@ -323,7 +355,7 @@ def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold normalized ConvRot SwiGLU FFNs after ordinary ConvRot rewriting."""
+    """Fold semantic gate/value FFNs before ordinary linear normalization."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
@@ -353,10 +385,10 @@ compile_pass = _CompilePass()
 def convrot_swiglu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Install chunked FFN folding immediately after ordinary ConvRot folding."""
+    """Install semantic FFN folding before ordinary ConvRot folding."""
     return preparation_sharing.add_ordered_post_grad_passes(
         options,
-        (convrot_compile.compile_pass, compile_pass),
+        (compile_pass, convrot_compile.compile_pass),
     )
 
 

@@ -2,121 +2,33 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
-from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
-from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 from . import _core
+from ._preparation import StandardPreparation
 
 _DEFAULT_CHUNK_ROWS = _core.DEFAULT_CHUNK_ROWS
-
-
-def _dynamic_swiglu_scale(input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-    up, gate = input.chunk(2, dim=-1)
-    activated = up * F.silu(gate)
-    return per_tensor_amax_to_scale(activated.abs().amax())
-
-
-def _projected_swiglu_scale(
-    input: torch.Tensor,  # noqa: A002
-    global_scale: torch.Tensor,
-) -> torch.Tensor:
-    projected = (input.float() * global_scale.float()).to(input.dtype)
-    return _dynamic_swiglu_scale(projected)
-
-
-def _projected_swiglu_scale_and_add_bias(
-    input: torch.Tensor,  # noqa: A002
-    global_scale: torch.Tensor,
-    bias: torch.Tensor,
-) -> torch.Tensor:
-    projected = (input.float() * global_scale.float() + bias.float()).to(input.dtype)
-    return _dynamic_swiglu_scale(projected)
-
-
-_compiled_projected_swiglu_scale = torch.compile(_projected_swiglu_scale, fullgraph=True)
-_compiled_projected_swiglu_scale_and_add_bias = torch.compile(
-    _projected_swiglu_scale_and_add_bias,
-    fullgraph=True,
-)
-
-
-def _projected_swiglu_dynamic_scale(
-    input: torch.Tensor,  # noqa: A002
-    global_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    """Calculate a dynamic scale without materializing the projected SwiGLU."""
-    if bias is None:
-        return _compiled_projected_swiglu_scale(input, global_scale)
-    return _compiled_projected_swiglu_scale_and_add_bias(input, global_scale, bias)
-
-
-@dataclass(frozen=True, slots=True)
-class _StandardPreparation:
-    """Ordinary NVFP4 preparation used by the shared chunked runner."""
-
-    up_high_first: bool
-    down_high_first: bool
-
-    def dynamic_up_scale(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-    ) -> torch.Tensor:
-        return nvfp4_backend.dynamic_scale(input)
-
-    def prepare_up(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-        per_tensor_scale: torch.Tensor,
-        out: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_backend.prepare_static_out(
-            input,
-            per_tensor_scale,
-            out,
-            high_first=self.up_high_first,
-        )
-
-    def dynamic_down_scale(
-        self,
-        packed: torch.Tensor,
-        up_global_scale: torch.Tensor,
-        up_bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        return _projected_swiglu_dynamic_scale(packed, up_global_scale, up_bias)
-
-    def prepare_down(
-        self,
-        packed: torch.Tensor,
-        down_per_tensor_scale: torch.Tensor,
-        up_global_scale: torch.Tensor,
-        up_bias: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_backend.prepare_static_projected_swiglu(
-            packed,
-            down_per_tensor_scale,
-            up_global_scale,
-            up_bias,
-            high_first=self.down_high_first,
-        )
 
 
 @torch.library.custom_op("piper_kernels::nvfp4_swiglu_ffn", mutates_args=())
 def _chunked_swiglu_ffn_op(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    up_weight_qdata: torch.Tensor,
-    up_weight_scale: torch.Tensor,
-    up_weight_per_tensor_scale: torch.Tensor | None,
-    up_activation_per_tensor_scale: torch.Tensor | None,
-    up_bias: torch.Tensor | None,
-    up_dynamic_activation_scale: bool,
-    up_high_first: bool,
+    gate_weight_qdata: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    gate_weight_per_tensor_scale: torch.Tensor | None,
+    gate_activation_per_tensor_scale: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+    gate_dynamic_activation_scale: bool,
+    gate_high_first: bool,
+    value_weight_qdata: torch.Tensor,
+    value_weight_scale: torch.Tensor,
+    value_weight_per_tensor_scale: torch.Tensor | None,
+    value_activation_per_tensor_scale: torch.Tensor | None,
+    value_bias: torch.Tensor | None,
+    value_dynamic_activation_scale: bool,
+    value_high_first: bool,
     down_weight_qdata: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_weight_per_tensor_scale: torch.Tensor | None,
@@ -126,16 +38,21 @@ def _chunked_swiglu_ffn_op(
     down_high_first: bool,
     chunk_rows: int,
 ) -> torch.Tensor:
-    up = _core.linear_operands(
-        up_weight_qdata,
-        up_weight_scale,
-        up_weight_per_tensor_scale,
-        up_activation_per_tensor_scale,
-        up_bias,
-        up_dynamic_activation_scale,
-        up_high_first,
-    )
-    down = _core.linear_operands(
+    gate, value, down = _core.linear_operands(
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_weight_per_tensor_scale,
+        gate_activation_per_tensor_scale,
+        gate_bias,
+        gate_dynamic_activation_scale,
+        gate_high_first,
+        value_weight_qdata,
+        value_weight_scale,
+        value_weight_per_tensor_scale,
+        value_activation_per_tensor_scale,
+        value_bias,
+        value_dynamic_activation_scale,
+        value_high_first,
         down_weight_qdata,
         down_weight_scale,
         down_weight_per_tensor_scale,
@@ -146,23 +63,31 @@ def _chunked_swiglu_ffn_op(
     )
     return _core.run_chunked_swiglu_ffn(
         input,
-        up,
+        gate,
+        value,
         down,
         chunk_rows,
-        _StandardPreparation(up_high_first, down_high_first),
+        StandardPreparation(gate_high_first, down_high_first),
     )
 
 
 @_chunked_swiglu_ffn_op.register_fake
 def _chunked_swiglu_ffn_op_fake(
     input: torch.Tensor,  # noqa: A002
-    _up_weight_qdata: torch.Tensor,
-    _up_weight_scale: torch.Tensor,
-    _up_weight_per_tensor_scale: torch.Tensor | None,
-    _up_activation_per_tensor_scale: torch.Tensor | None,
-    _up_bias: torch.Tensor | None,
-    _up_dynamic_activation_scale: bool,
-    _up_high_first: bool,
+    _gate_weight_qdata: torch.Tensor,
+    _gate_weight_scale: torch.Tensor,
+    _gate_weight_per_tensor_scale: torch.Tensor | None,
+    _gate_activation_per_tensor_scale: torch.Tensor | None,
+    _gate_bias: torch.Tensor | None,
+    _gate_dynamic_activation_scale: bool,
+    _gate_high_first: bool,
+    _value_weight_qdata: torch.Tensor,
+    _value_weight_scale: torch.Tensor,
+    _value_weight_per_tensor_scale: torch.Tensor | None,
+    _value_activation_per_tensor_scale: torch.Tensor | None,
+    _value_bias: torch.Tensor | None,
+    _value_dynamic_activation_scale: bool,
+    _value_high_first: bool,
     down_weight_qdata: torch.Tensor,
     _down_weight_scale: torch.Tensor,
     _down_weight_per_tensor_scale: torch.Tensor | None,
@@ -181,13 +106,20 @@ def _chunked_swiglu_ffn_op_fake(
 )
 def _chunked_swiglu_ffn_gated_updates_op(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    up_weight_qdata: torch.Tensor,
-    up_weight_scale: torch.Tensor,
-    up_weight_per_tensor_scale: torch.Tensor | None,
-    up_activation_per_tensor_scale: torch.Tensor | None,
-    up_bias: torch.Tensor | None,
-    up_dynamic_activation_scale: bool,
-    up_high_first: bool,
+    gate_weight_qdata: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    gate_weight_per_tensor_scale: torch.Tensor | None,
+    gate_activation_per_tensor_scale: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+    gate_dynamic_activation_scale: bool,
+    gate_high_first: bool,
+    value_weight_qdata: torch.Tensor,
+    value_weight_scale: torch.Tensor,
+    value_weight_per_tensor_scale: torch.Tensor | None,
+    value_activation_per_tensor_scale: torch.Tensor | None,
+    value_bias: torch.Tensor | None,
+    value_dynamic_activation_scale: bool,
+    value_high_first: bool,
     down_weight_qdata: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_weight_per_tensor_scale: torch.Tensor | None,
@@ -203,16 +135,21 @@ def _chunked_swiglu_ffn_gated_updates_op(
     python_indexing: bool,
     chunk_rows: int,
 ) -> None:
-    up = _core.linear_operands(
-        up_weight_qdata,
-        up_weight_scale,
-        up_weight_per_tensor_scale,
-        up_activation_per_tensor_scale,
-        up_bias,
-        up_dynamic_activation_scale,
-        up_high_first,
-    )
-    down = _core.linear_operands(
+    gate, value, down = _core.linear_operands(
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_weight_per_tensor_scale,
+        gate_activation_per_tensor_scale,
+        gate_bias,
+        gate_dynamic_activation_scale,
+        gate_high_first,
+        value_weight_qdata,
+        value_weight_scale,
+        value_weight_per_tensor_scale,
+        value_activation_per_tensor_scale,
+        value_bias,
+        value_dynamic_activation_scale,
+        value_high_first,
         down_weight_qdata,
         down_weight_scale,
         down_weight_per_tensor_scale,
@@ -223,10 +160,11 @@ def _chunked_swiglu_ffn_gated_updates_op(
     )
     _core.run_chunked_swiglu_ffn(
         input,
-        up,
+        gate,
+        value,
         down,
         chunk_rows,
-        _StandardPreparation(up_high_first, down_high_first),
+        StandardPreparation(gate_high_first, down_high_first),
         gated_updates=gated_updates_backend.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,
@@ -241,13 +179,20 @@ def _chunked_swiglu_ffn_gated_updates_op(
 @_chunked_swiglu_ffn_gated_updates_op.register_fake
 def _chunked_swiglu_ffn_gated_updates_op_fake(
     _input: torch.Tensor,
-    _up_weight_qdata: torch.Tensor,
-    _up_weight_scale: torch.Tensor,
-    _up_weight_per_tensor_scale: torch.Tensor | None,
-    _up_activation_per_tensor_scale: torch.Tensor | None,
-    _up_bias: torch.Tensor | None,
-    _up_dynamic_activation_scale: bool,
-    _up_high_first: bool,
+    _gate_weight_qdata: torch.Tensor,
+    _gate_weight_scale: torch.Tensor,
+    _gate_weight_per_tensor_scale: torch.Tensor | None,
+    _gate_activation_per_tensor_scale: torch.Tensor | None,
+    _gate_bias: torch.Tensor | None,
+    _gate_dynamic_activation_scale: bool,
+    _gate_high_first: bool,
+    _value_weight_qdata: torch.Tensor,
+    _value_weight_scale: torch.Tensor,
+    _value_weight_per_tensor_scale: torch.Tensor | None,
+    _value_activation_per_tensor_scale: torch.Tensor | None,
+    _value_bias: torch.Tensor | None,
+    _value_dynamic_activation_scale: bool,
+    _value_high_first: bool,
     _down_weight_qdata: torch.Tensor,
     _down_weight_scale: torch.Tensor,
     _down_weight_per_tensor_scale: torch.Tensor | None,
@@ -266,4 +211,7 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
     return None
 
 
-__all__ = ["_chunked_swiglu_ffn_gated_updates_op", "_chunked_swiglu_ffn_op"]
+__all__ = [
+    "_chunked_swiglu_ffn_gated_updates_op",
+    "_chunked_swiglu_ffn_op",
+]
