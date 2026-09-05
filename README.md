@@ -183,10 +183,8 @@ FP32 reduction ordering and fused activations can differ from the reference at I
 boundaries. This integration does not enable ROCm GGUF conversion, dequantized-input means,
 specialized FFN/attention fusions, attention kernels, or NVFP4 kernels.
 
-For environment details, test commands, and measurements, see
-[ROCm INT8 validation](docs/convrot-int8-rocm.md). The repository's default `uv` development
-sources still select CUDA; use a separate ROCm environment rather than `uv sync` in that
-environment.
+The repository's default `uv` development sources still select CUDA; use a separate
+ROCm environment rather than `uv sync` in that environment.
 
 ## NVFP4 construction
 

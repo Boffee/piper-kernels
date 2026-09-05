@@ -9,8 +9,7 @@ it is not part of the installed `piper_kernels` API.
 
 For the modular AMD ConvRot INT8 backend, use `benchmark_convrot_int8_rocm.py`
 with ROCm PyTorch. It reports allocation-free preparation/GEMM, full linear,
-dense INT8 TOPS, and separate cache-flushed/graph timings. See
-[ROCm validation and reproduction notes](../docs/convrot-int8-rocm.md).
+dense INT8 TOPS, and separate cache-flushed/graph timings.
 The older ConvRot phase/tuning utilities below still expose NVIDIA launch policy.
 
 A provider has two explicit callables:
