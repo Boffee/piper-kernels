@@ -6,7 +6,7 @@ import torch
 
 from piper_kernels.linear import _input_activations as input_activations
 
-from . import _layout, _projection, reference
+from . import _layout, _projection, _validation, reference
 from . import triton as nvfp4_triton
 
 
@@ -74,6 +74,10 @@ def _prepare_compiled(
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_activations.validate_input_activation(activation_fn)
+    if input.numel() == 0:
+        return reference.prepare_input(
+            input, activation_per_tensor_scale, dynamic_activation_scale, activation_fn, high_first
+        )
     if dynamic_activation_scale:
         return _compiled_prepare_dynamic(input, activation_fn, high_first)
     if activation_per_tensor_scale is None:
@@ -108,6 +112,8 @@ def _execute_prepared(
         device=input_qdata.device,
         dtype=logical_dtype,
     )
+    if input_qdata.shape[0] == 0:
+        return output
     return _projection.matmul_prepared_chunk_affine_out(
         input_qdata,
         input_scale,
@@ -134,6 +140,19 @@ def linear(
     high_first: bool = False,
 ) -> torch.Tensor:
     """Quantize an activation and apply a standard swizzled NVFP4 W4A4 weight."""
+    if input.numel() == 0:
+        _validation.validate_semantic_linear(
+            input,
+            weight_qdata,
+            weight_scale,
+            weight_per_tensor_scale,
+            activation_per_tensor_scale,
+            bias,
+            dynamic_activation_scale,
+            "NVFP4 linear",
+            allow_empty=True,
+        )
+        return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
     input_qdata, input_scale, input_per_tensor_scale = _prepare_compiled(
         input,
         activation_per_tensor_scale,

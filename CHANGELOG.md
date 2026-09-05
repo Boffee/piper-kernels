@@ -46,6 +46,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Return correctly shaped empty outputs for plain and ConvRot NVFP4 linears, including
+  static/dynamic activation scales and compiled preparation/projection paths.
 - Avoid a second full-size NVFP4 output allocation for scaling/bias, including supported eager
   linears that previously delegated to TorchAO. FP16 projections no longer need a full BF16
   intermediate, and FFN gate/value/down projections share the same mixed-bias behavior.

@@ -136,6 +136,8 @@ def validate_semantic_linear(
     bias: torch.Tensor | None,
     dynamic_activation_scale: bool,
     name: str,
+    *,
+    allow_empty: bool = False,
 ) -> LinearShape:
     """Validate an unprepared semantic NVFP4 linear."""
     if input.ndim == 0 or input.dtype not in _LOGICAL_DTYPES or input.layout is not torch.strided:
@@ -143,7 +145,7 @@ def validate_semantic_linear(
     input_features = input.shape[-1]
     _validate_input_features(input_features, name)
     rows = math.prod(input.shape[:-1])
-    if isinstance(rows, int) and rows < 1:
+    if not allow_empty and isinstance(rows, int) and rows < 1:
         raise ValueError(f"{name} input must contain at least one row")
     validate_activation_scale(
         activation_per_tensor_scale,

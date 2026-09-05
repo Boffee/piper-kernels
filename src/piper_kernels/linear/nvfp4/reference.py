@@ -38,6 +38,18 @@ def prepare_input(
     if group_size:
         activated = rotate_groups(activated, group_size)
     flattened = activated.reshape(-1, activated.shape[-1]).contiguous()
+    if flattened.shape[0] == 0:
+        if dynamic_activation_scale:
+            global_scale = input.new_zeros((), dtype=torch.float32)
+        elif activation_per_tensor_scale is not None:
+            global_scale = activation_per_tensor_scale.clone()
+        else:
+            raise ValueError("static NVFP4 preparation requires a per-tensor scale")
+        return (
+            input.new_empty(_layout.qdata_shape(0, flattened.shape[1]), dtype=torch.uint8),
+            input.new_empty(_layout.scale_shape(0, flattened.shape[1]), dtype=torch.float8_e4m3fn),
+            global_scale,
+        )
     global_scale = (
         per_tensor_amax_to_scale(flattened.abs().amax())
         if dynamic_activation_scale
@@ -71,6 +83,8 @@ def linear_prepared(
     logical_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Dequantize block scales, accumulate and apply affine terms in FP32, then cast."""
+    if input_qdata.shape[0] == 0:
+        return input_qdata.new_empty((0, weight_qdata.shape[0]), dtype=logical_dtype)
 
     def dequantize(qdata: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return TorchAONVFP4Tensor(
