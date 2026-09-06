@@ -4,22 +4,30 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._nvidia.gluon import (
+    _launch_sparse_piper_attention,
+)
+from piper_kernels.attention.sparse_piper_attention._prepared import (
+    _prepare_sparse_piper_query_from_quantized,
+    _PreparedSparsePiperAttention,
+)
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import (
-    _MEAN_ROUTING,
-    _MINMAX_ROUTING,
-)
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_sequences,
     routing_scores,
+)
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
@@ -30,14 +38,7 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     coarse_attention,
     mean_pool_block_values,
 )
-from piper_kernels.attention.sparse_piper_attention.gluon import (
-    _launch_sparse_piper_attention,
-)
-from piper_kernels.attention.sparse_piper_attention.triton import (
-    _prepare_sparse_piper_attention,
-    _prepare_sparse_piper_query_from_quantized,
-    _PreparedSparsePiperAttention,
-)
+from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
 
 
 def _sequence_block_means(sequence, block_lengths=None):
@@ -86,7 +87,8 @@ def _assert_fp32_coarse_composition(actual, fine_output, coarse_output, coarse_g
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("sequence_length", [65, 193])
@@ -181,7 +183,8 @@ def _local_query_range(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
@@ -287,7 +290,8 @@ def test_quantized_coarse_residual_matches_fp32_composition(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("sequence_length", [65, 193, 256])
@@ -467,7 +471,8 @@ def _block_length_case(routing_mode: int):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
@@ -554,7 +559,8 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
@@ -623,7 +629,8 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:

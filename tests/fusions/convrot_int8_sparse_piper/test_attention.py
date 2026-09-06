@@ -12,7 +12,9 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import _MINMAX_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MINMAX_ROUTING,
+)
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 

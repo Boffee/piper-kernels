@@ -6,8 +6,10 @@ from typing import Literal
 
 import torch
 
-from ._routes import routing_mode_from_name
 from ._routing import _coarse_residual_from_mode
+from ._routing_modes import (
+    routing_mode_from_name,
+)
 
 
 def sparse_piper_coarse_residual(

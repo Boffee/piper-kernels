@@ -6,25 +6,9 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
-
+from . import _backend
 from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
 from .coarse import coarse_attention
-
-try:
-    from ._routes_triton import tiled_radix_select_packed_routes as _sm120_select_routes
-except ModuleNotFoundError as exc:
-    if exc.name is None or not exc.name.startswith("triton"):
-        raise
-    _sm120_select_routes = None
-
-_MINMAX_ROUTING = 0
-_MEAN_ROUTING = 1
-_ROUTING_MODE_BY_NAME = {
-    "minmax": _MINMAX_ROUTING,
-    "mean": _MEAN_ROUTING,
-}
-_ROUTING_NAME_BY_MODE = {mode: name for name, mode in _ROUTING_MODE_BY_NAME.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,12 +52,16 @@ class PackedRouteBuilder:
             route_head_offsets=layout.route_head_offsets,
             head_keep_blocks=layout.head_keep_blocks,
         )
-        self._use_sm120 = _supports_sm120_selector(device)
+        self._select_routes = _backend.select_route_selector(self.routes.indices)
         self._route_head_offsets = (
-            None if self._use_sm120 else layout.route_head_offsets.detach().cpu().tolist()
+            None
+            if self._select_routes is not None
+            else layout.route_head_offsets.detach().cpu().tolist()
         )
         self._head_keep_block_values = (
-            None if self._use_sm120 else layout.head_keep_blocks.detach().cpu().tolist()
+            None
+            if self._select_routes is not None
+            else layout.head_keep_blocks.detach().cpu().tolist()
         )
 
     def write(
@@ -83,9 +71,8 @@ class PackedRouteBuilder:
         query_block_offset: int,
     ) -> None:
         """Select stable top-k routes from one dense-key score chunk."""
-        if self._use_sm120:
-            assert _sm120_select_routes is not None
-            _sm120_select_routes(
+        if self._select_routes is not None:
+            self._select_routes(
                 scores,
                 self.routes.indices,
                 self._layout.head_keep_blocks,
@@ -228,39 +215,9 @@ def _select_portable_routes(
         ] = selected
 
 
-def _supports_sm120_selector(device: torch.device) -> bool:
-    target = AcceleratorTarget.from_device(device)
-    return _sm120_select_routes is not None and target.is_cuda_capability(12, 0)
-
-
-def validate_routing_mode(routing_mode: int) -> None:
-    """Reject routing modes outside the internal static operator contract."""
-    if not is_valid_routing_mode(routing_mode):
-        raise ValueError("sparse Piper routing mode must be minmax or mean")
-
-
-def routing_mode_from_name(routing: str) -> int:
-    """Resolve a public routing name to its static operator mode."""
-    try:
-        return _ROUTING_MODE_BY_NAME[routing]
-    except (KeyError, TypeError) as exc:
-        raise ValueError("sparse Piper routing must be 'mean' or 'minmax'") from exc
-
-
-def is_valid_routing_mode(routing_mode: int) -> bool:
-    """Return whether a value names a supported static routing policy."""
-    return routing_mode in _ROUTING_NAME_BY_MODE
-
-
 __all__ = [
-    "_MEAN_ROUTING",
-    "_MINMAX_ROUTING",
-    "_ROUTING_NAME_BY_MODE",
     "PackedRouteAndCoarseBuilder",
     "PackedRouteBuilder",
     "PackedRoutes",
     "PackedRoutesAndCoarseOutput",
-    "is_valid_routing_mode",
-    "routing_mode_from_name",
-    "validate_routing_mode",
 ]

@@ -13,7 +13,10 @@ import triton.language as tl
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
 
-from ._routes import _MEAN_ROUTING, validate_routing_mode
+from ._routing_modes import (
+    _MEAN_ROUTING,
+    validate_routing_mode,
+)
 
 _BLOCK_ROWS = 64
 _HEAD_DIM = 128

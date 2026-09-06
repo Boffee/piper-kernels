@@ -6,22 +6,26 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import _MINMAX_ROUTING
-from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
-from piper_kernels.attention.sparse_piper_attention.gluon import (
+from piper_kernels.attention.sparse_piper_attention._nvidia.gluon import (
     _launch_sparse_piper_attention,
     _piper_pv_pair,
+)
+from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MINMAX_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+        not torch.cuda.is_available()
+        or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
         reason="requires exact NVIDIA SM120",
     ),
 ]

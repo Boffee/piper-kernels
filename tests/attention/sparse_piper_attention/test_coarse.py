@@ -11,11 +11,11 @@ from piper_kernels import (
     mean_pool_block_values,
     sparse_piper_coarse_residual,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import (
+from piper_kernels.attention.sparse_piper_attention._routing import routing_scores
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.attention.sparse_piper_attention._routing import routing_scores
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
 )

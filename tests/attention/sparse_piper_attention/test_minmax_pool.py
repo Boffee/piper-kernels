@@ -9,16 +9,19 @@ from piper_kernels import (
     mean_pool_block_values,
     sparse_piper_coarse_residual,
 )
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import _MINMAX_ROUTING
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_sequences,
     packed_routes_from_summaries,
     routing_scores,
+)
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MINMAX_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
@@ -387,7 +390,8 @@ def test_route_and_coarse_path_reuses_chunked_minmax_pool_scores() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
@@ -410,7 +414,8 @@ def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_padded_summaries_match_portable_valid_prefix_extrema() -> None:
@@ -440,7 +445,8 @@ def test_sm120_padded_summaries_match_portable_valid_prefix_extrema() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_ragged_key_summaries_match_portable_extrema() -> None:
@@ -457,7 +463,8 @@ def test_sm120_ragged_key_summaries_match_portable_extrema() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_ragged_routes_ignore_invalid_query_storage() -> None:

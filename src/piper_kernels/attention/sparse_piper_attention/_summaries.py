@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
+from . import _backend
 from ._block_layout import valid_block_rows, validate_block_lengths
-from ._routes import _MEAN_ROUTING, validate_routing_mode
+from ._routing_modes import (
+    _MEAN_ROUTING,
+    validate_routing_mode,
+)
 from .coarse import _mean_pool_head_major_blocks
-
-try:
-    from ._summaries_triton import sequence_block_summaries as _sm120_sequence_block_summaries
-except ModuleNotFoundError as exc:
-    if exc.name is None or not exc.name.startswith("triton"):
-        raise
-    _sm120_sequence_block_summaries = None
 
 
 def sequence_block_summaries(
@@ -28,9 +24,9 @@ def sequence_block_summaries(
     """Return policy-specific Q/K summaries through one fixed tensor contract."""
     validate_routing_mode(routing_mode)
     _validate_sequences(query, key, block_lengths)
-    if _supports_sm120_sequence_summaries(query, key):
-        assert _sm120_sequence_block_summaries is not None
-        return _sm120_sequence_block_summaries(query, key, routing_mode, block_lengths)
+    summarize = _backend.select_sequence_summaries(query, key)
+    if summarize is not None:
+        return summarize(query, key, routing_mode, block_lengths)
 
     key_lengths = None if block_lengths is None else block_lengths[: key.shape[2] // _BLOCK_ROWS]
     if routing_mode == _MEAN_ROUTING:
@@ -67,20 +63,6 @@ def _padded_block_extrema(
     maximum = torch.where(valid_rows, blocks, -float("inf")).amax(dim=3)
     minimum = torch.where(valid_rows, blocks, float("inf")).amin(dim=3)
     return maximum, minimum
-
-
-def _supports_sm120_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> bool:
-    target = AcceleratorTarget.from_device(query.device)
-    return (
-        _sm120_sequence_block_summaries is not None
-        and target.is_cuda_capability(12, 0)
-        and query.shape[-1] == 128
-        and key.shape[-1] == 128
-        and query.stride(-1) == 1
-        and key.stride(-1) == 1
-        and query.dtype in (torch.bfloat16, torch.float16)
-        and key.dtype == query.dtype
-    )
 
 
 def _validate_sequences(

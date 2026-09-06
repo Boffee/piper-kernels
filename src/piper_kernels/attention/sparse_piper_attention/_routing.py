@@ -10,12 +10,14 @@ from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BL
 
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
-    _MEAN_ROUTING,
-    _ROUTING_NAME_BY_MODE,
     PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
     PackedRoutes,
     PackedRoutesAndCoarseOutput,
+)
+from ._routing_modes import (
+    _MEAN_ROUTING,
+    _ROUTING_NAME_BY_MODE,
     validate_routing_mode,
 )
 from ._summaries import sequence_block_summaries
