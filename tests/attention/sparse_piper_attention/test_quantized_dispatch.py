@@ -62,6 +62,28 @@ def packed_minmax_pool_routes_from_sequences(query, key, layout, block_lengths=N
     )
 
 
+def _assert_fp32_coarse_composition(actual, fine_output, coarse_output, coarse_gate):
+    residual = apply_coarse_attention_residual(coarse_output, coarse_gate.float())
+    expected = fine_output.float() + residual
+
+    # The standalone fine result is already BF16; the fused epilogue retains
+    # its FP32 value. Bound that unavailable rounding error and the final BF16
+    # store separately instead of requiring the lossy eager composition.
+    def half_ulp(value):
+        magnitude = value.abs()
+        successor = torch.nextafter(magnitude, torch.full_like(magnitude, torch.inf))
+        return (successor.float() - magnitude.float()) * 0.5
+
+    fp32_error = (
+        8 * torch.finfo(torch.float32).eps * (1 + fine_output.float().abs() + residual.abs())
+    )
+    bound = half_ulp(fine_output) + half_ulp(actual) + fp32_error
+    excess = (actual.float() - expected).abs() - bound
+    assert bool(torch.all(excess <= 0)), (
+        f"FP32 composition error exceeds rounding bound by {excess.max().item()}"
+    )
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
@@ -163,7 +185,7 @@ def _local_query_range(
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
-def test_quantized_coarse_residual_matches_explicit_composition(
+def test_quantized_coarse_residual_matches_fp32_composition(
     routing_mode: int,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(1221 + routing_mode)
@@ -245,10 +267,6 @@ def test_quantized_coarse_residual_matches_explicit_composition(
             scores * coarse_scale,
             block_mean[:, :, :coarse_key_blocks],
         )
-        expected = fine_output + apply_coarse_attention_residual(
-            expected_coarse,
-            coarse_gate,
-        )
         actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *coarse_arguments,
         )
@@ -262,7 +280,7 @@ def test_quantized_coarse_residual_matches_explicit_composition(
             coarse_arguments,
         )
 
-    assert torch.equal(actual, expected)
+    _assert_fp32_coarse_composition(actual, fine_output, expected_coarse, coarse_gate)
     assert torch.equal(zero_gate_output, fine_output)
     assert set(opcheck.values()) == {"SUCCESS"}
 
@@ -329,10 +347,6 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     query_block_offset = 0
     with torch.no_grad():
         _launch_sparse_piper_attention(prepared, fine_output.transpose(1, 2))
-        expected = fine_output + apply_coarse_attention_residual(
-            coarse_output,
-            coarse_gate,
-        )
         _launch_sparse_piper_attention(
             prepared,
             full_output.transpose(1, 2),
@@ -390,7 +404,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
             query_block_offset += range_block_count
 
     ranged_output = torch.cat(chunks, dim=1)
-    torch.testing.assert_close(full_output, expected, atol=0.0078125, rtol=0.0078125)
+    _assert_fp32_coarse_composition(full_output, fine_output, coarse_output, coarse_gate)
     assert torch.equal(ranged_output, full_output)
 
 
@@ -590,12 +604,9 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
             block_lengths,
             2,
         )
-        expected = fine_output + apply_coarse_attention_residual(
-            coarse_attention(
-                scores * coarse_scale,
-                block_mean[:, :, :coarse_key_blocks],
-            ),
-            coarse_gate,
+        expected_coarse = coarse_attention(
+            scores * coarse_scale,
+            block_mean[:, :, :coarse_key_blocks],
         )
         actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *coarse_arguments,
@@ -606,7 +617,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         )
 
     assert actual.shape == value.shape
-    torch.testing.assert_close(actual, expected, atol=0.00390625, rtol=0.01)
+    _assert_fp32_coarse_composition(actual, fine_output, expected_coarse, coarse_gate)
     assert set(opcheck.values()) == {"SUCCESS"}
 
 

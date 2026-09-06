@@ -34,23 +34,19 @@ _GL_VALUE_LOG_BOUND_CORRECTION = gl.constexpr(0.086085)
 
 
 @gluon.jit
-def _mark_uint8_int8_dot(value):
-    return gl.inline_asm_elementwise(
-        asm="piper_attention_u8s8_dot_marker $0, $1;",
-        constraints="=r,r",
-        args=[value],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
 def _uint8_int8_mma(lhs, rhs, accumulator):
     gl.static_assert(lhs.dtype == gl.uint8, "lhs must be UINT8")
     gl.static_assert(rhs.dtype == gl.int8, "rhs must be INT8")
     lhs_bits = lhs.to(gl.int8, bitcast=True)
-    return _mark_uint8_int8_dot(mma_v2(lhs_bits, rhs, accumulator))
+    result = mma_v2(lhs_bits, rhs, accumulator)
+    return gl.inline_asm_elementwise(
+        asm="piper_attention_u8s8_dot_marker $0, $1;",
+        constraints="=r,r",
+        args=[result],
+        dtype=gl.int32,
+        is_pure=True,
+        pack=1,
+    )
 
 
 @gluon.jit
@@ -82,30 +78,6 @@ def _fma_fp32(lhs, rhs, addend):
         asm="fma.rn.f32 $0, $1, $2, $3;",
         constraints="=f,f,f,f",
         args=[lhs, rhs, addend],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _mul_fp32(lhs, rhs):
-    return gl.inline_asm_elementwise(
-        asm="mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[lhs, rhs],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _add_fp32(lhs, rhs):
-    return gl.inline_asm_elementwise(
-        asm="add.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[lhs, rhs],
         dtype=gl.float32,
         is_pure=True,
         pack=1,
@@ -250,21 +222,24 @@ def _piper_pv_pair(
     mma_layout: gl.constexpr,
     value_layout: gl.constexpr,
 ):
-    """Combine two full-D128 integer PV partials under one numerator weight."""
+    """Accumulate paired K64 PV products in one INT32 tile and update the numerator."""
     value_0 = value_shared_0.permute([1, 0]).load(value_layout)
     value_1 = value_shared_1.permute([1, 0]).load(value_layout)
-    partial_0 = _uint8_int8_mma(
+    # The two K64 products sum at most 128 * 255 * 128 in magnitude, so
+    # accumulate them in one INT32 tile without overflow. Reusing the tile
+    # removes a full-D128 temporary and reduces pressure on the FP32 epilogue.
+    partial = _uint8_int8_mma(
         probability_uint8_0,
         value_0,
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
     )
-    partial_1 = _uint8_int8_mma(
+    partial = _uint8_int8_mma(
         probability_uint8_1,
         value_1,
-        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        partial,
     )
     return _fma_fp32(
-        (partial_0 + partial_1).to(gl.float32),
+        partial.to(gl.float32),
         current_weight[:, None],
         accumulator * old_weight[:, None],
     )
@@ -627,12 +602,8 @@ def _sparse_piper_attention_kernel(
             ).to(gl.float32)
         else:
             gate = gl.load(coarse_gate_ptr + gate_offsets).to(gl.float32)
-        # Packing these temporaries limits register pressure on SM120. Removing
-        # both casts increased spills and slowed long-sequence kernels in the
-        # precision audit; retain them for that performance benefit.
-        fine_output = output.to(gl.bfloat16).to(gl.float32)
-        residual = _mul_fp32(gate, coarse[None, :]).to(gl.bfloat16).to(gl.float32)
-        output = _add_fp32(fine_output, residual)
+        # Round once at the output store, after combining both FP32 terms.
+        output = _fma_fp32(gate, coarse[None, :], output)
     output_offsets = (
         batch * stride_ob
         + head * stride_oh

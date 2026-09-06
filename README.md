@@ -11,9 +11,10 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
 Fused ConvRot preparation, GGUF conversion, and NVFP4 weight updates use FP32 arithmetic
 instead of reproducing the extra FP16/BF16 rounding of an eager PyTorch composition.
-Their portable references use FP32 arithmetic. Lower-precision tensor-core operands,
-compact workspaces, and sparse attention's packed residual epilogue remain where they reduce
-storage or execution cost.
+Their portable references use FP32 arithmetic. Lower-precision tensor-core operands and
+compact workspaces remain where they reduce storage or execution cost.
+Sparse attention's fused coarse residual keeps the fine output and gated coarse contribution
+in FP32 until the final BF16 store.
 
 ## Operators
 
@@ -447,9 +448,10 @@ tail and defaults to every available block.
 `block_lengths` is optional for compact storage and selects valid-front internally padded storage
 when supplied. `coarse_attention_residual` remains available for learned or already-materialized
 block scores.
-These composable implementations are the correctness and training contract; compatible compiled
+These composable implementations define the operations and training behavior; compatible compiled
 ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
-and gated residual, including valid-front padded storage.
+and gated residual, including valid-front padded storage. The fused residual combines both terms
+in FP32 and rounds once on output, avoiding the intermediate BF16 rounding of eager composition.
 When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
 quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
 residual together with `sparse_query_blocks`. It passes the coarse result and coarse gate into

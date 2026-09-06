@@ -33,6 +33,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Keep sparse attention's fused coarse-residual epilogue in FP32 until its final BF16
+  store. Accumulating paired integer PV products in one INT32 tile removes a temporary
+  and eliminates register spills in the aligned SM120 kernel.
 - Keep AMD chunked ConvRot INT8 rotations in FP32 until INT8 quantization, removing
   intermediate BF16 casts without changing launch policy. Numerical tests check
   reconstruction accuracy against the FP32 reference instead of identical INT8 codes.
