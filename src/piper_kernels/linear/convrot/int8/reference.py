@@ -33,7 +33,7 @@ def quantize_weight(
         raise ValueError(
             f"ConvRot in_features {weight.shape[1]} is not divisible by group size {group_size}"
         )
-    return dynamic_quantize_rows(rotate_groups(weight, group_size))
+    return dynamic_quantize_rows(rotate_groups(weight.float(), group_size))
 
 
 def validate_storage(
@@ -80,19 +80,7 @@ def dynamic_quantize_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamically quantize each row to signed INT8 with a float32 scale."""
     scale = (value.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
-    logical_scale = scale.to(value.dtype)
-    if value.dtype is torch.float16:
-        scale_underflowed = logical_scale == 0
-        safe_logical_scale = torch.where(
-            scale_underflowed,
-            torch.ones_like(logical_scale),
-            logical_scale,
-        )
-        scaled = value / safe_logical_scale
-        scaled = torch.where(scale_underflowed, value.float() / scale, scaled.float())
-    else:
-        # The minimum scale remains representable in bfloat16 and float32.
-        scaled = value / logical_scale
+    scaled = value.float() / scale
     qdata = scaled.round().clamp(-128, 127).to(torch.int8)
     if rounding_seed is not None:
         stochastic_scaled = value.to(torch.float32) / scale
@@ -118,11 +106,11 @@ def addmm_(
 ) -> None:
     """Add a matrix product to a logical ConvRot weight and requantize it in place."""
     if beta == 0:
-        rotated_weight = torch.zeros(qdata.shape, device=qdata.device, dtype=mat1.dtype)
+        rotated_weight = torch.zeros(qdata.shape, device=qdata.device, dtype=torch.float32)
     else:
-        rotated_weight = qdata.to(mat1.dtype) * scale.to(mat1.dtype)
-    rotated_mat2 = rotate_groups(mat2, group_size)
-    merged = torch.addmm(rotated_weight, mat1, rotated_mat2, beta=beta, alpha=alpha)
+        rotated_weight = qdata.float() * scale
+    rotated_mat2 = rotate_groups(mat2.float(), group_size)
+    merged = torch.addmm(rotated_weight, mat1.float(), rotated_mat2, beta=beta, alpha=alpha)
     _requantize_(qdata, scale, merged, rounding_seed)
 
 
@@ -135,8 +123,8 @@ def add_(
     rounding_seed: int | None = None,
 ) -> None:
     """Add a dense logical update to a ConvRot weight and requantize it in place."""
-    rotated_weight = qdata.to(update.dtype) * scale.to(update.dtype)
-    rotated_update = rotate_groups(update, group_size)
+    rotated_weight = qdata.float() * scale
+    rotated_update = rotate_groups(update.float(), group_size)
     merged = torch.add(rotated_weight, rotated_update, alpha=alpha)
     _requantize_(qdata, scale, merged, rounding_seed)
 
@@ -162,7 +150,7 @@ def prepare_input(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate and dynamically quantize a linear input for one or more weights."""
     input_2d = input.reshape(math.prod(input.shape[:-1]), input.shape[-1])
-    input_qdata, input_scale = dynamic_quantize_rows(rotate_groups(input_2d, group_size))
+    input_qdata, input_scale = dynamic_quantize_rows(rotate_groups(input_2d.float(), group_size))
     return (
         input_qdata.reshape(input.shape),
         input_scale.reshape(input.shape[:-1]),

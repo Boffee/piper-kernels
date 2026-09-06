@@ -145,9 +145,9 @@ def test_dequantize_revalidates_canonical_storage_layout(storage_name: str) -> N
 def test_from_hp_rotates_and_quantizes_each_weight_row(dtype: torch.dtype) -> None:
     torch.manual_seed(12)
     weight = torch.randn(7, 32, dtype=dtype)
-    rotated = rotate_groups(weight, 16)
-    expected_scale = (rotated.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
-    expected_qdata = (rotated / expected_scale.to(dtype)).round().clamp(-128, 127).to(torch.int8)
+    rotated = rotate_groups(weight.float(), 16)
+    expected_scale = (rotated.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
+    expected_qdata = (rotated / expected_scale).round().clamp(-128, 127).to(torch.int8)
 
     wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
 

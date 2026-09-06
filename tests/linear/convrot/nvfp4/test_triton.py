@@ -21,7 +21,7 @@ def _materialized_optimized_preparation(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compare fused preparation with separate optimized rotation and packing."""
     flattened = input.reshape(-1, input.shape[-1]).contiguous()
-    rotated = torch.empty_like(flattened)
+    rotated = torch.empty_like(flattened, dtype=torch.float32)
     convrot_backend.rotate_input(
         flattened,
         rotated,
@@ -251,7 +251,11 @@ def test_swiglu_preparation_matches_materialized_activation(
             "swiglu",
         )
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
-        assert torch.equal(actual_tensor, expected_tensor)
+        if actual_tensor.dtype is torch.float32:
+            # FP32 SiLU implementations can differ by one ULP in the global amax.
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=3e-7, atol=0)
+        else:
+            assert torch.equal(actual_tensor, expected_tensor)
 
 
 @pytest.mark.parametrize("group_size", [15, 32])

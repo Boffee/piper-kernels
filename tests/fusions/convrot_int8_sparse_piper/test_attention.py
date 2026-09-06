@@ -14,7 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 )
 from piper_kernels.attention.sparse_piper_attention._routes import _MINMAX_ROUTING
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 _BATCH = 1
 _SEQUENCE = 192
@@ -133,7 +133,7 @@ def _prepare(
         1e-5,
         _MINMAX_ROUTING,
     )
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
@@ -175,7 +175,7 @@ def _materialize_qk(
 ) -> torch.Tensor:
     batch, sequence_length, _input_features = operands.input_qdata.shape
     heads = weight.shape[0] // _HEAD_DIM
-    projected = convrot_int8_backend.linear_prepared(
+    projected = int8_ops.linear_prepared(
         operands.input_qdata,
         operands.input_scale,
         weight,
@@ -196,7 +196,7 @@ def _materialize_qk(
 
 def _materialize_value(operands: _Operands) -> torch.Tensor:
     batch, sequence_length, _input_features = operands.input_qdata.shape
-    return convrot_int8_backend.linear_prepared(
+    return int8_ops.linear_prepared(
         operands.input_qdata,
         operands.input_scale,
         operands.value_weight,

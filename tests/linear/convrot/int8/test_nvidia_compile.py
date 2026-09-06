@@ -24,7 +24,6 @@ def test_nvidia_preparation_compiles_without_a_device(architecture):
             "chunk_count": chunk_count,
             "group_size": 256,
             "inverse_sqrt_group": 256**-0.5,
-            "logical_dtype_code": 1,
             "activation_fn": "gelu_tanh",
             "accelerator_backend": "cuda",
             "gguf_quant_type": -1,

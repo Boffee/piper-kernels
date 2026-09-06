@@ -72,7 +72,6 @@ def test_amd_activated_preparation_compiles(architecture, chunked):
     constants = {
         "group_size": 256,
         "inverse_sqrt_group": 256**-0.5,
-        "logical_dtype_code": 2 if chunked else 1,
         "activation_fn": "swiglu" if chunked else "gelu_tanh",
         "accelerator_backend": "hip",
     }

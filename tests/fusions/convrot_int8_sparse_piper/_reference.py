@@ -11,7 +11,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 _BLOCK_ROWS = 64
 _HEAD_DIM = 128
@@ -63,7 +63,7 @@ def _materialized_fp32_qk(
 ) -> torch.Tensor:
     batch, sequence_length, _input_features = input_qdata.shape
     heads = weight_qdata.shape[0] // _HEAD_DIM
-    projected = convrot_int8_backend.linear_prepared(
+    projected = int8_ops.linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -197,7 +197,7 @@ def composed_value_projection(
         heads,
         _HEAD_DIM,
     )
-    projected = convrot_int8_backend.linear_prepared(
+    projected = int8_ops.linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,

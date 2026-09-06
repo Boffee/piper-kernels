@@ -10,9 +10,7 @@ from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import ConvRotInt8Tensor, _backend, _gguf
-from piper_kernels.linear.convrot.int8 import triton as legacy_triton
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
-from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 
 _gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 
@@ -22,14 +20,15 @@ _gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA o
     torch.version.hip is not None or not torch.cuda.is_available(), reason="requires NVIDIA CUDA"
 )
 @pytest.mark.parametrize("quant_type", list(GGUFQuantizationType))
-def test_nvidia_conversion_preserves_exact_bf16_reference(quant_type):
+def test_nvidia_conversion_matches_fp32_decoding(quant_type):
     torch.manual_seed(820 + int(quant_type))
     packed = finite_packed(quant_type)
-    dense = dequantize_reference(packed, quant_type).cuda()
+    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
     expected = ConvRotInt8Tensor.from_hp(dense, group_size=64)
     actual = ConvRotInt8Tensor.from_gguf(packed.cuda(), quant_type=quant_type, group_size=64)
     assert torch.equal(actual.qdata, expected.qdata)
-    assert torch.equal(actual.scale, expected.scale)
+    # The FP32 butterfly and matrix-multiply oracle can differ in their last bits.
+    torch.testing.assert_close(actual.scale, expected.scale, rtol=5e-7, atol=0)
 
 
 @pytest.mark.gpu
@@ -45,7 +44,7 @@ def test_from_gguf_matches_materialized_reference(
         monkeypatch.setattr(generic_triton, "select_conversion_chunks", lambda target, width: None)
     torch.manual_seed(820 + int(quant_type))
     packed = finite_packed(quant_type, rows=3, features=1280)
-    dense = dequantize_reference(packed, quant_type, dtype=dtype).cuda()
+    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
 
     expected = ConvRotInt8Tensor.from_hp(dense, group_size=group_size)
     actual = ConvRotInt8Tensor.from_gguf(
@@ -160,7 +159,7 @@ def test_generic_conversion_widths_and_bounded_batches(monkeypatch, quant_type, 
     monkeypatch.setattr(generic_triton, "_GGUF_MAXIMA_BYTES", 48)
     torch.manual_seed(75)
     packed = finite_packed(quant_type, rows=5, features=width)
-    dense = dequantize_reference(packed, quant_type, dtype=dtype).cuda()
+    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
     expected = ConvRotInt8Tensor.from_hp(dense, group_size=16)
     device_packed = packed.cuda()
     # Packed inputs may be noncontiguous; output views must keep their surrounding canaries.
@@ -236,11 +235,6 @@ def test_generic_conversion_does_not_materialize_dense_weights(monkeypatch, tile
     torch.cuda.synchronize()
     # A dense BF16 weight is 16 MiB. Only the tiled fallback retains a maxima buffer.
     assert torch.cuda.max_memory_allocated() - baseline < 2 * 1024 * 1024
-
-
-def test_legacy_conversion_exports_point_to_shared_implementations():
-    assert legacy_triton._convert_gguf_out is generic_triton.convert_gguf_out
-    assert legacy_triton.rotate_quantize_rows_kernel is kernels.rotate_quantize_rows_kernel
 
 
 @pytest.mark.gpu

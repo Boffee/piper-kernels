@@ -1,4 +1,4 @@
-"""Shared custom-op tests and NVIDIA-only legacy low-level utility tests."""
+"""Shared custom-op tests and NVIDIA low-level utility tests."""
 
 from dataclasses import replace
 
@@ -14,13 +14,17 @@ from piper_kernels.linear.convrot import (
     convrot_int8_compile_options,
     convrot_int8_linear,
 )
-from piper_kernels.linear.convrot._rotation import rotate_groups
-from piper_kernels.linear.convrot.int8 import triton as triton_backend
-from piper_kernels.linear.convrot.int8._policy import select_execution_plan
+from piper_kernels.linear.convrot import triton as convrot_backend
+from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.linear.convrot.int8 import _ops as int8_ops
+from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
+from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
+from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 from piper_kernels.linear.convrot.int8.reference import add_ as reference_add_
 from piper_kernels.linear.convrot.int8.reference import (
     addmm_,
     linear,
+    linear_prepared,
 )
 
 
@@ -41,7 +45,7 @@ def _scaled_projection_epilogue_probe(  # noqa: PLR0913, PLR0917
     """Exercise ConvRot's reusable scaled accumulator with a non-linear epilogue."""
     offsets_m = tl.program_id(0) * block_m + tl.arange(0, block_m)
     offsets_n = tl.program_id(1) * block_n + tl.arange(0, block_n)
-    projected = triton_backend.scaled_int8_matmul(
+    projected = int8_kernels.scaled_int8_matmul(
         input_ptr,
         weight_ptr,
         input_scale_ptr,
@@ -181,7 +185,7 @@ def test_factorized_h4_rotation_matches_gpu_reference(
     activation = torch.randn(5, 2 * group_size, dtype=dtype, device="cuda")
     actual = torch.empty_like(activation)
 
-    triton_backend.rotate_input(activation, actual, group_size, num_warps=4)
+    convrot_backend.rotate_input(activation, actual, group_size, num_warps=4)
     expected = rotate_groups(activation, group_size)
 
     torch.testing.assert_close(actual, expected)
@@ -204,7 +208,7 @@ def test_factorized_h4_rotation_handles_rounding_boundary_values(
     activation = activation.reshape(1, width)
     actual = torch.empty_like(activation)
 
-    triton_backend.rotate_input(activation, actual, group_size, num_warps=4)
+    convrot_backend.rotate_input(activation, actual, group_size, num_warps=4)
     expected = rotate_groups(activation, group_size)
 
     torch.testing.assert_close(actual, expected)
@@ -216,39 +220,33 @@ def test_factorized_h4_rotation_handles_rounding_boundary_values(
     "in_features",
     [512, 5_376, 7_168, 9_728, 14_336, 16_640, 28_672, 40_960, 49_152],
 )
-@pytest.mark.parametrize(
-    ("dtype", "dtype_code"),
-    [(torch.float16, 1), (torch.bfloat16, 2)],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
-def test_fused_rotation_quantization_matches_split_path_exactly(
+def test_fused_rotation_quantization_matches_fp32_rotation_exactly(
     in_features: int,
     dtype: torch.dtype,
-    dtype_code: int,
 ) -> None:
     torch.manual_seed(63)
     rows = 7
     activation = torch.randn(rows, in_features, dtype=dtype, device="cuda")
-    rotated = torch.empty_like(activation)
+    rotated = torch.empty_like(activation, dtype=torch.float32)
     expected_qdata = torch.empty_like(activation, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
-    triton_backend.rotate_input(activation, rotated, 256, num_warps=4)
-    triton_backend.quantize_input(
+    convrot_backend.rotate_input(activation, rotated, 256, num_warps=4)
+    int8_nvidia.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
-        dtype_code,
         num_warps=8,
     )
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    triton_backend.fused_rotate_quantize_input(
+    int8_nvidia.fused_rotate_quantize_input(
         activation,
         actual_qdata,
         actual_scale,
         256,
-        dtype_code,
         num_warps=select_execution_plan(
             AcceleratorTarget.from_device(activation.device), in_features=in_features
         ).fused_num_warps,
@@ -264,41 +262,35 @@ def test_fused_rotation_quantization_matches_split_path_exactly(
     "in_features",
     [512, 5_376, 9_728, 14_336, 16_640, 28_672, 40_960, 49_152],
 )
-@pytest.mark.parametrize(
-    ("dtype", "dtype_code"),
-    [(torch.float16, 1), (torch.bfloat16, 2)],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
     in_features: int,
     dtype: torch.dtype,
-    dtype_code: int,
 ) -> None:
     torch.manual_seed(75)
     rows = 7
     raw_activation = torch.randn(rows, 2 * in_features, dtype=dtype, device="cuda")
     up, gate = raw_activation.chunk(2, dim=-1)
-    activation = up * torch.nn.functional.silu(gate)
-    rotated = torch.empty_like(activation)
+    activation = up.float() * torch.nn.functional.silu(gate.float())
+    rotated = torch.empty_like(activation, dtype=torch.float32)
     expected_qdata = torch.empty_like(activation, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
-    triton_backend.rotate_input(activation, rotated, 256, num_warps=4)
-    triton_backend.quantize_input(
+    convrot_backend.rotate_input(activation, rotated, 256, num_warps=4)
+    int8_nvidia.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
-        dtype_code,
         num_warps=8,
     )
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    triton_backend.fused_rotate_quantize_input(
+    int8_nvidia.fused_rotate_quantize_input(
         raw_activation,
         actual_qdata,
         actual_scale,
         256,
-        dtype_code,
         activation_fn="swiglu",
         num_warps=select_execution_plan(
             AcceleratorTarget.from_device(activation.device), in_features=in_features
@@ -321,40 +313,34 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
     "in_features",
     [512, 5_376, 14_336, 16_640, 28_672, 40_960],
 )
-@pytest.mark.parametrize(
-    ("dtype", "dtype_code"),
-    [(torch.float16, 1), (torch.bfloat16, 2), (torch.float32, 0)],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_fused_gelu_tanh_preparation_matches_materialized_path(
     in_features: int,
     dtype: torch.dtype,
-    dtype_code: int,
 ) -> None:
     torch.manual_seed(76)
     rows = 7
     raw_input = torch.randn(rows, in_features, dtype=dtype, device="cuda")
-    activated_input = torch.nn.functional.gelu(raw_input, approximate="tanh")
+    activated_input = torch.nn.functional.gelu(raw_input.float(), approximate="tanh")
     rotated = torch.empty_like(activated_input)
     expected_qdata = torch.empty_like(activated_input, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
-    triton_backend.rotate_input(activated_input, rotated, 256, num_warps=4)
-    triton_backend.quantize_input(
+    convrot_backend.rotate_input(activated_input, rotated, 256, num_warps=4)
+    int8_nvidia.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
-        dtype_code,
         num_warps=8,
     )
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    triton_backend.fused_rotate_quantize_input(
+    int8_nvidia.fused_rotate_quantize_input(
         raw_input,
         actual_qdata,
         actual_scale,
         256,
-        dtype_code,
         activation_fn="gelu_tanh",
         num_warps=select_execution_plan(
             AcceleratorTarget.from_device(raw_input.device), in_features=in_features
@@ -371,22 +357,10 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
     )
 
 
-@pytest.mark.parametrize(
-    ("dtype", "expected"),
-    [
-        (torch.float32, 0),
-        (torch.float16, 1),
-        (torch.bfloat16, 2),
-    ],
-)
-def test_dtype_code(dtype: torch.dtype, expected: int) -> None:
-    assert triton_backend.dtype_code(dtype) == expected
-
-
 def test_default_linear_execution_plan_accepts_explicit_target_for_meta_weight() -> None:
     qdata = torch.empty((96, 512), dtype=torch.int8, device="meta")
 
-    plan = triton_backend.default_execution_plan(qdata, target=AcceleratorTarget("cuda", "sm120"))
+    plan = int8_nvidia.default_execution_plan(qdata, target=AcceleratorTarget("cuda", "sm120"))
 
     assert plan.fuse_rotation_quantization
     assert plan.matmul_block_m == 128
@@ -416,7 +390,7 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
-    production = triton_backend.default_execution_plan(qdata)
+    production = int8_nvidia.default_execution_plan(qdata)
     candidate = replace(
         production,
         fuse_rotation_quantization=False,
@@ -426,7 +400,7 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
         matmul_num_stages=2,
     )
 
-    actual = triton_backend.run_linear(
+    actual = int8_nvidia.run_linear(
         activation,
         qdata,
         scale,
@@ -435,14 +409,15 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
         activation_fn=activation_fn,
         execution_plan=candidate,
     )
-    expected = linear(
+    prepared = int8_nvidia.prepare_input_with_plan(
         activation,
-        qdata,
-        scale,
+        in_features,
         256,
-        bias,
         activation_fn=activation_fn,
+        execution_plan=candidate,
+        target=AcceleratorTarget.from_device(activation.device),
     )
+    expected = linear_prepared(*prepared, qdata, scale, activation.dtype, bias)
 
     assert torch.equal(actual, expected)
 
@@ -467,11 +442,11 @@ def test_input_preparation_populates_caller_owned_storage(
     )
     qdata = torch.empty((96, in_features), dtype=torch.int8, device="cuda")
     plan = replace(
-        triton_backend.default_execution_plan(qdata),
+        int8_nvidia.default_execution_plan(qdata),
         fuse_rotation_quantization=fused,
     )
     target = AcceleratorTarget.from_device(activation.device)
-    expected_qdata, expected_scale = triton_backend._prepare_input(
+    expected_qdata, expected_scale = int8_nvidia.prepare_input_with_plan(
         activation,
         in_features,
         256,
@@ -494,7 +469,7 @@ def test_input_preparation_populates_caller_owned_storage(
 
     qdata_out = qdata_storage[1:-1]
     scale_out = scale_storage[1:-1]
-    actual = triton_backend._prepare_input(
+    actual = int8_nvidia.prepare_input_with_plan(
         activation,
         in_features,
         256,
@@ -536,8 +511,8 @@ def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
     )
     weight_scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda") if with_bias else None
-    plan = triton_backend.default_execution_plan(weight_qdata)
-    expected = triton_backend._execute_prepared_linear(
+    plan = int8_nvidia.default_execution_plan(weight_qdata)
+    expected = int8_nvidia.execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -554,7 +529,7 @@ def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
     )
 
     output = output_storage[1:-1]
-    actual = triton_backend._execute_prepared_linear(
+    actual = int8_nvidia.execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -572,6 +547,33 @@ def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
 
 def _exact_sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation_fn", [None, "swiglu"])
+def test_fused_preparation_keeps_rotation_beyond_fp16_range(activation_fn):
+    signs = build_hadamard(256, torch.device("cuda"))[0].sign().to(torch.float16)[None, :]
+    if activation_fn == "swiglu":
+        activation = torch.cat((signs * 128, torch.full_like(signs, 128)), dim=-1)
+        maximum = 262144.0
+    else:
+        activation = signs * 8192
+        maximum = 131072.0
+    output = torch.empty((1, 256), device="cuda", dtype=torch.int8)
+    scale = torch.empty(1, device="cuda")
+    int8_nvidia.fused_rotate_quantize_input(
+        activation,
+        output,
+        scale,
+        256,
+        activation_fn=activation_fn,
+        num_warps=4,
+    )
+    expected = torch.zeros_like(output)
+    expected[0, 0] = 127
+    assert torch.equal(output, expected)
+    torch.testing.assert_close(scale, torch.full_like(scale, maximum / 127), rtol=1e-7, atol=0)
 
 
 @pytest.mark.gpu
@@ -619,7 +621,7 @@ def test_sm120_large_matmul_matches_reference(
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=dtype, device="cuda") if with_bias else None
 
-    plan = triton_backend.default_execution_plan(qdata)
+    plan = int8_nvidia.default_execution_plan(qdata)
     assert (
         plan.matmul_block_m,
         plan.matmul_block_n,
@@ -627,7 +629,7 @@ def test_sm120_large_matmul_matches_reference(
         plan.matmul_num_warps,
     ) == (128, 256, 128, 8)
 
-    actual = triton_backend.run_linear(
+    actual = int8_nvidia.run_linear(
         activation,
         qdata,
         scale,
@@ -635,7 +637,15 @@ def test_sm120_large_matmul_matches_reference(
         group_size,
         execution_plan=plan,
     )
-    expected = linear(activation, qdata, scale, group_size, bias)
+    prepared = int8_nvidia.prepare_input_with_plan(
+        activation,
+        in_features,
+        group_size,
+        activation_fn=None,
+        execution_plan=plan,
+        target=AcceleratorTarget.from_device(activation.device),
+    )
+    expected = linear_prepared(*prepared, qdata, scale, dtype, bias)
 
     if dtype is torch.bfloat16:
         if bias is None:
@@ -657,12 +667,11 @@ def test_fused_preparation_validates_input_width_from_qdata(
     input_scale = torch.empty(rows, dtype=torch.float32)
 
     with pytest.raises(ValueError, match=f"must have shape \\({rows}, {expected_width}\\)"):
-        triton_backend.fused_rotate_quantize_input(
+        int8_nvidia.fused_rotate_quantize_input(
             activation,
             input_qdata,
             input_scale,
             16,
-            triton_backend.dtype_code(activation.dtype),
             activation_fn=activation_fn,  # type: ignore[arg-type]
             num_warps=4,
         )
@@ -675,12 +684,11 @@ def test_fused_preparation_rejects_unsupported_row_width() -> None:
     input_scale = torch.empty(rows, dtype=torch.float32)
 
     with pytest.raises(ValueError, match=f"does not support row width {in_features}"):
-        triton_backend.fused_rotate_quantize_input(
+        int8_nvidia.fused_rotate_quantize_input(
             activation,
             input_qdata,
             input_scale,
             256,
-            triton_backend.dtype_code(activation.dtype),
             num_warps=4,
             target=AcceleratorTarget("cuda", "sm120"),
         )
@@ -715,12 +723,12 @@ def test_fused_up_gate_swiglu_linear_matches_materialized_path(
     up, gate = raw_activation.chunk(2, dim=-1)
 
     expected = linear(
-        up * torch.nn.functional.silu(gate),
+        up.float() * torch.nn.functional.silu(gate.float()),
         qdata,
         scale,
         256,
         bias,
-    )
+    ).to(dtype)
     actual = convrot_int8_linear(raw_activation, weight, bias, activation_fn="swiglu")
 
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
@@ -756,7 +764,7 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
         weight_scale: torch.Tensor,
         linear_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        return triton_backend.linear(
+        return int8_ops.linear(
             value,
             packed,
             weight_scale,
@@ -813,7 +821,7 @@ def test_cuda_semantic_linear_custom_ops_pass_opcheck(
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
     result = torch.library.opcheck(
-        triton_backend.linear,
+        int8_ops.linear,
         (activation, qdata, scale, bias, group_size, activation_fn),
     )
 
@@ -830,7 +838,7 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
     mat2 = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
 
     result = torch.library.opcheck(
-        triton_backend.addmm_,
+        int8_ops.addmm_,
         (qdata, scale, mat1, mat2, 64, 0.5, 1.25, 123),
     )
 
@@ -846,7 +854,7 @@ def test_cuda_semantic_add_custom_op_passes_opcheck() -> None:
     update = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
 
     result = torch.library.opcheck(
-        triton_backend.add_,
+        int8_ops.add_,
         (qdata, scale, update, 64, 1.25, 123),
     )
 

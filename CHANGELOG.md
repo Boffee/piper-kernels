@@ -30,6 +30,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Removed unused dtype-code arguments from ConvRot kernels and the obsolete INT8
+  `triton` and `_policy` re-export modules. Internal callers and benchmarks now import
+  the owning backend, kernel, or custom-op module directly.
+- Removed intermediate FP16/BF16 rounding from fused ConvRot activation preparation,
+  INT8 normalization, GGUF conversion, and NVFP4 weight merges. Arithmetic retains FP32
+  values across these stages, preserving compact storage and tensor-core operands where
+  they serve performance. References use FP32 arithmetic instead of eager PyTorch rounding;
+  quantized codes and scales can change. CUDA INT8 encoding also combines rounding and
+  float-to-integer conversion into one instruction.
 - Use eight packing warps for selected wide group-16 ConvRot NVFP4 layouts, reducing
   synthetic H3-shape fused FFN latency by approximately 1–4% on RTX 5090 without changing
   outputs, peak tensor allocation, or the fixed 1,536-row FFN chunk size.

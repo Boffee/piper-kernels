@@ -11,7 +11,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 
 from .test_attention import (
     _HEAD_DIM,
@@ -83,7 +83,7 @@ def _arguments(
             logical_sequence_length=sequence_length,
             sparse_key_blocks=sparse_key_blocks,
         )
-        expected = convrot_int8_backend.run_linear(
+        expected = int8_nvidia.run_linear(
             materialized_attention.reshape(batch, sequence_length, _HEADS * _HEAD_DIM),
             weight,
             scale,
@@ -147,7 +147,7 @@ def _padded_arguments(
             sparse_query_blocks,
         )
     weight, scale, bias, group_size = projection_arguments
-    expected = convrot_int8_backend.run_linear(
+    expected = int8_nvidia.run_linear(
         materialized_attention.flatten(2),
         weight,
         scale,
@@ -324,14 +324,14 @@ def test_attention_output_projects_a_bounded_coarse_gate(
     gate_scale = gate_scale[:gate_features].contiguous()
     assert gate_bias is not None
     gate_bias = gate_bias[:gate_features].contiguous()
-    coarse_gate = convrot_int8_backend._execute_prepared_linear(
+    coarse_gate = int8_nvidia.execute_prepared_linear(
         gate_input_qdata,
         gate_input_scale,
         gate_weight,
         gate_scale,
         gate_bias,
         torch.bfloat16,
-        convrot_int8_backend.default_execution_plan(gate_weight),
+        int8_nvidia.default_execution_plan(gate_weight),
     ).unflatten(-1, (_HEADS, _HEAD_DIM))
     query_blocks = (sequence_length + 63) // 64
     block_mean = torch.randn(
@@ -352,7 +352,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         None,
     )
     output_weight, output_scale, output_bias, output_group_size = output_arguments
-    expected = convrot_int8_backend.run_linear(
+    expected = int8_nvidia.run_linear(
         materialized_attention.flatten(2),
         output_weight,
         output_scale,

@@ -67,7 +67,6 @@ def load_activated_rotated_chunk(
     chunk_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
@@ -95,16 +94,12 @@ def load_activated_rotated_chunk(
         gate = values
 
     if activation_fn == "swiglu":
-        values = swiglu(values, gate, logical_dtype_code)
+        values = swiglu(values, gate)
     elif activation_fn == "gelu_tanh":
-        values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
+        values = gelu_tanh(values, accelerator_backend)
 
     values = rotate_hadamard_groups(values, chunk_size, group_size)
     values *= inverse_sqrt_group
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
     return values
 
 
@@ -126,15 +121,6 @@ def rotate_groups_kernel(
     values = tl.load(pointers).to(tl.float32)
     values = rotate_hadamard_groups(values, group_size, group_size)
     tl.store(output_ptr + row_offset + group * group_size + offsets, values * inverse_sqrt_group)
-
-
-def logical_dtype_code(dtype: torch.dtype) -> int:
-    """Encode a logical floating dtype for shared Triton activation helpers."""
-    if dtype is torch.float16:
-        return 1
-    if dtype is torch.bfloat16:
-        return 2
-    return 0
 
 
 def rotate_input(
@@ -161,7 +147,6 @@ def rotate_input(
 
 __all__ = [
     "load_activated_rotated_chunk",
-    "logical_dtype_code",
     "rotate_groups_kernel",
     "rotate_hadamard_groups",
     "rotate_hadamard_stage",

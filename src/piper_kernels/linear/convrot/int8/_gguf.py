@@ -64,7 +64,6 @@ def convert(
             raw,
             int(normalized),
             group_size,
-            logical_dtype,
             qdata,
             scale,
         )

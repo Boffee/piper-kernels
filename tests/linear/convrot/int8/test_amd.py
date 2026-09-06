@@ -1,7 +1,6 @@
 """AMD support boundaries and on-device coverage of the shared INT8 contract."""
 
 import sys
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,6 +15,7 @@ from piper_kernels.linear.convrot import (
     convrot_int8_compile_options,
     convrot_int8_linear,
 )
+from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
@@ -145,7 +145,7 @@ def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, paired):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("width", [256, 5376, 9216, 12288, 16384, 32768])
 @pytest.mark.parametrize("activation", [None, "gelu_tanh", "swiglu"])
-def test_amd_preparation_matches_split_and_populates_storage(dtype, width, activation):
+def test_amd_preparation_matches_rotation_and_populates_storage(dtype, width, activation):
     torch.manual_seed(721)
     raw_width = width * (2 if activation == "swiglu" else 1)
     # Noncontiguous input and multidimensional leading shape.
@@ -157,25 +157,29 @@ def test_amd_preparation_matches_split_and_populates_storage(dtype, width, activ
     implementation = _backend.require_linear_backend(value)
     assert implementation is amd
     actual = implementation.prepare_input(value, 256, activation, out=output)
-    plan = replace(
-        amd.default_execution_plan(output[0].reshape(6, width)), fuse_rotation_quantization=False
-    )
-    expected = amd.prepare_input_with_plan(
-        value,
-        width,
-        256,
-        activation_fn=activation,
-        execution_plan=plan,
-        target=AcceleratorTarget.from_device(value.device),
-    )
+    plan = amd.default_execution_plan(output[0].reshape(6, width))
+    activated = apply_input_activation(value, activation)
+    rotated = rotate_groups(activated.float(), 256)
+    if not plan.fuse_rotation_quantization:
+        # The split path stores a compact materialized rotation.
+        rotated = rotated.to(activated.dtype)
+    elif amd._uses_amd_chunked_preparation(
+        AcceleratorTarget.from_device(value.device),
+        dtype,
+        policy.preparation_blocks(width),
+    ):
+        # Wide BF16 kernels pack live chunks to reduce register pressure.
+        rotated = rotated.bfloat16()
+    expected = reference.dynamic_quantize_rows(rotated)
     assert actual is output
-    # Activated fused math may differ at quantization boundaries from PyTorch;
-    # keep the same one-bin bound used by the CUDA activation tests.
+    # FP32 activation/reduction implementations may cross a terminal half-bin.
     error = (actual[0].short() - expected[0].short()).abs()
-    assert error.max().item() <= (1 if activation else 0)
+    assert error.max().item() <= 1
     if activation is None:
-        assert torch.equal(actual[1], expected[1])
-    torch.testing.assert_close(actual[1], expected[1], rtol=2 * torch.finfo(dtype).eps, atol=1e-7)
+        assert error.count_nonzero().item() <= actual[0].numel() * 0.001
+    torch.testing.assert_close(
+        actual[1], expected[1].squeeze(-1), rtol=3e-7 if activation is None else 2e-5, atol=1e-7
+    )
 
 
 @pytest.mark.gpu
@@ -216,7 +220,11 @@ def test_amd_preparation_zero_and_tiny_scales(dtype, width, magnitude):
     value = torch.zeros(2, width, device="cuda", dtype=dtype)
     value[:, 0] = magnitude
     actual = amd.prepare_input(value, 256)
-    expected = reference.prepare_input(value, 256)
+    rotated = rotate_groups(value.float(), 256)
+    if not amd.default_execution_plan(actual[0]).fuse_rotation_quantization:
+        rotated = rotated.to(dtype)
+    expected_qdata, expected_scale = reference.dynamic_quantize_rows(rotated)
+    expected = expected_qdata, expected_scale.squeeze(-1)
     assert torch.equal(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 

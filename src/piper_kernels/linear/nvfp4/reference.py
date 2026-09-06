@@ -36,7 +36,7 @@ def prepare_input(
     """Prepare activations using only PyTorch rotation and quantization operations."""
     activated = apply_input_activation(input, activation_fn)
     if group_size:
-        activated = rotate_groups(activated, group_size)
+        activated = rotate_groups(activated.float(), group_size)
     flattened = activated.reshape(-1, activated.shape[-1]).contiguous()
     if flattened.shape[0] == 0:
         if dynamic_activation_scale:
@@ -152,16 +152,16 @@ def addmm_(
         rotated_weight = torch.zeros(
             weight.shape,
             device=weight.device,
-            dtype=weight.orig_dtype,
+            dtype=torch.float32,
         )
     else:
         # Bypass ConvRot's logical dequantize override and remain in the
         # physical rotated basis used by the packed storage.
-        rotated_weight = PiperNVFP4Tensor.dequantize(weight, weight.orig_dtype)
-    rotated_update = rotate_groups(mat2, group_size) if group_size else mat2
+        rotated_weight = PiperNVFP4Tensor.dequantize(weight, torch.float32)
+    rotated_update = rotate_groups(mat2.float(), group_size) if group_size else mat2.float()
     merged = torch.addmm(
         rotated_weight,
-        mat1,
+        mat1.float(),
         rotated_update,
         beta=beta,
         alpha=alpha,
@@ -181,8 +181,8 @@ def add_(
     """Merge a dense logical update in the stored basis and refill NVFP4 storage."""
     # Stay in the physical rotated basis used by the packed storage. Rotation
     # is linear, so this equals rotating the logical sum before requantization.
-    rotated_weight = PiperNVFP4Tensor.dequantize(weight, weight.orig_dtype)
-    rotated_update = rotate_groups(update, group_size) if group_size else update
+    rotated_weight = PiperNVFP4Tensor.dequantize(weight, torch.float32)
+    rotated_update = rotate_groups(update.float(), group_size) if group_size else update.float()
     merged = torch.add(rotated_weight, rotated_update, alpha=alpha)
     _refill_(weight, merged, rounding_seed)
 
@@ -201,7 +201,7 @@ def _refill_(
         )
     encoded = PiperNVFP4Tensor.from_torchao(
         TorchAONVFP4Tensor.to_nvfp4(
-            merged.float() if merged.dtype is torch.float16 else merged,
+            merged,
             block_size=weight.block_size,
             per_tensor_scale=per_tensor_scale,
             act_per_tensor_scale=weight.act_per_tensor_scale,

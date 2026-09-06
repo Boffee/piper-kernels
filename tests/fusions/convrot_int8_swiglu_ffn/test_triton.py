@@ -10,7 +10,7 @@ from piper_kernels.fusions.convrot_int8_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
 )
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,9 +79,9 @@ def _operands(
 
 
 def _materialized(operands: _Operands) -> torch.Tensor:
-    gate = convrot_int8_backend.run_linear(operands.input, *operands.gate.arguments())
-    value = convrot_int8_backend.run_linear(operands.input, *operands.value.arguments())
-    return convrot_int8_backend.run_linear(
+    gate = int8_nvidia.run_linear(operands.input, *operands.gate.arguments())
+    value = int8_nvidia.run_linear(operands.input, *operands.value.arguments())
+    return int8_nvidia.run_linear(
         value * F.silu(gate),
         *operands.down.arguments(),
     )

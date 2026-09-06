@@ -128,7 +128,7 @@ def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, targe
     qdata, scale = torch.full((2, 512), 99, dtype=torch.int8), torch.full((2,), -99.0)
     if supported:
         # SM70 preparation still works without INT8 matrix instructions.
-        nvidia.fused_rotate_quantize_input(value, qdata, scale, 16, 0, num_warps=4)
+        nvidia.fused_rotate_quantize_input(value, qdata, scale, 16, num_warps=4)
         kernel.__getitem__.assert_called_once_with((2,))
         launch = kernel.__getitem__.return_value
         launch.assert_called_once()
@@ -137,7 +137,7 @@ def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, targe
         assert launch.call_args.kwargs["accelerator_backend"] == "cuda"
     else:
         with pytest.raises(ValueError, match="preparation has no optimized policy"):
-            nvidia.fused_rotate_quantize_input(value, qdata, scale, 16, 0, num_warps=4)
+            nvidia.fused_rotate_quantize_input(value, qdata, scale, 16, num_warps=4)
         kernel.__getitem__.assert_not_called()
         assert (qdata == 99).all()
         assert (scale == -99.0).all()

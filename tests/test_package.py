@@ -149,7 +149,6 @@ import sys
 import piper_kernels.attention.sparse_piper_attention
 
 assert "piper_kernels.linear.convrot" not in sys.modules
-assert "piper_kernels.linear.convrot.int8.triton" not in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 

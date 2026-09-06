@@ -195,7 +195,6 @@ def test_nvfp4_scale_and_gguf_launchers_own_context(launches):
             value,
             int(GGUFQuantizationType.F32),
             256,
-            torch.bfloat16,
             per_tensor_scale,
             torch.empty(3, 128, dtype=torch.uint8, device=value.device),
             torch.empty(3, 16, dtype=torch.float8_e4m3fn, device=value.device),

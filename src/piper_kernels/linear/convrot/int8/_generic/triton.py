@@ -8,7 +8,7 @@ import triton
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.stochastic_quantization import seed_argument
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.triton import logical_dtype_code, rotate_input
+from piper_kernels.linear.convrot.triton import rotate_input
 
 from .._gguf_policy import select_conversion_chunks
 from .._kernels.triton import (
@@ -40,14 +40,14 @@ def prepare_input(input, group_size, *, out):  # noqa: A002
             out[1],
             width,
             block_size=max(128, triton.next_power_of_2(width)),
-            logical_dtype_code=logical_dtype_code(value.dtype),
             reciprocal_scale=_reciprocal_scale(value),
+            accelerator_backend="hip" if _reciprocal_scale(value) else value.device.type,
             num_warps=4,
         )
         return out
 
 
-def convert_gguf_out(data, quant_type, group_size, logical_dtype, qdata, scale):
+def convert_gguf_out(data, quant_type, group_size, qdata, scale):
     """Share fused conversion across accelerators, with a bounded wide-row fallback."""
     rows, width = qdata.shape
     if rows == 0 or width == 0:
@@ -67,17 +67,16 @@ def convert_gguf_out(data, quant_type, group_size, logical_dtype, qdata, scale):
                 chunk_count=chunk_count,
                 group_size=group_size,
                 inverse_sqrt_group=group_size**-0.5,
-                logical_dtype_code=logical_dtype_code(logical_dtype),
                 activation_fn=None,
                 accelerator_backend=target.backend,
                 gguf_quant_type=quant_type,
                 num_warps=4,
             )
             return
-        _convert_gguf_tiled_out(data, quant_type, group_size, logical_dtype, qdata, scale)
+        _convert_gguf_tiled_out(data, quant_type, group_size, qdata, scale)
 
 
-def _convert_gguf_tiled_out(data, quant_type, group_size, logical_dtype, qdata, scale):
+def _convert_gguf_tiled_out(data, quant_type, group_size, qdata, scale):
     """Convert with at most 1 MiB of maxima, or one row's maxima."""
     rows, width = qdata.shape
     tiles = (width + _GGUF_TILE_SIZE - 1) // _GGUF_TILE_SIZE
@@ -97,9 +96,9 @@ def _convert_gguf_tiled_out(data, quant_type, group_size, logical_dtype, qdata, 
                     tiles,
                     block_size=_GGUF_TILE_SIZE,
                     group_size=group_size,
-                    logical_dtype_code=logical_dtype_code(logical_dtype),
                     quant_type=quant_type,
                     write_maxima=write_maxima,
+                    accelerator_backend="hip" if _reciprocal_scale(data) else data.device.type,
                     num_warps=4,
                 )
                 if write_maxima:
@@ -123,14 +122,10 @@ def addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed=None
         update = torch.mm(mat1, rotated_mat2)
     else:
         update = qdata
-    _requantize_update_(
-        qdata, scale, update, mat1.dtype, beta, alpha, rounding_seed, has_update=has_update
-    )
+    _requantize_update_(qdata, scale, update, beta, alpha, rounding_seed, has_update=has_update)
 
 
-def _requantize_update_(
-    qdata, scale, update, logical_dtype, beta, alpha, rounding_seed, *, has_update
-):
+def _requantize_update_(qdata, scale, update, beta, alpha, rounding_seed, *, has_update):
     """Refill existing rowwise storage with shared deterministic/stochastic math."""
     out_features, in_features = qdata.shape
     with device_context(qdata.device):
@@ -148,11 +143,11 @@ def _requantize_update_(
             alpha,
             seed_argument(rounding_seed),
             block_size=max(128, triton.next_power_of_2(in_features)),
-            logical_dtype_code=logical_dtype_code(logical_dtype),
             has_base=beta != 0,
             has_update=has_update,
             stochastic=rounding_seed is not None,
             reciprocal_scale=_reciprocal_scale(qdata),
+            accelerator_backend="hip" if _reciprocal_scale(qdata) else qdata.device.type,
             num_warps=8,
         )
 
@@ -170,7 +165,6 @@ def add_(qdata, scale, update, group_size, alpha, rounding_seed=None):
         qdata,
         scale,
         rotated_update,
-        update.dtype,
         1.0,
         alpha,
         rounding_seed,

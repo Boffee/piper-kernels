@@ -25,9 +25,9 @@ _TARGETS = [
 
 
 @pytest.mark.parametrize("target", _TARGETS)
-@pytest.mark.parametrize(("dtype", "dtype_code"), [("fp16", 1), ("bf16", 2), ("fp32", 0)])
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp32"])
 @pytest.mark.parametrize("operation", ["rotate", "quantize", "update"])
-def test_generic_primitives_compile(target, dtype, dtype_code, operation):
+def test_generic_primitives_compile(target, dtype, operation):
     if operation == "rotate":
         kernel = rotate_groups_kernel
         signature = {
@@ -40,8 +40,8 @@ def test_generic_primitives_compile(target, dtype, dtype_code, operation):
     else:
         constants = {
             "block_size": 1024,
-            "logical_dtype_code": dtype_code,
             "reciprocal_scale": target.backend == "hip",
+            "accelerator_backend": target.backend,
         }
         if operation == "quantize":
             kernel = kernels.quantize_rows_kernel
@@ -94,9 +94,9 @@ def test_generic_gguf_tiles_compile(target, quant_type, write_maxima):
             constexprs={
                 "block_size": 1024,
                 "group_size": 256,
-                "logical_dtype_code": 2,
                 "quant_type": int(quant_type),
                 "write_maxima": write_maxima,
+                "accelerator_backend": target.backend,
             },
         ),
         target=target,
@@ -121,8 +121,7 @@ def test_generic_gguf_scale_reduction_compiles(target):
 
 @pytest.mark.parametrize("target", _TARGETS)
 @pytest.mark.parametrize("quant_type", list(GGUFQuantizationType))
-@pytest.mark.parametrize("dtype_code", [0, 1, 2])
-def test_shared_fused_gguf_compiles(target, quant_type, dtype_code):
+def test_shared_fused_gguf_compiles(target, quant_type):
     compiled = triton.compile(
         ASTSource(
             kernels.rotate_quantize_rows_kernel,
@@ -132,7 +131,6 @@ def test_shared_fused_gguf_compiles(target, quant_type, dtype_code):
                 "chunk_count": 3,
                 "group_size": 256,
                 "inverse_sqrt_group": 256**-0.5,
-                "logical_dtype_code": dtype_code,
                 "activation_fn": None,
                 "accelerator_backend": target.backend,
                 "gguf_quant_type": int(quant_type),

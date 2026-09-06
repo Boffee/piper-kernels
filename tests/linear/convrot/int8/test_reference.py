@@ -9,6 +9,46 @@ from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
 from piper_kernels.linear.convrot.int8.reference import dynamic_quantize_rows, linear
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm"),
+            ],
+        ),
+    ],
+)
+def test_int8_normalization_avoids_bfloat16_double_rounding(device) -> None:
+    # Both inputs are exact BF16 values. The smaller value is 2/3 of the
+    # maximum, so its terminal INT8 code is round(127 * 2/3) = 85, not 84.
+    values = torch.tensor([[0.02001953125, 0.030029296875]], dtype=torch.bfloat16, device=device)
+    expected = torch.tensor([[85, 127]], dtype=torch.int8, device=device)
+    actual, scale = dynamic_quantize_rows(values)
+    assert torch.equal(actual, expected)
+    if device == "cuda":
+        from piper_kernels.linear.convrot.int8._kernels.triton import (  # noqa: PLC0415
+            quantize_rows_kernel,
+        )
+
+        output = torch.empty_like(expected)
+        output_scale = torch.empty_like(scale)
+        quantize_rows_kernel[(1,)](
+            values,
+            output,
+            output_scale,
+            2,
+            block_size=128,
+            reciprocal_scale=torch.version.hip is not None,
+            accelerator_backend="hip" if torch.version.hip is not None else "cuda",
+        )
+        assert torch.equal(output, expected)
+        torch.testing.assert_close(output_scale, scale)
+
+
 def test_cpu_linear_matches_explicit_w8a8_reference() -> None:
     torch.manual_seed(4)
     group_size, in_features, out_features = 16, 32, 11

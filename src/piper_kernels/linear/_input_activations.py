@@ -31,12 +31,12 @@ def apply_input_activation(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     activation_fn: str | None,
 ) -> torch.Tensor:
-    """Apply a supported activation using portable PyTorch operations."""
+    """Apply a supported activation with FP32 intermediate arithmetic."""
     validate_input_activation(activation_fn)
     if activation_fn == "gelu_tanh":
-        return torch.nn.functional.gelu(input, approximate="tanh")
+        return torch.nn.functional.gelu(input.float(), approximate="tanh")
     if activation_fn == "swiglu":
-        up, gate = input.chunk(2, dim=-1)
+        up, gate = input.float().chunk(2, dim=-1)
         return up * torch.nn.functional.silu(gate)
     return input
 

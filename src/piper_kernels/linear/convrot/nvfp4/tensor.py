@@ -159,9 +159,10 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """
         if group_size is None:
             raise TypeError("ConvRot NVFP4 quantization requires a group size")
-        return cls.from_torchao(
+        storage = cast(
+            NVFP4Storage,
             _quantize_hp(
-                rotate_groups(hp_tensor.detach(), group_size),
+                rotate_groups(hp_tensor.detach().float(), group_size),
                 block_size=block_size,
                 per_tensor_scale=per_tensor_scale,
                 compute_per_tensor_scale=compute_per_tensor_scale,
@@ -170,7 +171,18 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
                 use_triton_kernel=use_triton_kernel,
                 act_quant_kwargs=act_quant_kwargs,
             ),
-            group_size=group_size,
+        )
+        return cls(
+            storage.qdata,
+            storage.scale,
+            storage.block_size,
+            hp_tensor.dtype,
+            group_size,
+            storage.per_tensor_scale,
+            storage.act_per_tensor_scale,
+            storage.is_swizzled_scales,
+            storage.use_triton_kernel,
+            storage.act_quant_kwargs,
         )
 
     @classmethod

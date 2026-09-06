@@ -9,6 +9,12 @@ The package owns operator semantics, portable PyTorch references, tensor subclas
 and optimized backends. It deliberately does not know about model repositories,
 checkpoint metadata, pipeline frameworks, or device-offloading policy.
 
+Fused ConvRot preparation, GGUF conversion, and NVFP4 weight updates use FP32 arithmetic
+instead of reproducing the extra FP16/BF16 rounding of an eager PyTorch composition.
+Their portable references use FP32 arithmetic. Lower-precision tensor-core operands,
+compact workspaces, AMD's packed live rotation chunks, and sparse attention's packed
+residual epilogue remain where they reduce storage or execution cost.
+
 ## Operators
 
 | Package | Role |
