@@ -1,4 +1,4 @@
-"""Real-device regressions for device ownership and non-default stream execution."""
+"""Device and stream integration tests requiring the optional linear dependencies."""
 
 import pytest
 import torch

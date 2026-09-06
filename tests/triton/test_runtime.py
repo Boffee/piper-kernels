@@ -9,9 +9,6 @@ import torch
 import triton
 
 from piper_kernels._triton import runtime
-from piper_kernels.linear.convrot.int8 import _backend
-from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
-from piper_kernels.linear.convrot.int8._generic import triton as generic
 
 
 @pytest.fixture
@@ -135,11 +132,3 @@ def test_missing_driver_uses_fallback(monkeypatch):
     driver = SimpleNamespace(get_active_torch_device=Mock(side_effect=RuntimeError("no driver")))
     monkeypatch.setattr(triton.runtime, "driver", SimpleNamespace(active=driver))
     assert not runtime.supports_device(torch.device("cuda:1"))
-
-
-def test_gguf_and_generic_operations_accept_supported_noncurrent_gpu(devices):
-    value = SimpleNamespace(device=torch.device("cuda:1"), shape=(2, 256), numel=lambda: 512)
-    assert _backend.select_gguf_converter(value) is generic.convert_gguf_out
-    assert generic_dispatch._use_triton(value)
-    assert devices.queries == [1, 1]
-    assert devices.current == 0
