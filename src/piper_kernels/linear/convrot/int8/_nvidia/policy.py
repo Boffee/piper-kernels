@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .._plan import LinearExecutionPlan
+from .._plan import LinearExecutionPlan, fused_preparation_chunks
 
 _FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
@@ -45,16 +45,9 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
 
 
 _FUSED_MAX_CHUNK_SIZE = 16_384
-_FUSED_MAX_CHUNK_COUNT = 3
-_ALWAYS_SINGLE_CHUNK_MAX_SIZE = 4_096
-_SINGLE_CHUNK_MAX_SIZE = 8_192
 _TWO_WARP_MAX_CHUNK_SIZE = 2_048
 _DEFAULT_ROTATION_NUM_WARPS = 4
 _DEFAULT_QUANTIZATION_NUM_WARPS = 8
-
-
-def _preparation_block_size(in_features: int) -> int:
-    return max(128, 1 << (in_features - 1).bit_length())
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -67,37 +60,6 @@ def supports_preparation_target(target: AcceleratorTarget) -> bool:
     return target.is_nvidia_cuda
 
 
-def _select_fused_preparation_chunks(in_features: int) -> tuple[int, int] | None:
-    """Return ``(chunk_count, chunk_size)`` for fused input preparation.
-
-    Preserve the inexpensive single-chunk path for small rows. Above it, choose
-    the supported layout with the least padded work, preferring fewer chunks on
-    ties.
-    """
-    block_size = _preparation_block_size(in_features)
-    if block_size <= _ALWAYS_SINGLE_CHUNK_MAX_SIZE:
-        return 1, block_size
-
-    candidates: list[tuple[int, int]] = []
-    for chunk_count in range(1, _FUSED_MAX_CHUNK_COUNT + 1):
-        chunk_width = (in_features + chunk_count - 1) // chunk_count
-        chunk_size = _preparation_block_size(chunk_width)
-        if chunk_size > _FUSED_MAX_CHUNK_SIZE:
-            continue
-        if chunk_count == 1 and chunk_size > _SINGLE_CHUNK_MAX_SIZE:
-            continue
-        if chunk_size * (chunk_count - 1) >= in_features:
-            continue
-        candidates.append((chunk_count, chunk_size))
-
-    if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda candidate: (candidate[0] * candidate[1], candidate[0]),
-    )
-
-
 def select_execution_plan(
     target: AcceleratorTarget,
     *,
@@ -106,7 +68,7 @@ def select_execution_plan(
     """Select the production preparation and GEMM schedule for one linear."""
     if not supports_target(target):
         raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
-    fused_chunks = _select_fused_preparation_chunks(in_features)
+    fused_chunks = fused_preparation_chunks(in_features)
     fused_num_warps = 4
     if fused_chunks is not None:
         chunk_count, chunk_size = fused_chunks
@@ -126,13 +88,3 @@ def select_execution_plan(
         matmul_block_k=128,
         matmul_num_warps=8,
     )
-
-
-def select_fused_preparation_chunks(
-    target: AcceleratorTarget,
-    in_features: int,
-) -> tuple[int, int] | None:
-    """Select a NVIDIA preparation layout independently of INT8 matrix support."""
-    if not supports_preparation_target(target):
-        raise ValueError(f"ConvRot INT8 preparation has no optimized policy for {target}")
-    return _select_fused_preparation_chunks(in_features)

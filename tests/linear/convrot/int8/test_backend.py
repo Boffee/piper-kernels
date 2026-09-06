@@ -1,13 +1,16 @@
 """Implementation selection preserves ConvRot INT8 dispatch and fallback contracts."""
 
+import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _update, dispatch
+from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 
 
@@ -54,16 +57,29 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
 def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architecture):
     target = AcceleratorTarget("cuda", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    monkeypatch.setattr(generic_triton, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
 
-    assert _backend.select_gguf_converter(value) is nvidia._convert_gguf_out
+    assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out
     assert _backend.select_dequantized_mean(value) is nvidia.dequantized_input_mean
     assert _backend.select_add(value) is not None
     assert _backend.select_addmm(value) is not None
 
 
-def test_nvidia_interface_forwards_preparation_and_projection_buffers(monkeypatch):
-    target = AcceleratorTarget("cuda", "sm120")
+@pytest.mark.parametrize(
+    ("backend", "target"),
+    [
+        (nvidia, AcceleratorTarget("cuda", "sm120")),
+        pytest.param(
+            amd,
+            AcceleratorTarget("hip", "gfx1201"),
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only"),
+        ),
+    ],
+)
+def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
+    monkeypatch, backend, target
+):
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     value = torch.empty(2, 64)
     prepared = (torch.empty(2, 32, dtype=torch.int8), torch.empty(2))
@@ -72,21 +88,58 @@ def test_nvidia_interface_forwards_preparation_and_projection_buffers(monkeypatc
     output = torch.empty(2, 18)[:, 2:-2]
     prepare = Mock(return_value=prepared)
     project = Mock(return_value=output)
-    monkeypatch.setattr(nvidia, "_prepare_input", prepare)
-    monkeypatch.setattr(nvidia, "_execute_prepared_linear", project)
+    monkeypatch.setattr(backend, "prepare_input_with_plan", prepare)
+    monkeypatch.setattr(backend, "execute_prepared_linear", project)
     implementation = _backend.require_linear_backend(value)
+    assert implementation is backend
 
     assert implementation.prepare_input(value, 16, "swiglu", out=prepared) is prepared
     assert prepare.call_args.args == (value, 32, 16)
     assert prepare.call_args.kwargs["out"] is prepared
     assert prepare.call_args.kwargs["activation_fn"] == "swiglu"
     assert prepare.call_args.kwargs["target"] == target
+    expected_plan = backend.default_execution_plan(weight, target=target)
+    assert prepare.call_args.kwargs["execution_plan"] == expected_plan
 
     result = implementation.linear_prepared(
         *prepared, weight, scale, None, torch.float32, out=output, second_projection=second
     )
     assert result is output
+    assert project.call_args.args[-1] == expected_plan
     assert project.call_args.kwargs == {"out": output, "second_projection": second}
+
+
+@pytest.mark.parametrize(
+    ("target", "supported"),
+    [
+        (AcceleratorTarget("cuda", "sm70"), True),
+        (AcceleratorTarget("cuda", "sm120"), True),
+        (AcceleratorTarget("cpu"), False),
+        (AcceleratorTarget("meta"), False),
+        (AcceleratorTarget("hip", "gfx1201"), False),
+    ],
+)
+def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, target, supported):
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    kernel = MagicMock()
+    monkeypatch.setattr(nvidia, "rotate_quantize_rows_kernel", kernel)
+    value = torch.empty(2, 512)
+    qdata, scale = torch.full((2, 512), 99, dtype=torch.int8), torch.full((2,), -99.0)
+    if supported:
+        # SM70 preparation still works without INT8 matrix instructions.
+        nvidia.fused_rotate_quantize_input(value, qdata, scale, 16, 0, num_warps=4)
+        kernel.__getitem__.assert_called_once_with((2,))
+        launch = kernel.__getitem__.return_value
+        launch.assert_called_once()
+        assert launch.call_args.kwargs["chunk_count"] == 1
+        assert launch.call_args.kwargs["chunk_size"] == 512
+        assert launch.call_args.kwargs["accelerator_backend"] == "cuda"
+    else:
+        with pytest.raises(ValueError, match="preparation has no optimized policy"):
+            nvidia.fused_rotate_quantize_input(value, qdata, scale, 16, 0, num_warps=4)
+        kernel.__getitem__.assert_not_called()
+        assert (qdata == 99).all()
+        assert (scale == -99.0).all()
 
 
 @pytest.mark.parametrize("operation", ["linear", "add_", "addmm_"])

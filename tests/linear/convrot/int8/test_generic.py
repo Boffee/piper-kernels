@@ -10,10 +10,9 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import ConvRotInt8Tensor
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops, reference
-from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8 import triton as legacy_triton
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 
 _DEVICES = [
     "cpu",
@@ -45,9 +44,9 @@ def test_generic_package_reexports_dispatch(operation):
     assert getattr(_generic, operation) is getattr(generic_dispatch, operation)
 
 
-def test_backend_update_exports_are_shared():
-    assert amd.add_ is nvidia.add_ is _generic.add_
-    assert amd.addmm_ is nvidia.addmm_ is _generic.addmm_
+def test_legacy_update_exports_preserve_custom_ops():
+    assert legacy_triton.add_ is _ops.add_
+    assert legacy_triton.addmm_ is _ops.addmm_
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])

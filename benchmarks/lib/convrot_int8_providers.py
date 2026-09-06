@@ -8,8 +8,8 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
-from piper_kernels.linear.convrot.int8 import _policy as convrot_int8_policy
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
 
 from .convrot import ConvRotConfig, ConvRotInputs, ConvRotShape, make_convrot_inputs
@@ -23,7 +23,7 @@ class ConvRotInt8Workload:
     shape: ConvRotShape
     config: ConvRotConfig
     inputs: ConvRotInputs
-    production_plan: convrot_int8_policy.LinearExecutionPlan
+    production_plan: LinearExecutionPlan
 
     @property
     def input_preparation(self) -> str | None:
@@ -129,7 +129,7 @@ def make_public_convrot_int8_provider(
 
 def planned_convrot_int8_configuration(
     workload: ConvRotInt8Workload,
-    plan: convrot_int8_policy.LinearExecutionPlan,
+    plan: LinearExecutionPlan,
 ) -> dict[str, object]:
     """Return complete metadata for one explicitly injected execution plan."""
     return {
@@ -141,7 +141,7 @@ def planned_convrot_int8_configuration(
 
 def make_planned_convrot_int8_provider(
     workload: ConvRotInt8Workload,
-    plan: convrot_int8_policy.LinearExecutionPlan,
+    plan: LinearExecutionPlan,
     *,
     name: str,
 ) -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:

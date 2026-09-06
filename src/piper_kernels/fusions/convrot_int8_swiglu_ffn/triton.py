@@ -9,8 +9,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear import _bias
-from piper_kernels.linear.convrot.int8 import reference
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8 import _backend, reference
 
 _DEFAULT_CHUNK_ROWS = 4_096
 
@@ -182,9 +181,7 @@ def _run_chunked_swiglu_ffn(
         dtype=torch.int8,
     )
     scale_storage = torch.empty(capacity, device=input.device, dtype=torch.float32)
-    target = AcceleratorTarget.from_device(input.device)
-    input_plan = convrot_int8_backend.default_execution_plan(gate_weight_qdata)
-    down_plan = convrot_int8_backend.default_execution_plan(down_weight_qdata)
+    backend = _backend.require_linear_backend(input)
 
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
@@ -194,24 +191,20 @@ def _run_chunked_swiglu_ffn(
             input_features,
         )
         prepared_scale = scale_storage[:chunk_row_count]
-        convrot_int8_backend._prepare_input(
+        backend.prepare_input(
             input_2d[start:stop],
-            input_features,
             gate_group_size,
             activation_fn=None,
-            execution_plan=input_plan,
-            target=target,
             out=(prepared_input, prepared_scale),
         )
         projections = projection_workspace[:chunk_row_count]
-        convrot_int8_backend._execute_prepared_linear(
+        backend.linear_prepared(
             prepared_input,
             prepared_scale,
             value_weight_qdata,
             value_weight_scale,
             value_bias,
             input.dtype,
-            input_plan,
             out=projections,
             second_projection=(gate_weight_qdata, gate_weight_scale, gate_bias),
         )
@@ -220,24 +213,20 @@ def _run_chunked_swiglu_ffn(
             chunk_row_count,
             intermediate_features,
         )
-        convrot_int8_backend._prepare_input(
+        backend.prepare_input(
             projections,
-            intermediate_features,
             down_group_size,
             activation_fn="swiglu",
-            execution_plan=down_plan,
-            target=target,
             out=(prepared_swiglu, prepared_scale),
         )
         output_chunk = output_2d[start:stop] if projected is None else projected[:chunk_row_count]
-        convrot_int8_backend._execute_prepared_linear(
+        backend.linear_prepared(
             prepared_swiglu,
             prepared_scale,
             down_weight_qdata,
             down_weight_scale,
             down_bias,
             input.dtype,
-            down_plan,
             out=output_chunk,
         )
         if gated_updates is not None:

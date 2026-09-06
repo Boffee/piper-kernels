@@ -27,11 +27,12 @@ def convert(
             f"ConvRot INT8 GGUF logical dtype must be FP16, BF16, or FP32, got {logical_dtype}"
         )
     raw, normalized, rows, features = prepare_packed_matrix(data, quant_type)
-    if raw.device.type != "cuda":
-        raise ValueError("ConvRot INT8 GGUF conversion requires CUDA")
     convert_out = _backend.select_gguf_converter(raw)
     if convert_out is None:
-        raise ValueError(f"ConvRot INT8 GGUF conversion is unavailable on {raw.device}")
+        raise ValueError(
+            "ConvRot INT8 GGUF conversion requires a supported Triton accelerator; "
+            f"conversion is unavailable on {raw.device}"
+        )
     if features % group_size:
         raise ValueError(
             f"GGUF in_features {features} is not divisible by ConvRot group size {group_size}"
@@ -56,14 +57,17 @@ def convert(
         ):
             raise ValueError("ConvRot INT8 GGUF output storage is incompatible")
 
-    convert_out(
-        raw,
-        int(normalized),
-        group_size,
-        logical_dtype,
-        qdata,
-        scale,
-    )
+    if rows == 0 or features == 0:
+        scale.fill_(1e-30)
+    else:
+        convert_out(
+            raw,
+            int(normalized),
+            group_size,
+            logical_dtype,
+            qdata,
+            scale,
+        )
     return qdata, scale
 
 

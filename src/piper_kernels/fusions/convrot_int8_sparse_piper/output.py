@@ -6,11 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
-from piper_kernels.linear.convrot.int8 import _policy, reference
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8 import _backend, reference
+from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 
 from . import query as query_projection
 
@@ -26,20 +25,19 @@ class _PreparedGateProjection:
     weight_qdata: torch.Tensor
     weight_scale: torch.Tensor
     bias: torch.Tensor | None
-    execution_plan: _policy.LinearExecutionPlan
+    backend: LinearBackend
 
     def project(self, output: torch.Tensor, start: int, rows: int) -> None:
         """Project one sequence window into caller-owned token-major gate storage."""
         output_features = self.weight_qdata.shape[0]
         for batch_index in range(self.input_qdata.shape[0]):
-            convrot_int8_backend._execute_prepared_linear(
+            self.backend.linear_prepared(
                 self.input_qdata[batch_index, start : start + rows],
                 self.input_scale[batch_index, start : start + rows],
                 self.weight_qdata,
                 self.weight_scale,
                 self.bias,
                 torch.bfloat16,
-                self.execution_plan,
                 out=output[batch_index, :rows].reshape(rows, output_features),
             )
 
@@ -113,7 +111,7 @@ def _prepare_gate_projection(
         weight_qdata,
         weight_scale,
         bias,
-        convrot_int8_backend.default_execution_plan(weight_qdata),
+        _backend.require_linear_backend(input_qdata),
     )
 
 
@@ -209,31 +207,26 @@ def _project_attention_chunk(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
-    execution_plan: _policy.LinearExecutionPlan,
-    target: AcceleratorTarget,
+    backend: LinearBackend,
 ) -> None:
     """Project one ready attention chunk into its final output rows."""
     batch = attention_chunk.shape[0]
     input_features = weight_qdata.shape[1]
     for batch_index in range(batch):
         chunk_input = attention_chunk[batch_index, :rows].reshape(rows, input_features)
-        convrot_int8_backend._prepare_input(
+        backend.prepare_input(
             chunk_input,
-            input_features,
             group_size,
             activation_fn=None,
-            execution_plan=execution_plan,
-            target=target,
             out=(prepared_input[:rows], prepared_scale[:rows]),
         )
-        convrot_int8_backend._execute_prepared_linear(
+        backend.linear_prepared(
             prepared_input[:rows],
             prepared_scale[:rows],
             weight_qdata,
             weight_scale,
             bias,
             torch.bfloat16,
-            execution_plan,
             out=output[batch_index, start : start + rows],
         )
 
@@ -269,8 +262,7 @@ def _prepare_output_chunk_projector(
         device=attention_storage.device,
         dtype=torch.float32,
     )
-    target = AcceleratorTarget.from_device(attention_storage.device)
-    execution_plan = convrot_int8_backend.default_execution_plan(weight_qdata)
+    backend = _backend.require_linear_backend(attention_storage)
 
     def project_chunk(
         attention_chunk: torch.Tensor,
@@ -289,8 +281,7 @@ def _prepare_output_chunk_projector(
             weight_scale,
             bias,
             group_size,
-            execution_plan,
-            target,
+            backend,
         )
 
     return output_features, project_chunk, (prepared_input, prepared_scale)

@@ -10,6 +10,13 @@ from ._interfaces import Add, Addmm, DequantizedMean, GGUFConvert, LinearBackend
 from ._nvidia import policy as nvidia_policy
 
 try:
+    from ._generic import triton as _generic_backend
+except ModuleNotFoundError as error:
+    if error.name != "triton":
+        raise
+    _generic_backend = None
+
+try:
     from ._nvidia import triton as _nvidia_backend
 except ModuleNotFoundError as error:
     if error.name != "triton":
@@ -59,14 +66,9 @@ def select_preparation_backend(input: torch.Tensor) -> PreparationBackend:  # no
 
 def select_gguf_converter(input: torch.Tensor) -> GGUFConvert | None:  # noqa: A002
     """Select direct GGUF conversion without requiring INT8 matrix instructions."""
-    if _nvidia_backend is None:
-        return None
-    target = AcceleratorTarget.from_device(input.device)
-    return (
-        _nvidia_backend._convert_gguf_out
-        if nvidia_policy.supports_preparation_target(target)
-        else None
-    )
+    if _generic_backend is not None and _generic_backend.supports_device(input.device):
+        return _generic_backend.convert_gguf_out
+    return None
 
 
 def select_dequantized_mean(input: torch.Tensor) -> DequantizedMean | None:  # noqa: A002

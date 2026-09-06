@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels.fusions.projected_qk import triton as projected_qk
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._kernels import triton as convrot_int8_kernels
 
 _HEAD_DIM = 128
 
@@ -41,7 +41,7 @@ def project_rmsnorm_rope_tile(
     block_k: tl.constexpr,
 ):
     """Return one FP32 normalized and rotated projection tile."""
-    projection = convrot_int8_backend.scaled_int8_matmul(
+    projection = convrot_int8_kernels.scaled_int8_matmul(
         input_ptr,
         weight_ptr,
         input_scale_ptr,

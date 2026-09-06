@@ -6,17 +6,18 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 from piper_kernels.linear.convrot.int8._nvidia import policy
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
+from piper_kernels.linear.convrot.int8._plan import fused_preparation_chunks
 
 
 @pytest.mark.parametrize("architecture", [75, 89, 120])
 def test_nvidia_preparation_compiles_without_a_device(architecture):
     target = AcceleratorTarget("cuda", f"sm{architecture}")
     plan = policy.select_execution_plan(target, in_features=5376)
-    chunk_count, chunk_size = policy.select_fused_preparation_chunks(target, 5376)
+    chunk_count, chunk_size = fused_preparation_chunks(5376)
     source = ASTSource(
-        nvidia.rotate_quantize_rows_kernel,
+        kernels.rotate_quantize_rows_kernel,
         {"x_ptr": "*fp16", "q_ptr": "*i8", "scale_ptr": "*fp32", "row_width": "i32"},
         constexprs={
             "chunk_size": chunk_size,
@@ -58,7 +59,7 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture):
         AcceleratorTarget("cuda", f"sm{architecture}"), in_features=512
     )
     source = ASTSource(
-        nvidia._int8_matmul_kernel,
+        kernels.int8_matmul_kernel,
         {
             "input_ptr": "*i8",
             "weight_ptr": "*i8",

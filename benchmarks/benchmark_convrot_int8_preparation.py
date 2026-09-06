@@ -39,8 +39,10 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import (
     apply_input_activation,
 )
-from piper_kernels.linear.convrot.int8 import _policy as convrot_int8_policy
-from piper_kernels.linear.convrot.int8 import triton as triton_backend
+from piper_kernels.linear.convrot import triton as convrot_backend
+from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
+from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_policy
+from piper_kernels.linear.convrot.int8._nvidia import triton as triton_backend
 
 COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
 PIPER_TRITON_PROVIDER = "piper-triton"
@@ -72,10 +74,10 @@ class PreparationPhaseResult:
 
 
 _PHASE_PROVENANCE = {
-    "rotate": "piper_kernels.linear.convrot.int8.triton.rotate_input",
-    "quantize": "piper_kernels.linear.convrot.int8.triton.quantize_input",
+    "rotate": "piper_kernels.linear.convrot.triton.rotate_input",
+    "quantize": "piper_kernels.linear.convrot.int8._nvidia.triton.quantize_input",
     "split": "Piper rotate_input followed by quantize_input",
-    "fused": "piper_kernels.linear.convrot.int8.triton.fused_rotate_quantize_input",
+    "fused": "piper_kernels.linear.convrot.int8._nvidia.triton.fused_rotate_quantize_input",
     "comfy-kitchen": "comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64",
 }
 
@@ -285,10 +287,10 @@ def _benchmark_width(
     split_scale = torch.empty(rows, device="cuda", dtype=torch.float32)
     fused_qdata = torch.empty_like(split_qdata)
     fused_scale = torch.empty_like(split_scale)
-    dtype_code = triton_backend.dtype_code(dtype)
+    dtype_code = convrot_backend.logical_dtype_code(dtype)
 
     def rotate() -> None:
-        triton_backend.rotate_input(
+        convrot_backend.rotate_input(
             activation,
             rotated,
             256,
@@ -489,11 +491,11 @@ def _inspection_provider(
     args: argparse.Namespace,
     preparation_configuration: _PreparationConfiguration,
 ) -> BenchmarkProvider[None, None]:
-    jit_functions = {"fused": triton_backend.rotate_quantize_rows_kernel}
+    jit_functions = {"fused": int8_kernels.rotate_quantize_rows_kernel}
     if args.input_activation is None:
         jit_functions = {
-            "rotate": triton_backend.rotate_groups_kernel,
-            "quantize": triton_backend.quantize_rows_kernel,
+            "rotate": convrot_backend.rotate_groups_kernel,
+            "quantize": int8_kernels.quantize_rows_kernel,
             **jit_functions,
         }
     return BenchmarkProvider(

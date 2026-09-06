@@ -15,7 +15,7 @@ import triton.language as tl
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._kernels import triton as convrot_int8_kernels
 
 from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length, validate_block_lengths
 
@@ -112,7 +112,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     projection_feature_offsets = tl.arange(0, block_n)
     head_offsets = head_block * heads_per_program + tl.arange(0, heads_per_program)
     weight_offsets = head_block * block_n + projection_feature_offsets
-    projection = convrot_int8_backend.scaled_int8_matmul(
+    projection = convrot_int8_kernels.scaled_int8_matmul(
         input_ptr,
         weight_ptr,
         input_scale_ptr,

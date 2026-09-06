@@ -3,7 +3,6 @@
 # Triton's JIT launcher accepts compile-time options not represented in its
 # Python call signature.
 # pyright: reportCallIssue=false
-# ruff: noqa: PLC0414 - preserve the established low-level exports
 
 import math
 
@@ -12,33 +11,23 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.gguf import triton as gguf_backend
 from piper_kernels.linear._input_activations import (
     apply_input_activation,
     input_activation_width,
 )
 from piper_kernels.linear.convrot import triton as convrot_backend
 
-from .._generic import add_ as add_
-from .._generic import addmm_ as addmm_
-from .._generic.triton import _requantize_update_ as _requantize_update_
-from .._kernels.triton import _int8_matmul_kernel as _int8_matmul_kernel
-from .._kernels.triton import _normalize_for_int8 as _normalize_for_int8
-from .._kernels.triton import _quantize_int8 as _quantize_int8
-from .._kernels.triton import _requantize_update_rows_kernel as _requantize_update_rows_kernel
-from .._kernels.triton import quantize_rows_kernel as quantize_rows_kernel
-from .._kernels.triton import scaled_int8_matmul as scaled_int8_matmul
-from . import policy as _policy
+from .._kernels.triton import (
+    int8_matmul_kernel,
+    quantize_rows_kernel,
+    rotate_quantize_rows_kernel,
+)
+from .._plan import LinearExecutionPlan, fused_preparation_chunks
+from . import policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
 _MEAN_BLOCK_M = 256
 _MEAN_BLOCK_K = 128
-
-# Preserve the established INT8 module-level utility surface while the
-# implementations live at the format-independent ConvRot boundary.
-dtype_code = convrot_backend.logical_dtype_code
-rotate_groups_kernel = convrot_backend.rotate_groups_kernel
-rotate_input = convrot_backend.rotate_input
 
 
 @triton.jit
@@ -123,196 +112,6 @@ def _dequantized_input_mean_reduce_kernel(
     )
 
 
-@triton.jit
-def _store_quantized_chunk(
-    q_ptr,
-    output_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    values,
-    scale,
-    logical_dtype_code: tl.constexpr,
-):
-    offsets = chunk_start + chunk_offsets
-    quantized = _quantize_int8(values, scale, logical_dtype_code)
-    tl.store(
-        q_ptr + output_row_offset + offsets,
-        quantized,
-        mask=offsets < row_width,
-    )
-
-
-@triton.jit
-def _load_weight_chunk(
-    x_ptr,
-    input_row_offset,
-    packed_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    chunk_size: tl.constexpr,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-    gguf_quant_type: tl.constexpr,
-):
-    if gguf_quant_type >= 0:
-        return gguf_backend.load_rotated_chunk(
-            x_ptr,
-            packed_row_offset,
-            row_width,
-            chunk_start,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            logical_dtype_code,
-            gguf_quant_type,
-        )
-    return convrot_backend.load_activated_rotated_chunk(
-        x_ptr,
-        input_row_offset,
-        row_width,
-        chunk_start,
-        chunk_offsets,
-        chunk_size,
-        group_size,
-        inverse_sqrt_group,
-        logical_dtype_code,
-        activation_fn,
-        accelerator_backend,
-    )
-
-
-@triton.jit
-def rotate_quantize_rows_kernel(
-    x_ptr,
-    q_ptr,
-    scale_ptr,
-    row_width,
-    chunk_size: tl.constexpr,
-    chunk_count: tl.constexpr,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-    gguf_quant_type: tl.constexpr,
-):
-    """Rotate and quantize a row held as one, two, or three equal chunks.
-
-    Keep every rotated chunk live until the shared row scale is known, avoiding
-    both recomputation and a global-memory intermediate.
-    """
-    row = tl.program_id(0)
-    row_i64 = row.to(tl.int64)
-    chunk_offsets = tl.arange(0, chunk_size)
-    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
-    input_row_offset = row_i64 * input_row_width
-    packed_row_offset = 0
-    if gguf_quant_type >= 0:
-        packed_row_offset = row_i64 * gguf_backend.packed_row_size(
-            row_width,
-            gguf_quant_type,
-        )
-    output_row_offset = row_i64 * row_width
-
-    values0 = _load_weight_chunk(
-        x_ptr,
-        input_row_offset,
-        packed_row_offset,
-        row_width,
-        0,
-        chunk_offsets,
-        chunk_size,
-        group_size,
-        inverse_sqrt_group,
-        logical_dtype_code,
-        activation_fn,
-        accelerator_backend,
-        gguf_quant_type,
-    )
-    row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
-    if chunk_count >= 2:
-        values1 = _load_weight_chunk(
-            x_ptr,
-            input_row_offset,
-            packed_row_offset,
-            row_width,
-            chunk_size,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            logical_dtype_code,
-            activation_fn,
-            accelerator_backend,
-            gguf_quant_type,
-        )
-        row_max = tl.maximum(
-            row_max,
-            tl.max(tl.abs(values1).to(tl.float32), axis=0),
-        )
-    if chunk_count >= 3:
-        values2 = _load_weight_chunk(
-            x_ptr,
-            input_row_offset,
-            packed_row_offset,
-            row_width,
-            2 * chunk_size,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            logical_dtype_code,
-            activation_fn,
-            accelerator_backend,
-            gguf_quant_type,
-        )
-        row_max = tl.maximum(
-            row_max,
-            tl.max(tl.abs(values2).to(tl.float32), axis=0),
-        )
-
-    scale = tl.maximum(row_max / 127.0, 1e-30)
-    _store_quantized_chunk(
-        q_ptr,
-        output_row_offset,
-        row_width,
-        0,
-        chunk_offsets,
-        values0,
-        scale,
-        logical_dtype_code,
-    )
-    if chunk_count >= 2:
-        _store_quantized_chunk(
-            q_ptr,
-            output_row_offset,
-            row_width,
-            chunk_size,
-            chunk_offsets,
-            values1,
-            scale,
-            logical_dtype_code,
-        )
-    if chunk_count >= 3:
-        _store_quantized_chunk(
-            q_ptr,
-            output_row_offset,
-            row_width,
-            2 * chunk_size,
-            chunk_offsets,
-            values2,
-            scale,
-            logical_dtype_code,
-        )
-    tl.store(scale_ptr + row_i64, scale)
-
-
 def quantize_input(
     rotated: torch.Tensor,
     input_qdata: torch.Tensor,
@@ -363,7 +162,9 @@ def fused_rotate_quantize_input(
             f"got {tuple(input.shape)}"
         )
     target = AcceleratorTarget.from_device(input.device) if target is None else target
-    fused_chunks = _policy.select_fused_preparation_chunks(target, k)
+    if not policy.supports_preparation_target(target):
+        raise ValueError(f"ConvRot INT8 preparation has no optimized policy for {target}")
+    fused_chunks = fused_preparation_chunks(k)
     if fused_chunks is None:
         raise ValueError(f"fused preparation does not support row width {k}")
     chunk_count, chunk_size = fused_chunks
@@ -384,58 +185,26 @@ def fused_rotate_quantize_input(
     )
 
 
-def _convert_gguf_out(
-    data: torch.Tensor,
-    quant_type: int,
-    group_size: int,
-    logical_dtype: torch.dtype,
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-) -> None:
-    """Decode packed GGUF rows through the existing ConvRot INT8 epilogue."""
-    rows, row_width = qdata.shape
-    target = AcceleratorTarget.from_device(data.device)
-    chunks = _policy.select_fused_preparation_chunks(target, row_width)
-    if chunks is None:
-        raise ValueError(f"fused GGUF conversion does not support row width {row_width}")
-    chunk_count, chunk_size = chunks
-    rotate_quantize_rows_kernel[(rows,)](
-        data,
-        qdata,
-        scale,
-        row_width,
-        chunk_size=chunk_size,
-        chunk_count=chunk_count,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
-        activation_fn=None,
-        accelerator_backend=target.backend,
-        gguf_quant_type=quant_type,
-        num_warps=4,
-    )
-
-
 def default_execution_plan(
     weight_qdata: torch.Tensor,
     *,
     target: AcceleratorTarget | None = None,
-) -> _policy.LinearExecutionPlan:
+) -> LinearExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
-    return _policy.select_execution_plan(
+    return policy.select_execution_plan(
         target,
         in_features=weight_qdata.shape[1],
     )
 
 
-def _prepare_input(
+def prepare_input_with_plan(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     in_features: int,
     group_size: int,
     *,
     activation_fn: str | None,
-    execution_plan: _policy.LinearExecutionPlan,
+    execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -457,7 +226,7 @@ def _prepare_input(
         result = out
     input_qdata = result[0].reshape(m, in_features)
     input_scale = result[1].reshape(m)
-    logical_dtype_code = dtype_code(input.dtype)
+    logical_dtype_code = convrot_backend.logical_dtype_code(input.dtype)
     if execution_plan.fuse_rotation_quantization:
         fused_rotate_quantize_input(
             input_2d,
@@ -472,7 +241,7 @@ def _prepare_input(
     else:
         transformed_input = apply_input_activation(input_2d, activation_fn)
         rotated = torch.empty_like(transformed_input)
-        rotate_input(
+        convrot_backend.rotate_input(
             transformed_input,
             rotated,
             group_size,
@@ -498,11 +267,11 @@ def _prepare_input_with_production_plan(
     """Prepare an ordinary or activated input under production policy."""
     in_features = input.shape[-1] // input_activation_width(activation_fn)
     target = AcceleratorTarget.from_device(input.device)
-    plan = _policy.select_execution_plan(
+    plan = policy.select_execution_plan(
         target,
         in_features=in_features,
     )
-    return _prepare_input(
+    return prepare_input_with_plan(
         input,
         in_features,
         group_size,
@@ -513,14 +282,14 @@ def _prepare_input_with_production_plan(
     )
 
 
-def _execute_prepared_linear(
+def execute_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     logical_dtype: torch.dtype,
-    execution_plan: _policy.LinearExecutionPlan,
+    execution_plan: LinearExecutionPlan,
     *,
     out: torch.Tensor | None = None,
     second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
@@ -568,7 +337,7 @@ def _execute_prepared_linear(
 
     def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
         grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
-        _int8_matmul_kernel[grid](
+        int8_matmul_kernel[grid](
             input_qdata_2d,
             weight_qdata,
             output,
@@ -620,7 +389,7 @@ def run_linear(
     group_size: int,
     *,
     activation_fn: str | None = None,
-    execution_plan: _policy.LinearExecutionPlan | None = None,
+    execution_plan: LinearExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input preparation and INT8 GEMM under one plan."""
     original_shape = input.shape
@@ -637,7 +406,7 @@ def run_linear(
         if execution_plan is not None
         else default_execution_plan(weight_qdata, target=target)
     )
-    input_qdata, input_scale = _prepare_input(
+    input_qdata, input_scale = prepare_input_with_plan(
         input,
         k,
         group_size,
@@ -645,7 +414,7 @@ def run_linear(
         execution_plan=plan,
         target=target,
     )
-    return _execute_prepared_linear(
+    return execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -771,7 +540,7 @@ def linear_prepared(
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
     plan = default_execution_plan(weight_qdata)
-    return _execute_prepared_linear(
+    return execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
