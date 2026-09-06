@@ -18,7 +18,7 @@ from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
 
-from .triton import _PreparedSparsePiperAttention
+from .._prepared import _PreparedSparsePiperAttention
 
 _BLOCK_M = 64
 _BLOCK_N = 64

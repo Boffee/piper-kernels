@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from ._routes import _ROUTING_NAME_BY_MODE, validate_routing_mode
 from ._routing import coarse_residual_impl
+from ._routing_modes import (
+    _ROUTING_NAME_BY_MODE,
+    validate_routing_mode,
+)
 from .coarse import validate_coarse_residual_inputs
 
 

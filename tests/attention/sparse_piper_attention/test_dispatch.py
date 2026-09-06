@@ -5,6 +5,7 @@ import torch
 
 import piper_kernels
 from piper_kernels import SparsePiperAttention
+from piper_kernels._triton.targets import AcceleratorTarget
 
 
 def _inputs(
@@ -96,7 +97,8 @@ def test_dense_query_suffix_bypasses_sparse_routes(
     sparse_query_blocks: int,
 ) -> None:
     if device == "cuda" and (
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
+        not torch.cuda.is_available()
+        or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
     ):
         pytest.skip("requires exact NVIDIA SM120")
     shape = (1, 3 * 64, 1, 128)
@@ -189,7 +191,8 @@ def test_internal_block_lengths_make_padded_values_unobservable(
     device: str,
 ) -> None:
     if device == "cuda" and (
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
+        not torch.cuda.is_available()
+        or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
     ):
         pytest.skip("requires exact NVIDIA SM120")
     query, key, value = _inputs(device=device)
@@ -250,7 +253,8 @@ def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_path_runs_and_writes_engine_layout() -> None:
@@ -267,7 +271,8 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None:
@@ -287,7 +292,8 @@ def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("sequence_length", [192, 193])
@@ -316,7 +322,8 @@ def test_sm120_custom_op_passes_opcheck(sequence_length: int) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize(
@@ -351,7 +358,8 @@ def test_sm120_matches_the_portable_quantized_reference(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("sequence_length", [64, 65, 127, 128, 129, 181, 191, 192, 193])
@@ -383,7 +391,8 @@ def test_sm120_ragged_lengths_match_the_portable_reference(sequence_length: int)
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_operator_is_opaque_to_a_full_compile_graph() -> None:
@@ -403,7 +412,8 @@ def test_operator_is_opaque_to_a_full_compile_graph() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_mean_pool_operator_is_opaque_to_a_full_compile_graph() -> None:

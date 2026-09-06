@@ -7,9 +7,9 @@ from collections.abc import Sequence
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
+from . import _backend
 from ._block_layout import validate_block_lengths, validate_sparse_query_blocks
 from ._budget import (
     _RATIO_SCALE,
@@ -17,26 +17,13 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
-from ._routes import _ROUTING_NAME_BY_MODE, routing_mode_from_name, validate_routing_mode
 from ._routing import packed_routes_from_sequences
+from ._routing_modes import (
+    _ROUTING_NAME_BY_MODE,
+    routing_mode_from_name,
+    validate_routing_mode,
+)
 from .reference import reference_sparse_piper_attention
-
-try:
-    from .gluon import (
-        _launch_sparse_piper_attention as _launch_sm120_attention,
-    )
-    from .triton import (
-        _prepare_sparse_piper_attention as _prepare_sm120_attention,
-    )
-except ModuleNotFoundError as exc:
-    if exc.name is None or not exc.name.startswith("triton"):
-        raise
-    _launch_sm120_attention = None
-    _prepare_sm120_attention = None
-
-
-def _supports_sm120(target: AcceleratorTarget) -> bool:
-    return _launch_sm120_attention is not None and target.is_cuda_capability(12, 0)
 
 
 class SparsePiperAttention(torch.nn.Module):
@@ -195,7 +182,6 @@ def _run_sparse_piper_attention(
     sparse_key_blocks: int,
     sparse_query_blocks: int | None,
     scale: float,
-    target_is_sm120: bool,
     routing_mode: int,
     block_lengths: torch.Tensor | None,
 ) -> torch.Tensor:
@@ -213,7 +199,8 @@ def _run_sparse_piper_attention(
         block_lengths,
     )
 
-    if not target_is_sm120:
+    backend = _backend.select_attention_backend(query)
+    if backend is None:
         return reference_sparse_piper_attention(
             query,
             key,
@@ -225,11 +212,9 @@ def _run_sparse_piper_attention(
             sparse_query_blocks=sparse_query_blocks,
         )
 
-    assert _launch_sm120_attention is not None
-    assert _prepare_sm120_attention is not None
     value_head_major = value.transpose(1, 2)
     output = torch.empty_like(query, memory_format=torch.contiguous_format)
-    prepared = _prepare_sm120_attention(
+    prepared = backend.prepare(
         query_head_major,
         routes.indices,
         routes.head_keep_blocks,
@@ -241,7 +226,7 @@ def _run_sparse_piper_attention(
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
     )
-    _launch_sm120_attention(prepared, output.transpose(1, 2))
+    backend.launch(prepared, output.transpose(1, 2))
     return output
 
 
@@ -262,7 +247,6 @@ def _sparse_piper_attention_op(
         sparse_key_blocks,
         query.device,
     )
-    target = AcceleratorTarget.from_device(query.device)
     return _run_sparse_piper_attention(
         query,
         key,
@@ -271,7 +255,6 @@ def _sparse_piper_attention_op(
         sparse_key_blocks=sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         scale=scale,
-        target_is_sm120=_supports_sm120(target),
         routing_mode=routing_mode,
         block_lengths=block_lengths,
     )

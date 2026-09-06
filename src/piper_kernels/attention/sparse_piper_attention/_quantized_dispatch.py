@@ -3,40 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
+from . import _backend
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
-from ._routes import validate_routing_mode
+from ._prepared import (
+    _prepare_sparse_piper_context_from_quantized,
+    _prepare_sparse_piper_query_from_quantized,
+    _PreparedSparsePiperAttention,
+    _PreparedSparsePiperContext,
+)
 from ._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_summaries,
 )
+from ._routing_modes import (
+    validate_routing_mode,
+)
 from .coarse import _resolve_coarse_key_blocks
-
-if TYPE_CHECKING:
-    from .triton import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
-
-try:
-    from .gluon import (
-        _launch_sparse_piper_attention as _launch_sm120_attention,
-    )
-    from .triton import (
-        _prepare_sparse_piper_context_from_quantized as _prepare_sm120_quantized_context,
-    )
-    from .triton import (
-        _prepare_sparse_piper_query_from_quantized as _prepare_sm120_quantized_query,
-    )
-    from .triton import (
-        _PreparedSparsePiperAttention,
-    )
-except ModuleNotFoundError as exc:
-    if exc.name is None or not exc.name.startswith("triton"):
-        raise
-    _launch_sm120_attention = None
-    _prepare_sm120_quantized_context = None
-    _prepare_sm120_quantized_query = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +56,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
 ) -> _PreparedQuantizedSparsePiperContext:
     """Prepare global K/V and routing state without requiring materialized Q."""
-    if _prepare_sm120_quantized_context is None:
-        raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
+    _backend.require_attention_backend(key)
     layout = _resolve_route_layout(
         tuple(head_keep_ratio_units),
         sparse_key_blocks,
@@ -93,7 +77,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
             available_coarse_key_blocks=block_mean.shape[2],
         )
         pooled_value = block_mean[:, :, :route_key_blocks]
-    kernel_context = _prepare_sm120_quantized_context(
+    kernel_context = _prepare_sparse_piper_context_from_quantized(
         key,
         key_scale,
         value,
@@ -127,8 +111,6 @@ def _prepare_quantized_sparse_piper_query(
     global_block_offset: int,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor | None]:
     """Route and prepare one compact Q chunk against global K/V state."""
-    if _prepare_sm120_quantized_query is None:
-        raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
     if context.pooled_value is None:
         routed = packed_routes_from_summaries(
             query_summary,
@@ -155,7 +137,7 @@ def _prepare_quantized_sparse_piper_query(
     return (
         _PreparedSparsePiperAttention(
             context=context.kernel_context,
-            query=_prepare_sm120_quantized_query(
+            query=_prepare_sparse_piper_query_from_quantized(
                 query,
                 query_scale,
                 routed.indices,
@@ -185,7 +167,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
 ) -> _PreparedSparsePiperAttention:
-    """Build the validated SM120 launch state for quantized sparse Piper."""
+    """Build validated shared launch state for quantized sparse Piper."""
     context = _prepare_quantized_sparse_piper_context(
         key,
         key_scale,
@@ -300,9 +282,8 @@ def _launch_quantized_sparse_piper_attention(
     coarse_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch a prepared quantized sparse-Piper query range."""
-    if _launch_sm120_attention is None:
-        raise RuntimeError("quantized-input sparse Piper SM120 implementation is unavailable")
-    _launch_sm120_attention(
+    backend = _backend.require_attention_backend(prepared.query.data)
+    backend.launch(
         prepared,
         output,
         query_block_offset=query_block_offset,

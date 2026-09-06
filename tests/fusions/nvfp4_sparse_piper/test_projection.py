@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._routes import (
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )

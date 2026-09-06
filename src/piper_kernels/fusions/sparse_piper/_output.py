@@ -13,7 +13,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM, TILE_R
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 
 if TYPE_CHECKING:
-    from piper_kernels.attention.sparse_piper_attention.triton import (
+    from piper_kernels.attention.sparse_piper_attention._prepared import (
         _PreparedSparsePiperAttention,
     )
 

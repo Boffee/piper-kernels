@@ -3,18 +3,21 @@
 import pytest
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._routes import (
-    _MEAN_ROUTING,
     PackedRouteAndCoarseBuilder,
 )
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_sequences,
     packed_routes_from_summaries,
+)
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MEAN_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
@@ -199,7 +202,8 @@ def test_route_and_coarse_builder_places_out_of_order_query_chunks_by_offset() -
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
 def test_sm120_padded_summaries_match_portable_valid_prefix_means() -> None:
