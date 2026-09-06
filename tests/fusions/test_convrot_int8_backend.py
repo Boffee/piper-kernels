@@ -64,7 +64,9 @@ def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(operation
     expected = reference.linear(
         torch.cat((up_result, gate_result), dim=-1), *down[:2], 16, down[2], activation_fn="swiglu"
     )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Chunked and full-batch CPU arithmetic can differ by FP32 roundoff.
+    # Numerical agreement is approximate; dispatch and storage checks below stay exact.
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-8)
     select.assert_called_once_with(value)
     chunks = (10 + chunk_rows - 1) // chunk_rows
     assert backend.prepare_input.call_count == backend.linear_prepared.call_count == 2 * chunks
