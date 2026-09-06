@@ -15,6 +15,7 @@ from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
 
 from .triton import _PreparedSparsePiperAttention
@@ -673,29 +674,30 @@ def _make_gluon_descriptors(
         )
     ):
         raise ValueError("paired Gluon routed Piper requires compatible Q and K/V storage")
-    return (
-        TensorDescriptor(
-            query,
-            [batch_heads * query_storage_sequence_length, _HEAD_DIM],
-            [_HEAD_DIM, 1],
-            [_BLOCK_M, _HEAD_DIM],
-            query_layout,
-        ),
-        TensorDescriptor(
-            key,
-            [batch_heads * storage_sequence_length, _HEAD_DIM],
-            [_HEAD_DIM, 1],
-            [_BLOCK_N, _HEAD_DIM],
-            key_layout,
-        ),
-        TensorDescriptor(
-            value,
-            [batch_heads * _HEAD_DIM, storage_sequence_length],
-            [storage_sequence_length, 1],
-            [_HEAD_DIM, _BLOCK_N],
-            value_layout,
-        ),
-    )
+    with device_context(query.device):
+        return (
+            TensorDescriptor(
+                query,
+                [batch_heads * query_storage_sequence_length, _HEAD_DIM],
+                [_HEAD_DIM, 1],
+                [_BLOCK_M, _HEAD_DIM],
+                query_layout,
+            ),
+            TensorDescriptor(
+                key,
+                [batch_heads * storage_sequence_length, _HEAD_DIM],
+                [_HEAD_DIM, 1],
+                [_BLOCK_N, _HEAD_DIM],
+                key_layout,
+            ),
+            TensorDescriptor(
+                value,
+                [batch_heads * _HEAD_DIM, storage_sequence_length],
+                [storage_sequence_length, 1],
+                [_HEAD_DIM, _BLOCK_N],
+                value_layout,
+            ),
+        )
 
 
 def _resolve_query_block_range(
@@ -810,63 +812,67 @@ def _launch_sparse_piper_attention(
             or coarse_gate.stride(-1) != 1
         ):
             raise ValueError("Gluon coarse gate must match the local attention output")
-    with torch.cuda.device(query.device):
+    with device_context(output.device):
         install_uint8_int8_dot_hook()
 
-    query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared)
-    routes = query_state.routes
-    route_head_offsets = context.route_head_offsets
-    stride_rb = routes.stride(0)
-    stride_rq = routes.stride(1)
-    stride_rr = routes.stride(2)
-    coarse_tensor = context.value_mean if coarse_output is None else coarse_output
-    gate_tensor = output if coarse_gate is None else coarse_gate
-    coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
-    gate_strides = (
-        (0, 0, 0)
-        if coarse_gate is None
-        else (
-            coarse_gate.stride(0),
-            coarse_gate.stride(2),
-            coarse_gate.stride(1),
+        query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared)
+        routes = query_state.routes
+        route_head_offsets = context.route_head_offsets
+        stride_rb = routes.stride(0)
+        stride_rq = routes.stride(1)
+        stride_rr = routes.stride(2)
+        coarse_tensor = context.value_mean if coarse_output is None else coarse_output
+        gate_tensor = output if coarse_gate is None else coarse_gate
+        coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
+        gate_strides = (
+            (0, 0, 0)
+            if coarse_gate is None
+            else (
+                coarse_gate.stride(0),
+                coarse_gate.stride(2),
+                coarse_gate.stride(1),
+            )
         )
-    )
-    _sparse_piper_attention_kernel[(resolved_query_block_count, heads, batch)](
-        query_desc,
-        key_desc,
-        value_desc,
-        query_state.scale,
-        context.key_scale,
-        context.value_scale_multiplier,
-        context.value_mean,
-        coarse_tensor,
-        gate_tensor,
-        (context.block_lengths if context.block_lengths is not None else context.head_keep_blocks),
-        routes,
-        context.head_keep_blocks,
-        route_head_offsets,
-        output,
-        query_block_offset,
-        global_query_block_offset,
-        query_storage_sequence_length,
-        storage_sequence_length,
-        logical_sequence_length,
-        context.sparse_key_blocks,
-        total_query_blocks if sparse_query_blocks is None else sparse_query_blocks,
-        stride_rb,
-        stride_rq,
-        stride_rr,
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        *coarse_strides,
-        *gate_strides,
-        heads,
-        has_block_lengths,
-        not has_block_lengths and logical_sequence_length != storage_sequence_length,
-        sparse_query_blocks is not None,
-        has_coarse_residual,
-        4,
-        num_warps=4,
-        num_stages=1,
-    )
+        _sparse_piper_attention_kernel[(resolved_query_block_count, heads, batch)](
+            query_desc,
+            key_desc,
+            value_desc,
+            query_state.scale,
+            context.key_scale,
+            context.value_scale_multiplier,
+            context.value_mean,
+            coarse_tensor,
+            gate_tensor,
+            (
+                context.block_lengths
+                if context.block_lengths is not None
+                else context.head_keep_blocks
+            ),
+            routes,
+            context.head_keep_blocks,
+            route_head_offsets,
+            output,
+            query_block_offset,
+            global_query_block_offset,
+            query_storage_sequence_length,
+            storage_sequence_length,
+            logical_sequence_length,
+            context.sparse_key_blocks,
+            total_query_blocks if sparse_query_blocks is None else sparse_query_blocks,
+            stride_rb,
+            stride_rq,
+            stride_rr,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            *coarse_strides,
+            *gate_strides,
+            heads,
+            has_block_lengths,
+            not has_block_lengths and logical_sequence_length != storage_sequence_length,
+            sparse_query_blocks is not None,
+            has_coarse_residual,
+            4,
+            num_warps=4,
+            num_stages=1,
+        )

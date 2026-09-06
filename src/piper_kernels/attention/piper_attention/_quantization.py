@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -150,47 +151,48 @@ def compute_kv_means(
         if not is_causal
         else torch.empty((1,), device=value.device, dtype=torch.float32)
     )
-    _kv_mean_partial_kernel[
-        (
+    with device_context(key.device):
+        _kv_mean_partial_kernel[
+            (
+                num_chunks,
+                int(triton.cdiv(head_dim, _MEAN_BLOCK_D)),
+                batch * heads,
+            )
+        ](
+            key,
+            value,
+            key_partial,
+            value_partial,
+            key_length,
             num_chunks,
-            int(triton.cdiv(head_dim, _MEAN_BLOCK_D)),
-            batch * heads,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            is_causal=is_causal,
+            heads=heads,
+            head_dim=head_dim,
+            chunk_n=_MEAN_CHUNK_N,
+            block_n=_MEAN_BLOCK_N,
+            block_d=_MEAN_BLOCK_D,
+            num_warps=4,
         )
-    ](
-        key,
-        value,
-        key_partial,
-        value_partial,
-        key_length,
-        num_chunks,
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        is_causal=is_causal,
-        heads=heads,
-        head_dim=head_dim,
-        chunk_n=_MEAN_CHUNK_N,
-        block_n=_MEAN_BLOCK_N,
-        block_d=_MEAN_BLOCK_D,
-        num_warps=4,
-    )
-    _kv_mean_finalize_kernel[(batch * heads, int(triton.cdiv(head_dim, _MEAN_BLOCK_D)))](
-        key_partial,
-        value_partial,
-        key_mean,
-        value_mean,
-        key_length,
-        num_chunks,
-        is_causal=is_causal,
-        head_dim=head_dim,
-        block_chunks=triton.next_power_of_2(num_chunks),
-        block_d=_MEAN_BLOCK_D,
-        num_warps=4,
-    )
-    return key_mean, value_mean
+        _kv_mean_finalize_kernel[(batch * heads, int(triton.cdiv(head_dim, _MEAN_BLOCK_D)))](
+            key_partial,
+            value_partial,
+            key_mean,
+            value_mean,
+            key_length,
+            num_chunks,
+            is_causal=is_causal,
+            head_dim=head_dim,
+            block_chunks=triton.next_power_of_2(num_chunks),
+            block_d=_MEAN_BLOCK_D,
+            num_warps=4,
+        )
+        return key_mean, value_mean
 
 
 @triton.jit

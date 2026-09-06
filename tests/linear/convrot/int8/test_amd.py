@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import (
@@ -18,6 +19,7 @@ from piper_kernels.linear.convrot import (
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -31,11 +33,12 @@ _gpu = pytest.mark.skipif(
 def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architecture):
     target = AcceleratorTarget("hip", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
     assert _backend.select_linear_backend(value) is amd
-    assert _backend.select_add(value) is amd.add_
-    assert _backend.select_addmm(value) is amd.addmm_
-    assert _backend.select_gguf_converter(value) is None
+    assert _backend.select_add(value) is _generic.add_
+    assert _backend.select_addmm(value) is _generic.addmm_
+    assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out
     assert _backend.select_dequantized_mean(value) is None
 
 
@@ -157,7 +160,7 @@ def test_amd_preparation_matches_split_and_populates_storage(dtype, width, activ
     plan = replace(
         amd.default_execution_plan(output[0].reshape(6, width)), fuse_rotation_quantization=False
     )
-    expected = amd._prepare_input(
+    expected = amd.prepare_input_with_plan(
         value,
         width,
         256,

@@ -187,8 +187,11 @@ allowlist; tuned preparation and GEMM policies remain accelerator-specific.
 AMD fused preparation supports widths through 16,384; larger widths use separate rotation
 and quantization. RDNA4 uses BF16 ragged-row chunks and its own measured GEMM schedule.
 FP32 reduction ordering and fused activations can differ from the reference at INT8 rounding
-boundaries. This integration does not enable ROCm GGUF conversion, dequantized-input means,
-specialized FFN/attention fusions, attention kernels, or NVFP4 kernels.
+boundaries. GGUF-to-INT8 conversion uses a shared fused decoding/rotation kernel, using
+fused rows through 8,192 columns on ROCm and bounded tiled conversion for wider rows,
+including on AMD targets without a tuned GEMM policy. This integration does
+not enable ROCm dequantized-input means, specialized FFN/attention fusions, attention kernels,
+or NVFP4 kernels.
 
 The repository's default `uv` development sources still select CUDA; use a separate
 ROCm environment rather than `uv sync` in that environment.
@@ -304,10 +307,15 @@ nvfp4_weight.copy_from_gguf_(
 )
 ```
 
-CUDA INT8 conversion and exact-SM120 NVFP4 conversion decode GGUF values in registers and feed
+CUDA/ROCm INT8 conversion and exact-SM120 NVFP4 conversion decode GGUF values in registers and feed
 the existing ConvRot quantization epilogues, so no dense weight is allocated. Computing an NVFP4
 global scale requires one row-amax pass and one packing pass. Unsupported devices fail closed
-instead of allocating a dense fallback: INT8 requires CUDA, while NVFP4 requires exact SM120.
+instead of allocating a dense fallback: INT8 requires a compatible Triton accelerator, while
+NVFP4 requires exact SM120. INT8 uses one shared fused converter across NVIDIA and AMD;
+NVIDIA retains its existing fused schedule through 49,152 columns. The wide-row fallback
+recomputes decoded/rotated tiles after reducing their maxima, retaining at most 1 MiB of
+temporary maxima or one row's maxima, whichever is larger. Existing output buffers can be
+refilled without replacing their storage.
 Piper Kernels does not parse GGUF files and does not require a GGUF parser at runtime; the caller
 owns file loading, tensor-name mapping, and the packed bytes plus quant-type metadata.
 

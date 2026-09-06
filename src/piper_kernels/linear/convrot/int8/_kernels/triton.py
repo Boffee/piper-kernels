@@ -8,6 +8,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from piper_kernels._triton.stochastic_quantization import stochastic_round_to_int
+from piper_kernels.gguf import triton as gguf_backend
+from piper_kernels.linear.convrot import triton as convrot_backend
 
 
 @triton.jit
@@ -92,7 +94,7 @@ def scaled_int8_matmul(
 
 
 @triton.jit
-def _normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
+def normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
     """Normalize values without dividing by an underflowed logical scale."""
     if logical_dtype_code == 1:
         logical_scale = scale.to(tl.float16)
@@ -112,8 +114,256 @@ def _normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
 @triton.jit
 def _quantize_int8(values, scale, logical_dtype_code: tl.constexpr):
     """Apply the shared deterministic rounding and saturation policy."""
-    scaled = _normalize_for_int8(values, scale, logical_dtype_code)
+    scaled = normalize_for_int8(values, scale, logical_dtype_code)
     return tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+
+
+@triton.jit
+def _store_quantized_chunk(
+    q_ptr,
+    output_row_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    values,
+    scale,
+    logical_dtype_code: tl.constexpr,
+):
+    offsets = chunk_start + chunk_offsets
+    quantized = _quantize_int8(values, scale, logical_dtype_code)
+    tl.store(
+        q_ptr + output_row_offset + offsets,
+        quantized,
+        mask=offsets < row_width,
+    )
+
+
+@triton.jit
+def _load_weight_chunk(
+    x_ptr,
+    input_row_offset,
+    packed_row_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    chunk_size: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    gguf_quant_type: tl.constexpr,
+):
+    if gguf_quant_type >= 0:
+        return gguf_backend.load_rotated_chunk(
+            x_ptr,
+            packed_row_offset,
+            row_width,
+            chunk_start,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            logical_dtype_code,
+            gguf_quant_type,
+        )
+    return convrot_backend.load_activated_rotated_chunk(
+        x_ptr,
+        input_row_offset,
+        row_width,
+        chunk_start,
+        chunk_offsets,
+        chunk_size,
+        group_size,
+        inverse_sqrt_group,
+        logical_dtype_code,
+        activation_fn,
+        accelerator_backend,
+    )
+
+
+@triton.jit
+def rotate_quantize_rows_kernel(
+    x_ptr,
+    q_ptr,
+    scale_ptr,
+    row_width,
+    chunk_size: tl.constexpr,
+    chunk_count: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    gguf_quant_type: tl.constexpr,
+):
+    """Rotate and quantize a row held as one, two, or three equal chunks.
+
+    Keep every rotated chunk live until the shared row scale is known, avoiding
+    both recomputation and a global-memory intermediate.
+    """
+    row = tl.program_id(0)
+    row_i64 = row.to(tl.int64)
+    chunk_offsets = tl.arange(0, chunk_size)
+    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
+    input_row_offset = row_i64 * input_row_width
+    packed_row_offset = 0
+    if gguf_quant_type >= 0:
+        packed_row_offset = row_i64 * gguf_backend.packed_row_size(
+            row_width,
+            gguf_quant_type,
+        )
+    output_row_offset = row_i64 * row_width
+
+    values0 = _load_weight_chunk(
+        x_ptr,
+        input_row_offset,
+        packed_row_offset,
+        row_width,
+        0,
+        chunk_offsets,
+        chunk_size,
+        group_size,
+        inverse_sqrt_group,
+        logical_dtype_code,
+        activation_fn,
+        accelerator_backend,
+        gguf_quant_type,
+    )
+    row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
+    if chunk_count >= 2:
+        values1 = _load_weight_chunk(
+            x_ptr,
+            input_row_offset,
+            packed_row_offset,
+            row_width,
+            chunk_size,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            logical_dtype_code,
+            activation_fn,
+            accelerator_backend,
+            gguf_quant_type,
+        )
+        row_max = tl.maximum(
+            row_max,
+            tl.max(tl.abs(values1).to(tl.float32), axis=0),
+        )
+    if chunk_count >= 3:
+        values2 = _load_weight_chunk(
+            x_ptr,
+            input_row_offset,
+            packed_row_offset,
+            row_width,
+            2 * chunk_size,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            logical_dtype_code,
+            activation_fn,
+            accelerator_backend,
+            gguf_quant_type,
+        )
+        row_max = tl.maximum(
+            row_max,
+            tl.max(tl.abs(values2).to(tl.float32), axis=0),
+        )
+
+    scale = tl.maximum(int8_scale_from_max(row_max, accelerator_backend == "hip"), 1e-30)
+    _store_quantized_chunk(
+        q_ptr,
+        output_row_offset,
+        row_width,
+        0,
+        chunk_offsets,
+        values0,
+        scale,
+        logical_dtype_code,
+    )
+    if chunk_count >= 2:
+        _store_quantized_chunk(
+            q_ptr,
+            output_row_offset,
+            row_width,
+            chunk_size,
+            chunk_offsets,
+            values1,
+            scale,
+            logical_dtype_code,
+        )
+    if chunk_count >= 3:
+        _store_quantized_chunk(
+            q_ptr,
+            output_row_offset,
+            row_width,
+            2 * chunk_size,
+            chunk_offsets,
+            values2,
+            scale,
+            logical_dtype_code,
+        )
+    tl.store(scale_ptr + row_i64, scale)
+
+
+@triton.jit
+def convert_gguf_tiles_kernel(
+    data_ptr,
+    q_ptr,
+    scale_ptr,
+    maxima_ptr,
+    row_width,
+    tiles_per_row,
+    block_size: tl.constexpr,
+    group_size: tl.constexpr,
+    logical_dtype_code: tl.constexpr,
+    quant_type: tl.constexpr,
+    write_maxima: tl.constexpr,
+):
+    """Decode/rotate twice, retaining only tile maxima between the two passes."""
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    offsets = tl.arange(0, block_size)
+    start = tile * block_size
+    row_bytes = gguf_backend.packed_row_size(row_width, quant_type)
+    tile_bytes = gguf_backend.packed_row_size(block_size, quant_type)
+    values = gguf_backend.load_rotated_chunk(
+        data_ptr,
+        row * row_bytes + tile.to(tl.int64) * tile_bytes,
+        row_width - start,
+        0,
+        offsets,
+        block_size,
+        group_size,
+        group_size**-0.5,
+        logical_dtype_code,
+        quant_type,
+    )
+    if write_maxima:
+        maximum = tl.max(tl.abs(values).to(tl.float32), axis=0)
+        tl.store(maxima_ptr + row * tiles_per_row + tile, maximum)
+    else:
+        scale = tl.load(scale_ptr + row)
+        quantized = _quantize_int8(values, scale, logical_dtype_code)
+        tl.store(q_ptr + row * row_width + start + offsets, quantized, start + offsets < row_width)
+
+
+@triton.jit
+def gguf_row_scales_kernel(
+    maxima_ptr,
+    scale_ptr,
+    tiles_per_row,
+    block_size: tl.constexpr,
+    reciprocal_scale: tl.constexpr,
+):
+    """Reduce decoded/rotated tile maxima to the weight's single scale per row."""
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, block_size)
+    maxima = tl.load(maxima_ptr + row * tiles_per_row + offsets, offsets < tiles_per_row, 0.0)
+    scale = tl.maximum(int8_scale_from_max(tl.max(maxima, axis=0), reciprocal_scale), 1e-30)
+    tl.store(scale_ptr + row, scale)
 
 
 @triton.jit
@@ -139,7 +389,7 @@ def quantize_rows_kernel(
 
 
 @triton.jit
-def _requantize_update_rows_kernel(
+def requantize_update_rows_kernel(
     q_ptr,
     scale_ptr,
     update_ptr,
@@ -210,7 +460,7 @@ def _requantize_update_rows_kernel(
 
 
 @triton.jit
-def _int8_matmul_kernel(
+def int8_matmul_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,

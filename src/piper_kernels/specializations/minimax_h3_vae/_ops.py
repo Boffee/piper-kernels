@@ -4,13 +4,14 @@ from dataclasses import replace
 
 import torch
 
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 
 
 def _execution_plan(
     weight_qdata: torch.Tensor,
     schedule: list[int],
-) -> convrot_int8_backend._policy.LinearExecutionPlan:
+) -> LinearExecutionPlan:
     if len(schedule) != 5:
         raise ValueError("H3 VAE ConvRot schedule must contain exactly five integers")
     block_m, block_n, block_k, num_warps, num_stages = schedule
@@ -38,7 +39,7 @@ def linear_prepared(
     schedule: list[int],
 ) -> torch.Tensor:
     """Apply one H3 VAE weight to an input prepared by ordinary ConvRot."""
-    return convrot_int8_backend._execute_prepared_linear(
+    return convrot_int8_backend.execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,

@@ -88,6 +88,8 @@ weight = ConvRotInt8Tensor.from_quantized(
 result = convrot_int8_linear(torch.ones(2, 32), weight)
 assert result.shape == (2, 7)
 assert _backend.select_linear_backend(torch.ones(1)) is None
+assert _backend._generic_backend is None
+assert _backend.select_gguf_converter(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert generic_dispatch._triton_backend is None

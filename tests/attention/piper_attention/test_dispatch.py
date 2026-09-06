@@ -60,7 +60,7 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         raise PreprocessingReachedError
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 0))
-    monkeypatch.setattr(torch.cuda, "device", DeviceGuard)
+    monkeypatch.setattr(piper_attention_backend, "device_context", DeviceGuard)
     monkeypatch.setattr(
         piper_attention_backend,
         "install_uint8_int8_dot_hook",
@@ -88,7 +88,7 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         )
 
     assert guarded_devices == [query.device]
-    assert events == ["device-enter", "hook", "device-exit", "preprocessing"]
+    assert events == ["device-enter", "hook", "preprocessing", "device-exit"]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int8])

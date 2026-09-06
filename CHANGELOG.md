@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Enabled direct GGUF-to-ConvRot-INT8 conversion and in-place refills on ROCm through
+  the shared fused Triton converter formerly owned by NVIDIA. Wider rows use tiled
+  conversion with bounded maxima storage; neither path allocates a dense weight or
+  requires a tuned INT8 GEMM target.
 - Added `add_` and `addmm_` adapter merges to plain `PiperNVFP4Tensor`, sharing validation,
   rounding, and packed-storage mutation behavior with ConvRot NVFP4.
 - Added fused Triton updates for plain and ConvRot NVFP4 on NVIDIA compute capability 10.0+.
@@ -21,7 +25,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   prepared/paired projections, dense and low-rank updates, and compiler preparation sharing.
   RX 9070 XT (`gfx1201`) has on-device validation; `gfx942`, `gfx1100`, `gfx1151`, and
   `gfx1200` have offline compiler coverage only. Unknown AMD architectures use the reference.
-  GGUF conversion, prepared-input means, specialized FFN/attention fusions, attention, and
+  Prepared-input means, specialized FFN/attention fusions, attention, and
   NVFP4 remain outside this ROCm integration.
 
 ### Changed

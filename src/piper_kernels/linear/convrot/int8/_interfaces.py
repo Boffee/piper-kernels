@@ -25,6 +25,9 @@ class PreparationBackend(Protocol):
 class LinearBackend(PreparationBackend, Protocol):
     """A compatible linear, preparation, and projection implementation.
 
+    Backends own target inspection and launch-plan selection. Ordinary callers
+    supply mathematical operands and optional buffers, not execution plans.
+
     Prepared inputs contain contiguous INT8 data of shape ``[..., K]`` and FP32
     row scales of shape ``[...]``. Preparation depends on input width, dtype,
     group size, and activation, never on the consuming weight or output width.

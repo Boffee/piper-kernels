@@ -10,6 +10,7 @@ from triton.compiler import ASTSource
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -23,7 +24,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture):
         else 0
     )
     source = ASTSource(
-        amd._int8_matmul_kernel,
+        kernels.int8_matmul_kernel,
         {
             "input_ptr": "*i8",
             "weight_ptr": "*i8",

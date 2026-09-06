@@ -14,6 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
@@ -239,55 +240,57 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else query_scale
 
-    def launch(row_block_count: int, *, mask_ragged_tail: bool) -> None:
-        _convrot_project_rmsnorm_rope_quantize_query_kernel[
-            (row_block_count, triton.cdiv(heads, _HEADS_PER_PROGRAM), batch)
-        ](
-            input_qdata,
-            input_scale,
-            weight_qdata,
-            weight_scale,
-            norm_weight,
-            cos,
-            sin,
-            query,
-            query_scale,
-            query_summary,
-            block_lengths_ptr,
-            batch * sequence_length,
-            chunk_start,
-            chunk_rows,
-            sequence_length,
-            chunk_start + chunk_rows,
-            storage_sequence_length,
-            input_features=input_qdata.shape[2],
-            heads=heads,
-            heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=HEAD_DIM,
-            rotary_dim=rotary_dim,
-            norm_epsilon=norm_epsilon,
-            softmax_scale=softmax_scale,
-            mean_pool_summary=routing_mode == _MEAN_ROUTING,
-            mask_block_lengths=has_block_lengths,
-            mask_ragged_tail=mask_ragged_tail,
-            aligned_projection=(
-                not mask_ragged_tail
-                and input_qdata.shape[2] % _BLOCK_K == 0
-                and heads % _HEADS_PER_PROGRAM == 0
-            ),
-            block_m=_BLOCK_M,
-            block_n=_BLOCK_N,
-            block_k=_BLOCK_K,
-            num_warps=8,
-            num_stages=3,
-        )
+    with device_context(input_qdata.device):
 
-    full_row_blocks = chunk_rows // _BLOCK_M
-    if full_row_blocks:
-        launch(full_row_blocks, mask_ragged_tail=False)
-    if chunk_rows % _BLOCK_M:
-        launch(1, mask_ragged_tail=True)
-    return query, query_scale, query_summary
+        def launch(row_block_count: int, *, mask_ragged_tail: bool) -> None:
+            _convrot_project_rmsnorm_rope_quantize_query_kernel[
+                (row_block_count, triton.cdiv(heads, _HEADS_PER_PROGRAM), batch)
+            ](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                norm_weight,
+                cos,
+                sin,
+                query,
+                query_scale,
+                query_summary,
+                block_lengths_ptr,
+                batch * sequence_length,
+                chunk_start,
+                chunk_rows,
+                sequence_length,
+                chunk_start + chunk_rows,
+                storage_sequence_length,
+                input_features=input_qdata.shape[2],
+                heads=heads,
+                heads_per_program=_HEADS_PER_PROGRAM,
+                head_dim=HEAD_DIM,
+                rotary_dim=rotary_dim,
+                norm_epsilon=norm_epsilon,
+                softmax_scale=softmax_scale,
+                mean_pool_summary=routing_mode == _MEAN_ROUTING,
+                mask_block_lengths=has_block_lengths,
+                mask_ragged_tail=mask_ragged_tail,
+                aligned_projection=(
+                    not mask_ragged_tail
+                    and input_qdata.shape[2] % _BLOCK_K == 0
+                    and heads % _HEADS_PER_PROGRAM == 0
+                ),
+                block_m=_BLOCK_M,
+                block_n=_BLOCK_N,
+                block_k=_BLOCK_K,
+                num_warps=8,
+                num_stages=3,
+            )
+
+        full_row_blocks = chunk_rows // _BLOCK_M
+        if full_row_blocks:
+            launch(full_row_blocks, mask_ragged_tail=False)
+        if chunk_rows % _BLOCK_M:
+            launch(1, mask_ragged_tail=True)
+        return query, query_scale, query_summary
 
 
 def _launch_query_projection(  # noqa: PLR0913, PLR0917

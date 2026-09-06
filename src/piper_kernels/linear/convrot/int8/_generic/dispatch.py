@@ -2,6 +2,7 @@
 
 import torch
 
+from piper_kernels._triton import runtime
 from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot._rotation import validate_group_size
 
@@ -22,7 +23,7 @@ def _use_triton(value: torch.Tensor) -> bool:
         _triton_backend is not None
         and value.numel() != 0
         and value.shape[-1] <= 16384
-        and _triton_backend.supports_device(value.device)
+        and runtime.supports_device(value.device)
     )
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
@@ -359,47 +360,49 @@ def launch_query(  # noqa: PLR0913, PLR0917
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else query_scale
 
-    def launch(row_blocks: int, row_block_offset: int, *, ragged: bool) -> None:
-        _query_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
-            projection,
-            input_per_tensor_scale,
-            weight_per_tensor_scale,
-            bias,
-            norm_weight,
-            cos,
-            sin,
-            query,
-            query_scale,
-            query_summary,
-            block_lengths_ptr,
-            chunk_rows,
-            chunk_start,
-            chunk_start + chunk_rows,
-            storage_sequence_length,
-            storage_chunk_start,
-            row_block_offset,
-            0,
-            output_features=output_features,
-            has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
-            has_bias=bias is not None,
-            heads=heads,
-            heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=HEAD_DIM,
-            rotary_dim=cos.shape[1],
-            norm_epsilon=norm_epsilon,
-            softmax_scale=softmax_scale,
-            mean_pool_summary=mean_pool_summary,
-            mask_block_lengths=has_block_lengths,
-            mask_ragged_tail=ragged,
-            block_m=_QUERY_BLOCK_M,
-            num_warps=8,
-        )
+    with device_context(projection.device):
 
-    full_blocks = chunk_rows // _QUERY_BLOCK_M
-    if full_blocks:
-        launch(full_blocks, 0, ragged=False)
-    if chunk_rows % _QUERY_BLOCK_M:
-        launch(1, full_blocks, ragged=True)
+        def launch(row_blocks: int, row_block_offset: int, *, ragged: bool) -> None:
+            _query_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
+                projection,
+                input_per_tensor_scale,
+                weight_per_tensor_scale,
+                bias,
+                norm_weight,
+                cos,
+                sin,
+                query,
+                query_scale,
+                query_summary,
+                block_lengths_ptr,
+                chunk_rows,
+                chunk_start,
+                chunk_start + chunk_rows,
+                storage_sequence_length,
+                storage_chunk_start,
+                row_block_offset,
+                0,
+                output_features=output_features,
+                has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+                has_bias=bias is not None,
+                heads=heads,
+                heads_per_program=_HEADS_PER_PROGRAM,
+                head_dim=HEAD_DIM,
+                rotary_dim=cos.shape[1],
+                norm_epsilon=norm_epsilon,
+                softmax_scale=softmax_scale,
+                mean_pool_summary=mean_pool_summary,
+                mask_block_lengths=has_block_lengths,
+                mask_ragged_tail=ragged,
+                block_m=_QUERY_BLOCK_M,
+                num_warps=8,
+            )
+
+        full_blocks = chunk_rows // _QUERY_BLOCK_M
+        if full_blocks:
+            launch(full_blocks, 0, ragged=False)
+        if chunk_rows % _QUERY_BLOCK_M:
+            launch(1, full_blocks, ragged=True)
 
 
 def launch_key(  # noqa: PLR0913, PLR0917
@@ -426,46 +429,48 @@ def launch_key(  # noqa: PLR0913, PLR0917
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else key_scale
 
-    def launch(row_blocks: int, row_block_offset: int, *, ragged: bool) -> None:
-        _key_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
-            projection,
-            input_per_tensor_scale,
-            weight_per_tensor_scale,
-            bias,
-            norm_weight,
-            cos,
-            sin,
-            key,
-            key_scale,
-            key_summary,
-            key_aux,
-            block_lengths_ptr,
-            chunk_rows,
-            chunk_start,
-            logical_sequence_length,
-            storage_sequence_length,
-            row_block_offset,
-            0,
-            output_features=output_features,
-            has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
-            has_bias=bias is not None,
-            heads=heads,
-            heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=HEAD_DIM,
-            rotary_dim=cos.shape[1],
-            norm_epsilon=norm_epsilon,
-            mean_pool_summary=mean_pool_summary,
-            mask_block_lengths=has_block_lengths,
-            mask_ragged_tail=ragged,
-            block_m=_KEY_VALUE_BLOCK_M,
-            num_warps=8,
-        )
+    with device_context(projection.device):
 
-    full_blocks = chunk_rows // _KEY_VALUE_BLOCK_M
-    if full_blocks:
-        launch(full_blocks, 0, ragged=False)
-    if chunk_rows % _KEY_VALUE_BLOCK_M:
-        launch(1, full_blocks, ragged=True)
+        def launch(row_blocks: int, row_block_offset: int, *, ragged: bool) -> None:
+            _key_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
+                projection,
+                input_per_tensor_scale,
+                weight_per_tensor_scale,
+                bias,
+                norm_weight,
+                cos,
+                sin,
+                key,
+                key_scale,
+                key_summary,
+                key_aux,
+                block_lengths_ptr,
+                chunk_rows,
+                chunk_start,
+                logical_sequence_length,
+                storage_sequence_length,
+                row_block_offset,
+                0,
+                output_features=output_features,
+                has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+                has_bias=bias is not None,
+                heads=heads,
+                heads_per_program=_HEADS_PER_PROGRAM,
+                head_dim=HEAD_DIM,
+                rotary_dim=cos.shape[1],
+                norm_epsilon=norm_epsilon,
+                mean_pool_summary=mean_pool_summary,
+                mask_block_lengths=has_block_lengths,
+                mask_ragged_tail=ragged,
+                block_m=_KEY_VALUE_BLOCK_M,
+                num_warps=8,
+            )
+
+        full_blocks = chunk_rows // _KEY_VALUE_BLOCK_M
+        if full_blocks:
+            launch(full_blocks, 0, ragged=False)
+        if chunk_rows % _KEY_VALUE_BLOCK_M:
+            launch(1, full_blocks, ragged=True)
 
 
 def launch_value(  # noqa: PLR0913, PLR0917
@@ -489,40 +494,42 @@ def launch_value(  # noqa: PLR0913, PLR0917
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else value_mean
 
-    def launch(row_blocks: int, row_block_offset: int) -> None:
-        _value_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
-            projection,
-            input_per_tensor_scale,
-            weight_per_tensor_scale,
-            bias,
-            value_mean,
-            value,
-            value_scale,
-            block_mean,
-            block_lengths_ptr,
-            chunk_rows,
-            chunk_start,
-            logical_sequence_length,
-            storage_sequence_length,
-            row_block_offset,
-            0,
-            output_features=output_features,
-            has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
-            has_bias=bias is not None,
-            heads=heads,
-            heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=HEAD_DIM,
-            mask_block_lengths=has_block_lengths,
-            emit_block_mean=emit_block_mean,
-            block_m=_KEY_VALUE_BLOCK_M,
-            num_warps=8,
-        )
+    with device_context(projection.device):
 
-    full_blocks = chunk_rows // _KEY_VALUE_BLOCK_M
-    if full_blocks:
-        launch(full_blocks, 0)
-    if chunk_rows % _KEY_VALUE_BLOCK_M:
-        launch(1, full_blocks)
+        def launch(row_blocks: int, row_block_offset: int) -> None:
+            _value_epilogue_kernel[(row_blocks, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
+                projection,
+                input_per_tensor_scale,
+                weight_per_tensor_scale,
+                bias,
+                value_mean,
+                value,
+                value_scale,
+                block_mean,
+                block_lengths_ptr,
+                chunk_rows,
+                chunk_start,
+                logical_sequence_length,
+                storage_sequence_length,
+                row_block_offset,
+                0,
+                output_features=output_features,
+                has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+                has_bias=bias is not None,
+                heads=heads,
+                heads_per_program=_HEADS_PER_PROGRAM,
+                head_dim=HEAD_DIM,
+                mask_block_lengths=has_block_lengths,
+                emit_block_mean=emit_block_mean,
+                block_m=_KEY_VALUE_BLOCK_M,
+                num_warps=8,
+            )
+
+        full_blocks = chunk_rows // _KEY_VALUE_BLOCK_M
+        if full_blocks:
+            launch(full_blocks, 0)
+        if chunk_rows % _KEY_VALUE_BLOCK_M:
+            launch(1, full_blocks)
 
 
 __all__ = ["launch_key", "launch_query", "launch_value"]

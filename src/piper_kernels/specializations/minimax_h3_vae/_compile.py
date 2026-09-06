@@ -15,7 +15,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx as convrot_int8_compile_fx
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
 
 from . import _ops
 

@@ -6,10 +6,10 @@ import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia.policy import NvidiaExecutionPlan
+from piper_kernels.linear.convrot.int8._plan import fused_preparation_chunks
 from piper_kernels.linear.convrot.int8._policy import (
     LinearExecutionPlan,
     select_execution_plan,
-    select_fused_preparation_chunks,
 )
 
 _SM120 = AcceleratorTarget("cuda", "sm120")
@@ -52,9 +52,6 @@ def test_supported_nvidia_targets_keep_the_existing_schedule(architecture, in_fe
     assert select_execution_plan(target, in_features=in_features) == select_execution_plan(
         _SM120, in_features=in_features
     )
-    assert select_fused_preparation_chunks(target, in_features) == select_fused_preparation_chunks(
-        _SM120, in_features
-    )
 
 
 @pytest.mark.parametrize(
@@ -71,16 +68,6 @@ def test_supported_nvidia_targets_keep_the_existing_schedule(architecture, in_fe
 def test_execution_planning_rejects_unsupported_targets(target):
     with pytest.raises(ValueError, match="no optimized policy"):
         select_execution_plan(target, in_features=512)
-
-
-def test_preparation_does_not_require_linear_matrix_instructions():
-    assert select_fused_preparation_chunks(AcceleratorTarget("cuda", "sm70"), 512) == (1, 512)
-
-
-@pytest.mark.parametrize("backend", ["cpu", "meta", "hip"])
-def test_preparation_does_not_select_a_nvidia_layout_for_other_backends(backend):
-    with pytest.raises(ValueError, match="no optimized policy"):
-        select_fused_preparation_chunks(AcceleratorTarget(backend), 512)
 
 
 @pytest.mark.parametrize(
@@ -139,7 +126,7 @@ def test_fused_preparation_selects_low_padding_equal_chunks(
     in_features: int,
     expected_chunks: tuple[int, int] | None,
 ) -> None:
-    assert select_fused_preparation_chunks(_SM120, in_features) == expected_chunks
+    assert fused_preparation_chunks(in_features) == expected_chunks
 
 
 def test_execution_plan_uses_uniform_mid_size_fused_launch_schedule() -> None:

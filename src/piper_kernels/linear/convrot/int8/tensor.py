@@ -115,9 +115,9 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         """Decode packed GGUF storage directly into ConvRot INT8 storage.
 
         ``quant_type`` may be omitted when ``data`` exposes a ``quant_type``
-        attribute, as piper-offload's GGUF tensor wrapper does. CUDA conversion
-        fuses GGUF decoding, grouped rotation, and rowwise INT8 quantization
-        without allocating a dense weight.
+        attribute, as piper-offload's GGUF tensor wrapper does. Triton conversion
+        combines GGUF decoding, grouped rotation, and rowwise INT8 quantization
+        without allocating a dense weight, including on ROCm.
         """
         from ._gguf import convert  # noqa: PLC0415
 

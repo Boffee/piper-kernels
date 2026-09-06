@@ -10,26 +10,23 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation, input_activation_width
 from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 from piper_kernels.linear.convrot import triton as convrot_backend
 
-from .._generic import add_ as add_  # noqa: PLC0414 - preserve backend imports
-from .._generic import addmm_ as addmm_  # noqa: PLC0414
 from .._kernels.triton import (
-    _int8_matmul_kernel,
-    _normalize_for_int8,
+    int8_matmul_kernel,
     int8_scale_from_max,
+    normalize_for_int8,
     quantize_rows_kernel,
 )
-from . import policy as _policy
+from .._plan import LinearExecutionPlan
+from . import policy
 
 # Smaller row groups improve cache reuse at the validated large/wide RDNA4 shapes.
 _LARGE_MATMUL_GROUP_M_TILES = 8
-dtype_code = convrot_backend.logical_dtype_code
-rotate_input = convrot_backend.rotate_input
-_rotate_hadamard_groups = convrot_backend.rotate_hadamard_groups
 
 
 @triton.jit
@@ -47,7 +44,7 @@ def _normalize_rotated_values(
     scale = tl.maximum(
         int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), True), 1e-30
     )
-    return _normalize_for_int8(values, scale, logical_dtype_code), scale
+    return normalize_for_int8(values, scale, logical_dtype_code), scale
 
 
 @triton.jit
@@ -79,7 +76,7 @@ def _normalize_rotated_values_amd_wide(
         inverse_sqrt_group,
     )
     scale = normalization_scale * inverse_sqrt_group
-    return _normalize_for_int8(values, normalization_scale, logical_dtype_code), scale
+    return normalize_for_int8(values, normalization_scale, logical_dtype_code), scale
 
 
 @triton.jit
@@ -125,7 +122,7 @@ def rotate_quantize_rows_kernel(
         if activation_fn == "gelu_tanh":
             values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
 
-    values = _rotate_hadamard_groups(values, block_size, group_size)
+    values = convrot_backend.rotate_hadamard_groups(values, block_size, group_size)
     if accelerator_backend != "hip" or logical_dtype_code == 1 or block_size <= 8_192:
         scaled, scale = _normalize_rotated_values(
             values,
@@ -208,7 +205,7 @@ def rotate_quantize_rows_chunked_kernel(
         activation_fn,
         accelerator_backend,
     )
-    values0 = _rotate_hadamard_groups(values0, block0, group_size).to(tl.bfloat16)
+    values0 = convrot_backend.rotate_hadamard_groups(values0, block0, group_size).to(tl.bfloat16)
     max0 = tl.max(tl.abs(values0).to(tl.float32), axis=0)
 
     offsets1 = block0 + tl.arange(0, block1)
@@ -223,7 +220,7 @@ def rotate_quantize_rows_chunked_kernel(
         activation_fn,
         accelerator_backend,
     )
-    values1 = _rotate_hadamard_groups(values1, block1, group_size).to(tl.bfloat16)
+    values1 = convrot_backend.rotate_hadamard_groups(values1, block1, group_size).to(tl.bfloat16)
     max1 = tl.max(tl.abs(values1).to(tl.float32), axis=0)
     absolute_max = tl.maximum(max0, max1)
 
@@ -240,7 +237,9 @@ def rotate_quantize_rows_chunked_kernel(
             activation_fn,
             accelerator_backend,
         )
-        values2 = _rotate_hadamard_groups(values2, block2, group_size).to(tl.bfloat16)
+        values2 = convrot_backend.rotate_hadamard_groups(values2, block2, group_size).to(
+            tl.bfloat16
+        )
         max2 = tl.max(tl.abs(values2).to(tl.float32), axis=0)
         absolute_max = tl.maximum(absolute_max, max2)
 
@@ -253,14 +252,14 @@ def rotate_quantize_rows_chunked_kernel(
     )
     quantized0 = tl.clamp(
         libdevice.rint(
-            _normalize_for_int8(values0, normalization_scale, logical_dtype_code).to(tl.float32)
+            normalize_for_int8(values0, normalization_scale, logical_dtype_code).to(tl.float32)
         ),
         -128.0,
         127.0,
     ).to(tl.int8)
     quantized1 = tl.clamp(
         libdevice.rint(
-            _normalize_for_int8(values1, normalization_scale, logical_dtype_code).to(tl.float32)
+            normalize_for_int8(values1, normalization_scale, logical_dtype_code).to(tl.float32)
         ),
         -128.0,
         127.0,
@@ -270,7 +269,7 @@ def rotate_quantize_rows_chunked_kernel(
     if block2:
         quantized2 = tl.clamp(
             libdevice.rint(
-                _normalize_for_int8(values2, normalization_scale, logical_dtype_code).to(tl.float32)
+                normalize_for_int8(values2, normalization_scale, logical_dtype_code).to(tl.float32)
             ),
             -128.0,
             127.0,
@@ -300,21 +299,22 @@ def _launch_amd_chunked_preparation(
 ) -> None:
     """Launch AMD's chunked fused rotation and quantization path."""
     m, k = input_qdata.shape
-    rotate_quantize_rows_chunked_kernel[(m,)](
-        input,
-        input_qdata,
-        input_scale,
-        k,
-        block0=blocks[0],
-        block1=blocks[1],
-        block2=blocks[2],
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=logical_dtype_code,
-        activation_fn=activation_fn,
-        accelerator_backend="hip",
-        num_warps=num_warps,
-    )
+    with device_context(input.device):
+        rotate_quantize_rows_chunked_kernel[(m,)](
+            input,
+            input_qdata,
+            input_scale,
+            k,
+            block0=blocks[0],
+            block1=blocks[1],
+            block2=blocks[2],
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=logical_dtype_code,
+            activation_fn=activation_fn,
+            accelerator_backend="hip",
+            num_warps=num_warps,
+        )
 
 
 def _launch_full_row_preparation(
@@ -329,19 +329,20 @@ def _launch_full_row_preparation(
 ) -> None:
     """Launch the shared full-row fused rotation and quantization path."""
     m, k = input_qdata.shape
-    rotate_quantize_rows_kernel[(m,)](
-        input,
-        input_qdata,
-        input_scale,
-        k,
-        block_size=max(128, triton.next_power_of_2(k)),
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=logical_dtype_code,
-        activation_fn=activation_fn,
-        accelerator_backend=target.backend,
-        num_warps=num_warps,
-    )
+    with device_context(input.device):
+        rotate_quantize_rows_kernel[(m,)](
+            input,
+            input_qdata,
+            input_scale,
+            k,
+            block_size=max(128, triton.next_power_of_2(k)),
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=logical_dtype_code,
+            activation_fn=activation_fn,
+            accelerator_backend=target.backend,
+            num_warps=num_warps,
+        )
 
 
 def fused_rotate_quantize_input(
@@ -373,9 +374,9 @@ def fused_rotate_quantize_input(
             f"got {tuple(input.shape)}"
         )
     target = AcceleratorTarget.from_device(input.device) if target is None else target
-    if not _policy.select_execution_plan(target, in_features=k).fuse_rotation_quantization:
+    if not policy.select_execution_plan(target, in_features=k).fuse_rotation_quantization:
         raise ValueError(f"fused preparation does not support row width {k}")
-    blocks = _policy.preparation_blocks(k)
+    blocks = policy.preparation_blocks(k)
     if _uses_amd_chunked_preparation(target, logical_dtype_code, blocks):
         _launch_amd_chunked_preparation(
             input,
@@ -429,38 +430,39 @@ def quantize_input(
 ) -> None:
     """Apply the portable split-path rowwise quantization."""
     m, k = rotated.shape
-    quantize_rows_kernel[(m,)](
-        rotated,
-        input_qdata,
-        input_scale,
-        k,
-        block_size=max(128, triton.next_power_of_2(k)),
-        logical_dtype_code=logical_dtype_code,
-        reciprocal_scale=True,
-        num_warps=num_warps,
-    )
+    with device_context(rotated.device):
+        quantize_rows_kernel[(m,)](
+            rotated,
+            input_qdata,
+            input_scale,
+            k,
+            block_size=max(128, triton.next_power_of_2(k)),
+            logical_dtype_code=logical_dtype_code,
+            reciprocal_scale=True,
+            num_warps=num_warps,
+        )
 
 
 def default_execution_plan(
     weight_qdata: torch.Tensor,
     *,
     target: AcceleratorTarget | None = None,
-) -> _policy.LinearExecutionPlan:
+) -> LinearExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
-    return _policy.select_execution_plan(
+    return policy.select_execution_plan(
         target,
         in_features=weight_qdata.shape[1],
     )
 
 
-def _prepare_input(
+def prepare_input_with_plan(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     in_features: int,
     group_size: int,
     *,
     activation_fn: str | None,
-    execution_plan: _policy.LinearExecutionPlan,
+    execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -482,7 +484,7 @@ def _prepare_input(
         result = out
     input_qdata = result[0].reshape(m, in_features)
     input_scale = result[1].reshape(m)
-    logical_dtype_code = dtype_code(input.dtype)
+    logical_dtype_code = convrot_backend.logical_dtype_code(input.dtype)
     if execution_plan.fuse_rotation_quantization:
         fused_rotate_quantize_input(
             input_2d,
@@ -497,7 +499,7 @@ def _prepare_input(
     else:
         transformed_input = apply_input_activation(input_2d, activation_fn)
         rotated = torch.empty_like(transformed_input)
-        rotate_input(
+        convrot_backend.rotate_input(
             transformed_input,
             rotated,
             group_size,
@@ -523,11 +525,11 @@ def _prepare_input_with_production_plan(
     """Prepare an ordinary or activated input under production policy."""
     in_features = input.shape[-1] // input_activation_width(activation_fn)
     target = AcceleratorTarget.from_device(input.device)
-    plan = _policy.select_execution_plan(
+    plan = policy.select_execution_plan(
         target,
         in_features=in_features,
     )
-    return _prepare_input(
+    return prepare_input_with_plan(
         input,
         in_features,
         group_size,
@@ -538,14 +540,14 @@ def _prepare_input_with_production_plan(
     )
 
 
-def _execute_prepared_linear(
+def execute_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     logical_dtype: torch.dtype,
-    execution_plan: _policy.LinearExecutionPlan,
+    execution_plan: LinearExecutionPlan,
     *,
     out: torch.Tensor | None = None,
     second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
@@ -594,51 +596,53 @@ def _execute_prepared_linear(
     )
     bias_pointer = bias if bias is not None else output
 
-    def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
-        grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
-        _int8_matmul_kernel[grid](
-            input_qdata_2d,
-            weight_qdata,
-            output,
-            input_scale_1d,
-            weight_scale,
-            bias_pointer,
-            second_weight,
-            second_scale,
-            second_bias if second_bias is not None else output,
-            m,
-            n,
-            k,
-            output.stride(0),
-            row_block_offset,
-            block_m=plan.matmul_block_m,
-            block_n=plan.matmul_block_n,
-            block_k=plan.matmul_block_k,
-            has_bias=bias is not None,
-            paired=paired,
-            second_has_bias=second_bias is not None,
-            aligned_tiles=aligned_m
-            and (n % plan.matmul_block_n == 0)
-            and (k % plan.matmul_block_k == 0),
-            group_m=group_m,
-            **compiler_options,
-            num_stages=plan.matmul_num_stages,
-            num_warps=plan.matmul_num_warps,
-        )
+    with device_context(input_qdata.device):
 
-    full_row_blocks = m // plan.matmul_block_m
-    if group_m:
-        if full_row_blocks:
-            launch_tiles(full_row_blocks, 0, aligned_m=True)
-        if m % plan.matmul_block_m:
-            launch_tiles(1, full_row_blocks, aligned_m=False)
-    else:
-        launch_tiles(
-            (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
-            0,
-            aligned_m=False,
-        )
-    return result
+        def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
+            grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+            int8_matmul_kernel[grid](
+                input_qdata_2d,
+                weight_qdata,
+                output,
+                input_scale_1d,
+                weight_scale,
+                bias_pointer,
+                second_weight,
+                second_scale,
+                second_bias if second_bias is not None else output,
+                m,
+                n,
+                k,
+                output.stride(0),
+                row_block_offset,
+                block_m=plan.matmul_block_m,
+                block_n=plan.matmul_block_n,
+                block_k=plan.matmul_block_k,
+                has_bias=bias is not None,
+                paired=paired,
+                second_has_bias=second_bias is not None,
+                aligned_tiles=aligned_m
+                and (n % plan.matmul_block_n == 0)
+                and (k % plan.matmul_block_k == 0),
+                group_m=group_m,
+                **compiler_options,
+                num_stages=plan.matmul_num_stages,
+                num_warps=plan.matmul_num_warps,
+            )
+
+        full_row_blocks = m // plan.matmul_block_m
+        if group_m:
+            if full_row_blocks:
+                launch_tiles(full_row_blocks, 0, aligned_m=True)
+            if m % plan.matmul_block_m:
+                launch_tiles(1, full_row_blocks, aligned_m=False)
+        else:
+            launch_tiles(
+                (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
+                0,
+                aligned_m=False,
+            )
+        return result
 
 
 def run_linear(
@@ -649,7 +653,7 @@ def run_linear(
     group_size: int,
     *,
     activation_fn: str | None = None,
-    execution_plan: _policy.LinearExecutionPlan | None = None,
+    execution_plan: LinearExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input preparation and INT8 GEMM under one plan."""
     original_shape = input.shape
@@ -666,7 +670,7 @@ def run_linear(
         if execution_plan is not None
         else default_execution_plan(weight_qdata, target=target)
     )
-    input_qdata, input_scale = _prepare_input(
+    input_qdata, input_scale = prepare_input_with_plan(
         input,
         k,
         group_size,
@@ -674,7 +678,7 @@ def run_linear(
         execution_plan=plan,
         target=target,
     )
-    return _execute_prepared_linear(
+    return execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -733,7 +737,7 @@ def linear_prepared(
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
     plan = default_execution_plan(weight_qdata)
-    return _execute_prepared_linear(
+    return execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,

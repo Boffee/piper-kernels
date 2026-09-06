@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
+
 _RADIX_BINS = tl.constexpr(256)
 _SELECTOR_TILE = 512
 
@@ -197,23 +199,24 @@ def tiled_radix_select_packed_routes(
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled scores and packed routes must share the batch dimension")
     batch, heads, query_blocks, sparse_key_blocks = scores.shape
-    _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
-        scores,
-        routes,
-        head_keep_blocks,
-        route_head_offsets,
-        sparse_key_blocks,
-        query_block_offset,
-        scores.stride(0),
-        scores.stride(1),
-        scores.stride(2),
-        routes.stride(0),
-        routes.stride(1),
-        routes.stride(2),
-        selector_tile=_SELECTOR_TILE,
-        num_warps=4,
-        num_stages=1,
-    )
+    with device_context(scores.device):
+        _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
+            scores,
+            routes,
+            head_keep_blocks,
+            route_head_offsets,
+            sparse_key_blocks,
+            query_block_offset,
+            scores.stride(0),
+            scores.stride(1),
+            scores.stride(2),
+            routes.stride(0),
+            routes.stride(1),
+            routes.stride(2),
+            selector_tile=_SELECTOR_TILE,
+            num_warps=4,
+            num_stages=1,
+        )
 
 
 __all__ = ["tiled_radix_select_packed_routes"]

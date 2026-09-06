@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.stochastic_quantization import _random, seed_argument
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.triton import rotate_hadamard_groups
@@ -416,27 +417,28 @@ def dynamic_scale(
         per_tensor_scale = out
 
     values = input.contiguous().view(-1)
-    while values.numel() > _AMAX_REDUCTION_BLOCK_SIZE:
-        partial_count = (
-            values.numel() + _AMAX_REDUCTION_BLOCK_SIZE - 1
-        ) // _AMAX_REDUCTION_BLOCK_SIZE
-        partial = torch.empty(partial_count, device=input.device, dtype=torch.float32)
-        _amax_partial_kernel[(partial_count,)](
+    with device_context(input.device):
+        while values.numel() > _AMAX_REDUCTION_BLOCK_SIZE:
+            partial_count = (
+                values.numel() + _AMAX_REDUCTION_BLOCK_SIZE - 1
+            ) // _AMAX_REDUCTION_BLOCK_SIZE
+            partial = torch.empty(partial_count, device=input.device, dtype=torch.float32)
+            _amax_partial_kernel[(partial_count,)](
+                values,
+                partial,
+                values.numel(),
+                block_size=_AMAX_REDUCTION_BLOCK_SIZE,
+                num_warps=8,
+            )
+            values = partial
+        _amax_scale_kernel[(1,)](
             values,
-            partial,
+            per_tensor_scale,
             values.numel(),
-            block_size=_AMAX_REDUCTION_BLOCK_SIZE,
+            block_size=triton.next_power_of_2(values.numel()),
             num_warps=8,
         )
-        values = partial
-    _amax_scale_kernel[(1,)](
-        values,
-        per_tensor_scale,
-        values.numel(),
-        block_size=triton.next_power_of_2(values.numel()),
-        num_warps=8,
-    )
-    return per_tensor_scale
+        return per_tensor_scale
 
 
 def _prepare_static_storage(
@@ -453,22 +455,23 @@ def _prepare_static_storage(
     rows = int(contiguous_input.numel() // input_features)
     qdata, scale = _layout.prepare_activation_storage(input, rows, output_features, out)
     block_count = rows * (output_features // _NVFP4_BLOCK_SIZE)
-    _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
-        contiguous_input,
-        per_tensor_scale,
-        qdata,
-        scale,
-        block_count,
-        input_features=input_features,
-        output_features=output_features,
-        scale_column_blocks=(output_features + _layout.SCALE_COLUMN_TILE - 1)
-        // _layout.SCALE_COLUMN_TILE,
-        swiglu=swiglu,
-        blocks_per_program=_PREPARE_BLOCKS,
-        high_first=high_first,
-        num_warps=2,
-    )
-    return qdata, scale
+    with device_context(input.device):
+        _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
+            contiguous_input,
+            per_tensor_scale,
+            qdata,
+            scale,
+            block_count,
+            input_features=input_features,
+            output_features=output_features,
+            scale_column_blocks=(output_features + _layout.SCALE_COLUMN_TILE - 1)
+            // _layout.SCALE_COLUMN_TILE,
+            swiglu=swiglu,
+            blocks_per_program=_PREPARE_BLOCKS,
+            high_first=high_first,
+            num_warps=2,
+        )
+        return qdata, scale
 
 
 def prepare_static(
@@ -519,18 +522,19 @@ def add_bias_out(
     ):
         raise ValueError("NVFP4 bias addition requires matching row-major matrices and bias width")
     elements = input.numel()
-    _add_bias_kernel[(triton.cdiv(elements, _BIAS_BLOCK_SIZE),)](
-        input,
-        bias,
-        output,
-        elements,
-        features=input.shape[-1],
-        input_row_stride=input.stride(0),
-        bias_stride=bias.stride(0),
-        output_row_stride=output.stride(0),
-        block_size=_BIAS_BLOCK_SIZE,
-        num_warps=4,
-    )
+    with device_context(input.device):
+        _add_bias_kernel[(triton.cdiv(elements, _BIAS_BLOCK_SIZE),)](
+            input,
+            bias,
+            output,
+            elements,
+            features=input.shape[-1],
+            input_row_stride=input.stride(0),
+            bias_stride=bias.stride(0),
+            output_row_stride=output.stride(0),
+            block_size=_BIAS_BLOCK_SIZE,
+            num_warps=4,
+        )
 
 
 @triton.jit
@@ -824,52 +828,53 @@ def linear_mean(
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else input_scale
     valid_count = block_lengths.sum(dtype=torch.float32) if has_block_lengths else input_scale
-    _dequantized_input_mean_partial_kernel[
-        (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
-    ](
-        input_qdata,
-        input_scale,
-        partial,
-        block_lengths_ptr,
-        sequence_length,
-        input_features=input_features,
-        row_block_count=row_block_count,
-        scale_column_blocks=scale_column_blocks,
-        mask_block_lengths=has_block_lengths,
-        block_m=_MEAN_BLOCK_M,
-        block_k=_MEAN_BLOCK_K,
-        num_warps=8,
-    )
-    _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
-        partial,
-        input_per_tensor_scale,
-        input_mean,
-        valid_count,
-        sequence_length,
-        input_features=input_features,
-        row_block_count=row_block_count,
-        reduction_rows=triton.next_power_of_2(row_block_count),
-        mask_block_lengths=has_block_lengths,
-        block_k=_MEAN_BLOCK_K,
-        num_warps=8,
-    )
-    _project_input_mean_kernel[(triton.cdiv(output_features, _PROJECTION_BLOCK_N), batch)](
-        input_mean,
-        weight_qdata,
-        weight_scale,
-        weight_per_tensor_scale,
-        bias,
-        output,
-        input_features=input_features,
-        output_features=output_features,
-        scale_column_blocks=scale_column_blocks,
-        has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
-        has_bias=bias is not None,
-        block_n=_PROJECTION_BLOCK_N,
-        block_k=_PROJECTION_BLOCK_K,
-        num_warps=8,
-    )
-    return output
+    with device_context(input_qdata.device):
+        _dequantized_input_mean_partial_kernel[
+            (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
+        ](
+            input_qdata,
+            input_scale,
+            partial,
+            block_lengths_ptr,
+            sequence_length,
+            input_features=input_features,
+            row_block_count=row_block_count,
+            scale_column_blocks=scale_column_blocks,
+            mask_block_lengths=has_block_lengths,
+            block_m=_MEAN_BLOCK_M,
+            block_k=_MEAN_BLOCK_K,
+            num_warps=8,
+        )
+        _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
+            partial,
+            input_per_tensor_scale,
+            input_mean,
+            valid_count,
+            sequence_length,
+            input_features=input_features,
+            row_block_count=row_block_count,
+            reduction_rows=triton.next_power_of_2(row_block_count),
+            mask_block_lengths=has_block_lengths,
+            block_k=_MEAN_BLOCK_K,
+            num_warps=8,
+        )
+        _project_input_mean_kernel[(triton.cdiv(output_features, _PROJECTION_BLOCK_N), batch)](
+            input_mean,
+            weight_qdata,
+            weight_scale,
+            weight_per_tensor_scale,
+            bias,
+            output,
+            input_features=input_features,
+            output_features=output_features,
+            scale_column_blocks=scale_column_blocks,
+            has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+            has_bias=bias is not None,
+            block_n=_PROJECTION_BLOCK_N,
+            block_k=_PROJECTION_BLOCK_K,
+            num_warps=8,
+        )
+        return output
 
 
 @linear_mean.register_fake  # pyright: ignore[reportFunctionMemberAccess]
@@ -950,32 +955,33 @@ def _update_(
         "num_warps": 4,
         "enable_fp_fusion": False,
     }
-    if two_level:
-        _update_kernel[grid](*arguments, amax_only=True, **options)  # pyright: ignore[reportArgumentType]
-        assert partial is not None
-        while partial.numel() > 1024:
-            count = (partial.numel() + 1023) // 1024
-            reduced = torch.empty(count, device=qdata.device, dtype=torch.float32)
-            _amax_partial_kernel[(count,)](
+    with device_context(qdata.device):
+        if two_level:
+            _update_kernel[grid](*arguments, amax_only=True, **options)  # pyright: ignore[reportArgumentType]
+            assert partial is not None
+            while partial.numel() > 1024:
+                count = (partial.numel() + 1023) // 1024
+                reduced = torch.empty(count, device=qdata.device, dtype=torch.float32)
+                _amax_partial_kernel[(count,)](
+                    partial,
+                    reduced,
+                    partial.numel(),
+                    block_size=1024,
+                    num_warps=4,
+                )
+                partial = reduced
+            _global_scale_kernel[(1,)](
                 partial,
-                reduced,
+                new_global,
                 partial.numel(),
-                block_size=1024,
+                block_size=triton.next_power_of_2(partial.numel()),
                 num_warps=4,
             )
-            partial = reduced
-        _global_scale_kernel[(1,)](
-            partial,
-            new_global,
-            partial.numel(),
-            block_size=triton.next_power_of_2(partial.numel()),
-            num_warps=4,
-        )
-    _update_kernel[grid](*arguments, amax_only=False, **options)  # pyright: ignore[reportArgumentType]
-    if per_tensor_scale is not None:
-        assert new_global is not None
-        # All packing CTAs must finish reading the old global scale first.
-        per_tensor_scale.copy_(new_global)
+        _update_kernel[grid](*arguments, amax_only=False, **options)  # pyright: ignore[reportArgumentType]
+        if per_tensor_scale is not None:
+            assert new_global is not None
+            # All packing CTAs must finish reading the old global scale first.
+            per_tensor_scale.copy_(new_global)
 
 
 @torch.library.custom_op(

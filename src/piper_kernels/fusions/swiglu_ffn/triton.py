@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
+
 _EPILOGUE_BLOCK_SIZE = 256
 
 
@@ -193,30 +195,31 @@ def apply_indexed_gated_updates(
 ) -> None:
     """Apply one validated chunk of indexed gated updates into reusable output storage."""
     elements = ffn.numel()
-    _gated_updates_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
-        ffn,
-        ffn_scale if ffn_scale is not None else ffn,
-        ffn_bias if ffn_bias is not None else ffn,
-        base,
-        output,
-        updates.update_gate,
-        updates.ffn_gate,
-        updates.gate_indices,
-        elements,
-        row_offset,
-        features=ffn.shape[-1],
-        update_gate_row_stride=layout.update_gate_row_stride,
-        ffn_gate_row_stride=layout.ffn_gate_row_stride,
-        update_gate_rows=layout.update_gate_rows,
-        ffn_gate_rows=layout.ffn_gate_rows,
-        python_indexing=updates.python_indexing,
-        has_ffn_scale=ffn_scale is not None,
-        has_ffn_bias=ffn_bias is not None,
-        ffn_dtype_code={torch.float16: 1, torch.bfloat16: 2}.get(ffn.dtype, 0),
-        block_size=_EPILOGUE_BLOCK_SIZE,
-        num_warps=4,
-        debug=True,
-    )
+    with device_context(ffn.device):
+        _gated_updates_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
+            ffn,
+            ffn_scale if ffn_scale is not None else ffn,
+            ffn_bias if ffn_bias is not None else ffn,
+            base,
+            output,
+            updates.update_gate,
+            updates.ffn_gate,
+            updates.gate_indices,
+            elements,
+            row_offset,
+            features=ffn.shape[-1],
+            update_gate_row_stride=layout.update_gate_row_stride,
+            ffn_gate_row_stride=layout.ffn_gate_row_stride,
+            update_gate_rows=layout.update_gate_rows,
+            ffn_gate_rows=layout.ffn_gate_rows,
+            python_indexing=updates.python_indexing,
+            has_ffn_scale=ffn_scale is not None,
+            has_ffn_bias=ffn_bias is not None,
+            ffn_dtype_code={torch.float16: 1, torch.bfloat16: 2}.get(ffn.dtype, 0),
+            block_size=_EPILOGUE_BLOCK_SIZE,
+            num_warps=4,
+            debug=True,
+        )
 
 
 __all__ = [
