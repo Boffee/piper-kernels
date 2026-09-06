@@ -79,7 +79,7 @@ def test_shared_converter_executes_selected_schedule_without_vendor_rules(monkey
     width = 16384 if chunks is not None else 4096
     data = torch.empty(2, 16, dtype=torch.uint8)
     qdata, scale = torch.empty(2, width, dtype=torch.int8), torch.empty(2, 1)
-    arguments = (data, int(GGUFQuantizationType.Q4_K), 256, torch.bfloat16, qdata, scale)
+    arguments = (data, int(GGUFQuantizationType.Q4_K), 256, qdata, scale)
     generic.convert_gguf_out(*arguments)
     select.assert_called_once_with(target, width)
     if chunks is None:
@@ -97,7 +97,6 @@ def test_shared_converter_executes_selected_schedule_without_vendor_rules(monkey
             chunk_size=8192,
             group_size=256,
             inverse_sqrt_group=256**-0.5,
-            logical_dtype_code=2,
             activation_fn=None,
             accelerator_backend="hip",
             gguf_quant_type=int(GGUFQuantizationType.Q4_K),
@@ -111,8 +110,6 @@ def test_empty_shared_conversion_does_not_select_a_schedule(monkeypatch, shape):
     monkeypatch.setattr(AcceleratorTarget, "from_device", unexpected)
     monkeypatch.setattr(generic, "select_conversion_chunks", unexpected)
     qdata, scale = torch.empty(shape, dtype=torch.int8), torch.empty(shape[0], 1)
-    generic.convert_gguf_out(
-        torch.empty(shape), int(GGUFQuantizationType.F32), 16, torch.float32, qdata, scale
-    )
+    generic.convert_gguf_out(torch.empty(shape), int(GGUFQuantizationType.F32), 16, qdata, scale)
     assert (scale == 1e-30).all()
     unexpected.assert_not_called()

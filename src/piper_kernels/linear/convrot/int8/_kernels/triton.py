@@ -94,28 +94,23 @@ def scaled_int8_matmul(
 
 
 @triton.jit
-def normalize_for_int8(values, scale, logical_dtype_code: tl.constexpr):
-    """Normalize values without dividing by an underflowed logical scale."""
-    if logical_dtype_code == 1:
-        logical_scale = scale.to(tl.float16)
-        safe_logical_scale = tl.where(logical_scale == 0, 1.0, logical_scale).to(tl.float16)
-        scaled = (values / safe_logical_scale).to(tl.float16)
-        return tl.where(
-            logical_scale == 0,
-            values.to(tl.float32) / scale,
-            scaled.to(tl.float32),
-        )
-    elif logical_dtype_code == 2:
-        return (values / scale.to(tl.bfloat16)).to(tl.bfloat16)
-    else:
-        return values / scale
+def normalize_for_int8(values, scale):
+    """Normalize in FP32 without rounding the scale or quotient."""
+    return values.to(tl.float32) / scale
 
 
 @triton.jit
-def _quantize_int8(values, scale, logical_dtype_code: tl.constexpr):
-    """Apply the shared deterministic rounding and saturation policy."""
-    scaled = normalize_for_int8(values, scale, logical_dtype_code)
-    return tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+def round_to_int8(scaled, accelerator_backend: tl.constexpr):
+    """Saturate and round once to nearest-even INT8 using the target's conversion."""
+    if accelerator_backend == "cuda":
+        return libdevice.float2int_rn(tl.clamp(scaled, -128.0, 127.0)).to(tl.int8)  # pyright: ignore[reportAttributeAccessIssue]
+    return tl.clamp(libdevice.rint(scaled), -128.0, 127.0).to(tl.int8)
+
+
+@triton.jit
+def _quantize_int8(values, scale, accelerator_backend: tl.constexpr):
+    """Apply terminal INT8 rounding after FP32 normalization."""
+    return round_to_int8(normalize_for_int8(values, scale), accelerator_backend)
 
 
 @triton.jit
@@ -127,10 +122,10 @@ def _store_quantized_chunk(
     chunk_offsets,
     values,
     scale,
-    logical_dtype_code: tl.constexpr,
+    accelerator_backend: tl.constexpr,
 ):
     offsets = chunk_start + chunk_offsets
-    quantized = _quantize_int8(values, scale, logical_dtype_code)
+    quantized = _quantize_int8(values, scale, accelerator_backend)
     tl.store(
         q_ptr + output_row_offset + offsets,
         quantized,
@@ -149,7 +144,6 @@ def _load_weight_chunk(
     chunk_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
@@ -164,7 +158,6 @@ def _load_weight_chunk(
             chunk_size,
             group_size,
             inverse_sqrt_group,
-            logical_dtype_code,
             gguf_quant_type,
         )
     return convrot_backend.load_activated_rotated_chunk(
@@ -176,7 +169,6 @@ def _load_weight_chunk(
         chunk_size,
         group_size,
         inverse_sqrt_group,
-        logical_dtype_code,
         activation_fn,
         accelerator_backend,
     )
@@ -192,7 +184,6 @@ def rotate_quantize_rows_kernel(
     chunk_count: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
@@ -225,7 +216,6 @@ def rotate_quantize_rows_kernel(
         chunk_size,
         group_size,
         inverse_sqrt_group,
-        logical_dtype_code,
         activation_fn,
         accelerator_backend,
         gguf_quant_type,
@@ -242,7 +232,6 @@ def rotate_quantize_rows_kernel(
             chunk_size,
             group_size,
             inverse_sqrt_group,
-            logical_dtype_code,
             activation_fn,
             accelerator_backend,
             gguf_quant_type,
@@ -262,7 +251,6 @@ def rotate_quantize_rows_kernel(
             chunk_size,
             group_size,
             inverse_sqrt_group,
-            logical_dtype_code,
             activation_fn,
             accelerator_backend,
             gguf_quant_type,
@@ -281,7 +269,7 @@ def rotate_quantize_rows_kernel(
         chunk_offsets,
         values0,
         scale,
-        logical_dtype_code,
+        accelerator_backend,
     )
     if chunk_count >= 2:
         _store_quantized_chunk(
@@ -292,7 +280,7 @@ def rotate_quantize_rows_kernel(
             chunk_offsets,
             values1,
             scale,
-            logical_dtype_code,
+            accelerator_backend,
         )
     if chunk_count >= 3:
         _store_quantized_chunk(
@@ -303,7 +291,7 @@ def rotate_quantize_rows_kernel(
             chunk_offsets,
             values2,
             scale,
-            logical_dtype_code,
+            accelerator_backend,
         )
     tl.store(scale_ptr + row_i64, scale)
 
@@ -318,9 +306,9 @@ def convert_gguf_tiles_kernel(
     tiles_per_row,
     block_size: tl.constexpr,
     group_size: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     quant_type: tl.constexpr,
     write_maxima: tl.constexpr,
+    accelerator_backend: tl.constexpr,
 ):
     """Decode/rotate twice, retaining only tile maxima between the two passes."""
     row = tl.program_id(0).to(tl.int64)
@@ -338,7 +326,6 @@ def convert_gguf_tiles_kernel(
         block_size,
         group_size,
         group_size**-0.5,
-        logical_dtype_code,
         quant_type,
     )
     if write_maxima:
@@ -346,7 +333,7 @@ def convert_gguf_tiles_kernel(
         tl.store(maxima_ptr + row * tiles_per_row + tile, maximum)
     else:
         scale = tl.load(scale_ptr + row)
-        quantized = _quantize_int8(values, scale, logical_dtype_code)
+        quantized = _quantize_int8(values, scale, accelerator_backend)
         tl.store(q_ptr + row * row_width + start + offsets, quantized, start + offsets < row_width)
 
 
@@ -373,7 +360,7 @@ def quantize_rows_kernel(
     scale_ptr,
     row_width,
     block_size: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
+    accelerator_backend: tl.constexpr,
     reciprocal_scale: tl.constexpr = False,
 ):
     row = tl.program_id(0)
@@ -382,8 +369,10 @@ def quantize_rows_kernel(
     mask = offsets < row_width
     row_offset = row_i64 * row_width
     values = tl.load(x_ptr + row_offset + offsets, mask=mask, other=0.0)
-    scale = tl.maximum(int8_scale_from_max(tl.max(tl.abs(values), axis=0), reciprocal_scale), 1e-30)
-    quantized = _quantize_int8(values, scale, logical_dtype_code)
+    scale = tl.maximum(
+        int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), reciprocal_scale), 1e-30
+    )
+    quantized = _quantize_int8(values, scale, accelerator_backend)
     tl.store(q_ptr + row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
 
@@ -403,10 +392,10 @@ def requantize_update_rows_kernel(
     alpha,
     rounding_seed,
     block_size: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     has_base: tl.constexpr,
     has_update: tl.constexpr,
     stochastic: tl.constexpr,
+    accelerator_backend: tl.constexpr,
     reciprocal_scale: tl.constexpr = False,
 ):
     row = tl.program_id(0)
@@ -431,15 +420,11 @@ def requantize_update_rows_kernel(
             other=0.0,
         )
         values += alpha * update.to(tl.float32)
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
     scale = tl.maximum(
         int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), reciprocal_scale),
         1e-30,
     )
-    quantized = _quantize_int8(values, scale, logical_dtype_code)
+    quantized = _quantize_int8(values, scale, accelerator_backend)
     if stochastic:
         stochastic_scaled = values.to(tl.float32) / scale
         logical_offsets = row_i64 * row_width + offsets_i64

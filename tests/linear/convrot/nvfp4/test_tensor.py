@@ -24,6 +24,7 @@ from piper_kernels.linear.convrot.nvfp4 import (
 )
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 
 
 def _exact_sm120_available() -> bool:
@@ -100,7 +101,7 @@ def test_high_first_preserves_storage_and_rotation_metadata() -> None:
 def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: int) -> None:
     torch.manual_seed(610 + group_size)
     logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
-    rotated_weight = rotate_groups(logical_weight, group_size)
+    rotated_weight = rotate_groups(logical_weight.float(), group_size)
     per_tensor_scale = per_tensor_amax_to_scale(rotated_weight.abs().amax())
     activation_scale = torch.tensor(0.5)
 
@@ -133,7 +134,7 @@ def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: 
 def test_from_hp_computes_global_scale_in_the_rotated_basis() -> None:
     torch.manual_seed(874)
     logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
-    rotated_weight = rotate_groups(logical_weight, 64)
+    rotated_weight = rotate_groups(logical_weight.float(), 64)
     expected_scale = per_tensor_amax_to_scale(rotated_weight.float().abs().amax())
 
     weight = ConvRotNVFP4Tensor.from_hp(
@@ -355,11 +356,11 @@ def test_addmm_updates_rotated_storage_in_place(
     alpha: float,
 ) -> None:
     weight, mat1, mat2 = _cpu_addmm_case(group_size=group_size)
-    rotated_before = TorchAONVFP4Tensor.dequantize(weight, weight.orig_dtype)
+    rotated_before = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
     expected_dense = torch.addmm(
         rotated_before,
-        mat1,
-        rotate_groups(mat2, group_size),
+        mat1.float(),
+        rotate_groups(mat2.float(), group_size),
         beta=beta,
         alpha=alpha,
     )
@@ -397,10 +398,10 @@ def test_addmm_updates_rotated_storage_in_place(
 @pytest.mark.parametrize("alpha", [1, 0.25, -0.5])
 def test_add_updates_rotated_storage_in_place(group_size: int, alpha: float) -> None:
     weight, update = _cpu_add_case(group_size=group_size, seed=623)
-    rotated_before = TorchAONVFP4Tensor.dequantize(weight, weight.orig_dtype)
+    rotated_before = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
     expected_dense = torch.add(
         rotated_before,
-        rotate_groups(update, group_size),
+        rotate_groups(update.float(), group_size),
         alpha=alpha,
     )
     expected = TorchAONVFP4Tensor.to_nvfp4(
@@ -735,8 +736,8 @@ def _cuda_case(
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 def test_cuda_linear_matches_materialized_rotation(dynamic: bool, group_size: int) -> None:
     torch.manual_seed(612 + group_size + dynamic)
-    activation, torchao_weight, weight, bias = _cuda_case(dynamic, group_size)
-    rotated_input = rotate_groups(activation, group_size)
+    activation, _torchao_weight, weight, bias = _cuda_case(dynamic, group_size)
+    rotated_input = rotate_groups(activation.float(), group_size)
     prepared_input = nvfp4_ops._prepare_compiled(
         rotated_input,
         weight.act_per_tensor_scale,
@@ -750,15 +751,20 @@ def test_cuda_linear_matches_materialized_rotation(dynamic: bool, group_size: in
         bias,
         activation.dtype,
     )
-    torchao_reference = F.linear(rotated_input, torchao_weight, bias)
+    portable = nvfp4_reference.linear_prepared(
+        *prepared_input,
+        weight.qdata,
+        weight.scale,
+        weight.per_tensor_scale,
+        bias,
+        activation.dtype,
+    )
 
     actual = F.linear(activation, weight, bias)
 
     assert torch.equal(actual, expected)
-    relative_l2 = (
-        actual.float() - torchao_reference.float()
-    ).norm() / torchao_reference.float().norm()
-    assert relative_l2 < 0.02
+    relative_l2 = (actual.float() - portable.float()).norm() / portable.float().norm()
+    assert relative_l2 < 0.002
 
 
 @pytest.mark.gpu

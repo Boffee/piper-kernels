@@ -117,7 +117,6 @@ def quantize_input(
     rotated: torch.Tensor,
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    logical_dtype_code: int,
     *,
     num_warps: int,
 ) -> None:
@@ -130,7 +129,7 @@ def quantize_input(
             input_scale,
             k,
             block_size=max(128, triton.next_power_of_2(k)),
-            logical_dtype_code=logical_dtype_code,
+            accelerator_backend="cuda",
             num_warps=num_warps,
         )
 
@@ -140,7 +139,6 @@ def fused_rotate_quantize_input(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     group_size: int,
-    logical_dtype_code: int,
     *,
     activation_fn: str | None = None,
     num_warps: int,
@@ -180,7 +178,6 @@ def fused_rotate_quantize_input(
             chunk_count=chunk_count,
             group_size=group_size,
             inverse_sqrt_group=group_size**-0.5,
-            logical_dtype_code=logical_dtype_code,
             activation_fn=activation_fn,
             accelerator_backend=target.backend,
             gguf_quant_type=-1,
@@ -229,14 +226,12 @@ def prepare_input_with_plan(
         result = out
     input_qdata = result[0].reshape(m, in_features)
     input_scale = result[1].reshape(m)
-    logical_dtype_code = convrot_backend.logical_dtype_code(input.dtype)
     if execution_plan.fuse_rotation_quantization:
         fused_rotate_quantize_input(
             input_2d,
             input_qdata,
             input_scale,
             group_size,
-            logical_dtype_code,
             activation_fn=activation_fn,
             num_warps=execution_plan.fused_num_warps,
             target=target,
@@ -254,7 +249,6 @@ def prepare_input_with_plan(
             rotated,
             input_qdata,
             input_scale,
-            logical_dtype_code,
             num_warps=execution_plan.quantization_num_warps,
         )
     return result

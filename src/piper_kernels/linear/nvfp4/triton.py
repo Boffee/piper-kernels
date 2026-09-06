@@ -325,11 +325,7 @@ def _update_kernel(  # noqa: PLR0915
                     block_m * block_n,
                     group_size,
                 )
-                update = (
-                    tl.reshape(rotated * (group_size**-0.5), (block_m, block_n))
-                    .to(logical_dtype)
-                    .to(tl.float32)
-                )
+                update = tl.reshape(rotated * (group_size**-0.5), (block_m, block_n))
 
     base = tl.full((block_m, block_n), 0.0, tl.float32)
     if has_base:
@@ -344,10 +340,9 @@ def _update_kernel(  # noqa: PLR0915
         scales = tl.load(scale_ptr + scale_offsets, mask=valid, other=0.0).to(tl.float32)
         if two_level:
             scales *= tl.load(old_global_ptr).to(tl.float32)
-        # Preserve the logical-dtype dequantization boundary of Tensor.add/mm.
-        base = (_decode_fp4_code(code) * scales).to(logical_dtype).to(tl.float32)
+        base = _decode_fp4_code(code) * scales
 
-    merged = (beta * base + alpha * update).to(logical_dtype).to(tl.float32)
+    merged = beta * base + alpha * update
     merged = tl.where(valid, merged, 0.0)
     if amax_only:
         amax = tl.max(tl.max(tl.abs(merged), axis=1), axis=0)

@@ -9,8 +9,8 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import ConvRotInt8Tensor
+from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops, reference
-from piper_kernels.linear.convrot.int8 import triton as legacy_triton
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 
@@ -42,11 +42,6 @@ def test_generic_update_selection_does_not_query_architecture(monkeypatch, devic
 @pytest.mark.parametrize("operation", ["prepare_input", "add_", "addmm_"])
 def test_generic_package_reexports_dispatch(operation):
     assert getattr(_generic, operation) is getattr(generic_dispatch, operation)
-
-
-def test_legacy_update_exports_preserve_custom_ops():
-    assert legacy_triton.add_ is _ops.add_
-    assert legacy_triton.addmm_ is _ops.addmm_
 
 
 @pytest.mark.gpu
@@ -196,7 +191,12 @@ def test_generic_preparation_zero_and_tiny_scales(device, magnitude, dtype):
     value = torch.zeros(2, 256, device=device, dtype=dtype)
     value[:, 0] = magnitude
     qdata, scale = _generic.prepare_input(value, 256)
-    expected_qdata, expected_scale = reference.prepare_input(value, 256)
+    rotated = rotate_groups(value.float(), 256)
+    if device == "cuda":
+        # The generic GPU path materializes a compact rotation workspace.
+        rotated = rotated.to(dtype)
+    expected_qdata, expected_scale = reference.dynamic_quantize_rows(rotated)
+    expected_scale = expected_scale.squeeze(-1)
     assert torch.equal(qdata, expected_qdata)
     torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=0)
     assert scale.isfinite().all()

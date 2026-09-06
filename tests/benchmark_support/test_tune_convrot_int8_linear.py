@@ -14,7 +14,7 @@ from tune_convrot_int8_linear import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
-from piper_kernels.linear.convrot.int8._policy import select_execution_plan
+from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 
 
 def _production_plan():

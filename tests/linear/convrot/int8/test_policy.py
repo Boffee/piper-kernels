@@ -5,12 +5,11 @@ from dataclasses import replace
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._nvidia.policy import NvidiaExecutionPlan
-from piper_kernels.linear.convrot.int8._plan import fused_preparation_chunks
-from piper_kernels.linear.convrot.int8._policy import (
-    LinearExecutionPlan,
+from piper_kernels.linear.convrot.int8._nvidia.policy import (
+    NvidiaExecutionPlan,
     select_execution_plan,
 )
+from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan, fused_preparation_chunks
 
 _SM120 = AcceleratorTarget("cuda", "sm120")
 

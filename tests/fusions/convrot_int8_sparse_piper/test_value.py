@@ -9,7 +9,7 @@ import torch
 
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as value_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 from ._reference import composed_value_projection
 
@@ -77,7 +77,7 @@ def _random_operands(
 @pytest.mark.parametrize("sequence_length", [64, 65])
 def test_fused_value_projection_matches_the_fp32_composed_contract(sequence_length: int) -> None:
     operands = _random_operands(sequence_length=sequence_length)
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
@@ -117,7 +117,7 @@ def test_fused_value_projection_optionally_emits_valid_prefix_block_means(
     sequence_length: int,
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length)
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
@@ -154,7 +154,7 @@ def test_fused_value_block_means_respect_internal_block_lengths() -> None:
         *operands.as_tuple()[2:],
         block_lengths,
     )
-    projected = convrot_int8_backend.linear_prepared(
+    projected = int8_ops.linear_prepared(
         *operands.as_tuple(),
         None,
         torch.float32,
@@ -177,7 +177,7 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
         input_features=256,
         heads=3,
     )
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
@@ -196,7 +196,7 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
     operands = _random_operands(sequence_length=192, input_features=256, heads=3)
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
@@ -205,7 +205,7 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
         input_mean,
         *operands.as_tuple()[2:],
     )
-    materialized = convrot_int8_backend.linear_prepared(
+    materialized = int8_ops.linear_prepared(
         *operands.as_tuple(),
         None,
         torch.bfloat16,
@@ -221,7 +221,7 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
 def test_dequantized_input_mean_matches_the_represented_activation() -> None:
     operands = _random_operands(batch=2, sequence_length=192, input_features=256)
 
-    actual = convrot_int8_backend.dequantized_input_mean(
+    actual = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
@@ -238,7 +238,7 @@ def test_dequantized_input_mean_ignores_internal_padding() -> None:
     valid_rows = torch.arange(192, device="cuda") % 64
     valid_rows = valid_rows < block_lengths.repeat_interleave(64)
 
-    actual = convrot_int8_backend.dequantized_input_mean(
+    actual = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
         block_lengths,
@@ -253,13 +253,13 @@ def test_dequantized_input_mean_ignores_internal_padding() -> None:
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_value_projection_custom_ops_pass_opcheck() -> None:
     operands = _random_operands()
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
     )
 
     mean_result = torch.library.opcheck(
-        convrot_int8_backend.dequantized_input_mean,
+        int8_ops.dequantized_input_mean,
         (operands.input_qdata, operands.input_scale),
     )
     value_result = torch.library.opcheck(
@@ -295,7 +295,7 @@ def test_value_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        input_mean = convrot_int8_backend.dequantized_input_mean(args[0], args[1])
+        input_mean = int8_ops.dequantized_input_mean(args[0], args[1])
         return value_fusion._project_value_op(
             args[0],
             args[1],
@@ -317,7 +317,7 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
     weight_qdata = torch.empty((3 * 128, 272), device="meta", dtype=torch.int8)
     weight_scale = torch.empty((3 * 128, 1), device="meta", dtype=torch.float32)
 
-    input_mean = convrot_int8_backend.dequantized_input_mean(input_qdata, input_scale)
+    input_mean = int8_ops.dequantized_input_mean(input_qdata, input_scale)
     value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
         input_qdata,
         input_scale,

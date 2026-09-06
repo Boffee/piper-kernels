@@ -18,7 +18,7 @@ def _materialized_reference(
     packed: torch.Tensor,
     quant_type: GGUFQuantizationType,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dense = dequantize_reference(packed, quant_type, dtype=torch.bfloat16).cuda()
+    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
     rotated = torch.empty_like(dense)
     convrot_backend.rotate_input(dense, rotated, 64, num_warps=4)
     return nvfp4_ops._compiled_prepare_dynamic(rotated, None)

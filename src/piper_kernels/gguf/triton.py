@@ -292,7 +292,6 @@ def load_rotated_chunk(
     chunk_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     quant_type: tl.constexpr,
 ):
     """Decode and rotate one group-aligned slice without global dense storage."""
@@ -305,16 +304,8 @@ def load_rotated_chunk(
         mask,
         quant_type,
     )
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16).to(tl.float32)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16).to(tl.float32)
     values = convrot_backend.rotate_hadamard_groups(values, chunk_size, group_size)
     values *= inverse_sqrt_group
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
     return values
 
 

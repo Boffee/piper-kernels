@@ -63,9 +63,13 @@ def _operands(weight, operation, *, rank=19, strided=False):
 
 
 def _merged(weight, operands, operation, alpha, beta):
-    base = PiperNVFP4Tensor.dequantize(weight, weight.dtype)
+    base = PiperNVFP4Tensor.dequantize(weight, torch.float32)
     group_size = getattr(weight, "group_size", 0)
-    update = rotate_groups(operands[-1], group_size) if group_size else operands[-1]
+    update = rotate_groups(operands[-1].float(), group_size) if group_size else operands[-1].float()
+    if operation == "addmm" and group_size and weight.device.type == "cuda":
+        # The optimized dot deliberately retains native FP16/BF16 operands.
+        # Model that hardware boundary, but keep dequantization and merging FP32.
+        update = update.to(operands[-1].dtype).float()
     if operation == "add":
         return torch.add(base, update, alpha=alpha)
     # Use FP32 accumulation as the oracle instead of inheriting cuBLAS's
@@ -76,7 +80,7 @@ def _merged(weight, operands, operation, alpha, beta):
         update.float(),
         alpha=alpha,
         beta=beta,
-    ).to(weight.dtype)
+    )
 
 
 def _apply(weight, operands, operation, *, alpha=0.375, beta=0.25, seed=None):
@@ -86,6 +90,24 @@ def _apply(weight, operands, operation, *, alpha=0.375, beta=0.25, seed=None):
     if operation == "addmm":
         kwargs["beta"] = beta
     return getattr(weight, f"{operation}_")(*operands, **kwargs)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
+def test_merge_retains_update_smaller_than_bfloat16_ulp(device):
+    weight = PiperNVFP4Tensor.from_hp(
+        torch.ones(1, 16, device=device, dtype=torch.bfloat16),
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+    )
+    base = weight.dequantize(torch.float32)
+    previous_scale = weight.per_tensor_scale.clone()
+    update = torch.ones_like(base, dtype=torch.bfloat16)
+    expected_scale = per_tensor_amax_to_scale((base + 2**-10).abs().amax())
+
+    weight.add_(update, alpha=2**-10)
+
+    assert weight.per_tensor_scale > previous_scale
+    torch.testing.assert_close(weight.per_tensor_scale, expected_scale, rtol=2e-7, atol=0)
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])

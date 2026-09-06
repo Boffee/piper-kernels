@@ -287,7 +287,6 @@ def _benchmark_width(
     split_scale = torch.empty(rows, device="cuda", dtype=torch.float32)
     fused_qdata = torch.empty_like(split_qdata)
     fused_scale = torch.empty_like(split_scale)
-    dtype_code = convrot_backend.logical_dtype_code(dtype)
 
     def rotate() -> None:
         convrot_backend.rotate_input(
@@ -302,7 +301,6 @@ def _benchmark_width(
             rotated,
             split_qdata,
             split_scale,
-            dtype_code,
             num_warps=preparation_configuration["quantization_num_warps"],
         )
 
@@ -316,7 +314,6 @@ def _benchmark_width(
             fused_qdata,
             fused_scale,
             256,
-            dtype_code,
             activation_fn=input_activation,  # type: ignore[arg-type]
             num_warps=preparation_configuration["fused_num_warps"],
         )

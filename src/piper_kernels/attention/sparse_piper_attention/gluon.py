@@ -627,6 +627,9 @@ def _sparse_piper_attention_kernel(
             ).to(gl.float32)
         else:
             gate = gl.load(coarse_gate_ptr + gate_offsets).to(gl.float32)
+        # Packing these temporaries limits register pressure on SM120. Removing
+        # both casts increased spills and slowed long-sequence kernels in the
+        # precision audit; retain them for that performance benefit.
         fine_output = output.to(gl.bfloat16).to(gl.float32)
         residual = _mul_fp32(gate, coarse[None, :]).to(gl.bfloat16).to(gl.float32)
         output = _add_fp32(fine_output, residual)

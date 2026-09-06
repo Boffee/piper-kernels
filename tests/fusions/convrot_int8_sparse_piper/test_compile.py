@@ -25,8 +25,9 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._compile import (
     compile_pass as fusion_compile_pass,
 )
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_compile_options
-from piper_kernels.linear.convrot.int8 import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
+from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
@@ -504,7 +505,7 @@ def _run_explicit_fused_projection(
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
-    input_qdata, input_scale = convrot_int8_backend.prepare_input(
+    input_qdata, input_scale = int8_ops.prepare_input(
         hidden_states,
         model.query.weight.group_size,
     )
@@ -534,7 +535,7 @@ def _run_explicit_fused_projection(
         routing_mode,
         block_lengths,
     )
-    input_mean = convrot_int8_backend.dequantized_input_mean(
+    input_mean = int8_ops.dequantized_input_mean(
         input_qdata,
         input_scale,
         block_lengths,
@@ -606,7 +607,7 @@ def _run_explicit_attention_output(
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
     )
-    projected = convrot_int8_backend.run_linear(
+    projected = int8_nvidia.run_linear(
         attention.reshape(
             hidden_states.shape[0],
             hidden_states.shape[1],

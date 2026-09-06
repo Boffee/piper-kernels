@@ -8,7 +8,6 @@ import math
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -17,10 +16,12 @@ from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
 from piper_kernels.linear.convrot import triton as convrot_backend
 
 from .._kernels.triton import (
+    _quantize_int8,
     int8_matmul_kernel,
     int8_scale_from_max,
     normalize_for_int8,
     quantize_rows_kernel,
+    round_to_int8,
 )
 from .._plan import LinearExecutionPlan
 from . import policy
@@ -33,18 +34,13 @@ _LARGE_MATMUL_GROUP_M_TILES = 8
 def _normalize_rotated_values(
     values,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
 ):
     """Apply the portable group normalization and construct an INT8 row scale."""
     values *= inverse_sqrt_group
-    if logical_dtype_code == 1:
-        values = values.to(tl.float16)
-    elif logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
     scale = tl.maximum(
         int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), True), 1e-30
     )
-    return normalize_for_int8(values, scale, logical_dtype_code), scale
+    return normalize_for_int8(values, scale), scale
 
 
 @triton.jit
@@ -63,11 +59,8 @@ def _amd_normalization_scale(
 def _normalize_rotated_values_amd_wide(
     values,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
 ):
     """Fold wide AMD group normalization into the stored row scale."""
-    if logical_dtype_code == 2:
-        values = values.to(tl.bfloat16)
     # Every supported group has an exact power-of-two normalization factor.
     # Wide HIP BF16/FP32 quantization is invariant to that common factor, so
     # apply it once to the stored row scale instead of every rotated value.
@@ -76,7 +69,7 @@ def _normalize_rotated_values_amd_wide(
         inverse_sqrt_group,
     )
     scale = normalization_scale * inverse_sqrt_group
-    return normalize_for_int8(values, normalization_scale, logical_dtype_code), scale
+    return normalize_for_int8(values, normalization_scale), scale
 
 
 @triton.jit
@@ -88,7 +81,6 @@ def rotate_quantize_rows_kernel(
     block_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
@@ -112,7 +104,7 @@ def rotate_quantize_rows_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        values = swiglu(up, gate, logical_dtype_code)
+        values = swiglu(up, gate)
     else:
         values = tl.load(
             x_ptr + input_row_offset + offsets,
@@ -120,22 +112,20 @@ def rotate_quantize_rows_kernel(
             other=0.0,
         ).to(tl.float32)
         if activation_fn == "gelu_tanh":
-            values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
+            values = gelu_tanh(values, accelerator_backend)
 
     values = convrot_backend.rotate_hadamard_groups(values, block_size, group_size)
-    if accelerator_backend != "hip" or logical_dtype_code == 1 or block_size <= 8_192:
+    if accelerator_backend != "hip" or x_ptr.dtype.element_ty == tl.float16 or block_size <= 8_192:
         scaled, scale = _normalize_rotated_values(
             values,
             inverse_sqrt_group,
-            logical_dtype_code,
         )
     else:
         scaled, scale = _normalize_rotated_values_amd_wide(
             values,
             inverse_sqrt_group,
-            logical_dtype_code,
         )
-    quantized = tl.clamp(libdevice.rint(scaled.to(tl.float32)), -128.0, 127.0).to(tl.int8)
+    quantized = round_to_int8(scaled, accelerator_backend)
     tl.store(q_ptr + output_row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
 
@@ -147,7 +137,6 @@ def _load_activated_input_chunk(
     row_width,
     offsets,
     mask,
-    logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
@@ -159,11 +148,11 @@ def _load_activated_input_chunk(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        return swiglu(up, gate, logical_dtype_code)
+        return swiglu(up, gate)
 
     values = tl.load(x_ptr + input_row_offset + offsets, mask=mask, other=0.0).to(tl.float32)
     if activation_fn == "gelu_tanh":
-        values = gelu_tanh(values, logical_dtype_code, accelerator_backend)
+        values = gelu_tanh(values, accelerator_backend)
     return values
 
 
@@ -178,7 +167,6 @@ def rotate_quantize_rows_chunked_kernel(
     block2: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    logical_dtype_code: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
@@ -201,10 +189,12 @@ def rotate_quantize_rows_chunked_kernel(
         row_width,
         offsets0,
         mask0,
-        logical_dtype_code,
         activation_fn,
         accelerator_backend,
     )
+    # Retain compact chunks across the rowwide maximum reduction. Keeping all
+    # chunks in FP32 increases VGPR usage on gfx942 and gfx1201; this cast saves
+    # live storage, while activation and quantization arithmetic remain FP32.
     values0 = convrot_backend.rotate_hadamard_groups(values0, block0, group_size).to(tl.bfloat16)
     max0 = tl.max(tl.abs(values0).to(tl.float32), axis=0)
 
@@ -216,7 +206,6 @@ def rotate_quantize_rows_chunked_kernel(
         row_width,
         offsets1,
         mask1,
-        logical_dtype_code,
         activation_fn,
         accelerator_backend,
     )
@@ -233,7 +222,6 @@ def rotate_quantize_rows_chunked_kernel(
             row_width,
             offsets2,
             mask2,
-            logical_dtype_code,
             activation_fn,
             accelerator_backend,
         )
@@ -250,41 +238,23 @@ def rotate_quantize_rows_chunked_kernel(
         absolute_max,
         inverse_sqrt_group,
     )
-    quantized0 = tl.clamp(
-        libdevice.rint(
-            normalize_for_int8(values0, normalization_scale, logical_dtype_code).to(tl.float32)
-        ),
-        -128.0,
-        127.0,
-    ).to(tl.int8)
-    quantized1 = tl.clamp(
-        libdevice.rint(
-            normalize_for_int8(values1, normalization_scale, logical_dtype_code).to(tl.float32)
-        ),
-        -128.0,
-        127.0,
-    ).to(tl.int8)
+    quantized0 = _quantize_int8(values0, normalization_scale, accelerator_backend)
+    quantized1 = _quantize_int8(values1, normalization_scale, accelerator_backend)
     tl.store(q_ptr + output_row_offset + offsets0, quantized0, mask=mask0)
     tl.store(q_ptr + output_row_offset + offsets1, quantized1, mask=mask1)
     if block2:
-        quantized2 = tl.clamp(
-            libdevice.rint(
-                normalize_for_int8(values2, normalization_scale, logical_dtype_code).to(tl.float32)
-            ),
-            -128.0,
-            127.0,
-        ).to(tl.int8)
+        quantized2 = _quantize_int8(values2, normalization_scale, accelerator_backend)
         tl.store(q_ptr + output_row_offset + offsets2, quantized2, mask=mask2)
     tl.store(scale_ptr + row_i64, normalization_scale * inverse_sqrt_group)
 
 
 def _uses_amd_chunked_preparation(
     target: AcceleratorTarget,
-    logical_dtype_code: int,
+    input_dtype: torch.dtype,
     blocks: tuple[int, int, int],
 ) -> bool:
     """Return whether AMD uses the lower-live-range BF16 preparation kernel."""
-    return target.is_amd_hip and logical_dtype_code == 2 and blocks[1] != 0
+    return target.is_amd_hip and input_dtype is torch.bfloat16 and blocks[1] != 0
 
 
 def _launch_amd_chunked_preparation(
@@ -292,7 +262,6 @@ def _launch_amd_chunked_preparation(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     group_size: int,
-    logical_dtype_code: int,
     activation_fn: str | None,
     num_warps: int,
     blocks: tuple[int, int, int],
@@ -310,7 +279,6 @@ def _launch_amd_chunked_preparation(
             block2=blocks[2],
             group_size=group_size,
             inverse_sqrt_group=group_size**-0.5,
-            logical_dtype_code=logical_dtype_code,
             activation_fn=activation_fn,
             accelerator_backend="hip",
             num_warps=num_warps,
@@ -322,7 +290,6 @@ def _launch_full_row_preparation(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     group_size: int,
-    logical_dtype_code: int,
     activation_fn: str | None,
     num_warps: int,
     target: AcceleratorTarget,
@@ -338,7 +305,6 @@ def _launch_full_row_preparation(
             block_size=max(128, triton.next_power_of_2(k)),
             group_size=group_size,
             inverse_sqrt_group=group_size**-0.5,
-            logical_dtype_code=logical_dtype_code,
             activation_fn=activation_fn,
             accelerator_backend=target.backend,
             num_warps=num_warps,
@@ -350,7 +316,6 @@ def fused_rotate_quantize_input(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     group_size: int,
-    logical_dtype_code: int,
     *,
     activation_fn: str | None = None,
     num_warps: int,
@@ -377,13 +342,12 @@ def fused_rotate_quantize_input(
     if not policy.select_execution_plan(target, in_features=k).fuse_rotation_quantization:
         raise ValueError(f"fused preparation does not support row width {k}")
     blocks = policy.preparation_blocks(k)
-    if _uses_amd_chunked_preparation(target, logical_dtype_code, blocks):
+    if _uses_amd_chunked_preparation(target, input.dtype, blocks):
         _launch_amd_chunked_preparation(
             input,
             input_qdata,
             input_scale,
             group_size,
-            logical_dtype_code,
             activation_fn,
             num_warps,
             blocks,
@@ -394,7 +358,6 @@ def fused_rotate_quantize_input(
         input_qdata,
         input_scale,
         group_size,
-        logical_dtype_code,
         activation_fn,
         num_warps,
         target,
@@ -424,7 +387,6 @@ def quantize_input(
     rotated: torch.Tensor,
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    logical_dtype_code: int,
     *,
     num_warps: int,
 ) -> None:
@@ -437,7 +399,7 @@ def quantize_input(
             input_scale,
             k,
             block_size=max(128, triton.next_power_of_2(k)),
-            logical_dtype_code=logical_dtype_code,
+            accelerator_backend="hip",
             reciprocal_scale=True,
             num_warps=num_warps,
         )
@@ -484,14 +446,12 @@ def prepare_input_with_plan(
         result = out
     input_qdata = result[0].reshape(m, in_features)
     input_scale = result[1].reshape(m)
-    logical_dtype_code = convrot_backend.logical_dtype_code(input.dtype)
     if execution_plan.fuse_rotation_quantization:
         fused_rotate_quantize_input(
             input_2d,
             input_qdata,
             input_scale,
             group_size,
-            logical_dtype_code,
             activation_fn=activation_fn,
             num_warps=execution_plan.fused_num_warps,
             target=target,
@@ -509,7 +469,6 @@ def prepare_input_with_plan(
             rotated,
             input_qdata,
             input_scale,
-            logical_dtype_code,
             num_warps=execution_plan.quantization_num_warps,
         )
     return result
