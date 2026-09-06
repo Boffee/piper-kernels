@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation, input_activation_width
 from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
@@ -298,21 +299,22 @@ def _launch_amd_chunked_preparation(
 ) -> None:
     """Launch AMD's chunked fused rotation and quantization path."""
     m, k = input_qdata.shape
-    rotate_quantize_rows_chunked_kernel[(m,)](
-        input,
-        input_qdata,
-        input_scale,
-        k,
-        block0=blocks[0],
-        block1=blocks[1],
-        block2=blocks[2],
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=logical_dtype_code,
-        activation_fn=activation_fn,
-        accelerator_backend="hip",
-        num_warps=num_warps,
-    )
+    with device_context(input.device):
+        rotate_quantize_rows_chunked_kernel[(m,)](
+            input,
+            input_qdata,
+            input_scale,
+            k,
+            block0=blocks[0],
+            block1=blocks[1],
+            block2=blocks[2],
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=logical_dtype_code,
+            activation_fn=activation_fn,
+            accelerator_backend="hip",
+            num_warps=num_warps,
+        )
 
 
 def _launch_full_row_preparation(
@@ -327,19 +329,20 @@ def _launch_full_row_preparation(
 ) -> None:
     """Launch the shared full-row fused rotation and quantization path."""
     m, k = input_qdata.shape
-    rotate_quantize_rows_kernel[(m,)](
-        input,
-        input_qdata,
-        input_scale,
-        k,
-        block_size=max(128, triton.next_power_of_2(k)),
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=logical_dtype_code,
-        activation_fn=activation_fn,
-        accelerator_backend=target.backend,
-        num_warps=num_warps,
-    )
+    with device_context(input.device):
+        rotate_quantize_rows_kernel[(m,)](
+            input,
+            input_qdata,
+            input_scale,
+            k,
+            block_size=max(128, triton.next_power_of_2(k)),
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=logical_dtype_code,
+            activation_fn=activation_fn,
+            accelerator_backend=target.backend,
+            num_warps=num_warps,
+        )
 
 
 def fused_rotate_quantize_input(
@@ -427,16 +430,17 @@ def quantize_input(
 ) -> None:
     """Apply the portable split-path rowwise quantization."""
     m, k = rotated.shape
-    quantize_rows_kernel[(m,)](
-        rotated,
-        input_qdata,
-        input_scale,
-        k,
-        block_size=max(128, triton.next_power_of_2(k)),
-        logical_dtype_code=logical_dtype_code,
-        reciprocal_scale=True,
-        num_warps=num_warps,
-    )
+    with device_context(rotated.device):
+        quantize_rows_kernel[(m,)](
+            rotated,
+            input_qdata,
+            input_scale,
+            k,
+            block_size=max(128, triton.next_power_of_2(k)),
+            logical_dtype_code=logical_dtype_code,
+            reciprocal_scale=True,
+            num_warps=num_warps,
+        )
 
 
 def default_execution_plan(
@@ -592,51 +596,53 @@ def execute_prepared_linear(
     )
     bias_pointer = bias if bias is not None else output
 
-    def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
-        grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
-        int8_matmul_kernel[grid](
-            input_qdata_2d,
-            weight_qdata,
-            output,
-            input_scale_1d,
-            weight_scale,
-            bias_pointer,
-            second_weight,
-            second_scale,
-            second_bias if second_bias is not None else output,
-            m,
-            n,
-            k,
-            output.stride(0),
-            row_block_offset,
-            block_m=plan.matmul_block_m,
-            block_n=plan.matmul_block_n,
-            block_k=plan.matmul_block_k,
-            has_bias=bias is not None,
-            paired=paired,
-            second_has_bias=second_bias is not None,
-            aligned_tiles=aligned_m
-            and (n % plan.matmul_block_n == 0)
-            and (k % plan.matmul_block_k == 0),
-            group_m=group_m,
-            **compiler_options,
-            num_stages=plan.matmul_num_stages,
-            num_warps=plan.matmul_num_warps,
-        )
+    with device_context(input_qdata.device):
 
-    full_row_blocks = m // plan.matmul_block_m
-    if group_m:
-        if full_row_blocks:
-            launch_tiles(full_row_blocks, 0, aligned_m=True)
-        if m % plan.matmul_block_m:
-            launch_tiles(1, full_row_blocks, aligned_m=False)
-    else:
-        launch_tiles(
-            (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
-            0,
-            aligned_m=False,
-        )
-    return result
+        def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
+            grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+            int8_matmul_kernel[grid](
+                input_qdata_2d,
+                weight_qdata,
+                output,
+                input_scale_1d,
+                weight_scale,
+                bias_pointer,
+                second_weight,
+                second_scale,
+                second_bias if second_bias is not None else output,
+                m,
+                n,
+                k,
+                output.stride(0),
+                row_block_offset,
+                block_m=plan.matmul_block_m,
+                block_n=plan.matmul_block_n,
+                block_k=plan.matmul_block_k,
+                has_bias=bias is not None,
+                paired=paired,
+                second_has_bias=second_bias is not None,
+                aligned_tiles=aligned_m
+                and (n % plan.matmul_block_n == 0)
+                and (k % plan.matmul_block_k == 0),
+                group_m=group_m,
+                **compiler_options,
+                num_stages=plan.matmul_num_stages,
+                num_warps=plan.matmul_num_warps,
+            )
+
+        full_row_blocks = m // plan.matmul_block_m
+        if group_m:
+            if full_row_blocks:
+                launch_tiles(full_row_blocks, 0, aligned_m=True)
+            if m % plan.matmul_block_m:
+                launch_tiles(1, full_row_blocks, aligned_m=False)
+        else:
+            launch_tiles(
+                (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
+                0,
+                aligned_m=False,
+            )
+        return result
 
 
 def run_linear(

@@ -6,6 +6,7 @@ import pytest
 import torch
 from gguf_format._fixtures import dequantize_reference, finite_packed
 
+from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import ConvRotInt8Tensor, _backend, _gguf
@@ -122,7 +123,7 @@ def test_generic_conversion_does_not_require_a_tuned_amd_target(monkeypatch, arc
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", architecture)
     )
-    monkeypatch.setattr(generic_triton, "supports_device", lambda device: True)
+    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     assert _backend.select_gguf_converter(torch.empty(1)) is generic_triton.convert_gguf_out
     monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
@@ -131,7 +132,7 @@ def test_generic_conversion_does_not_require_a_tuned_amd_target(monkeypatch, arc
 
 def test_conversion_requires_a_matching_triton_driver(monkeypatch):
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    monkeypatch.setattr(generic_triton, "supports_device", lambda device: False)
+    monkeypatch.setattr(runtime, "supports_device", lambda device: False)
     assert _backend.select_gguf_converter(torch.empty(1)) is None
     monkeypatch.setattr(_backend, "_generic_backend", None)
     assert _backend.select_gguf_converter(torch.empty(1)) is None

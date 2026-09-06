@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -200,50 +201,51 @@ def _prepare_sparse_piper_attention(
         dtype=torch.float32,
     )
 
-    _quantize_value_per_tile_kernel[(tile_count, batch * heads)](
-        combined_value,
-        value_mean,
-        value_scale_multiplier,
-        value_int8,
-        block_lengths if block_lengths is not None else value_mean,
-        logical_sequence_length,
-        combined_value.stride(0),
-        combined_value.stride(1),
-        combined_value.stride(2),
-        value_int8.stride(0),
-        value_int8.stride(1),
-        value_int8.stride(2),
-        value_int8.stride(3),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=_BLOCK_N,
-        mask_block_lengths=block_lengths is not None,
-        num_warps=4,
-    )
+    with device_context(query.device):
+        _quantize_value_per_tile_kernel[(tile_count, batch * heads)](
+            combined_value,
+            value_mean,
+            value_scale_multiplier,
+            value_int8,
+            block_lengths if block_lengths is not None else value_mean,
+            logical_sequence_length,
+            combined_value.stride(0),
+            combined_value.stride(1),
+            combined_value.stride(2),
+            value_int8.stride(0),
+            value_int8.stride(1),
+            value_int8.stride(2),
+            value_int8.stride(3),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=_BLOCK_N,
+            mask_block_lengths=block_lengths is not None,
+            num_warps=4,
+        )
 
-    context = _PreparedSparsePiperContext(
-        key=prepared_qk.key,
-        value=value_int8,
-        key_scale=prepared_qk.key_scale,
-        value_scale_multiplier=value_scale_multiplier,
-        value_mean=value_mean,
-        route_head_offsets=route_head_offsets,
-        head_keep_blocks=head_keep_blocks,
-        routes_per_query=routes.shape[2],
-        block_lengths=block_lengths,
-        sparse_key_blocks=sparse_key_blocks,
-        sparse_query_blocks=sparse_query_blocks,
-        logical_sequence_length=logical_sequence_length,
-    )
-    return _PreparedSparsePiperAttention(
-        context=context,
-        query=_prepare_sparse_piper_query_from_quantized(
-            prepared_qk.query,
-            prepared_qk.query_scale,
-            routes,
-            context,
-        ),
-    )
+        context = _PreparedSparsePiperContext(
+            key=prepared_qk.key,
+            value=value_int8,
+            key_scale=prepared_qk.key_scale,
+            value_scale_multiplier=value_scale_multiplier,
+            value_mean=value_mean,
+            route_head_offsets=route_head_offsets,
+            head_keep_blocks=head_keep_blocks,
+            routes_per_query=routes.shape[2],
+            block_lengths=block_lengths,
+            sparse_key_blocks=sparse_key_blocks,
+            sparse_query_blocks=sparse_query_blocks,
+            logical_sequence_length=logical_sequence_length,
+        )
+        return _PreparedSparsePiperAttention(
+            context=context,
+            query=_prepare_sparse_piper_query_from_quantized(
+                prepared_qk.query,
+                prepared_qk.query_scale,
+                routes,
+                context,
+            ),
+        )
 
 
 def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912

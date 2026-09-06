@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import (
@@ -32,7 +33,7 @@ _gpu = pytest.mark.skipif(
 def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architecture):
     target = AcceleratorTarget("hip", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    monkeypatch.setattr(generic_triton, "supports_device", lambda device: True)
+    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
     assert _backend.select_linear_backend(value) is amd
     assert _backend.select_add(value) is _generic.add_

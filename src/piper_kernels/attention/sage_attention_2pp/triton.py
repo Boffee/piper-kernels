@@ -16,6 +16,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
@@ -640,19 +641,20 @@ def _make_attention_tensor_descriptors(
 ) -> tuple[TensorDescriptor, TensorDescriptor]:
     """Describe flattened-BH K and feature-major V for descriptor loads."""
     batch, heads, key_length, head_dim = key.shape
-    key_descriptor = TensorDescriptor(
-        base=key,
-        shape=[batch * heads, key_length, head_dim],
-        strides=[key_length * head_dim, head_dim, 1],
-        block_shape=[1, int(_BLOCK_N), head_dim],
-    )
-    value_descriptor = TensorDescriptor(
-        base=value,
-        shape=[batch * heads, head_dim, key_length],
-        strides=[head_dim * key_length, key_length, 1],
-        block_shape=[1, head_dim, int(_BLOCK_N)],
-    )
-    return key_descriptor, value_descriptor
+    with device_context(key.device):
+        key_descriptor = TensorDescriptor(
+            base=key,
+            shape=[batch * heads, key_length, head_dim],
+            strides=[key_length * head_dim, head_dim, 1],
+            block_shape=[1, int(_BLOCK_N), head_dim],
+        )
+        value_descriptor = TensorDescriptor(
+            base=value,
+            shape=[batch * heads, head_dim, key_length],
+            strides=[head_dim * key_length, key_length, 1],
+            block_shape=[1, head_dim, int(_BLOCK_N)],
+        )
+        return key_descriptor, value_descriptor
 
 
 def _default_sage_attention_2pp_execution_plan(
@@ -699,40 +701,41 @@ def _compute_kv_statistics(
     partial_shape = (batch, heads, num_partials, head_dim)
     key_sum_partial = torch.empty(partial_shape, device=key.device, dtype=torch.float32)
     value_max_partial = torch.empty_like(key_sum_partial)
-    _kv_statistics_partial_kernel[(num_partials, heads, batch)](
-        key,
-        value,
-        key_sum_partial,
-        value_max_partial,
-        key_length,
-        num_partials,
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=statistics_block,
-        num_warps=4,
-    )
+    with device_context(key.device):
+        _kv_statistics_partial_kernel[(num_partials, heads, batch)](
+            key,
+            value,
+            key_sum_partial,
+            value_max_partial,
+            key_length,
+            num_partials,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=statistics_block,
+            num_warps=4,
+        )
 
-    key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
-    value_scale = torch.empty_like(key_mean)
-    _finish_kv_statistics_kernel[(triton.cdiv(head_dim, 32), batch * heads)](
-        key_sum_partial,
-        value_max_partial,
-        key_mean,
-        value_scale,
-        key_length,
-        num_partials,
-        head_dim=head_dim,
-        partial_block=triton.next_power_of_2(num_partials),
-        block_d=32,
-        num_warps=4,
-    )
-    return key_mean, value_scale
+        key_mean = torch.empty((batch, heads, head_dim), device=key.device, dtype=torch.float32)
+        value_scale = torch.empty_like(key_mean)
+        _finish_kv_statistics_kernel[(triton.cdiv(head_dim, 32), batch * heads)](
+            key_sum_partial,
+            value_max_partial,
+            key_mean,
+            value_scale,
+            key_length,
+            num_partials,
+            head_dim=head_dim,
+            partial_block=triton.next_power_of_2(num_partials),
+            block_d=32,
+            num_warps=4,
+        )
+        return key_mean, value_scale
 
 
 def _quantize_value(
@@ -750,23 +753,24 @@ def _quantize_value(
     )
 
     num_key_blocks = int(triton.cdiv(key_length, _BLOCK_N))
-    _quantize_value_kernel[(num_key_blocks, heads, batch)](
-        value,
-        value_scale,
-        value_fp8,
-        key_length,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        value_fp8.stride(0),
-        value_fp8.stride(1),
-        value_fp8.stride(2),
-        heads=heads,
-        head_dim=head_dim,
-        block_n=_BLOCK_N,
-        num_warps=4,
-    )
-    return value_fp8
+    with device_context(value.device):
+        _quantize_value_kernel[(num_key_blocks, heads, batch)](
+            value,
+            value_scale,
+            value_fp8,
+            key_length,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value_fp8.stride(0),
+            value_fp8.stride(1),
+            value_fp8.stride(2),
+            heads=heads,
+            head_dim=head_dim,
+            block_n=_BLOCK_N,
+            num_warps=4,
+        )
+        return value_fp8
 
 
 def _prepare_sage_attention_2pp(
@@ -830,34 +834,35 @@ def _launch_sage_attention_2pp(prepared: _PreparedSageAttention2pp) -> torch.Ten
     """Launch only the fused attention recurrence on prepared quantized inputs."""
     batch, heads, query_length, head_dim = prepared.output.shape
     plan = prepared.plan
-    _sage_attention_2pp_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
-        prepared.query,
-        prepared.key,
-        prepared.value,
-        prepared.query_scale,
-        prepared.key_scale,
-        prepared.value_scale,
-        prepared.output,
-        query_length,
-        prepared.key_length,
-        prepared.query.stride(0),
-        prepared.query.stride(1),
-        prepared.query.stride(2),
-        is_causal=prepared.is_causal,
-        grouped_qk=plan.grouped_qk,
-        use_packed_probability_conversion=plan.use_packed_probability_conversion,
-        reverse_causal_blocks=plan.reverse_causal_blocks,
-        loop_num_stages=plan.loop_num_stages,
-        loop_licm=plan.loop_licm,
-        heads=heads,
-        head_dim=head_dim,
-        block_m=plan.block_m,
-        block_n=_BLOCK_N,
-        use_tensor_descriptors=plan.use_tensor_descriptors,
-        num_stages=plan.num_stages,
-        num_warps=plan.num_warps,
-    )
-    return prepared.output
+    with device_context(prepared.output.device):
+        _sage_attention_2pp_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
+            prepared.query,
+            prepared.key,
+            prepared.value,
+            prepared.query_scale,
+            prepared.key_scale,
+            prepared.value_scale,
+            prepared.output,
+            query_length,
+            prepared.key_length,
+            prepared.query.stride(0),
+            prepared.query.stride(1),
+            prepared.query.stride(2),
+            is_causal=prepared.is_causal,
+            grouped_qk=plan.grouped_qk,
+            use_packed_probability_conversion=plan.use_packed_probability_conversion,
+            reverse_causal_blocks=plan.reverse_causal_blocks,
+            loop_num_stages=plan.loop_num_stages,
+            loop_licm=plan.loop_licm,
+            heads=heads,
+            head_dim=head_dim,
+            block_m=plan.block_m,
+            block_n=_BLOCK_N,
+            use_tensor_descriptors=plan.use_tensor_descriptors,
+            num_stages=plan.num_stages,
+            num_warps=plan.num_warps,
+        )
+        return prepared.output
 
 
 def _run_sage_attention_2pp(

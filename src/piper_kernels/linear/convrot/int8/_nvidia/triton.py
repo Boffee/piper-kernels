@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._input_activations import (
     apply_input_activation,
@@ -122,15 +123,16 @@ def quantize_input(
 ) -> None:
     """Apply the portable split-path rowwise quantization."""
     m, k = rotated.shape
-    quantize_rows_kernel[(m,)](
-        rotated,
-        input_qdata,
-        input_scale,
-        k,
-        block_size=max(128, triton.next_power_of_2(k)),
-        logical_dtype_code=logical_dtype_code,
-        num_warps=num_warps,
-    )
+    with device_context(rotated.device):
+        quantize_rows_kernel[(m,)](
+            rotated,
+            input_qdata,
+            input_scale,
+            k,
+            block_size=max(128, triton.next_power_of_2(k)),
+            logical_dtype_code=logical_dtype_code,
+            num_warps=num_warps,
+        )
 
 
 def fused_rotate_quantize_input(
@@ -168,21 +170,22 @@ def fused_rotate_quantize_input(
     if fused_chunks is None:
         raise ValueError(f"fused preparation does not support row width {k}")
     chunk_count, chunk_size = fused_chunks
-    rotate_quantize_rows_kernel[(m,)](
-        input,
-        input_qdata,
-        input_scale,
-        k,
-        chunk_size=chunk_size,
-        chunk_count=chunk_count,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=logical_dtype_code,
-        activation_fn=activation_fn,
-        accelerator_backend=target.backend,
-        gguf_quant_type=-1,
-        num_warps=num_warps,
-    )
+    with device_context(input.device):
+        rotate_quantize_rows_kernel[(m,)](
+            input,
+            input_qdata,
+            input_scale,
+            k,
+            chunk_size=chunk_size,
+            chunk_count=chunk_count,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=logical_dtype_code,
+            activation_fn=activation_fn,
+            accelerator_backend=target.backend,
+            gguf_quant_type=-1,
+            num_warps=num_warps,
+        )
 
 
 def default_execution_plan(
@@ -335,50 +338,52 @@ def execute_prepared_linear(
     )
     bias_pointer = bias if bias is not None else output
 
-    def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
-        grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
-        int8_matmul_kernel[grid](
-            input_qdata_2d,
-            weight_qdata,
-            output,
-            input_scale_1d,
-            weight_scale,
-            bias_pointer,
-            second_weight,
-            second_scale,
-            second_bias if second_bias is not None else output,
-            m,
-            n,
-            k,
-            output.stride(0),
-            row_block_offset,
-            block_m=plan.matmul_block_m,
-            block_n=plan.matmul_block_n,
-            block_k=plan.matmul_block_k,
-            has_bias=bias is not None,
-            paired=paired,
-            second_has_bias=second_bias is not None,
-            aligned_tiles=aligned_m
-            and (n % plan.matmul_block_n == 0)
-            and (k % plan.matmul_block_k == 0),
-            group_m=group_m,
-            num_stages=plan.matmul_num_stages,
-            num_warps=plan.matmul_num_warps,
-        )
+    with device_context(input_qdata.device):
 
-    full_row_blocks = m // plan.matmul_block_m
-    if group_m:
-        if full_row_blocks:
-            launch_tiles(full_row_blocks, 0, aligned_m=True)
-        if m % plan.matmul_block_m:
-            launch_tiles(1, full_row_blocks, aligned_m=False)
-    else:
-        launch_tiles(
-            (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
-            0,
-            aligned_m=False,
-        )
-    return result
+        def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
+            grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+            int8_matmul_kernel[grid](
+                input_qdata_2d,
+                weight_qdata,
+                output,
+                input_scale_1d,
+                weight_scale,
+                bias_pointer,
+                second_weight,
+                second_scale,
+                second_bias if second_bias is not None else output,
+                m,
+                n,
+                k,
+                output.stride(0),
+                row_block_offset,
+                block_m=plan.matmul_block_m,
+                block_n=plan.matmul_block_n,
+                block_k=plan.matmul_block_k,
+                has_bias=bias is not None,
+                paired=paired,
+                second_has_bias=second_bias is not None,
+                aligned_tiles=aligned_m
+                and (n % plan.matmul_block_n == 0)
+                and (k % plan.matmul_block_k == 0),
+                group_m=group_m,
+                num_stages=plan.matmul_num_stages,
+                num_warps=plan.matmul_num_warps,
+            )
+
+        full_row_blocks = m // plan.matmul_block_m
+        if group_m:
+            if full_row_blocks:
+                launch_tiles(full_row_blocks, 0, aligned_m=True)
+            if m % plan.matmul_block_m:
+                launch_tiles(1, full_row_blocks, aligned_m=False)
+        else:
+            launch_tiles(
+                (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
+                0,
+                aligned_m=False,
+            )
+        return result
 
 
 def run_linear(
@@ -497,34 +502,35 @@ def dequantized_input_mean(
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else input_scale
     valid_count = block_lengths.sum(dtype=torch.float32) if has_block_lengths else input_scale
-    _dequantized_input_mean_partial_kernel[
-        (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
-    ](
-        input_qdata,
-        input_scale,
-        partial,
-        block_lengths_ptr,
-        sequence_length,
-        input_features=input_features,
-        row_block_count=row_block_count,
-        mask_block_lengths=has_block_lengths,
-        block_m=_MEAN_BLOCK_M,
-        block_k=_MEAN_BLOCK_K,
-        num_warps=8,
-    )
-    _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
-        partial,
-        output,
-        valid_count,
-        sequence_length,
-        input_features=input_features,
-        row_block_count=row_block_count,
-        reduction_rows=triton.next_power_of_2(row_block_count),
-        mask_block_lengths=has_block_lengths,
-        block_k=_MEAN_BLOCK_K,
-        num_warps=8,
-    )
-    return output
+    with device_context(input_qdata.device):
+        _dequantized_input_mean_partial_kernel[
+            (row_block_count, triton.cdiv(input_features, _MEAN_BLOCK_K), batch)
+        ](
+            input_qdata,
+            input_scale,
+            partial,
+            block_lengths_ptr,
+            sequence_length,
+            input_features=input_features,
+            row_block_count=row_block_count,
+            mask_block_lengths=has_block_lengths,
+            block_m=_MEAN_BLOCK_M,
+            block_k=_MEAN_BLOCK_K,
+            num_warps=8,
+        )
+        _dequantized_input_mean_reduce_kernel[(triton.cdiv(input_features, _MEAN_BLOCK_K), batch)](
+            partial,
+            output,
+            valid_count,
+            sequence_length,
+            input_features=input_features,
+            row_block_count=row_block_count,
+            reduction_rows=triton.next_power_of_2(row_block_count),
+            mask_block_lengths=has_block_lengths,
+            block_k=_MEAN_BLOCK_K,
+            num_warps=8,
+        )
+        return output
 
 
 def linear_prepared(

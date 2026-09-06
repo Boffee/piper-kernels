@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
 
 from ._routes import _MEAN_ROUTING, validate_routing_mode
@@ -142,40 +143,42 @@ def sequence_block_summaries(
         else torch.empty_like(key_primary)
     )
 
-    def launch(
-        sequence: torch.Tensor,
-        primary: torch.Tensor,
-        aux: torch.Tensor,
-        *,
-        query: bool,
-    ) -> None:
-        logical_rows = sequence.shape[2]
-        logical_blocks = (logical_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-        _block_summary_kernel[(batch * heads * logical_blocks,)](
-            sequence,
-            primary,
-            aux,
-            sequence if block_lengths is None else block_lengths,
-            logical_block_count=logical_blocks,
-            logical_row_count=logical_rows,
-            stride_ib=sequence.stride(0),
-            stride_ih=sequence.stride(1),
-            stride_il=_BLOCK_ROWS * sequence.stride(2),
-            stride_ir=sequence.stride(2),
-            block_rows=_BLOCK_ROWS,
-            head_dim=_HEAD_DIM,
-            heads=heads,
-            query_summary=query,
-            mean_pool_summary=mean_pool_summary,
-            mask_block_lengths=block_lengths is not None,
-            mask_ragged_tail=block_lengths is None and logical_rows % _BLOCK_ROWS != 0,
-            num_warps=4,
-            num_stages=1,
-        )
+    with device_context(query.device):
 
-    launch(query, query_summary, query_summary, query=True)
-    launch(key, key_primary, key_aux, query=False)
-    return query_summary, key_primary, key_aux
+        def launch(
+            sequence: torch.Tensor,
+            primary: torch.Tensor,
+            aux: torch.Tensor,
+            *,
+            query: bool,
+        ) -> None:
+            logical_rows = sequence.shape[2]
+            logical_blocks = (logical_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+            _block_summary_kernel[(batch * heads * logical_blocks,)](
+                sequence,
+                primary,
+                aux,
+                sequence if block_lengths is None else block_lengths,
+                logical_block_count=logical_blocks,
+                logical_row_count=logical_rows,
+                stride_ib=sequence.stride(0),
+                stride_ih=sequence.stride(1),
+                stride_il=_BLOCK_ROWS * sequence.stride(2),
+                stride_ir=sequence.stride(2),
+                block_rows=_BLOCK_ROWS,
+                head_dim=_HEAD_DIM,
+                heads=heads,
+                query_summary=query,
+                mean_pool_summary=mean_pool_summary,
+                mask_block_lengths=block_lengths is not None,
+                mask_ragged_tail=block_lengths is None and logical_rows % _BLOCK_ROWS != 0,
+                num_warps=4,
+                num_stages=1,
+            )
+
+        launch(query, query_summary, query_summary, query=True)
+        launch(key, key_primary, key_aux, query=False)
+        return query_summary, key_primary, key_aux
 
 
 __all__ = ["sequence_block_summaries"]

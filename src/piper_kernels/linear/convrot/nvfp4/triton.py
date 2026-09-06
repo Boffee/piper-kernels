@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import triton as gguf_backend
 from piper_kernels.linear._input_activations import input_activation_width
@@ -476,23 +477,24 @@ def _prepare_dynamic_scale(
     chunk_size0, chunk_size1, chunk_size2 = chunk_sizes
     amax_num_warps, _ = _preparation_num_warps(chunk_sizes, group_size)
     row_amax = torch.empty(rows, device=contiguous_input.device, dtype=torch.float32)
-    _rotated_row_amax_kernel[(rows,)](
-        contiguous_input,
-        row_amax,
-        input_features,
-        chunk_count=chunk_count,
-        chunk_size0=chunk_size0,
-        chunk_size1=chunk_size1,
-        chunk_size2=chunk_size2,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=convrot_backend.logical_dtype_code(contiguous_input.dtype),
-        activation_fn=activation_fn,
-        accelerator_backend=target.backend,
-        gguf_quant_type=-1,
-        num_warps=amax_num_warps,
-    )
-    return nvfp4_backend.dynamic_scale(row_amax, out=out)
+    with device_context(contiguous_input.device):
+        _rotated_row_amax_kernel[(rows,)](
+            contiguous_input,
+            row_amax,
+            input_features,
+            chunk_count=chunk_count,
+            chunk_size0=chunk_size0,
+            chunk_size1=chunk_size1,
+            chunk_size2=chunk_size2,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=convrot_backend.logical_dtype_code(contiguous_input.dtype),
+            activation_fn=activation_fn,
+            accelerator_backend=target.backend,
+            gguf_quant_type=-1,
+            num_warps=amax_num_warps,
+        )
+        return nvfp4_backend.dynamic_scale(row_amax, out=out)
 
 
 def _prepare_static_storage(
@@ -521,30 +523,31 @@ def _prepare_static_storage(
     chunk_count = sum(chunk_size > 0 for chunk_size in chunk_sizes)
     chunk_size0, chunk_size1, chunk_size2 = chunk_sizes
     _, packing_num_warps = _preparation_num_warps(chunk_sizes, group_size)
-    _rotate_quantize_nvfp4_kernel[(rows,)](
-        contiguous_input,
-        per_tensor_scale,
-        qdata,
-        scale,
-        input_features,
-        chunk_count=chunk_count,
-        chunk_size0=chunk_size0,
-        chunk_size1=chunk_size1,
-        chunk_size2=chunk_size2,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=convrot_backend.logical_dtype_code(contiguous_input.dtype),
-        scale_column_blocks=(input_features + nvfp4_layout.SCALE_COLUMN_TILE - 1)
-        // nvfp4_layout.SCALE_COLUMN_TILE,
-        activation_fn=activation_fn,
-        accelerator_backend=target.backend,
-        gguf_quant_type=-1,
-        has_per_tensor_scale=True,
-        swizzled_scales=True,
-        high_first=high_first,
-        num_warps=packing_num_warps,
-    )
-    return qdata, scale
+    with device_context(contiguous_input.device):
+        _rotate_quantize_nvfp4_kernel[(rows,)](
+            contiguous_input,
+            per_tensor_scale,
+            qdata,
+            scale,
+            input_features,
+            chunk_count=chunk_count,
+            chunk_size0=chunk_size0,
+            chunk_size1=chunk_size1,
+            chunk_size2=chunk_size2,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=convrot_backend.logical_dtype_code(contiguous_input.dtype),
+            scale_column_blocks=(input_features + nvfp4_layout.SCALE_COLUMN_TILE - 1)
+            // nvfp4_layout.SCALE_COLUMN_TILE,
+            activation_fn=activation_fn,
+            accelerator_backend=target.backend,
+            gguf_quant_type=-1,
+            has_per_tensor_scale=True,
+            swizzled_scales=True,
+            high_first=high_first,
+            num_warps=packing_num_warps,
+        )
+        return qdata, scale
 
 
 def _gguf_dynamic_scale(
@@ -564,23 +567,24 @@ def _gguf_dynamic_scale(
     amax_num_warps, _ = _preparation_num_warps(chunk_sizes, group_size)
     row_amax = torch.empty(rows, device=data.device, dtype=torch.float32)
     target = AcceleratorTarget.from_device(data.device)
-    _rotated_row_amax_kernel[(rows,)](
-        data,
-        row_amax,
-        row_width,
-        chunk_count=chunk_count,
-        chunk_size0=chunk_size0,
-        chunk_size1=chunk_size1,
-        chunk_size2=chunk_size2,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
-        activation_fn=None,
-        accelerator_backend=target.backend,
-        gguf_quant_type=quant_type,
-        num_warps=amax_num_warps,
-    )
-    return nvfp4_backend.dynamic_scale(row_amax, out=out)
+    with device_context(data.device):
+        _rotated_row_amax_kernel[(rows,)](
+            data,
+            row_amax,
+            row_width,
+            chunk_count=chunk_count,
+            chunk_size0=chunk_size0,
+            chunk_size1=chunk_size1,
+            chunk_size2=chunk_size2,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
+            activation_fn=None,
+            accelerator_backend=target.backend,
+            gguf_quant_type=quant_type,
+            num_warps=amax_num_warps,
+        )
+        return nvfp4_backend.dynamic_scale(row_amax, out=out)
 
 
 def _gguf_prepare_out(
@@ -603,29 +607,30 @@ def _gguf_prepare_out(
     chunk_size0, chunk_size1, chunk_size2 = chunk_sizes
     _, packing_num_warps = _preparation_num_warps(chunk_sizes, group_size)
     target = AcceleratorTarget.from_device(data.device)
-    _rotate_quantize_nvfp4_kernel[(rows,)](
-        data,
-        per_tensor_scale if per_tensor_scale is not None else data,
-        qdata,
-        scale,
-        row_width,
-        chunk_count=chunk_count,
-        chunk_size0=chunk_size0,
-        chunk_size1=chunk_size1,
-        chunk_size2=chunk_size2,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
-        scale_column_blocks=(row_width + nvfp4_layout.SCALE_COLUMN_TILE - 1)
-        // nvfp4_layout.SCALE_COLUMN_TILE,
-        activation_fn=None,
-        accelerator_backend=target.backend,
-        gguf_quant_type=quant_type,
-        has_per_tensor_scale=per_tensor_scale is not None,
-        swizzled_scales=is_swizzled_scales,
-        high_first=high_first,
-        num_warps=packing_num_warps,
-    )
+    with device_context(data.device):
+        _rotate_quantize_nvfp4_kernel[(rows,)](
+            data,
+            per_tensor_scale if per_tensor_scale is not None else data,
+            qdata,
+            scale,
+            row_width,
+            chunk_count=chunk_count,
+            chunk_size0=chunk_size0,
+            chunk_size1=chunk_size1,
+            chunk_size2=chunk_size2,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            logical_dtype_code=convrot_backend.logical_dtype_code(logical_dtype),
+            scale_column_blocks=(row_width + nvfp4_layout.SCALE_COLUMN_TILE - 1)
+            // nvfp4_layout.SCALE_COLUMN_TILE,
+            activation_fn=None,
+            accelerator_backend=target.backend,
+            gguf_quant_type=quant_type,
+            has_per_tensor_scale=per_tensor_scale is not None,
+            swizzled_scales=is_swizzled_scales,
+            high_first=high_first,
+            num_warps=packing_num_warps,
+        )
 
 
 def dynamic_scale(

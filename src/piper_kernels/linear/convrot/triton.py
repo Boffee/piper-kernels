@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear._triton_input_activations import (
     gelu_tanh,
     swiglu,
@@ -146,15 +147,16 @@ def rotate_input(
     """Materialize a grouped ConvRot transform into caller-owned storage."""
     rows, features = input.shape
     groups_per_row = features // group_size
-    rotate_groups_kernel[(rows * groups_per_row,)](
-        input,
-        rotated,
-        features,
-        groups_per_row,
-        group_size=group_size,
-        inverse_sqrt_group=group_size**-0.5,
-        num_warps=num_warps,
-    )
+    with device_context(input.device):
+        rotate_groups_kernel[(rows * groups_per_row,)](
+            input,
+            rotated,
+            features,
+            groups_per_row,
+            group_size=group_size,
+            inverse_sqrt_group=group_size**-0.5,
+            num_warps=num_warps,
+        )
 
 
 __all__ = [

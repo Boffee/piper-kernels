@@ -49,49 +49,6 @@ def test_legacy_update_exports_preserve_custom_ops():
     assert legacy_triton.addmm_ is _ops.addmm_
 
 
-@pytest.mark.parametrize("device", ["cpu", "meta"])
-def test_host_and_fake_devices_do_not_initialize_triton(monkeypatch, device):
-    monkeypatch.setattr(generic_triton.triton.runtime, "driver", None)
-    assert not generic_triton.supports_device(torch.device(device))
-
-
-@pytest.mark.parametrize(
-    ("backend", "architecture", "device", "supported"),
-    [
-        ("cuda", 60, "cuda", False),
-        ("cuda", 70, "cuda", True),
-        ("hip", "gfx1036", "cuda", True),
-        ("hip", "gfx9999", "cuda", True),
-        ("xpu", "future_device", "xpu", True),
-    ],
-)
-def test_generic_triton_probes_driver_not_model_allowlist(
-    monkeypatch, backend, architecture, device, supported
-):
-    driver = SimpleNamespace(
-        get_active_torch_device=lambda: torch.device(device),
-        get_current_target=lambda: SimpleNamespace(backend=backend, arch=architecture),
-    )
-    monkeypatch.setattr(generic_triton.triton.runtime, "driver", SimpleNamespace(active=driver))
-    assert generic_triton.supports_device(torch.device(device)) is supported
-    assert not generic_triton.supports_device(torch.device("mps"))
-
-
-def test_missing_driver_uses_pytorch(monkeypatch):
-    driver = SimpleNamespace(get_active_torch_device=Mock(side_effect=RuntimeError("no driver")))
-    monkeypatch.setattr(generic_triton.triton.runtime, "driver", SimpleNamespace(active=driver))
-    assert not generic_triton.supports_device(torch.device("cuda"))
-
-
-def test_driver_capabilities_are_not_reused_for_a_different_gpu(monkeypatch):
-    driver = SimpleNamespace(
-        get_active_torch_device=lambda: torch.device("cuda:0"),
-        get_current_target=Mock(side_effect=AssertionError("wrong GPU capability query")),
-    )
-    monkeypatch.setattr(generic_triton.triton.runtime, "driver", SimpleNamespace(active=driver))
-    assert not generic_triton.supports_device(torch.device("cuda:1"))
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(
     torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm GPU"

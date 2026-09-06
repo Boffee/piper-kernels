@@ -23,6 +23,7 @@ from piper_kernels._triton.mixed_int8 import (
     install_uint8_int8_dot_hook,
     uint8_int8_dot,
 )
+from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
@@ -613,23 +614,24 @@ def _make_key_value_descriptors(
     split_pv_head_dim: bool,
 ) -> tuple[TensorDescriptor, TensorDescriptor]:
     batch, heads, storage_key_length, head_dim = key.shape
-    key_descriptor = TensorDescriptor(
-        base=key,
-        shape=[batch * heads, storage_key_length, head_dim],
-        strides=[storage_key_length * head_dim, head_dim, 1],
-        block_shape=[1, _BLOCK_N, head_dim],
-    )
-    value_descriptor = TensorDescriptor(
-        base=value,
-        shape=[batch * heads, head_dim, storage_key_length],
-        strides=[head_dim * storage_key_length, storage_key_length, 1],
-        block_shape=[
-            1,
-            head_dim // 2 if split_pv_head_dim else head_dim,
-            _BLOCK_N,
-        ],
-    )
-    return key_descriptor, value_descriptor
+    with device_context(key.device):
+        key_descriptor = TensorDescriptor(
+            base=key,
+            shape=[batch * heads, storage_key_length, head_dim],
+            strides=[storage_key_length * head_dim, head_dim, 1],
+            block_shape=[1, _BLOCK_N, head_dim],
+        )
+        value_descriptor = TensorDescriptor(
+            base=value,
+            shape=[batch * heads, head_dim, storage_key_length],
+            strides=[head_dim * storage_key_length, storage_key_length, 1],
+            block_shape=[
+                1,
+                head_dim // 2 if split_pv_head_dim else head_dim,
+                _BLOCK_N,
+            ],
+        )
+        return key_descriptor, value_descriptor
 
 
 def _make_query_descriptor(
@@ -638,12 +640,13 @@ def _make_query_descriptor(
 ) -> TensorDescriptor:
     """Describe flattened-BH Q for complete query-block loads."""
     batch, heads, query_length, head_dim = query.shape
-    return TensorDescriptor(
-        base=query,
-        shape=[batch * heads, query_length, head_dim],
-        strides=[query_length * head_dim, head_dim, 1],
-        block_shape=[1, block_m, head_dim],
-    )
+    with device_context(query.device):
+        return TensorDescriptor(
+            base=query,
+            shape=[batch * heads, query_length, head_dim],
+            strides=[query_length * head_dim, head_dim, 1],
+            block_shape=[1, block_m, head_dim],
+        )
 
 
 def _default_piper_attention_execution_plan(
@@ -696,97 +699,97 @@ def _prepare_piper_attention(
         raise ValueError("split-PV Piper Attention requires head_dim=128")
     if plan.optimize_causal_traversal and not is_causal:
         raise ValueError("optimized causal traversal requires causal attention")
-    with torch.cuda.device(query.device):
+    with device_context(query.device):
         install_uint8_int8_dot_hook()
-    padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
-    storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
+        padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
+        storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
 
-    # A sequence-wide V mean is valid only for non-causal attention. Per-row
-    # INT8 rounding would otherwise let future V rows perturb earlier outputs.
-    key_mean, value_mean = _quantization.compute_kv_means(
-        key,
-        value,
-        is_causal=is_causal,
-    )
-    prepared_qk = qk_quantization.prepare_query_key(
-        query,
-        key,
-        key_mean,
-        scale,
-        grouped=plan.grouped_qk,
-        storage_key_length=storage_key_length,
-    )
+        # A sequence-wide V mean is valid only for non-causal attention. Per-row
+        # INT8 rounding would otherwise let future V rows perturb earlier outputs.
+        key_mean, value_mean = _quantization.compute_kv_means(
+            key,
+            value,
+            is_causal=is_causal,
+        )
+        prepared_qk = qk_quantization.prepare_query_key(
+            query,
+            key,
+            key_mean,
+            scale,
+            grouped=plan.grouped_qk,
+            storage_key_length=storage_key_length,
+        )
 
-    value_shape = (batch, heads, head_dim, storage_key_length)
-    value_int8 = (
-        torch.zeros(value_shape, device=value.device, dtype=torch.int8)
-        if storage_key_length != key_length
-        else torch.empty(value_shape, device=value.device, dtype=torch.int8)
-    )
-    value_scale_multiplier = torch.empty(
-        (batch, heads, key_length),
-        device=value.device,
-        dtype=torch.float32,
-    )
-    value_log_scale = torch.empty(
-        (1,) if plan.derive_value_log_bound else (batch, heads, key_length),
-        device=value.device,
-        dtype=torch.float16,
-    )
-    _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), heads, batch)](
-        value,
-        value_mean,
-        value_scale_multiplier,
-        value_log_scale,
-        value_int8,
-        key_length,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        value_int8.stride(0),
-        value_int8.stride(1),
-        value_int8.stride(2),
-        value_int8.stride(3),
-        is_causal=is_causal,
-        store_log_scale=not plan.derive_value_log_bound,
-        heads=heads,
-        head_dim=head_dim,
-        block_n=_BLOCK_N,
-        num_warps=4,
-    )
-
-    key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
-    value_argument: torch.Tensor | TensorDescriptor = value_int8
-    if plan.use_tensor_descriptors:
-        key_argument, value_argument = _make_key_value_descriptors(
-            prepared_qk.key,
+        value_shape = (batch, heads, head_dim, storage_key_length)
+        value_int8 = (
+            torch.zeros(value_shape, device=value.device, dtype=torch.int8)
+            if storage_key_length != key_length
+            else torch.empty(value_shape, device=value.device, dtype=torch.int8)
+        )
+        value_scale_multiplier = torch.empty(
+            (batch, heads, key_length),
+            device=value.device,
+            dtype=torch.float32,
+        )
+        value_log_scale = torch.empty(
+            (1,) if plan.derive_value_log_bound else (batch, heads, key_length),
+            device=value.device,
+            dtype=torch.float16,
+        )
+        _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), heads, batch)](
+            value,
+            value_mean,
+            value_scale_multiplier,
+            value_log_scale,
             value_int8,
-            split_pv_head_dim=plan.split_pv_head_dim,
+            key_length,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value_int8.stride(0),
+            value_int8.stride(1),
+            value_int8.stride(2),
+            value_int8.stride(3),
+            is_causal=is_causal,
+            store_log_scale=not plan.derive_value_log_bound,
+            heads=heads,
+            head_dim=head_dim,
+            block_n=_BLOCK_N,
+            num_warps=4,
         )
-    query_descriptor = (
-        _make_query_descriptor(
-            prepared_qk.query,
-            plan.block_m,
+
+        key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
+        value_argument: torch.Tensor | TensorDescriptor = value_int8
+        if plan.use_tensor_descriptors:
+            key_argument, value_argument = _make_key_value_descriptors(
+                prepared_qk.key,
+                value_int8,
+                split_pv_head_dim=plan.split_pv_head_dim,
+            )
+        query_descriptor = (
+            _make_query_descriptor(
+                prepared_qk.query,
+                plan.block_m,
+            )
+            if plan.use_tensor_descriptors and plan.block_m == 128
+            else None
         )
-        if plan.use_tensor_descriptors and plan.block_m == 128
-        else None
-    )
-    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-    return _PreparedPiperAttention(
-        query=prepared_qk.query,
-        query_descriptor=query_descriptor,
-        key=key_argument,
-        value=value_argument,
-        query_scale=prepared_qk.query_scale,
-        key_scale=prepared_qk.key_scale,
-        value_scale_multiplier=value_scale_multiplier,
-        value_log_scale=value_log_scale,
-        value_mean=value_mean,
-        output=output,
-        key_length=key_length,
-        is_causal=is_causal,
-        plan=plan,
-    )
+        output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+        return _PreparedPiperAttention(
+            query=prepared_qk.query,
+            query_descriptor=query_descriptor,
+            key=key_argument,
+            value=value_argument,
+            query_scale=prepared_qk.query_scale,
+            key_scale=prepared_qk.key_scale,
+            value_scale_multiplier=value_scale_multiplier,
+            value_log_scale=value_log_scale,
+            value_mean=value_mean,
+            output=output,
+            key_length=key_length,
+            is_causal=is_causal,
+            plan=plan,
+        )
 
 
 def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
@@ -799,51 +802,53 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
         "num_stages": plan.num_stages,
     }
 
-    def launch(query_blocks: int, unmasked_queries: bool) -> None:
-        use_query_tensor_descriptor = unmasked_queries and prepared.query_descriptor is not None
-        query_argument = (
-            prepared.query_descriptor if use_query_tensor_descriptor else prepared.query
-        )
-        attention_kernel[(query_blocks, heads, batch)](
-            query_argument,
-            prepared.key,
-            prepared.value,
-            prepared.query_scale,
-            prepared.key_scale,
-            prepared.value_scale_multiplier,
-            prepared.value_log_scale,
-            prepared.value_mean,
-            prepared.output,
-            query_length,
-            prepared.key_length,
-            is_causal=prepared.is_causal,
-            grouped_qk=plan.grouped_qk,
-            split_pv_head_dim=plan.split_pv_head_dim,
-            unmasked_query_tiles=unmasked_queries,
-            unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
-            heads=heads,
-            head_dim=head_dim,
-            block_m=plan.block_m,
-            block_n=_BLOCK_N,
-            use_tensor_descriptors=plan.use_tensor_descriptors,
-            use_query_tensor_descriptor=use_query_tensor_descriptor,
-            optimize_causal_traversal=plan.optimize_causal_traversal,
-            loop_num_stages=plan.loop_num_stages,
-            loop_licm=plan.loop_licm,
-            use_packed_probability_conversion=plan.use_packed_probability_conversion,
-            derive_value_log_bound=plan.derive_value_log_bound,
-            **launch_options,
-        )
+    with device_context(prepared.output.device):
 
-    full_query_blocks = query_length // plan.block_m
-    has_partial_query_block = query_length % plan.block_m != 0
-    if plan.optimize_causal_traversal and has_partial_query_block:
-        launch(1, False)
-    if full_query_blocks:
-        launch(full_query_blocks, True)
-    if not plan.optimize_causal_traversal and has_partial_query_block:
-        launch(1, False)
-    return prepared.output
+        def launch(query_blocks: int, unmasked_queries: bool) -> None:
+            use_query_tensor_descriptor = unmasked_queries and prepared.query_descriptor is not None
+            query_argument = (
+                prepared.query_descriptor if use_query_tensor_descriptor else prepared.query
+            )
+            attention_kernel[(query_blocks, heads, batch)](
+                query_argument,
+                prepared.key,
+                prepared.value,
+                prepared.query_scale,
+                prepared.key_scale,
+                prepared.value_scale_multiplier,
+                prepared.value_log_scale,
+                prepared.value_mean,
+                prepared.output,
+                query_length,
+                prepared.key_length,
+                is_causal=prepared.is_causal,
+                grouped_qk=plan.grouped_qk,
+                split_pv_head_dim=plan.split_pv_head_dim,
+                unmasked_query_tiles=unmasked_queries,
+                unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
+                heads=heads,
+                head_dim=head_dim,
+                block_m=plan.block_m,
+                block_n=_BLOCK_N,
+                use_tensor_descriptors=plan.use_tensor_descriptors,
+                use_query_tensor_descriptor=use_query_tensor_descriptor,
+                optimize_causal_traversal=plan.optimize_causal_traversal,
+                loop_num_stages=plan.loop_num_stages,
+                loop_licm=plan.loop_licm,
+                use_packed_probability_conversion=plan.use_packed_probability_conversion,
+                derive_value_log_bound=plan.derive_value_log_bound,
+                **launch_options,
+            )
+
+        full_query_blocks = query_length // plan.block_m
+        has_partial_query_block = query_length % plan.block_m != 0
+        if plan.optimize_causal_traversal and has_partial_query_block:
+            launch(1, False)
+        if full_query_blocks:
+            launch(full_query_blocks, True)
+        if not plan.optimize_causal_traversal and has_partial_query_block:
+            launch(1, False)
+        return prepared.output
 
 
 def _run_piper_attention(

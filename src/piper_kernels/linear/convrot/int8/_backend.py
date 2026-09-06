@@ -2,6 +2,7 @@
 
 import torch
 
+from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from . import _generic
@@ -66,7 +67,7 @@ def select_preparation_backend(input: torch.Tensor) -> PreparationBackend:  # no
 
 def select_gguf_converter(input: torch.Tensor) -> GGUFConvert | None:  # noqa: A002
     """Select direct GGUF conversion without requiring INT8 matrix instructions."""
-    if _generic_backend is not None and _generic_backend.supports_device(input.device):
+    if _generic_backend is not None and runtime.supports_device(input.device):
         return _generic_backend.convert_gguf_out
     return None
 

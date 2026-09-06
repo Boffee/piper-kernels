@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 
+from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _update, dispatch
 from piper_kernels.linear.convrot.int8._amd import triton as amd
@@ -57,7 +58,7 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
 def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architecture):
     target = AcceleratorTarget("cuda", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    monkeypatch.setattr(generic_triton, "supports_device", lambda device: True)
+    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
 
     assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out

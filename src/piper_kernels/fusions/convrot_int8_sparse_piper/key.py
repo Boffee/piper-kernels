@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
@@ -174,56 +175,58 @@ def _launch_projection(  # noqa: PLR0913, PLR0917
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else key_scale
 
-    def launch(row_block_count: int, row_block_offset: int, *, aligned_rows: bool) -> None:
-        _convrot_project_quantize_key_kernel[
-            (
-                row_block_count,
-                triton.cdiv(heads, _HEADS_PER_PROGRAM),
-                batch,
-            )
-        ](
-            input_qdata,
-            input_scale,
-            weight_qdata,
-            weight_scale,
-            norm_weight,
-            cos,
-            sin,
-            key,
-            key_scale,
-            key_summary,
-            key_aux,
-            block_lengths_ptr,
-            batch * logical_sequence_length,
-            logical_sequence_length,
-            storage_sequence_length,
-            row_block_offset,
-            input_features=input_qdata.shape[2],
-            heads=heads,
-            heads_per_program=_HEADS_PER_PROGRAM,
-            head_dim=HEAD_DIM,
-            rotary_dim=rotary_dim,
-            norm_epsilon=norm_epsilon,
-            mean_pool_summary=mean_pool_summary,
-            mask_block_lengths=has_block_lengths,
-            aligned_projection=(
-                aligned_rows
-                and input_qdata.shape[2] % _BLOCK_K == 0
-                and heads % _HEADS_PER_PROGRAM == 0
-            ),
-            mask_ragged_tail=not aligned_rows,
-            block_m=_BLOCK_M,
-            block_n=_BLOCK_N,
-            block_k=_BLOCK_K,
-            num_warps=8,
-            num_stages=3,
-        )
+    with device_context(input_qdata.device):
 
-    full_row_blocks = logical_sequence_length // _BLOCK_M
-    if full_row_blocks:
-        launch(full_row_blocks, 0, aligned_rows=True)
-    if logical_sequence_length % _BLOCK_M:
-        launch(1, full_row_blocks, aligned_rows=False)
+        def launch(row_block_count: int, row_block_offset: int, *, aligned_rows: bool) -> None:
+            _convrot_project_quantize_key_kernel[
+                (
+                    row_block_count,
+                    triton.cdiv(heads, _HEADS_PER_PROGRAM),
+                    batch,
+                )
+            ](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                norm_weight,
+                cos,
+                sin,
+                key,
+                key_scale,
+                key_summary,
+                key_aux,
+                block_lengths_ptr,
+                batch * logical_sequence_length,
+                logical_sequence_length,
+                storage_sequence_length,
+                row_block_offset,
+                input_features=input_qdata.shape[2],
+                heads=heads,
+                heads_per_program=_HEADS_PER_PROGRAM,
+                head_dim=HEAD_DIM,
+                rotary_dim=rotary_dim,
+                norm_epsilon=norm_epsilon,
+                mean_pool_summary=mean_pool_summary,
+                mask_block_lengths=has_block_lengths,
+                aligned_projection=(
+                    aligned_rows
+                    and input_qdata.shape[2] % _BLOCK_K == 0
+                    and heads % _HEADS_PER_PROGRAM == 0
+                ),
+                mask_ragged_tail=not aligned_rows,
+                block_m=_BLOCK_M,
+                block_n=_BLOCK_N,
+                block_k=_BLOCK_K,
+                num_warps=8,
+                num_stages=3,
+            )
+
+        full_row_blocks = logical_sequence_length // _BLOCK_M
+        if full_row_blocks:
+            launch(full_row_blocks, 0, aligned_rows=True)
+        if logical_sequence_length % _BLOCK_M:
+            launch(1, full_row_blocks, aligned_rows=False)
 
 
 def _launch_key_projection(
