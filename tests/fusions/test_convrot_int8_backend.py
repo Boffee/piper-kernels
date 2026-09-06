@@ -11,6 +11,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
+from piper_kernels.fusions.convrot_int8_swiglu_ffn import _compile as ffn_compile
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as ffn
 from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot.int8 import _backend, reference
@@ -53,14 +54,10 @@ def _weight(rows, width, offset=0):
 
 
 @pytest.mark.parametrize("chunk_rows", [1, 4, 16])
-def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(
-    monkeypatch, operations, chunk_rows
-):
+def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(operations, chunk_rows):
     backend, select = operations
     value = torch.linspace(-1, 1, 160).reshape(2, 5, 16)
     gate, up, down = _weight(32, 16), _weight(32, 16, offset=2), _weight(20, 32)
-    # Exercise CPU orchestration independently of the unchanged hardware gate.
-    monkeypatch.setattr(ffn, "_validate_inputs", lambda *args: (16, 32, 20))
     actual = ffn._run_chunked_swiglu_ffn(value, *gate, 16, *up, 16, *down, 16, chunk_rows)
     gate_result = reference.linear(value, *gate[:2], 16, gate[2])
     up_result = reference.linear(value, *up[:2], 16, up[2])
@@ -83,6 +80,65 @@ def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(
         else:
             assert call.args[2] is down[0]
             assert "second_projection" not in call.kwargs
+
+
+def test_ffn_rejects_missing_backend_before_allocating_workspace(monkeypatch):
+    value = torch.ones(5, 16)
+    gate, up, down = _weight(32, 16), _weight(32, 16), _weight(20, 32)
+    select = Mock(return_value=None)
+    monkeypatch.setattr(_backend, "select_linear_backend", select)
+    allocate = Mock(side_effect=AssertionError("workspace allocated without a backend"))
+    monkeypatch.setattr(torch, "empty", allocate)
+    with pytest.raises(ValueError, match="optimized linear is unavailable"):
+        ffn._run_chunked_swiglu_ffn(value, *gate, 16, *up, 16, *down, 16, 4)
+    select.assert_called_once_with(value)
+    allocate.assert_not_called()
+
+
+def _semantic_ffn_graph(device):
+    graph = torch.fx.Graph()
+
+    def placeholder(name, shape, dtype):
+        node = graph.placeholder(name)
+        node.meta["val"] = torch.empty(shape, dtype=dtype, device=device)
+        return node
+
+    def linear(name, source, width, columns):
+        qdata = placeholder(f"{name}_qdata", (columns, width), torch.int8)
+        scale = placeholder(f"{name}_scale", (columns, 1), torch.float32)
+        node = graph.call_function(
+            torch.ops.piper_kernels.convrot_int8_linear.default,
+            (source, qdata, scale, None, 16),
+        )
+        node.meta["val"] = torch.empty(5, columns, dtype=torch.bfloat16, device=device)
+        return node
+
+    value = placeholder("input", (5, 16), torch.bfloat16)
+    gate, up = linear("gate", value, 16, 32), linear("up", value, 16, 32)
+    activated = graph.call_function(torch.ops.aten.silu.default, (gate,))
+    multiplied = graph.call_function(torch.ops.aten.mul.Tensor, (up, activated))
+    for node in (activated, multiplied):
+        node.meta["val"] = torch.empty(5, 32, dtype=torch.bfloat16, device=device)
+    output = linear("down", multiplied, 32, 20)
+    graph.output(output)
+    return torch.fx.GraphModule(torch.nn.Module(), graph), value.meta["val"]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "xpu"])
+@pytest.mark.parametrize("supported", [False, True])
+def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device, supported):
+    select = Mock(return_value=object() if supported else None)
+    monkeypatch.setattr(_backend, "select_linear_backend", select)
+    with FakeTensorMode():
+        module, value = _semantic_ffn_graph(device)
+        ffn_compile.compile_pass(module.graph, is_inference=True)
+    targets = [node.target for node in module.graph.nodes]
+    assert (torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default in targets) is supported
+    assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == (
+        0 if supported else 3
+    )
+    assert select.called
+    assert all(call.args[0] is value for call in select.call_args_list)
 
 
 def test_sparse_output_uses_operations_and_preserves_output_views(monkeypatch, operations):
@@ -133,9 +189,9 @@ def test_sparse_gate_uses_selected_projection_operation(operations):
     assert backend.linear_prepared.call_count == 2
 
 
-@pytest.mark.parametrize("module", [ffn, sparse_output])
+@pytest.mark.parametrize("module", [ffn, ffn_compile, sparse_output])
 def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module):
-    tree = ast.parse(Path(module.__file__).read_text())
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
     forbidden = tuple(
         f"piper_kernels.linear.convrot.int8.{name}"
         for name in ("_nvidia", "_amd", "_plan", "_policy", "triton")
@@ -153,32 +209,17 @@ def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module
                 "prepare_input_with_plan",
                 "execute_prepared_linear",
             }
+            if module in (ffn, ffn_compile):
+                assert node.attr not in {"from_device", "cuda_capability_at_least"}
 
 
-def test_unvalidated_fusions_still_reject_rocm(monkeypatch, operations):
+def test_unvalidated_sparse_fusion_still_rejects_rocm(monkeypatch, operations):
     _implementation, select = operations
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
     with FakeTensorMode():
         value = torch.empty(1, 16, device="cuda")
-        with pytest.raises(ValueError, match="requires NVIDIA CUDA capability"):
-            ffn._run_chunked_swiglu_ffn(
-                value,
-                value,
-                value,
-                None,
-                16,
-                value,
-                value,
-                None,
-                16,
-                value,
-                value,
-                None,
-                16,
-                4,
-            )
         storage = torch.empty(1, 1, 64, 128, dtype=torch.int8, device="cuda")
         with pytest.raises(ValueError, match="requires exact NVIDIA SM120"):
             sparse_output._prepare_output_chunk_projector(

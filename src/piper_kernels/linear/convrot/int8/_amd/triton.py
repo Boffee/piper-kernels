@@ -170,7 +170,7 @@ def rotate_quantize_rows_chunked_kernel(
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
-    """Rotate a BF16 row as up to three power-of-two chunks before quantizing.
+    """Rotate a BF16 input row in FP32 chunks before terminal INT8 quantization.
 
     ConvRot groups never cross a chunk boundary. Avoiding a single next-power-
     of-two pad substantially reduces work and live storage for wide ragged rows.
@@ -192,10 +192,7 @@ def rotate_quantize_rows_chunked_kernel(
         activation_fn,
         accelerator_backend,
     )
-    # Retain compact chunks across the rowwide maximum reduction. Keeping all
-    # chunks in FP32 increases VGPR usage on gfx942 and gfx1201; this cast saves
-    # live storage, while activation and quantization arithmetic remain FP32.
-    values0 = convrot_backend.rotate_hadamard_groups(values0, block0, group_size).to(tl.bfloat16)
+    values0 = convrot_backend.rotate_hadamard_groups(values0, block0, group_size)
     max0 = tl.max(tl.abs(values0).to(tl.float32), axis=0)
 
     offsets1 = block0 + tl.arange(0, block1)
@@ -209,7 +206,7 @@ def rotate_quantize_rows_chunked_kernel(
         activation_fn,
         accelerator_backend,
     )
-    values1 = convrot_backend.rotate_hadamard_groups(values1, block1, group_size).to(tl.bfloat16)
+    values1 = convrot_backend.rotate_hadamard_groups(values1, block1, group_size)
     max1 = tl.max(tl.abs(values1).to(tl.float32), axis=0)
     absolute_max = tl.maximum(max0, max1)
 
@@ -225,14 +222,12 @@ def rotate_quantize_rows_chunked_kernel(
             activation_fn,
             accelerator_backend,
         )
-        values2 = convrot_backend.rotate_hadamard_groups(values2, block2, group_size).to(
-            tl.bfloat16
-        )
+        values2 = convrot_backend.rotate_hadamard_groups(values2, block2, group_size)
         max2 = tl.max(tl.abs(values2).to(tl.float32), axis=0)
         absolute_max = tl.maximum(absolute_max, max2)
 
     # All supported group normalizations are exact powers of two. Quantizing
-    # the unnormalized BF16 values and applying that factor once to the scale
+    # the unnormalized FP32 values and applying that factor once to the scale
     # preserves the logical result while avoiding a vector multiply per chunk.
     normalization_scale = _amd_normalization_scale(
         absolute_max,
@@ -253,7 +248,7 @@ def _uses_amd_chunked_preparation(
     input_dtype: torch.dtype,
     blocks: tuple[int, int, int],
 ) -> bool:
-    """Return whether AMD uses the lower-live-range BF16 preparation kernel."""
+    """Return whether AMD prepares BF16 input in separate row segments."""
     return target.is_amd_hip and input_dtype is torch.bfloat16 and blocks[1] != 0
 
 

@@ -163,22 +163,14 @@ def test_amd_preparation_matches_rotation_and_populates_storage(dtype, width, ac
     if not plan.fuse_rotation_quantization:
         # The split path stores a compact materialized rotation.
         rotated = rotated.to(activated.dtype)
-    elif amd._uses_amd_chunked_preparation(
-        AcceleratorTarget.from_device(value.device),
-        dtype,
-        policy.preparation_blocks(width),
-    ):
-        # Wide BF16 kernels pack live chunks to reduce register pressure.
-        rotated = rotated.bfloat16()
-    expected = reference.dynamic_quantize_rows(rotated)
+    _, expected_scale = reference.dynamic_quantize_rows(rotated)
     assert actual is output
-    # FP32 activation/reduction implementations may cross a terminal half-bin.
-    error = (actual[0].short() - expected[0].short()).abs()
-    assert error.max().item() <= 1
-    if activation is None:
-        assert error.count_nonzero().item() <= actual[0].numel() * 0.001
+    # Nearest rounding has half a quantization step of error. Allow a small
+    # margin for FP32 activation/reduction ordering, not intermediate BF16 casts.
+    decoded = actual[0].float() * actual[1][..., None]
+    assert ((decoded - rotated.float()).abs() <= 0.51 * actual[1][..., None] + 1e-7).all()
     torch.testing.assert_close(
-        actual[1], expected[1].squeeze(-1), rtol=3e-7 if activation is None else 2e-5, atol=1e-7
+        actual[1], expected_scale.squeeze(-1), rtol=3e-7 if activation is None else 2e-5, atol=1e-7
     )
 
 
@@ -201,14 +193,16 @@ def test_amd_public_linear_matches_reference(group_size, dtype, activation):
     prepared = amd.prepare_input(value, group_size, activation)
     expected = reference.linear_prepared(*prepared, qdata, scale, dtype, bias)
     torch.testing.assert_close(actual, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-6)
-    portable = reference.prepare_input(apply_input_activation(value, activation), group_size)
-    # The factorized H4 and the reference matrix multiply use different FP32
-    # reduction orders: a value within a few ULPs of a half-bin can round apart.
-    bin_error = (prepared[0].short() - portable[0].short()).abs()
-    assert bin_error.max().item() <= (1 if activation or dtype is torch.float32 else 0)
-    if activation is None and dtype is torch.float32:
-        assert bin_error.count_nonzero().item() <= prepared[0].numel() * 0.001
-    torch.testing.assert_close(prepared[1], portable[1], rtol=2 * torch.finfo(dtype).eps, atol=1e-7)
+    rotated = rotate_groups(apply_input_activation(value, activation).float(), group_size)
+    _, expected_scale = reference.dynamic_quantize_rows(rotated)
+    decoded = prepared[0].float() * prepared[1][..., None]
+    assert ((decoded - rotated).abs() <= 0.51 * prepared[1][..., None] + 1e-7).all()
+    torch.testing.assert_close(
+        prepared[1],
+        expected_scale.squeeze(-1),
+        rtol=3e-7 if activation is None else 2e-5,
+        atol=1e-7,
+    )
 
 
 @pytest.mark.gpu

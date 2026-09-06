@@ -65,9 +65,9 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture):
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
-@pytest.mark.parametrize("chunked", [False, True])
-def test_amd_activated_preparation_compiles(architecture, chunked):
-    width = 5376 if chunked else 16384
+@pytest.mark.parametrize("width", [5376, 9216, 12288, 14336, 16384])
+def test_amd_activated_preparation_compiles(architecture, width):
+    chunked = width != 16384
     plan = policy.select_execution_plan(AcceleratorTarget("hip", architecture), in_features=width)
     constants = {
         "group_size": 256,
@@ -97,3 +97,6 @@ def test_amd_activated_preparation_compiles(architecture, chunked):
         options={"num_warps": plan.fused_num_warps},
     )
     assert compiled.asm["hsaco"]
+    # BF16 inputs are widened on load; rotated/activated values stay FP32
+    # until the terminal integer conversion, on every supported AMD target.
+    assert "arith.truncf" not in compiled.asm["ttir"]

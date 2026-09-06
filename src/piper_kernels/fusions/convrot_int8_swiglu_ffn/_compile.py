@@ -18,17 +18,17 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.convrot.int8 import _backend
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v6"
+_COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v7"
 
 
 def _semantic_linear_pattern(
@@ -127,7 +127,6 @@ def _valid_semantic_ffn(  # noqa: PLR0911
     if (
         input_value.ndim == 0
         or input_value.dtype is not torch.bfloat16
-        or input_value.device.type != "cuda"
         or input_value.layout is not torch.strided
         or not input_value.is_contiguous()
         or any(
@@ -145,7 +144,7 @@ def _valid_semantic_ffn(  # noqa: PLR0911
             or not scale.is_contiguous()
             for scale in scales
         )
-        or not AcceleratorTarget.from_device(input_value.device).cuda_capability_at_least(7, 5)
+        or _backend.select_linear_backend(input_value) is None
     ):
         return False
 

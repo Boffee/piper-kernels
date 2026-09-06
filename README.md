@@ -12,8 +12,8 @@ checkpoint metadata, pipeline frameworks, or device-offloading policy.
 Fused ConvRot preparation, GGUF conversion, and NVFP4 weight updates use FP32 arithmetic
 instead of reproducing the extra FP16/BF16 rounding of an eager PyTorch composition.
 Their portable references use FP32 arithmetic. Lower-precision tensor-core operands,
-compact workspaces, AMD's packed live rotation chunks, and sparse attention's packed
-residual epilogue remain where they reduce storage or execution cost.
+compact workspaces, and sparse attention's packed residual epilogue remain where they reduce
+storage or execution cost.
 
 ## Operators
 
@@ -170,7 +170,7 @@ uses the portable PyTorch reference. Install the tensor format and optimized bac
 `piper-kernels[convrot,triton]`. The base package does not require TorchAO or Triton, and
 attention-only consumers do not inherit the TorchAO dependency.
 
-### ROCm base INT8 support
+### ROCm INT8 support
 
 The AMD implementation lives in `linear/convrot/int8/_amd/`, alongside `_nvidia/`.
 Both implement the same preparation/projection interface; reusable INT8 arithmetic lives in
@@ -179,6 +179,8 @@ Both implement the same preparation/projection interface; reusable INT8 arithmet
 ROCm coverage includes ordinary, GELU-tanh, and SwiGLU input preparation; INT8 linear and
 prepared/paired projections; caller-owned output buffers; dense and low-rank weight updates;
 and base `torch.compile` preparation sharing. FP16, BF16, and FP32 are supported.
+The shared chunked INT8 SwiGLU FFN also runs on ROCm, including indexed gated updates
+and automatic fusion of compatible BF16 graphs via `convrot_int8_swiglu_ffn_compile_options`.
 The RX 9070 XT (`gfx1201`) has on-device validation. `gfx942`, `gfx1100`, `gfx1151`,
 and `gfx1200` have compiler coverage only, not hardware correctness or performance validation.
 Unknown AMD architectures retain the portable reference for linear execution.
@@ -196,7 +198,7 @@ FP32 reduction ordering and fused activations can differ from the reference at I
 boundaries. GGUF-to-INT8 conversion uses a shared fused decoding/rotation kernel, using
 fused rows through 8,192 columns on ROCm and bounded tiled conversion for wider rows,
 including on AMD targets without a tuned GEMM policy. This integration does
-not enable ROCm dequantized-input means, specialized FFN/attention fusions, attention kernels,
+not enable ROCm dequantized-input means, specialized attention fusions, attention kernels,
 or NVFP4 kernels.
 
 The repository's default `uv` development sources still select CUDA; use a separate

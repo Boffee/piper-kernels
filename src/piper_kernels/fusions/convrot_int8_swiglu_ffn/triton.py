@@ -6,7 +6,6 @@ import math
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend, reference
@@ -54,11 +53,6 @@ def _validate_inputs(
 ) -> tuple[int, int, int]:
     if input.ndim == 0 or input.layout is not torch.strided or not input.is_contiguous():
         raise ValueError("ConvRot INT8 FFN input must be a non-scalar contiguous strided tensor")
-    if input.device.type != "cuda":
-        raise ValueError("ConvRot INT8 FFN currently requires CUDA")
-    target = AcceleratorTarget.from_device(input.device)
-    if not target.cuda_capability_at_least(7, 5):
-        raise ValueError("ConvRot INT8 FFN requires NVIDIA CUDA capability 7.5 or newer")
     if math.prod(input.shape[:-1]) < 1:
         raise ValueError("ConvRot INT8 FFN requires at least one input row")
     if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, int) or chunk_rows < 1:
@@ -73,7 +67,7 @@ def _validate_inputs(
     ):
         reference.validate_storage(weight_qdata, weight_scale, group_size, input.dtype)
         if weight_qdata.device != input.device or weight_scale.device != input.device:
-            raise ValueError("ConvRot INT8 FFN operands must share a CUDA device")
+            raise ValueError("ConvRot INT8 FFN operands must share a device")
 
     input_features = gate_weight_qdata.shape[1]
     intermediate_features = gate_weight_qdata.shape[0]
@@ -136,6 +130,7 @@ def _run_chunked_swiglu_ffn(
         down_group_size,
         chunk_rows,
     )
+    backend = _backend.require_linear_backend(input)
     leading_shape = input.shape[:-1]
     rows = math.prod(leading_shape)
     capacity = min(rows, chunk_rows)
@@ -181,8 +176,6 @@ def _run_chunked_swiglu_ffn(
         dtype=torch.int8,
     )
     scale_storage = torch.empty(capacity, device=input.device, dtype=torch.float32)
-    backend = _backend.require_linear_backend(input)
-
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         chunk_row_count = stop - start

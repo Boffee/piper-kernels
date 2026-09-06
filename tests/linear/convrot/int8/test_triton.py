@@ -546,7 +546,24 @@ def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
 
 
 def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).is_cuda_capability(12, 0)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        (AcceleratorTarget("hip", "gfx1201"), False),
+        (AcceleratorTarget("cuda", "sm120"), True),
+        (AcceleratorTarget("cuda", "sm89"), False),
+    ],
+)
+def test_sm120_availability_checks_backend_not_just_capability(monkeypatch, target, expected):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    assert _exact_sm120_available() is expected
 
 
 @pytest.mark.gpu
