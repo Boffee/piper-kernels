@@ -237,7 +237,7 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize(
     ("promote_gate", "reverse_multiply", "bias_dtype"),
     [
@@ -247,7 +247,7 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
         (True, True, None),
     ],
 )
-def test_cuda_compile_options_fold_semantic_swiglu_ffn(
+def test_compile_options_fold_semantic_swiglu_ffn(
     promote_gate: bool,
     reverse_multiply: bool,
     bias_dtype: torch.dtype | None,
@@ -284,9 +284,9 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize("failure", ["projection-escapes", "different-input", "noncontiguous"])
-def test_cuda_compile_options_fail_closed(failure: str) -> None:
+def test_compile_options_fail_closed(failure: str) -> None:
     torch.manual_seed(225)
     model = _SwiGluFfn(expose_gate=failure == "projection-escapes").eval()
     activation = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
@@ -322,8 +322,8 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     torch.manual_seed(227)
     model = _SwiGluFfn().eval()
     first = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
@@ -345,9 +345,9 @@ def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize("python_indexing", [False, True])
-def test_cuda_compile_options_fold_h3_style_gated_updates(python_indexing: bool) -> None:
+def test_compile_options_fold_h3_style_gated_updates(python_indexing: bool) -> None:
     torch.manual_seed(224)
     model = _GatedUpdates(python_indexing=python_indexing).eval()
     arguments = _gated_update_arguments(model, 257)
@@ -373,9 +373,9 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(python_indexing: bool)
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize("expose", ["ffn", "hidden"])
-def test_cuda_gated_updates_fail_closed_when_intermediate_escapes(
+def test_gated_updates_fail_closed_when_intermediate_escapes(
     expose: Literal["ffn", "hidden"],
 ) -> None:
     torch.manual_seed(216)
@@ -405,9 +405,9 @@ def test_cuda_gated_updates_fail_closed_when_intermediate_escapes(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize("update_mode", ["direct", "alias"])
-def test_cuda_gated_updates_do_not_mutate_caller_input(
+def test_gated_updates_do_not_mutate_caller_input(
     update_mode: Literal["direct", "alias"],
 ) -> None:
     torch.manual_seed(217)

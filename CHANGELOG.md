@@ -7,6 +7,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Enabled the shared ConvRot INT8 SwiGLU FFN on supported Linux ROCm devices, including
+  indexed gated updates and compiler folding. Fusion eligibility now uses the INT8 backend
+  contract instead of NVIDIA capability checks; RX 9070 XT has on-device validation.
 - Enabled direct GGUF-to-ConvRot-INT8 conversion and in-place refills on ROCm through
   the shared fused Triton converter formerly owned by NVIDIA. Wider rows use tiled
   conversion with bounded maxima storage; neither path allocates a dense weight or
@@ -25,11 +28,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   prepared/paired projections, dense and low-rank updates, and compiler preparation sharing.
   RX 9070 XT (`gfx1201`) has on-device validation; `gfx942`, `gfx1100`, `gfx1151`, and
   `gfx1200` have offline compiler coverage only. Unknown AMD architectures use the reference.
-  Prepared-input means, specialized FFN/attention fusions, attention, and
+  Prepared-input means, specialized attention fusions, attention, and
   NVFP4 remain outside this ROCm integration.
 
 ### Changed
 
+- Keep AMD chunked ConvRot INT8 rotations in FP32 until INT8 quantization, removing
+  intermediate BF16 casts without changing launch policy. Numerical tests check
+  reconstruction accuracy against the FP32 reference instead of identical INT8 codes.
 - Removed unused dtype-code arguments from ConvRot kernels and the obsolete INT8
   `triton` and `_policy` re-export modules. Internal callers and benchmarks now import
   the owning backend, kernel, or custom-op module directly.
