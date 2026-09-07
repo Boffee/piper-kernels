@@ -32,7 +32,7 @@ from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from . import _compile_validation, _core, _preparation
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v3"
+_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v4"
 
 
 @dataclass(frozen=True, slots=True)

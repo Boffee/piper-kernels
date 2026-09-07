@@ -34,6 +34,7 @@ class _SwiGluFfn(torch.nn.Module):
         *,
         promote_gate: bool = False,
         reverse_multiply: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
         bias_dtype: torch.dtype | None = torch.bfloat16,
         expose_gate: bool = False,
     ) -> None:
@@ -41,15 +42,20 @@ class _SwiGluFfn(torch.nn.Module):
         self.promote_gate = promote_gate
         self.reverse_multiply = reverse_multiply
         self.expose_gate = expose_gate
-        self.gate = self._linear(self.intermediate_features, self.input_features, bias_dtype)
-        self.value = self._linear(self.intermediate_features, self.input_features, bias_dtype)
-        self.down = self._linear(self.output_features, self.intermediate_features, bias_dtype)
+        self.gate = self._linear(self.intermediate_features, self.input_features, bias_dtype, dtype)
+        self.value = self._linear(
+            self.intermediate_features, self.input_features, bias_dtype, dtype
+        )
+        self.down = self._linear(
+            self.output_features, self.intermediate_features, bias_dtype, dtype
+        )
 
     @staticmethod
     def _linear(
         out_features: int,
         in_features: int,
         bias_dtype: torch.dtype | None,
+        dtype: torch.dtype,
     ) -> torch.nn.Linear:
         qdata = torch.randint(
             -127,
@@ -59,12 +65,12 @@ class _SwiGluFfn(torch.nn.Module):
             device="cuda",
         )
         scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
-        weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256)
+        weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256, logical_dtype=dtype)
         linear = torch.nn.Linear(
             in_features,
             out_features,
             bias=bias_dtype is not None,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device="cuda",
         )
         linear.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -93,9 +99,11 @@ class _GatedUpdates(torch.nn.Module):
         expose: Literal["none", "ffn", "hidden"] = "none",
         update_mode: Literal["materialized", "direct", "alias"] = "materialized",
         python_indexing: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
-        self.ffn = _SwiGluFfn(promote_gate=True, reverse_multiply=True)
+        self.ffn = _SwiGluFfn(promote_gate=True, reverse_multiply=True, dtype=dtype)
+        self.dtype = dtype
         self.expose = expose
         self.update_mode = update_mode
         self.python_indexing = python_indexing
@@ -103,7 +111,7 @@ class _GatedUpdates(torch.nn.Module):
             self.ffn.output_features,
             self.ffn.output_features,
             bias=False,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device="cuda",
         )
         self.update.weight.requires_grad_(False)
@@ -144,14 +152,14 @@ def _gated_update_arguments(
     rows: int,
 ) -> tuple[torch.Tensor, ...]:
     features = model.ffn.output_features
-    base = torch.randn(rows, features, dtype=torch.bfloat16, device="cuda")
+    base = torch.randn(rows, features, dtype=model.dtype, device="cuda")
     update_source = torch.randn(
         rows + int(model.update_mode == "alias"),
         features,
-        dtype=torch.bfloat16,
+        dtype=model.dtype,
         device="cuda",
     )
-    gate_storage = torch.randn(7, 6 * features, dtype=torch.bfloat16, device="cuda")
+    gate_storage = torch.randn(7, 6 * features, dtype=model.dtype, device="cuda")
     update_gate = gate_storage[:, 2 * features : 3 * features]
     ffn_gate = gate_storage[:, 5 * features :]
     gate_indices = torch.randint(0, 7, (rows,), dtype=torch.int64, device="cuda")
@@ -242,27 +250,31 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
     ("promote_gate", "reverse_multiply", "bias_dtype"),
     [
         (False, False, None),
+        (False, True, torch.float16),
         (False, True, torch.bfloat16),
         (True, False, torch.float32),
         (True, True, None),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_compile_options_fold_semantic_swiglu_ffn(
     promote_gate: bool,
     reverse_multiply: bool,
     bias_dtype: torch.dtype | None,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(220 + promote_gate + 10 * reverse_multiply)
     model = _SwiGluFfn(
         promote_gate=promote_gate,
         reverse_multiply=reverse_multiply,
         bias_dtype=bias_dtype,
+        dtype=dtype,
     ).eval()
     activation = torch.randn(
         2,
         257,
         model.input_features,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="cuda",
     )
     capture = _TargetCapturePass()
@@ -278,6 +290,7 @@ def test_compile_options_fold_semantic_swiglu_ffn(
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
+    assert actual.dtype is dtype
     assert _relative_l2(actual, expected) < 0.01
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default) == 1
     assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets
@@ -347,9 +360,12 @@ def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize("python_indexing", [False, True])
-def test_compile_options_fold_h3_style_gated_updates(python_indexing: bool) -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_compile_options_fold_h3_style_gated_updates(
+    python_indexing: bool, dtype: torch.dtype
+) -> None:
     torch.manual_seed(224)
-    model = _GatedUpdates(python_indexing=python_indexing).eval()
+    model = _GatedUpdates(python_indexing=python_indexing, dtype=dtype).eval()
     arguments = _gated_update_arguments(model, 257)
     capture = _TargetCapturePass()
     with torch.no_grad():
@@ -362,6 +378,7 @@ def test_compile_options_fold_h3_style_gated_updates(python_indexing: bool) -> N
             *arguments
         )
 
+    assert actual.dtype is dtype
     assert _relative_l2(actual, expected) < 0.01
     assert (
         capture.targets.count(

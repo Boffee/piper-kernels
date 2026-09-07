@@ -20,15 +20,18 @@ def _exact_sm120_available() -> bool:
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 385], ids=["short", "ragged-multi-chunk"])
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
-@pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_chunked_ffn_matches_materialized(
     rows: int,
     dynamic: bool,
     bias_dtype: torch.dtype | None,
+    dtype: torch.dtype,
 ) -> None:
     operands = make_operands(
         rows=rows,
         dynamic=dynamic,
+        dtype=dtype,
         bias_dtype=bias_dtype,
         seed=931 + rows + dynamic,
     )
@@ -37,7 +40,7 @@ def test_chunked_ffn_matches_materialized(
     actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
-    assert actual.dtype is torch.bfloat16
+    assert actual.dtype is dtype
     # The independent reference includes portable rotation and FP4 preparation.
     assert relative_l2 < (0.1 if dynamic else 0.06)
 

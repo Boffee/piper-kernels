@@ -127,6 +127,11 @@ eager, and training paths remain unchanged. Existing post-grad compiler passes i
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
+The ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU FFN compiler integrations support
+FP16 and BF16 activations. Their `*_swiglu_ffn_compile_options()` helpers match separate
+gate, value, and down projections and install FFN fusion before ordinary linear rewriting.
+Fused activation preparation retains FP32 arithmetic; outputs retain the input dtype.
+
 The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
 `convrot_int8_sparse_piper_compile_options` from
 `piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary
@@ -181,7 +186,7 @@ ROCm coverage includes ordinary, GELU-tanh, and SwiGLU input preparation; INT8 l
 prepared/paired projections; caller-owned output buffers; dense and low-rank weight updates;
 and base `torch.compile` preparation sharing. FP16, BF16, and FP32 are supported.
 The shared chunked INT8 SwiGLU FFN also runs on ROCm, including indexed gated updates
-and automatic fusion of compatible BF16 graphs via `convrot_int8_swiglu_ffn_compile_options`.
+and automatic fusion of compatible FP16/BF16 graphs via `convrot_int8_swiglu_ffn_compile_options`.
 The RX 9070 XT (`gfx1201`) has on-device validation. `gfx942`, `gfx1100`, `gfx1151`,
 and `gfx1200` have compiler coverage only, not hardware correctness or performance validation.
 Unknown AMD architectures retain the portable reference for linear execution.
