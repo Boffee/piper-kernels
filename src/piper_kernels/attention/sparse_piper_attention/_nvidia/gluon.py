@@ -107,8 +107,7 @@ def _issue_tma_pair(
 @gluon.jit
 def _piper_probability_pair(
     query,
-    key_shared_0,
-    key_shared_1,
+    key_shared_pair,
     query_scale,
     key_scale_ptr,
     value_scale_multiplier_ptr,
@@ -129,44 +128,53 @@ def _piper_probability_pair(
     mask_duplicate: gl.constexpr,
 ):
     """Advance one shared Piper coordinate over two independently scaled K64 tiles."""
-    key_0 = key_shared_0.permute([1, 0]).load(key_layout)
-    key_1 = key_shared_1.permute([1, 0]).load(key_layout)
-    integer_scores_0 = mma_v2(
+    key = key_shared_pair.permute([1, 0]).load(key_layout)
+    integer_scores = mma_v2(
         query,
-        key_0,
-        gl.zeros([_GL_BLOCK_M, _GL_BLOCK_N], gl.int32, mma_layout),
+        key,
+        gl.zeros([_GL_BLOCK_M, 2 * _GL_BLOCK_N], gl.int32, mma_layout),
     )
-    integer_scores_1 = mma_v2(
-        query,
-        key_1,
-        gl.zeros([_GL_BLOCK_M, _GL_BLOCK_N], gl.int32, mma_layout),
+    integer_scores_0, integer_scores_1 = gl.split(
+        gl.permute(
+            gl.reshape(integer_scores, [_GL_BLOCK_M, 2, _GL_BLOCK_N]),
+            [0, 2, 1],
+        )
     )
+    integer_scores_0 = gl.convert_layout(integer_scores_0, mma_layout)
+    integer_scores_1 = gl.convert_layout(integer_scores_1, mma_layout)
     key_scale_0 = gl.load(key_scale_ptr + batch_head * sequence_tiles + start_n_0 // _GL_BLOCK_N)
     key_scale_1 = gl.load(key_scale_ptr + batch_head * sequence_tiles + start_n_1 // _GL_BLOCK_N)
-    scores_0 = integer_scores_0.to(gl.float32) * (query_scale[:, None] * key_scale_0)
-    scores_1 = integer_scores_1.to(gl.float32) * (query_scale[:, None] * key_scale_1)
+    score_scale_0 = query_scale * key_scale_0
+    score_scale_1 = query_scale * key_scale_1
+    column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
+    offsets_n = gl.arange(0, _GL_BLOCK_N, column_layout)
+    valid_keys_0 = gl.full([_GL_BLOCK_N], True, gl.int1, column_layout)
+    valid_keys_1 = valid_keys_0
     if mask_block_lengths:
-        column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
-        offsets_n = gl.arange(0, _GL_BLOCK_N, column_layout)
         block_length_0 = gl.load(block_lengths_ptr + start_n_0 // _GL_BLOCK_N)
         block_length_1 = gl.load(block_lengths_ptr + start_n_1 // _GL_BLOCK_N)
         valid_keys_0 = offsets_n < block_length_0
         valid_keys_1 = offsets_n < block_length_1
-        if mask_duplicate:
-            valid_keys_1 &= has_second
-        scores_0 = gl.where(valid_keys_0[None, :], scores_0, -float("inf"))
-        scores_1 = gl.where(valid_keys_1[None, :], scores_1, -float("inf"))
     elif mask_ragged_tail:
-        column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
-        offsets_n = gl.arange(0, _GL_BLOCK_N, column_layout)
         valid_keys_0 = start_n_0 + offsets_n < logical_sequence_length
         valid_keys_1 = start_n_1 + offsets_n < logical_sequence_length
+    if mask_block_lengths or mask_ragged_tail:
         if mask_duplicate:
             valid_keys_1 &= has_second
-        scores_0 = gl.where(valid_keys_0[None, :], scores_0, -float("inf"))
-        scores_1 = gl.where(valid_keys_1[None, :], scores_1, -float("inf"))
-    elif mask_duplicate:
-        scores_1 = gl.where(has_second, scores_1, -float("inf"))
+        integer_scores_0 = gl.where(valid_keys_0[None, :], integer_scores_0, -2147483648)
+        integer_scores_1 = gl.where(valid_keys_1[None, :], integer_scores_1, -2147483648)
+    # A duplicate second tile is entirely invalid, so its maximum is
+    # replaced by -inf below without masking all of its integer scores.
+
+    # Q/K scales are nonnegative. Their FP32 conversion and multiplication
+    # are monotonic, so the row maximum can be reduced exactly in INT32
+    # before scaling, keeping both full FP32 score tiles out of this stage.
+    score_max_0 = gl.max(integer_scores_0, axis=1).to(gl.float32) * score_scale_0
+    score_max_1 = gl.max(integer_scores_1, axis=1).to(gl.float32) * score_scale_1
+    # Every selected physical K64 has at least one valid key; only the
+    # duplicated final tile can have no active keys in this kernel's contract.
+    if mask_duplicate:
+        score_max_1 = gl.where(has_second, score_max_1, -float("inf"))
 
     value_scale_multiplier_0 = gl.load(
         value_scale_multiplier_ptr + batch_head * sequence_tiles + start_n_0 // _GL_BLOCK_N
@@ -183,26 +191,47 @@ def _piper_probability_pair(
         127.0 + _GL_LOG2_255 - _GL_VALUE_LOG_BOUND_CORRECTION
     )
     block_max = gl.maximum(
-        gl.max(scores_0, axis=1) + value_log_scale_0,
-        gl.max(scores_1, axis=1) + value_log_scale_1,
+        score_max_0 + value_log_scale_0,
+        score_max_1 + value_log_scale_1,
     )
     next_max = gl.maximum(running_max, block_max)
     old_weight = gl.exp2(running_max - next_max)
     current_weight = gl.exp2(block_max - next_max)
-    probabilities_0 = gl.exp2(scores_0 - block_max[:, None])
-    probability_uint8_0 = _packed_float32_to_uint8(probabilities_0 * value_scale_multiplier_0 + 0.5)
-    probabilities_1 = gl.exp2(scores_1 - block_max[:, None])
-    probability_uint8_1 = _packed_float32_to_uint8(probabilities_1 * value_scale_multiplier_1 + 0.5)
-    probability_uint8_0 = gl.convert_layout(probability_uint8_0, probability_layout)
-    probability_uint8_1 = gl.convert_layout(probability_uint8_1, probability_layout)
-    probability_sum_0 = gl.sum(probabilities_0, axis=1)
-    probability_sum_1 = gl.sum(probabilities_1, axis=1)
-    denominator = (
-        denominator * old_weight + (probability_sum_0 + probability_sum_1) * current_weight
+    scores_0 = integer_scores_0.to(gl.float32) * score_scale_0[:, None]
+    scores_1 = integer_scores_1.to(gl.float32) * score_scale_1[:, None]
+    # Join the independent K64 coordinates along a register dimension before
+    # probability work, retaining the original shared coordinate and K64 scales.
+    scores = gl.reshape(
+        gl.permute(gl.join(scores_0, scores_1), [0, 2, 1]),
+        [_GL_BLOCK_M, 2 * _GL_BLOCK_N],
     )
+    scores = gl.convert_layout(scores, mma_layout)
+    paired_columns = gl.arange(0, 2 * _GL_BLOCK_N, column_layout)
+    value_scale_multiplier = gl.where(
+        paired_columns < _GL_BLOCK_N,
+        value_scale_multiplier_0,
+        value_scale_multiplier_1,
+    )
+    # Mask the final exponent argument, permitting FMA for valid score shifts.
+    shifted_scores = scores - block_max[:, None]
+    if mask_block_lengths or mask_ragged_tail:
+        valid_keys = gl.reshape(
+            gl.permute(gl.join(valid_keys_0, valid_keys_1), [1, 0]), [2 * _GL_BLOCK_N]
+        )
+        valid_keys = gl.convert_layout(valid_keys, column_layout)
+        shifted_scores = gl.where(valid_keys[None, :], shifted_scores, -float("inf"))
+    elif mask_duplicate:
+        valid_keys = (paired_columns < _GL_BLOCK_N) | has_second
+        shifted_scores = gl.where(valid_keys[None, :], shifted_scores, -float("inf"))
+    probabilities = gl.exp2(shifted_scores)
+    probability_uint8 = _packed_float32_to_uint8(
+        probabilities * value_scale_multiplier[None, :] + 0.5
+    )
+    probability_uint8 = gl.convert_layout(probability_uint8, probability_layout)
+    probability_sum = gl.sum(probabilities, axis=1)
+    denominator = denominator * old_weight + probability_sum * current_weight
     return (
-        probability_uint8_0,
-        probability_uint8_1,
+        probability_uint8,
         denominator,
         next_max,
         old_weight,
@@ -211,38 +240,167 @@ def _piper_probability_pair(
 
 
 @gluon.jit
+def _rescale_packed(partial, accumulator, old_weight, current_weight):
+    """Update the FP32 numerator, skipping rescaling when both row weights are one.
+
+    Requires M64/D128 MMA[4,1] register order A,A,B,B repeated within each
+    32-element pack. Checking elements 0 and 2 covers both rows. No MMA
+    instruction or collective synchronization occurs inside the branch.
+    """
+    return gl.inline_asm_elementwise(
+        asm="""
+            {
+            .reg .pred keep_a, keep_b, keep_pair;
+            .reg .f32 product;
+            setp.eq.f32 keep_a, $96, 0f3f800000;
+            setp.eq.f32 keep_b, $98, 0f3f800000;
+            and.pred keep_pair, keep_a, keep_b;
+            @keep_pair bra PIPER_RESCALE_DONE;
+            mul.rn.f32 $0, $0, $96;
+            mul.rn.f32 $1, $1, $97;
+            mul.rn.f32 $2, $2, $98;
+            mul.rn.f32 $3, $3, $99;
+            mul.rn.f32 $4, $4, $100;
+            mul.rn.f32 $5, $5, $101;
+            mul.rn.f32 $6, $6, $102;
+            mul.rn.f32 $7, $7, $103;
+            mul.rn.f32 $8, $8, $104;
+            mul.rn.f32 $9, $9, $105;
+            mul.rn.f32 $10, $10, $106;
+            mul.rn.f32 $11, $11, $107;
+            mul.rn.f32 $12, $12, $108;
+            mul.rn.f32 $13, $13, $109;
+            mul.rn.f32 $14, $14, $110;
+            mul.rn.f32 $15, $15, $111;
+            mul.rn.f32 $16, $16, $112;
+            mul.rn.f32 $17, $17, $113;
+            mul.rn.f32 $18, $18, $114;
+            mul.rn.f32 $19, $19, $115;
+            mul.rn.f32 $20, $20, $116;
+            mul.rn.f32 $21, $21, $117;
+            mul.rn.f32 $22, $22, $118;
+            mul.rn.f32 $23, $23, $119;
+            mul.rn.f32 $24, $24, $120;
+            mul.rn.f32 $25, $25, $121;
+            mul.rn.f32 $26, $26, $122;
+            mul.rn.f32 $27, $27, $123;
+            mul.rn.f32 $28, $28, $124;
+            mul.rn.f32 $29, $29, $125;
+            mul.rn.f32 $30, $30, $126;
+            mul.rn.f32 $31, $31, $127;
+            PIPER_RESCALE_DONE:
+            cvt.rn.f32.s32 product, $32;
+            fma.rn.f32 $0, product, $128, $0;
+            cvt.rn.f32.s32 product, $33;
+            fma.rn.f32 $1, product, $129, $1;
+            cvt.rn.f32.s32 product, $34;
+            fma.rn.f32 $2, product, $130, $2;
+            cvt.rn.f32.s32 product, $35;
+            fma.rn.f32 $3, product, $131, $3;
+            cvt.rn.f32.s32 product, $36;
+            fma.rn.f32 $4, product, $132, $4;
+            cvt.rn.f32.s32 product, $37;
+            fma.rn.f32 $5, product, $133, $5;
+            cvt.rn.f32.s32 product, $38;
+            fma.rn.f32 $6, product, $134, $6;
+            cvt.rn.f32.s32 product, $39;
+            fma.rn.f32 $7, product, $135, $7;
+            cvt.rn.f32.s32 product, $40;
+            fma.rn.f32 $8, product, $136, $8;
+            cvt.rn.f32.s32 product, $41;
+            fma.rn.f32 $9, product, $137, $9;
+            cvt.rn.f32.s32 product, $42;
+            fma.rn.f32 $10, product, $138, $10;
+            cvt.rn.f32.s32 product, $43;
+            fma.rn.f32 $11, product, $139, $11;
+            cvt.rn.f32.s32 product, $44;
+            fma.rn.f32 $12, product, $140, $12;
+            cvt.rn.f32.s32 product, $45;
+            fma.rn.f32 $13, product, $141, $13;
+            cvt.rn.f32.s32 product, $46;
+            fma.rn.f32 $14, product, $142, $14;
+            cvt.rn.f32.s32 product, $47;
+            fma.rn.f32 $15, product, $143, $15;
+            cvt.rn.f32.s32 product, $48;
+            fma.rn.f32 $16, product, $144, $16;
+            cvt.rn.f32.s32 product, $49;
+            fma.rn.f32 $17, product, $145, $17;
+            cvt.rn.f32.s32 product, $50;
+            fma.rn.f32 $18, product, $146, $18;
+            cvt.rn.f32.s32 product, $51;
+            fma.rn.f32 $19, product, $147, $19;
+            cvt.rn.f32.s32 product, $52;
+            fma.rn.f32 $20, product, $148, $20;
+            cvt.rn.f32.s32 product, $53;
+            fma.rn.f32 $21, product, $149, $21;
+            cvt.rn.f32.s32 product, $54;
+            fma.rn.f32 $22, product, $150, $22;
+            cvt.rn.f32.s32 product, $55;
+            fma.rn.f32 $23, product, $151, $23;
+            cvt.rn.f32.s32 product, $56;
+            fma.rn.f32 $24, product, $152, $24;
+            cvt.rn.f32.s32 product, $57;
+            fma.rn.f32 $25, product, $153, $25;
+            cvt.rn.f32.s32 product, $58;
+            fma.rn.f32 $26, product, $154, $26;
+            cvt.rn.f32.s32 product, $59;
+            fma.rn.f32 $27, product, $155, $27;
+            cvt.rn.f32.s32 product, $60;
+            fma.rn.f32 $28, product, $156, $28;
+            cvt.rn.f32.s32 product, $61;
+            fma.rn.f32 $29, product, $157, $29;
+            cvt.rn.f32.s32 product, $62;
+            fma.rn.f32 $30, product, $158, $30;
+            cvt.rn.f32.s32 product, $63;
+            fma.rn.f32 $31, product, $159, $31;
+            }
+        """,
+        constraints=(
+            # $0..31: FP32 outputs, written before all inputs are consumed.
+            "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
+            "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
+            # $32..63: INT32 PV products.
+            "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
+            # $64..95: FP32 accumulator inputs tied to the output registers.
+            "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,"
+            # $96..127: old row weights (elements 0 and 2 are $96 and $98).
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+            # $128..159: current row weights.
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f"
+        ),
+        args=[partial, accumulator, old_weight[:, None], current_weight[:, None]],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=32,
+    )
+
+
+@gluon.jit
 def _piper_pv_pair(
-    probability_uint8_0,
-    probability_uint8_1,
-    value_shared_0,
-    value_shared_1,
+    probability_uint8,
+    value_shared_pair,
     accumulator,
     old_weight,
     current_weight,
     mma_layout: gl.constexpr,
     value_layout: gl.constexpr,
 ):
-    """Accumulate paired K64 PV products in one INT32 tile and update the numerator."""
-    value_0 = value_shared_0.permute([1, 0]).load(value_layout)
-    value_1 = value_shared_1.permute([1, 0]).load(value_layout)
-    # The two K64 products sum at most 128 * 255 * 128 in magnitude, so
-    # accumulate them in one INT32 tile without overflow. Reusing the tile
-    # removes a full-D128 temporary and reduces pressure on the FP32 epilogue.
+    """Accumulate two K64 PV tiles in INT32 and update the FP32 numerator."""
+    value_0 = value_shared_pair.index(0).permute([1, 0]).load(value_layout)
+    value_1 = value_shared_pair.index(1).permute([1, 0]).load(value_layout)
+    value = gl.reshape(
+        gl.permute(gl.join(value_0, value_1), [2, 0, 1]),
+        [2 * _GL_BLOCK_N, _GL_HEAD_DIM],
+    )
+    value = gl.convert_layout(value, value_layout)
+    # Each product sum is bounded by 128 * 255 * 128 = 4,177,920 in magnitude:
+    # safe in INT32 and exactly representable when converted to FP32.
     partial = _uint8_int8_mma(
-        probability_uint8_0,
-        value_0,
+        probability_uint8,
+        value,
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
     )
-    partial = _uint8_int8_mma(
-        probability_uint8_1,
-        value_1,
-        partial,
-    )
-    return _fma_fp32(
-        partial.to(gl.float32),
-        current_weight[:, None],
-        accumulator * old_weight[:, None],
-    )
+    return _rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
 @gluon.jit
@@ -315,7 +473,7 @@ def _sparse_piper_attention_kernel(
     mask_ragged_tail: gl.constexpr,
     has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
-    kernel_warps: gl.constexpr,
+    ragged_tail_is_routed: gl.constexpr,
 ):
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
     local_query_block = gl.program_id(0)
@@ -331,9 +489,10 @@ def _sparse_piper_attention_kernel(
         routes_ptr + batch * stride_rb + query_block * stride_rq + route_head_offset * stride_rr
     )
 
+    # _rescale_packed relies on this four-warp MMA register layout.
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0],
-        warps_per_cta=[kernel_warps, 1],
+        warps_per_cta=[4, 1],
         instr_shape=[16, 8],
     )
     query_layout: gl.constexpr = gl.DotOperandLayout(0, mma_layout, k_width=4)
@@ -346,24 +505,23 @@ def _sparse_piper_attention_kernel(
     query_shared = gl.allocate_shared_memory(
         query_desc.dtype, [_GL_BLOCK_M, _GL_HEAD_DIM], query_desc.layout
     )
-    key_shared_0 = gl.allocate_shared_memory(
-        key_desc.dtype, [_GL_BLOCK_N, _GL_HEAD_DIM], key_desc.layout
+    key_shared_pair = gl.allocate_shared_memory(
+        key_desc.dtype, [2 * _GL_BLOCK_N, _GL_HEAD_DIM], key_desc.layout
     )
-    key_shared_1 = gl.allocate_shared_memory(
-        key_desc.dtype, [_GL_BLOCK_N, _GL_HEAD_DIM], key_desc.layout
+    key_shared_0 = key_shared_pair.slice(0, _GL_BLOCK_N)
+    key_shared_1 = key_shared_pair.slice(_GL_BLOCK_N, _GL_BLOCK_N)
+    value_shared_pair = gl.allocate_shared_memory(
+        value_desc.dtype, [2, _GL_HEAD_DIM, _GL_BLOCK_N], value_desc.layout
     )
-    value_shared_0 = gl.allocate_shared_memory(
-        value_desc.dtype, [_GL_HEAD_DIM, _GL_BLOCK_N], value_desc.layout
-    )
-    value_shared_1 = gl.allocate_shared_memory(
-        value_desc.dtype, [_GL_HEAD_DIM, _GL_BLOCK_N], value_desc.layout
-    )
+    value_shared_0 = value_shared_pair.index(0)
+    value_shared_1 = value_shared_pair.index(1)
     query_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     key_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     value_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(query_barrier, count=1)
     mbarrier.init(key_barrier, count=1)
     mbarrier.init(value_barrier, count=1)
+    gl.barrier()
 
     routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
     if has_dense_query_suffix:
@@ -443,16 +601,14 @@ def _sparse_piper_attention_kernel(
         tile_position_0 = pair_index * 2
         mbarrier.wait(key_barrier, phase=phase)
         (
-            probability_0,
-            probability_1,
+            probability,
             denominator,
             running_max,
             old_weight,
             current_weight,
         ) = _piper_probability_pair(
             query,
-            key_shared_0,
-            key_shared_1,
+            key_shared_pair,
             query_scale,
             key_scale_ptr,
             value_scale_multiplier_ptr,
@@ -469,7 +625,7 @@ def _sparse_piper_attention_kernel(
             key_layout,
             probability_layout,
             mask_block_lengths,
-            mask_ragged_tail,
+            mask_ragged_tail and ragged_tail_is_routed,
             False,
         )
 
@@ -504,10 +660,8 @@ def _sparse_piper_attention_kernel(
         )
         mbarrier.wait(value_barrier, phase=phase)
         accumulator = _piper_pv_pair(
-            probability_0,
-            probability_1,
-            value_shared_0,
-            value_shared_1,
+            probability,
+            value_shared_pair,
             accumulator,
             old_weight,
             current_weight,
@@ -532,16 +686,14 @@ def _sparse_piper_attention_kernel(
     has_second = final_position_0 + 1 < tile_count
     mbarrier.wait(key_barrier, phase=final_phase)
     (
-        probability_0,
-        probability_1,
+        probability,
         denominator,
         running_max,
         old_weight,
         current_weight,
     ) = _piper_probability_pair(
         query,
-        key_shared_0,
-        key_shared_1,
+        key_shared_pair,
         query_scale,
         key_scale_ptr,
         value_scale_multiplier_ptr,
@@ -563,10 +715,8 @@ def _sparse_piper_attention_kernel(
     )
     mbarrier.wait(value_barrier, phase=final_phase)
     accumulator = _piper_pv_pair(
-        probability_0,
-        probability_1,
-        value_shared_0,
-        value_shared_1,
+        probability,
+        value_shared_pair,
         accumulator,
         old_weight,
         current_weight,
@@ -578,8 +728,7 @@ def _sparse_piper_attention_kernel(
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
     value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + offsets_d).to(gl.float32)
     output += value_mean[None, :]
-    if mask_ragged_tail:
-        valid_queries = global_query_block * _GL_BLOCK_M + offsets_m < logical_sequence_length
+    valid_queries = global_query_block * _GL_BLOCK_M + offsets_m < logical_sequence_length
     if apply_coarse_residual:
         coarse = gl.load(
             coarse_output_ptr
@@ -619,6 +768,9 @@ def _sparse_piper_attention_kernel(
     else:
         gl.store(output_ptr + output_offsets, output.to(gl.bfloat16))
 
+    # Every warp must finish its final waits before any warp invalidates the
+    # shared barriers.
+    gl.barrier()
     mbarrier.invalidate(query_barrier)
     mbarrier.invalidate(key_barrier)
     mbarrier.invalidate(value_barrier)
@@ -727,6 +879,12 @@ def _launch_sparse_piper_attention(
     logical_sequence_length = context.logical_sequence_length
     storage_sequence_length = context.key.shape[2]
     has_block_lengths = context.block_lengths is not None
+    # A compact ragged tile outside the sparse prefix is visited last by the
+    # dense suffix. Caller-supplied routes may put it anywhere within the
+    # sparse prefix, requiring masks in the ordinary loop as well.
+    ragged_tail_is_routed = (
+        not has_block_lengths and context.sparse_key_blocks * _BLOCK_N > logical_sequence_length
+    )
     if (
         head_dim != _HEAD_DIM
         or query_storage_sequence_length < _BLOCK_M
@@ -846,7 +1004,7 @@ def _launch_sparse_piper_attention(
             not has_block_lengths and logical_sequence_length != storage_sequence_length,
             sparse_query_blocks is not None,
             has_coarse_residual,
-            4,
+            ragged_tail_is_routed,
             num_warps=4,
             num_stages=1,
         )
