@@ -78,7 +78,7 @@ def valid_semantic_ffn(
         return False
     return bool(
         gate.input is value.input
-        and input_value.dtype is torch.bfloat16
+        and input_value.dtype in (torch.float16, torch.bfloat16)
         and value_input.dtype is input_value.dtype
         and _dimension_matches(gate_shape.rows, value_shape.rows)
         and _dimension_matches(gate_shape.rows, down_shape.rows)

@@ -66,15 +66,17 @@ def _weight(
         use_triton_kernel=False,
         use_dynamic_per_tensor_scale=dynamic,
     )
+    # TorchAO's reference quantizer accepts BF16/FP32; retain the logical input dtype.
+    quantization_input = dense.float() if dense.dtype is torch.float16 else dense
     weight = PiperNVFP4Tensor.from_torchao(
         TorchAONVFP4Tensor.to_nvfp4(
-            dense,
+            quantization_input,
             per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
             act_per_tensor_scale=activation_scale,
             is_swizzled_scales=True,
             act_quant_kwargs=quantization,
         )
-    )
+    ).to(dtype=dense.dtype)
     if not high_first:
         return weight
     return PiperNVFP4Tensor(
@@ -110,25 +112,26 @@ def make_operands(
     intermediate_features: int = 512,
     output_features: int = 384,
     dynamic: bool,
+    dtype: torch.dtype = torch.bfloat16,
     bias_dtype: torch.dtype | None = torch.bfloat16,
     high_first: bool = False,
     distinct_input_scales: bool = False,
     seed: int = 951,
 ) -> Operands:
     torch.manual_seed(seed)
-    input = torch.randn(rows, input_features, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    input = torch.randn(rows, input_features, device="cuda", dtype=dtype)  # noqa: A001
     gate_dense = torch.randn(
         intermediate_features,
         input_features,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     value_dense = torch.randn_like(gate_dense)
     down_dense = torch.randn(
         output_features,
         intermediate_features,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     input_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
     value_scale = (

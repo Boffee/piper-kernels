@@ -162,8 +162,8 @@ def _validate_inputs(
         value.dynamic_activation_scale,
         "NVFP4 FFN value projection",
     )
-    if input.dtype is not torch.bfloat16:
-        raise ValueError("NVFP4 FFN currently requires BF16 activations")
+    if input.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("NVFP4 FFN requires FP16 or BF16 activations")
     if (
         isinstance(chunk_rows, bool)
         or not isinstance(chunk_rows, int)

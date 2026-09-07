@@ -16,6 +16,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 
 
@@ -70,16 +71,18 @@ def _weight(
         use_dynamic_per_tensor_scale=dynamic,
     )
     rotated = rotate_groups(dense, group_size)
-    weight = ConvRotNVFP4Tensor.from_torchao(
+    # TorchAO's reference quantizer accepts BF16/FP32; retain the logical input dtype.
+    quantization_input = rotated.float() if dense.dtype is torch.float16 else rotated
+    storage = PiperNVFP4Tensor.from_torchao(
         TorchAONVFP4Tensor.to_nvfp4(
-            rotated,
+            quantization_input,
             per_tensor_scale=per_tensor_amax_to_scale(rotated.abs().amax()),
             act_per_tensor_scale=activation_scale,
             is_swizzled_scales=True,
             act_quant_kwargs=quantization,
         ),
-        group_size=group_size,
-    )
+    ).to(dtype=dense.dtype)
+    weight = ConvRotNVFP4Tensor.from_torchao(storage, group_size=group_size)
     if not high_first:
         return weight
     return ConvRotNVFP4Tensor(
@@ -130,6 +133,7 @@ def make_operands(  # noqa: PLR0913
     intermediate_features: int = 512,
     output_features: int = 384,
     dynamic: bool,
+    dtype: torch.dtype = torch.bfloat16,
     bias_dtype: torch.dtype | None = torch.bfloat16,
     source_group_size: int = 16,
     down_group_size: int = 64,
@@ -138,19 +142,19 @@ def make_operands(  # noqa: PLR0913
     seed: int = 951,
 ) -> Operands:
     torch.manual_seed(seed)
-    input = torch.randn(rows, input_features, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    input = torch.randn(rows, input_features, device="cuda", dtype=dtype)  # noqa: A001
     gate_dense = torch.randn(
         intermediate_features,
         input_features,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     value_dense = torch.randn_like(gate_dense)
     down_dense = torch.randn(
         output_features,
         intermediate_features,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     input_scale = None if dynamic else _activation_scale(input, source_group_size)
     value_scale = (

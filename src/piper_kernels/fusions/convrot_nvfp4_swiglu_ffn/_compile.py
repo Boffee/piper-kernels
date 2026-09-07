@@ -33,7 +33,7 @@ from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-nvfp4-swiglu-ffn-compile-v4"
+_COMPILE_PASS_VERSION = "convrot-nvfp4-swiglu-ffn-compile-v5"
 
 
 @dataclass(frozen=True, slots=True)

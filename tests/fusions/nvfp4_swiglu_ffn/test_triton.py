@@ -11,9 +11,10 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_op,
 )
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
-from ._helpers import make_operands, materialized, precise_linear
+from ._helpers import make_operands, materialized
 
 
 def _exact_sm120_available() -> bool:
@@ -24,11 +25,13 @@ def _exact_sm120_available() -> bool:
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("with_weight_global_scale", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_source_affine_precision_in_strided_workspace(
     bias_dtype: torch.dtype | None,
     with_weight_global_scale: bool,
+    dtype: torch.dtype,
 ) -> None:
-    operands = make_operands(rows=127, dynamic=False, bias_dtype=bias_dtype, seed=987)
+    operands = make_operands(rows=127, dynamic=False, dtype=dtype, bias_dtype=bias_dtype, seed=987)
     linear = operands.gate
     if not with_weight_global_scale:
         linear.weight.per_tensor_scale = None
@@ -36,12 +39,22 @@ def test_source_affine_precision_in_strided_workspace(
         operands.input, linear.activation_scale, linear.dynamic
     )
     width = linear.weight.shape[0]
-    workspace = torch.full((127, 2 * width), float("nan"), device="cuda", dtype=torch.bfloat16)
+    workspace = torch.full((127, 2 * width), float("nan"), device="cuda", dtype=dtype)
     actual = workspace[:, width:]
     _core._project_affine_chunk(
         qdata, scale, global_scale, _core.LinearOperands(*linear.arguments()), 127, actual
     )
-    reference = precise_linear(operands.input, linear)
+    # Isolate affine precision from independent preparation's FP4 rounding boundaries.
+    reference = nvfp4_reference.linear_prepared(
+        qdata,
+        scale,
+        global_scale,
+        linear.weight.qdata,
+        linear.weight.scale,
+        linear.weight.per_tensor_scale,
+        linear.bias,
+        dtype,
+    )
     error = (actual.float() - reference.float()).norm() / reference.float().norm()
     assert error < 0.0001
     assert workspace[:, :width].isnan().all()
@@ -50,9 +63,10 @@ def test_source_affine_precision_in_strided_workspace(
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [1, 127, 1536])
-def test_compiled_swiglu_scale_matches_fp32_reference(rows: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_compiled_swiglu_scale_matches_fp32_reference(rows: int, dtype: torch.dtype) -> None:
     torch.manual_seed(989)
-    projections = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
+    projections = torch.randn(rows, 1024, device="cuda", dtype=dtype)
     value, gate = projections.chunk(2, dim=-1)
     expected = per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
 
@@ -63,15 +77,18 @@ def test_compiled_swiglu_scale_matches_fp32_reference(rows: int) -> None:
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 385], ids=["short", "ragged-multi-chunk"])
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
-@pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_chunked_ffn_matches_materialized(
     rows: int,
     dynamic: bool,
     bias_dtype: torch.dtype | None,
+    dtype: torch.dtype,
 ) -> None:
     operands = make_operands(
         rows=rows,
         dynamic=dynamic,
+        dtype=dtype,
         bias_dtype=bias_dtype,
         seed=901 + rows + dynamic,
     )
@@ -80,7 +97,7 @@ def test_chunked_ffn_matches_materialized(
     actual = _chunked_swiglu_ffn_op(*operands.arguments(128))
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
-    assert actual.dtype is torch.bfloat16
+    assert actual.dtype is dtype
     # Independent PyTorch preparation can choose neighboring FP4 codes at
     # reciprocal-rounding boundaries; dynamic down scales also differ by chunk.
     assert relative_l2 < (0.1 if dynamic else 0.06)

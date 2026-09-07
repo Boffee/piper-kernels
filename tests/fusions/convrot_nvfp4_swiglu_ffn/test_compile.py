@@ -61,7 +61,7 @@ class _SwiGluFfn(torch.nn.Module):
             out_features,
             bias=operands.bias is not None,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=operands.weight.dtype,
         )
         linear.weight = torch.nn.Parameter(operands.weight, requires_grad=False)
         if operands.bias is not None:
@@ -92,7 +92,7 @@ class _GatedUpdates(torch.nn.Module):
             output_features,
             bias=False,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=operands.input.dtype,
         )
         self.update.weight.requires_grad_(False)
 
@@ -204,17 +204,20 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
     ("dynamic", "promote_gate", "reverse_multiply", "bias_dtype", "high_first"),
     [
         (False, False, False, None, False),
+        (False, False, True, torch.float16, False),
         (False, True, True, torch.float32, True),
         (True, False, True, torch.bfloat16, False),
         (True, True, False, torch.float32, True),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cuda_compile_options_fold_semantic_swiglu_ffn(
     dynamic: bool,
     promote_gate: bool,
     reverse_multiply: bool,
     bias_dtype: torch.dtype | None,
     high_first: bool,
+    dtype: torch.dtype,
 ) -> None:
     operands = make_operands(
         rows=258,
@@ -222,6 +225,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
         bias_dtype=bias_dtype,
         high_first=high_first,
         seed=951 + dynamic + 10 * promote_gate + 100 * reverse_multiply,
+        dtype=dtype,
     )
     activation = operands.input.reshape(2, 129, -1)
     model = _SwiGluFfn(
@@ -244,6 +248,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
+    assert actual.dtype is dtype
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative_l2 < (0.1 if dynamic else 0.04)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn.default) == 1
@@ -253,9 +258,12 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("source_convrot", [False, True])
-def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(source_convrot: bool) -> None:
-    convrot = make_operands(rows=258, dynamic=True, seed=981)
-    standard = make_standard_operands(rows=258, dynamic=True, seed=982)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(
+    source_convrot: bool, dtype: torch.dtype
+) -> None:
+    convrot = make_operands(rows=258, dynamic=True, seed=981, dtype=dtype)
+    standard = make_standard_operands(rows=258, dynamic=True, seed=982, dtype=dtype)
     source = convrot if source_convrot else standard
     down = standard.down if source_convrot else convrot.down
     operands = Operands(source.input, source.gate, source.value, down)  # type: ignore[arg-type]
@@ -274,6 +282,7 @@ def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(source_convrot: bool) 
     assert isinstance(actual, torch.Tensor)
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative_l2 < 0.1
+    assert actual.dtype is dtype
     assert capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in capture.targets
@@ -313,7 +322,8 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_cuda_compile_options_fold_h3_style_gated_updates() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) -> None:
     rows = 257
     operands = make_operands(
         rows=rows,
@@ -321,12 +331,13 @@ def test_cuda_compile_options_fold_h3_style_gated_updates() -> None:
         dynamic=False,
         bias_dtype=torch.float32,
         seed=946,
+        dtype=dtype,
     )
     model = _GatedUpdates(operands).eval()
     output_features = operands.down.weight.shape[0]
-    base = torch.randn(rows, output_features, device="cuda", dtype=torch.bfloat16)
+    base = torch.randn(rows, output_features, device="cuda", dtype=dtype)
     update_source = torch.randn_like(base)
-    gate_storage = torch.randn(7, 6 * output_features, device="cuda", dtype=torch.bfloat16)
+    gate_storage = torch.randn(7, 6 * output_features, device="cuda", dtype=dtype)
     update_gate = gate_storage[:, 2 * output_features : 3 * output_features]
     ffn_gate = gate_storage[:, 5 * output_features :]
     gate_indices = torch.randint(0, 7, (rows,), device="cuda", dtype=torch.int64)
@@ -346,6 +357,7 @@ def test_cuda_compile_options_fold_h3_style_gated_updates() -> None:
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative_l2 < 0.04
+    assert actual.dtype is dtype
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn_gated_updates_.default

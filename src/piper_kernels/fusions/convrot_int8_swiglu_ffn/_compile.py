@@ -28,7 +28,7 @@ from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v7"
+_COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v8"
 
 
 def _semantic_linear_pattern(
@@ -126,7 +126,7 @@ def _valid_semantic_ffn(  # noqa: PLR0911
     scales = gate_scale, value_scale, down_scale
     if (
         input_value.ndim == 0
-        or input_value.dtype is not torch.bfloat16
+        or input_value.dtype not in (torch.float16, torch.bfloat16)
         or input_value.layout is not torch.strided
         or not input_value.is_contiguous()
         or any(
