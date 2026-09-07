@@ -4,16 +4,17 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
+from piper_kernels.attention.sparse_piper_attention._backend import (
+    require_attention_backend,
+    select_attention_backend,
+)
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._nvidia.gluon import (
-    _launch_sparse_piper_attention,
-)
 from piper_kernels.attention.sparse_piper_attention._prepared import (
+    _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
@@ -39,6 +40,57 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     mean_pool_block_values,
 )
 from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
+)
+@pytest.mark.parametrize("sequence_length", [129, 193, 257])
+@pytest.mark.parametrize("tail_position", [0, 1, -1])
+def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_length, tail_position):
+    tiles = (sequence_length + 63) // 64
+    storage_length = tiles * 64
+    query = torch.zeros((1, 1, storage_length, 128), device="cuda", dtype=torch.int8)
+    key = torch.zeros_like(query)
+    value = torch.full((1, 1, 128, storage_length), 64, device="cuda", dtype=torch.int8)
+    value[..., sequence_length:] = 0
+    context = _prepare_sparse_piper_context_from_quantized(
+        key,
+        torch.ones((1, 1, tiles), device="cuda"),
+        value,
+        torch.ones((1, 1, tiles, 1), device="cuda"),
+        torch.zeros((1, 1, 128), device="cuda"),
+        torch.tensor([tiles], device="cuda", dtype=torch.int32),
+        torch.tensor([0, tiles], device="cuda", dtype=torch.int32),
+        sparse_key_blocks=tiles,
+        routes_per_query=tiles,
+        logical_sequence_length=sequence_length,
+    )
+    order = list(range(tiles - 1))
+    order.insert(tiles - 1 if tail_position == -1 else tail_position, tiles - 1)
+    routes = (
+        torch.tensor(order, device="cuda", dtype=torch.uint16)[None, None, :]
+        .expand(1, tiles, tiles)
+        .contiguous()
+    )
+    query_state = _prepare_sparse_piper_query_from_quantized(
+        query,
+        torch.ones((1, 1, storage_length // QUERY_SCALE_ROWS), device="cuda"),
+        routes,
+        context,
+    )
+    prepared = _PreparedSparsePiperAttention(context, query_state)
+    expected = torch.empty((1, 1, sequence_length, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty_like(expected)
+    require_attention_backend(prepared.query.data).launch(prepared, expected)
+    # Padding is not part of the attention sequence, even when its physical
+    # block occurs in the middle of a caller-supplied sparse route.
+    value[..., sequence_length:] = -128
+    require_attention_backend(prepared.query.data).launch(prepared, actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _sequence_block_means(sequence, block_lengths=None):
@@ -88,8 +140,52 @@ def _assert_fp32_coarse_composition(actual, fine_output, coarse_output, coarse_g
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
+)
+@pytest.mark.parametrize("sequence_length", [128, 193, 320])
+def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_length):
+    query = torch.zeros((1, 1, sequence_length, 128), dtype=torch.bfloat16, device="cuda")
+    key = torch.zeros_like(query)
+    value = torch.full_like(query, 1.0 / 256)
+    # In the first half of D, averaging adjacent BF16 values produces a fine
+    # result between BF16 values. In the second half, the coarse term supplies
+    # that extra precision. Prematurely rounding either term loses the update.
+    value[..., :64] = 1.0
+    value[:, :, 1::2, :64] += 1.0 / 128
+    blocks = sequence_length // 64
+    layout = _resolve_route_layout(_normalize_head_keep_ratios((1.0,)), blocks, query.device)
+    routes = packed_routes_from_sequences(query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING)
+    prepared = _prepare_sparse_piper_attention(
+        query,
+        routes.indices,
+        routes.head_keep_blocks,
+        128**-0.5,
+        sparse_key_blocks=blocks,
+        route_head_offsets=routes.route_head_offsets,
+        combined_key=key,
+        combined_value=value,
+    )
+    coarse = torch.full(
+        (1, 1, (sequence_length + 63) // 64, 128),
+        1.0 / 256,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    coarse[..., 64:] += 1.0
+    gate = torch.ones((1, sequence_length, 1, 128), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty_like(query)
+    require_attention_backend(prepared.query.data).launch(
+        prepared, actual, coarse_output=coarse, coarse_gate=gate
+    )
+    torch.testing.assert_close(actual, torch.full_like(actual, 1.0 + 1.0 / 128), atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [65, 193])
 def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: int) -> None:
@@ -184,8 +280,8 @@ def _local_query_range(
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 def test_quantized_coarse_residual_matches_fp32_composition(
@@ -291,8 +387,8 @@ def test_quantized_coarse_residual_matches_fp32_composition(
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [65, 193, 256])
 @pytest.mark.parametrize("mixed_query_scope", [False, True])
@@ -350,8 +446,8 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     chunks: list[torch.Tensor] = []
     query_block_offset = 0
     with torch.no_grad():
-        _launch_sparse_piper_attention(prepared, fine_output.transpose(1, 2))
-        _launch_sparse_piper_attention(
+        require_attention_backend(prepared.query.data).launch(prepared, fine_output.transpose(1, 2))
+        require_attention_backend(prepared.query.data).launch(
             prepared,
             full_output.transpose(1, 2),
             coarse_output=coarse_output,
@@ -371,7 +467,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 device=query.device,
             )
             output = guarded[:, 1 : range_rows + 1]
-            _launch_sparse_piper_attention(
+            require_attention_backend(prepared.query.data).launch(
                 prepared,
                 output.transpose(1, 2),
                 query_block_offset=query_block_offset,
@@ -388,7 +484,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 range_block_count,
             )
             local_output = torch.empty_like(output)
-            _launch_sparse_piper_attention(
+            require_attention_backend(local_prepared.query.data).launch(
                 local_prepared,
                 local_output.transpose(1, 2),
                 coarse_output=coarse_output[
@@ -472,8 +568,8 @@ def _block_length_case(routing_mode: int):
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
@@ -560,8 +656,8 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 def test_quantized_coarse_residual_supports_internal_block_padding(
@@ -630,8 +726,8 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
     generator = torch.Generator(device="cuda").manual_seed(418)

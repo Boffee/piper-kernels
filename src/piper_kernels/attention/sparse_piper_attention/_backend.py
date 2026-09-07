@@ -5,21 +5,48 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM
 
+from ._amd import policy as amd_policy
 from ._interfaces import AttentionBackend, SelectRoutes, SequenceSummaries
 from ._nvidia import policy as nvidia_policy
 
 try:
     from . import triton as preparation
-    from ._nvidia import gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
-    _nvidia_attention = None
-else:
-    _nvidia_attention = AttentionBackend(
+    preparation = None
+
+try:
+    from ._nvidia import gluon as nvidia_gluon
+except ModuleNotFoundError as error:
+    if error.name is None or not error.name.startswith("triton"):
+        raise
+    nvidia_gluon = None
+
+try:
+    from ._amd import gluon as amd_gluon
+except ModuleNotFoundError as error:
+    if error.name is None or not error.name.startswith("triton"):
+        raise
+    amd_gluon = None
+
+_nvidia_attention = (
+    AttentionBackend(
         prepare=preparation._prepare_sparse_piper_attention,
-        launch=gluon._launch_sparse_piper_attention,
+        launch=nvidia_gluon._launch_sparse_piper_attention,
     )
+    if preparation is not None and nvidia_gluon is not None
+    else None
+)
+_amd_attention = (
+    AttentionBackend(
+        prepare=preparation._prepare_sparse_piper_attention,
+        launch=amd_gluon._launch_sparse_piper_attention,
+        bind=amd_gluon.bind_context,
+    )
+    if preparation is not None and amd_gluon is not None
+    else None
+)
 
 
 try:
@@ -39,10 +66,12 @@ except ModuleNotFoundError as error:
 
 def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
     """Return native execution or let the caller use the quantized reference."""
-    if _nvidia_attention is None:
+    if _nvidia_attention is None and _amd_attention is None:
         return None
     target = AcceleratorTarget.from_device(query.device)
-    return _nvidia_attention if nvidia_policy.supports_target(target) else None
+    if nvidia_policy.supports_target(target):
+        return _nvidia_attention
+    return _amd_attention if amd_policy.supports_target(target) else None
 
 
 def require_attention_backend(query: torch.Tensor) -> AttentionBackend:
