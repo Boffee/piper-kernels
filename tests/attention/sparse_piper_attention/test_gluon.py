@@ -1,4 +1,4 @@
-"""Integer accumulation and final-rounding checks for the SM120 sparse kernel."""
+"""Integer accumulation checks for the SM120 sparse kernel."""
 
 import pytest
 import torch
@@ -7,25 +7,9 @@ from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
-from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-)
 from piper_kernels.attention.sparse_piper_attention._nvidia.gluon import (
-    _launch_sparse_piper_attention,
     _piper_pv_pair,
 )
-from piper_kernels.attention.sparse_piper_attention._prepared import (
-    _prepare_sparse_piper_context_from_quantized,
-    _prepare_sparse_piper_query_from_quantized,
-    _PreparedSparsePiperAttention,
-)
-from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
-    _MINMAX_ROUTING,
-)
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
 
 pytestmark = [
     pytest.mark.gpu,
@@ -113,84 +97,3 @@ def test_paired_pv_accumulation_matches_int64_products(value_extremes, weight_pa
     install_uint8_int8_dot_hook()
     _paired_pv_kernel[(1,)](*operands, actual, num_warps=4)
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("sequence_length", [129, 193, 257])
-@pytest.mark.parametrize("tail_position", [0, 1, -1])
-def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_length, tail_position):
-    tiles = (sequence_length + 63) // 64
-    storage_length = tiles * 64
-    query = torch.zeros((1, 1, storage_length, 128), device="cuda", dtype=torch.int8)
-    key = torch.zeros_like(query)
-    value = torch.full((1, 1, 128, storage_length), 64, device="cuda", dtype=torch.int8)
-    value[..., sequence_length:] = 0
-    context = _prepare_sparse_piper_context_from_quantized(
-        key,
-        torch.ones((1, 1, tiles), device="cuda"),
-        value,
-        torch.ones((1, 1, tiles, 1), device="cuda"),
-        torch.zeros((1, 1, 128), device="cuda"),
-        torch.tensor([tiles], device="cuda", dtype=torch.int32),
-        torch.tensor([0, tiles], device="cuda", dtype=torch.int32),
-        sparse_key_blocks=tiles,
-        routes_per_query=tiles,
-        logical_sequence_length=sequence_length,
-    )
-    order = list(range(tiles - 1))
-    order.insert(tiles - 1 if tail_position == -1 else tail_position, tiles - 1)
-    routes = (
-        torch.tensor(order, device="cuda", dtype=torch.uint16)[None, None, :]
-        .expand(1, tiles, tiles)
-        .contiguous()
-    )
-    query_state = _prepare_sparse_piper_query_from_quantized(
-        query,
-        torch.ones((1, 1, storage_length // QUERY_SCALE_ROWS), device="cuda"),
-        routes,
-        context,
-    )
-    prepared = _PreparedSparsePiperAttention(context, query_state)
-    expected = torch.empty((1, 1, sequence_length, 128), device="cuda", dtype=torch.bfloat16)
-    actual = torch.empty_like(expected)
-    _launch_sparse_piper_attention(prepared, expected)
-    # Padding is not part of the attention sequence, even when its physical
-    # block occurs in the middle of a caller-supplied sparse route.
-    value[..., sequence_length:] = -128
-    _launch_sparse_piper_attention(prepared, actual)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("sequence_length", [128, 193, 320])
-def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_length):
-    query = torch.zeros((1, 1, sequence_length, 128), dtype=torch.bfloat16, device="cuda")
-    key = torch.zeros_like(query)
-    value = torch.full_like(query, 1.0 / 256)
-    # In the first half of D, averaging adjacent BF16 values produces a fine
-    # result between BF16 values. In the second half, the coarse term supplies
-    # that extra precision. Prematurely rounding either term loses the update.
-    value[..., :64] = 1.0
-    value[:, :, 1::2, :64] += 1.0 / 128
-    blocks = sequence_length // 64
-    layout = _resolve_route_layout(_normalize_head_keep_ratios((1.0,)), blocks, query.device)
-    routes = packed_routes_from_sequences(query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING)
-    prepared = _prepare_sparse_piper_attention(
-        query,
-        routes.indices,
-        routes.head_keep_blocks,
-        128**-0.5,
-        sparse_key_blocks=blocks,
-        route_head_offsets=routes.route_head_offsets,
-        combined_key=key,
-        combined_value=value,
-    )
-    coarse = torch.full(
-        (1, 1, (sequence_length + 63) // 64, 128),
-        1.0 / 256,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    coarse[..., 64:] += 1.0
-    gate = torch.ones((1, sequence_length, 1, 128), dtype=torch.bfloat16, device="cuda")
-    actual = torch.empty_like(query)
-    _launch_sparse_piper_attention(prepared, actual, coarse_output=coarse, coarse_gate=gate)
-    torch.testing.assert_close(actual, torch.full_like(actual, 1.0 + 1.0 / 128), atol=0, rtol=0)

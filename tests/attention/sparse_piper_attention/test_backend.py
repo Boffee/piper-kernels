@@ -50,6 +50,7 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, supported)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     backend = AttentionBackend(prepare=Mock(), launch=Mock())
     monkeypatch.setattr(_backend, "_nvidia_attention", backend)
+    monkeypatch.setattr(_backend, "_amd_attention", None)
     assert policy.supports_target(target) is supported
     assert _backend.select_attention_backend(query) is (backend if supported else None)
     probe.assert_called_once_with(query.device)
@@ -57,11 +58,28 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, supported)
 
 def test_missing_attention_implementation_does_not_probe_device(monkeypatch):
     monkeypatch.setattr(_backend, "_nvidia_attention", None)
+    monkeypatch.setattr(_backend, "_amd_attention", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
     query = torch.empty(1)
     assert _backend.select_attention_backend(query) is None
     with pytest.raises(RuntimeError, match="unavailable on cpu"):
         _backend.require_attention_backend(query)
+
+
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx1100", "gfx942"])
+def test_amd_attention_selection_is_independent_and_uses_tensor_device(monkeypatch, architecture):
+    target = AcceleratorTarget("hip", architecture)
+    probe = Mock(return_value=target)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
+    monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
+    monkeypatch.setattr(_backend, "_nvidia_attention", None)
+    backend = AttentionBackend(prepare=Mock(), launch=Mock())
+    monkeypatch.setattr(_backend, "_amd_attention", backend)
+    query = SimpleNamespace(device=torch.device("cuda:1"))
+    assert _backend.select_attention_backend(query) is (
+        backend if architecture in ("gfx1200", "gfx1201") else None
+    )
+    probe.assert_called_once_with(query.device)
 
 
 @pytest.mark.parametrize("missing", ["_route_backend", "_summary_backend"])
@@ -232,8 +250,36 @@ def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeyp
         coarse_output=pooled,
         coarse_gate=gate,
     )
-    assert select.call_args_list[0].args[0] is arguments["key"]
-    assert select.call_args_list[1].args[0] is query
+    select.assert_called_once_with(arguments["key"])
+
+
+def test_backend_context_binding_is_once_per_context_not_per_query(monkeypatch):
+    launch = Mock()
+    bind = Mock(return_value=launch)
+    one_shot = Mock(side_effect=AssertionError("must reuse the bound context"))
+    backend = AttentionBackend(prepare=Mock(), launch=one_shot, bind=bind)
+    select = Mock(return_value=backend)
+    monkeypatch.setattr(_backend, "select_attention_backend", select)
+    arguments = _quantized_context_arguments()
+    context = _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
+    for offset in (0, 1):
+        prepared, _ = _quantized_dispatch._prepare_quantized_sparse_piper_query(
+            context,
+            torch.zeros(1, 1, 64, 128, dtype=torch.int8),
+            torch.ones(1, 1, 2),
+            torch.zeros(1, 1, 1, 128),
+            global_block_offset=offset,
+        )
+        _quantized_dispatch._launch_quantized_sparse_piper_attention(
+            prepared, torch.empty(1, 1, 64, 128, dtype=torch.bfloat16)
+        )
+    bind.assert_called_once_with(context.kernel_context)
+    select.assert_called_once_with(arguments["key"])
+    assert launch.call_count == 2
+    one_shot.assert_not_called()
+    next_context = _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
+    assert bind.call_count == 2
+    assert bind.call_args.args[0] is next_context.kernel_context
 
 
 def test_quantized_unsupported_backend_rejects_before_allocating_routes(monkeypatch):

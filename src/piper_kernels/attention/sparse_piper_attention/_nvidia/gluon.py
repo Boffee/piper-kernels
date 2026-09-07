@@ -18,6 +18,7 @@ from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
 
+from .._launch import validate_attention_launch
 from .._prepared import _PreparedSparsePiperAttention
 
 _BLOCK_M = 64
@@ -826,37 +827,6 @@ def _make_gluon_descriptors(
         )
 
 
-def _resolve_query_block_range(
-    prepared: _PreparedSparsePiperAttention,
-    query_block_offset: int,
-    query_block_count: int | None,
-) -> tuple[int, int, int]:
-    """Validate a local launch range and return its size and global offset."""
-    query_state = prepared.query
-    stored_query_blocks = query_state.data.shape[2] // _BLOCK_M
-    if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
-        raise TypeError("sparse Piper query block offset must be an integer")
-    if query_block_count is not None and (
-        isinstance(query_block_count, bool) or not isinstance(query_block_count, int)
-    ):
-        raise TypeError("sparse Piper query block count must be an integer or None")
-    if not 0 <= query_block_offset < stored_query_blocks:
-        raise ValueError("sparse Piper query block offset must fit the prepared query storage")
-    resolved_query_block_count = (
-        stored_query_blocks - query_block_offset if query_block_count is None else query_block_count
-    )
-    if (
-        resolved_query_block_count < 1
-        or query_block_offset + resolved_query_block_count > stored_query_blocks
-    ):
-        raise ValueError("sparse Piper query block range must fit the prepared query storage")
-    return (
-        stored_query_blocks,
-        resolved_query_block_count,
-        query_state.global_block_offset + query_block_offset,
-    )
-
-
 def _launch_sparse_piper_attention(
     prepared: _PreparedSparsePiperAttention,
     output: torch.Tensor,
@@ -875,7 +845,7 @@ def _launch_sparse_piper_attention(
     query_state = prepared.query
     context = prepared.context
     query = query_state.data
-    batch, heads, query_storage_sequence_length, head_dim = query.shape
+    batch, heads, query_storage_sequence_length, _ = query.shape
     logical_sequence_length = context.logical_sequence_length
     storage_sequence_length = context.key.shape[2]
     has_block_lengths = context.block_lengths is not None
@@ -885,65 +855,12 @@ def _launch_sparse_piper_attention(
     ragged_tail_is_routed = (
         not has_block_lengths and context.sparse_key_blocks * _BLOCK_N > logical_sequence_length
     )
-    if (
-        head_dim != _HEAD_DIM
-        or query_storage_sequence_length < _BLOCK_M
-        or query_storage_sequence_length % _BLOCK_M
-        or storage_sequence_length < _BLOCK_N
-        or storage_sequence_length % _BLOCK_N
-        or (
-            not has_block_lengths
-            and (logical_sequence_length + _BLOCK_M - 1) // _BLOCK_M * _BLOCK_M
-            != storage_sequence_length
-        )
-    ):
-        raise ValueError("paired Gluon routed Piper requires padded M64/D128 storage")
     total_query_blocks = storage_sequence_length // _BLOCK_M
     sparse_query_blocks = context.sparse_query_blocks
-    stored_query_blocks, resolved_query_block_count, global_query_block_offset = (
-        _resolve_query_block_range(
-            prepared,
-            query_block_offset,
-            query_block_count,
-        )
+    resolved_query_block_count, global_query_block_offset = validate_attention_launch(
+        prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
     )
-    output_sequence_length = (
-        resolved_query_block_count * _BLOCK_M
-        if has_block_lengths
-        else min(
-            resolved_query_block_count * _BLOCK_M,
-            logical_sequence_length - global_query_block_offset * _BLOCK_M,
-        )
-    )
-    if (
-        output.shape != (batch, heads, output_sequence_length, head_dim)
-        or output.dtype is not torch.bfloat16
-        or output.device != query.device
-        or output.stride(-1) != 1
-    ):
-        raise ValueError("paired Gluon routed Piper output must match the query block range")
-    if context.value_scale_multiplier.shape[-1] != 1:
-        raise ValueError("paired Gluon routed Piper requires one folded scale per K64 tile")
-    has_coarse_residual = coarse_output is not None or coarse_gate is not None
-    if (coarse_output is None) != (coarse_gate is None):
-        raise ValueError("coarse output and coarse gate must be supplied together")
-    if has_coarse_residual:
-        assert coarse_output is not None
-        assert coarse_gate is not None
-        if (
-            coarse_output.shape != (batch, heads, stored_query_blocks, head_dim)
-            or coarse_output.dtype is not torch.float32
-            or coarse_output.device != query.device
-            or coarse_output.stride(-1) != 1
-        ):
-            raise ValueError("Gluon coarse output must be FP32 [batch,heads,Q64,D128]")
-        if (
-            coarse_gate.shape != (batch, output_sequence_length, heads, head_dim)
-            or coarse_gate.dtype is not torch.bfloat16
-            or coarse_gate.device != query.device
-            or coarse_gate.stride(-1) != 1
-        ):
-            raise ValueError("Gluon coarse gate must match the local attention output")
+    has_coarse_residual = coarse_output is not None
     with device_context(output.device):
         install_uint8_int8_dot_hook()
 

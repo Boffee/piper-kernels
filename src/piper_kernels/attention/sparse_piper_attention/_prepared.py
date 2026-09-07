@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,6 +14,9 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
 )
 
 from ._block_layout import validate_sparse_query_blocks
+
+if TYPE_CHECKING:
+    from ._interfaces import LaunchAttention
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +53,9 @@ class _PreparedSparsePiperAttention:
 
     context: _PreparedSparsePiperContext
     query: _PreparedSparsePiperQuery
+    # Orchestration may bind backend-owned state once for a sequence of query
+    # chunks. Raw prepared tensors remain usable through one-shot launchers.
+    launch: LaunchAttention | None = None
 
 
 def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913

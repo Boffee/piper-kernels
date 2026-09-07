@@ -8,6 +8,7 @@ import torch
 
 from . import _backend
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
+from ._interfaces import LaunchAttention
 from ._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
@@ -33,6 +34,7 @@ class _PreparedQuantizedSparsePiperContext:
     key_summary: torch.Tensor
     key_aux: torch.Tensor
     routing_mode: int
+    launch: LaunchAttention
     pooled_value: torch.Tensor | None = None
     coarse_scale: float | None = None
 
@@ -56,7 +58,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
 ) -> _PreparedQuantizedSparsePiperContext:
     """Prepare global K/V and routing state without requiring materialized Q."""
-    _backend.require_attention_backend(key)
+    backend = _backend.require_attention_backend(key)
     layout = _resolve_route_layout(
         tuple(head_keep_ratio_units),
         sparse_key_blocks,
@@ -97,6 +99,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         key_summary=key_summary[:, :, :route_key_blocks],
         key_aux=key_aux[:, :, :route_key_blocks],
         routing_mode=routing_mode,
+        launch=backend.bind_context(kernel_context),
         pooled_value=pooled_value,
         coarse_scale=coarse_scale,
     )
@@ -137,6 +140,7 @@ def _prepare_quantized_sparse_piper_query(
     return (
         _PreparedSparsePiperAttention(
             context=context.kernel_context,
+            launch=context.launch,
             query=_prepare_sparse_piper_query_from_quantized(
                 query,
                 query_scale,
@@ -282,8 +286,10 @@ def _launch_quantized_sparse_piper_attention(
     coarse_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch a prepared quantized sparse-Piper query range."""
-    backend = _backend.require_attention_backend(prepared.query.data)
-    backend.launch(
+    launch = prepared.launch
+    if launch is None:
+        launch = _backend.require_attention_backend(prepared.query.data).launch
+    launch(
         prepared,
         output,
         query_block_offset=query_block_offset,

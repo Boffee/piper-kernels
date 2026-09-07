@@ -5,7 +5,7 @@ from typing import Protocol
 
 import torch
 
-from ._prepared import _PreparedSparsePiperAttention
+from ._prepared import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
 
 
 class PrepareAttention(Protocol):
@@ -38,6 +38,10 @@ class LaunchAttention(Protocol):
     ) -> None: ...
 
 
+class BindAttention(Protocol):
+    def __call__(self, context: _PreparedSparsePiperContext) -> LaunchAttention: ...
+
+
 @dataclass(frozen=True, slots=True)
 class AttentionBackend:
     """Preparation and execution over the common quantized tensor contract.
@@ -48,6 +52,11 @@ class AttentionBackend:
 
     prepare: PrepareAttention
     launch: LaunchAttention
+    bind: BindAttention | None = None
+
+    def bind_context(self, context: _PreparedSparsePiperContext) -> LaunchAttention:
+        """Own backend preparation once for an immutable K/V context lifetime."""
+        return self.launch if self.bind is None else self.bind(context)
 
 
 class SelectRoutes(Protocol):

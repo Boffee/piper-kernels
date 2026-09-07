@@ -5,7 +5,7 @@ import torch
 
 import piper_kernels
 from piper_kernels import SparsePiperAttention
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._backend import select_attention_backend
 
 
 def _inputs(
@@ -98,9 +98,9 @@ def test_dense_query_suffix_bypasses_sparse_routes(
 ) -> None:
     if device == "cuda" and (
         not torch.cuda.is_available()
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
+        or select_attention_backend(torch.empty((), device="cuda")) is None
     ):
-        pytest.skip("requires exact NVIDIA SM120")
+        pytest.skip("requires a native sparse-attention backend")
     shape = (1, 3 * 64, 1, 128)
     query = torch.zeros(shape, dtype=torch.bfloat16, device=device)
     key = torch.zeros_like(query)
@@ -192,9 +192,9 @@ def test_internal_block_lengths_make_padded_values_unobservable(
 ) -> None:
     if device == "cuda" and (
         not torch.cuda.is_available()
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
+        or select_attention_backend(torch.empty((), device="cuda")) is None
     ):
-        pytest.skip("requires exact NVIDIA SM120")
+        pytest.skip("requires a native sparse-attention backend")
     query, key, value = _inputs(device=device)
     block_lengths = torch.tensor([64, 17, 51], device=device, dtype=torch.int32)
     valid_rows = torch.arange(query.shape[1], device=device) % 64
@@ -254,10 +254,10 @@ def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
-def test_sm120_path_runs_and_writes_engine_layout() -> None:
+def test_native_path_runs_and_writes_engine_layout() -> None:
     query, key, value = _inputs("cuda")
     attention = _attention((0.5, 1.0))
 
@@ -272,10 +272,10 @@ def test_sm120_path_runs_and_writes_engine_layout() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
-def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None:
+def test_native_path_returns_contiguous_output_for_noncontiguous_inputs() -> None:
     query, key, value = (
         tensor.transpose(1, 2).contiguous().transpose(1, 2)
         for tensor in _inputs("cuda", sequence_length=193)
@@ -293,11 +293,11 @@ def test_sm120_path_returns_contiguous_output_for_noncontiguous_inputs() -> None
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [192, 193])
-def test_sm120_custom_op_passes_opcheck(sequence_length: int) -> None:
+def test_native_custom_op_passes_opcheck(sequence_length: int) -> None:
     from piper_kernels.attention.sparse_piper_attention.dispatch import (  # noqa: PLC0415
         _sparse_piper_attention_op,
     )
@@ -323,14 +323,14 @@ def test_sm120_custom_op_passes_opcheck(sequence_length: int) -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize(
     ("sparse_key_blocks", "ratios"),
     [(1, (1.0, 1.0)), (2, (0.5, 1.0)), (3, (1 / 3, 2 / 3))],
 )
-def test_sm120_matches_the_portable_quantized_reference(
+def test_native_matches_the_portable_quantized_reference(
     sparse_key_blocks: int,
     ratios: tuple[float, float],
 ) -> None:
@@ -359,11 +359,11 @@ def test_sm120_matches_the_portable_quantized_reference(
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [64, 65, 127, 128, 129, 181, 191, 192, 193])
-def test_sm120_ragged_lengths_match_the_portable_reference(sequence_length: int) -> None:
+def test_native_ragged_lengths_match_the_portable_reference(sequence_length: int) -> None:
     query, key, value = _inputs(sequence_length=sequence_length)
     attention = _attention((0.5, 1.0))
     sparse_key_blocks = sequence_length // 64
@@ -392,8 +392,8 @@ def test_sm120_ragged_lengths_match_the_portable_reference(sequence_length: int)
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 def test_operator_is_opaque_to_a_full_compile_graph() -> None:
     query, key, value = _inputs("cuda", sequence_length=193)
@@ -413,8 +413,8 @@ def test_operator_is_opaque_to_a_full_compile_graph() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
 )
 def test_mean_pool_operator_is_opaque_to_a_full_compile_graph() -> None:
     query, key, value = _inputs("cuda", sequence_length=193)
