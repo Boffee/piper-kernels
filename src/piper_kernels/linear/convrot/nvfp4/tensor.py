@@ -14,7 +14,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
-from piper_kernels.linear._tensor_matmul import require_untransposed
+from piper_kernels.linear._tensor_views import require_untransposed
 from piper_kernels.linear.convrot._rotation import (
     rotate_groups,
     validate_group_size,

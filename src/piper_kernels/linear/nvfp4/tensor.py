@@ -25,8 +25,8 @@ from piper_kernels.linear._dispatch import (
     apply_linear_autocast,
     bind_linear_arguments,
 )
-from piper_kernels.linear._tensor_matmul import register_matrix_ops, require_untransposed
-from piper_kernels.linear._tensor_views import same_layout_as_strided, same_shape_view
+from piper_kernels.linear._tensor_matmul import register_matrix_ops
+from piper_kernels.linear._tensor_views import register_view_ops, require_untransposed
 
 from . import _layout
 from ._typing import NVFP4Storage
@@ -346,10 +346,7 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         return copied
 
 
-PiperNVFP4Tensor.implements([torch.ops.aten.view.default, torch.ops.aten.view_as.default])(
-    same_shape_view
-)
-PiperNVFP4Tensor.implements(torch.ops.aten.as_strided.default)(same_layout_as_strided)
+register_view_ops(PiperNVFP4Tensor)
 register_matrix_ops(PiperNVFP4Tensor)
 
 

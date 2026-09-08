@@ -1,6 +1,7 @@
 """DTensor linear uses the same quantized interpretation as local Piper linear."""
 
 from datetime import timedelta
+from itertools import product
 
 import pytest
 import torch
@@ -68,6 +69,20 @@ def _replicated(value, mesh):
     return DTensor.from_local(value, mesh, [Replicate()], run_check=False)
 
 
+def _linear(format_name, device_type, compiled):
+    if not compiled:
+        return F.linear
+    torch.compiler.reset()
+    if device_type == "cpu":
+        return torch.compile(F.linear, fullgraph=True, backend="aot_eager")
+    _, compile_options = _FORMATS[format_name]
+    return torch.compile(
+        F.linear,
+        fullgraph=True,
+        options=compile_options({"triton.cudagraphs": False}),
+    )
+
+
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 def test_cpu_dtensor_int8_linear(process_group, compiled, bias):
@@ -78,14 +93,75 @@ def test_cpu_dtensor_int8_linear(process_group, compiled, bias):
     mesh = DeviceMesh("cpu", [0])
     dw, dx = _replicated(weight, mesh), _replicated(activation, mesh)
     db = None if bias is None else _replicated(bias, mesh)
-    linear = F.linear
-    if compiled:
-        torch.compiler.reset()
-        linear = torch.compile(linear, fullgraph=True, backend="aot_eager")
+    linear = _linear("int8", "cpu", compiled)
     with torch.no_grad():
         actual = linear(dx, dw, db).to_local()
         expected = F.linear(activation, weight, bias)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _sharded_inputs(rank, format_name, placement, mesh, with_bias):
+    torch.manual_seed(106)
+    device_type = mesh.device_type
+    dtype = torch.bfloat16 if device_type == "cuda" else torch.float32
+    source = torch.randn(384, 512, dtype=dtype) * 0.02
+    activation = torch.randn(32, 512, dtype=dtype)
+    bias = torch.randn(384, dtype=dtype) if with_bias else None
+    if isinstance(placement, Shard):
+        source = source.chunk(2, dim=placement.dim)[rank].contiguous()
+        if placement.dim == 0 and bias is not None:
+            bias = bias.chunk(2)[rank]
+        elif placement.dim == 1:
+            activation = activation.chunk(2, dim=1)[rank].contiguous()
+    weight = _weight(format_name, source.to(device_type), high_first=format_name != "int8")
+    activation = activation.to(device_type)
+    bias = None if bias is None else bias.to(device_type)
+
+    # Map weight placement to activation, bias, and output placements.
+    if placement == Shard(0):
+        input_placement, bias_placement, output_placement = Replicate(), Shard(0), Shard(1)
+    elif placement == Shard(1):
+        input_placement, bias_placement, output_placement = Shard(1), Replicate(), Partial()
+    else:
+        input_placement, bias_placement, output_placement = Replicate(), Replicate(), Replicate()
+    dx = DTensor.from_local(activation, mesh, [input_placement], run_check=False)
+    dw = DTensor.from_local(weight, mesh, [placement], run_check=False)
+    db = None if bias is None else DTensor.from_local(bias, mesh, [bias_placement], run_check=False)
+    # A replicated bias contributes once when partial products are summed;
+    # DTensor divides it between the two ranks.
+    local_bias = bias / 2 if bias is not None and placement == Shard(1) else bias
+    return (activation, weight, local_bias), (dx, dw, db), output_placement
+
+
+def _gather_reference(local, placement):
+    if isinstance(placement, Replicate):
+        return local
+    gathered = [torch.empty_like(local) for _ in range(2)]
+    dist.all_gather(gathered, local)
+    if isinstance(placement, Partial):
+        return gathered[0] + gathered[1]
+    return torch.cat(gathered, dim=placement.dim)
+
+
+def _check_sharded_linear(local_args, distributed_args, output_placement, cpu_mesh, linear):
+    with torch.no_grad():
+        expected = F.linear(*local_args).cpu()
+        result = linear(*distributed_args)
+    assert result.placements == (output_placement,), (
+        f"expected {(output_placement,)}, got {result.placements}"
+    )
+    local = result.to_local().cpu()
+    torch.testing.assert_close(local, expected, rtol=0, atol=0)
+    full_expected = _gather_reference(expected, output_placement)
+    # Gloo can reduce/gather dense CPU outputs even when two simulated CUDA
+    # ranks share one GPU.
+    full_actual = DTensor.from_local(
+        local,
+        cpu_mesh,
+        result.placements,
+        run_check=False,
+    ).full_tensor()
+    torch.testing.assert_close(full_actual, full_expected, rtol=0, atol=0)
 
 
 def _two_rank_linear(rank, store_path, device_type):
@@ -101,88 +177,29 @@ def _two_rank_linear(rank, store_path, device_type):
         mesh = DeviceMesh(device_type, [0, 1])
         cpu_mesh = DeviceMesh("cpu", [0, 1])
         formats = tuple(_FORMATS) if device_type == "cuda" else ("int8",)
-        dtype = torch.bfloat16 if device_type == "cuda" else torch.float32
-        for format_name in formats:
-            for placement in (Replicate(), Shard(0), Shard(1)):
-                torch.manual_seed(106)
-                source = torch.randn(384, 512, dtype=dtype) * 0.02
-                activation = torch.randn(32, 512, dtype=dtype)
-                bias = torch.randn(384, dtype=dtype)
-                if isinstance(placement, Shard):
-                    source = source.chunk(2, dim=placement.dim)[rank].contiguous()
-                    if placement.dim == 0:
-                        bias = bias.chunk(2)[rank]
-                    else:
-                        activation = activation.chunk(2, dim=1)[rank].contiguous()
-                weight = _weight(format_name, source.to(device_type), high_first=True)
-                activation, bias = activation.to(device_type), bias.to(device_type)
-                column_shard = placement == Shard(1)
-                dx = DTensor.from_local(
-                    activation,
+        cases = product(formats, (Replicate(), Shard(0), Shard(1)), (False, True), (False, True))
+        for format_name, placement, with_bias, compiled in cases:
+            label = (
+                f"rank={rank}, device={device_type}, format={format_name}, "
+                f"weight_placement={placement}, bias={with_bias}, compiled={compiled}"
+            )
+            try:
+                local_args, distributed_args, output_placement = _sharded_inputs(
+                    rank,
+                    format_name,
+                    placement,
                     mesh,
-                    [Shard(1) if column_shard else Replicate()],
-                    run_check=False,
+                    with_bias,
                 )
-                dw = DTensor.from_local(weight, mesh, [placement], run_check=False)
-                for with_bias in (False, True):
-                    db = (
-                        DTensor.from_local(
-                            bias,
-                            mesh,
-                            [Shard(0) if placement == Shard(0) else Replicate()],
-                            run_check=False,
-                        )
-                        if with_bias
-                        else None
-                    )
-                    # A replicated bias contributes once when partial products
-                    # are summed; DTensor divides it between the two ranks.
-                    local_bias = (bias / 2 if column_shard else bias) if with_bias else None
-                    with torch.no_grad():
-                        expected = F.linear(activation, weight, local_bias).cpu()
-                    gathered = [torch.empty_like(expected) for _ in range(2)]
-                    dist.all_gather(gathered, expected)
-                    if column_shard:
-                        full_expected = gathered[0] + gathered[1]
-                    elif placement == Shard(0):
-                        full_expected = torch.cat(gathered, dim=1)
-                    else:
-                        full_expected = expected
-                    for compiled in (False, True):
-                        linear = F.linear
-                        if compiled:
-                            torch.compiler.reset()
-                            _, compile_options = _FORMATS[format_name]
-                            linear = torch.compile(
-                                linear,
-                                fullgraph=True,
-                                **(
-                                    {"options": compile_options({"triton.cudagraphs": False})}
-                                    if device_type == "cuda"
-                                    else {"backend": "aot_eager"}
-                                ),
-                            )
-                        with torch.no_grad():
-                            result = linear(dx, dw, db)
-                        expected_placement = (
-                            Partial()
-                            if column_shard
-                            else Shard(1)
-                            if placement == Shard(0)
-                            else Replicate()
-                        )
-                        assert result.placements == (expected_placement,)
-                        local = result.to_local().cpu()
-                        torch.testing.assert_close(local, expected, rtol=0, atol=0)
-                        # Gloo can reduce/gather these dense CPU outputs even
-                        # when both simulated CUDA ranks share one GPU.
-                        full_actual = DTensor.from_local(
-                            local,
-                            cpu_mesh,
-                            result.placements,
-                            run_check=False,
-                        ).full_tensor()
-                        torch.testing.assert_close(full_actual, full_expected, rtol=0, atol=0)
+                _check_sharded_linear(
+                    local_args,
+                    distributed_args,
+                    output_placement,
+                    cpu_mesh,
+                    _linear(format_name, device_type, compiled),
+                )
+            except Exception as error:
+                raise AssertionError(f"{label}: {error}") from error
     finally:
         dist.destroy_process_group()
 
@@ -199,9 +216,16 @@ def test_two_rank_replicated_and_sharded_linear(tmp_path, device_type):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("format_name", _FORMATS)
 @pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("case", ["plain", "bias", "batched", "high_first", "static"])
+@pytest.mark.parametrize(
+    ("format_name", "case"),
+    [
+        (format_name, case)
+        for format_name in _FORMATS
+        for case in ("plain", "bias", "mixed_bias", "batched", "high_first", "static")
+        if format_name != "int8" or case not in ("high_first", "static")
+    ],
+)
 def test_cuda_dtensor_linear_matches_local_quantized_weight(
     process_group,
     format_name,
@@ -219,19 +243,14 @@ def test_cuda_dtensor_linear_matches_local_quantized_weight(
     )
     shape = (2, 16, 256) if case == "batched" else (32, 256)
     activation = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(192, device="cuda", dtype=torch.bfloat16) if case == "bias" else None
+    bias = None
+    if case in ("bias", "mixed_bias"):
+        bias_dtype = torch.float32 if case == "mixed_bias" else torch.bfloat16
+        bias = torch.randn(192, device="cuda", dtype=bias_dtype)
     mesh = DeviceMesh("cuda", [0])
     dw, dx = _replicated(weight, mesh), _replicated(activation, mesh)
     db = None if bias is None else _replicated(bias, mesh)
-    linear = F.linear
-    if compiled:
-        torch.compiler.reset()
-        _, compile_options = _FORMATS[format_name]
-        linear = torch.compile(
-            linear,
-            fullgraph=True,
-            options=compile_options({"triton.cudagraphs": False}),
-        )
+    linear = _linear(format_name, "cuda", compiled)
     with torch.no_grad():
         transposed = dw.t().to_local()
         assert type(transposed) is type(weight)

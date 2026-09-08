@@ -11,22 +11,35 @@ from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.linear.nvfp4._layout import swap_packed_pairs
 
+_WEIGHT_FORMATS = [
+    pytest.param(ConvRotInt8Tensor, False, id="int8"),
+    pytest.param(PiperNVFP4Tensor, False, id="nvfp4_low_first"),
+    pytest.param(PiperNVFP4Tensor, True, id="nvfp4_high_first"),
+    pytest.param(ConvRotNVFP4Tensor, False, id="convrot_nvfp4_low_first"),
+    pytest.param(ConvRotNVFP4Tensor, True, id="convrot_nvfp4_high_first"),
+]
+
+
+def _weight(cls, high_first=False):
+    torch.manual_seed(106)
+    # The output dimension deliberately cannot be a ConvRot feature dimension.
+    source = torch.randn(7, 64, dtype=torch.bfloat16)
+    result = cls.from_hp(source, **({} if cls is PiperNVFP4Tensor else {"group_size": 64}))
+    if high_first:
+        result.qdata = swap_packed_pairs(result.qdata)
+        result.high_first = True
+    return result
+
 
 @pytest.fixture(params=[ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor])
 def weight(request):
-    torch.manual_seed(106)
-    cls = request.param
-    # The output dimension deliberately cannot be a ConvRot feature dimension.
-    source = torch.randn(7, 64, dtype=torch.bfloat16)
-    return cls.from_hp(source, **({} if cls is PiperNVFP4Tensor else {"group_size": 64}))
+    return _weight(request.param)
 
 
-@pytest.mark.parametrize("high_first", [False, True])
+@pytest.mark.parametrize(("cls", "high_first"), _WEIGHT_FORMATS)
 @pytest.mark.parametrize("operation", ["t", "transpose", "negative", "mT", "permute", "aten"])
-def test_transpose_preserves_weight_metadata_and_aliases(weight, high_first, operation):
-    if high_first and isinstance(weight, PiperNVFP4Tensor):
-        weight.qdata = swap_packed_pairs(weight.qdata)
-        weight.high_first = True
+def test_transpose_preserves_weight_metadata_and_aliases(cls, high_first, operation):
+    weight = _weight(cls, high_first)
     operations = {
         "t": lambda w: w.t(),
         "transpose": lambda w: w.transpose(0, 1),
@@ -145,17 +158,35 @@ def test_unsupported_slicing_cannot_drop_wrapper(weight, operation):
         weight[index]
 
 
-@pytest.mark.parametrize("bias_shape", [(), (1,), (7,), (3, 1), (3, 7)])
-@pytest.mark.parametrize(("alpha", "beta"), [(1, 1), (0.5, 2), (2, 0)])
-def test_portable_addmm_preserves_scalars_and_bias(bias_shape, alpha, beta):
-    weight = ConvRotInt8Tensor.from_hp(torch.randn(7, 64), group_size=64)
-    activation = torch.randn(3, 64)
-    bias = torch.full(bias_shape, float("nan")) if beta == 0 else torch.randn(bias_shape)
-    expected = F.linear(activation, weight) * alpha
-    if beta:
-        expected = expected + bias * beta
-    actual = torch.addmm(bias, activation, weight.t(), alpha=alpha, beta=beta)
-    torch.testing.assert_close(actual, expected)
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+def test_portable_addmm_preserves_linear_output_dtype(bias_dtype):
+    weight = _weight(ConvRotInt8Tensor)
+    activation = torch.randn(3, 64, dtype=weight.dtype)
+    bias = torch.randn(7, dtype=bias_dtype)
+    actual = torch.addmm(bias, activation, weight.t())
+    expected = F.linear(activation, weight, bias)
+    assert actual.dtype is weight.dtype
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("alpha", "beta", "bias_shape"),
+    [
+        (0.5, 1, (7,)),
+        (1, 0, (7,)),
+        (1, 2, (7,)),
+        (1 + 0j, 1, (7,)),
+        (1, 1, ()),
+        (1, 1, (1,)),
+        (1, 1, (3, 1)),
+        (1, 1, (3, 7)),
+    ],
+)
+def test_addmm_rejects_non_linear_arguments(weight, alpha, beta, bias_shape):
+    activation = torch.randn(3, 64, dtype=weight.dtype)
+    bias = torch.randn(bias_shape, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="quantized addmm requires"):
+        torch.addmm(bias, activation, weight.t(), alpha=alpha, beta=beta)
 
 
 @pytest.mark.parametrize("cls", [ConvRotInt8Tensor, PiperNVFP4Tensor])
@@ -187,9 +218,8 @@ def test_int8_checkpoint_without_transpose_metadata_still_reconstructs():
     assert torch.equal(actual.dequantize(), weight.dequantize())
 
 
-@pytest.mark.parametrize("cls", [ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor])
+@pytest.mark.parametrize(("cls", "high_first"), _WEIGHT_FORMATS)
 @pytest.mark.parametrize("rows", [0, 1])
-@pytest.mark.parametrize("high_first", [False, True])
 def test_transpose_empty_and_single_row_weights(cls, rows, high_first):
     if cls is ConvRotInt8Tensor:
         weight = cls.from_hp(torch.randn(rows, 64, dtype=torch.bfloat16), group_size=64)

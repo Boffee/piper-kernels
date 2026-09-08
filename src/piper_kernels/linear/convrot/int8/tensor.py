@@ -14,8 +14,8 @@ from piper_kernels.linear._dispatch import (
     bind_linear_arguments,
 )
 from piper_kernels.linear._input_activations import InputActivation
-from piper_kernels.linear._tensor_matmul import register_matrix_ops, require_untransposed
-from piper_kernels.linear._tensor_views import same_layout_as_strided, same_shape_view
+from piper_kernels.linear._tensor_matmul import register_matrix_ops
+from piper_kernels.linear._tensor_views import register_view_ops, require_untransposed
 
 from .._rotation import rotate_groups
 from . import _update, dispatch
@@ -280,10 +280,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         return copied
 
 
-ConvRotInt8Tensor.implements([torch.ops.aten.view.default, torch.ops.aten.view_as.default])(
-    same_shape_view
-)
-ConvRotInt8Tensor.implements(torch.ops.aten.as_strided.default)(same_layout_as_strided)
+register_view_ops(ConvRotInt8Tensor)
 register_matrix_ops(ConvRotInt8Tensor)
 
 
@@ -387,20 +384,7 @@ def _convrot_addmm_dispatch(
     weight, mat1, mat2 = args
     if not isinstance(weight, ConvRotInt8Tensor):
         raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
-    if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
-        raise TypeError("ConvRot addmm_ matrices must be tensors")
-    require_untransposed(weight, "addmm_")
-    _update.addmm_(
-        weight.qdata,
-        weight.scale,
-        weight.dtype,
-        weight.group_size,
-        mat1,
-        mat2,
-        beta=kwargs.get("beta", 1),
-        alpha=kwargs.get("alpha", 1),
-    )
-    return weight
+    return weight.addmm_(mat1, mat2, beta=kwargs.get("beta", 1), alpha=kwargs.get("alpha", 1))
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten.add_.Tensor)
@@ -413,15 +397,4 @@ def _convrot_add_dispatch(
     weight, update = args
     if not isinstance(weight, ConvRotInt8Tensor):
         raise TypeError(f"ConvRot add_ weight must be ConvRotInt8Tensor, got {type(weight)}")
-    if not isinstance(update, torch.Tensor):
-        raise TypeError("ConvRot add_ update must be a tensor")
-    require_untransposed(weight, "add_")
-    _update.add_(
-        weight.qdata,
-        weight.scale,
-        weight.dtype,
-        weight.group_size,
-        update,
-        alpha=kwargs.get("alpha", 1),
-    )
-    return weight
+    return weight.add_(update, alpha=kwargs.get("alpha", 1))

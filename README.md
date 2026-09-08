@@ -269,6 +269,8 @@ contiguous or updated in place.
 
 `F.linear` on DTensors constructed with `DTensor.from_local(..., run_check=False)` uses
 Piper's local quantized linear implementation through the transpose and `mm`/`addmm` path.
+`addmm` supports the linear case: `alpha=1`, `beta=1`, and a bias vector with one value per
+output feature. Other coefficients and bias shapes raise `NotImplementedError`.
 Eager and fullgraph compiled execution support replicated weights, output-feature weight
 shards (`Shard(0)`), and input-feature weight shards (`Shard(1)`) with matching activation
 placements. Quantize each local shard in its own layout; ConvRot feature shards must align
