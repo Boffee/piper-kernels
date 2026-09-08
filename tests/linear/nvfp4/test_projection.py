@@ -1,5 +1,8 @@
 """Precision and bounded-workspace checks for the shared affine GEMM."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 import torch
 from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, unpack_uint4
@@ -104,3 +107,54 @@ def test_mixed_bias_chunks_preserve_strided_output_and_ragged_rows(dtype):
     assert actual.data_ptr() == output.data_ptr()
     assert storage[:, :outputs].isnan().all()
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("separate_streams", [False, True])
+def test_concurrent_affine_projections_keep_independent_tensor_scales(separate_streams):
+    rows, features, outputs = 192, 256, 512
+    qdata = torch.full((rows, features // 2), 0x22, device="cuda", dtype=torch.uint8)
+    weight = torch.full((outputs, features // 2), 0x22, device="cuda", dtype=torch.uint8)
+    scale = torch.ones(_layout.scale_shape(rows, features), device="cuda").to(torch.float8_e4m3fn)
+    weight_scale = torch.ones(_layout.scale_shape(outputs, features), device="cuda").to(
+        torch.float8_e4m3fn,
+    )
+    input_scale = torch.tensor(1 / 256, device="cuda")
+    weight_scales = [torch.tensor(value, device="cuda") for value in (0.5, 2.0)]
+    bias = torch.full((outputs,), 0.25, device="cuda", dtype=torch.bfloat16)
+    buffers = [torch.empty((rows, outputs), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    streams = [
+        torch.cuda.Stream() if separate_streams else torch.cuda.default_stream() for _ in range(2)
+    ]
+
+    def project(rank):
+        return _projection.matmul_prepared_chunk_affine_out(
+            qdata,
+            scale,
+            input_scale,
+            weight,
+            weight_scale,
+            weight_scales[rank],
+            bias,
+            0,
+            rows,
+            buffers[rank],
+        )
+
+    # Warm up GEMM and finish input initialization before sharing inputs.
+    for rank in range(2):
+        project(rank)
+    torch.cuda.synchronize()
+    barrier = Barrier(2, timeout=30)
+
+    def run(rank):
+        results = []
+        with torch.no_grad(), torch.cuda.stream(streams[rank]):
+            for _ in range(32):
+                barrier.wait()
+                results.append(project(rank).cpu())
+        return torch.stack(results)
+
+    with ThreadPoolExecutor(2) as pool:
+        actual = list(pool.map(run, range(2)))
+    for result, expected in zip(actual, (0.75, 2.25), strict=True):
+        torch.testing.assert_close(result, torch.full_like(result, expected), rtol=0, atol=0)

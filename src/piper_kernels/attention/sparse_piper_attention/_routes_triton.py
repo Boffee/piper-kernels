@@ -57,7 +57,7 @@ def _tiled_radix_select_pass(  # noqa: ANN202
         tl.where(bins < descending_bin, descending_counts, 0),
         axis=0,
     )
-    chosen_digit = (_RADIX_BINS - 1 - descending_bin).to(tl.uint32)
+    chosen_digit = (_RADIX_BINS - 1 - descending_bin).to(tl.uint32)  # pyright: ignore[reportAttributeAccessIssue]
     return (prefix << 8) | chosen_digit, rank - preceding
 
 
@@ -111,7 +111,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         prefix,
         rank,
-        24,
+        tl.constexpr(24),
         selector_tile,
     )
     prefix, rank = _tiled_radix_select_pass(
@@ -120,7 +120,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         prefix,
         rank,
-        16,
+        tl.constexpr(16),
         selector_tile,
     )
     prefix, rank = _tiled_radix_select_pass(
@@ -129,7 +129,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         prefix,
         rank,
-        8,
+        tl.constexpr(8),
         selector_tile,
     )
     threshold_bits, equal_keep = _tiled_radix_select_pass(
@@ -138,7 +138,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         sparse_key_blocks,
         prefix,
         rank,
-        0,
+        tl.constexpr(0),
         selector_tile,
     )
 
@@ -158,8 +158,8 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
             key_offsets,
             mask=selected,
         )
-        output_offset += tl.sum(selected.to(tl.int32), axis=0)
-        equal_offset += tl.sum(equal.to(tl.int32), axis=0)
+        output_offset += tl.sum(selected.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
+        equal_offset += tl.sum(equal.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
 
 
 def tiled_radix_select_packed_routes(

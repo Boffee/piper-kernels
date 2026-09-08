@@ -38,7 +38,8 @@ def _normalize_rotated_values(
     """Apply the portable group normalization and construct an INT8 row scale."""
     values *= inverse_sqrt_group
     scale = tl.maximum(
-        int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), True), 1e-30
+        int8_scale_from_max(tl.max(tl.abs(values).to(tl.float32), axis=0), tl.constexpr(True)),
+        1e-30,
     )
     return normalize_for_int8(values, scale), scale
 
@@ -50,7 +51,7 @@ def _amd_normalization_scale(
 ):
     """Construct the value scale used by AMD's folded normalization."""
     return tl.maximum(
-        int8_scale_from_max(absolute_max, True),
+        int8_scale_from_max(absolute_max, tl.constexpr(True)),
         1e-30 / inverse_sqrt_group,
     )
 
@@ -238,8 +239,8 @@ def rotate_quantize_rows_chunked_kernel(
     tl.store(q_ptr + output_row_offset + offsets0, quantized0, mask=mask0)
     tl.store(q_ptr + output_row_offset + offsets1, quantized1, mask=mask1)
     if block2:
-        quantized2 = _quantize_int8(values2, normalization_scale, accelerator_backend)
-        tl.store(q_ptr + output_row_offset + offsets2, quantized2, mask=mask2)
+        quantized2 = _quantize_int8(values2, normalization_scale, accelerator_backend)  # pyright: ignore[reportPossiblyUnboundVariable]
+        tl.store(q_ptr + output_row_offset + offsets2, quantized2, mask=mask2)  # pyright: ignore[reportPossiblyUnboundVariable]
     tl.store(scale_ptr + row_i64, normalization_scale * inverse_sqrt_group)
 
 

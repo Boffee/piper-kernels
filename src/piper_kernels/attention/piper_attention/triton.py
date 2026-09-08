@@ -279,7 +279,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     )
     probabilities = tl.where(
         valid_queries[:, None] & valid_keys,
-        tl.exp2(scores - block_max[:, None]),
+        tl.exp2(scores - block_max[:, None]),  # pyright: ignore[reportArgumentType]
         0.0,
     )
     denominator = denominator * old_weight + tl.sum(probabilities, axis=1) * current_weight
@@ -289,7 +289,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             mask=current_n < key_length,
             other=0.0,
         )
-    probability_values = probabilities * value_scale_multiplier[None, :] + 0.5
+    probability_values = probabilities * value_scale_multiplier[None, :] + 0.5  # pyright: ignore[reportPossiblyUnboundVariable]
     if use_packed_probability_conversion:
         probability_uint8 = _ptx_float32_to_uint8x4(probability_values)
     else:
@@ -310,7 +310,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             current_n,
             offsets_vd,
             key_length,
-            0,
+            tl.constexpr(0),
             half_head_dim,
             head_dim,
             block_n,
@@ -349,7 +349,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             current_n,
             offsets_d,
             key_length,
-            0,
+            tl.constexpr(0),
             head_dim,
             head_dim,
             block_n,
@@ -450,13 +450,13 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         end_n = tl.minimum(key_length, (query_block + 1) * block_m)
 
     if is_causal and optimize_causal_traversal:
-        numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator
+        numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator  # pyright: ignore[reportPossiblyUnboundVariable]
         # Only complete K tiles strictly before the first query row are
         # mask-free. Keep ragged tails and diagonal overlap in the boundary.
         full_key_end = key_length // block_n * block_n
         causal_prefix_end = query_block * block_m // block_n * block_n
         prefix_end = tl.minimum(causal_prefix_end, full_key_end)
-        for start_n in tl.range(
+        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             0,
             prefix_end,
             block_n,
@@ -481,7 +481,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 offsets_d,
                 valid_queries,
                 key_length,
-                mask_keys=False,
+                mask_keys=tl.constexpr(False),
                 is_causal=is_causal,
                 grouped_qk=grouped_qk,
                 split_pv_head_dim=split_pv_head_dim,
@@ -492,7 +492,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
             )
-        for start_n in tl.range(
+        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             prefix_end,
             end_n,
             block_n,
@@ -517,7 +517,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 offsets_d,
                 valid_queries,
                 key_length,
-                mask_keys=True,
+                mask_keys=tl.constexpr(True),
                 is_causal=is_causal,
                 grouped_qk=grouped_qk,
                 split_pv_head_dim=split_pv_head_dim,
@@ -533,8 +533,8 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         else:
             accumulator = numerator
     else:
-        numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator
-        for start_n in tl.range(
+        numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator  # pyright: ignore[reportPossiblyUnboundVariable]
+        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             0,
             end_n,
             block_n,
@@ -559,7 +559,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 offsets_d,
                 valid_queries,
                 key_length,
-                mask_keys=not unmasked_key_tiles,
+                mask_keys=tl.constexpr(not unmasked_key_tiles),
                 is_causal=is_causal,
                 grouped_qk=grouped_qk,
                 split_pv_head_dim=split_pv_head_dim,
@@ -577,25 +577,25 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     denominator_safe = tl.maximum(denominator, 1e-30)[:, None]
     denominator_code_units = denominator_safe * _P_UINT8_RANGE
     if split_pv_head_dim:
-        output_low = accumulator_low / denominator_code_units
-        output_high = accumulator_high / denominator_code_units
+        output_low = accumulator_low / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
+        output_high = accumulator_high / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         if not is_causal:
             value_mean_base = value_mean_ptr + batch_head * head_dim
-            output_low += tl.load(value_mean_base + offsets_vd)[None, :]
-            output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]
+            output_low += tl.load(value_mean_base + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
+            output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
         output_base = output_ptr + (batch_head * query_length + offsets_m[:, None]) * head_dim
         tl.store(
-            output_base + offsets_vd[None, :],
+            output_base + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
             output_low,
             mask=valid_queries[:, None],
         )
         tl.store(
-            output_base + half_head_dim + offsets_vd[None, :],
+            output_base + half_head_dim + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
             output_high,
             mask=valid_queries[:, None],
         )
     else:
-        output = accumulator / denominator_code_units
+        output = accumulator / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         if not is_causal:
             output += tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)[None, :]
         tl.store(

@@ -257,7 +257,8 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """Use the unrotated basis for ordinary NVFP4 updates."""
         return 0
 
-    def addmm_(
+    # Quantized updates require concrete scalars; Tensor also types symbolic scalars.
+    def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         mat1: torch.Tensor,
         mat2: torch.Tensor,

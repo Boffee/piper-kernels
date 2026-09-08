@@ -170,8 +170,8 @@ def _piper_probability_pair(
     # Q/K scales are nonnegative. Their FP32 conversion and multiplication
     # are monotonic, so the row maximum can be reduced exactly in INT32
     # before scaling, keeping both full FP32 score tiles out of this stage.
-    score_max_0 = gl.max(integer_scores_0, axis=1).to(gl.float32) * score_scale_0
-    score_max_1 = gl.max(integer_scores_1, axis=1).to(gl.float32) * score_scale_1
+    score_max_0 = gl.max(integer_scores_0, axis=1).to(gl.float32) * score_scale_0  # pyright: ignore[reportAttributeAccessIssue]
+    score_max_1 = gl.max(integer_scores_1, axis=1).to(gl.float32) * score_scale_1  # pyright: ignore[reportAttributeAccessIssue]
     # Every selected physical K64 has at least one valid key; only the
     # duplicated final tile can have no active keys in this kernel's contract.
     if mask_duplicate:

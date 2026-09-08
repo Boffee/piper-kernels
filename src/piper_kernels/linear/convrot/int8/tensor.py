@@ -171,7 +171,8 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         result = rotate_groups(rotated, self.group_size)
         return result.t() if self.transposed else result
 
-    def addmm_(
+    # Quantized updates require concrete scalars; Tensor also types symbolic scalars.
+    def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         mat1: torch.Tensor,
         mat2: torch.Tensor,

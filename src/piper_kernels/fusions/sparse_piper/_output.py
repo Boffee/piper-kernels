@@ -278,7 +278,7 @@ def _query_chunk_ranges(
     return ranges
 
 
-def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
+def _run_chunked_attention_pipeline(  # noqa: PLR0915
     attention_storage: torch.Tensor,
     sequence_length: int,
     has_coarse_residual: bool,
@@ -290,15 +290,12 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
-    share_projection_stream: bool = False,
 ) -> torch.Tensor:
     """Share buffering, gate, and stream ordering across both Q lifetimes."""
     chunk_ranges = _query_chunk_ranges(sequence_length, query_chunk_rows)
     chunk_count = len(chunk_ranges)
     pipeline_projected_gate = (
-        project_coarse_gate_chunk is not None
-        and chunk_count > 1
-        and (share_projection_stream or chunk_count >= _MIN_PROJECTED_GATE_PIPELINE_CHUNKS)
+        project_coarse_gate_chunk is not None and chunk_count >= _MIN_PROJECTED_GATE_PIPELINE_CHUNKS
     )
     capacity = min(sequence_length, query_chunk_rows)
     batch, heads, head_dim = (
@@ -368,11 +365,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
         if pipeline_projected_gate:
             assert coarse_gate_buffers is not None
             assert project_coarse_gate_chunk is not None
-            gate_stream = (
-                consumer
-                if share_projection_stream
-                else torch.cuda.Stream(device=attention_storage.device)
-            )
+            gate_stream = torch.cuda.Stream(device=attention_storage.device)
             gate_slots = _PingPongSlots(
                 (torch.cuda.Event(), torch.cuda.Event()),
                 attention_slots.produced,
@@ -446,7 +439,6 @@ def run_chunked_attention_output(
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
-    share_projection_stream: bool = False,
 ) -> torch.Tensor:
     """Pipeline a materialized Q boundary through bounded attention output."""
     prepared_attention = prepared.attention
@@ -479,7 +471,6 @@ def run_chunked_attention_output(
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=project_coarse_gate_chunk,
-        share_projection_stream=share_projection_stream,
     )
 
 
@@ -492,7 +483,6 @@ def run_chunked_projected_query_attention_output(
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
-    share_projection_stream: bool = False,
 ) -> torch.Tensor:
     """Project, route, attend, and consume one bounded Q window at a time."""
 
@@ -530,7 +520,6 @@ def run_chunked_projected_query_attention_output(
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=project_coarse_gate_chunk,
-        share_projection_stream=share_projection_stream,
     )
 
 

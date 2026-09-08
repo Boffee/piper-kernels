@@ -48,12 +48,12 @@ def rotate_hadamard_groups(
     group_size: tl.constexpr,
 ):
     """Apply every H4 factor within independent ConvRot groups."""
-    values = rotate_hadamard_stage(values, block_size, 1)
-    values = rotate_hadamard_stage(values, block_size, 4)
+    values = rotate_hadamard_stage(values, block_size, tl.constexpr(1))
+    values = rotate_hadamard_stage(values, block_size, tl.constexpr(4))
     if group_size >= 64:
-        values = rotate_hadamard_stage(values, block_size, 16)
+        values = rotate_hadamard_stage(values, block_size, tl.constexpr(16))
     if group_size >= 256:
-        values = rotate_hadamard_stage(values, block_size, 64)
+        values = rotate_hadamard_stage(values, block_size, tl.constexpr(64))
     return values
 
 

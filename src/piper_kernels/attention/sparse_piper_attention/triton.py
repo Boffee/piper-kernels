@@ -72,7 +72,7 @@ def _quantize_value_per_tile_kernel(
         tl.reshape(value, (block_n, 1, head_dim)),
         tl.reshape(value_mean, (1, head_dim)),
         valid_rows,
-        1,
+        tl.constexpr(1),
         head_dim,
         block_n,
         block_n,

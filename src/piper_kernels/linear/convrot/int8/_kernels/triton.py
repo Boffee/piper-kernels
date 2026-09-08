@@ -278,7 +278,7 @@ def rotate_quantize_rows_kernel(
             row_width,
             chunk_size,
             chunk_offsets,
-            values1,
+            values1,  # pyright: ignore[reportPossiblyUnboundVariable]
             scale,
             accelerator_backend,
         )
@@ -289,7 +289,7 @@ def rotate_quantize_rows_kernel(
             row_width,
             2 * chunk_size,
             chunk_offsets,
-            values2,
+            values2,  # pyright: ignore[reportPossiblyUnboundVariable]
             scale,
             accelerator_backend,
         )
@@ -483,8 +483,8 @@ def int8_matmul_kernel(
     else:
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
+    second = pid_n >= tl.cdiv(n, block_n)
     if paired:
-        second = pid_n >= tl.cdiv(n, block_n)
         pid_n %= tl.cdiv(n, block_n)
         weight_ptr = tl.where(second, second_weight_ptr, weight_ptr)
         weight_scale_ptr = tl.where(second, second_scale_ptr, weight_scale_ptr)

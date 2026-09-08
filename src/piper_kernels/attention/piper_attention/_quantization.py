@@ -51,10 +51,9 @@ def _kv_mean_partial_kernel(
     offsets_d = feature_block * block_d + tl.arange(0, block_d)
     offsets_n = tl.arange(0, block_n)
     key_accumulator = tl.zeros((block_d,), dtype=tl.float32)
-    if not is_causal:
-        value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
+    value_accumulator = tl.zeros((block_d,), dtype=tl.float32)
     chunk_start = chunk * chunk_n
-    for offset in tl.range(0, chunk_n, block_n, disable_licm=True):
+    for offset in tl.range(0, chunk_n, block_n, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
         current_n = chunk_start + offset + offsets_n
         mask = (current_n[:, None] < key_length) & (offsets_d[None, :] < head_dim)
         key = tl.load(

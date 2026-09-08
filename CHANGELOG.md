@@ -33,6 +33,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Require PyTorch 2.14 or newer for its NVFP4 GEMM concurrency fix and select matching
+  Triton 3.8 on Windows.
+- Make Triton compile-time arguments explicit and keep remaining typing workarounds
+  scoped to individual expressions for compatibility with Triton 3.8.
 - Keep sparse attention's fused coarse-residual epilogue in FP32 until its final BF16
   store. Accumulating paired integer PV products in one INT32 tile removes a temporary
   and eliminates register spills in the aligned SM120 kernel.
@@ -68,7 +72,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   NVIDIA schedules, and portable fallbacks are preserved. Portable INT8 arithmetic is shared
   by accelerator-owned launchers; AMD retains its own preparation and group-8 RDNA4 policy.
 - Use the Linux PyTorch distribution's matching CUDA or ROCm Triton instead of pinning a
-  competing Linux Triton version in Piper's extra. Windows retains `triton-windows` 3.7.
+  competing Linux Triton version in Piper's extra. Windows uses `triton-windows` 3.8.
 
 - Renamed INT8-only fusion packages, compiler helpers, and custom-op prefixes from
   `convrot_swiglu_ffn`, `convrot_sparse_piper`, and `convrot_sage_qk` to their explicit
@@ -91,6 +95,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Prevent concurrent NVFP4 affine projections from sharing a device alpha buffer through
+  PyTorch 2.14's upstream fix. Preserve native fused scale/bias epilogues and allow sparse
+  attention's gate and output projections to run on separate streams.
 - Allow plain NVFP4 SwiGLU FFN compilation in fresh processes without prior ConvRot
   operator registration. Shared projection validation reads the graph operator's schema.
 - Preserve batched SwiGLU FFN and sparse-attention projection fusion across DTensor
@@ -109,8 +116,6 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Compute NVFP4 projection epilogue offsets in 64 bits before multiplication so outputs larger
   than 2^31 elements do not overflow their indices.
 - Honor noncontiguous bias strides in both native NVFP4 GEMM and mixed-bias addition.
-- Order sparse-attention gate and output NVFP4 GEMMs on one projection stream to avoid
-  concurrent scaling-buffer overwrites in PyTorch 2.13. Attention still overlaps projection.
 - Match NVFP4 FFN projections by their complete operands so shared weights do not conflate
   distinct biases or quantization scales.
 
