@@ -9,7 +9,6 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import _compile as ffn_compile
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as ffn
@@ -150,7 +149,7 @@ def test_sparse_output_uses_operations_and_preserves_output_views(monkeypatch, o
     weight, scale, bias = _weight(7, 128)
     monkeypatch.setattr(sparse_output, "_validate_output_projection", lambda *args: (128, 7))
     width, project, prepared = sparse_output._prepare_output_chunk_projector(
-        storage, 5, weight, scale, bias, 16, 5, 3
+        storage, 5, weight, scale, bias, 16, 5, 3, backend=backend
     )
     assert width == 7
     backing = torch.full((2, 5, 9), -999, dtype=torch.bfloat16)
@@ -163,7 +162,7 @@ def test_sparse_output_uses_operations_and_preserves_output_views(monkeypatch, o
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert torch.all(backing[..., 0] == -999)
     assert torch.all(backing[..., -1] == -999)
-    select.assert_called_once_with(storage)
+    select.assert_not_called()
     assert backend.prepare_input.call_count == backend.linear_prepared.call_count == 4
     for call in backend.prepare_input.call_args_list:
         assert call.kwargs["out"][0].data_ptr() == prepared[0].data_ptr()
@@ -213,18 +212,3 @@ def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module
             }
             if module in (ffn, ffn_compile):
                 assert node.attr not in {"from_device", "cuda_capability_at_least"}
-
-
-def test_unvalidated_sparse_fusion_still_rejects_rocm(monkeypatch, operations):
-    _implementation, select = operations
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
-    )
-    with FakeTensorMode():
-        value = torch.empty(1, 16, device="cuda")
-        storage = torch.empty(1, 1, 64, 128, dtype=torch.int8, device="cuda")
-        with pytest.raises(ValueError, match="requires exact NVIDIA SM120"):
-            sparse_output._prepare_output_chunk_projector(
-                storage, 64, value, value, None, 16, 64, 64
-            )
-    select.assert_not_called()

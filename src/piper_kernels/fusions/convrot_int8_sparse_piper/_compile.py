@@ -18,13 +18,13 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
+from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.attention.sparse_piper_attention import (
     _coarse_dispatch,
     _quantized_dispatch,
@@ -38,6 +38,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     is_valid_routing_mode,
 )
+from piper_kernels.fusions.convrot_int8_sage_qk import _validation as convrot_int8_qk_validation
 from piper_kernels.fusions.convrot_int8_sage_qk import triton as convrot_int8_sage_qk
 from piper_kernels.fusions.projected_qk import triton as projected_qk
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
@@ -46,12 +47,13 @@ from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
-from . import _layout, _output_compile, key, output, query, value
+from . import _backend, _kernels, _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v23"
+_COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v24"
 _HEAD_DIM = _layout.HEAD_DIM
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
@@ -72,10 +74,13 @@ def _source_files() -> tuple[str, ...]:
             __file__,
             _bias.__file__,
             _layout.__file__,
+            *_backend.source_files(),
+            _kernels.__file__,
             _output_compile.__file__,
             qk_quantization.__file__,
             sparse_piper_kernels.__file__,
             convrot_int8_sage_qk.__file__,
+            convrot_int8_qk_validation.__file__,
             *sparse_piper_compile.source_files(),
             sparse_piper_output.__file__,
             sparse_piper_pattern.__file__,
@@ -192,14 +197,16 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
         return False
     batch, sequence_length = input_value.shape[:2]
     heads = output_features // _HEAD_DIM
-    if (
-        input_value.dtype is not torch.bfloat16
-        or input_value.device.type != "cuda"
-        or (isinstance(sequence_length, int) and sequence_length < _TILE_ROWS)
+    if input_value.dtype is not torch.bfloat16 or (
+        isinstance(sequence_length, int) and sequence_length < _TILE_ROWS
     ):
         return False
-    target = AcceleratorTarget.from_device(input_value.device)
-    if not target.is_cuda_capability(12, 0):
+    if (
+        _backend.select_projection_backend(input_value) is None
+        or linear_backend.select_linear_backend(input_value) is None
+        or linear_backend.select_dequantized_mean(input_value) is None
+        or attention_backend.select_attention_backend(input_value) is None
+    ):
         return False
 
     group_size = sparse_piper_compile.static_int(match.kwargs["sparse_group_size"])

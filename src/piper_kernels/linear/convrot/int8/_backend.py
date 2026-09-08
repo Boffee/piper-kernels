@@ -11,11 +11,13 @@ from ._interfaces import Add, Addmm, DequantizedMean, GGUFConvert, LinearBackend
 from ._nvidia import policy as nvidia_policy
 
 try:
+    from ._generic import mean as _mean_backend
     from ._generic import triton as _generic_backend
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _generic_backend = None
+    _mean_backend = None
 
 try:
     from ._nvidia import triton as _nvidia_backend
@@ -73,12 +75,7 @@ def select_gguf_converter(input: torch.Tensor) -> GGUFConvert | None:  # noqa: A
 
 
 def select_dequantized_mean(input: torch.Tensor) -> DequantizedMean | None:  # noqa: A002
-    """Select the prepared-input mean independently of projection support."""
-    if _nvidia_backend is None:
-        return None
-    target = AcceleratorTarget.from_device(input.device)
-    return (
-        _nvidia_backend.dequantized_input_mean
-        if nvidia_policy.supports_preparation_target(target)
-        else None
-    )
+    """Use the shared reduction independently of optimized INT8 matrix support."""
+    if _mean_backend is not None and runtime.supports_device(input.device):
+        return _mean_backend.dequantized_input_mean
+    return None

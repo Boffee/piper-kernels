@@ -161,6 +161,8 @@ def _validate_output_projection(
     query_chunk_rows: int,
 ) -> tuple[int, int]:
     """Validate the static projection boundary and return its logical dimensions."""
+    # The shared pipeline validates shapes, not NVFP4's accelerator requirements.
+    _validation._validate_device(attention_storage.device, "fused sparse Piper NVFP4 output")
     if (
         isinstance(query_chunk_rows, bool)
         or not isinstance(query_chunk_rows, int)

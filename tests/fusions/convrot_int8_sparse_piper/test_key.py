@@ -14,6 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
+from ._helpers import exact_sm120_available
 from ._reference import composed_key_projection, composed_mean_pool_summary
 
 
@@ -37,10 +38,6 @@ class _Operands:
             self.cos,
             self.sin,
         )
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _random_operands(
@@ -101,7 +98,7 @@ def _random_operands(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("sequence_length", [64, 65])
 def test_fused_key_projection_matches_the_fp32_composed_contract(sequence_length: int) -> None:
     operands = _random_operands(sequence_length=sequence_length)
@@ -130,7 +127,7 @@ def test_fused_key_projection_matches_the_fp32_composed_contract(sequence_length
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("sequence_length", [64, 65])
 def test_mean_pool_key_projection_emits_exact_valid_prefix_means(
     sequence_length: int,
@@ -154,7 +151,7 @@ def test_mean_pool_key_projection_emits_exact_valid_prefix_means(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
     # S192 is K64-aligned but leaves a half-M128 tail whose nonexistent rows
     # must not read beyond the physical RoPE buffers.
@@ -178,7 +175,7 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
 def test_fused_key_projection_ignores_internal_padding(routing_mode: int) -> None:
     operands = _random_operands(sequence_length=192)
@@ -206,7 +203,7 @@ def test_fused_key_projection_ignores_internal_padding(routing_mode: int) -> Non
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_key_projection_custom_op_passes_opcheck() -> None:
     operands = _random_operands()
     result = torch.library.opcheck(
@@ -224,7 +221,7 @@ def test_key_projection_custom_op_passes_opcheck() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_key_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 

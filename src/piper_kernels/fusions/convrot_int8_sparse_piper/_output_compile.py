@@ -12,13 +12,12 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _layout, output
+from . import _backend, _layout, output
 
 type _PreparedGateProjectionNodes = tuple[
     torch.fx.Node,
@@ -180,11 +179,9 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
         or projected.dtype is not torch.bfloat16
         or weight.dtype is not torch.int8
         or scale.dtype is not torch.float32
-        or query.device.type != "cuda"
     ):
         return False
-    target = AcceleratorTarget.from_device(query.device)
-    if not target.is_cuda_capability(12, 0):
+    if _backend.select_output_backend(query) is None:
         return False
 
     batch, sequence_length = attention.shape[:2]
