@@ -6,8 +6,10 @@ from collections.abc import Callable
 from typing import Any, ClassVar, Self, cast
 
 import torch
+from torch._prims_common import make_contiguous_strides_for
 from torch.types import Number
 from torch.utils._python_dispatch import return_and_correct_aliasing
+from torchao.prototype.mx_formats.mx_tensor import tensor_size_fp4x2_to_hp
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -23,6 +25,7 @@ from piper_kernels.linear._dispatch import (
     apply_linear_autocast,
     bind_linear_arguments,
 )
+from piper_kernels.linear._tensor_matmul import register_matrix_ops, require_untransposed
 from piper_kernels.linear._tensor_views import same_layout_as_strided, same_shape_view
 
 from . import _layout
@@ -98,20 +101,49 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
     ) -> PiperNVFP4Tensor:
         if type(high_first) is not bool:
             raise TypeError(f"NVFP4 high_first must be bool, got {type(high_first).__name__}")
-        tensor = super().__new__(
+        transposed = qdata.stride(-2) < qdata.stride(-1)
+        shape = tensor_size_fp4x2_to_hp(qdata.shape, not transposed)
+        # TorchAO reconstructs every wrapper with contiguous logical strides.
+        # A transpose must also expose the reversed logical strides to DTensor
+        # and AOTAutograd, independently of the packed storage's strides.
+        canonical_shape = (*shape[:-2], shape[-1], shape[-2]) if transposed else shape
+        strides = make_contiguous_strides_for(canonical_shape)
+        if transposed:
+            strides = (*strides[:-2], strides[-1], strides[-2])
+        tensor = torch.Tensor._make_wrapper_subclass(
             cls,
-            qdata,
-            scale,
-            block_size,
-            orig_dtype,
-            per_tensor_scale,
-            act_per_tensor_scale,
-            is_swizzled_scales,
-            use_triton_kernel,
-            act_quant_kwargs,
+            shape,
+            strides=strides,
+            dtype=orig_dtype,
+            device=qdata.device,
+            requires_grad=False,
         )
+        if per_tensor_scale is not None and per_tensor_scale.ndim not in (0, 3):
+            raise ValueError("NVFP4 per-tensor scale must be scalar or per-expert")
+        tensor.qdata = qdata
+        tensor.scale = scale
+        tensor.block_size = block_size
+        tensor.orig_dtype = orig_dtype
+        tensor.per_tensor_scale = per_tensor_scale
+        tensor.act_per_tensor_scale = act_per_tensor_scale
+        tensor.is_swizzled_scales = is_swizzled_scales
+        tensor.use_triton_kernel = use_triton_kernel
+        tensor.act_quant_kwargs = act_quant_kwargs
         tensor.high_first = high_first
         return cast(PiperNVFP4Tensor, tensor)
+
+    @property
+    def transposed(self) -> bool:
+        """Whether the packed feature axis precedes the output-row axis."""
+        return self.qdata.stride(-2) < self.qdata.stride(-1)
+
+    def _transpose(self) -> Self:
+        """Transpose packed views without changing their quantized interpretation."""
+        names, metadata = self.__tensor_flatten__()
+        tensors = {name: getattr(self, name) for name in names}
+        tensors["qdata"] = self.qdata.t()
+        tensors["scale"] = self.scale.t()
+        return type(self).__tensor_unflatten__(tensors, metadata, None, None)
 
     @classmethod
     def from_hp(
@@ -207,13 +239,19 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Dequantize either packed-pair order to the logical weight."""
+        if self.transposed:
+            return self._transpose().dequantize(output_dtype).t()
         result = super().dequantize(output_dtype)
         if not self.high_first:
             return result
-        packed_dimension = -2 if self.qdata.stride(-2) < self.qdata.stride(-1) else -1
-        moved = result.movedim(packed_dimension, -1)
-        swapped = moved.reshape(*moved.shape[:-1], -1, 2).flip(-1).reshape(moved.shape)
-        return swapped.movedim(-1, packed_dimension)
+        pairs = result.reshape(*result.shape[:-1], result.shape[-1] // 2, 2)
+        return pairs.flip(-1).reshape(result.shape)
+
+    def get_hp_scales(self) -> torch.Tensor:
+        """Recover canonical scales, including flat scales on transposed views."""
+        if self.transposed:
+            return self._transpose().get_hp_scales()
+        return super().get_hp_scales()
 
     def _update_group_size(self) -> int:
         """Use the unrotated basis for ordinary NVFP4 updates."""
@@ -236,6 +274,7 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """
         from . import _update  # noqa: PLC0415 - update validation depends on this tensor
 
+        require_untransposed(self, "addmm_")
         operation = _update._operation(self, "addmm_")
         if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
             raise TypeError(f"{operation} matrices must be tensors")
@@ -260,6 +299,7 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """Add a dense logical update and requantize in place."""
         from . import _update  # noqa: PLC0415 - update validation depends on this tensor
 
+        require_untransposed(self, "add_")
         operation = _update._operation(self, "add_")
         if not isinstance(other, torch.Tensor):
             raise TypeError(f"{operation} update must be a tensor")
@@ -276,6 +316,8 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
 
     def to(self, *args: object, **kwargs: object) -> Self:
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
+        if kwargs.get("memory_format") not in (None, torch.preserve_format):
+            require_untransposed(self, "to with a different memory format")
         explicit_copy_args = _explicit_to_copy_args(args, kwargs)
         if explicit_copy_args is None:
             return cast(
@@ -308,6 +350,7 @@ PiperNVFP4Tensor.implements([torch.ops.aten.view.default, torch.ops.aten.view_as
     same_shape_view
 )
 PiperNVFP4Tensor.implements(torch.ops.aten.as_strided.default)(same_layout_as_strided)
+register_matrix_ops(PiperNVFP4Tensor)
 
 
 @PiperNVFP4Tensor.implements(torch.ops.aten._to_copy.default)
@@ -326,6 +369,8 @@ def _nvfp4_to_copy(
     non_blocking = arguments.pop("non_blocking", False)
     copy = arguments.pop("copy", False)
     memory_format = arguments.pop("memory_format", None)
+    if memory_format not in (None, torch.preserve_format):
+        require_untransposed(tensor, "to with a different memory format")
     layout = arguments.pop("layout", None)
     pin_memory = arguments.pop("pin_memory", None)
     if arguments:
@@ -392,6 +437,7 @@ def _nvfp4_linear_dispatch(
     input, weight, bias = bind_linear_arguments(args, kwargs)  # noqa: A001
     if not isinstance(input, torch.Tensor) or not isinstance(weight, PiperNVFP4Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)
+    require_untransposed(weight, "linear")
     if bias is not None and not isinstance(bias, torch.Tensor):
         return torchao_nvfp4_linear(func, types, args, kwargs)
 

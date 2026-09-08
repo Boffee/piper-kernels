@@ -1,12 +1,15 @@
 """Aliasing views shared by quantized weight wrappers."""
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch._prims_common import infer_size
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
+
+if TYPE_CHECKING:
+    from ._tensor_matmul import QuantizedWeight
 
 
 def same_shape_view(
@@ -33,10 +36,18 @@ def same_layout_as_strided(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    """Support AOTAutograd replay of a view that preserves the entire layout."""
+    """Support AOTAutograd replay of an alias or a matrix transpose."""
     tensor = cast(TorchAOBaseTensor, args[0])
     shape, strides = args[1:3]
     offset = args[3] if len(args) > 3 else kwargs.get("storage_offset")
+    if (
+        tensor.ndim == 2
+        and tuple(shape) == tuple(reversed(tensor.shape))
+        and tuple(strides) == tuple(reversed(tensor.stride()))
+        and (offset is None or offset == tensor.storage_offset())
+    ):
+        viewed = cast("QuantizedWeight", tensor)._transpose()
+        return cast(torch.Tensor, return_and_correct_aliasing(func, args, kwargs, viewed))
     if (
         tuple(shape) != tuple(tensor.shape)
         or tuple(strides) != tensor.stride()

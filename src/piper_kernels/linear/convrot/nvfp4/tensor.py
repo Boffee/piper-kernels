@@ -14,6 +14,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
+from piper_kernels.linear._tensor_matmul import require_untransposed
 from piper_kernels.linear.convrot._rotation import (
     rotate_groups,
     validate_group_size,
@@ -67,9 +68,10 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         )
         if tensor.ndim != 2:
             raise ValueError("ConvRot NVFP4 weight must be two-dimensional")
-        if tensor.shape[-1] % group_size:
+        features = tensor.shape[-2] if tensor.transposed else tensor.shape[-1]
+        if features % group_size:
             raise ValueError(
-                f"ConvRot NVFP4 weight features {tensor.shape[-1]} must be divisible "
+                f"ConvRot NVFP4 weight features {features} must be divisible "
                 f"by group size {group_size}"
             )
         return cast(ConvRotNVFP4Tensor, tensor)
@@ -246,6 +248,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         compute_per_tensor_scale: bool = False,
     ) -> ConvRotNVFP4Tensor:
         """Refill this tensor from compatible packed GGUF storage in place."""
+        require_untransposed(self, "copy_from_gguf_")
         if compute_per_tensor_scale and self.per_tensor_scale is None:
             raise ValueError("recomputing the NVFP4 scale requires existing scale storage")
         from ._gguf import convert  # noqa: PLC0415
@@ -286,6 +289,8 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis."""
+        if self.transposed:
+            return self._transpose().dequantize(output_dtype).t()
         return rotate_groups(super().dequantize(output_dtype), self.group_size)
 
     def _update_group_size(self) -> int:
@@ -313,6 +318,7 @@ def convrot_nvfp4_linear(
         raise TypeError(
             "ConvRot NVFP4 linear requires a tensor input and ConvRotNVFP4Tensor weight"
         )
+    require_untransposed(weight, "linear")
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(
             f"ConvRot NVFP4 linear bias must be a tensor or None, got {type(bias).__name__}"

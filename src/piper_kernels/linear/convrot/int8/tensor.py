@@ -14,6 +14,7 @@ from piper_kernels.linear._dispatch import (
     bind_linear_arguments,
 )
 from piper_kernels.linear._input_activations import InputActivation
+from piper_kernels.linear._tensor_matmul import register_matrix_ops, require_untransposed
 from piper_kernels.linear._tensor_views import same_layout_as_strided, same_shape_view
 
 from .._rotation import rotate_groups
@@ -30,6 +31,8 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
 
     tensor_data_names: ClassVar[list[str]] = ["qdata", "scale"]
     tensor_attribute_names: ClassVar[list[str]] = ["group_size", "dtype"]
+    optional_tensor_attribute_names: ClassVar[list[str]] = ["transposed"]
+    transposed: bool = False
 
     def __new__(
         cls,
@@ -37,11 +40,15 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         scale: torch.Tensor,
         group_size: int,
         dtype: torch.dtype = torch.bfloat16,
+        transposed: bool = False,
     ) -> "ConvRotInt8Tensor":
         validate_storage(qdata, scale, group_size, dtype)
+        if type(transposed) is not bool:
+            raise TypeError("ConvRot INT8 transposed must be bool")
         return torch.Tensor._make_wrapper_subclass(
             cls,
-            qdata.shape,
+            qdata.shape[::-1] if transposed else qdata.shape,
+            strides=(1, max(1, qdata.shape[1])) if transposed else None,
             device=qdata.device,
             dtype=dtype,
             requires_grad=False,
@@ -53,6 +60,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         scale: torch.Tensor,
         group_size: int,
         dtype: torch.dtype = torch.bfloat16,
+        transposed: bool = False,
     ) -> None:
         super().__init__()
         if self.dtype is not dtype:
@@ -60,6 +68,11 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         self.qdata = qdata
         self.scale = scale
         self.group_size = group_size
+        self.transposed = transposed
+
+    def _transpose(self) -> Self:
+        """Reverse the logical axes while retaining canonical rowwise storage."""
+        return type(self)(self.qdata, self.scale, self.group_size, self.dtype, not self.transposed)
 
     @classmethod
     def from_quantized(
@@ -137,6 +150,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         quant_type: int | None = None,
     ) -> "ConvRotInt8Tensor":
         """Refill this tensor from compatible packed GGUF storage in place."""
+        require_untransposed(self, "copy_from_gguf_")
         from ._gguf import convert  # noqa: PLC0415
 
         convert(
@@ -154,7 +168,8 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         if output_dtype is None:
             output_dtype = self.dtype
         rotated = self.qdata.to(output_dtype) * self.scale.to(output_dtype)
-        return rotate_groups(rotated, self.group_size)
+        result = rotate_groups(rotated, self.group_size)
+        return result.t() if self.transposed else result
 
     def addmm_(
         self,
@@ -171,6 +186,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         makes terminal INT8 code selection reproducible for a fixed device and
         backend without consuming the process-global random-number generator.
         """
+        require_untransposed(self, "addmm_")
         if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
             raise TypeError("ConvRot addmm_ matrices must be tensors")
         _update.addmm_(
@@ -194,6 +210,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         rounding_seed: int | None = None,
     ) -> "ConvRotInt8Tensor":
         """Add a dense logical update and requantize in place."""
+        require_untransposed(self, "add_")
         if not isinstance(other, torch.Tensor):
             raise TypeError("ConvRot add_ update must be a tensor")
         if alpha is None:
@@ -219,6 +236,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
                 str(self.device),
                 str(self.dtype),
                 self.group_size,
+                self.transposed,
                 tuple(self.qdata.shape),
                 self.qdata.stride(),
                 tuple(self.scale.shape),
@@ -228,10 +246,12 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
 
     def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> Self:
         """Rebuild the semantic wrapper without converting quantized storage."""
-        return type(self)(self.qdata, self.scale, self.group_size, dtype)
+        return type(self)(self.qdata, self.scale, self.group_size, dtype, self.transposed)
 
     def to(self, *args: object, **kwargs: object) -> Self:
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
+        if kwargs.get("memory_format") not in (None, torch.preserve_format):
+            require_untransposed(self, "to with a different memory format")
         explicit_copy_args = _explicit_to_copy_args(args, kwargs)
         if explicit_copy_args is None:
             return cast(
@@ -264,6 +284,7 @@ ConvRotInt8Tensor.implements([torch.ops.aten.view.default, torch.ops.aten.view_a
     same_shape_view
 )
 ConvRotInt8Tensor.implements(torch.ops.aten.as_strided.default)(same_layout_as_strided)
+register_matrix_ops(ConvRotInt8Tensor)
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten._to_copy.default)
@@ -282,6 +303,8 @@ def _convrot_int8_to_copy(
     non_blocking = arguments.pop("non_blocking", False)
     copy = arguments.pop("copy", False)
     memory_format = arguments.pop("memory_format", None)
+    if memory_format not in (None, torch.preserve_format):
+        require_untransposed(tensor, "to with a different memory format")
     layout = arguments.pop("layout", None)
     pin_memory = arguments.pop("pin_memory", None)
     if arguments:
@@ -322,6 +345,7 @@ def convrot_int8_linear(
     activation_fn: InputActivation | None = None,
 ) -> torch.Tensor:
     """Apply an optional input activation followed by a ConvRot INT8 linear."""
+    require_untransposed(weight, "linear")
     converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
     assert isinstance(converted_weight, ConvRotInt8Tensor)
     return dispatch.linear(
@@ -365,6 +389,7 @@ def _convrot_addmm_dispatch(
         raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
     if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
         raise TypeError("ConvRot addmm_ matrices must be tensors")
+    require_untransposed(weight, "addmm_")
     _update.addmm_(
         weight.qdata,
         weight.scale,
@@ -390,6 +415,7 @@ def _convrot_add_dispatch(
         raise TypeError(f"ConvRot add_ weight must be ConvRotInt8Tensor, got {type(weight)}")
     if not isinstance(update, torch.Tensor):
         raise TypeError("ConvRot add_ update must be a tensor")
+    require_untransposed(weight, "add_")
     _update.add_(
         weight.qdata,
         weight.scale,
