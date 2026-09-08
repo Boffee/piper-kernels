@@ -15,9 +15,10 @@ def _dimension_matches(left: int | torch.SymInt, right: int | torch.SymInt) -> b
 
 def projection_call_matches(node: torch.fx.Node, match: Match, prefix: str) -> bool:
     """Identify a captured projection by all operands, not potentially shared weights."""
-    if node.kwargs:
+    if node.kwargs or not isinstance(node.target, torch._ops.OpOverload):
         return False
-    convrot = node.target == torch.ops.piper_kernels.convrot_nvfp4_linear.default
+    # Plain NVFP4 callers need not have registered the optional ConvRot operator.
+    convrot = node.target._schema.name == "piper_kernels::convrot_nvfp4_linear"
     if convrot != (f"{prefix}_group_size" in match.kwargs):
         return False
     names = (

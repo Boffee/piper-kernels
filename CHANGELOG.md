@@ -91,6 +91,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Allow plain NVFP4 SwiGLU FFN compilation in fresh processes without prior ConvRot
+  operator registration. Shared projection validation reads the graph operator's schema.
 - Preserve batched SwiGLU FFN and sparse-attention projection fusion across DTensor
   boundaries for ConvRot INT8, Piper NVFP4, and ConvRot NVFP4. Shared projection-view
   normalization handles feature-preserving row reshapes, including symbolic leading
