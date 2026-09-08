@@ -31,9 +31,10 @@ from piper_kernels.linear.convrot.nvfp4 import _compile_fx as convrot_nvfp4_comp
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 
+from . import _preparation as convrot_preparation
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-nvfp4-swiglu-ffn-compile-v5"
+_COMPILE_PASS_VERSION = "convrot-nvfp4-swiglu-ffn-compile-v6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +298,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _bias.__file__,
                     _core.__file__,
                     _preparation.__file__,
+                    convrot_preparation.__file__,
                     _compile_validation.__file__,
                     ffn_backend.__file__,
                     convrot_nvfp4_compile_fx.__file__,

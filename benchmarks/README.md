@@ -398,6 +398,66 @@ on field names. A shortened record looks like:
 
 ## Included benchmarks
 
+### NVFP4 FFN
+
+Measure the current complete fused FFN on NVIDIA SM120:
+
+```shell
+uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
+  --shape 1024 2048 8192 --shape 1797 2048 8192 --shape 4096 5376 14336 \
+  --json artifacts/convrot-nvfp4-ffn.json
+uv run python benchmarks/benchmark_nvfp4_ffn.py --format nvfp4 \
+  --shape 127 256 512 --shape 1024 2048 8192 --shape 1797 2048 8192 \
+  --shape 4096 2048 8192 --json artifacts/nvfp4-ffn.json
+```
+
+Each shape is `M K N`: input rows, input/output width, and intermediate FFN width.
+Both FP16/BF16 and static/dynamic scales run by default; select a subset with `--dtype`
+and `--scaling`. `--group-size` selects ConvRot groups 16, 64, or 256; `--high-first`
+checks the other nibble order. The recorded seed deterministically generates the input,
+independent gate/value weights, and biases. Static source scales are measured from the input;
+the synthetic static down scale is fixed at 0.01 and recorded in the output.
+
+The benchmark uses the production FFN runner and the selected format's current preparation,
+with 1,536-row chunks by default. It writes one record per configuration. To evaluate future
+changes, run the same command on each Git revision using the same GPU and compare the saved
+results. Match shapes, dtype, scales, chunking, seeds, and timing settings between runs.
+
+The reported `prepared_execution` is CUDA graph replay of the **complete FFN**, measured
+with device events. Each graph contains 16 FFN calls; six unmeasured warmup rounds
+precede 11 samples targeting 80 ms each. Capture, compilation,
+allocation, Python dispatch, and output checks are excluded from the timing. These are
+GPU execution measurements, not engine end-to-end latency. JSON/JSONL includes raw samples,
+calls per sample, timing settings, output finiteness, and environment and Git metadata.
+Unexpected output shapes/dtypes or non-finite values stop the benchmark before timing;
+numerical accuracy is covered by the FFN correctness tests. The script uses `nvidia-smi` to check
+for other compute processes on the selected GPU before and after each timed case; a conflict
+stops the run, preserving earlier completed records.
+
+ConvRot's **32 MiB** production limit bounds the additional FP32 rotated scratch for each
+FFN chunk. It was selected from RTX 5090 measurements: reuse avoided repeated rotation for
+smaller working sets, while larger buffers added enough traffic that recomputation was faster.
+It is a measured tradeoff, not an NVFP4 format requirement or a universal optimum for all
+SM120 GPUs. Reproduce the decision around the cutoff with the benchmark-only override:
+
+```shell
+uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
+  --shape 1023 2048 8192 --shape 1024 2048 8192 --shape 1025 2048 8192 \
+  --dtype bfloat16 --scaling dynamic --rotated-workspace-mib 0 \
+  --json artifacts/convrot-recompute.json
+uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
+  --shape 1023 2048 8192 --shape 1024 2048 8192 --shape 1025 2048 8192 \
+  --dtype bfloat16 --scaling dynamic --rotated-workspace-mib 64 \
+  --json artifacts/convrot-reuse.json
+```
+
+The 0 MiB run forces recomputation; 64 MiB permits reuse for all three shapes. Omit the
+override to measure the production cutoff. The option affects only this benchmark process;
+it is not an engine or compiler option. Larger-scale sweeps and additional devices are needed
+before changing the production policy.
+
+### ConvRot INT8
+
 Run the ConvRot provider comparison with:
 
 ```shell

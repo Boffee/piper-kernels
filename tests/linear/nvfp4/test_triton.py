@@ -380,3 +380,30 @@ def test_linear_mean_ignores_valid_front_padding() -> None:
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("count", [1_024, 1_025, 1_797, 4_097, 8_192, 8_193, 65_537])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_dynamic_scale_small_final_reduction_boundaries(count, dtype):
+    torch.manual_seed(count)
+    storage = torch.randn(count * 2, device="cuda", dtype=dtype)
+    values = storage[::2]
+    values[-1] = -123
+    out = torch.empty((), device="cuda", dtype=torch.float32)
+    expected = per_tensor_amax_to_scale(values.float().abs().amax())
+    actual = nvfp4_triton.dynamic_scale(values, out=out)
+    assert actual is out
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("maximum", [0.0, 2.0**-126, float("inf")])
+def test_dynamic_scale_small_reduction_extremes(maximum):
+    values = torch.zeros(1_797, device="cuda", dtype=torch.float32)
+    values[-1] = maximum
+    actual = nvfp4_triton.dynamic_scale(values)
+    expected = per_tensor_amax_to_scale(values.abs().amax())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)

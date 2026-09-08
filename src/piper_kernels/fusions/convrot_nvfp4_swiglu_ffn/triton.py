@@ -12,6 +12,8 @@ from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 
+from . import _preparation as swiglu_preparation
+
 _DEFAULT_CHUNK_ROWS = _core.DEFAULT_CHUNK_ROWS
 
 
@@ -63,19 +65,11 @@ class _Preparation:
             return self.standard.prepare_down(
                 projections, activation_per_tensor_scale, dynamic_activation_scale
             )
-        if dynamic_activation_scale:
-            return convrot_nvfp4_backend.prepare_dynamic(
-                projections,
-                self.down_group_size,
-                "swiglu",
-                high_first=self.standard.down_high_first,
-            )
-        assert activation_per_tensor_scale is not None
-        return convrot_nvfp4_backend.prepare_static(
+        return swiglu_preparation.prepare(
             projections,
             activation_per_tensor_scale,
+            dynamic_activation_scale,
             self.down_group_size,
-            "swiglu",
             high_first=self.standard.down_high_first,
         )
 
