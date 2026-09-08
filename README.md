@@ -281,6 +281,19 @@ Slicing or redistributing quantized weights is unsupported and raises explicitly
 weights support dense activation matrix products; using one as the weight of another `linear`
 is unsupported.
 
+With the corresponding `*_swiglu_ffn_compile_options()` or
+`*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,
+QKV-preparation, and attention/output-projection fusions. Shared compiler normalization
+removes redundant row flatten/restore pairs around semantic linears, including symbolic
+leading dimensions. Feature order, quantization metadata, and externally consumed values
+are preserved; the existing layout and intermediate-consumer restrictions still apply.
+
+For sharded attention, unwrap QKV projection outputs before the local attention region and
+wrap its head-flattened result for the output projection. Each rank computes its own complete
+heads or FFN intermediate-feature shard. Sum partial outputs after the output/down projection,
+keeping collectives outside the local fused region. The numerical reference is the corresponding
+local **fused** quantized computation; fused and unfused quantization boundaries can differ.
+
 Supported eager and compiled NVFP4 linears share the same prepared projection backend,
 including ConvRot and the affine projections used by fused SwiGLU FFNs and sparse attention.
 Global scales and bias are applied in FP32 before the final FP16/BF16 output conversion.

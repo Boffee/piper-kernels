@@ -11,6 +11,7 @@ from torch._inductor.custom_graph_pass import (
 )
 
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.convrot import _rotation as convrot_rotation
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
@@ -85,6 +86,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
+            projection_views.normalize_projection_views(graph)
             preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
@@ -92,6 +94,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             (
                 __file__,
                 preparation_sharing.__file__,
+                projection_views.__file__,
                 convrot_rotation.__file__,
                 _compile_fx.__file__,
                 _ops.__file__,

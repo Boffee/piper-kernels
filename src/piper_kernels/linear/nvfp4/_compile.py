@@ -21,6 +21,7 @@ from torch._inductor.pattern_matcher import (
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _projection_views as projection_views
 
 from . import _compile_fx, _layout, _ops, _validation
 from . import triton as nvfp4_triton
@@ -192,6 +193,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
+        projection_views.normalize_projection_views(graph)
         _fold_gelu_tanh_inputs(graph)
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
@@ -202,6 +204,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 _bias.__file__,
                 input_activation_compile.__file__,
                 preparation_sharing.__file__,
+                projection_views.__file__,
                 _compile_fx.__file__,
                 _layout.__file__,
                 _ops.__file__,

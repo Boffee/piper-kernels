@@ -91,6 +91,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Preserve batched SwiGLU FFN and sparse-attention projection fusion across DTensor
+  boundaries for ConvRot INT8, Piper NVFP4, and ConvRot NVFP4. Shared projection-view
+  normalization handles feature-preserving row reshapes, including symbolic leading
+  dimensions, while preserving external consumers and local shard boundaries.
 - Preserve ConvRot INT8, Piper NVFP4, and ConvRot NVFP4 weight semantics through matrix
   transpose and DTensor `linear`. Transposes share quantized storage and retain rotation and
   packing metadata; `mm`/`addmm` use Piper's local linear implementation in eager and compiled
