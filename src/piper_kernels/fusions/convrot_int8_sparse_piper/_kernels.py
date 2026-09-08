@@ -2,7 +2,7 @@
 
 # Triton device parameters are not Python runtime values.
 # ruff: noqa: ANN001, ANN202
-# pyright: reportArgumentType=false
+# pyright: reportArgumentType=false, reportGeneralTypeIssues=false
 
 import triton
 import triton.language as tl
@@ -16,6 +16,22 @@ from ._layout import QUERY_SCALE_ROWS, TILE_ROWS
 _JIT_QUERY_SCALE_ROWS = tl.constexpr(QUERY_SCALE_ROWS)
 _JIT_KEY_TILE_ROWS = tl.constexpr(TILE_ROWS)
 _JIT_VALUE_TILE_ROWS = tl.constexpr(TILE_ROWS)
+
+
+@triton.jit
+def _projection_tile_ids(group_m: tl.constexpr):
+    """Optionally group row/head tiles for reuse without changing the launch grid."""
+    row, head = tl.program_id(0), tl.program_id(1)
+    if group_m:
+        rows, heads = tl.num_programs(0), tl.num_programs(1)
+        program = row + head * rows
+        group = program // (group_m * heads)
+        first_row = group * group_m
+        group_rows = tl.minimum(rows - first_row, group_m)
+        within_group = program % (group_m * heads)
+        row = first_row + within_group % group_rows
+        head = within_group // group_rows
+    return row, head
 
 
 @triton.jit
@@ -52,20 +68,20 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     rsqrt_fn: tl.constexpr = None,
+    group_m: tl.constexpr = 0,
 ):
-    """Project one Q64/two-head tile and emit Q32 INT8 plus route summaries."""
+    """Project a Q64 tile and emit Q32 INT8 plus route summaries."""
     tl.static_assert(block_m == 64)
-    tl.static_assert(heads_per_program == 2)
+    tl.static_assert(heads_per_program == 1 or heads_per_program == 2)  # noqa: PLR1714
     tl.static_assert(block_n == heads_per_program * head_dim)
     tl.static_assert(head_dim == 128)
     tl.static_assert(rotary_dim <= head_dim)
     tl.static_assert(rotary_dim % 2 == 0)
 
-    storage_query_block = tl.program_id(0)
+    storage_query_block, head_block = _projection_tile_ids(group_m)
     if mask_ragged_tail:
         storage_query_block = chunk_rows // block_m
     global_query_block = chunk_start // block_m + storage_query_block
-    head_block = tl.program_id(1)
     batch = tl.program_id(2)
     storage_sequence_offsets = storage_query_block * block_m + tl.arange(0, block_m)
     global_sequence_offsets = chunk_start + storage_sequence_offsets
@@ -158,10 +174,11 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     rsqrt_fn: tl.constexpr = None,
+    group_m: tl.constexpr = 0,
 ):
     """Project K once and emit INT8 operands plus route summaries."""
-    row_block = row_block_offset + tl.program_id(0)
-    head_block = tl.program_id(1)
+    row_block, head_block = _projection_tile_ids(group_m)
+    row_block += row_block_offset
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
     row_offsets = batch * logical_sequence_length + sequence_offsets
@@ -288,6 +305,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    group_m: tl.constexpr = 0,
 ):
     """Project two heads over two K64 tiles and emit sparse Piper's V format."""
     tl.static_assert(block_m == 2 * _JIT_VALUE_TILE_ROWS)
@@ -295,8 +313,8 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     tl.static_assert(block_n == heads_per_program * head_dim)
     tl.static_assert(head_dim == 128)
 
-    row_block = row_block_offset + tl.program_id(0)
-    head_block = tl.program_id(1)
+    row_block, head_block = _projection_tile_ids(group_m)
+    row_block += row_block_offset
     batch = tl.program_id(2)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
     row_offsets = batch * logical_sequence_length + sequence_offsets

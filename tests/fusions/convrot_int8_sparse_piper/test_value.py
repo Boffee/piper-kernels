@@ -11,7 +11,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import value as value_fusio
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
-from ._helpers import exact_sm120_available
+from ._helpers import projection_available
 from ._reference import composed_value_projection
 
 
@@ -70,7 +70,7 @@ def _random_operands(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("sequence_length", [64, 65])
 def test_fused_value_projection_matches_the_fp32_composed_contract(sequence_length: int) -> None:
     operands = _random_operands(sequence_length=sequence_length)
@@ -108,7 +108,7 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(sequence_leng
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("sequence_length", [64, 65, 192])
 def test_fused_value_projection_optionally_emits_valid_prefix_block_means(
     sequence_length: int,
@@ -138,7 +138,7 @@ def test_fused_value_projection_optionally_emits_valid_prefix_block_means(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_fused_value_block_means_respect_internal_block_lengths() -> None:
     operands = _random_operands(sequence_length=128)
     block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
@@ -166,7 +166,7 @@ def test_fused_value_block_means_respect_internal_block_lengths() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> None:
     operands = _random_operands(
         batch=2,
@@ -190,7 +190,7 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
     operands = _random_operands(sequence_length=192, input_features=256, heads=3)
     input_mean = int8_ops.dequantized_input_mean(
@@ -214,7 +214,7 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_value_projection_custom_ops_pass_opcheck() -> None:
     operands = _random_operands()
     input_mean = int8_ops.dequantized_input_mean(
@@ -249,7 +249,7 @@ def test_value_projection_custom_ops_pass_opcheck() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_value_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 

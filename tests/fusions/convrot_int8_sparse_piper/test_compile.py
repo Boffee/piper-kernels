@@ -29,7 +29,7 @@ from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
 from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 
-from ._helpers import exact_sm120_available
+from ._helpers import exact_sm120_available, projection_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
@@ -672,10 +672,10 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
-def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
+def test_compile_options_fuse_sparse_piper_projection_region() -> None:
     torch.manual_seed(701)
     model = _SparseProjectionAttention().eval()
     hidden_states = torch.randn(
@@ -734,11 +734,11 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_cuda_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
+def test_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
     torch.manual_seed(703)
     model = _SparseProjectionAttention(routing=routing).eval()
     hidden_states = torch.randn(

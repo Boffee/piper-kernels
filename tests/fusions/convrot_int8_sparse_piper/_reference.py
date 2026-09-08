@@ -1,7 +1,8 @@
-"""Materialized FP32 references for ConvRot INT8-to-sparse-Piper fusion tests."""
+"""Composed FP32 and independent FP64 references for sparse-Piper projection tests."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -10,11 +11,94 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
+from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 _BLOCK_ROWS = 64
 _HEAD_DIM = 128
+
+
+def _rotate_fp64(values):
+    offsets = torch.arange(_HEAD_DIM, device=values.device)
+    words = torch.tensor(SIGNED_HADAMARD_MASK, device=values.device, dtype=torch.int64)
+    result = values * (2 * ((words[offsets // 32] >> (offsets % 32)) & 1) - 1)
+    for distance in (1, 2, 4, 8, 16, 32, 64):
+        low, high = result.reshape(*result.shape[:-1], -1, 2, distance).unbind(-2)
+        result = torch.stack((low + high, low - high), dim=-2).flatten(-3)
+    return result / math.sqrt(_HEAD_DIM)
+
+
+def assert_int8_codes_close(actual, expected):
+    """Allow at most one INT8 code of rounding difference."""
+    assert int((actual.short() - expected.short()).abs().max()) <= 1
+
+
+def _encode_fp64(values, rows):
+    grouped = values.reshape(-1, rows, _HEAD_DIM)
+    scale = grouped.abs().amax((-1, -2)) / 127 + 1e-7
+    normalized = grouped / scale[:, None, None]
+    codes = torch.trunc(normalized + 0.5 * normalized.sign()).clamp(-127, 127).to(torch.int8)
+    return codes.reshape_as(values), scale
+
+
+def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *, is_query):
+    """Check one minmax Q/K block with H3 normalization and softmax constants."""
+    rotary = cos.shape[1]
+    projected *= torch.rsqrt(projected.square().mean(-1, keepdim=True) + 1e-5)
+    projected *= norm.double()
+    first, second = projected[:, :rotary].chunk(2, dim=-1)
+    rotated = torch.cat((-second, first), -1)
+    projected[:, :rotary] = (
+        projected[:, :rotary] * cos[start : start + rows].double()
+        + rotated * sin[start : start + rows].double()
+    )
+    maximum, minimum = projected.amax(0), projected.amin(0)
+    summary = maximum + minimum if is_query else maximum
+    torch.testing.assert_close(
+        output[2][0, head, start // _BLOCK_ROWS].double(), summary, rtol=3e-5, atol=3e-5
+    )
+    if not is_query:
+        torch.testing.assert_close(
+            output[3][0, head, start // _BLOCK_ROWS].double(), minimum, rtol=3e-5, atol=3e-5
+        )
+    padded = projected.new_zeros((_BLOCK_ROWS, _HEAD_DIM), dtype=torch.float64)
+    padded[:rows] = _rotate_fp64(projected)
+    scale_rows = 32 if is_query else _BLOCK_ROWS
+    codes, expected_scale = _encode_fp64(padded, scale_rows)
+    actual = output[0][0, head, start : start + _BLOCK_ROWS]
+    assert_int8_codes_close(actual, codes)
+    if is_query:
+        expected_scale *= _HEAD_DIM**-0.5 * math.log2(math.e)
+        if rows <= scale_rows:
+            expected_scale[1] = 0
+    offset = start // scale_rows
+    torch.testing.assert_close(
+        output[1][0, head, offset : offset + expected_scale.numel()].double(),
+        expected_scale,
+        rtol=3e-5,
+        atol=1e-7,
+    )
+
+
+def check_value_sample_fp64(projected, output, head, start, rows, mean_v):
+    """Check a centered V64 block, scale multiplier, and uncentered block mean."""
+    torch.testing.assert_close(
+        output[3][0, head, start // _BLOCK_ROWS].double(),
+        projected.mean(0),
+        rtol=2e-5,
+        atol=2e-4,
+    )
+    centered = projected.new_zeros((_BLOCK_ROWS, _HEAD_DIM), dtype=torch.float64)
+    centered[:rows] = projected - mean_v
+    codes, expected_scale = _encode_fp64(centered, _BLOCK_ROWS)
+    assert_int8_codes_close(output[0][0, head, :, start : start + _BLOCK_ROWS].T, codes)
+    torch.testing.assert_close(
+        output[1][0, head, start // _BLOCK_ROWS, 0].double(),
+        expected_scale[0] * 255,
+        rtol=3e-5,
+        atol=1e-5,
+    )
 
 
 @dataclass(frozen=True, slots=True)

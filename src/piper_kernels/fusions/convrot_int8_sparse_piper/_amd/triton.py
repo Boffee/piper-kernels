@@ -1,11 +1,10 @@
-"""NVIDIA launches over shared fused projection kernels and operand formats."""
+"""RDNA4 launches over shared fused FP32 projection kernels and operand formats."""
 
 # Triton's launch options and constexpr function arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
 import torch
 import triton
-from triton.language.extra.cuda import libdevice
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
@@ -17,10 +16,19 @@ from .._layout import HEAD_DIM, TILE_ROWS
 # GEMM row tiles may span multiple 64-row attention blocks; scale/summary groups
 # remain fixed by the shared kernels, independently of these compute tiles.
 _QUERY_BLOCK_M = TILE_ROWS
-_CONTEXT_BLOCK_M = 2 * TILE_ROWS
-_BLOCK_K = 128
-_HEADS_PER_PROGRAM = 2
-_BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
+_KEY_BLOCK_M = TILE_ROWS
+_VALUE_BLOCK_M = 2 * TILE_ROWS
+_BLOCK_K = 64
+_QK_NUM_WARPS = 4
+_VALUE_NUM_WARPS = 8
+_NUM_STAGES = 2
+# Reuse a small input row group across heads, including beyond the input cache size.
+_GROUP_M = 8
+# Q/K's Hadamard and RoPE epilogues need smaller tiles to bound LDS/register use.
+_QK_HEADS_PER_PROGRAM = 1
+_QK_BLOCK_N = HEAD_DIM * _QK_HEADS_PER_PROGRAM
+_VALUE_HEADS_PER_PROGRAM = 2
+_VALUE_BLOCK_N = HEAD_DIM * _VALUE_HEADS_PER_PROGRAM
 
 
 def project_query(
@@ -51,7 +59,7 @@ def project_query(
 
         def launch(row_block_count: int, *, mask_ragged_tail: bool) -> None:
             _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel[
-                (row_block_count, triton.cdiv(heads, _HEADS_PER_PROGRAM), batch)
+                (row_block_count, triton.cdiv(heads, _QK_HEADS_PER_PROGRAM), batch)
             ](
                 input_qdata,
                 input_scale,
@@ -72,7 +80,7 @@ def project_query(
                 storage_sequence_length,
                 input_features=input_qdata.shape[2],
                 heads=heads,
-                heads_per_program=_HEADS_PER_PROGRAM,
+                heads_per_program=_QK_HEADS_PER_PROGRAM,
                 head_dim=HEAD_DIM,
                 rotary_dim=rotary_dim,
                 norm_epsilon=norm_epsilon,
@@ -83,14 +91,14 @@ def project_query(
                 aligned_projection=(
                     not mask_ragged_tail
                     and input_qdata.shape[2] % _BLOCK_K == 0
-                    and heads % _HEADS_PER_PROGRAM == 0
+                    and heads % _QK_HEADS_PER_PROGRAM == 0
                 ),
                 block_m=_QUERY_BLOCK_M,
-                block_n=_BLOCK_N,
+                block_n=_QK_BLOCK_N,
                 block_k=_BLOCK_K,
-                rsqrt_fn=libdevice.rsqrt_rn,
-                num_warps=8,
-                num_stages=3,
+                group_m=_GROUP_M,
+                num_warps=_QK_NUM_WARPS,
+                num_stages=_NUM_STAGES,
             )
 
         full_row_blocks = chunk_rows // _QUERY_BLOCK_M
@@ -128,7 +136,7 @@ def project_key(
             _kernels._convrot_project_quantize_key_kernel[
                 (
                     row_block_count,
-                    triton.cdiv(heads, _HEADS_PER_PROGRAM),
+                    triton.cdiv(heads, _QK_HEADS_PER_PROGRAM),
                     batch,
                 )
             ](
@@ -150,7 +158,7 @@ def project_key(
                 row_block_offset,
                 input_features=input_qdata.shape[2],
                 heads=heads,
-                heads_per_program=_HEADS_PER_PROGRAM,
+                heads_per_program=_QK_HEADS_PER_PROGRAM,
                 head_dim=HEAD_DIM,
                 rotary_dim=rotary_dim,
                 norm_epsilon=norm_epsilon,
@@ -159,21 +167,21 @@ def project_key(
                 aligned_projection=(
                     aligned_rows
                     and input_qdata.shape[2] % _BLOCK_K == 0
-                    and heads % _HEADS_PER_PROGRAM == 0
+                    and heads % _QK_HEADS_PER_PROGRAM == 0
                 ),
                 mask_ragged_tail=not aligned_rows,
-                block_m=_CONTEXT_BLOCK_M,
-                block_n=_BLOCK_N,
+                block_m=_KEY_BLOCK_M,
+                block_n=_QK_BLOCK_N,
                 block_k=_BLOCK_K,
-                rsqrt_fn=libdevice.rsqrt_rn,
-                num_warps=8,
-                num_stages=3,
+                group_m=_GROUP_M,
+                num_warps=_QK_NUM_WARPS,
+                num_stages=_NUM_STAGES,
             )
 
-        full_row_blocks = logical_sequence_length // _CONTEXT_BLOCK_M
+        full_row_blocks = logical_sequence_length // _KEY_BLOCK_M
         if full_row_blocks:
             launch(full_row_blocks, 0, aligned_rows=True)
-        if logical_sequence_length % _CONTEXT_BLOCK_M:
+        if logical_sequence_length % _KEY_BLOCK_M:
             launch(1, full_row_blocks, aligned_rows=False)
 
 
@@ -196,7 +204,7 @@ def project_value(
     block_lengths_ptr = block_lengths if has_block_lengths else value_mean
     with device_context(input_qdata.device):
         _kernels._project_prepared_input_mean_kernel[
-            (triton.cdiv(heads * HEAD_DIM, _BLOCK_N), batch)
+            (triton.cdiv(heads * HEAD_DIM, _VALUE_BLOCK_N), batch)
         ](
             input_mean,
             weight_qdata,
@@ -204,16 +212,16 @@ def project_value(
             value_mean,
             input_features=input_qdata.shape[2],
             output_features=heads * HEAD_DIM,
-            block_n=_BLOCK_N,
+            block_n=_VALUE_BLOCK_N,
             block_k=_BLOCK_K,
-            num_warps=8,
+            num_warps=_VALUE_NUM_WARPS,
         )
 
         def launch(row_block_count: int, row_block_offset: int, *, aligned_rows: bool) -> None:
             _kernels._convrot_project_quantize_sparse_value_kernel[
                 (
                     row_block_count,
-                    triton.cdiv(heads, _HEADS_PER_PROGRAM),
+                    triton.cdiv(heads, _VALUE_HEADS_PER_PROGRAM),
                     batch,
                 )
             ](
@@ -232,24 +240,25 @@ def project_value(
                 row_block_offset,
                 input_features=input_qdata.shape[2],
                 heads=heads,
-                heads_per_program=_HEADS_PER_PROGRAM,
+                heads_per_program=_VALUE_HEADS_PER_PROGRAM,
                 head_dim=HEAD_DIM,
                 aligned_projection=(
                     aligned_rows
                     and input_qdata.shape[2] % _BLOCK_K == 0
-                    and heads % _HEADS_PER_PROGRAM == 0
+                    and heads % _VALUE_HEADS_PER_PROGRAM == 0
                 ),
                 mask_block_lengths=has_block_lengths,
                 emit_block_mean=emit_block_mean,
-                block_m=_CONTEXT_BLOCK_M,
-                block_n=_BLOCK_N,
+                block_m=_VALUE_BLOCK_M,
+                block_n=_VALUE_BLOCK_N,
                 block_k=_BLOCK_K,
-                num_warps=8,
-                num_stages=3,
+                group_m=_GROUP_M,
+                num_warps=_VALUE_NUM_WARPS,
+                num_stages=_NUM_STAGES,
             )
 
-        full_row_blocks = sequence_length // _CONTEXT_BLOCK_M
+        full_row_blocks = sequence_length // _VALUE_BLOCK_M
         if full_row_blocks:
             launch(full_row_blocks, 0, aligned_rows=True)
-        if sequence_length % _CONTEXT_BLOCK_M:
+        if sequence_length % _VALUE_BLOCK_M:
             launch(1, full_row_blocks, aligned_rows=False)
