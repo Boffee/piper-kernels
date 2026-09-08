@@ -1343,7 +1343,13 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
             options=options,
         )(hidden_states)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # Q chunk size changes FP32 reduction order in coarse attention. Subsequent
+    # BF16/INT8 rounding can amplify those differences, so compare accuracy while
+    # keeping the tensor contract and compiler rewrite assertions exact.
+    assert actual.shape == expected.shape
+    assert actual.dtype is expected.dtype
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 1e-3
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     assert (
         capture.targets.count(
