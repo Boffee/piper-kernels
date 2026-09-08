@@ -8,6 +8,7 @@ from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 
 from . import _interfaces
+from ._amd import policy as amd_policy
 from ._interfaces import ProjectionBackend
 from ._nvidia import policy as nvidia_policy
 
@@ -19,6 +20,14 @@ except ModuleNotFoundError as error:
     _nvidia_projection = None
 
 
+try:
+    from ._amd import triton as _amd_projection
+except ModuleNotFoundError as error:
+    if error.name != "triton":
+        raise
+    _amd_projection = None
+
+
 def source_files() -> tuple[str, ...]:
     """Include selection and execution policy in the compiler-pass cache key."""
     return tuple(
@@ -27,7 +36,9 @@ def source_files() -> tuple[str, ...]:
             __file__,
             _interfaces.__file__,
             nvidia_policy.__file__,
+            amd_policy.__file__,
             None if _nvidia_projection is None else _nvidia_projection.__file__,
+            None if _amd_projection is None else _amd_projection.__file__,
             linear_backend.__file__,
             attention_backend.__file__,
         )
@@ -37,10 +48,12 @@ def source_files() -> tuple[str, ...]:
 
 def select_projection_backend(input: torch.Tensor) -> ProjectionBackend | None:  # noqa: A002
     """Select fused Q/K/V execution, independently of standalone linear support."""
-    if _nvidia_projection is None:
+    if _nvidia_projection is None and _amd_projection is None:
         return None
     target = AcceleratorTarget.from_device(input.device)
-    return _nvidia_projection if nvidia_policy.supports_target(target) else None
+    if nvidia_policy.supports_target(target):
+        return _nvidia_projection
+    return _amd_projection if amd_policy.supports_target(target) else None
 
 
 def require_projection_backend(input: torch.Tensor) -> ProjectionBackend:  # noqa: A002
@@ -51,13 +64,9 @@ def require_projection_backend(input: torch.Tensor) -> ProjectionBackend:  # noq
 
 
 def select_output_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
-    """Select an independently validated attention-to-output integration.
-
-    Standalone AMD attention and linear support does not yet imply validation of
-    the chunked multi-stream fusion. Keep that integration disabled in this pass.
-    """
+    """Select the validated chunked attention-to-output integration on this device."""
     target = AcceleratorTarget.from_device(input.device)
-    if not nvidia_policy.supports_target(target):
+    if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     if attention_backend.select_attention_backend(input) is None:
         return None

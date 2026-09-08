@@ -18,7 +18,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
-from ._helpers import exact_sm120_available
+from ._helpers import projection_available
 
 _BATCH = 1
 _SEQUENCE = 192
@@ -207,7 +207,7 @@ def _materialize_value(operands: _Operands) -> torch.Tensor:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_quantized_sparse_piper_writes_engine_layout() -> None:
     operands = _operands()
     query, key, value = _prepare(operands)
@@ -230,7 +230,7 @@ def test_quantized_sparse_piper_writes_engine_layout() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
     operands = _operands()
     query, key, value = _prepare(operands)
@@ -271,7 +271,7 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize(
     ("batch", "sequence_length"),
     [(1, 65), (1, 127), (2, 129), (1, 193)],
@@ -329,7 +329,7 @@ def test_ragged_fused_projection_matches_materialized_attention(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_full_fused_sparse_piper_pipeline_compiles_as_one_graph() -> None:
     operands = _operands()
     attention = SparsePiperAttention((0.5, 1.0))

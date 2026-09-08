@@ -1,6 +1,7 @@
 import argparse
 import importlib.metadata
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import lib.environment as environment_module
@@ -14,7 +15,7 @@ from lib.reporting import (
     output_target,
     write_records,
 )
-from lib.timing import ClockDomain, PhaseTimings, Timing
+from lib.timing import ClockDomain, PhaseTimings, SampleTimings, Timing
 
 
 def _environment() -> EnvironmentInfo:
@@ -92,6 +93,22 @@ def test_jsonl_output_has_one_record_per_line(tmp_path: Path) -> None:
     lines = path.read_text().splitlines()
     assert len(lines) == 2
     assert all(json.loads(line)["provider"] == "test" for line in lines)
+
+
+def test_fixed_count_records_use_the_shared_schema_without_fake_phases(tmp_path):
+    path = tmp_path / "samples.jsonl"
+    record = replace(_record(), timings=SampleTimings(warmup_calls=1, samples_ms=(3.0, 1.0, 2.0)))
+    write_records([record], OutputTarget(path, OutputFormat.JSONL))
+    value = json.loads(path.read_text())
+    assert value["schema_version"] == 1
+    assert value["environment"]["gpu_architecture"] == "SM120"
+    assert value["timings"]["samples_ms"] == [3.0, 1.0, 2.0]
+    assert value["timings"]["sample_count"] == 3
+    assert value["timings"]["operator_end_to_end"]["clock"] == "synchronized_wall"
+    assert value["timings"]["operator_end_to_end"]["median_ms"] == 2.0
+    assert "prepared_execution" not in value["timings"]
+    assert "warmup_ms" not in value["timings"]
+    assert "measurement_time_ms" not in value["timings"]
 
 
 def test_output_arguments_are_optional_and_mutually_exclusive(tmp_path: Path) -> None:

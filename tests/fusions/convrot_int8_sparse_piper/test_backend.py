@@ -3,6 +3,7 @@
 import ast
 import builtins
 import importlib.util
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     query,
     value,
 )
+from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import triton as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
@@ -69,6 +71,8 @@ def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False):
         AcceleratorTarget("cuda", "sm120"),
         AcceleratorTarget("cuda", "sm121"),
         AcceleratorTarget("hip", "gfx1201"),
+        AcceleratorTarget("hip", "gfx1200"),
+        AcceleratorTarget("hip", "gfx1100"),
         AcceleratorTarget("cpu"),
     ],
 )
@@ -79,20 +83,29 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(monke
         torch.cuda, "current_device", Mock(side_effect=AssertionError("current GPU"))
     )
     operand = SimpleNamespace(device=torch.device("cuda:1"))
-    assert _backend.select_projection_backend(operand) is (
-        nvidia if target.is_cuda_capability(12, 0) else None
-    )
+    expected = None
+    if target.is_cuda_capability(12, 0):
+        expected = nvidia
+    elif (
+        sys.platform == "linux"
+        and target.is_amd_hip
+        and target.is_architecture("gfx1200", "gfx1201")
+    ):
+        expected = amd
+    assert _backend.select_projection_backend(operand) is expected
     probe.assert_called_once_with(operand.device)
 
 
 def test_missing_projection_backend_does_not_probe_device(monkeypatch):
     monkeypatch.setattr(_backend, "_nvidia_projection", None)
+    monkeypatch.setattr(_backend, "_amd_projection", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
     assert _backend.select_projection_backend(torch.empty(1)) is None
 
 
 @pytest.mark.parametrize("missing", ["triton", "triton.language.extra.cuda", "triton_extra", None])
-def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, missing):
+@pytest.mark.parametrize("vendor", ["_nvidia", "_amd"])
+def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, missing, vendor):
     original_import = builtins.__import__
     error = ModuleNotFoundError("missing dependency", name=missing)
 
@@ -103,7 +116,7 @@ def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, m
         fromlist=(),
         level=0,
     ):
-        if name == "_nvidia" and fromlist == ("triton",) and level == 1:
+        if name == vendor and fromlist == ("triton",) and level == 1:
             raise error
         return original_import(name, globals, locals, fromlist, level)
 
@@ -114,7 +127,7 @@ def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, m
     monkeypatch.setattr(builtins, "__import__", import_with_missing_dependency)
     if missing == "triton":
         spec.loader.exec_module(module)
-        assert module._nvidia_projection is None
+        assert getattr(module, f"{vendor}_projection") is None
     else:
         with pytest.raises(ModuleNotFoundError) as caught:
             spec.loader.exec_module(module)
@@ -166,7 +179,7 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 def test_unvalidated_projection_rejects_before_output_allocation(monkeypatch, operation):
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1100")
     )
     with FakeTensorMode():
         operands = _operands()
@@ -176,24 +189,53 @@ def test_unvalidated_projection_rejects_before_output_allocation(monkeypatch, op
 
 
 @pytest.mark.parametrize("missing", [None, "attention", "linear"])
-def test_output_support_is_independent_of_qkv_projection_support(monkeypatch, missing):
+@pytest.mark.parametrize(
+    "target",
+    [
+        AcceleratorTarget("cuda", "sm120"),
+        AcceleratorTarget("hip", "gfx1200"),
+        AcceleratorTarget("hip", "gfx1201"),
+    ],
+)
+def test_output_support_is_independent_of_qkv_projection_support(monkeypatch, missing, target):
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(_backend, "_nvidia_projection", None)
+    monkeypatch.setattr(_backend, "_amd_projection", None)
+    probe = Mock(return_value=target)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm120")
+        torch.cuda, "current_device", Mock(side_effect=AssertionError("current GPU"))
     )
     attention = Mock(return_value=None if missing == "attention" else object())
     linear = Mock(return_value=None if missing == "linear" else object())
     monkeypatch.setattr(_backend.attention_backend, "select_attention_backend", attention)
     monkeypatch.setattr(_backend.linear_backend, "select_linear_backend", linear)
-    operand = torch.empty(1)
+    operand = SimpleNamespace(device=torch.device("cuda:1"))
     assert _backend.select_output_backend(operand) is (
         linear.return_value if missing is None else None
     )
     attention.assert_called_once_with(operand)
+    probe.assert_called_once_with(operand.device)
+    if missing == "attention":
+        linear.assert_not_called()
+    else:
+        linear.assert_called_once_with(operand)
 
 
-@pytest.mark.parametrize("target", [AcceleratorTarget("hip", "gfx1201"), AcceleratorTarget("cpu")])
-def test_unvalidated_output_integration_rejects_before_resolving_operations(monkeypatch, target):
+@pytest.mark.parametrize(
+    ("platform", "target"),
+    [
+        ("linux", AcceleratorTarget("hip", "gfx1100")),
+        ("linux", AcceleratorTarget("cuda", "sm121")),
+        ("linux", AcceleratorTarget("cpu")),
+        ("win32", AcceleratorTarget("hip", "gfx1200")),
+        ("win32", AcceleratorTarget("hip", "gfx1201")),
+    ],
+)
+def test_unvalidated_output_integration_rejects_before_resolving_operations(
+    monkeypatch, platform, target
+):
+    monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(return_value=target))
     attention = Mock(side_effect=AssertionError("resolved unsupported attention"))
     linear = Mock(side_effect=AssertionError("resolved unsupported linear"))
@@ -460,7 +502,7 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
     select.assert_called_once_with(query_node.meta["val"])
 
 
-def _capture_projection(monkeypatch, operation):
+def _capture_projection(monkeypatch, operation, implementation=nvidia):
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": _kernels._convrot_project_quantize_key_kernel,
@@ -470,9 +512,9 @@ def _capture_projection(monkeypatch, operation):
     kernel = MagicMock()
     monkeypatch.setattr(_kernels, function.__name__, kernel)
     monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", MagicMock())
-    monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=nvidia))
+    monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(nvidia, "device_context", guard)
+    monkeypatch.setattr(implementation, "device_context", guard)
     with FakeTensorMode():
         _call(operation, _operands(), emit_block_mean=True)
     guard.assert_called_once_with(torch.device("cuda:1"))
@@ -498,13 +540,23 @@ def test_nvidia_launch_schedule_and_fp32_math_are_preserved(monkeypatch, operati
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-def test_nvidia_production_launches_compile_without_intermediate_bf16(monkeypatch, operation):
-    function, kernel = _capture_projection(monkeypatch, operation)
+@pytest.mark.parametrize(
+    "target",
+    [GPUTarget("cuda", 120, 32), GPUTarget("hip", "gfx1200", 32), GPUTarget("hip", "gfx1201", 32)],
+)
+def test_production_launches_compile_without_intermediate_bf16(monkeypatch, operation, target):
+    if target.backend == "hip" and sys.platform != "linux":
+        pytest.skip("ROCm support is Linux-only")
+    function, kernel = _capture_projection(
+        monkeypatch, operation, nvidia if target.backend == "cuda" else amd
+    )
     for call in kernel.__getitem__.return_value.call_args_list:
         arguments = dict(zip(function.arg_names, call.args, strict=False))
         arguments.update(
             {name: item for name, item in call.kwargs.items() if name in function.arg_names}
         )
+        arguments.setdefault("rsqrt_fn", None)
+        arguments.setdefault("group_m", 0)
         constants, signature = {}, {}
         types = {
             torch.int8: "*i8",
@@ -522,8 +574,12 @@ def test_nvidia_production_launches_compile_without_intermediate_bf16(monkeypatc
                 )
         compiled = triton.compile(
             ASTSource(function, signature, constexprs=constants),
-            target=GPUTarget("cuda", 120, 32),
-            options={"num_warps": 8, "num_stages": 3},
+            target=target,
+            options={name: call.kwargs[name] for name in ("num_warps", "num_stages")},
         )
-        assert compiled.asm["cubin"]
+        if target.backend == "cuda":
+            assert compiled.asm["cubin"]
+        else:
+            assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
+            assert compiled.metadata.shared <= 65536
         assert "arith.truncf" not in compiled.asm["ttgir"]

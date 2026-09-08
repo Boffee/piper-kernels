@@ -12,9 +12,10 @@ type ValueOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 class ProjectionBackend(Protocol):
     """Consume validated prepared inputs and fill caller-owned Q/K/V storage.
 
-    Projection, normalization/rotation, summaries, and terminal quantization
-    stay fused in FP32. Launch policies and device primitives belong to the
+    INT8 projection accumulates in INT32. Intermediate precision, compute tiles,
+    fusion boundaries, launch counts, and device primitives belong to the
     implementation, not graph rewrites or query-chunk orchestration.
+    They do not change Q32/K64/V64 scale groups or 64-row routing summaries.
 
     Inputs and caller-owned outputs are contiguous on the same device. B is
     batch size, H is the head count, and S is the output sequence capacity,

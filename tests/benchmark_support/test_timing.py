@@ -1,7 +1,45 @@
 import time
 
 import pytest
-from lib.timing import ClockDomain, synchronized_wall_benchmark
+from lib.timing import ClockDomain, SampleTimings, Timing, synchronized_wall_benchmark
+
+
+@pytest.mark.parametrize("clock", list(ClockDomain))
+def test_sample_quantiles_preserve_the_clock_and_input_order(clock):
+    samples = [5.0, 1.0, 3.0]
+    timing = Timing.from_samples(samples, clock)
+    assert samples == [5.0, 1.0, 3.0]
+    assert timing.as_dict() == {
+        "median_ms": 3.0,
+        "p20_ms": 1.8,
+        "p80_ms": 4.2,
+        "clock": clock.value,
+    }
+
+
+@pytest.mark.parametrize("samples", [[], [-1.0], [float("nan")], [float("inf")]])
+def test_invalid_samples_are_rejected(samples):
+    with pytest.raises(ValueError, match="latency samples"):
+        Timing.from_samples(samples, ClockDomain.DEVICE_EVENT)
+    with pytest.raises(ValueError, match="latency samples"):
+        SampleTimings(warmup_calls=1, samples_ms=tuple(samples))
+
+
+def test_fixed_count_timings_report_only_measured_phases():
+    timing = SampleTimings(warmup_calls=1, samples_ms=(2.0,))
+    assert timing.as_dict() == {
+        "warmup_calls": 1,
+        "sample_count": 1,
+        "operator_end_to_end": {
+            "median_ms": 2.0,
+            "p20_ms": 2.0,
+            "p80_ms": 2.0,
+            "clock": "synchronized_wall",
+        },
+        "samples_ms": [2.0],
+    }
+    with pytest.raises(ValueError, match="warmup calls"):
+        SampleTimings(warmup_calls=-1, samples_ms=(2.0,))
 
 
 def test_synchronized_wall_benchmark_captures_host_work() -> None:
