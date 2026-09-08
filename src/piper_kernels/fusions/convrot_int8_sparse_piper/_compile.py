@@ -47,6 +47,7 @@ from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
@@ -73,6 +74,7 @@ def _source_files() -> tuple[str, ...]:
         for file_name in (
             __file__,
             _bias.__file__,
+            projection_views.__file__,
             _layout.__file__,
             *_backend.source_files(),
             _kernels.__file__,
@@ -507,6 +509,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
+            projection_views.normalize_projection_views(graph)
             _fold_sparse_piper_projection(graph)
             _output_compile._fold_attention_output(graph)
 

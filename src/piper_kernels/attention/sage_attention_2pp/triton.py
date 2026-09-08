@@ -310,8 +310,8 @@ def _causal_attention_tile(
         use_tensor_descriptors,
     )
     integer_scores = tl.dot(query, key)
+    groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
     if grouped_qk:
-        groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
         key_scale = tl.load(
             key_scale_ptr
             + (batch * heads + head) * tl.cdiv(key_length, block_n)
@@ -334,10 +334,10 @@ def _causal_attention_tile(
     # A grouped Q scale and this tile's K scale form one positive multiplier
     # for each score row, so complete causal-prefix tiles can reduce first.
     if grouped_qk and not diagonal_or_tail:
-        raw_block_max = tl.max(raw_scores, axis=2)
+        raw_block_max = tl.max(raw_scores, axis=2)  # pyright: ignore[reportPossiblyUnboundVariable]
         block_max = tl.fma(
             raw_block_max,
-            score_scale,
+            score_scale,  # pyright: ignore[reportPossiblyUnboundVariable]
             -_P_FP8_LOG2_MAX,
         ).reshape((block_m,))
     else:
@@ -346,8 +346,8 @@ def _causal_attention_tile(
     old_weight = tl.exp2(running_max - next_max)
     if grouped_qk and not diagonal_or_tail:
         probability_log2 = tl.fma(
-            raw_scores,
-            score_scale[:, :, None],
+            raw_scores,  # pyright: ignore[reportPossiblyUnboundVariable]
+            score_scale[:, :, None],  # pyright: ignore[reportPossiblyUnboundVariable]
             -next_max.reshape((groups, _QUERY_GROUP_SIZE, 1)),
         ).reshape((block_m, block_n))
         probabilities = tl.exp2(probability_log2)
@@ -429,8 +429,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
         mask=offsets_m[:, None] < query_length,
         other=0,
     )
-    if grouped_qk:
-        groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
+    groups: tl.constexpr = block_m // _QUERY_GROUP_SIZE
     query = query_values
     if grouped_qk:
         query_scale = tl.load(
@@ -460,7 +459,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
         full_key_end = key_length // block_n * block_n
         causal_prefix_end = query_block * block_m // block_n * block_n
         prefix_end = tl.minimum(causal_prefix_end, full_key_end)
-        for start_n in tl.range(
+        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             0,
             prefix_end,
             block_n,
@@ -484,7 +483,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 offsets_n,
                 offsets_d,
                 key_length,
-                diagonal_or_tail=False,
+                diagonal_or_tail=tl.constexpr(False),
                 grouped_qk=grouped_qk,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 heads=heads,
@@ -493,7 +492,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 block_n=block_n,
                 use_tensor_descriptors=use_tensor_descriptors,
             )
-        for start_n in tl.range(
+        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             prefix_end,
             end_n,
             block_n,
@@ -517,7 +516,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 offsets_n,
                 offsets_d,
                 key_length,
-                diagonal_or_tail=True,
+                diagonal_or_tail=tl.constexpr(True),
                 grouped_qk=grouped_qk,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 heads=heads,
@@ -528,7 +527,7 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
             )
     else:
         # Keep the noncausal loop monolithic to preserve its register allocation.
-        for start_n in tl.range(
+        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             0,
             end_n,
             block_n,
@@ -570,29 +569,29 @@ def _sage_attention_2pp_kernel(  # noqa: PLR0912, PLR0915 - keep noncausal loop 
                 valid_keys = tl.broadcast_to(valid_keys, (block_m, block_n))
                 raw_scores = tl.where(
                     valid_keys.reshape((groups, _QUERY_GROUP_SIZE, block_n)),
-                    raw_scores,
+                    raw_scores,  # pyright: ignore[reportPossiblyUnboundVariable]
                     -float("inf"),
                 )
                 raw_block_max = tl.max(raw_scores, axis=2)
                 block_max = tl.fma(
                     raw_block_max,
-                    score_scale,
+                    score_scale,  # pyright: ignore[reportPossiblyUnboundVariable]
                     -_P_FP8_LOG2_MAX,
                 ).reshape((block_m,))
             else:
-                scores = tl.where(valid_keys, scores, -float("inf"))
+                scores = tl.where(valid_keys, scores, -float("inf"))  # pyright: ignore[reportPossiblyUnboundVariable]
                 block_max = tl.max(scores, axis=1) - _P_FP8_LOG2_MAX
             next_max = tl.maximum(running_max, block_max)
             old_weight = tl.exp2(running_max - next_max)
             if grouped_qk:
                 probability_log2 = tl.fma(
-                    raw_scores,
-                    score_scale[:, :, None],
+                    raw_scores,  # pyright: ignore[reportPossiblyUnboundVariable]
+                    score_scale[:, :, None],  # pyright: ignore[reportPossiblyUnboundVariable]
                     -next_max.reshape((groups, _QUERY_GROUP_SIZE, 1)),
                 ).reshape((block_m, block_n))
                 probabilities = tl.exp2(probability_log2)
             else:
-                probabilities = tl.exp2(scores - next_max[:, None])
+                probabilities = tl.exp2(scores - next_max[:, None])  # pyright: ignore[reportPossiblyUnboundVariable]
             accumulator *= old_weight[:, None]
             denominator = denominator * old_weight + tl.sum(probabilities, axis=1)
 
@@ -752,7 +751,7 @@ def _quantize_value(
         else torch.empty(value_shape, device=value.device, dtype=torch.float8_e4m3fn)
     )
 
-    num_key_blocks = int(triton.cdiv(key_length, _BLOCK_N))
+    num_key_blocks = triton.cdiv(key_length, int(_BLOCK_N))
     with device_context(value.device):
         _quantize_value_kernel[(num_key_blocks, heads, batch)](
             value,
@@ -790,7 +789,7 @@ def _prepare_sage_attention_2pp(
     # The feature-major FP8 V descriptor requires its row stride to be
     # 16-byte aligned; pad only storage whose sequence length violates it.
     storage_key_length = (
-        int(triton.cdiv(key_length, _BLOCK_N)) * int(_BLOCK_N)
+        triton.cdiv(key_length, int(_BLOCK_N)) * int(_BLOCK_N)
         if plan.use_tensor_descriptors and key_length % 16 != 0
         else key_length
     )

@@ -373,9 +373,6 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
-        # PyTorch 2.13 stages NVFP4 GEMM alpha in a shared device scalar.
-        # Keep affine GEMMs ordered while attention runs on the producer stream.
-        share_projection_stream=True,
     )
 
 
@@ -486,7 +483,6 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
-        share_projection_stream=True,
     )
 
 

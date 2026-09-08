@@ -43,8 +43,8 @@ def test_nvidia_preparation_compiles_without_a_device(architecture):
         pytest.param(
             75,
             marks=pytest.mark.xfail(
-                triton.__version__ == "3.7.1",
-                reason="Upstream SM75 INT8 dot lowering fails in Triton 3.7.1 (arith.extf on INT8)",
+                triton.__version__ in ("3.7.1", "3.8.0"),
+                reason="Upstream Triton 3.7.1/3.8.0 SM75 INT8 lowering fails (arith.extf on INT8)",
                 raises=RuntimeError,
                 strict=True,
             ),

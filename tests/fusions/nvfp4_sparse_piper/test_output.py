@@ -471,8 +471,8 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         return matmul(*args, **kwargs)
 
     monkeypatch.setattr(_projection, "_matmul_affine_out", record_stream)
-    # GPU contention exposes the native shared-alpha race between gate and
-    # output GEMMs; they must remain ordered even for short pipelines.
+    # Gate and output GEMMs must retain their own scales on separate streams,
+    # including under contention that exposed the native shared-alpha race.
     load_input = torch.randn((4096, 4096), device="cuda", dtype=torch.bfloat16)
     load_output = torch.empty_like(load_input)
     load_stream = torch.cuda.Stream()
@@ -485,7 +485,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         actual = output._attention_output_op(*arguments)
     torch.cuda.current_stream().wait_stream(load_stream)
 
-    assert len(streams) == 1
+    assert len(streams) == 2
     torch.testing.assert_close(actual, expected, atol=2**-7, rtol=2**-7)
 
 

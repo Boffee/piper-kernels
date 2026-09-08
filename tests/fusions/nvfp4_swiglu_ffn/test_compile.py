@@ -1,5 +1,8 @@
 """Tests for automatic semantic NVFP4 SwiGLU FFN folding."""
 
+import os
+import subprocess
+import sys
 import uuid
 from dataclasses import replace
 
@@ -125,6 +128,80 @@ def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
     assert isinstance(passes, tuple)
     options[_POST_GRAD_PRE_PASS] = (*passes, capture)
     return options
+
+
+@pytest.mark.parametrize("register_convrot", [False, True])
+def test_projection_matching_in_fresh_process(register_convrot: bool) -> None:
+    script = """
+import sys
+from types import SimpleNamespace
+import torch
+from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
+from piper_kernels.fusions.nvfp4_swiglu_ffn._compile_validation import projection_call_matches
+
+nvfp4_swiglu_ffn_compile_options()
+assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
+register_convrot = sys.argv[1] == "True"
+if register_convrot:
+    from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
+    convrot_nvfp4_compile_options()
+
+graph = torch.fx.Graph()
+input = graph.placeholder("input")
+operands = {
+    name: graph.placeholder(name)
+    for name in ("weight_qdata", "weight_scale", "weight_per_tensor_scale")
+}
+operands.update(activation_per_tensor_scale=None, bias=None, dynamic_activation_scale=True,
+                high_first=True)
+node = graph.call_function(torch.ops.piper_kernels.nvfp4_linear.default,
+                           (input, *operands.values()))
+match = SimpleNamespace(kwargs={f"gate_{name}": value for name, value in operands.items()})
+assert projection_call_matches(node, match, "gate")
+assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear") == register_convrot
+"""
+    subprocess.run([sys.executable, "-c", script, str(register_convrot)], check=True, timeout=60)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("register_convrot", [False, True])
+def test_cuda_compile_in_fresh_process(register_convrot: bool) -> None:
+    script = """
+import sys
+import torch
+from tests.fusions.nvfp4_swiglu_ffn.test_compile import (
+    _SwiGluFfn, _TargetCapturePass, _capturing_options, _chunked_swiglu_ffn_op, make_operands,
+)
+
+assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
+register_convrot = sys.argv[1] == "True"
+if register_convrot:
+    from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
+    convrot_nvfp4_compile_options()
+
+torch.set_num_threads(1)
+operands = make_operands(rows=256, output_features=256, dynamic=True)
+model = _SwiGluFfn(operands).eval()
+capture = _TargetCapturePass()
+options = _capturing_options(capture)
+options.update({"triton.cudagraphs": False, "compile_threads": 1})
+with torch.no_grad():
+    expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
+    actual = torch.compile(model, fullgraph=True, options=options)(operands.input)
+
+torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+assert capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn.default) == 1
+assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in capture.targets
+assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear") == register_convrot
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(register_convrot)],
+        env={**os.environ, "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1"},
+        check=True,
+        timeout=180,
+    )
 
 
 @pytest.mark.gpu

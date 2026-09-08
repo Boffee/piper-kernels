@@ -156,8 +156,8 @@ def load_values(
     quant_type: tl.constexpr,
 ):
     """Decode arbitrary logical offsets from one packed GGUF row."""
-    block_size: tl.constexpr = _block_size(quant_type)
-    type_size: tl.constexpr = _type_size(quant_type)
+    block_size: tl.constexpr = tl.constexpr(_block_size(quant_type))
+    type_size: tl.constexpr = tl.constexpr(_type_size(quant_type))
     block = logical_offsets // block_size
     index = logical_offsets % block_size
     block_base = row_byte_offset + block * type_size
@@ -181,8 +181,12 @@ def load_values(
         or quant_type == _Q5_1
         or quant_type == _IQ4_NL
     ):
-        minimum_bytes: tl.constexpr = 2 if quant_type == _Q4_1 or quant_type == _Q5_1 else 0
-        high_bytes: tl.constexpr = 4 if quant_type == _Q5_0 or quant_type == _Q5_1 else 0
+        minimum_bytes: tl.constexpr = tl.constexpr(
+            2 if quant_type == _Q4_1 or quant_type == _Q5_1 else 0
+        )
+        high_bytes: tl.constexpr = tl.constexpr(
+            4 if quant_type == _Q5_0 or quant_type == _Q5_1 else 0
+        )
         quantized_base: tl.constexpr = 2 + minimum_bytes + high_bytes
         packed_index = index % 16
         packed = _load_u8(data_ptr, block_base + quantized_base + packed_index, mask)
@@ -217,7 +221,7 @@ def load_values(
     if quant_type == _Q4_K or quant_type == _Q5_K:
         group = index // 32
         position = index % 32
-        quantized_base: tl.constexpr = 48 if quant_type == _Q5_K else 16
+        quantized_base: tl.constexpr = tl.constexpr(48 if quant_type == _Q5_K else 16)
         packed = _load_u8(
             data_ptr,
             block_base + quantized_base + (group // 2) * 32 + position,
@@ -227,8 +231,8 @@ def load_values(
         if quant_type == _Q5_K:
             high = _load_u8(data_ptr, block_base + 16 + position, mask)
             quantized |= ((high >> group) & 1) << 4
-        block_scale = _scale_min(data_ptr, block_base, group, False, mask)
-        block_minimum = _scale_min(data_ptr, block_base, group, True, mask)
+        block_scale = _scale_min(data_ptr, block_base, group, tl.constexpr(False), mask)
+        block_minimum = _scale_min(data_ptr, block_base, group, tl.constexpr(True), mask)
         minimum_scale = _load_f16(data_ptr, block_base + 2, mask)
         return scale * block_scale * quantized.to(tl.float32) - minimum_scale * block_minimum
 

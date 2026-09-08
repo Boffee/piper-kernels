@@ -86,7 +86,7 @@ def _normalize_nvfp4_blocks(values, per_tensor_scale):
     values = values.to(tl.float32)
     block_amax = tl.max(tl.abs(values), axis=1)
     encoded_scale = tl.clamp(
-        block_amax * (1.0 / 6.0) / per_tensor_scale,
+        block_amax * (1.0 / 6.0) / per_tensor_scale,  # pyright: ignore[reportOperatorIssue]
         0.015625,
         448.0,
     ).to(tl.float8e4nv)
@@ -225,7 +225,7 @@ def _amax_scale_kernel(
     offsets = tl.arange(0, block_size)
     values = tl.load(input_ptr + offsets, mask=offsets < elements, other=0.0)
     amax = tl.max(tl.abs(values).to(tl.float32), axis=0)
-    tl.store(per_tensor_scale_ptr, amax * (1.0 / (448.0 * 6.0)))
+    tl.store(per_tensor_scale_ptr, amax * (1.0 / (448.0 * 6.0)))  # pyright: ignore[reportOperatorIssue]
 
 
 @triton.jit
@@ -387,7 +387,7 @@ def _update_kernel(  # noqa: PLR0915
 def _global_scale_kernel(partial_ptr, output_ptr, count, block_size: tl.constexpr):
     offsets = tl.arange(0, block_size)
     values = tl.load(partial_ptr + offsets, mask=offsets < count, other=0.0)
-    scale = tl.max(values, axis=0) * (1.0 / (448.0 * 6.0))
+    scale = tl.max(values, axis=0) * (1.0 / (448.0 * 6.0))  # pyright: ignore[reportOperatorIssue]
     # Keep the global reciprocal / smallest normal FP8 scale finite for zero weights.
     tl.store(output_ptr, tl.maximum(scale, 2.0**-120))
 

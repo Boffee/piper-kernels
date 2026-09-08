@@ -28,12 +28,12 @@ def summarize_block_tiles(
     valid = valid_rows[None, :, :, None]
     if mean_pool_summary:
         valid_count = tl.sum(valid_rows.to(tl.int32), axis=1)
-        primary = tl.sum(tl.where(valid, values, 0.0), axis=2) / valid_count[None, :, None]
+        primary = tl.sum(tl.where(valid, values, 0.0), axis=2) / valid_count[None, :, None]  # pyright: ignore[reportArgumentType]
         auxiliary = primary
     else:
         maximum = tl.max(tl.where(valid, values, -float("inf")), axis=2)
         minimum = tl.min(tl.where(valid, values, float("inf")), axis=2)
-        primary = maximum + minimum if combine_extrema else maximum
+        primary = maximum + minimum if combine_extrema else maximum  # pyright: ignore[reportOperatorIssue]
         auxiliary = minimum
     return primary, auxiliary
 
@@ -114,7 +114,7 @@ def store_query_tile(
         summary_values,
         tl.reshape(valid_rows, (1, block_m)),
         mean_pool_summary,
-        True,
+        tl.constexpr(True),
     )
     summary = tl.reshape(summary, (heads_per_program, head_dim))
     summary_offsets = (
@@ -221,7 +221,7 @@ def store_key_tile(
         grouped,
         valid,
         mean_pool_summary,
-        False,
+        tl.constexpr(False),
     )
 
     quantized, key_scale = qk_quantization.quantize_key_tile(

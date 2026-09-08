@@ -25,6 +25,7 @@ from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -249,6 +250,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
+            projection_views.normalize_projection_views(graph)
             _fold_chunked_ffn(graph)
 
     def uuid(self) -> bytes:
@@ -258,6 +260,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 for file_name in (
                     __file__,
                     _bias.__file__,
+                    projection_views.__file__,
                     _core.__file__,
                     _preparation.__file__,
                     _compile_validation.__file__,

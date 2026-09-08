@@ -143,7 +143,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
         norm_epsilon,
         mask_ragged_tail,
         block_m,
-        rsqrt_fn=libdevice.rsqrt_rn,
+        rsqrt_fn=tl.constexpr(libdevice.rsqrt_rn),
     )
     sparse_piper_kernels.store_query_tile(
         transformed,
@@ -239,7 +239,7 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
         norm_epsilon,
         mask_ragged_tail,
         block_m,
-        rsqrt_fn=libdevice.rsqrt_rn,
+        rsqrt_fn=tl.constexpr(libdevice.rsqrt_rn),
     )
     sparse_piper_kernels.store_key_tile(
         transformed,

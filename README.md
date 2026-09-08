@@ -3,7 +3,7 @@
 Reusable PyTorch inference operators and optimized kernels for the Piper ecosystem and
 other consumers.
 
-Piper Kernels requires Python 3.13 or newer.
+Piper Kernels requires Python 3.13 or newer and PyTorch 2.14 or newer.
 
 The package owns operator semantics, portable PyTorch references, tensor subclasses,
 and optimized backends. It deliberately does not know about model repositories,
@@ -30,7 +30,7 @@ in FP32 until the final BF16 store.
 Install the optimized backends with `piper-kernels[triton]`, or include ConvRot's tensor
 format with `piper-kernels[convrot,triton]`. On Linux, first install a CUDA or ROCm PyTorch
 distribution with its matching Triton; Piper does not pin a competing Linux Triton version.
-The extra selects Triton 3.7 via
+The extra selects Triton 3.8 via
 [`triton-windows`](https://github.com/triton-lang/triton-windows) on 64-bit Windows.
 
 Optimized Windows execution requires Windows 10 or 11, a supported NVIDIA GPU with a
@@ -281,6 +281,19 @@ Slicing or redistributing quantized weights is unsupported and raises explicitly
 weights support dense activation matrix products; using one as the weight of another `linear`
 is unsupported.
 
+With the corresponding `*_swiglu_ffn_compile_options()` or
+`*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,
+QKV-preparation, and attention/output-projection fusions. Shared compiler normalization
+removes redundant row flatten/restore pairs around semantic linears, including symbolic
+leading dimensions. Feature order, quantization metadata, and externally consumed values
+are preserved; the existing layout and intermediate-consumer restrictions still apply.
+
+For sharded attention, unwrap QKV projection outputs before the local attention region and
+wrap its head-flattened result for the output projection. Each rank computes its own complete
+heads or FFN intermediate-feature shard. Sum partial outputs after the output/down projection,
+keeping collectives outside the local fused region. The numerical reference is the corresponding
+local **fused** quantized computation; fused and unfused quantization boundaries can differ.
+
 Supported eager and compiled NVFP4 linears share the same prepared projection backend,
 including ConvRot and the affine projections used by fused SwiGLU FFNs and sparse attention.
 Global scales and bias are applied in FP32 before the final FP16/BF16 output conversion.
@@ -290,11 +303,10 @@ its dtype until FP32 addition and uses a reusable FP32 workspace bounded by 32 M
 although small mixed-bias projections can be slower. FP32 outputs reuse their output buffer
 for bias addition. Autocast converts eligible operands at the public linear boundary.
 
-PyTorch 2.13's native two-level NVFP4 GEMM uses a
-[shared device scalar for scaling](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/cuda/detail/BLASConstants.cu#L36), so
-independent affine NVFP4 calls must not run concurrently on different CUDA streams.
-Sparse-attention fusions order gate and output GEMMs on one projection stream while
-overlapping attention on another stream.
+PyTorch 2.14's native two-level NVFP4 GEMM keeps each call's scaling tensor independent
+through the [upstream concurrency fix](https://github.com/pytorch/pytorch/commit/7add580915ff1a547f3c8bfd25afaca4207ac832).
+Affine projections retain their fused GEMM epilogue across concurrent threads and CUDA
+streams. Sparse-attention fusions can overlap gate and output projections on separate streams.
 
 `piper_kernels.linear.nvfp4.reference` provides independent PyTorch-only activation preparation,
 prepared projections, and ordinary/ConvRot projections. It does not invoke the optimized

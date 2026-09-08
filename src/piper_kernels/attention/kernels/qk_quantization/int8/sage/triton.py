@@ -76,14 +76,14 @@ def rotate_signed_hadamard_heads(values, head_dim: tl.constexpr):
     signs = tl.where(((words >> (offsets % 32)) & 1) != 0, 1.0, -1.0)
     values *= signs[None, :]
 
-    values = _hadamard_stage(values, head_dim, 1)
-    values = _hadamard_stage(values, head_dim, 2)
-    values = _hadamard_stage(values, head_dim, 4)
-    values = _hadamard_stage(values, head_dim, 8)
-    values = _hadamard_stage(values, head_dim, 16)
-    values = _hadamard_stage(values, head_dim, 32)
+    values = _hadamard_stage(values, head_dim, tl.constexpr(1))
+    values = _hadamard_stage(values, head_dim, tl.constexpr(2))
+    values = _hadamard_stage(values, head_dim, tl.constexpr(4))
+    values = _hadamard_stage(values, head_dim, tl.constexpr(8))
+    values = _hadamard_stage(values, head_dim, tl.constexpr(16))
+    values = _hadamard_stage(values, head_dim, tl.constexpr(32))
     if head_dim == 128:
-        values = _hadamard_stage(values, head_dim, 64)
+        values = _hadamard_stage(values, head_dim, tl.constexpr(64))
         return values * 0.08838834764831845
     return values * 0.125
 
@@ -124,7 +124,7 @@ def quantize_query_tile(
         ),
     )
     maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
-    raw_scale = maximum / 127.0 + _SCALE_EPSILON
+    raw_scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(grouped / tl.where(group_valid, raw_scale, 1.0)[:, :, None, None])
     stored_scale = tl.where(
         group_valid,
@@ -161,7 +161,7 @@ def quantize_key_tile(
         ),
     )
     maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
-    key_scale = maximum / 127.0 + _SCALE_EPSILON
+    key_scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(grouped / key_scale[:, :, None, None])
     return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), key_scale
 
@@ -203,7 +203,7 @@ def quantize_query_per_thread_group(
     ).to(tl.float32)
     values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON
+    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(values / scale)
     tl.store(
         output_ptr
@@ -294,7 +294,7 @@ def quantize_query_per_warp_kernel(
     ).to(tl.float32)
     values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON
+    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(values / scale)
     tl.store(
         output_ptr
@@ -352,7 +352,7 @@ def quantize_key_per_thread_group(
     values = tl.where(mask, values - mean[None, :], 0.0)
     values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON
+    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(values / scale)
     tl.store(
         output_ptr
@@ -449,7 +449,7 @@ def quantize_key_per_block_kernel(
     values = tl.where(mask, values - mean[None, :], 0.0)
     values = rotate_signed_hadamard_heads(values, head_dim)
     maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON
+    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(values / scale)
     tl.store(
         output_ptr
