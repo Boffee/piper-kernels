@@ -7,7 +7,7 @@ from typing import cast
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM, TILE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._block_layout import (
     validate_block_lengths as validate_k64_block_lengths,
 )
@@ -24,8 +24,11 @@ def validate_projection(
     bias: torch.Tensor | None,
     chunk_rows: int,
     name: str,
+    head_dim: int = 128,
 ) -> tuple[int, int]:
     """Validate one batch-one prepared NVFP4 projection and return length/heads."""
+    if head_dim not in SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"{name} requires head_dim=64 or 128")
     shape = nvfp4_validation.validate_prepared_linear(
         input_qdata,
         input_scale,
@@ -41,11 +44,11 @@ def validate_projection(
     output_features = shape.output_features
     if isinstance(sequence_length, int) and sequence_length < TILE_ROWS:
         raise ValueError(f"{name} input must contain at least K64 rows")
-    if not isinstance(output_features, int) or output_features % HEAD_DIM:
-        raise ValueError(f"{name} weight must map to complete packed D128 heads")
+    if not isinstance(output_features, int) or output_features % head_dim:
+        raise ValueError(f"{name} weight must map to complete packed D64/D128 heads")
     if chunk_rows < 128 or chunk_rows % 128:
         raise ValueError(f"{name} chunk rows must be a positive multiple of 128")
-    return cast(int, sequence_length), output_features // HEAD_DIM
+    return cast(int, sequence_length), output_features // head_dim
 
 
 def validate_qk_epilogue(
@@ -58,17 +61,18 @@ def validate_qk_epilogue(
     name: str,
 ) -> None:
     """Validate the RMSNorm/RoPE inputs shared by Q and K epilogues."""
+    head_dim = norm_weight.shape[0] if norm_weight.ndim == 1 else 0
     rotary_dim = cos.shape[1] if cos.ndim == 2 else 0
     operands = (norm_weight, cos, sin)
     if (
-        norm_weight.shape != (HEAD_DIM,)
+        head_dim not in SUPPORTED_HEAD_DIMS
         or norm_weight.dtype is not torch.bfloat16
         or cos.ndim != 2
         or sin.shape != cos.shape
         or cos.shape[0] != sequence_length
         or cos.dtype is not torch.float32
         or sin.dtype is not torch.float32
-        or not 2 <= rotary_dim <= HEAD_DIM
+        or not 2 <= rotary_dim <= head_dim
         or rotary_dim % 2
         or any(operand.device != input_qdata.device for operand in operands)
         or any(not operand.is_contiguous() for operand in operands)

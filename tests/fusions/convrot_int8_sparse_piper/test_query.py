@@ -45,6 +45,7 @@ def _random_operands(
     sequence_length: int = 64,
     input_features: int = 272,
     heads: int = 2,
+    head_dim: int = 128,
 ) -> _Operands:
     torch.manual_seed(191)
     input_qdata = torch.randint(
@@ -66,22 +67,22 @@ def _random_operands(
     weight_qdata = torch.randint(
         -127,
         128,
-        (heads * 128, input_features),
+        (heads * head_dim, input_features),
         device="cuda",
         dtype=torch.int8,
     )
     weight_scale = (
         torch.rand(
-            (heads * 128, 1),
+            (heads * head_dim, 1),
             device="cuda",
             dtype=torch.float32,
         )
         .mul_(0.01)
         .add_(0.001)
     )
-    norm_weight = torch.rand((128,), device="cuda", dtype=torch.float32).add_(0.5).bfloat16()
+    norm_weight = torch.rand((head_dim,), device="cuda", dtype=torch.float32).add_(0.5).bfloat16()
     angles = torch.rand(
-        (sequence_length, 96),
+        (sequence_length, head_dim * 3 // 4),
         device="cuda",
         dtype=torch.float32,
     ).mul_(2 * torch.pi)
@@ -99,13 +100,26 @@ def _random_operands(
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("sequence_length", [64, 65])
+@pytest.mark.parametrize(
+    "head_dim",
+    [
+        pytest.param(
+            64,
+            marks=pytest.mark.skipif(
+                not projection_available(64), reason="requires D64 fused sparse projection support"
+            ),
+        ),
+        128,
+    ],
+)
 def test_fused_query_projection_matches_the_fp32_composed_contract(
     sequence_length: int,
+    head_dim: int,
 ) -> None:
-    operands = _random_operands(sequence_length=sequence_length)
+    operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
     options = {
         "norm_epsilon": 1e-6,
-        "softmax_scale": 128**-0.5,
+        "softmax_scale": head_dim**-0.5,
     }
 
     actual_query, actual_scale, actual_summary = query_fusion._project_query_op(
@@ -117,11 +131,11 @@ def test_fused_query_projection_matches_the_fp32_composed_contract(
     expected = composed_query_projection(*operands.as_tuple(), **options)
     storage_length = padded_sequence_length(sequence_length)
 
-    assert actual_query.shape == (1, 2, storage_length, 128)
+    assert actual_query.shape == (1, 2, storage_length, head_dim)
     assert actual_query.dtype is torch.int8
     assert actual_scale.shape == (1, 2, storage_length // 32)
     assert actual_scale.dtype is torch.float32
-    assert actual_summary.shape == (1, 2, storage_length // 64, 128)
+    assert actual_summary.shape == (1, 2, storage_length // 64, head_dim)
     assert actual_summary.dtype is torch.float32
     assert int((actual_query.to(torch.int16) - expected.query).abs().max()) <= 1
     torch.testing.assert_close(

@@ -148,7 +148,7 @@ The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by
 `convrot_int8_sparse_piper_compile_options` from
 `piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
-bias-free ConvRot Q/K/V projections, D128 RMSNorm and split-half RoPE for Q/K, followed by
+bias-free ConvRot Q/K/V projections, D64/D128 RMSNorm and split-half RoPE for Q/K, followed by
 `sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
 plus routing summaries directly, avoiding the three materialized BF16 projection outputs. Arbitrary
 logical sequence lengths are written directly into internally K64-padded attention storage; only
@@ -452,10 +452,11 @@ output = attention(
 )
 ```
 
-Inputs use pre-tiled `[batch, sequence, heads, 128]` BF16 layout. Without `block_lengths`, every row
-participates in attention and the sequence length may be arbitrary; the operator pads only its
-internal quantized storage to K64. Supplying one contiguous device INT32 length in `[1, 64]` per
-physical K64 block instead selects valid-front padded storage. The output retains that physical
+Inputs use `[batch, sequence, heads, head_dim]` BF16 layout with head dimensions 64 or 128.
+Without `block_lengths`, every row participates in attention and the sequence length may be
+arbitrary. The operator pads only its internal quantized storage to K64. Supplying one contiguous
+device INT32 length in `[1, 64]` per physical K64 block instead selects valid-front padded
+storage. The output retains that physical
 layout so the caller can apply its existing gather; padded query rows are unspecified.
 `sparse_key_blocks` is a runtime count of complete routeable physical K64 prefix tiles, so any
 compact partial final tile belongs to the dense suffix. Routing defaults to FP32 min/max pooling;
@@ -514,10 +515,13 @@ residual together with `sparse_query_blocks`. It passes the coarse result and co
 each ranged attention launch and projects that chunk directly, so the full BF16 attention output is
 not materialized.
 
-The SM120 path writes packed UINT16 routes, pairs two logical K64 tiles in one physical K128
-recurrence, and uses one centered-V INT8 scale per logical tile. Its online numerator and
-pre-rounding denominator remain FP32. Unsupported devices use a slow portable implementation of
-the same quantized Sparse Piper arithmetic. A separate exact-BF16 sparse reference serves as its
+The SM120 path supports both head widths, pairs two logical K64 tiles in one physical K128
+recurrence, and uses one centered-V INT8 scale per logical tile. It normally reads packed UINT16
+routes. Full-keep D64 calls use `skip_dense_routing` to visit all blocks without a route list;
+D128 retains the list. The online numerator and pre-rounding denominator remain FP32.
+The RDNA4 native path remains D128-only; D64 uses the portable fallback there.
+Unsupported devices use a slow portable implementation of the same quantized Sparse Piper
+arithmetic. A separate exact-BF16 sparse reference serves as its
 quality oracle; it is not the public fallback.
 
 ## SageAttention2++

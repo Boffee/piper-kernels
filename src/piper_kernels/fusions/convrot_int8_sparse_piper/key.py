@@ -13,7 +13,7 @@ from piper_kernels.fusions.convrot_int8_sage_qk._validation import (
 )
 
 from . import _backend
-from ._layout import HEAD_DIM, TILE_ROWS, padded_sequence_length, validate_block_lengths
+from ._layout import TILE_ROWS, padded_sequence_length, validate_block_lengths
 
 
 def _validate_inputs(
@@ -66,11 +66,12 @@ def _launch_key_projection(
         sin,
         norm_epsilon=norm_epsilon,
     )
+    head_dim = norm_weight.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
-    backend = _backend.require_projection_backend(input_qdata)
+    backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     key = torch.empty(
-        (batch, heads, storage_sequence_length, HEAD_DIM),
+        (batch, heads, storage_sequence_length, head_dim),
         device=input_qdata.device,
         dtype=torch.int8,
     )
@@ -79,12 +80,12 @@ def _launch_key_projection(
         device=input_qdata.device,
         dtype=torch.float32,
     )
-    summary_shape = (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
+    summary_shape = (batch, heads, storage_sequence_length // TILE_ROWS, head_dim)
     key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
     mean_pool_summary = routing_mode == _MEAN_ROUTING
     key_aux = (
         torch.empty(
-            (batch, heads, 0, HEAD_DIM),
+            (batch, heads, 0, head_dim),
             device=input_qdata.device,
             dtype=torch.float32,
         )
@@ -143,7 +144,7 @@ def _project_key_op_fake(
     _input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
-    _norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
     _cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
@@ -151,19 +152,20 @@ def _project_key_op_fake(
     _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
+    head_dim = norm_weight.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
-    heads = weight_qdata.shape[0] // HEAD_DIM
-    key = input_qdata.new_empty((batch, heads, storage_sequence_length, HEAD_DIM))
+    heads = weight_qdata.shape[0] // head_dim
+    key = input_qdata.new_empty((batch, heads, storage_sequence_length, head_dim))
     key_scale = input_qdata.new_empty(
         (batch, heads, storage_sequence_length // TILE_ROWS),
         dtype=torch.float32,
     )
     summary = input_qdata.new_empty(
-        (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
+        (batch, heads, storage_sequence_length // TILE_ROWS, head_dim),
         dtype=torch.float32,
     )
     key_aux = (
-        summary.new_empty((batch, heads, 0, HEAD_DIM))
+        summary.new_empty((batch, heads, 0, head_dim))
         if routing_mode == _MEAN_ROUTING
         else summary.new_empty(summary.shape)
     )

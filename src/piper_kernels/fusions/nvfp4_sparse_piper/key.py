@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import (
-    HEAD_DIM,
     TILE_ROWS,
     padded_sequence_length,
 )
@@ -41,6 +40,7 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     block_lengths: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
+    head_dim = norm_weight.shape[0] if norm_weight.ndim == 1 else 0
     sequence_length, heads = validate_projection(
         input_qdata,
         input_scale,
@@ -51,6 +51,7 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         bias,
         chunk_rows,
         "K projection",
+        head_dim,
     )
     validate_qk_epilogue(
         input_qdata,
@@ -70,7 +71,7 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     operands = (norm_weight, cos, sin)
     storage_sequence_length = padded_sequence_length(sequence_length)
     key = torch.empty(
-        (1, heads, storage_sequence_length, HEAD_DIM),
+        (1, heads, storage_sequence_length, head_dim),
         device=input_qdata.device,
         dtype=torch.int8,
     )
@@ -79,12 +80,12 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         device=input_qdata.device,
         dtype=torch.float32,
     )
-    summary_shape = (1, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)
+    summary_shape = (1, heads, storage_sequence_length // TILE_ROWS, head_dim)
     key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
     mean_pool_summary = routing_mode == _MEAN_ROUTING
     key_aux = (
         torch.empty(
-            (1, heads, 0, HEAD_DIM),
+            (1, heads, 0, head_dim),
             device=input_qdata.device,
             dtype=torch.float32,
         )
@@ -173,7 +174,7 @@ def _project_key_fake(
     _weight_scale: torch.Tensor,
     _weight_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
-    _norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
     _cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
@@ -183,18 +184,19 @@ def _project_key_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
-    heads = weight_qdata.shape[0] // HEAD_DIM
-    key = input_qdata.new_empty((1, heads, storage_sequence_length, HEAD_DIM), dtype=torch.int8)
+    head_dim = norm_weight.shape[0]
+    heads = weight_qdata.shape[0] // head_dim
+    key = input_qdata.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8)
     key_scale = input_qdata.new_empty(
         (1, heads, storage_sequence_length // TILE_ROWS),
         dtype=torch.float32,
     )
     summary = input_qdata.new_empty(
-        (1, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
+        (1, heads, storage_sequence_length // TILE_ROWS, head_dim),
         dtype=torch.float32,
     )
     key_aux = (
-        summary.new_empty((1, heads, 0, HEAD_DIM))
+        summary.new_empty((1, heads, 0, head_dim))
         if routing_mode == _MEAN_ROUTING
         else summary.new_empty(summary.shape)
     )

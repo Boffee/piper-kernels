@@ -53,6 +53,8 @@ class AttentionBackend:
     prepare: PrepareAttention
     launch: LaunchAttention
     bind: BindAttention | None = None
+    # Selected for this backend and head width; applies only to full-keep calls.
+    skip_dense_routing: bool = False
 
     def bind_context(self, context: _PreparedSparsePiperContext) -> LaunchAttention:
         """Own backend preparation once for an immutable K/V context lifetime."""

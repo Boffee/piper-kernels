@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM, TILE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 
 from ._prepared import _PreparedSparsePiperAttention
 
@@ -57,7 +57,7 @@ def validate_attention_launch(
     storage_sequence_length = context.key.shape[2]
     has_block_lengths = context.block_lengths is not None
     if (
-        head_dim != HEAD_DIM
+        head_dim not in SUPPORTED_HEAD_DIMS
         or query_storage_sequence_length < TILE_ROWS
         or query_storage_sequence_length % TILE_ROWS
         or storage_sequence_length < TILE_ROWS
@@ -68,7 +68,7 @@ def validate_attention_launch(
             != storage_sequence_length
         )
     ):
-        raise ValueError("sparse Piper requires padded Q64/K64/D128 storage")
+        raise ValueError("sparse Piper requires padded Q64/K64/D64/D128 storage")
     stored_query_blocks, resolved_query_block_count, global_query_block_offset = (
         _resolve_query_block_range(
             prepared,
@@ -105,7 +105,7 @@ def validate_attention_launch(
             or coarse_output.device != query.device
             or coarse_output.stride(-1) != 1
         ):
-            raise ValueError("sparse Piper coarse output must be FP32 [batch,heads,Q64,D128]")
+            raise ValueError("sparse Piper coarse output must be FP32 [batch,heads,Q64,D64/D128]")
         if (
             coarse_gate.shape != (batch, output_sequence_length, heads, head_dim)
             or coarse_gate.dtype is not torch.bfloat16

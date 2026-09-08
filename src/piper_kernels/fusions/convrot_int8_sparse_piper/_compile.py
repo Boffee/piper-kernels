@@ -54,8 +54,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _backend, _kernels, _layout, _output_compile, key, output, query, value
 
-_COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v24"
-_HEAD_DIM = _layout.HEAD_DIM
+_COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v25"
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
 
@@ -195,16 +194,22 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
     q_weight = metadata["sparse_q_weight_qdata"]
     assert q_weight is not None
     output_features = sparse_piper_compile.static_int(q_weight.shape[0])
-    if input_features is None or output_features is None or output_features % _HEAD_DIM:
+    head_dim = sparse_piper_compile.attention_head_dim(match)
+    if (
+        input_features is None
+        or output_features is None
+        or head_dim is None
+        or output_features % head_dim
+    ):
         return False
     batch, sequence_length = input_value.shape[:2]
-    heads = output_features // _HEAD_DIM
+    heads = output_features // head_dim
     if input_value.dtype is not torch.bfloat16 or (
         isinstance(sequence_length, int) and sequence_length < _TILE_ROWS
     ):
         return False
     if (
-        _backend.select_projection_backend(input_value) is None
+        _backend.select_projection_backend(input_value, head_dim=head_dim) is None
         or linear_backend.select_linear_backend(input_value) is None
         or linear_backend.select_dequantized_mean(input_value) is None
         or attention_backend.select_attention_backend(input_value) is None
@@ -221,9 +226,9 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
         assert scale is not None
         if (
             weight.dtype is not torch.int8
-            or tuple(weight.shape) != (heads * _HEAD_DIM, input_features)
+            or tuple(weight.shape) != (heads * head_dim, input_features)
             or scale.dtype is not torch.float32
-            or tuple(scale.shape) != (heads * _HEAD_DIM, 1)
+            or tuple(scale.shape) != (heads * head_dim, 1)
             or weight.device != input_value.device
             or scale.device != input_value.device
         ):
@@ -235,7 +240,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
         sequence_length=sequence_length,
         heads=heads,
         device=input_value.device,
-        head_dim=_HEAD_DIM,
+        head_dim=head_dim,
         tile_rows=_TILE_ROWS,
     )
 
@@ -284,8 +289,9 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     batch, sequence_length = input_value.shape[:2]
     q_weight_value = preparation_sharing.tensor_metadata(sparse_q_weight_qdata)
     assert q_weight_value is not None
-    heads = q_weight_value.shape[0] // _HEAD_DIM
-    head_dim = _HEAD_DIM
+    head_dim = sparse_piper_compile.attention_head_dim(match)
+    assert head_dim is not None
+    heads = q_weight_value.shape[0] // head_dim
     storage_sequence_length = _layout.padded_sequence_length(sequence_length)
     block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
     with graph.inserting_before(original):
@@ -438,7 +444,8 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 input_mean,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
-                *block_length_arguments,
+                sparse_block_lengths,
+                head_dim,
             ),
             value_values,
         )

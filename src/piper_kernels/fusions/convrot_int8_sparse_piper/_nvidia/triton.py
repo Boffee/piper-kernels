@@ -12,7 +12,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_
 
 from .. import _kernels
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
-from .._layout import HEAD_DIM, TILE_ROWS
+from .._layout import TILE_ROWS
 
 # GEMM row tiles may span multiple 64-row attention blocks; scale/summary groups
 # remain fixed by the shared kernels, independently of these compute tiles.
@@ -20,7 +20,6 @@ _QUERY_BLOCK_M = TILE_ROWS
 _CONTEXT_BLOCK_M = 2 * TILE_ROWS
 _BLOCK_K = 128
 _HEADS_PER_PROGRAM = 2
-_BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
 
 
 def project_query(
@@ -42,7 +41,8 @@ def project_query(
 ) -> None:
     """Launch Q32 quantization and Q64 summaries for a validated query window."""
     query, query_scale, query_summary = out
-    batch, heads, storage_sequence_length, _ = query.shape
+    batch, heads, storage_sequence_length, head_dim = query.shape
+    block_n = head_dim * _HEADS_PER_PROGRAM
     sequence_length = input_qdata.shape[1]
     rotary_dim = cos.shape[1]
     has_block_lengths = block_lengths is not None
@@ -73,7 +73,7 @@ def project_query(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 heads_per_program=_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=head_dim,
                 rotary_dim=rotary_dim,
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
@@ -86,7 +86,7 @@ def project_query(
                     and heads % _HEADS_PER_PROGRAM == 0
                 ),
                 block_m=_QUERY_BLOCK_M,
-                block_n=_BLOCK_N,
+                block_n=block_n,
                 block_k=_BLOCK_K,
                 rsqrt_fn=libdevice.rsqrt_rn,
                 num_warps=8,
@@ -116,7 +116,8 @@ def project_key(
 ) -> None:
     """Launch K64 quantization and routing summaries for global key storage."""
     key, key_scale, key_summary, key_aux = out
-    batch, heads, storage_sequence_length, _ = key.shape
+    batch, heads, storage_sequence_length, head_dim = key.shape
+    block_n = head_dim * _HEADS_PER_PROGRAM
     logical_sequence_length = input_qdata.shape[1]
     rotary_dim = cos.shape[1]
     mean_pool_summary = routing_mode == _MEAN_ROUTING
@@ -151,7 +152,7 @@ def project_key(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 heads_per_program=_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=head_dim,
                 rotary_dim=rotary_dim,
                 norm_epsilon=norm_epsilon,
                 mean_pool_summary=mean_pool_summary,
@@ -163,7 +164,7 @@ def project_key(
                 ),
                 mask_ragged_tail=not aligned_rows,
                 block_m=_CONTEXT_BLOCK_M,
-                block_n=_BLOCK_N,
+                block_n=block_n,
                 block_k=_BLOCK_K,
                 rsqrt_fn=libdevice.rsqrt_rn,
                 num_warps=8,
@@ -190,21 +191,22 @@ def project_value(
 ) -> None:
     """Launch projected means and centered tile-scaled INT8 values."""
     value, value_scale_multiplier, value_mean, block_mean = out
-    batch, heads, _, storage_sequence_length = value.shape
+    batch, heads, head_dim, storage_sequence_length = value.shape
+    block_n = head_dim * _HEADS_PER_PROGRAM
     sequence_length = input_qdata.shape[1]
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else value_mean
     with device_context(input_qdata.device):
         _kernels._project_prepared_input_mean_kernel[
-            (triton.cdiv(heads * HEAD_DIM, _BLOCK_N), batch)
+            (triton.cdiv(heads * head_dim, block_n), batch)
         ](
             input_mean,
             weight_qdata,
             weight_scale,
             value_mean,
             input_features=input_qdata.shape[2],
-            output_features=heads * HEAD_DIM,
-            block_n=_BLOCK_N,
+            output_features=heads * head_dim,
+            block_n=block_n,
             block_k=_BLOCK_K,
             num_warps=8,
         )
@@ -233,7 +235,7 @@ def project_value(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 heads_per_program=_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=head_dim,
                 aligned_projection=(
                     aligned_rows
                     and input_qdata.shape[2] % _BLOCK_K == 0
@@ -242,7 +244,7 @@ def project_value(
                 mask_block_lengths=has_block_lengths,
                 emit_block_mean=emit_block_mean,
                 block_m=_CONTEXT_BLOCK_M,
-                block_n=_BLOCK_N,
+                block_n=block_n,
                 block_k=_BLOCK_K,
                 num_warps=8,
                 num_stages=3,

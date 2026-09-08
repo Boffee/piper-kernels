@@ -11,9 +11,10 @@ from piper_kernels.attention.sparse_piper_attention._backend import select_atten
 def _inputs(
     device: str = "cpu",
     sequence_length: int = 3 * 64,
+    head_dim: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(52)
-    shape = (1, sequence_length, 2, 128)
+    shape = (1, sequence_length, 2, head_dim)
     query = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
     key = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
     value = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
@@ -92,8 +93,10 @@ def test_dense_suffix_is_included_for_prefix_and_suffix_queries() -> None:
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("sparse_query_blocks", [0, 2, 3])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_dense_query_suffix_bypasses_sparse_routes(
     device: str,
+    head_dim: int,
     sparse_query_blocks: int,
 ) -> None:
     if device == "cuda" and (
@@ -101,7 +104,7 @@ def test_dense_query_suffix_bypasses_sparse_routes(
         or select_attention_backend(torch.empty((), device="cuda")) is None
     ):
         pytest.skip("requires a native sparse-attention backend")
-    shape = (1, 3 * 64, 1, 128)
+    shape = (1, 3 * 64, 1, head_dim)
     query = torch.zeros(shape, dtype=torch.bfloat16, device=device)
     key = torch.zeros_like(query)
     value = torch.empty_like(query)
@@ -151,8 +154,11 @@ def test_backend_accepts_sparse_prefix_length_changes_without_derived_state() ->
 
 
 @pytest.mark.parametrize("sequence_length", [64, 65, 127, 128, 129, 181, 191, 192, 193])
-def test_public_contract_accepts_ragged_logical_lengths(sequence_length: int) -> None:
-    query, key, value = _inputs(sequence_length=sequence_length)
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_public_contract_accepts_ragged_logical_lengths(
+    sequence_length: int, head_dim: int
+) -> None:
+    query, key, value = _inputs(sequence_length=sequence_length, head_dim=head_dim)
     attention = _attention((0.5, 1.0))
 
     with torch.no_grad():
@@ -186,16 +192,18 @@ def test_partial_dense_suffix_attends_only_valid_rows() -> None:
 
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_internal_block_lengths_make_padded_values_unobservable(
     routing: str,
     device: str,
+    head_dim: int,
 ) -> None:
     if device == "cuda" and (
         not torch.cuda.is_available()
         or select_attention_backend(torch.empty((), device="cuda")) is None
     ):
         pytest.skip("requires a native sparse-attention backend")
-    query, key, value = _inputs(device=device)
+    query, key, value = _inputs(device=device, head_dim=head_dim)
     block_lengths = torch.tensor([64, 17, 51], device=device, dtype=torch.int32)
     valid_rows = torch.arange(query.shape[1], device=device) % 64
     valid_rows = valid_rows < block_lengths.repeat_interleave(64)
@@ -297,12 +305,13 @@ def test_native_path_returns_contiguous_output_for_noncontiguous_inputs() -> Non
     reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [192, 193])
-def test_native_custom_op_passes_opcheck(sequence_length: int) -> None:
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_native_custom_op_passes_opcheck(sequence_length: int, head_dim: int) -> None:
     from piper_kernels.attention.sparse_piper_attention.dispatch import (  # noqa: PLC0415
         _sparse_piper_attention_op,
     )
 
-    query, key, value = _inputs("cuda", sequence_length)
+    query, key, value = _inputs("cuda", sequence_length, head_dim)
     attention = _attention((0.5, 1.0))
     result = torch.library.opcheck(
         _sparse_piper_attention_op,
@@ -312,7 +321,7 @@ def test_native_custom_op_passes_opcheck(sequence_length: int) -> None:
             value,
             list(attention._head_keep_ratio_units),
             sequence_length // 64,
-            128**-0.5,
+            head_dim**-0.5,
             attention._routing_mode,
         ),
     )
@@ -330,11 +339,13 @@ def test_native_custom_op_passes_opcheck(sequence_length: int) -> None:
     ("sparse_key_blocks", "ratios"),
     [(1, (1.0, 1.0)), (2, (0.5, 1.0)), (3, (1 / 3, 2 / 3))],
 )
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_native_matches_the_portable_quantized_reference(
+    head_dim: int,
     sparse_key_blocks: int,
     ratios: tuple[float, float],
 ) -> None:
-    query, key, value = _inputs()
+    query, key, value = _inputs(head_dim=head_dim)
     cpu_attention = _attention(ratios)
     cuda_attention = _attention(ratios)
 
@@ -363,8 +374,11 @@ def test_native_matches_the_portable_quantized_reference(
     reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [64, 65, 127, 128, 129, 181, 191, 192, 193])
-def test_native_ragged_lengths_match_the_portable_reference(sequence_length: int) -> None:
-    query, key, value = _inputs(sequence_length=sequence_length)
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_native_ragged_lengths_match_the_portable_reference(
+    sequence_length: int, head_dim: int
+) -> None:
+    query, key, value = _inputs(sequence_length=sequence_length, head_dim=head_dim)
     attention = _attention((0.5, 1.0))
     sparse_key_blocks = sequence_length // 64
 

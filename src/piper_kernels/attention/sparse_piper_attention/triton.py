@@ -48,7 +48,7 @@ def _quantize_value_per_tile_kernel(
     block_n: tl.constexpr,
     mask_block_lengths: tl.constexpr,
 ):
-    """Quantize one D128 K64 storage tile while masking the logical V tail."""
+    """Quantize one K64 storage tile while masking the logical V tail."""
     key_block = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch = batch_head // heads

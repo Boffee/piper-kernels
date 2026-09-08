@@ -11,7 +11,9 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_
 
 from .. import _kernels
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
-from .._layout import HEAD_DIM, TILE_ROWS
+from .._layout import TILE_ROWS
+
+_HEAD_DIM = 128
 
 # GEMM row tiles may span multiple 64-row attention blocks; scale/summary groups
 # remain fixed by the shared kernels, independently of these compute tiles.
@@ -26,9 +28,9 @@ _NUM_STAGES = 2
 _GROUP_M = 8
 # Q/K's Hadamard and RoPE epilogues need smaller tiles to bound LDS/register use.
 _QK_HEADS_PER_PROGRAM = 1
-_QK_BLOCK_N = HEAD_DIM * _QK_HEADS_PER_PROGRAM
+_QK_BLOCK_N = _HEAD_DIM * _QK_HEADS_PER_PROGRAM
 _VALUE_HEADS_PER_PROGRAM = 2
-_VALUE_BLOCK_N = HEAD_DIM * _VALUE_HEADS_PER_PROGRAM
+_VALUE_BLOCK_N = _HEAD_DIM * _VALUE_HEADS_PER_PROGRAM
 
 
 def project_query(
@@ -81,7 +83,7 @@ def project_query(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 heads_per_program=_QK_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=_HEAD_DIM,
                 rotary_dim=rotary_dim,
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
@@ -159,7 +161,7 @@ def project_key(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 heads_per_program=_QK_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=_HEAD_DIM,
                 rotary_dim=rotary_dim,
                 norm_epsilon=norm_epsilon,
                 mean_pool_summary=mean_pool_summary,
@@ -204,14 +206,14 @@ def project_value(
     block_lengths_ptr = block_lengths if has_block_lengths else value_mean
     with device_context(input_qdata.device):
         _kernels._project_prepared_input_mean_kernel[
-            (triton.cdiv(heads * HEAD_DIM, _VALUE_BLOCK_N), batch)
+            (triton.cdiv(heads * _HEAD_DIM, _VALUE_BLOCK_N), batch)
         ](
             input_mean,
             weight_qdata,
             weight_scale,
             value_mean,
             input_features=input_qdata.shape[2],
-            output_features=heads * HEAD_DIM,
+            output_features=heads * _HEAD_DIM,
             block_n=_VALUE_BLOCK_N,
             block_k=_BLOCK_K,
             num_warps=_VALUE_NUM_WARPS,
@@ -241,7 +243,7 @@ def project_value(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 heads_per_program=_VALUE_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=_HEAD_DIM,
                 aligned_projection=(
                     aligned_rows
                     and input_qdata.shape[2] % _BLOCK_K == 0

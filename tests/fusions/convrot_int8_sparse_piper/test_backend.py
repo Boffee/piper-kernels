@@ -18,6 +18,7 @@ from triton.compiler import ASTSource
 from triton.language.extra.cuda import libdevice
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -35,33 +36,42 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import triton as nvidia
+from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_compile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
 
 
-def _operands(sequence=193, heads=3):
+def _operands(sequence=193, heads=3, head_dim=128):
     return (
         torch.empty((2, sequence, 272), device="cuda:1", dtype=torch.int8),
         torch.empty((2, sequence), device="cuda:1"),
-        torch.empty((heads * 128, 272), device="cuda:1", dtype=torch.int8),
-        torch.empty((heads * 128, 1), device="cuda:1"),
-        torch.empty(128, device="cuda:1", dtype=torch.bfloat16),
-        torch.empty((sequence, 96), device="cuda:1"),
-        torch.empty((sequence, 96), device="cuda:1"),
+        torch.empty((heads * head_dim, 272), device="cuda:1", dtype=torch.int8),
+        torch.empty((heads * head_dim, 1), device="cuda:1"),
+        torch.empty(head_dim, device="cuda:1", dtype=torch.bfloat16),
+        torch.empty((sequence, head_dim * 3 // 4), device="cuda:1"),
+        torch.empty((sequence, head_dim * 3 // 4), device="cuda:1"),
     )
 
 
 def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False):
+    head_dim = operands[4].shape[0]
     if operation == "query":
         return query._launch_query_projection_range(
-            *operands, 1e-6, 128**-0.5, routing, chunk_start=64, chunk_rows=129
+            *operands, 1e-6, head_dim**-0.5, routing, chunk_start=64, chunk_rows=129
         )
     if operation == "key":
         return key._launch_key_projection(*operands, 1e-6, routing)
     qdata, scale, weight, weight_scale, *_ = operands
     mean = qdata.new_empty((2, 272), dtype=torch.float32)
     return value._launch_value_projection(
-        qdata, scale, mean, weight, weight_scale, None, emit_block_mean=emit_block_mean
+        qdata,
+        scale,
+        mean,
+        weight,
+        weight_scale,
+        None,
+        emit_block_mean=emit_block_mean,
+        head_dim=head_dim,
     )
 
 
@@ -76,7 +86,10 @@ def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False):
         AcceleratorTarget("cpu"),
     ],
 )
-def test_projection_selection_uses_operand_target_and_keeps_support_closed(monkeypatch, target):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_projection_selection_uses_operand_target_and_keeps_support_closed(
+    monkeypatch, target, head_dim
+):
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(
@@ -90,9 +103,10 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(monke
         sys.platform == "linux"
         and target.is_amd_hip
         and target.is_architecture("gfx1200", "gfx1201")
+        and head_dim == 128
     ):
         expected = amd
-    assert _backend.select_projection_backend(operand) is expected
+    assert _backend.select_projection_backend(operand, head_dim=head_dim) is expected
     probe.assert_called_once_with(operand.device)
 
 
@@ -146,7 +160,7 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
     with FakeTensorMode():
         operands = _operands()
         result = _call(operation, operands, routing, emit_block_mean=True)
-    select.assert_called_once_with(operands[0])
+    select.assert_called_once_with(operands[0], head_dim=128)
     execute.assert_called_once()
     assert execute.call_args.args[0] is operands[0]
     assert all(
@@ -177,12 +191,15 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-def test_unvalidated_projection_rejects_before_output_allocation(monkeypatch, operation):
+@pytest.mark.parametrize(("architecture", "head_dim"), [("gfx1100", 128), ("gfx1201", 64)])
+def test_unvalidated_projection_rejects_before_output_allocation(
+    monkeypatch, operation, architecture, head_dim
+):
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1100")
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", architecture)
     )
     with FakeTensorMode():
-        operands = _operands()
+        operands = _operands(head_dim=head_dim)
         monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated outputs")))
         with pytest.raises(ValueError, match="sparse projections are unavailable"):
             _call(operation, operands)
@@ -325,7 +342,9 @@ def test_output_fusion_selects_once_before_preparation_and_reuses_backend(
     events = []
     projection = SimpleNamespace(project_query=Mock())
     linear = object()
-    select_projection = Mock(side_effect=lambda operand: events.append("projection") or projection)
+    select_projection = Mock(
+        side_effect=lambda operand, **kwargs: events.append("projection") or projection
+    )
     select_output = Mock(side_effect=lambda operand: events.append("output") or linear)
     monkeypatch.setattr(_backend, "require_projection_backend", select_projection)
     monkeypatch.setattr(_backend, "require_output_backend", select_output)
@@ -359,7 +378,7 @@ def test_output_fusion_selects_once_before_preparation_and_reuses_backend(
     select_output.assert_called_once_with(storage)
     assert projector.call_args.kwargs["backend"] is linear
     if projected_query:
-        select_projection.assert_called_once_with(operands[0])
+        select_projection.assert_called_once_with(operands[0], head_dim=128)
         assert projection.project_query.call_count == 2
         assert [call.kwargs["chunk_start"] for call in projection.project_query.call_args_list] == [
             0,
@@ -407,8 +426,10 @@ def test_shared_fusion_does_not_inspect_targets_or_launch_kernels(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
 
 
-def test_compiler_cache_key_includes_projection_validation():
+def test_compiler_cache_keys_include_projection_validation_and_attention_policy():
     assert qk_validation.__file__ in _compile._source_files()
+    for compiler in (_compile, nvfp4_compile):
+        assert attention_policy.__file__ in compiler._source_files()
 
 
 @pytest.mark.parametrize("vendor", ["_nvidia", "_amd"])
@@ -425,6 +446,43 @@ def test_compiler_cache_key_includes_projection_validation():
 def test_shared_boundary_check_rejects_relative_and_absolute_vendor_imports(source, vendor):
     with pytest.raises(AssertionError):
         _assert_shared_fusion_boundary(source.format(vendor=vendor))
+
+
+def _projection_match(head_dim, input_features=256):
+    graph = torch.fx.Graph()
+    arguments = {"sparse_routing_mode": _MINMAX_ROUTING, "sparse_group_size": 16}
+
+    def operand(name, shape, dtype):
+        node = graph.placeholder(name)
+        node.meta["val"] = torch.empty(shape, dtype=dtype)
+        arguments[name] = node
+        return node.meta["val"]
+
+    input_value = operand("sparse_input", (1, 128, input_features), torch.bfloat16)
+    for kind in ("q", "k", "v"):
+        operand(f"sparse_{kind}_weight_qdata", (2 * head_dim, input_features), torch.int8)
+        operand(f"sparse_{kind}_weight_scale", (2 * head_dim, 1), torch.float32)
+    operand("attention_output", (1, 128, 2, head_dim), torch.bfloat16)
+    match = SimpleNamespace(kwargs=arguments, output_node=lambda: arguments["attention_output"])
+    return match, input_value
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("input_features", [128, 256])
+def test_amd_projection_compiler_selects_actual_attention_width(
+    monkeypatch, head_dim, input_features
+):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
+    )
+    for attribute in ("select_linear_backend", "select_dequantized_mean"):
+        monkeypatch.setattr(_compile.linear_backend, attribute, Mock(return_value=object()))
+    validate = Mock(return_value=True)
+    monkeypatch.setattr(_compile.sparse_piper_compile, "valid_sparse_piper_attention", validate)
+    match, _ = _projection_match(head_dim, input_features)
+    assert _compile._valid_sparse_piper_projection(match) is (head_dim == 128)
+    assert validate.called is (head_dim == 128)
 
 
 @pytest.mark.parametrize("missing", [None, "projection", "linear", "mean", "attention"])
@@ -444,25 +502,14 @@ def test_projection_compiler_requires_each_emitted_operation(monkeypatch, missin
     monkeypatch.setattr(
         _compile.sparse_piper_compile, "valid_sparse_piper_attention", validate_attention
     )
-    graph = torch.fx.Graph()
-    arguments = {"sparse_routing_mode": _MINMAX_ROUTING, "sparse_group_size": 16}
-
-    def operand(name, shape, dtype):
-        node = graph.placeholder(name)
-        node.meta["val"] = torch.empty(shape, dtype=dtype)
-        arguments[name] = node
-        return node.meta["val"]
-
-    input_value = operand("sparse_input", (1, 128, 256), torch.bfloat16)
-    for kind in ("q", "k", "v"):
-        operand(f"sparse_{kind}_weight_qdata", (256, 256), torch.int8)
-        operand(f"sparse_{kind}_weight_scale", (256, 1), torch.float32)
-    assert _compile._valid_sparse_piper_projection(SimpleNamespace(kwargs=arguments)) is (
-        missing is None
-    )
+    match, input_value = _projection_match(128)
+    assert _compile._valid_sparse_piper_projection(match) is (missing is None)
     for probe in probes:
         if probe.called:
-            probe.assert_called_once_with(input_value)
+            if probe is probes[0]:
+                probe.assert_called_once_with(input_value, head_dim=128)
+            else:
+                probe.assert_called_once_with(input_value)
     assert validate_attention.called is (missing is None)
 
 

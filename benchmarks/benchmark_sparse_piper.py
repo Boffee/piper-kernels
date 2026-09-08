@@ -49,6 +49,7 @@ def _positive_int(value: str) -> int:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", type=_positive_int, nargs="+", default=[1024, 4096])
+    parser.add_argument("--head-dim", type=int, choices=[64, 128], default=128)
     parser.add_argument("--heads", type=_positive_int, default=8)
     parser.add_argument("--batch", type=_positive_int, default=1)
     parser.add_argument("--ratios", type=float, nargs="+", default=[0.25, 1.0])
@@ -69,7 +70,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     device = torch.device("cuda", args.device)
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    shape = (args.batch, sequence, args.heads, 128)
+    shape = (args.batch, sequence, args.heads, args.head_dim)
     query, key, value = [
         torch.randn(shape, device=device, dtype=torch.bfloat16, generator=generator)
         for _ in range(3)
@@ -86,14 +87,16 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
         key.transpose(1, 2)[:, :, : blocks * 64],
         layout,
         routing_mode_from_name(args.routing),
+        skip_dense_routing=backend.skip_dense_routing,
     )
     routes = route_call()
+    skip_dense_routing = routes.indices.shape[-1] == 0
     prepare_call = partial(
         backend.prepare,
         query.transpose(1, 2),
         routes.indices,
         routes.head_keep_blocks,
-        128**-0.5,
+        args.head_dim**-0.5,
         sparse_key_blocks=blocks,
         route_head_offsets=routes.route_head_offsets,
         combined_key=key.transpose(1, 2),
@@ -126,7 +129,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
             value,
             routes,
             sparse_key_blocks=blocks,
-            scale=128**-0.5,
+            scale=args.head_dim**-0.5,
         )
 
         reference = reference_call()
@@ -152,7 +155,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
         prepare_execution, 60, args.rep_ms, synchronize=torch.cuda.synchronize
     )
     selected_blocks = routes.head_keep_blocks.cpu().tolist()
-    operations = useful_integer_operations(sequence, selected_blocks, args.batch)
+    operations = useful_integer_operations(sequence, selected_blocks, args.batch, args.head_dim)
     # Measure real public-call memory with no extra prepared benchmark state or
     # output retained. This matters at 100k tokens on a 16-GB accelerator.
     del launch, bound_launch, prepared, output, routes, route_call, prepare_execution, prepare_call
@@ -168,6 +171,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
                 "input_source": "synthetic_bf16_normal",
                 "ratio": ratio,
                 "routing": args.routing,
+                "skip_dense_routing": skip_dense_routing,
                 "selected_blocks_per_head": selected_blocks,
                 "relative_l2_vs_quantized_reference": error,
                 "reference_wall_ms_excluding_routing": reference_ms,

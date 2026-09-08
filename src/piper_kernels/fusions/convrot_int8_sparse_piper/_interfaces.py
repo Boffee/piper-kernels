@@ -42,7 +42,7 @@ class ProjectionBackend(Protocol):
         chunk_rows: int,
         out: QueryOutput,
     ) -> None:
-        """Fill (Q[B,H,S,128], scales[B,H,S/32], summaries[B,H,S/64,128]).
+        """Fill (Q[B,H,S,D], scales[B,H,S/32], summaries[B,H,S/64,D]), D=64 or 128.
 
         Read the global window [chunk_start, chunk_start + chunk_rows) and
         write it starting at local row zero, with neutral tail padding.
@@ -63,10 +63,10 @@ class ProjectionBackend(Protocol):
         *,
         out: KeyOutput,
     ) -> None:
-        """Fill (K[B,H,S,128], scales[B,H,S/64], summaries, auxiliary).
+        """Fill (K[B,H,S,D], scales[B,H,S/64], summaries, auxiliary), D=64 or 128.
 
-        Minmax routing uses two [B,H,S/64,128] summary tensors. Mean routing
-        uses one summary tensor and an empty auxiliary [B,H,0,128].
+        Minmax routing uses two [B,H,S/64,D] summary tensors. Mean routing
+        uses one summary tensor and an empty auxiliary [B,H,0,D].
         """
 
     def project_value(
@@ -81,9 +81,9 @@ class ProjectionBackend(Protocol):
         emit_block_mean: bool,
         out: ValueOutput,
     ) -> None:
-        """Fill (V[B,H,128,S], multipliers[B,H,S/64,1], mean, block_mean).
+        """Fill (V[B,H,D,S], multipliers[B,H,S/64,1], mean, block_mean), D=64 or 128.
 
-        The projected global mean is [B,H,128]. When emit_block_mean is true,
-        block_mean is [B,H,S/64,128]; otherwise it aliases mean and must not
+        The projected global mean is [B,H,D]. When emit_block_mean is true,
+        block_mean is [B,H,S/64,D]; otherwise it aliases mean and must not
         be written separately. V is centered using the projected global mean.
         """

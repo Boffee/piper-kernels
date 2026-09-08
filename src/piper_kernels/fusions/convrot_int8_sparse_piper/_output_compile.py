@@ -193,7 +193,7 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
         input_features is None
         or output_features is None
         or heads is None
-        or head_dim != _layout.HEAD_DIM
+        or head_dim not in _layout.SUPPORTED_HEAD_DIMS
         or input_features != heads * head_dim
         or output_features < 1
         or not _same_dimension(reshaped.shape[0], batch)

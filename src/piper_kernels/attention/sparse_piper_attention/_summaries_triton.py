@@ -12,6 +12,7 @@ import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
 from ._routing_modes import (
     _MEAN_ROUTING,
@@ -19,7 +20,6 @@ from ._routing_modes import (
 )
 
 _BLOCK_ROWS = 64
-_HEAD_DIM = 128
 
 
 @triton.jit(
@@ -100,12 +100,12 @@ def sequence_block_summaries(
         raise ValueError("optimized sequence summaries require rank-four Q/K tensors")
     if (
         query.shape[:2] != key.shape[:2]
-        or query.shape[-1] != _HEAD_DIM
-        or key.shape[-1] != _HEAD_DIM
+        or query.shape[-1] not in SUPPORTED_HEAD_DIMS
+        or key.shape[-1] != query.shape[-1]
         or query.shape[2] < 1
         or key.shape[2] < _BLOCK_ROWS
     ):
-        raise ValueError("optimized summaries require nonempty ragged Q/K with D128 K")
+        raise ValueError("optimized summaries require nonempty ragged Q/K with D64/D128 K")
     if query.device.type != "cuda" or query.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("optimized summaries require CUDA BF16/FP16 inputs")
     if key.device != query.device or key.dtype != query.dtype:
@@ -113,7 +113,7 @@ def sequence_block_summaries(
     if query.stride(-1) != 1 or key.stride(-1) != 1:
         raise ValueError("optimized summaries require contiguous feature dimensions")
 
-    batch, heads, query_rows, _head_dim = query.shape
+    batch, heads, query_rows, head_dim = query.shape
     key_rows = key.shape[2]
     if block_lengths is not None and (
         query_rows % _BLOCK_ROWS
@@ -130,18 +130,18 @@ def sequence_block_summaries(
     query_blocks = (query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     key_blocks = (key_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     query_summary = torch.empty(
-        (batch, heads, query_blocks, _HEAD_DIM),
+        (batch, heads, query_blocks, head_dim),
         device=query.device,
         dtype=torch.float32,
     )
     key_primary = torch.empty(
-        (batch, heads, key_blocks, _HEAD_DIM),
+        (batch, heads, key_blocks, head_dim),
         device=key.device,
         dtype=torch.float32,
     )
     mean_pool_summary = routing_mode == _MEAN_ROUTING
     key_aux = (
-        torch.empty((batch, heads, 0, _HEAD_DIM), device=key.device, dtype=torch.float32)
+        torch.empty((batch, heads, 0, head_dim), device=key.device, dtype=torch.float32)
         if mean_pool_summary
         else torch.empty_like(key_primary)
     )
@@ -169,7 +169,7 @@ def sequence_block_summaries(
                 stride_il=_BLOCK_ROWS * sequence.stride(2),
                 stride_ir=sequence.stride(2),
                 block_rows=_BLOCK_ROWS,
-                head_dim=_HEAD_DIM,
+                head_dim=head_dim,
                 heads=heads,
                 query_summary=query,
                 mean_pool_summary=mean_pool_summary,

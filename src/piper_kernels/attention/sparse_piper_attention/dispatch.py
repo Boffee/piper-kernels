@@ -7,6 +7,7 @@ from collections.abc import Sequence
 
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from . import _backend
@@ -63,7 +64,7 @@ class SparsePiperAttention(torch.nn.Module):
         """Route leading query blocks over a sparse K64 prefix and dense suffix.
 
         Without ``block_lengths``, Q/K/V use compact BF16
-        ``[batch, sequence, heads, 128]`` storage. Supplying one valid-prefix
+        ``[batch, sequence, heads, head_dim]`` storage. Supplying one valid-prefix
         length per physical K64 block selects internally padded storage and
         returns that same physical layout; padded query outputs are unspecified.
         ``sparse_query_blocks`` optionally limits routing to the leading query
@@ -143,8 +144,8 @@ def _validate_inputs(
         raise RuntimeError("sparse Piper is inference-only and does not support autograd")
 
     _batch, sequence, heads, head_dim = query.shape
-    if head_dim != 128:
-        raise ValueError("sparse Piper requires head_dim=128")
+    if head_dim not in SUPPORTED_HEAD_DIMS:
+        raise ValueError("sparse Piper requires head_dim=64 or 128")
     if sequence < 64:
         raise ValueError("sparse Piper requires at least 64 sequence rows")
     if len(head_keep_ratio_units) != heads:
@@ -191,15 +192,16 @@ def _run_sparse_piper_attention(
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
     validate_routing_mode(routing_mode)
+    backend = _backend.select_attention_backend(query)
     routes = packed_routes_from_sequences(
         query_head_major,
         sparse_key,
         layout,
         routing_mode,
         block_lengths,
+        skip_dense_routing=backend is not None and backend.skip_dense_routing,
     )
 
-    backend = _backend.select_attention_backend(query)
     if backend is None:
         return reference_sparse_piper_attention(
             query,

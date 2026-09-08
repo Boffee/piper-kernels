@@ -1,9 +1,11 @@
 """Operation-specific sparse-Piper selection using the operands' device."""
 
+from dataclasses import replace
+
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
 from ._amd import policy as amd_policy
 from ._interfaces import AttentionBackend, MinmaxScores, SelectRoutes, SequenceSummaries
@@ -37,6 +39,9 @@ _nvidia_attention = (
     )
     if preparation is not None and nvidia_gluon is not None
     else None
+)
+_nvidia_attention_skip_dense_routing = (
+    replace(_nvidia_attention, skip_dense_routing=True) if _nvidia_attention is not None else None
 )
 _amd_attention = (
     AttentionBackend(
@@ -77,9 +82,18 @@ def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
     if _nvidia_attention is None and _amd_attention is None:
         return None
     target = AcceleratorTarget.from_device(query.device)
+    # Device probes and pre-projection activations do not have an attention head axis.
+    head_dim = query.shape[-1] if query.ndim == 4 else 128
     if nvidia_policy.supports_target(target):
+        if _nvidia_attention is not None and nvidia_policy.skip_dense_routing(head_dim):
+            return _nvidia_attention_skip_dense_routing
         return _nvidia_attention
-    return _amd_attention if amd_policy.supports_target(target) else None
+    return _amd_attention if amd_policy.supports_target(target) and head_dim == 128 else None
+
+
+def source_files() -> tuple[str, ...]:
+    """Sources governing backend selection and execution policy for compiler caches."""
+    return __file__, nvidia_policy.__file__, amd_policy.__file__
 
 
 def require_attention_backend(query: torch.Tensor) -> AttentionBackend:
@@ -120,14 +134,14 @@ def select_minmax_scores(
     ):
         return None
     if not (
-        query_summary.shape[-1] == HEAD_DIM
+        query_summary.shape[-1] == 128
         and query_summary.shape[0] > 0
         and query_summary.shape[1] > 0
         and 1 <= query_summary.shape[2] <= 64
         and key_primary.shape[2] > 0
         and key_primary.shape == key_aux.shape
         and query_summary.shape[:2] == key_primary.shape[:2]
-        and key_primary.shape[-1] == HEAD_DIM
+        and key_primary.shape[-1] == 128
     ):
         return None
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
@@ -152,8 +166,8 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
     if not (
         nvidia_policy.supports_target(AcceleratorTarget.from_device(query.device))
         and query.device == key.device
-        and query.shape[-1] == HEAD_DIM
-        and key.shape[-1] == HEAD_DIM
+        and query.shape[-1] in SUPPORTED_HEAD_DIMS
+        and key.shape[-1] == query.shape[-1]
         and query.stride(-1) == 1
         and key.stride(-1) == 1
         and query.dtype in (torch.bfloat16, torch.float16)

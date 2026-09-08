@@ -47,8 +47,7 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 
 from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v9"
-_HEAD_DIM = layout.HEAD_DIM
+_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v10"
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
 
@@ -134,9 +133,10 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
         return False
     sequence_length = q_input.shape[0]
     output_features = sparse_piper_compile.static_int(q_weight.shape[0])
-    if output_features is None or output_features % _HEAD_DIM:
+    head_dim = sparse_piper_compile.attention_head_dim(match)
+    if output_features is None or head_dim is None or output_features % head_dim:
         return False
-    heads = output_features // _HEAD_DIM
+    heads = output_features // head_dim
 
     for prefix, projection in zip(prefixes, projections, strict=True):
         assert projection is not None
@@ -170,6 +170,7 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
                 bias,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
                 f"{prefix} compiler projection",
+                head_dim,
             )
         except ValueError:
             return False
@@ -201,7 +202,7 @@ def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
         sequence_length=sequence_length,
         heads=heads,
         device=q_input.device,
-        head_dim=_HEAD_DIM,
+        head_dim=head_dim,
         tile_rows=_TILE_ROWS,
     )
 
@@ -251,7 +252,9 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     assert input_value is not None
     assert q_weight_value is not None
     sequence_length = input_value.shape[0]
-    heads = q_weight_value.shape[0] // _HEAD_DIM
+    head_dim = sparse_piper_compile.attention_head_dim(match)
+    assert head_dim is not None
+    heads = q_weight_value.shape[0] // head_dim
     storage_sequence_length = layout.padded_sequence_length(sequence_length)
     logical_sequence_length = sparse_piper_compile.integer_scalar_argument(
         sparse_attention_shape[1]
@@ -260,13 +263,13 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
     with graph.inserting_before(original):
         query_values = (
-            input_value.new_empty((1, heads, storage_sequence_length, _HEAD_DIM), dtype=torch.int8),
+            input_value.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),
             input_value.new_empty(
                 (1, heads, storage_sequence_length // _QUERY_SCALE_ROWS),
                 dtype=torch.float32,
             ),
             input_value.new_empty(
-                (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
+                (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
                 dtype=torch.float32,
             ),
         )
@@ -287,17 +290,17 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             query_values,
         )
         key_summary = input_value.new_empty(
-            (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
+            (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
             dtype=torch.float32,
         )
         key_values = (
-            input_value.new_empty((1, heads, storage_sequence_length, _HEAD_DIM), dtype=torch.int8),
+            input_value.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),
             input_value.new_empty(
                 (1, heads, storage_sequence_length // _TILE_ROWS), dtype=torch.float32
             ),
             key_summary,
             (
-                input_value.new_empty((1, heads, 0, _HEAD_DIM), dtype=torch.float32)
+                input_value.new_empty((1, heads, 0, head_dim), dtype=torch.float32)
                 if sparse_routing_mode == _MEAN_ROUTING
                 else input_value.new_empty(key_summary.shape, dtype=torch.float32)
             ),
@@ -327,16 +330,16 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             ),
         )
         value_mean_flat.meta["val"] = input_value.new_empty(
-            (1, heads * _HEAD_DIM), dtype=torch.float32
+            (1, heads * head_dim), dtype=torch.float32
         )
         value_mean = graph.call_function(
             torch.ops.aten.reshape.default,
-            args=(value_mean_flat, (1, heads, _HEAD_DIM)),
+            args=(value_mean_flat, (1, heads, head_dim)),
         )
-        value_mean.meta["val"] = input_value.new_empty((1, heads, _HEAD_DIM), dtype=torch.float32)
+        value_mean.meta["val"] = input_value.new_empty((1, heads, head_dim), dtype=torch.float32)
         with_coarse_residual = coarse_gate is not None
         value_values = (
-            input_value.new_empty((1, heads, _HEAD_DIM, storage_sequence_length), dtype=torch.int8),
+            input_value.new_empty((1, heads, head_dim, storage_sequence_length), dtype=torch.int8),
             input_value.new_empty(
                 (1, heads, storage_sequence_length // _TILE_ROWS, 1),
                 dtype=torch.float32,
@@ -346,7 +349,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             value_values = (
                 *value_values,
                 input_value.new_empty(
-                    (1, heads, storage_sequence_length // _TILE_ROWS, _HEAD_DIM),
+                    (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
                     dtype=torch.float32,
                 ),
             )

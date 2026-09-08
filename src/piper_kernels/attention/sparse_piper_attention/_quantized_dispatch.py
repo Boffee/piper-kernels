@@ -88,7 +88,11 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         layout.head_keep_blocks,
         layout.route_head_offsets,
         sparse_key_blocks=sparse_key_blocks,
-        routes_per_query=layout.routes_per_query,
+        routes_per_query=(
+            0
+            if backend.skip_dense_routing and layout.keeps_all_blocks(sparse_key_blocks)
+            else layout.routes_per_query
+        ),
         logical_sequence_length=logical_sequence_length,
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
@@ -121,6 +125,7 @@ def _prepare_quantized_sparse_piper_query(
             context.key_aux,
             context.route_layout,
             context.routing_mode,
+            skip_dense_routing=context.kernel_context.routes_per_query == 0,
         )
         coarse_output = None
     else:
@@ -134,6 +139,7 @@ def _prepare_quantized_sparse_piper_query(
             sparse_key_blocks=context.kernel_context.sparse_key_blocks,
             coarse_scale=context.coarse_scale,
             routing_mode=context.routing_mode,
+            skip_dense_routing=context.kernel_context.routes_per_query == 0,
         )
         routed = routed_with_coarse.routes
         coarse_output = routed_with_coarse.coarse_output

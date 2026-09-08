@@ -647,6 +647,32 @@ Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research control
 reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`; they are not copied
 into the installed package.
 
+For sparse Piper, measure the prepared kernel separately from routing, preparation, and the
+complete public call:
+
+```shell
+uv run python benchmarks/benchmark_sparse_piper.py \
+  --head-dim 64 --sequence 1797 4096 --heads 32 --ratios 0.25 1.0 --samples 7
+```
+
+`--head-dim` accepts 64 or 128 and defaults to 128. A keep ratio of 1.0 includes every key
+block while retaining Piper's quantized arithmetic. The benchmark checks sampled query blocks
+against an independent FP64 reference and counts useful operations using the selected head width.
+
+Sparse Piper uses a separate routing-aware schedule from dense Piper Attention. Full physical
+head budgets skip score/top-k selection. On SM120, D128 retains its Q64/four-warp kernel and a
+canonical route list; D64 traverses all key blocks directly without a list. The internal
+`skip_dense_routing` flag selects this behavior, and the benchmark reports whether it was used.
+Direct D64 uses Q128 when both the prepared query range and K/V storage contain at least 32,768
+rows, except when a coarse residual requires the Q64 epilogue. Other direct D64 calls retain
+Q64/four warps.
+Routed D64 uses Q64/two warps when both ranges contain at least 8,192 rows and the average selected
+key work, including the dense suffix, reaches 1,024 rows per head. Smaller budgets retain four
+warps. The length crossovers were checked at 32 and 56 heads over 8k/16k/32k and 50k/100k rows;
+the budget guard excludes the 1%-keep regression found in the broader sparse-budget screen.
+These choices retain the same quantization and FP32 recurrence. Coarse attention still computes
+its own scores even when fine-route selection is unnecessary.
+
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell

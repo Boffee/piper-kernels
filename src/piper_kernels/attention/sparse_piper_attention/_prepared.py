@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import (
-    HEAD_DIM,
     QUERY_SCALE_ROWS,
+    SUPPORTED_HEAD_DIMS,
     TILE_ROWS,
 )
 
@@ -21,7 +21,12 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperContext:
-    """Sequence-global K/V storage and sparse-attention policy metadata."""
+    """Sequence-global K/V and policy metadata.
+
+    Zero routes per query denotes canonical full keep without a route list.
+    Each backend validates whether it implements that execution mode.
+    Caller-supplied route lists retain their ordering and semantics.
+    """
 
     key: torch.Tensor
     value: torch.Tensor
@@ -82,15 +87,15 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     """
     if key.ndim != 4 or key.dtype is not torch.int8:
         raise ValueError(
-            "quantized sparse Piper K must be [batch,heads,storage_sequence,D128] INT8"
+            "quantized sparse Piper K must be [batch,heads,storage_sequence,D64/D128] INT8"
         )
     batch, heads, storage_sequence_length, head_dim = key.shape
     if (
-        head_dim != HEAD_DIM
+        head_dim not in SUPPORTED_HEAD_DIMS
         or storage_sequence_length < TILE_ROWS
         or storage_sequence_length % TILE_ROWS
     ):
-        raise ValueError("quantized sparse Piper requires K64-aligned D128 key storage")
+        raise ValueError("quantized sparse Piper requires K64-aligned D64/D128 key storage")
     if block_lengths is None:
         if (
             logical_sequence_length < TILE_ROWS
@@ -114,7 +119,7 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     if value_scale_multiplier.shape != (batch, heads, tile_count, 1):
         raise ValueError("quantized sparse Piper V scales must contain one value per K64")
     if value_mean.shape != (batch, heads, head_dim):
-        raise ValueError("quantized sparse Piper V mean must be [batch,heads,D128]")
+        raise ValueError("quantized sparse Piper V mean must be [batch,heads,D64/D128]")
     # Layout construction owns the value-range invariants documented
     # above. Inspecting device values here would add a validation kernel or a host
     # synchronization to every launch; only launch-critical tensor properties
@@ -154,6 +159,8 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         raise ValueError("quantized sparse Piper head keep blocks must be one INT32 value per head")
     if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
+    if routes_per_query < 0:
+        raise ValueError("route count must be nonnegative")
 
     return _PreparedSparsePiperContext(
         key=key,
@@ -182,16 +189,18 @@ def _prepare_sparse_piper_query_from_quantized(
     """Validate query-local quantized storage and locate it globally."""
     if query.ndim != 4 or query.dtype is not torch.int8:
         raise ValueError(
-            "quantized sparse Piper Q must be [batch,heads,storage_sequence,D128] INT8"
+            "quantized sparse Piper Q must be [batch,heads,storage_sequence,D64/D128] INT8"
         )
     batch, heads, storage_sequence_length, head_dim = query.shape
     if (
         query.shape[:2] != context.key.shape[:2]
-        or head_dim != HEAD_DIM
+        or head_dim != context.key.shape[-1]
         or storage_sequence_length < TILE_ROWS
         or storage_sequence_length % TILE_ROWS
     ):
-        raise ValueError("quantized sparse Piper requires compatible K64-aligned D128 Q storage")
+        raise ValueError(
+            "quantized sparse Piper requires compatible K64-aligned D64/D128 Q storage"
+        )
     query_block_count = storage_sequence_length // TILE_ROWS
     total_query_blocks = context.key.shape[2] // TILE_ROWS
     if (

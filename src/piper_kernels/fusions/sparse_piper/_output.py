@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM, TILE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 
 if TYPE_CHECKING:
@@ -132,8 +132,8 @@ def validate_attention_output(
     if attention_storage.ndim != 4:
         raise ValueError("fused sparse Piper output requires four-dimensional quantized storage")
     batch, heads, _storage_sequence_length, head_dim = attention_storage.shape
-    if batch < 1 or head_dim != HEAD_DIM:
-        raise ValueError("fused sparse Piper output requires nonempty batches with D128 heads")
+    if batch < 1 or head_dim not in SUPPORTED_HEAD_DIMS:
+        raise ValueError("fused sparse Piper output requires nonempty batches with D64/D128 heads")
     if isinstance(logical_sequence_length, bool) or not isinstance(logical_sequence_length, int):
         raise TypeError("fused sparse Piper logical sequence length must be an integer")
     if (

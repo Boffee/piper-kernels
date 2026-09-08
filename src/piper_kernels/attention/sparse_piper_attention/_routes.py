@@ -13,7 +13,7 @@ from .coarse import coarse_attention
 
 @dataclass(frozen=True, slots=True)
 class PackedRoutes:
-    """UINT16 routes packed by physical head for every query block."""
+    """UINT16 routes packed by head; an empty last axis means dense routing is skipped."""
 
     indices: torch.Tensor
     route_head_offsets: torch.Tensor
@@ -40,13 +40,15 @@ class PackedRouteBuilder:
         query_blocks: int,
         sparse_key_blocks: int,
         device: torch.device,
+        skip_dense_routing: bool = False,
     ) -> None:
         _validate_route_layout(layout, heads, sparse_key_blocks, device)
         self._layout = layout
         self._full_keep = layout.keeps_all_blocks(sparse_key_blocks)
+        skip_dense_routing = self._full_keep and skip_dense_routing
         self.routes = PackedRoutes(
             indices=torch.empty(
-                (batch, query_blocks, layout.routes_per_query),
+                (batch, query_blocks, 0 if skip_dense_routing else layout.routes_per_query),
                 dtype=torch.uint16,
                 device=device,
             ),
@@ -54,7 +56,8 @@ class PackedRouteBuilder:
             head_keep_blocks=layout.head_keep_blocks,
         )
         if self._full_keep:
-            _backend.fill_full_keep_routes(self.routes.indices, sparse_key_blocks)
+            if not skip_dense_routing:
+                _backend.fill_full_keep_routes(self.routes.indices, sparse_key_blocks)
             return
         self._select_routes = _backend.select_route_selector(self.routes.indices)
         self._route_head_offsets = (
@@ -110,6 +113,7 @@ class PackedRouteAndCoarseBuilder:
         query_blocks: int,
         sparse_key_blocks: int,
         device: torch.device,
+        skip_dense_routing: bool = False,
     ) -> None:
         if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
             raise ValueError("pooled V must use [batch,heads,key blocks,features]")
@@ -129,6 +133,7 @@ class PackedRouteAndCoarseBuilder:
             query_blocks=query_blocks,
             sparse_key_blocks=sparse_key_blocks,
             device=device,
+            skip_dense_routing=skip_dense_routing,
         )
         self._pooled_value = pooled_value
         self._sparse_key_blocks = sparse_key_blocks

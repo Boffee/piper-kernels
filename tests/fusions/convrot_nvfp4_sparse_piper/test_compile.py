@@ -562,10 +562,15 @@ class _TargetCapturePass(CustomInferenceAwareGraphPass):
     ("dynamic", "routing"),
     [(False, "minmax"), (True, "minmax"), (False, "mean")],
 )
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
+    monkeypatch,
+    head_dim: int,
     dynamic: bool,
     routing: str,
 ) -> None:
+    monkeypatch.setattr(_SparseProjectionAttentionOutput, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttentionOutput, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(967 + dynamic)
     model = _ConvRotSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
     input = torch.randn(  # noqa: A001

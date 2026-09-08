@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import (
-    HEAD_DIM,
     QUERY_SCALE_ROWS,
+    SUPPORTED_HEAD_DIMS,
     TILE_ROWS,
     padded_sequence_length,
 )
@@ -31,8 +31,8 @@ def validate_block_lengths(
 
 
 __all__ = [
-    "HEAD_DIM",
     "QUERY_SCALE_ROWS",
+    "SUPPORTED_HEAD_DIMS",
     "TILE_ROWS",
     "padded_sequence_length",
     "validate_block_lengths",

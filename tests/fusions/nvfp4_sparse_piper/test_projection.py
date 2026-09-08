@@ -25,8 +25,10 @@ from ._helpers import (
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
-    operands = make_operands()
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_chunked_qkv_epilogues_match_materialized_fp32_contract(head_dim: int) -> None:
+    heads = 256 // head_dim
+    operands = make_operands(head_dim=head_dim, heads=heads)
     q_projection = operands.projection(0)
     k_projection = operands.projection(1)
     v_projection = operands.projection(2)
@@ -40,7 +42,7 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
             bias=biases[0],
             norm_epsilon=1e-5,
         ),
-        128**-0.5,
+        head_dim**-0.5,
     )
     expected_key = key_reference(
         materialize_qk(
@@ -52,8 +54,8 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
             norm_epsilon=1e-5,
         )
     )
-    value_mean = linear_mean(*v_projection.as_tuple(), biases[2], 1, 193).view(1, 2, 128)
-    materialized_value = materialize_projection(v_projection, biases[2]).view(193, 2, 128)
+    value_mean = linear_mean(*v_projection.as_tuple(), biases[2], 1, 193).view(1, heads, head_dim)
+    materialized_value = materialize_projection(v_projection, biases[2]).view(193, heads, head_dim)
     expected_value = value_reference(materialized_value, value_mean)
 
     actual_query = query.project_query(
@@ -63,7 +65,7 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract() -> None:
         operands.cos,
         operands.sin,
         1e-5,
-        128**-0.5,
+        head_dim**-0.5,
         128,
     )
     actual_key = key.project_key(

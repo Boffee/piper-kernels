@@ -16,6 +16,7 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -206,7 +207,7 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
     attention_shape = _shape_dimensions(match.kwargs["output_attention_shape"])
     if (
         heads is None
-        or head_dim != 128
+        or head_dim not in SUPPORTED_HEAD_DIMS
         or attention is None
         or attention.ndim != 4
         or attention.dtype is not torch.bfloat16

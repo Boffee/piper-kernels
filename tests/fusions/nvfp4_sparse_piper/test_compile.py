@@ -1087,11 +1087,16 @@ def test_static_output_fails_closed_when_attention_escapes(
     ("dynamic", "preparation_count", "routing"),
     [(False, 3, "minmax"), (True, 1, "minmax"), (False, 3, "mean")],
 )
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
+    monkeypatch,
+    head_dim: int,
     dynamic: bool,
     preparation_count: int,
     routing: str,
 ) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(823)
     model = _SparseProjectionAttention(dynamic=dynamic, routing=routing).eval()
     hidden_states = torch.randn(
@@ -1137,10 +1142,15 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_cuda_compile_fuses_static_nvfp4_attention_output(
+    monkeypatch,
+    head_dim: int,
     dynamic: bool,
     preparation_count: int,
 ) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(829)
     model = _SparseProjectionAttentionOutput(dynamic=dynamic).eval()
     hidden_states = torch.randn(
@@ -1188,10 +1198,15 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
     ("dynamic", "routing"),
     [(False, "minmax"), (False, "mean"), (True, "minmax")],
 )
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
+    monkeypatch,
+    head_dim: int,
     dynamic: bool,
     routing: str,
 ) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(831)
     model = _BoundedSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
     hidden_states = torch.randn(

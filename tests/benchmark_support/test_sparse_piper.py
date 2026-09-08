@@ -30,6 +30,7 @@ def test_ragged_benchmark_counts_only_valid_selected_work():
     assert _parse_args(["--sequence", "100000"]).sequence == [100000]
     assert useful_integer_operations(65, [1, 1]) == 4 * 65 * 128 * 2 * 65
     assert useful_integer_operations(4096, [16] * 8) == 17179869184
+    assert useful_integer_operations(4096, [16] * 8, head_dim=64) == 8589934592
 
 
 def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
@@ -41,15 +42,16 @@ def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
 
 @pytest.mark.parametrize("internal_padding", [False, True])
 @pytest.mark.parametrize("global_offset", [0, 1])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
-    internal_padding, global_offset
+    internal_padding, global_offset, head_dim
 ):
     generator = torch.Generator().manual_seed(713)
     lengths = [3, 64, 7, 41] if internal_padding else [64, 64, 64, 1]
-    value = torch.randint(-127, 128, (2, 2, 128, 256), dtype=torch.int8, generator=generator)
-    mean = torch.randn((2, 2, 128), generator=generator)
+    value = torch.randint(-127, 128, (2, 2, head_dim, 256), dtype=torch.int8, generator=generator)
+    mean = torch.randn((2, 2, head_dim), generator=generator)
     context = _PreparedSparsePiperContext(
-        key=torch.zeros((2, 2, 256, 128), dtype=torch.int8),
+        key=torch.zeros((2, 2, 256, head_dim), dtype=torch.int8),
         value=value,
         key_scale=torch.ones((2, 2, 4)),
         value_scale_multiplier=torch.full((2, 2, 4, 1), 255.0),
@@ -63,7 +65,7 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         logical_sequence_length=256 if internal_padding else 193,
     )
     query = _PreparedSparsePiperQuery(
-        data=torch.zeros((2, 2, (4 - global_offset) * 64, 128), dtype=torch.int8),
+        data=torch.zeros((2, 2, (4 - global_offset) * 64, head_dim), dtype=torch.int8),
         scale=torch.ones((2, 2, (4 - global_offset) * 2)),
         routes=torch.tensor([1, 1, 0], dtype=torch.uint16).repeat(2, 4 - global_offset, 1),
         global_block_offset=global_offset,
@@ -81,7 +83,7 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
                     value[batch, head, :, indices].double().mean(dim=1) + mean[batch, head].double()
                 )
                 rows = 64 if internal_padding else min(64, 193 - global_block * 64)
-                expected = expected.to(torch.bfloat16).expand(rows, 128)
+                expected = expected.to(torch.bfloat16).expand(rows, head_dim)
                 torch.testing.assert_close(
                     reference_prepared_query(prepared, batch, head, block), expected, rtol=0, atol=0
                 )

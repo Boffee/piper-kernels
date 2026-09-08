@@ -17,7 +17,6 @@ from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import (
-    HEAD_DIM,
     QUERY_SCALE_ROWS,
     TILE_ROWS,
 )
@@ -26,7 +25,6 @@ from piper_kernels.fusions.projected_qk import triton as projected_qk
 _QUERY_BLOCK_M = TILE_ROWS
 _KEY_VALUE_BLOCK_M = 2 * TILE_ROWS
 _HEADS_PER_PROGRAM = 2
-_BLOCK_N = HEAD_DIM * _HEADS_PER_PROGRAM
 _JIT_QUERY_SCALE_ROWS = tl.constexpr(QUERY_SCALE_ROWS)
 _JIT_TILE_ROWS = tl.constexpr(TILE_ROWS)
 
@@ -356,7 +354,8 @@ def launch_query(  # noqa: PLR0913, PLR0917
     storage_chunk_start: int | None = None,
 ) -> None:
     chunk_rows, output_features = projection.shape
-    heads = output_features // HEAD_DIM
+    head_dim = norm_weight.shape[0]
+    heads = output_features // head_dim
     storage_sequence_length = query.shape[2]
     if storage_chunk_start is None:
         storage_chunk_start = chunk_start
@@ -390,7 +389,7 @@ def launch_query(  # noqa: PLR0913, PLR0917
                 has_bias=bias is not None,
                 heads=heads,
                 heads_per_program=_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=head_dim,
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
@@ -427,7 +426,8 @@ def launch_key(  # noqa: PLR0913, PLR0917
     block_lengths,
 ) -> None:
     chunk_rows, output_features = projection.shape
-    heads = output_features // HEAD_DIM
+    head_dim = norm_weight.shape[0]
+    heads = output_features // head_dim
     storage_sequence_length = key.shape[2]
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else key_scale
@@ -459,7 +459,7 @@ def launch_key(  # noqa: PLR0913, PLR0917
                 has_bias=bias is not None,
                 heads=heads,
                 heads_per_program=_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=head_dim,
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
                 mean_pool_summary=mean_pool_summary,
@@ -492,7 +492,8 @@ def launch_value(  # noqa: PLR0913, PLR0917
     emit_block_mean: bool,
 ) -> None:
     chunk_rows, output_features = projection.shape
-    heads = output_features // HEAD_DIM
+    head_dim = value_mean.shape[-1]
+    heads = output_features // head_dim
     storage_sequence_length = value.shape[3]
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else value_mean
@@ -521,7 +522,7 @@ def launch_value(  # noqa: PLR0913, PLR0917
                 has_bias=bias is not None,
                 heads=heads,
                 heads_per_program=_HEADS_PER_PROGRAM,
-                head_dim=HEAD_DIM,
+                head_dim=head_dim,
                 mask_block_lengths=has_block_lengths,
                 emit_block_mean=emit_block_mean,
                 block_m=_KEY_VALUE_BLOCK_M,
