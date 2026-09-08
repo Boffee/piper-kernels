@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from .environment import EnvironmentInfo
 from .quality import QualityMetrics
-from .timing import PhaseTimings
+from .timing import PhaseTimings, SampleTimings
 
 SCHEMA_VERSION = 1
 type JSONValue = str | int | float | bool | list[JSONValue] | dict[str, JSONValue] | None
@@ -41,14 +41,14 @@ class OutputTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkRecord:
+class BenchmarkRecord[TimingsT: (PhaseTimings, SampleTimings) = PhaseTimings]:
     """One provider, shape, configuration, timing, and quality observation."""
 
     benchmark: str
     provider: str
     shape: Mapping[str, Any]
     configuration: Mapping[str, Any]
-    timings: PhaseTimings
+    timings: TimingsT
     environment: EnvironmentInfo
     quality: QualityMetrics | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)

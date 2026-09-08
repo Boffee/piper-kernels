@@ -15,6 +15,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     _backend,
     _quantized_dispatch,
     _routes,
+    _routing,
     _routing_modes,
     _summaries,
     dispatch,
@@ -93,18 +94,196 @@ def test_missing_auxiliary_implementation_does_not_probe_device(monkeypatch, mis
         assert _backend.select_sequence_summaries(query, query) is None
 
 
-@pytest.mark.parametrize("supported", [False, True])
-def test_auxiliary_selection_is_independent_of_attention(monkeypatch, supported):
-    target = (
-        AcceleratorTarget("cuda", "sm120") if supported else AcceleratorTarget("hip", "gfx1201")
+def test_missing_score_implementation_does_not_probe_device(monkeypatch):
+    monkeypatch.setattr(_backend, "_score_backend", None)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
+    summary = torch.empty(1, 1, 32, 128)
+    assert _backend.select_minmax_scores(summary, summary, summary) is None
+
+
+@pytest.mark.parametrize(
+    ("target", "supported"),
+    [
+        (AcceleratorTarget("hip", "gfx1200"), True),
+        (AcceleratorTarget("hip", "gfx1201"), True),
+        (AcceleratorTarget("hip", "gfx1100"), False),
+        (AcceleratorTarget("hip", "gfx942"), False),
+        (AcceleratorTarget("cuda", "sm120"), False),
+        (AcceleratorTarget("cpu"), False),
+    ],
+)
+def test_score_selection_is_independent_and_uses_operand_target(monkeypatch, target, supported):
+    score = Mock()
+    probe = Mock(return_value=target)
+    monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
+    monkeypatch.setattr(_backend, "_amd_attention", None)
+    monkeypatch.setattr(_backend, "_route_backend", None)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
+    monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
+    summary = SimpleNamespace(
+        device=torch.device("cuda:1"),
+        ndim=4,
+        shape=(1, 2, 32, 128),
+        dtype=torch.float32,
+        stride=lambda dim: 1,
+        requires_grad=False,
     )
+    selected = _backend.select_minmax_scores(summary, summary, summary)
+    assert selected is (score if supported else None)
+    probe.assert_called_once_with(summary.device)
+
+
+@pytest.fixture
+def score_selection_operands(monkeypatch):
+    """Reject unsupported operands before any device probe or kernel launch."""
+    score = Mock()
+    monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
+    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
+    query = torch.empty(1, 2, 32, 128)
+    primary = torch.empty(1, 2, 17, 128)
+    return [query, primary, torch.empty_like(primary)]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "rank",
+        "width",
+        "large_query",
+        "empty_query",
+        "empty_batch",
+        "empty_heads",
+        "empty_key",
+        "heads",
+        "auxiliary",
+    ],
+)
+def test_score_selection_rejects_unsupported_shapes(score_selection_operands, invalid):
+    query, primary, auxiliary = score_selection_operands
+    if invalid == "rank":
+        query = query[0]
+    elif invalid == "width":
+        query = query[..., :64]
+    elif invalid == "large_query":
+        query = torch.empty(1, 2, 65, 128)
+    elif invalid == "empty_query":
+        query = query[:, :, :0]
+    elif invalid == "empty_batch":
+        query, primary, auxiliary = query[:0], primary[:0], auxiliary[:0]
+    elif invalid == "empty_heads":
+        query, primary, auxiliary = query[:, :0], primary[:, :0], auxiliary[:, :0]
+    elif invalid == "empty_key":
+        primary, auxiliary = primary[:, :, :0], auxiliary[:, :, :0]
+    elif invalid == "heads":
+        query = query[:, :1]
+    else:
+        auxiliary = auxiliary[:, :, :3]
+    assert _backend.select_minmax_scores(query, primary, auxiliary) is None
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "query_stride", "key_stride", "device"])
+def test_score_selection_rejects_unsupported_storage(score_selection_operands, invalid):
+    query, primary, auxiliary = score_selection_operands
+    if invalid == "dtype":
+        primary = primary.bfloat16()
+    elif invalid == "query_stride":
+        query = torch.empty(1, 2, 32, 256)[..., ::2]
+    elif invalid == "key_stride":
+        primary = torch.empty(1, 2, 17, 256)[..., ::2]
+    else:
+        auxiliary = auxiliary.to("meta")
+    assert _backend.select_minmax_scores(query, primary, auxiliary) is None
+
+
+@pytest.mark.parametrize("operand", [0, 1, 2], ids=["query", "primary", "auxiliary"])
+def test_score_selection_preserves_autograd(score_selection_operands, operand):
+    score_selection_operands[operand].requires_grad_()
+    with torch.enable_grad():
+        assert _backend.select_minmax_scores(*score_selection_operands) is None
+
+
+def test_scoring_orchestration_selects_minmax_only_and_forwards_scale(monkeypatch):
+    generator = torch.Generator().manual_seed(672)
+    query, primary, auxiliary = [torch.randn(1, 2, 3, 128, generator=generator) for _ in range(3)]
+    expected = torch.empty(1, 2, 3, 3)
+    score = Mock(return_value=expected)
+    select = Mock(return_value=score)
+    monkeypatch.setattr(_backend, "select_minmax_scores", select)
+    assert (
+        _routing.routing_scores(
+            query, primary, auxiliary, _routing_modes._MINMAX_ROUTING, score_scale=0.125
+        )
+        is expected
+    )
+    select.assert_called_once_with(query, primary, auxiliary)
+    score.assert_called_once_with(query, primary, auxiliary, score_scale=0.125)
+    mean_scores = _routing.routing_scores(
+        query, primary, auxiliary[:, :, :0], _routing_modes._MEAN_ROUTING
+    )
+    torch.testing.assert_close(mean_scores, query @ primary.transpose(-1, -2))
+    select.assert_called_once()
+
+
+def test_score_fallback_keeps_autograd(monkeypatch):
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
+    )
+    score = Mock(side_effect=AssertionError("non-differentiable kernel"))
+    monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
+    generator = torch.Generator().manual_seed(673)
+    tensors = [torch.randn(1, 2, 3, 128, generator=generator, requires_grad=True) for _ in range(3)]
+    result = _routing.routing_scores(*tensors, _routing_modes._MINMAX_ROUTING, score_scale=0.125)
+    expected = torch.maximum(
+        tensors[0] @ tensors[1].transpose(-1, -2) * 0.125,
+        tensors[0] @ tensors[2].transpose(-1, -2) * 0.125,
+    )
+    expected_grad = torch.autograd.grad(expected.sum(), tensors)
+    actual_grad = torch.autograd.grad(result.sum(), tensors)
+    for actual, reference in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(actual, reference)
+    score.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("target", "routes_supported", "summaries_supported"),
+    [
+        (AcceleratorTarget("cuda", "sm120"), True, True),
+        (AcceleratorTarget("hip", "gfx1200"), True, False),
+        (AcceleratorTarget("hip", "gfx1201"), True, False),
+        (AcceleratorTarget("cuda", "sm121"), False, False),
+        (AcceleratorTarget("hip", "gfx1100"), False, False),
+        (AcceleratorTarget("hip", "gfx942"), False, False),
+        (AcceleratorTarget("cpu"), False, False),
+        (AcceleratorTarget("xpu"), False, False),
+    ],
+)
+def test_auxiliary_selection_is_independent_of_attention(
+    monkeypatch, target, routes_supported, summaries_supported
+):
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
+    monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     monkeypatch.setattr(_backend, "_nvidia_attention", None)
-    query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-    routes = torch.empty(1, 2, 1, dtype=torch.uint16)
-    assert (_backend.select_route_selector(routes) is not None) is supported
-    assert (_backend.select_sequence_summaries(query, query) is not None) is supported
+    monkeypatch.setattr(_backend, "_amd_attention", None)
+    route_selector, summarize = Mock(), Mock()
+    monkeypatch.setattr(
+        _backend, "_route_backend", SimpleNamespace(tiled_radix_select_packed_routes=route_selector)
+    )
+    monkeypatch.setattr(
+        _backend, "_summary_backend", SimpleNamespace(sequence_block_summaries=summarize)
+    )
+    query = SimpleNamespace(
+        device=torch.device("cuda:1"),
+        shape=(1, 1, 128, 128),
+        dtype=torch.bfloat16,
+        stride=lambda dim: 1,
+    )
+    routes = SimpleNamespace(device=query.device)
+    assert _backend.select_route_selector(routes) is (route_selector if routes_supported else None)
+    assert _backend.select_sequence_summaries(query, query) is (
+        summarize if summaries_supported else None
+    )
+    assert probe.call_count == 2
     assert all(call.args == (query.device,) for call in probe.call_args_list)
 
 
@@ -170,6 +349,8 @@ def test_route_builder_uses_selected_operation_once_and_preserves_offsets(monkey
     selector = Mock()
     select = Mock(return_value=selector)
     monkeypatch.setattr(_backend, "select_route_selector", select)
+    monkeypatch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("host readback")))
+    monkeypatch.setattr(torch.Tensor, "tolist", Mock(side_effect=AssertionError("host readback")))
     builder = _routes.PackedRouteBuilder(
         layout, batch=1, heads=1, query_blocks=3, sparse_key_blocks=2, device=torch.device("cpu")
     )
@@ -322,6 +503,7 @@ def test_sparse_orchestration_has_no_vendor_or_runtime_layout_knowledge():
         "dispatch.py",
         "_quantized_dispatch.py",
         "_routes.py",
+        "_routing.py",
         "_summaries.py",
         "_prepared.py",
         "_routing_modes.py",

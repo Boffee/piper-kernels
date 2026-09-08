@@ -64,13 +64,9 @@ def require_projection_backend(input: torch.Tensor) -> ProjectionBackend:  # noq
 
 
 def select_output_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
-    """Select an independently validated attention-to-output integration.
-
-    Standalone AMD attention and linear support does not yet imply validation of
-    the chunked multi-stream fusion. Keep that integration disabled in this pass.
-    """
+    """Select the validated chunked attention-to-output integration on this device."""
     target = AcceleratorTarget.from_device(input.device)
-    if not nvidia_policy.supports_target(target):
+    if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     if attention_backend.select_attention_backend(input) is None:
         return None

@@ -11,9 +11,9 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
-from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
-from ._helpers import exact_sm120_available
+from ._helpers import output_available
 from .test_attention import (
     _HEAD_DIM,
     _HEADS,
@@ -80,7 +80,7 @@ def _arguments(
             logical_sequence_length=sequence_length,
             sparse_key_blocks=sparse_key_blocks,
         )
-        expected = int8_nvidia.run_linear(
+        expected = linear_backend.require_linear_backend(materialized_attention).linear(
             materialized_attention.reshape(batch, sequence_length, _HEADS * _HEAD_DIM),
             weight,
             scale,
@@ -144,7 +144,7 @@ def _padded_arguments(
             sparse_query_blocks,
         )
     weight, scale, bias, group_size = projection_arguments
-    expected = int8_nvidia.run_linear(
+    expected = linear_backend.require_linear_backend(materialized_attention).linear(
         materialized_attention.flatten(2),
         weight,
         scale,
@@ -164,7 +164,7 @@ def _padded_arguments(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 @pytest.mark.parametrize(
     ("batch", "sequence_length", "query_chunk_rows", "bias"),
     [(1, 64, 64, False), (1, 65, 64, True), (2, 193, 128, True)],
@@ -190,7 +190,7 @@ def test_attention_output_matches_materialized_boundary(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
 def test_attention_output_supports_mixed_precision_bias(
     bias_dtype: torch.dtype,
@@ -210,7 +210,7 @@ def test_attention_output_supports_mixed_precision_bias(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 def test_projected_query_attention_output_matches_multiple_materialized_q_windows() -> None:
     sequence_length = 193
     operands = _operands(batch=1, sequence_length=sequence_length)
@@ -254,10 +254,11 @@ def test_projected_query_attention_output_matches_multiple_materialized_q_window
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 def test_attention_output_obeys_a_nondefault_current_stream() -> None:
     arguments, expected = _arguments(batch=1, sequence_length=193, bias=False)
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
 
     with torch.no_grad(), torch.cuda.stream(stream):
         actual = output_fusion._attention_output_op(*arguments, 128)
@@ -267,7 +268,7 @@ def test_attention_output_obeys_a_nondefault_current_stream() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 @pytest.mark.parametrize("coarse", [False, True])
 @pytest.mark.parametrize("sparse_query_blocks", [None, 2])
 def test_attention_output_supports_bounded_attention_features(
@@ -287,7 +288,7 @@ def test_attention_output_supports_bounded_attention_features(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 @pytest.mark.parametrize(
     ("sequence_length", "nondefault_stream"),
     [(128, False), (193, False), (512, True)],
@@ -321,15 +322,18 @@ def test_attention_output_projects_a_bounded_coarse_gate(
     gate_scale = gate_scale[:gate_features].contiguous()
     assert gate_bias is not None
     gate_bias = gate_bias[:gate_features].contiguous()
-    coarse_gate = int8_nvidia.execute_prepared_linear(
-        gate_input_qdata,
-        gate_input_scale,
-        gate_weight,
-        gate_scale,
-        gate_bias,
-        torch.bfloat16,
-        int8_nvidia.default_execution_plan(gate_weight),
-    ).unflatten(-1, (_HEADS, _HEAD_DIM))
+    coarse_gate = (
+        linear_backend.require_linear_backend(gate_input_qdata)
+        .linear_prepared(
+            gate_input_qdata,
+            gate_input_scale,
+            gate_weight,
+            gate_scale,
+            gate_bias,
+            torch.bfloat16,
+        )
+        .unflatten(-1, (_HEADS, _HEAD_DIM))
+    )
     query_blocks = (sequence_length + 63) // 64
     block_mean = torch.randn(
         (1, _HEADS, query_blocks, _HEAD_DIM),
@@ -349,7 +353,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         None,
     )
     output_weight, output_scale, output_bias, output_group_size = output_arguments
-    expected = int8_nvidia.run_linear(
+    expected = linear_backend.require_linear_backend(materialized_attention).linear(
         materialized_attention.flatten(2),
         output_weight,
         output_scale,
@@ -358,6 +362,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
     )
 
     stream = torch.cuda.Stream() if nondefault_stream else torch.cuda.current_stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         actual = output_fusion._attention_output_op(
             *attention_arguments,
@@ -381,7 +386,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 def test_attention_output_custom_op_passes_opcheck() -> None:
     arguments, _expected = _arguments(batch=1, sequence_length=128, bias=True)
 
@@ -451,7 +456,7 @@ def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 @pytest.mark.parametrize("query_chunk_rows", [0, 63, 65])
 def test_attention_output_rejects_invalid_query_chunk_rows(query_chunk_rows: int) -> None:
     arguments, _expected = _arguments(batch=1, sequence_length=128, bias=False)

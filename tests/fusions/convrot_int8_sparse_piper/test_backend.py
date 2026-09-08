@@ -189,24 +189,53 @@ def test_unvalidated_projection_rejects_before_output_allocation(monkeypatch, op
 
 
 @pytest.mark.parametrize("missing", [None, "attention", "linear"])
-def test_output_support_is_independent_of_qkv_projection_support(monkeypatch, missing):
+@pytest.mark.parametrize(
+    "target",
+    [
+        AcceleratorTarget("cuda", "sm120"),
+        AcceleratorTarget("hip", "gfx1200"),
+        AcceleratorTarget("hip", "gfx1201"),
+    ],
+)
+def test_output_support_is_independent_of_qkv_projection_support(monkeypatch, missing, target):
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(_backend, "_nvidia_projection", None)
+    monkeypatch.setattr(_backend, "_amd_projection", None)
+    probe = Mock(return_value=target)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm120")
+        torch.cuda, "current_device", Mock(side_effect=AssertionError("current GPU"))
     )
     attention = Mock(return_value=None if missing == "attention" else object())
     linear = Mock(return_value=None if missing == "linear" else object())
     monkeypatch.setattr(_backend.attention_backend, "select_attention_backend", attention)
     monkeypatch.setattr(_backend.linear_backend, "select_linear_backend", linear)
-    operand = torch.empty(1)
+    operand = SimpleNamespace(device=torch.device("cuda:1"))
     assert _backend.select_output_backend(operand) is (
         linear.return_value if missing is None else None
     )
     attention.assert_called_once_with(operand)
+    probe.assert_called_once_with(operand.device)
+    if missing == "attention":
+        linear.assert_not_called()
+    else:
+        linear.assert_called_once_with(operand)
 
 
-@pytest.mark.parametrize("target", [AcceleratorTarget("hip", "gfx1201"), AcceleratorTarget("cpu")])
-def test_unvalidated_output_integration_rejects_before_resolving_operations(monkeypatch, target):
+@pytest.mark.parametrize(
+    ("platform", "target"),
+    [
+        ("linux", AcceleratorTarget("hip", "gfx1100")),
+        ("linux", AcceleratorTarget("cuda", "sm121")),
+        ("linux", AcceleratorTarget("cpu")),
+        ("win32", AcceleratorTarget("hip", "gfx1200")),
+        ("win32", AcceleratorTarget("hip", "gfx1201")),
+    ],
+)
+def test_unvalidated_output_integration_rejects_before_resolving_operations(
+    monkeypatch, platform, target
+):
+    monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(return_value=target))
     attention = Mock(side_effect=AssertionError("resolved unsupported attention"))
     linear = Mock(side_effect=AssertionError("resolved unsupported linear"))

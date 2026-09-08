@@ -1,4 +1,4 @@
-"""Conservative support for ROCm fused Q/K/V projection on RDNA4."""
+"""Validated ROCm fused sparse projection and output integrations on RDNA4."""
 
 import sys
 

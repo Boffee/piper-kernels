@@ -6,7 +6,7 @@ import importlib
 import math
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
@@ -43,6 +43,19 @@ class Timing:
             raise ValueError("latencies cannot be negative")
         if not self.p20_ms <= self.median_ms <= self.p80_ms:
             raise ValueError("timing quantiles must satisfy p20 <= median <= p80")
+
+    @classmethod
+    def from_samples(cls, samples_ms: Sequence[float], clock: ClockDomain) -> Timing:
+        """Summarize finite, nonnegative samples with interpolated quantiles."""
+        if not samples_ms or any(not math.isfinite(value) or value < 0 for value in samples_ms):
+            raise ValueError("requires non-empty, finite, nonnegative latency samples")
+        ordered = sorted(samples_ms)
+        return cls(
+            median_ms=_linear_quantile(ordered, 0.5),
+            p20_ms=_linear_quantile(ordered, 0.2),
+            p80_ms=_linear_quantile(ordered, 0.8),
+            clock=clock,
+        )
 
     def display(self, precision: int = 3) -> str:
         """Format p50 followed by the p20/p80 interval."""
@@ -99,6 +112,37 @@ class PhaseTimings:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class SampleTimings:
+    """Fixed-count synchronized wall measurements of a complete operator.
+
+    Unlike ``PhaseTimings``, these describe individual calls, not time windows
+    or an independently measured prepared-execution phase.
+    """
+
+    warmup_calls: int
+    samples_ms: tuple[float, ...]
+    operator_end_to_end: Timing = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.warmup_calls < 0:
+            raise ValueError("warmup calls must be non-negative")
+        object.__setattr__(
+            self,
+            "operator_end_to_end",
+            Timing.from_samples(self.samples_ms, ClockDomain.SYNCHRONIZED_WALL),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Report actual call counts and samples without inventing time windows."""
+        return {
+            "warmup_calls": self.warmup_calls,
+            "sample_count": len(self.samples_ms),
+            "operator_end_to_end": self.operator_end_to_end.as_dict(),
+            "samples_ms": list(self.samples_ms),
+        }
+
+
 def time_first_call(
     function: Callable[[], Any],
     synchronize: Callable[[], None] | None = None,
@@ -150,13 +194,7 @@ def synchronized_wall_benchmark(
         samples.append(elapsed_ms)
         measured_ms += elapsed_ms
 
-    samples.sort()
-    return Timing(
-        median_ms=_linear_quantile(samples, 0.5),
-        p20_ms=_linear_quantile(samples, 0.2),
-        p80_ms=_linear_quantile(samples, 0.8),
-        clock=ClockDomain.SYNCHRONIZED_WALL,
-    )
+    return Timing.from_samples(samples, ClockDomain.SYNCHRONIZED_WALL)
 
 
 def triton_benchmark(

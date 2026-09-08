@@ -8,6 +8,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
+from . import _backend
 from ._budget import _ResolvedRouteLayout
 from ._routes import (
     PackedRouteAndCoarseBuilder,
@@ -220,6 +221,10 @@ def routing_scores(
 ) -> torch.Tensor:
     """Contract one summary chunk using the selected routing policy."""
     validate_routing_mode(routing_mode)
+    if routing_mode != _MEAN_ROUTING:
+        score = _backend.select_minmax_scores(query_summary, key_primary, key_aux)
+        if score is not None:
+            return score(query_summary, key_primary, key_aux, score_scale=score_scale)
     batch, heads, query_blocks, head_dim = query_summary.shape
     key_blocks = key_primary.shape[2]
     flat_query = query_summary.reshape(batch * heads, query_blocks, head_dim)

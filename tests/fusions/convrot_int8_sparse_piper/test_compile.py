@@ -19,17 +19,18 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as fused_key
+from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper import query as fused_query
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as fused_value
 from piper_kernels.fusions.convrot_int8_sparse_piper._compile import (
     compile_pass as fusion_compile_pass,
 )
 from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_compile_options
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
-from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 
-from ._helpers import exact_sm120_available, projection_available
+from ._helpers import output_available, projection_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
@@ -609,7 +610,7 @@ def _run_explicit_attention_output(
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
     )
-    projected = int8_nvidia.run_linear(
+    projected = linear_backend.require_linear_backend(attention).linear(
         attention.reshape(
             hidden_states.shape[0],
             hidden_states.shape[1],
@@ -781,11 +782,11 @@ def test_projection_fusion_respects_internal_block_lengths(routing: str) -> None
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None:
+def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None:
     torch.manual_seed(713)
     model = _CoarseSparseProjectionAttention(sparse_routing=routing).eval()
     hidden_states = torch.randn(
@@ -855,11 +856,11 @@ def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) ->
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_cuda_coarse_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
+def test_coarse_projection_fusion_respects_internal_block_lengths(routing: str) -> None:
     torch.manual_seed(715)
     model = _CoarseSparseProjectionAttention(sparse_routing=routing).eval()
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
@@ -924,10 +925,10 @@ def test_cuda_coarse_projection_fusion_respects_internal_block_lengths(routing: 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
-def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
+def test_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
     torch.manual_seed(716)
     model = _CoarseSparseProjectionAttention(sparse_routing="mean").eval()
     hidden_states = torch.randn(
@@ -974,10 +975,10 @@ def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
-def test_cuda_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
+def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
     torch.manual_seed(717)
     model = _CoarseSparseProjectionAttention(
         sparse_routing="minmax",
@@ -1025,10 +1026,10 @@ def test_cuda_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> No
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
-def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
+def test_compile_options_fuse_attention_output_boundary() -> None:
     torch.manual_seed(719)
     model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
     hidden_states = torch.randn(
@@ -1074,10 +1075,10 @@ def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
-def test_cuda_compile_fuses_padded_mixed_query_attention_output() -> None:
+def test_compile_fuses_padded_mixed_query_attention_output() -> None:
     torch.manual_seed(722)
     model = _SparseProjectionAttentionOutput().eval()
     hidden_states = torch.randn(
@@ -1126,10 +1127,10 @@ def test_cuda_compile_fuses_padded_mixed_query_attention_output() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
-def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
+def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
     torch.manual_seed(720)
     model = _MeanPoolSparseProjectionAttentionOutput().eval()
     hidden_states = torch.randn(
@@ -1183,11 +1184,11 @@ def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_cuda_compile_fuses_every_bounded_attention_feature(routing: str) -> None:
+def test_compile_fuses_every_bounded_attention_feature(routing: str) -> None:
     torch.manual_seed(721)
     model = _CoarseSparseProjectionAttentionOutput(routing=routing).eval()
     hidden_states = torch.randn(
@@ -1247,12 +1248,18 @@ def test_cuda_compile_fuses_every_bounded_attention_feature(routing: str) -> Non
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(routing: str) -> None:
+@pytest.mark.parametrize("query_chunk_rows", [64, 4096])
+def test_compile_lifetime_chunks_a_projected_coarse_gate(
+    monkeypatch: pytest.MonkeyPatch, routing: str, query_chunk_rows: int
+) -> None:
     torch.manual_seed(725)
+    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
+    # Eight chunks exercise gate production while Q/attention/output reuse slots.
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
     model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
     hidden_states = torch.randn(
         model.batch,
@@ -1309,10 +1316,10 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(routing: str) -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
-def test_cuda_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
+def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
     torch.manual_seed(727)
     model = _SparseProjectionAttentionOutput(escape_attention=True).eval()
     hidden_states = torch.randn(
@@ -1357,10 +1364,10 @@ def test_cuda_attention_output_fusion_fails_closed_when_attention_escapes() -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
-def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> None:
+def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> None:
     torch.manual_seed(709)
     model = _DynamicSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
@@ -1427,10 +1434,10 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
-def test_cuda_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
+def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(711)
     model = _DynamicCoarseSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
@@ -1500,10 +1507,10 @@ def test_cuda_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
-def test_cuda_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
+def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
     torch.manual_seed(712)
     model = _DynamicCoarseSparseProjectionAttention().eval()
     sequence = 192
@@ -1575,10 +1582,10 @@ def test_cuda_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not output_available(),
+    reason="requires fused sparse output support",
 )
-def test_cuda_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
+def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(733)
     model = _DynamicSparseProjectionAttentionOutput().eval()
     capture = _TargetCapturePass()
@@ -1594,7 +1601,8 @@ def test_cuda_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     )
 
     with torch.no_grad():
-        for sequence, sparse_key_blocks in ((193, 2), (256, 3), (257, 3)):
+        # Cross the default 4096-row chunk boundary twice without retracing.
+        for sequence, sparse_key_blocks in ((193, 2), (256, 3), (257, 3), (8193, 120)):
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -1631,15 +1639,15 @@ def test_cuda_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not exact_sm120_available(),
-    reason="requires exact NVIDIA SM120",
+    not projection_available(),
+    reason="requires fused sparse projection support",
 )
 @pytest.mark.parametrize(
     "model_options",
     [{"value_bias": True}, {"strided_rope": True}],
     ids=("projection-bias", "strided-rope"),
 )
-def test_cuda_sparse_piper_projection_fails_closed_for_incompatible_operands(
+def test_sparse_piper_projection_fails_closed_for_incompatible_operands(
     model_options: dict[str, bool],
 ) -> None:
     torch.manual_seed(703)

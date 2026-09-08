@@ -71,6 +71,17 @@ class SelectRoutes(Protocol):
     ) -> None: ...
 
 
+class MinmaxScores(Protocol):
+    def __call__(
+        self,
+        query_summary: torch.Tensor,
+        key_primary: torch.Tensor,
+        key_aux: torch.Tensor,
+        *,
+        score_scale: float | None = None,
+    ) -> torch.Tensor: ...
+
+
 class SequenceSummaries(Protocol):
     def __call__(
         self,
