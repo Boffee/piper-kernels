@@ -259,6 +259,13 @@ quantization in one package-owned operation and prevents callers from accidental
 logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported from
 `piper_kernels.linear.convrot` for format-policy validation.
 
+`ConvRotInt8Tensor`, `PiperNVFP4Tensor`, and `ConvRotNVFP4Tensor` support same-shape
+`view` and `view_as`, preserving the concrete wrapper, quantization metadata, and shared
+storage. `as_strided` also requires unchanged strides and storage offset. These views
+support replicated `DTensor.from_local(..., run_check=False).to_local()` construction;
+full tensor-parallel execution is not established by this support. Shape-changing views
+raise `NotImplementedError`.
+
 Supported eager and compiled NVFP4 linears share the same prepared projection backend,
 including ConvRot and the affine projections used by fused SwiGLU FFNs and sparse attention.
 Global scales and bias are applied in FP32 before the final FP16/BF16 output conversion.

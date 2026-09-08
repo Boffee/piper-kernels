@@ -23,6 +23,7 @@ from piper_kernels.linear._dispatch import (
     apply_linear_autocast,
     bind_linear_arguments,
 )
+from piper_kernels.linear._tensor_views import same_layout_as_strided, same_shape_view
 
 from . import _layout
 from ._typing import NVFP4Storage
@@ -301,6 +302,12 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         if dtype is not copied.orig_dtype:
             copied = cast(Self, copied._rebuild_with_orig_dtype(dtype))
         return copied
+
+
+PiperNVFP4Tensor.implements([torch.ops.aten.view.default, torch.ops.aten.view_as.default])(
+    same_shape_view
+)
+PiperNVFP4Tensor.implements(torch.ops.aten.as_strided.default)(same_layout_as_strided)
 
 
 @PiperNVFP4Tensor.implements(torch.ops.aten._to_copy.default)

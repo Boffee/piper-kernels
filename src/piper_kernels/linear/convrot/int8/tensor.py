@@ -14,6 +14,7 @@ from piper_kernels.linear._dispatch import (
     bind_linear_arguments,
 )
 from piper_kernels.linear._input_activations import InputActivation
+from piper_kernels.linear._tensor_views import same_layout_as_strided, same_shape_view
 
 from .._rotation import rotate_groups
 from . import _update, dispatch
@@ -257,6 +258,12 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         if dtype is not copied.dtype:
             copied = copied._rebuild_with_logical_dtype(dtype)
         return copied
+
+
+ConvRotInt8Tensor.implements([torch.ops.aten.view.default, torch.ops.aten.view_as.default])(
+    same_shape_view
+)
+ConvRotInt8Tensor.implements(torch.ops.aten.as_strided.default)(same_layout_as_strided)
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten._to_copy.default)
