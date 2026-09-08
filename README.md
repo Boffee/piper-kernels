@@ -132,6 +132,18 @@ FP16 and BF16 activations. Their `*_swiglu_ffn_compile_options()` helpers match 
 gate, value, and down projections and install FFN fusion before ordinary linear rewriting.
 Fused activation preparation retains FP32 arithmetic; outputs retain the input dtype.
 
+ConvRot NVFP4 FFN fusion includes SwiGLU, rotation, and NVFP4 preparation for the
+down projection. It reads the FFN's private projection workspace directly. Dynamic
+preparation reuses rotated FP32 values in a scratch buffer capped at 32 MiB per
+chunk and recomputes them in small tiles above that limit; static preparation
+uses those tiles directly. The scratch limit was selected from RTX 5090
+measurements: reuse helped smaller working sets, while larger buffers added
+enough memory traffic to favor recomputation. See the
+[FFN benchmark](benchmarks/README.md#nvfp4-ffn) for measurement commands.
+Source dynamic scaling covers the full input, while down dynamic scaling remains
+per chunk. The shared NVFP4 scale reduction handles arrays of up to 8,192 elements
+in one GPU launch.
+
 The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
 `convrot_int8_sparse_piper_compile_options` from
 `piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary

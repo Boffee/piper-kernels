@@ -47,9 +47,11 @@ class StandardPreparation:
             else activation_per_tensor_scale
         )
         assert per_tensor_scale is not None
-        return nvfp4_backend.prepare_static(
+        qdata, scale = nvfp4_backend._prepare_static_storage(
             projections,
             per_tensor_scale,
             swiglu=True,
             high_first=self.down_high_first,
         )
+        # The scale stays internal to the FFN and is only read by the down GEMM.
+        return qdata, scale, per_tensor_scale

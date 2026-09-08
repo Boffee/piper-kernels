@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
@@ -74,8 +75,31 @@ def test_dynamic_source_preparation_uses_one_global_scale_and_bounded_chunks(
     operands = make_operands(rows=385, dynamic=True, seed=935)
     scale_rows: list[int] = []
     prepared_rows: list[int] = []
+    down_rows: list[int] = []
+    down_workspaces: list[int] = []
     original_dynamic_scale = convrot_nvfp4_backend.dynamic_scale
     original_prepare_static_out = convrot_nvfp4_backend.prepare_static_out
+    original_prepare_down = _preparation.prepare
+
+    def prepare_down(
+        projections: torch.Tensor,
+        per_tensor_scale: torch.Tensor | None,
+        dynamic_activation_scale: bool,
+        group_size: int,
+        high_first: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert dynamic_activation_scale
+        assert projections.is_contiguous()
+        down_rows.append(projections.shape[0])
+        down_workspaces.append(projections.data_ptr())
+        actual = original_prepare_down(
+            projections, per_tensor_scale, dynamic_activation_scale, group_size, high_first
+        )
+        expected = convrot_nvfp4_backend.prepare_dynamic(
+            projections, group_size, "swiglu", high_first=high_first
+        )
+        torch.testing.assert_close(actual[2], expected[2], rtol=1e-6, atol=0)
+        return actual
 
     def dynamic_scale(input: torch.Tensor, group_size: int) -> torch.Tensor:  # noqa: A002
         scale_rows.append(input.shape[0])
@@ -99,11 +123,14 @@ def test_dynamic_source_preparation_uses_one_global_scale_and_bounded_chunks(
 
     monkeypatch.setattr(convrot_nvfp4_backend, "dynamic_scale", dynamic_scale)
     monkeypatch.setattr(convrot_nvfp4_backend, "prepare_static_out", prepare_static_out)
+    monkeypatch.setattr(_preparation, "prepare", prepare_down)
 
     _chunked_swiglu_ffn_op(*operands.arguments(128))
 
     assert scale_rows == [385]
     assert prepared_rows == [128, 128, 128, 1]
+    assert down_rows == prepared_rows
+    assert len(set(down_workspaces)) == 1
 
 
 def _materialized_gated_updates(

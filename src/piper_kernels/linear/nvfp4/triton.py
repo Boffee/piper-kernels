@@ -28,6 +28,9 @@ _MEAN_BLOCK_K = 128
 _PROJECTION_BLOCK_N = 64
 _PROJECTION_BLOCK_K = 128
 _AMAX_REDUCTION_BLOCK_SIZE = 1_024
+# Small tensors (including ConvRot row maxima) fit in one final CTA. Keep the
+# existing partial tile size for larger tensors to retain parallel reduction.
+_AMAX_FINAL_REDUCTION_SIZE = 8_192
 
 
 @triton.jit
@@ -413,7 +416,7 @@ def dynamic_scale(
 
     values = input.contiguous().view(-1)
     with device_context(input.device):
-        while values.numel() > _AMAX_REDUCTION_BLOCK_SIZE:
+        while values.numel() > _AMAX_FINAL_REDUCTION_SIZE:
             partial_count = (
                 values.numel() + _AMAX_REDUCTION_BLOCK_SIZE - 1
             ) // _AMAX_REDUCTION_BLOCK_SIZE
