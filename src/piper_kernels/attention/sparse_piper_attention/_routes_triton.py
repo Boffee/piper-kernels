@@ -17,6 +17,28 @@ _SELECTOR_TILE = 512
 
 
 @triton.jit
+def _fill_full_keep_routes_kernel(  # noqa: ANN202
+    routes_ptr,  # noqa: ANN001
+    count,  # noqa: ANN001
+    sparse_key_blocks: tl.constexpr,
+    block: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    tl.store(routes_ptr + offsets, offsets % sparse_key_blocks, offsets < count)
+
+
+def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
+    """Write canonical routes directly, without summaries or top-k selection."""
+    with device_context(routes.device):
+        _fill_full_keep_routes_kernel[(triton.cdiv(routes.numel(), 1024),)](
+            routes,
+            routes.numel(),
+            sparse_key_blocks,  # pyright: ignore[reportArgumentType]
+            1024,  # pyright: ignore[reportArgumentType]
+        )
+
+
+@triton.jit
 def _ordered_float_bits(scores):  # noqa: ANN001, ANN202
     """Map finite FP32 values to unsigned integers with the same ordering."""
     # Canonicalize signed zero, which compares equal under the reference sort.

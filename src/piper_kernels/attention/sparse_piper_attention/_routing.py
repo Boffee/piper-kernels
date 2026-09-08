@@ -21,7 +21,7 @@ from ._routing_modes import (
     _ROUTING_NAME_BY_MODE,
     validate_routing_mode,
 )
-from ._summaries import sequence_block_summaries
+from ._summaries import _validate_sequences, sequence_block_summaries
 from .coarse import (
     _apply_chunked_coarse_residual,
     _mean_pool_token_blocks,
@@ -133,6 +133,17 @@ def packed_routes_from_sequences(
     """Select routes for compact or valid-front padded Q and K64 sequences."""
     if key.ndim == 4 and (key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS):
         raise ValueError("sparse routing requires complete sparse-prefix K64 blocks")
+    if key.ndim == 4 and layout.keeps_all_blocks(key.shape[2] // _BLOCK_ROWS):
+        validate_routing_mode(routing_mode)
+        _validate_sequences(query, key, block_lengths)
+        return PackedRouteBuilder(
+            layout,
+            batch=query.shape[0],
+            heads=query.shape[1],
+            query_blocks=(query.shape[2] + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
+            sparse_key_blocks=key.shape[2] // _BLOCK_ROWS,
+            device=query.device,
+        ).routes
     query_summary, key_primary, key_aux = sequence_block_summaries(
         query,
         key,
@@ -166,6 +177,8 @@ def packed_routes_from_summaries(
         sparse_key_blocks=key_primary.shape[2],
         device=query_summary.device,
     )
+    if layout.keeps_all_blocks(key_primary.shape[2]):
+        return builder.routes
     for start, scores in score_chunks(
         query_summary,
         key_primary,

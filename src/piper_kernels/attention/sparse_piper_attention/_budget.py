@@ -20,6 +20,10 @@ class _ResolvedRouteLayout:
     route_head_offsets: torch.Tensor
     routes_per_query: int
 
+    def keeps_all_blocks(self, sparse_key_blocks: int) -> bool:
+        """Recognize a full physical budget without inspecting device values."""
+        return self.routes_per_query == self.head_keep_blocks.numel() * sparse_key_blocks
+
 
 def _normalize_head_keep_ratios(
     head_keep_ratios: Sequence[float] | torch.Tensor,

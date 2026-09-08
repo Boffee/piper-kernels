@@ -473,6 +473,11 @@ another graph or SM120 attention kernel. Routes remain call-local because both p
 the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler rewrites preserve
 the selected policy while producing its summaries directly from fused projections.
 
+When every head's physical budget includes every sparse key block, fine routing skips its
+scores and top-k selection. Standalone attention also skips routing summaries in this case.
+This includes ratios that round to a full physical budget. Coarse-attention scores still run
+because they contribute to the coarse output.
+
 Sparse Piper also exposes a routing-selectable Q/K/V-derived coarse-attention residual:
 
 ```python

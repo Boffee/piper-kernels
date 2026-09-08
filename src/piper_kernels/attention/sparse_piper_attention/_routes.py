@@ -43,6 +43,7 @@ class PackedRouteBuilder:
     ) -> None:
         _validate_route_layout(layout, heads, sparse_key_blocks, device)
         self._layout = layout
+        self._full_keep = layout.keeps_all_blocks(sparse_key_blocks)
         self.routes = PackedRoutes(
             indices=torch.empty(
                 (batch, query_blocks, layout.routes_per_query),
@@ -52,6 +53,9 @@ class PackedRouteBuilder:
             route_head_offsets=layout.route_head_offsets,
             head_keep_blocks=layout.head_keep_blocks,
         )
+        if self._full_keep:
+            _backend.fill_full_keep_routes(self.routes.indices, sparse_key_blocks)
+            return
         self._select_routes = _backend.select_route_selector(self.routes.indices)
         self._route_head_offsets = (
             None
@@ -71,6 +75,8 @@ class PackedRouteBuilder:
         query_block_offset: int,
     ) -> None:
         """Select stable top-k routes from one dense-key score chunk."""
+        if self._full_keep:
+            return
         if self._select_routes is not None:
             self._select_routes(
                 scores,

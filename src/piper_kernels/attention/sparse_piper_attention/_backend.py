@@ -136,6 +136,15 @@ def select_minmax_scores(
     return _score_backend.minmax_scores if amd_policy.supports_target(target) else None
 
 
+def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
+    """Materialize the known all-block route list on the selected device."""
+    if _route_backend is not None and select_route_selector(routes) is not None:
+        _route_backend.fill_full_keep_routes(routes, sparse_key_blocks)
+    else:
+        blocks = torch.arange(sparse_key_blocks, device=routes.device, dtype=torch.int32)
+        routes.unflatten(-1, (-1, sparse_key_blocks)).copy_(blocks.to(torch.uint16))
+
+
 def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> SequenceSummaries | None:
     """Preserve the existing summary kernel's device and tensor constraints."""
     if _summary_backend is None:
