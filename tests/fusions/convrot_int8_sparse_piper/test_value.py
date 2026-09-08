@@ -32,6 +32,7 @@ def _random_operands(
     sequence_length: int = 64,
     input_features: int = 272,
     heads: int = 2,
+    head_dim: int = 128,
 ) -> _Operands:
     torch.manual_seed(193)
     input_qdata = torch.randint(
@@ -53,13 +54,13 @@ def _random_operands(
     weight_qdata = torch.randint(
         -127,
         128,
-        (heads * 128, input_features),
+        (heads * head_dim, input_features),
         device="cuda",
         dtype=torch.int8,
     )
     weight_scale = (
         torch.rand(
-            (heads * 128, 1),
+            (heads * head_dim, 1),
             device="cuda",
             dtype=torch.float32,
         )
@@ -72,8 +73,22 @@ def _random_operands(
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("sequence_length", [64, 65])
-def test_fused_value_projection_matches_the_fp32_composed_contract(sequence_length: int) -> None:
-    operands = _random_operands(sequence_length=sequence_length)
+@pytest.mark.parametrize(
+    "head_dim",
+    [
+        pytest.param(
+            64,
+            marks=pytest.mark.skipif(
+                not projection_available(64), reason="requires D64 fused sparse projection support"
+            ),
+        ),
+        128,
+    ],
+)
+def test_fused_value_projection_matches_the_fp32_composed_contract(
+    sequence_length: int, head_dim: int
+) -> None:
+    operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
     input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
@@ -83,19 +98,21 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(sequence_leng
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
+        head_dim=head_dim,
     )
     expected = composed_value_projection(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
+        head_dim=head_dim,
     )
     storage_length = padded_sequence_length(sequence_length)
 
-    assert actual_value.shape == (1, 2, 128, storage_length)
+    assert actual_value.shape == (1, 2, head_dim, storage_length)
     assert actual_value.dtype is torch.int8
     assert actual_scale.shape == (1, 2, storage_length // 64, 1)
     assert actual_scale.dtype is torch.float32
-    assert actual_mean.shape == (1, 2, 128)
+    assert actual_mean.shape == (1, 2, head_dim)
     assert actual_mean.dtype is torch.float32
     assert int((actual_value.to(torch.int16) - expected.value).abs().max()) <= 1
     torch.testing.assert_close(

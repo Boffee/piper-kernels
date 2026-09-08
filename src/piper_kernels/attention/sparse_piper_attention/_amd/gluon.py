@@ -284,8 +284,17 @@ class _ContextLauncher:
         )
 
 
+def _validate_context(context: _PreparedSparsePiperContext) -> None:
+    """Reject unsupported execution modes before packing or launching."""
+    if context.key.shape[-1] != 128:
+        raise ValueError("AMD sparse Piper requires D128")
+    if context.routes_per_query == 0:
+        raise ValueError("AMD sparse Piper does not implement skip_dense_routing")
+
+
 def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
     """Pack immutable global K/V state once for any number of local Q launches."""
+    _validate_context(context)
     return _ContextLauncher(pack_context(context))
 
 
@@ -302,6 +311,7 @@ def _launch_sparse_piper_attention(
     """Validate once, then execute with fresh or explicitly bound K/V packing."""
     if packed is not None and prepared.context is not packed.source:
         raise ValueError("bound sparse Piper launcher requires its original context")
+    _validate_context(prepared.context)
     blocks, global_offset = validate_attention_launch(
         prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
     )

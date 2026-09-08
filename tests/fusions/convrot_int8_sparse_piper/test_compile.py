@@ -349,7 +349,7 @@ def _make_output_projection(
         )
         .mul_(0.01)
         .add_(0.001),
-        group_size=input_features,
+        group_size=256 if input_features % 256 == 0 else 64,
     )
     projection.weight = torch.nn.Parameter(weight, requires_grad=False)
     if projection.bias is not None:
@@ -551,7 +551,7 @@ def _run_explicit_fused_projection(
         model.value.weight.scale,
     )
     if coarse_gate is None:
-        value = fused_value._project_value_op(*projection_arguments, block_lengths)
+        value = fused_value._project_value_op(*projection_arguments, block_lengths, model.head_dim)
         return _sparse_piper_attention_from_quantized_op(
             *query,
             *key,
@@ -568,6 +568,7 @@ def _run_explicit_fused_projection(
     value = fused_value._project_value_with_block_means_op(
         *projection_arguments,
         block_lengths,
+        model.head_dim,
     )
     return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
         *query,
@@ -676,7 +677,21 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
     not projection_available(),
     reason="requires fused sparse projection support",
 )
-def test_compile_options_fuse_sparse_piper_projection_region() -> None:
+@pytest.mark.parametrize(
+    "head_dim",
+    [
+        pytest.param(
+            64,
+            marks=pytest.mark.skipif(
+                not projection_available(64), reason="requires D64 fused sparse projection support"
+            ),
+        ),
+        128,
+    ],
+)
+def test_compile_options_fuse_sparse_piper_projection_region(monkeypatch, head_dim: int) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(701)
     model = _SparseProjectionAttention().eval()
     hidden_states = torch.randn(
@@ -1029,7 +1044,21 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
     not output_available(),
     reason="requires fused sparse output support",
 )
-def test_compile_options_fuse_attention_output_boundary() -> None:
+@pytest.mark.parametrize(
+    "head_dim",
+    [
+        pytest.param(
+            64,
+            marks=pytest.mark.skipif(
+                not projection_available(64), reason="requires D64 fused sparse projection support"
+            ),
+        ),
+        128,
+    ],
+)
+def test_compile_options_fuse_attention_output_boundary(monkeypatch, head_dim: int) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(719)
     model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
     hidden_states = torch.randn(
@@ -1188,7 +1217,23 @@ def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
     reason="requires fused sparse output support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-def test_compile_fuses_every_bounded_attention_feature(routing: str) -> None:
+@pytest.mark.parametrize(
+    "head_dim",
+    [
+        pytest.param(
+            64,
+            marks=pytest.mark.skipif(
+                not projection_available(64), reason="requires D64 fused sparse projection support"
+            ),
+        ),
+        128,
+    ],
+)
+def test_compile_fuses_every_bounded_attention_feature(
+    monkeypatch, head_dim: int, routing: str
+) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
+    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(721)
     model = _CoarseSparseProjectionAttentionOutput(routing=routing).eval()
     hidden_states = torch.randn(
@@ -1298,7 +1343,13 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
             options=options,
         )(hidden_states)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # Q chunk size changes FP32 reduction order in coarse attention. Subsequent
+    # BF16/INT8 rounding can amplify those differences, so compare accuracy while
+    # keeping the tensor contract and compiler rewrite assertions exact.
+    assert actual.shape == expected.shape
+    assert actual.dtype is expected.dtype
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative_l2 < 1e-3
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     assert (
         capture.targets.count(

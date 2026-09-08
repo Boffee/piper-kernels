@@ -16,19 +16,16 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import validate_attention_launch
 from .._prepared import _PreparedSparsePiperAttention
+from . import policy
 
-_BLOCK_M = 64
-_BLOCK_N = 64
-_HEAD_DIM = 128
+_BLOCK_N = TILE_ROWS
 _LOG2_255 = 7.994353436858858
 
-_GL_BLOCK_M = gl.constexpr(_BLOCK_M)
 _GL_BLOCK_N = gl.constexpr(_BLOCK_N)
-_GL_HEAD_DIM = gl.constexpr(_HEAD_DIM)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
 _GL_LOG2_255 = gl.constexpr(_LOG2_255)
 _GL_VALUE_LOG_BOUND_CORRECTION = gl.constexpr(0.086085)
@@ -129,15 +126,16 @@ def _piper_probability_pair(
     mask_duplicate: gl.constexpr,
 ):
     """Advance one shared Piper coordinate over two independently scaled K64 tiles."""
+    block_m: gl.constexpr = query.shape[0]
     key = key_shared_pair.permute([1, 0]).load(key_layout)
     integer_scores = mma_v2(
         query,
         key,
-        gl.zeros([_GL_BLOCK_M, 2 * _GL_BLOCK_N], gl.int32, mma_layout),
+        gl.zeros([block_m, 2 * _GL_BLOCK_N], gl.int32, mma_layout),
     )
     integer_scores_0, integer_scores_1 = gl.split(
         gl.permute(
-            gl.reshape(integer_scores, [_GL_BLOCK_M, 2, _GL_BLOCK_N]),
+            gl.reshape(integer_scores, [block_m, 2, _GL_BLOCK_N]),
             [0, 2, 1],
         )
     )
@@ -204,7 +202,7 @@ def _piper_probability_pair(
     # probability work, retaining the original shared coordinate and K64 scales.
     scores = gl.reshape(
         gl.permute(gl.join(scores_0, scores_1), [0, 2, 1]),
-        [_GL_BLOCK_M, 2 * _GL_BLOCK_N],
+        [block_m, 2 * _GL_BLOCK_N],
     )
     scores = gl.convert_layout(scores, mma_layout)
     paired_columns = gl.arange(0, 2 * _GL_BLOCK_N, column_layout)
@@ -244,9 +242,10 @@ def _piper_probability_pair(
 def _rescale_packed(partial, accumulator, old_weight, current_weight):
     """Update the FP32 numerator, skipping rescaling when both row weights are one.
 
-    Requires M64/D128 MMA[4,1] register order A,A,B,B repeated within each
-    32-element pack. Checking elements 0 and 2 covers both rows. No MMA
-    instruction or collective synchronization occurs inside the branch.
+    Validated for M64/D64 MMA[2,1] or [4,1], M128/D64 MMA[4,1], and
+    M64/D128 MMA[4,1]: register order A,A,B,B repeats within each 32-element
+    pack. Checking elements 0 and 2 covers both rows. No MMA instruction or
+    collective synchronization occurs inside the branch.
     """
     return gl.inline_asm_elementwise(
         asm="""
@@ -387,11 +386,13 @@ def _piper_pv_pair(
     value_layout: gl.constexpr,
 ):
     """Accumulate two K64 PV tiles in INT32 and update the FP32 numerator."""
+    head_dim: gl.constexpr = accumulator.shape[1]
+    block_m: gl.constexpr = accumulator.shape[0]
     value_0 = value_shared_pair.index(0).permute([1, 0]).load(value_layout)
     value_1 = value_shared_pair.index(1).permute([1, 0]).load(value_layout)
     value = gl.reshape(
         gl.permute(gl.join(value_0, value_1), [2, 0, 1]),
-        [2 * _GL_BLOCK_N, _GL_HEAD_DIM],
+        [2 * _GL_BLOCK_N, head_dim],
     )
     value = gl.convert_layout(value, value_layout)
     # Each product sum is bounded by 128 * 255 * 128 = 4,177,920 in magnitude:
@@ -399,7 +400,7 @@ def _piper_pv_pair(
     partial = _uint8_int8_mma(
         probability_uint8,
         value,
-        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        gl.zeros([block_m, head_dim], gl.int32, mma_layout),
     )
     return _rescale_packed(partial, accumulator, old_weight, current_weight)
 
@@ -413,15 +414,20 @@ def _native_tile_start(
     sparse_key_blocks,
     stride_rr,
     use_sparse_routes,
+    skip_dense_routing: gl.constexpr,
 ):
-    safe_route_position = gl.minimum(tile_position, routed_sparse_tile_count - 1)
-    route = gl.load(route_base + safe_route_position * stride_rr).to(gl.int32)
-    sparse_tile = gl.where(use_sparse_routes, route, tile_position)
-    sparse_start = sparse_tile * _GL_BLOCK_N
-    dense_start = (
-        sparse_key_blocks * _GL_BLOCK_N + (tile_position - selected_sparse_tile_count) * _GL_BLOCK_N
-    )
-    return gl.where(tile_position < selected_sparse_tile_count, sparse_start, dense_start)
+    if skip_dense_routing:
+        return tile_position * _GL_BLOCK_N
+    else:
+        safe_route_position = gl.minimum(tile_position, routed_sparse_tile_count - 1)
+        route = gl.load(route_base + safe_route_position * stride_rr).to(gl.int32)
+        sparse_tile = gl.where(use_sparse_routes, route, tile_position)
+        sparse_start = sparse_tile * _GL_BLOCK_N
+        dense_start = (
+            sparse_key_blocks * _GL_BLOCK_N
+            + (tile_position - selected_sparse_tile_count) * _GL_BLOCK_N
+        )
+        return gl.where(tile_position < selected_sparse_tile_count, sparse_start, dense_start)
 
 
 @gluon.jit(
@@ -435,7 +441,7 @@ def _native_tile_start(
         "stride_rq",
     ]
 )
-def _sparse_piper_attention_kernel(
+def _sparse_piper_attention_kernel(  # noqa: PLR0912
     query_desc,
     key_desc,
     value_desc,
@@ -470,30 +476,42 @@ def _sparse_piper_attention_kernel(
     stride_gh,
     stride_gn,
     heads,
+    head_dim: gl.constexpr,
     mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
     has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
     ragged_tail_is_routed: gl.constexpr,
+    block_m: gl.constexpr,
+    mma_warps: gl.constexpr,
+    skip_dense_routing: gl.constexpr,
+    mask_output_tail: gl.constexpr,
+    output_sequence_length,
 ):
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
-    local_query_block = gl.program_id(0)
+    gl.static_assert(block_m == 64 or (block_m == 128 and head_dim == 64 and skip_dense_routing))
+    gl.static_assert(mma_warps == 4 or (mma_warps == 2 and head_dim == 64 and block_m == 64))
+    gl.static_assert(not apply_coarse_residual or block_m == 64)
+    local_query_block = gl.program_id(0) * (block_m // _GL_BLOCK_N)
     query_block = query_block_offset + local_query_block
     global_query_block = global_query_block_offset + local_query_block
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
-    start_m = query_block * _GL_BLOCK_M
-    output_start_m = local_query_block * _GL_BLOCK_M
-    route_head_offset = gl.load(route_head_offsets_ptr + head)
+    start_m = query_block * _GL_BLOCK_N
+    output_start_m = local_query_block * _GL_BLOCK_N
+    if skip_dense_routing:  # noqa: SIM108
+        route_head_offset = 0
+    else:
+        route_head_offset = gl.load(route_head_offsets_ptr + head)
     route_base = (
         routes_ptr + batch * stride_rb + query_block * stride_rq + route_head_offset * stride_rr
     )
 
-    # _rescale_packed relies on this four-warp MMA register layout.
+    # _rescale_packed is validated for each selected MMA register layout.
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0],
-        warps_per_cta=[4, 1],
+        warps_per_cta=[mma_warps, 1],
         instr_shape=[16, 8],
     )
     query_layout: gl.constexpr = gl.DotOperandLayout(0, mma_layout, k_width=4)
@@ -504,15 +522,15 @@ def _sparse_piper_attention_kernel(
     column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
 
     query_shared = gl.allocate_shared_memory(
-        query_desc.dtype, [_GL_BLOCK_M, _GL_HEAD_DIM], query_desc.layout
+        query_desc.dtype, [block_m, head_dim], query_desc.layout
     )
     key_shared_pair = gl.allocate_shared_memory(
-        key_desc.dtype, [2 * _GL_BLOCK_N, _GL_HEAD_DIM], key_desc.layout
+        key_desc.dtype, [2 * _GL_BLOCK_N, head_dim], key_desc.layout
     )
     key_shared_0 = key_shared_pair.slice(0, _GL_BLOCK_N)
     key_shared_1 = key_shared_pair.slice(_GL_BLOCK_N, _GL_BLOCK_N)
     value_shared_pair = gl.allocate_shared_memory(
-        value_desc.dtype, [2, _GL_HEAD_DIM, _GL_BLOCK_N], value_desc.layout
+        value_desc.dtype, [2, head_dim, _GL_BLOCK_N], value_desc.layout
     )
     value_shared_0 = value_shared_pair.index(0)
     value_shared_1 = value_shared_pair.index(1)
@@ -524,17 +542,22 @@ def _sparse_piper_attention_kernel(
     mbarrier.init(value_barrier, count=1)
     gl.barrier()
 
-    routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
-    if has_dense_query_suffix:
-        use_sparse_routes = global_query_block < sparse_query_blocks
-        selected_sparse_tile_count = gl.where(
-            use_sparse_routes,
-            routed_sparse_tile_count,
-            sparse_key_blocks,
-        )
+    if skip_dense_routing:
+        routed_sparse_tile_count = sparse_key_blocks
+        selected_sparse_tile_count = sparse_key_blocks
+        use_sparse_routes = False
     else:
-        use_sparse_routes = True
-        selected_sparse_tile_count = routed_sparse_tile_count
+        routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
+        if has_dense_query_suffix:
+            use_sparse_routes = global_query_block < sparse_query_blocks
+            selected_sparse_tile_count = gl.where(
+                use_sparse_routes,
+                routed_sparse_tile_count,
+                sparse_key_blocks,
+            )
+        else:
+            use_sparse_routes = True
+            selected_sparse_tile_count = routed_sparse_tile_count
     sequence_tiles = storage_sequence_length // _GL_BLOCK_N
     dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
@@ -548,6 +571,7 @@ def _sparse_piper_attention_kernel(
         sparse_key_blocks,
         stride_rr,
         use_sparse_routes,
+        skip_dense_routing,
     )
     initial_n_1 = _native_tile_start(
         route_base,
@@ -557,6 +581,7 @@ def _sparse_piper_attention_kernel(
         sparse_key_blocks,
         stride_rr,
         use_sparse_routes,
+        skip_dense_routing,
     )
 
     _issue_tma(
@@ -575,8 +600,8 @@ def _sparse_piper_attention_kernel(
     )
     _issue_tma_pair(
         value_desc,
-        [batch_head * _GL_HEAD_DIM, initial_n_0],
-        [batch_head * _GL_HEAD_DIM, initial_n_1],
+        [batch_head * head_dim, initial_n_0],
+        [batch_head * head_dim, initial_n_1],
         value_shared_0,
         value_shared_1,
         value_barrier,
@@ -584,16 +609,25 @@ def _sparse_piper_attention_kernel(
     mbarrier.wait(query_barrier, phase=0)
     query = query_shared.load(query_layout)
 
-    offsets_m = gl.arange(0, _GL_BLOCK_M, row_layout)
+    offsets_m = gl.arange(0, block_m, row_layout)
     query_scale_stride = query_storage_sequence_length // _GL_QUERY_SCALE_ROWS
-    query_scale = gl.load(
-        query_scale_ptr
-        + batch_head * query_scale_stride
-        + (start_m + offsets_m) // _GL_QUERY_SCALE_ROWS
-    )
-    accumulator = gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.float32, mma_layout)
-    denominator = gl.zeros([_GL_BLOCK_M], gl.float32, row_layout)
-    running_max = gl.full([_GL_BLOCK_M], -float("inf"), gl.float32, row_layout)
+    if block_m == 128:
+        query_scale = gl.load(
+            query_scale_ptr
+            + batch_head * query_scale_stride
+            + (start_m + offsets_m) // _GL_QUERY_SCALE_ROWS,
+            mask=start_m + offsets_m < query_storage_sequence_length,
+            other=0.0,
+        )
+    else:
+        query_scale = gl.load(
+            query_scale_ptr
+            + batch_head * query_scale_stride
+            + (start_m + offsets_m) // _GL_QUERY_SCALE_ROWS
+        )
+    accumulator = gl.zeros([block_m, head_dim], gl.float32, mma_layout)
+    denominator = gl.zeros([block_m], gl.float32, row_layout)
+    running_max = gl.full([block_m], -float("inf"), gl.float32, row_layout)
     start_n_0 = initial_n_0
     start_n_1 = initial_n_1
 
@@ -640,6 +674,7 @@ def _sparse_piper_attention_kernel(
             sparse_key_blocks,
             stride_rr,
             use_sparse_routes,
+            skip_dense_routing,
         )
         next_n_1 = _native_tile_start(
             route_base,
@@ -649,6 +684,7 @@ def _sparse_piper_attention_kernel(
             sparse_key_blocks,
             stride_rr,
             use_sparse_routes,
+            skip_dense_routing,
         )
         gl.barrier()
         _issue_tma_pair(
@@ -672,8 +708,8 @@ def _sparse_piper_attention_kernel(
         gl.barrier()
         _issue_tma_pair(
             value_desc,
-            [batch_head * _GL_HEAD_DIM, next_n_0],
-            [batch_head * _GL_HEAD_DIM, next_n_1],
+            [batch_head * head_dim, next_n_0],
+            [batch_head * head_dim, next_n_1],
             value_shared_0,
             value_shared_1,
             value_barrier,
@@ -725,11 +761,13 @@ def _sparse_piper_attention_kernel(
         value_layout,
     )
 
-    offsets_d = gl.arange(0, _GL_HEAD_DIM, column_layout)
+    offsets_d = gl.arange(0, head_dim, column_layout)
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
-    value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + offsets_d).to(gl.float32)
+    value_mean = gl.load(value_mean_ptr + batch_head * head_dim + offsets_d).to(gl.float32)
     output += value_mean[None, :]
-    valid_queries = global_query_block * _GL_BLOCK_M + offsets_m < logical_sequence_length
+    valid_queries = global_query_block * _GL_BLOCK_N + offsets_m < logical_sequence_length
+    if block_m == 128:
+        valid_queries = output_start_m + offsets_m < output_sequence_length
     if apply_coarse_residual:
         coarse = gl.load(
             coarse_output_ptr
@@ -760,7 +798,7 @@ def _sparse_piper_attention_kernel(
         + (output_start_m + offsets_m[:, None]) * stride_on
         + offsets_d[None, :]
     )
-    if mask_ragged_tail:
+    if mask_output_tail:
         gl.store(
             output_ptr + output_offsets,
             output.to(gl.bfloat16),
@@ -779,13 +817,15 @@ def _sparse_piper_attention_kernel(
 
 def _make_gluon_descriptors(
     prepared: _PreparedSparsePiperAttention,
+    block_m: int = TILE_ROWS,
 ) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor]:
     query = prepared.query.data
     key = prepared.context.key
     value = prepared.context.value
-    query_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_M, _HEAD_DIM], gl.int8)
-    key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, _HEAD_DIM], gl.int8)
-    value_layout = gl.NVMMASharedLayout.get_default_for([_HEAD_DIM, _BLOCK_N], gl.int8)
+    head_dim = query.shape[-1]
+    query_layout = gl.NVMMASharedLayout.get_default_for([block_m, head_dim], gl.int8)
+    key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, head_dim], gl.int8)
+    value_layout = gl.NVMMASharedLayout.get_default_for([head_dim, _BLOCK_N], gl.int8)
     batch_heads = int(query.shape[0] * query.shape[1])
     query_storage_sequence_length = int(query.shape[2])
     storage_sequence_length = int(key.shape[2])
@@ -805,23 +845,23 @@ def _make_gluon_descriptors(
         return (
             TensorDescriptor(
                 query,
-                [batch_heads * query_storage_sequence_length, _HEAD_DIM],
-                [_HEAD_DIM, 1],
-                [_BLOCK_M, _HEAD_DIM],
+                [batch_heads * query_storage_sequence_length, head_dim],
+                [head_dim, 1],
+                [block_m, head_dim],
                 query_layout,
             ),
             TensorDescriptor(
                 key,
-                [batch_heads * storage_sequence_length, _HEAD_DIM],
-                [_HEAD_DIM, 1],
-                [_BLOCK_N, _HEAD_DIM],
+                [batch_heads * storage_sequence_length, head_dim],
+                [head_dim, 1],
+                [_BLOCK_N, head_dim],
                 key_layout,
             ),
             TensorDescriptor(
                 value,
-                [batch_heads * _HEAD_DIM, storage_sequence_length],
+                [batch_heads * head_dim, storage_sequence_length],
                 [storage_sequence_length, 1],
-                [_HEAD_DIM, _BLOCK_N],
+                [head_dim, _BLOCK_N],
                 value_layout,
             ),
         )
@@ -845,7 +885,7 @@ def _launch_sparse_piper_attention(
     query_state = prepared.query
     context = prepared.context
     query = query_state.data
-    batch, heads, query_storage_sequence_length, _ = query.shape
+    batch, heads, query_storage_sequence_length, head_dim = query.shape
     logical_sequence_length = context.logical_sequence_length
     storage_sequence_length = context.key.shape[2]
     has_block_lengths = context.block_lengths is not None
@@ -855,16 +895,32 @@ def _launch_sparse_piper_attention(
     ragged_tail_is_routed = (
         not has_block_lengths and context.sparse_key_blocks * _BLOCK_N > logical_sequence_length
     )
-    total_query_blocks = storage_sequence_length // _BLOCK_M
+    total_query_blocks = storage_sequence_length // TILE_ROWS
     sparse_query_blocks = context.sparse_query_blocks
     resolved_query_block_count, global_query_block_offset = validate_attention_launch(
         prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
     )
     has_coarse_residual = coarse_output is not None
+    skip_dense_routing = context.routes_per_query == 0
+    if skip_dense_routing and head_dim != 64:
+        raise ValueError("skip_dense_routing requires NVIDIA D64 attention")
+    query_rows = resolved_query_block_count * TILE_ROWS
+    block_m, num_warps = policy.select_attention_schedule(
+        head_dim,
+        query_rows,
+        storage_sequence_length,
+        skip_dense_routing=skip_dense_routing,
+        has_coarse_residual=has_coarse_residual,
+        selected_key_rows=(
+            context.routes_per_query // heads * _BLOCK_N
+            + storage_sequence_length
+            - context.sparse_key_blocks * _BLOCK_N
+        ),
+    )
     with device_context(output.device):
         install_uint8_int8_dot_hook()
 
-        query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared)
+        query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared, block_m)
         routes = query_state.routes
         route_head_offsets = context.route_head_offsets
         stride_rb = routes.stride(0)
@@ -882,7 +938,8 @@ def _launch_sparse_piper_attention(
                 coarse_gate.stride(1),
             )
         )
-        _sparse_piper_attention_kernel[(resolved_query_block_count, heads, batch)](
+        grid = ((query_rows + block_m - 1) // block_m, heads, batch)
+        _sparse_piper_attention_kernel[grid](
             query_desc,
             key_desc,
             value_desc,
@@ -917,11 +974,17 @@ def _launch_sparse_piper_attention(
             *coarse_strides,
             *gate_strides,
             heads,
+            head_dim,
             has_block_lengths,
             not has_block_lengths and logical_sequence_length != storage_sequence_length,
             sparse_query_blocks is not None,
             has_coarse_residual,
             ragged_tail_is_routed,
-            num_warps=4,
+            block_m,
+            num_warps,
+            skip_dense_routing,
+            output.shape[2] % block_m != 0,
+            output.shape[2],
+            num_warps=num_warps,
             num_stages=1,
         )

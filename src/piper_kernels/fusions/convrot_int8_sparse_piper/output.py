@@ -54,7 +54,7 @@ def _prepare_gate_projection(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> _PreparedGateProjection:
-    """Validate shared prepared input and one D128-per-head gate weight."""
+    """Validate shared prepared input and one D64/D128-per-head gate weight."""
     sequence_length = output_common.output_sequence_length(
         attention_storage,
         logical_sequence_length,
@@ -85,7 +85,7 @@ def _prepare_gate_projection(
         or weight_qdata.device != attention_storage.device
         or not weight_qdata.is_contiguous()
     ):
-        raise ValueError("fused ConvRot INT8 gate weight must produce one D128 vector per head")
+        raise ValueError("fused ConvRot INT8 gate weight must produce one D64/D128 vector per head")
     if (
         weight_scale.shape != (output_features, 1)
         or weight_scale.dtype is not torch.float32
@@ -399,7 +399,9 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     gate_projection: _PreparedGateProjection | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output."""
-    projection_backend = fusion_backend.require_projection_backend(query_input_qdata)
+    projection_backend = fusion_backend.require_projection_backend(
+        query_input_qdata, head_dim=key.shape[-1]
+    )
     backend = fusion_backend.require_output_backend(key)
     prepared = output_common.prepare_attention_context(
         key,

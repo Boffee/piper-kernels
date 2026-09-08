@@ -16,7 +16,6 @@ from piper_kernels.fusions.convrot_int8_sage_qk._validation import (
 from . import _backend
 from ._interfaces import ProjectionBackend
 from ._layout import (
-    HEAD_DIM,
     QUERY_SCALE_ROWS,
     TILE_ROWS,
     padded_sequence_length,
@@ -97,12 +96,13 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         or chunk_start + chunk_rows > sequence_length
     ):
         raise ValueError("Q projection range must be a nonempty aligned sequence window")
+    head_dim = norm_weight.shape[0]
     storage_sequence_length = padded_sequence_length(chunk_rows)
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     if backend is None:
-        backend = _backend.require_projection_backend(input_qdata)
+        backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     query = torch.empty(
-        (batch, heads, storage_sequence_length, HEAD_DIM),
+        (batch, heads, storage_sequence_length, head_dim),
         device=input_qdata.device,
         dtype=torch.int8,
     )
@@ -112,7 +112,7 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         dtype=torch.float32,
     )
     query_summary = torch.empty(
-        (batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM),
+        (batch, heads, storage_sequence_length // TILE_ROWS, head_dim),
         device=input_qdata.device,
         dtype=torch.float32,
     )
@@ -200,7 +200,7 @@ def _project_query_op_fake(
     _input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
-    _norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
     cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
@@ -209,13 +209,14 @@ def _project_query_op_fake(
     _block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
+    head_dim = norm_weight.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
-    heads = weight_qdata.shape[0] // HEAD_DIM
+    heads = weight_qdata.shape[0] // head_dim
     return (
-        input_qdata.new_empty((batch, heads, storage_sequence_length, HEAD_DIM)),
+        input_qdata.new_empty((batch, heads, storage_sequence_length, head_dim)),
         input_qdata.new_empty(
             (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
             dtype=torch.float32,
         ),
-        cos.new_empty((batch, heads, storage_sequence_length // TILE_ROWS, HEAD_DIM)),
+        cos.new_empty((batch, heads, storage_sequence_length // TILE_ROWS, head_dim)),
     )

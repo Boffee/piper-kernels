@@ -46,18 +46,30 @@ def source_files() -> tuple[str, ...]:
     )
 
 
-def select_projection_backend(input: torch.Tensor) -> ProjectionBackend | None:  # noqa: A002
+def select_projection_backend(
+    input: torch.Tensor,  # noqa: A002
+    *,
+    head_dim: int = 128,
+) -> ProjectionBackend | None:
     """Select fused Q/K/V execution, independently of standalone linear support."""
     if _nvidia_projection is None and _amd_projection is None:
         return None
     target = AcceleratorTarget.from_device(input.device)
     if nvidia_policy.supports_target(target):
         return _nvidia_projection
-    return _amd_projection if amd_policy.supports_target(target) else None
+    return (
+        _amd_projection
+        if amd_policy.supports_target(target) and amd_policy.supports_head_dim(head_dim)
+        else None
+    )
 
 
-def require_projection_backend(input: torch.Tensor) -> ProjectionBackend:  # noqa: A002
-    backend = select_projection_backend(input)
+def require_projection_backend(
+    input: torch.Tensor,  # noqa: A002
+    *,
+    head_dim: int = 128,
+) -> ProjectionBackend:
+    backend = select_projection_backend(input, head_dim=head_dim)
     if backend is None:
         raise ValueError(f"ConvRot INT8 sparse projections are unavailable on {input.device}")
     return backend

@@ -11,7 +11,8 @@ from torch._inductor.pattern_matcher import Match
 from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
-from piper_kernels.attention.sparse_piper_attention import _budget
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
+from piper_kernels.attention.sparse_piper_attention import _backend, _budget
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
@@ -88,8 +89,12 @@ def _positive_float(value: object) -> float | None:
 
 
 def source_files() -> tuple[str, ...]:
-    """Return sources that affect shared sparse-attention validation."""
-    return tuple(file_name for file_name in (__file__, _budget.__file__) if file_name is not None)
+    """Return sources that affect shared sparse-attention validation and policy."""
+    return tuple(
+        file_name
+        for file_name in (__file__, _budget.__file__, *_backend.source_files())
+        if file_name is not None
+    )
 
 
 def valid_sparse_piper_coarse_residual(match: Match) -> bool:
@@ -176,6 +181,15 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
             ),
         ),
     )
+
+
+def attention_head_dim(match: Match) -> int | None:
+    """Read the supported head width from the semantic attention output."""
+    output = preparation_sharing.tensor_metadata(match.output_node())
+    if output is None or output.ndim != 4:
+        return None
+    head_dim = static_int(output.shape[-1])
+    return head_dim if head_dim in SUPPORTED_HEAD_DIMS else None
 
 
 def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
@@ -349,6 +363,7 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
 
 
 __all__ = [
+    "attention_head_dim",
     "emit_quantized_sparse_piper_attention",
     "integer_scalar_argument",
     "integer_scalar_metadata",

@@ -16,17 +16,18 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_seque
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 _BLOCK_ROWS = 64
-_HEAD_DIM = 128
 
 
 def _rotate_fp64(values):
-    offsets = torch.arange(_HEAD_DIM, device=values.device)
+    head_dim = values.shape[-1]
+    offsets = torch.arange(head_dim, device=values.device)
     words = torch.tensor(SIGNED_HADAMARD_MASK, device=values.device, dtype=torch.int64)
     result = values * (2 * ((words[offsets // 32] >> (offsets % 32)) & 1) - 1)
-    for distance in (1, 2, 4, 8, 16, 32, 64):
+    for level in range(head_dim.bit_length() - 1):
+        distance = 1 << level
         low, high = result.reshape(*result.shape[:-1], -1, 2, distance).unbind(-2)
         result = torch.stack((low + high, low - high), dim=-2).flatten(-3)
-    return result / math.sqrt(_HEAD_DIM)
+    return result / math.sqrt(head_dim)
 
 
 def assert_int8_codes_close(actual, expected):
@@ -35,7 +36,7 @@ def assert_int8_codes_close(actual, expected):
 
 
 def _encode_fp64(values, rows):
-    grouped = values.reshape(-1, rows, _HEAD_DIM)
+    grouped = values.reshape(-1, rows, values.shape[-1])
     scale = grouped.abs().amax((-1, -2)) / 127 + 1e-7
     normalized = grouped / scale[:, None, None]
     codes = torch.trunc(normalized + 0.5 * normalized.sign()).clamp(-127, 127).to(torch.int8)
@@ -44,6 +45,7 @@ def _encode_fp64(values, rows):
 
 def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *, is_query):
     """Check one minmax Q/K block with H3 normalization and softmax constants."""
+    head_dim = projected.shape[-1]
     rotary = cos.shape[1]
     projected *= torch.rsqrt(projected.square().mean(-1, keepdim=True) + 1e-5)
     projected *= norm.double()
@@ -62,14 +64,14 @@ def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *
         torch.testing.assert_close(
             output[3][0, head, start // _BLOCK_ROWS].double(), minimum, rtol=3e-5, atol=3e-5
         )
-    padded = projected.new_zeros((_BLOCK_ROWS, _HEAD_DIM), dtype=torch.float64)
+    padded = projected.new_zeros((_BLOCK_ROWS, head_dim), dtype=torch.float64)
     padded[:rows] = _rotate_fp64(projected)
     scale_rows = 32 if is_query else _BLOCK_ROWS
     codes, expected_scale = _encode_fp64(padded, scale_rows)
     actual = output[0][0, head, start : start + _BLOCK_ROWS]
     assert_int8_codes_close(actual, codes)
     if is_query:
-        expected_scale *= _HEAD_DIM**-0.5 * math.log2(math.e)
+        expected_scale *= head_dim**-0.5 * math.log2(math.e)
         if rows <= scale_rows:
             expected_scale[1] = 0
     offset = start // scale_rows
@@ -89,7 +91,7 @@ def check_value_sample_fp64(projected, output, head, start, rows, mean_v):
         rtol=2e-5,
         atol=2e-4,
     )
-    centered = projected.new_zeros((_BLOCK_ROWS, _HEAD_DIM), dtype=torch.float64)
+    centered = projected.new_zeros((_BLOCK_ROWS, projected.shape[-1]), dtype=torch.float64)
     centered[:rows] = projected - mean_v
     codes, expected_scale = _encode_fp64(centered, _BLOCK_ROWS)
     assert_int8_codes_close(output[0][0, head, :, start : start + _BLOCK_ROWS].T, codes)
@@ -146,7 +148,8 @@ def _materialized_fp32_qk(
     norm_epsilon: float,
 ) -> torch.Tensor:
     batch, sequence_length, _input_features = input_qdata.shape
-    heads = weight_qdata.shape[0] // _HEAD_DIM
+    head_dim = norm_weight.shape[0]
+    heads = weight_qdata.shape[0] // head_dim
     projected = int8_ops.linear_prepared(
         input_qdata,
         input_scale,
@@ -154,8 +157,8 @@ def _materialized_fp32_qk(
         weight_scale,
         None,
         torch.float32,
-    ).view(batch, sequence_length, heads, _HEAD_DIM)
-    normalized = F.rms_norm(projected, (_HEAD_DIM,), norm_weight.float(), norm_epsilon)
+    ).view(batch, sequence_length, heads, head_dim)
+    normalized = F.rms_norm(projected, (head_dim,), norm_weight.float(), norm_epsilon)
     rotary_dim = cos.shape[1]
     rotary = normalized[..., :rotary_dim]
     first, second = rotary.chunk(2, dim=-1)
@@ -215,7 +218,8 @@ def composed_key_projection(
 ) -> ProjectedKey:
     """Materialize the FP32 operations fused by one-pass key projection."""
     batch, sequence_length, _input_features = input_qdata.shape
-    heads = weight_qdata.shape[0] // _HEAD_DIM
+    head_dim = norm_weight.shape[0]
+    heads = weight_qdata.shape[0] // head_dim
     key = _materialized_fp32_qk(
         input_qdata,
         input_scale,
@@ -229,7 +233,7 @@ def composed_key_projection(
     storage_length = padded_sequence_length(sequence_length)
     key_int8, key_scale = qk_quantization.prepare_key(
         key,
-        torch.zeros((batch, heads, _HEAD_DIM), device=key.device, dtype=torch.float32),
+        torch.zeros((batch, heads, head_dim), device=key.device, dtype=torch.float32),
         grouped=True,
         storage_key_length=storage_length,
     )
@@ -272,14 +276,15 @@ def composed_value_projection(
     input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
+    head_dim: int = 128,
 ) -> ProjectedValue:
     """Materialize the FP32 operations fused by one-pass value projection."""
     batch, sequence_length, _input_features = input_qdata.shape
-    heads = weight_qdata.shape[0] // _HEAD_DIM
+    heads = weight_qdata.shape[0] // head_dim
     value_mean = ((input_mean @ weight_qdata.float().T) * weight_scale[:, 0]).view(
         batch,
         heads,
-        _HEAD_DIM,
+        head_dim,
     )
     projected = int8_ops.linear_prepared(
         input_qdata,
@@ -288,13 +293,13 @@ def composed_value_projection(
         weight_scale,
         None,
         torch.float32,
-    ).view(batch, sequence_length, heads, _HEAD_DIM)
+    ).view(batch, sequence_length, heads, head_dim)
     projected_blocks, valid = _padded_blocks(projected.permute(0, 2, 1, 3).float())
     block_mean = (projected_blocks * valid[None, None, :, :, None]).sum(dim=3) / valid.sum(dim=1)[
         None, None, :, None
     ]
     storage_length = padded_sequence_length(sequence_length)
-    centered = projected.new_zeros((batch, heads, storage_length, _HEAD_DIM))
+    centered = projected.new_zeros((batch, heads, storage_length, head_dim))
     centered[:, :, :sequence_length] = (
         projected.permute(0, 2, 1, 3).float() - value_mean[:, :, None, :]
     )

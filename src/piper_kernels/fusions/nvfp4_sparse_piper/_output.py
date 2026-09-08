@@ -68,7 +68,7 @@ def prepare_gate_projection(
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
 ) -> PreparedGateProjection:
-    """Validate a prepared NVFP4 gate that produces one D128 vector per head."""
+    """Validate a prepared NVFP4 gate that produces one D64/D128 vector per head."""
     if attention_storage.shape[0] != 1:
         raise ValueError("fused NVFP4 gate projection currently requires batch size one")
     shape = _validation.validate_prepared_linear(
@@ -90,7 +90,7 @@ def prepare_gate_projection(
     if shape.rows != sequence_length:
         raise ValueError("fused NVFP4 gate input must match the attention output rows")
     if shape.output_features != attention_storage.shape[1] * attention_storage.shape[3]:
-        raise ValueError("fused NVFP4 gate must produce one D128 vector per head")
+        raise ValueError("fused NVFP4 gate must produce one D64/D128 vector per head")
     differentiable_tensors = (
         input_scale,
         input_per_tensor_scale,

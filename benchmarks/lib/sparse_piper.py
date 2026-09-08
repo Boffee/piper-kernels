@@ -5,10 +5,12 @@ import torch
 from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperAttention
 
 
-def useful_integer_operations(sequence: int, keep_blocks: list[int], batch: int = 1) -> int:
+def useful_integer_operations(
+    sequence: int, keep_blocks: list[int], batch: int = 1, head_dim: int = 128
+) -> int:
     """Count selected QK/PV work, including the valid dense ragged suffix."""
     selected_rows = 64 * sum(keep_blocks) + len(keep_blocks) * (sequence % 64)
-    return 4 * batch * sequence * 128 * selected_rows
+    return 4 * batch * sequence * head_dim * selected_rows
 
 
 def assert_equal_finite(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -36,7 +38,7 @@ def reference_prepared_query(
     global_block = query.global_block_offset + query_block
     stored_blocks = context.key.shape[2] // 64
     use_routes = context.sparse_query_blocks is None or global_block < context.sparse_query_blocks
-    if use_routes:
+    if use_routes and context.routes_per_query != 0:
         start, stop = context.route_head_offsets[head : head + 2].tolist()
         tiles = query.routes[batch, query_block, start:stop].long()
     else:
@@ -72,7 +74,12 @@ def reference_prepared_query(
     pair_max = (scores + torch.log2(multipliers / 255)).amax(dim=-1)
     probabilities = torch.exp2(scores - pair_max[:, :, None])
     codes = (probabilities * multipliers + 0.5).floor().clamp(0, 255)
-    values = context.value[batch, head].index_select(1, indices).T.reshape(pairs, 128, 128).double()
+    values = (
+        context.value[batch, head]
+        .index_select(1, indices)
+        .T.reshape(pairs, 128, query.data.shape[-1])
+        .double()
+    )
     products = torch.bmm(codes, values)
     weights = torch.exp2(pair_max - pair_max.amax(dim=0))
     numerator = (products * weights[:, :, None]).sum(dim=0)

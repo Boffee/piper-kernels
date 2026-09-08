@@ -508,10 +508,10 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     assert torch.equal(ranged_output, full_output)
 
 
-def _block_length_case(routing_mode: int):
+def _block_length_case(routing_mode: int, head_dim: int):
     generator = torch.Generator(device="cuda").manual_seed(417)
     storage_sequence_length = 3 * 64
-    shape = (1, storage_sequence_length, 2, 128)
+    shape = (1, storage_sequence_length, 2, head_dim)
     query = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
     key = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
     value = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
@@ -539,7 +539,7 @@ def _block_length_case(routing_mode: int):
         query_head_major,
         routes.indices,
         routes.head_keep_blocks,
-        128**-0.5,
+        head_dim**-0.5,
         sparse_key_blocks=sparse_key_blocks,
         route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
@@ -572,9 +572,11 @@ def _block_length_case(routing_mode: int):
     reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
-def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_block_lengths_mask_internal_key_padding(routing_mode: int, head_dim: int) -> None:
     shape, query, _value, prepared, arguments, block_lengths = _block_length_case(
         routing_mode,
+        head_dim,
     )
     storage_sequence_length = shape[1]
     full_block_lengths = torch.full(
@@ -660,11 +662,14 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int) -> None:
     reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_quantized_coarse_residual_supports_internal_block_padding(
     routing_mode: int,
+    head_dim: int,
 ) -> None:
     _shape, _query, value, _prepared, arguments, block_lengths = _block_length_case(
         routing_mode,
+        head_dim,
     )
     logical_sequence_length = int(block_lengths.sum().item())
     fine_arguments = list(arguments)
@@ -688,7 +693,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
             routing_key_summary,
             fine_arguments[6][:, :, :coarse_key_blocks],
         )
-    coarse_scale = 128**-0.5
+    coarse_scale = head_dim**-0.5
     coarse_arguments = (
         *fine_arguments[:10],
         block_mean,

@@ -37,7 +37,7 @@ def _active_indices(
             query_block,
             route_start:route_stop,
         ].long()
-        if use_sparse_routes
+        if use_sparse_routes and routes.indices.shape[-1] != 0
         else torch.arange(sparse_key_blocks, device=routes.indices.device)
     )
     row_offsets = torch.arange(_BLOCK_ROWS, device=routes.indices.device)

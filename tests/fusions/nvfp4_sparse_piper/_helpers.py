@@ -20,7 +20,6 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 from piper_kernels.attention.kernels.sparse_piper.layout import padded_sequence_length
 from piper_kernels.linear.nvfp4._projection import matmul_prepared_chunk_out
 
-_HEAD_DIM = 128
 _TILE_ROWS = 64
 
 
@@ -87,6 +86,7 @@ def make_operands(
     input_features: int = 256,
     heads: int = 2,
     seed: int = 811,
+    head_dim: int = 128,
 ) -> Operands:
     """Create deterministic static-scale NVFP4 operands."""
     torch.manual_seed(seed)
@@ -105,7 +105,7 @@ def make_operands(
     weights = []
     for _ in range(3):
         dense = torch.randn(
-            (heads * _HEAD_DIM, input_features),
+            (heads * head_dim, input_features),
             device="cuda",
             dtype=torch.bfloat16,
         )
@@ -119,11 +119,11 @@ def make_operands(
             )
         )
     norms = tuple(
-        torch.rand(_HEAD_DIM, device="cuda", dtype=torch.float32).add_(0.5).bfloat16()
+        torch.rand(head_dim, device="cuda", dtype=torch.float32).add_(0.5).bfloat16()
         for _ in range(2)
     )
     angles = torch.rand(
-        (sequence_length, 96),
+        (sequence_length, head_dim * 3 // 4),
         device="cuda",
         dtype=torch.float32,
     ).mul_(2 * torch.pi)
@@ -175,15 +175,16 @@ def materialize_qk(
 ) -> torch.Tensor:
     """Apply the FP32 normalization/RoPE contract used by fused Q/K kernels."""
     sequence_length = projection.input_qdata.shape[0]
-    heads = projection.weight_qdata.shape[0] // _HEAD_DIM
+    head_dim = norm.shape[0]
+    heads = projection.weight_qdata.shape[0] // head_dim
     projected = materialize_projection(projection, bias).view(
         sequence_length,
         heads,
-        _HEAD_DIM,
+        head_dim,
     )
     normalized = F.rms_norm(
         projected.float(),
-        (_HEAD_DIM,),
+        (head_dim,),
         norm.float(),
         norm_epsilon,
     )
@@ -199,9 +200,10 @@ def query_reference(
     query: torch.Tensor,
     softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    head_dim = query.shape[-1]
     sequence_length = query.shape[2]
     storage_length = padded_sequence_length(sequence_length)
-    padded = query.new_zeros((*query.shape[:2], storage_length, _HEAD_DIM))
+    padded = query.new_zeros((*query.shape[:2], storage_length, head_dim))
     padded[:, :, :sequence_length] = query
     blocks = padded.unflatten(2, (storage_length // _TILE_ROWS, _TILE_ROWS))
     valid = torch.arange(storage_length, device=query.device) < sequence_length
@@ -221,15 +223,16 @@ def query_reference(
 def key_reference(
     key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    head_dim = key.shape[-1]
     sequence_length = key.shape[2]
     storage_length = padded_sequence_length(sequence_length)
     quantized, scale = qk_quantization.prepare_key(
         key,
-        torch.zeros((*key.shape[:2], _HEAD_DIM), device=key.device, dtype=torch.float32),
+        torch.zeros((*key.shape[:2], head_dim), device=key.device, dtype=torch.float32),
         grouped=True,
         storage_key_length=storage_length,
     )
-    padded = key.new_zeros((*key.shape[:2], storage_length, _HEAD_DIM))
+    padded = key.new_zeros((*key.shape[:2], storage_length, head_dim))
     padded[:, :, :sequence_length] = key
     blocks = padded.unflatten(2, (storage_length // _TILE_ROWS, _TILE_ROWS))
     valid = torch.arange(storage_length, device=key.device) < sequence_length
@@ -243,9 +246,9 @@ def value_reference(
     projected: torch.Tensor,
     value_mean: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    sequence_length, heads, _head_dim = projected.shape
+    sequence_length, heads, head_dim = projected.shape
     storage_length = padded_sequence_length(sequence_length)
-    centered = projected.new_zeros((1, heads, storage_length, _HEAD_DIM), dtype=torch.float32)
+    centered = projected.new_zeros((1, heads, storage_length, head_dim), dtype=torch.float32)
     centered[:, :, :sequence_length] = (
         projected.transpose(0, 1)[None].float() - value_mean[:, :, None, :]
     )

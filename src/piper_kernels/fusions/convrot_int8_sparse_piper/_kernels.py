@@ -74,7 +74,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     tl.static_assert(block_m == 64)
     tl.static_assert(heads_per_program == 1 or heads_per_program == 2)  # noqa: PLR1714
     tl.static_assert(block_n == heads_per_program * head_dim)
-    tl.static_assert(head_dim == 128)
+    tl.static_assert(head_dim == 64 or head_dim == 128)  # noqa: PLR1714
     tl.static_assert(rotary_dim <= head_dim)
     tl.static_assert(rotary_dim % 2 == 0)
 
@@ -311,7 +311,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     tl.static_assert(block_m == 2 * _JIT_VALUE_TILE_ROWS)
     tl.static_assert(heads_per_program == 2)
     tl.static_assert(block_n == heads_per_program * head_dim)
-    tl.static_assert(head_dim == 128)
+    tl.static_assert(head_dim == 64 or head_dim == 128)  # noqa: PLR1714
 
     row_block, head_block = _projection_tile_ids(group_m)
     row_block += row_block_offset

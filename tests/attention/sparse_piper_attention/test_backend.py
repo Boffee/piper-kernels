@@ -3,6 +3,7 @@
 import ast
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -29,9 +30,11 @@ from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
+    _PreparedSparsePiperAttention,
 )
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
     ("target", "supported"),
     [
@@ -44,16 +47,19 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
         (AcceleratorTarget("xpu"), False),
     ],
 )
-def test_attention_selection_uses_operand_target(monkeypatch, target, supported):
-    query = SimpleNamespace(device=torch.device("cuda:1"))
+def test_attention_selection_uses_operand_target(monkeypatch, target, supported, head_dim):
+    query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     backend = AttentionBackend(prepare=Mock(), launch=Mock())
+    d64_backend = replace(backend, skip_dense_routing=True)
     monkeypatch.setattr(_backend, "_nvidia_attention", backend)
+    monkeypatch.setattr(_backend, "_nvidia_attention_skip_dense_routing", d64_backend)
     monkeypatch.setattr(_backend, "_amd_attention", None)
     assert policy.supports_target(target) is supported
-    assert _backend.select_attention_backend(query) is (backend if supported else None)
+    expected = d64_backend if head_dim == 64 else backend
+    assert _backend.select_attention_backend(query) is (expected if supported else None)
     probe.assert_called_once_with(query.device)
 
 
@@ -68,7 +74,10 @@ def test_missing_attention_implementation_does_not_probe_device(monkeypatch):
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx1100", "gfx942"])
-def test_amd_attention_selection_is_independent_and_uses_tensor_device(monkeypatch, architecture):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_amd_attention_selection_is_independent_and_uses_tensor_device(
+    monkeypatch, architecture, head_dim
+):
     target = AcceleratorTarget("hip", architecture)
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
@@ -76,11 +85,21 @@ def test_amd_attention_selection_is_independent_and_uses_tensor_device(monkeypat
     monkeypatch.setattr(_backend, "_nvidia_attention", None)
     backend = AttentionBackend(prepare=Mock(), launch=Mock())
     monkeypatch.setattr(_backend, "_amd_attention", backend)
-    query = SimpleNamespace(device=torch.device("cuda:1"))
+    query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
     assert _backend.select_attention_backend(query) is (
-        backend if architecture in ("gfx1200", "gfx1201") else None
+        backend if architecture in ("gfx1200", "gfx1201") and head_dim == 128 else None
     )
     probe.assert_called_once_with(query.device)
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (1, 128, 256)])
+def test_amd_device_probes_and_projection_inputs_preserve_d128_support(monkeypatch, shape):
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
+    )
+    backend = AttentionBackend(prepare=Mock(), launch=Mock())
+    monkeypatch.setattr(_backend, "_amd_attention", backend)
+    assert _backend.select_attention_backend(torch.empty(shape)) is backend
 
 
 @pytest.mark.parametrize("missing", ["_route_backend", "_summary_backend"])
@@ -297,7 +316,7 @@ def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
     if invalid == "dtype":
         query, key = query.float(), key.float()
     elif invalid == "width":
-        query, key = query[..., :64], key[..., :64]
+        query, key = query[..., :32], key[..., :32]
     elif invalid == "stride":
         query = query.transpose(-1, -2)
     elif invalid == "key_dtype":
@@ -307,16 +326,18 @@ def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
     assert _backend.select_sequence_summaries(query, key) is None
 
 
-def test_dense_orchestration_uses_selected_operations(monkeypatch):
-    query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("keep_ratio", [0.5, 1.0])
+def test_dense_orchestration_uses_selected_operations(monkeypatch, head_dim, keep_ratio):
+    query = torch.zeros(1, 128, 1, head_dim, dtype=torch.bfloat16)
     key, value = torch.zeros_like(query), torch.zeros_like(query)
     state = object()
     prepare = Mock(return_value=state)
     launch = Mock(side_effect=lambda prepared, output: output.fill_(3))
-    backend = AttentionBackend(prepare=prepare, launch=launch)
+    backend = AttentionBackend(prepare=prepare, launch=launch, skip_dense_routing=head_dim == 64)
     select = Mock(return_value=backend)
     monkeypatch.setattr(_backend, "select_attention_backend", select)
-    result = dispatch.SparsePiperAttention((0.5,))(query, key, value, sparse_key_blocks=2)
+    result = dispatch.SparsePiperAttention((keep_ratio,))(query, key, value, sparse_key_blocks=2)
     assert result.shape == query.shape
     assert result.is_contiguous()
     assert (result == 3).all()
@@ -325,6 +346,8 @@ def test_dense_orchestration_uses_selected_operations(monkeypatch):
     select.assert_called_once()
     assert select.call_args.args[0].data_ptr() == query.data_ptr()
     assert prepare.call_args.args[0].data_ptr() == query.data_ptr()
+    route_count = 0 if head_dim == 64 and keep_ratio == 1.0 else int(2 * keep_ratio)
+    assert prepare.call_args.args[1].shape[-1] == route_count
     assert prepare.call_args.kwargs["combined_key"].data_ptr() == key.data_ptr()
     assert prepare.call_args.kwargs["combined_value"].data_ptr() == value.data_ptr()
     assert prepare.call_args.kwargs["sparse_key_blocks"] == 2
@@ -385,15 +408,15 @@ def test_summaries_use_selected_operation_after_validation(monkeypatch):
     select.assert_called_once()
 
 
-def _quantized_context_arguments():
+def _quantized_context_arguments(head_dim=128):
     return {
-        "key": torch.zeros(1, 1, 128, 128, dtype=torch.int8),
+        "key": torch.zeros(1, 1, 128, head_dim, dtype=torch.int8),
         "key_scale": torch.ones(1, 1, 2),
-        "key_summary": torch.zeros(1, 1, 2, 128),
-        "key_aux": torch.zeros(1, 1, 2, 128),
-        "value": torch.zeros(1, 1, 128, 128, dtype=torch.int8),
+        "key_summary": torch.zeros(1, 1, 2, head_dim),
+        "key_aux": torch.zeros(1, 1, 2, head_dim),
+        "value": torch.zeros(1, 1, head_dim, 128, dtype=torch.int8),
         "value_scale_multiplier": torch.ones(1, 1, 2, 1),
-        "value_mean": torch.zeros(1, 1, 128),
+        "value_mean": torch.zeros(1, 1, head_dim),
         "head_keep_ratio_units": list(_normalize_head_keep_ratios((0.5,))),
         "sparse_key_blocks": 2,
         "logical_sequence_length": 128,
@@ -497,6 +520,100 @@ def test_shared_quantized_validation_rejects_cross_device_query():
         )
 
 
+def test_prepared_query_must_match_context_head_width():
+    arguments = _quantized_context_arguments()
+    context = _prepare_sparse_piper_context_from_quantized(
+        arguments["key"],
+        arguments["key_scale"],
+        arguments["value"],
+        arguments["value_scale_multiplier"],
+        arguments["value_mean"],
+        torch.ones(1, dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        sparse_key_blocks=2,
+        routes_per_query=1,
+        logical_sequence_length=128,
+    )
+    with pytest.raises(ValueError, match=r"compatible.*Q storage"):
+        _prepare_sparse_piper_query_from_quantized(
+            torch.empty(1, 1, 64, 64, dtype=torch.int8),
+            torch.ones(1, 1, 2),
+            torch.zeros(1, 1, 1, dtype=torch.uint16),
+            context,
+        )
+
+
+def _prepared_attention(head_dim, routes_per_query):
+    arguments = _quantized_context_arguments(head_dim)
+    context = _prepare_sparse_piper_context_from_quantized(
+        arguments["key"],
+        arguments["key_scale"],
+        arguments["value"],
+        arguments["value_scale_multiplier"],
+        arguments["value_mean"],
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([0, 2], dtype=torch.int32),
+        sparse_key_blocks=2,
+        routes_per_query=routes_per_query,
+        logical_sequence_length=128,
+    )
+    query = _prepare_sparse_piper_query_from_quantized(
+        torch.zeros(1, 1, 128, head_dim, dtype=torch.int8),
+        torch.ones(1, 1, 4),
+        torch.zeros(1, 2, routes_per_query, dtype=torch.uint16),
+        context,
+    )
+    return _PreparedSparsePiperAttention(context, query)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_shared_preparation_accepts_empty_routes_and_rejects_negative_counts(head_dim):
+    prepared = _prepared_attention(head_dim, 0)
+    assert prepared.context.routes_per_query == 0
+    assert prepared.query.routes.shape == (1, 2, 0)
+    with pytest.raises(ValueError, match="route count must be nonnegative"):
+        _prepared_attention(head_dim, -1)
+
+
+@pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
+def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch):
+    native = _backend.nvidia_gluon
+    prepared = _prepared_attention(128, 0)
+    enter_device = Mock(side_effect=AssertionError("unsupported mode reached device execution"))
+    monkeypatch.setattr(native, "device_context", enter_device)
+    with pytest.raises(ValueError, match="skip_dense_routing requires NVIDIA D64"):
+        native._launch_sparse_piper_attention(
+            prepared, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+        )
+    enter_device.assert_not_called()
+
+
+@pytest.mark.skipif(_backend.amd_gluon is None, reason="requires Triton import")
+@pytest.mark.parametrize(
+    ("head_dim", "route_count", "message"), [(64, 2, "D128"), (128, 0, "skip_dense_routing")]
+)
+def test_amd_rejects_unsupported_context_before_packing_or_launch(
+    monkeypatch, head_dim, route_count, message
+):
+    native = _backend.amd_gluon
+    prepared = _prepared_attention(head_dim, route_count)
+    pack = Mock(side_effect=AssertionError("unsupported context reached packing"))
+    enter_device = Mock(side_effect=AssertionError("unsupported context reached device execution"))
+    monkeypatch.setattr(native, "pack_context", pack)
+    monkeypatch.setattr(native, "device_context", enter_device)
+    with pytest.raises(ValueError, match=message):
+        native.bind_context(prepared.context)
+    for packed in (None, SimpleNamespace(source=prepared.context)):
+        with pytest.raises(ValueError, match=message):
+            native._launch_sparse_piper_attention(
+                prepared,
+                torch.empty(1, 1, 128, head_dim, dtype=torch.bfloat16),
+                packed=packed,
+            )
+    pack.assert_not_called()
+    enter_device.assert_not_called()
+
+
 def test_sparse_orchestration_has_no_vendor_or_runtime_layout_knowledge():
     directory = Path(dispatch.__file__).parent
     for name in (
@@ -535,6 +652,12 @@ from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSp
 from piper_kernels._triton.targets import AcceleratorTarget
 query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
 assert _backend.select_attention_backend(query) is None
+from piper_kernels.attention.sparse_piper_attention._nvidia import policy
+assert policy.skip_dense_routing(64)
+assert policy.select_attention_schedule(
+    64, 32768, 32768, skip_dense_routing=True,
+    has_coarse_residual=False, selected_key_rows=32768,
+) == (128, 4)
 assert torch.equal(SparsePiperAttention((0.5,))(query, query, query, sparse_key_blocks=2), query)
 # Even a supported target cannot select absent optional implementations.
 AcceleratorTarget.from_device = lambda device: AcceleratorTarget("cuda", "sm120")
