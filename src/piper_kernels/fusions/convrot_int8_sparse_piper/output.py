@@ -8,9 +8,11 @@ import torch
 
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
-from piper_kernels.linear.convrot.int8 import _backend, reference
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
+from piper_kernels.linear.convrot.int8 import reference
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 
+from . import _backend as fusion_backend
 from . import query as query_projection
 
 _DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
@@ -111,7 +113,7 @@ def _prepare_gate_projection(
         weight_qdata,
         weight_scale,
         bias,
-        _backend.require_linear_backend(input_qdata),
+        linear_backend.require_linear_backend(input_qdata),
     )
 
 
@@ -175,7 +177,7 @@ def _validate_output_projection(
             "fused sparse Piper output projection weight must consume all attention heads"
         )
     if weight_qdata.device != attention_storage.device:
-        raise ValueError("fused sparse Piper attention and projection must share a CUDA device")
+        raise ValueError("fused sparse Piper attention and projection must share a device")
     if bias is not None and (
         bias.shape != (output_features,)
         or bias.device != attention_storage.device
@@ -240,8 +242,10 @@ def _prepare_output_chunk_projector(
     group_size: int,
     logical_sequence_length: int,
     query_chunk_rows: int,
+    *,
+    backend: LinearBackend,
 ) -> tuple[int, output_common.ChunkProjector, tuple[torch.Tensor, torch.Tensor]]:
-    """Prepare one reusable ConvRot INT8 output-projection chunk boundary."""
+    """Prepare output-chunk buffers using the fusion's already-selected backend."""
     input_features, output_features = _validate_output_projection(
         attention_storage,
         weight_qdata,
@@ -262,7 +266,6 @@ def _prepare_output_chunk_projector(
         device=attention_storage.device,
         dtype=torch.float32,
     )
-    backend = _backend.require_linear_backend(attention_storage)
 
     def project_chunk(
         attention_chunk: torch.Tensor,
@@ -316,6 +319,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     gate_projection: _PreparedGateProjection | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into the final ConvRot INT8 output."""
+    backend = fusion_backend.require_output_backend(query)
     prepared = output_common.prepare_attention(
         query,
         query_scale,
@@ -348,6 +352,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         group_size,
         logical_sequence_length,
         query_chunk_rows,
+        backend=backend,
     )
     return output_common.run_chunked_attention_output(
         prepared,
@@ -394,6 +399,8 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     gate_projection: _PreparedGateProjection | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output."""
+    projection_backend = fusion_backend.require_projection_backend(query_input_qdata)
+    backend = fusion_backend.require_output_backend(key)
     prepared = output_common.prepare_attention_context(
         key,
         key_scale,
@@ -425,6 +432,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         group_size,
         logical_sequence_length,
         query_chunk_rows,
+        backend=backend,
     )
 
     def project_query_chunk(
@@ -445,6 +453,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             block_lengths,
             chunk_start=start,
             chunk_rows=rows,
+            backend=projection_backend,
         )
 
     return output_common.run_chunked_projected_query_attention_output(

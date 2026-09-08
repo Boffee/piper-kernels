@@ -19,6 +19,7 @@ from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
@@ -39,7 +40,7 @@ def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architectu
     assert _backend.select_add(value) is _generic.add_
     assert _backend.select_addmm(value) is _generic.addmm_
     assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out
-    assert _backend.select_dequantized_mean(value) is None
+    assert _backend.select_dequantized_mean(value) is generic_mean.dequantized_input_mean
 
 
 @pytest.mark.parametrize(

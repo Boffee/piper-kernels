@@ -14,6 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import query as query_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
+from ._helpers import exact_sm120_available
 from ._reference import composed_mean_pool_summary, composed_query_projection
 
 
@@ -37,10 +38,6 @@ class _Operands:
             self.cos,
             self.sin,
         )
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _random_operands(
@@ -100,7 +97,7 @@ def _random_operands(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("sequence_length", [64, 65])
 def test_fused_query_projection_matches_the_fp32_composed_contract(
     sequence_length: int,
@@ -142,7 +139,7 @@ def test_fused_query_projection_matches_the_fp32_composed_contract(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("sequence_length", [64, 65])
 def test_mean_pool_query_projection_emits_exact_valid_prefix_means(
     sequence_length: int,
@@ -166,7 +163,7 @@ def test_mean_pool_query_projection_emits_exact_valid_prefix_means(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
     operands = _random_operands(sequence_length=128, input_features=256, heads=3)
 
@@ -183,7 +180,7 @@ def test_fused_query_projection_supports_multiple_q64_blocks() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
 def test_query_projection_range_uses_local_storage_and_global_rope_positions(
     routing_mode: int,
@@ -215,7 +212,7 @@ def test_query_projection_range_uses_local_storage_and_global_rope_positions(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
 def test_fused_query_projection_ignores_internal_padding(routing_mode: int) -> None:
     operands = _random_operands(sequence_length=192)
@@ -243,7 +240,7 @@ def test_fused_query_projection_ignores_internal_padding(routing_mode: int) -> N
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_query_projection_custom_op_passes_opcheck() -> None:
     operands = _random_operands()
 
@@ -262,7 +259,7 @@ def test_fused_query_projection_custom_op_passes_opcheck() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_fused_query_projection_is_a_fullgraph_compile_boundary() -> None:
     operands = _random_operands()
 

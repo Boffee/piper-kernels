@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import HEAD_DIM, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 
@@ -144,11 +143,6 @@ def validate_attention_output(
         or query_chunk_rows % TILE_ROWS
     ):
         raise ValueError("fused sparse Piper query chunk rows must be a positive multiple of 64")
-    if attention_storage.device.type != "cuda":
-        raise ValueError("fused sparse Piper output currently requires CUDA")
-    target = AcceleratorTarget.from_device(attention_storage.device)
-    if not target.is_cuda_capability(12, 0):
-        raise ValueError("fused sparse Piper output requires exact NVIDIA SM120")
     return heads * head_dim
 
 

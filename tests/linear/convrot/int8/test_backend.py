@@ -11,6 +11,7 @@ from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _update, dispatch
 from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 
@@ -62,7 +63,7 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
     value = SimpleNamespace(device=torch.device("cuda"))
 
     assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out
-    assert _backend.select_dequantized_mean(value) is nvidia.dequantized_input_mean
+    assert _backend.select_dequantized_mean(value) is generic_mean.dequantized_input_mean
     assert _backend.select_add(value) is not None
     assert _backend.select_addmm(value) is not None
 

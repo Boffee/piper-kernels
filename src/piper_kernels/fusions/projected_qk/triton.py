@@ -21,12 +21,14 @@ def rmsnorm_rope_tile(
     norm_epsilon: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
+    rsqrt_fn: tl.constexpr = None,  # pyright: ignore[reportArgumentType]
 ):
-    """Apply FP32 RMSNorm and split-half RoPE to one projected Q/K tile."""
+    """Apply FP32 RMSNorm and RoPE; execution may supply a rounding-specific rsqrt."""
     feature_offsets = tl.arange(0, head_dim)
-    inverse_rms = libdevice.rsqrt_rn(
-        tl.sum(projection * projection, axis=2) / head_dim + norm_epsilon
-    )
+    variance = tl.sum(projection * projection, axis=2) / head_dim + norm_epsilon
+    # Resolve generic libdevice through the compiling target, not a Python
+    # default that captures its non-executable declaration before JIT.
+    inverse_rms = libdevice.rsqrt(variance) if rsqrt_fn is None else rsqrt_fn(variance)
     norm_weight = tl.load(norm_weight_ptr + feature_offsets).to(tl.float32)
     normalized = projection * inverse_rms[:, :, None] * norm_weight[None, None, :]
 

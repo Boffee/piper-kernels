@@ -29,6 +29,8 @@ from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
 from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 
+from ._helpers import exact_sm120_available
+
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 
@@ -670,7 +672,7 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
@@ -732,7 +734,7 @@ def test_cuda_compile_options_fuse_sparse_piper_projection_region() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
@@ -779,7 +781,7 @@ def test_cuda_projection_fusion_respects_internal_block_lengths(routing: str) ->
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
@@ -853,7 +855,7 @@ def test_cuda_compile_options_fuse_sparse_piper_coarse_residual(routing: str) ->
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
@@ -922,7 +924,7 @@ def test_cuda_coarse_projection_fusion_respects_internal_block_lengths(routing: 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
@@ -972,7 +974,7 @@ def test_cuda_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
@@ -1023,7 +1025,7 @@ def test_cuda_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> No
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
@@ -1072,7 +1074,7 @@ def test_cuda_compile_options_fuse_attention_output_boundary() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_compile_fuses_padded_mixed_query_attention_output() -> None:
@@ -1124,7 +1126,7 @@ def test_cuda_compile_fuses_padded_mixed_query_attention_output() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
@@ -1181,7 +1183,7 @@ def test_cuda_compile_options_fuse_mean_pool_attention_and_output() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
@@ -1245,7 +1247,7 @@ def test_cuda_compile_fuses_every_bounded_attention_feature(routing: str) -> Non
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
@@ -1307,7 +1309,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(routing: str) -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
@@ -1355,7 +1357,7 @@ def test_cuda_attention_output_fusion_fails_closed_when_attention_escapes() -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> None:
@@ -1425,7 +1427,7 @@ def test_cuda_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
@@ -1498,7 +1500,7 @@ def test_cuda_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
@@ -1573,7 +1575,7 @@ def test_cuda_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
@@ -1629,7 +1631,7 @@ def test_cuda_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize(

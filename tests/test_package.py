@@ -93,6 +93,20 @@ assert _backend.select_gguf_converter(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert generic_dispatch._triton_backend is None
+from piper_kernels.fusions.convrot_int8_sage_qk._validation import validate_qk_projection_inputs
+assert validate_qk_projection_inputs(
+    torch.ones(1, 64, 32, dtype=torch.int8),
+    torch.ones(1, 64),
+    torch.ones(128, 32, dtype=torch.int8),
+    torch.ones(128, 1),
+    torch.ones(128, dtype=torch.bfloat16),
+    torch.ones(64, 96),
+    torch.zeros(64, 96),
+    norm_epsilon=1e-6,
+    name="Q",
+) == (1, 64, 1)
+assert "piper_kernels.fusions.convrot_int8_sage_qk.triton" not in sys.modules
+assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)
 _generic.add_(weight.qdata, weight.scale, torch.ones(7, 32), 16, 1.0)
