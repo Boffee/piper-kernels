@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from torchao.utils import TorchAOBaseTensor
 
-from ._tensor_views import unsupported_operation
+from ._dispatch import unsupported_operation_dispatch
 
 if TYPE_CHECKING:
-    from ._tensor_views import QuantizedWeight
+    from ._dispatch import QuantizedWeight
 
 
-def _matrix_product(
+def _matrix_product_dispatch(
     func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -55,10 +55,10 @@ def _matmul(
 ) -> torch.Tensor:
     if out is not None:
         raise NotImplementedError("Piper quantized matmul does not support out")
-    return _matrix_product(torch.ops.aten.matmul.default, (), (input, other), {})
+    return _matrix_product_dispatch(torch.ops.aten.matmul.default, (), (input, other), {})
 
 
-def _torch_matmul(
+def _torch_matmul_dispatch(
     _func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -72,8 +72,13 @@ def _torch_matmul(
 def register_matrix_ops(cls: type[TorchAOBaseTensor]) -> None:
     """Keep DTensor's transpose/mm/addmm decomposition on Piper's linear path."""
     aten = torch.ops.aten
-    cls.implements([aten.mm.default, aten.matmul.default, aten.addmm.default])(_matrix_product)
-    cls.implements_torch_function([torch.matmul, torch.Tensor.matmul, torch.Tensor.__matmul__])(
-        _torch_matmul
+    cls.implements([aten.mm.default, aten.matmul.default, aten.addmm.default])(
+        _matrix_product_dispatch
     )
-    cls.implements([aten.bmm.default, aten._grouped_mm.default])(unsupported_operation)
+    cls.implements_torch_function([torch.matmul, torch.Tensor.matmul, torch.Tensor.__matmul__])(
+        _torch_matmul_dispatch
+    )
+    cls.implements([aten.bmm.default, aten._grouped_mm.default])(unsupported_operation_dispatch)
+
+
+__all__ = ["register_matrix_ops"]

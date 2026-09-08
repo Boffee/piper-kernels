@@ -10,11 +10,10 @@ from torch._prims_common import infer_size
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
 
-if TYPE_CHECKING:
-    from .convrot.int8.tensor import ConvRotInt8Tensor
-    from .nvfp4.tensor import PiperNVFP4Tensor
+from ._dispatch import unsupported_operation_dispatch
 
-    type QuantizedWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
+if TYPE_CHECKING:
+    from ._dispatch import QuantizedWeight
 
 
 def require_untransposed(weight: QuantizedWeight, operation: str) -> None:
@@ -25,7 +24,7 @@ def require_untransposed(weight: QuantizedWeight, operation: str) -> None:
         )
 
 
-def _transpose(
+def _transpose_dispatch(
     func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -52,7 +51,7 @@ def _transpose(
     return cast(torch.Tensor, return_and_correct_aliasing(func, args, kwargs, viewed))
 
 
-def same_shape_view(
+def _same_shape_view_dispatch(
     func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -70,7 +69,7 @@ def same_shape_view(
     return _alias(func, args, kwargs)
 
 
-def alias_or_transpose_as_strided(
+def _as_strided_dispatch(
     func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -112,7 +111,7 @@ def _alias(
     return cast(torch.Tensor, return_and_correct_aliasing(func, args, kwargs, viewed))
 
 
-def _contiguous(
+def _contiguous_dispatch(
     func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -123,7 +122,7 @@ def _contiguous(
     return weight._apply_fn_to_data(lambda value: func(value, *args[1:], **kwargs))
 
 
-def _clone(
+def _clone_dispatch(
     func: Callable[..., torch.Tensor],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
@@ -135,25 +134,19 @@ def _clone(
     return weight._apply_fn_to_data(lambda value: func(value, **kwargs))
 
 
-def unsupported_operation(
-    func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    _args: tuple[Any, ...],
-    _kwargs: dict[str, Any],
-) -> torch.Tensor:
-    raise NotImplementedError(f"Piper quantized weights do not support {func}")
-
-
 def register_view_ops(cls: type[TorchAOBaseTensor]) -> None:
     """Preserve wrappers through views and reject unsupported layout changes."""
     aten = torch.ops.aten
-    cls.implements([aten.view.default, aten.view_as.default])(same_shape_view)
-    cls.implements(aten.as_strided.default)(alias_or_transpose_as_strided)
-    cls.implements([aten.t.default, aten.transpose.int, aten.permute.default])(_transpose)
-    cls.implements(aten.clone.default)(_clone)
-    cls.implements(aten.contiguous.default)(_contiguous)
-    cls.implements_torch_function(torch.Tensor.contiguous)(_contiguous)
+    cls.implements([aten.view.default, aten.view_as.default])(_same_shape_view_dispatch)
+    cls.implements(aten.as_strided.default)(_as_strided_dispatch)
+    cls.implements([aten.t.default, aten.transpose.int, aten.permute.default])(_transpose_dispatch)
+    cls.implements(aten.clone.default)(_clone_dispatch)
+    cls.implements(aten.contiguous.default)(_contiguous_dispatch)
+    cls.implements_torch_function(torch.Tensor.contiguous)(_contiguous_dispatch)
     # TorchAO's inherited slicing handlers construct a base NVFP4Tensor. Until
     # there is a packing/rotation-aware implementation, fail before losing data
     # interpretation (including during a DTensor redistribution).
-    cls.implements([aten.slice.Tensor, aten.select.int])(unsupported_operation)
+    cls.implements([aten.slice.Tensor, aten.select.int])(unsupported_operation_dispatch)
+
+
+__all__ = ["register_view_ops", "require_untransposed"]
