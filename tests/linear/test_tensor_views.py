@@ -120,7 +120,7 @@ def test_same_layout_as_strided_preserves_wrapper(wrapper, offset):
 )
 def test_as_strided_rejects_changed_layout(wrapper, shape, strides, offset):
     weight = _weight(wrapper)
-    with pytest.raises(NotImplementedError, match="unchanged shape, strides, and storage offset"):
+    with pytest.raises(NotImplementedError, match="unchanged layout or a matrix transpose"):
         weight.as_strided(shape, strides, storage_offset=offset)
 
 

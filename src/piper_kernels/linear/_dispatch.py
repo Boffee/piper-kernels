@@ -1,10 +1,27 @@
-"""Argument binding shared by linear tensor-subclass dispatchers."""
+"""Helpers shared by linear tensor-subclass dispatchers."""
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from .convrot.int8.tensor import ConvRotInt8Tensor
+    from .nvfp4.tensor import PiperNVFP4Tensor
+
+type QuantizedWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
+
+
+def unsupported_operation_dispatch(
+    func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    _args: tuple[Any, ...],
+    _kwargs: dict[str, Any],
+) -> torch.Tensor:
+    """Reject operations without an implementation that preserves quantized weights."""
+    raise NotImplementedError(f"Piper quantized weights do not support {func}")
 
 
 def _explicit_to_copy_args(
@@ -94,4 +111,10 @@ def apply_linear_autocast(
     )
 
 
-__all__ = ["apply_linear_autocast", "bind_linear_arguments", "linear_autocast_dtype"]
+__all__ = [
+    "QuantizedWeight",
+    "apply_linear_autocast",
+    "bind_linear_arguments",
+    "linear_autocast_dtype",
+    "unsupported_operation_dispatch",
+]

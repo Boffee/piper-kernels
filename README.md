@@ -261,10 +261,25 @@ logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported f
 
 `ConvRotInt8Tensor`, `PiperNVFP4Tensor`, and `ConvRotNVFP4Tensor` support same-shape
 `view` and `view_as`, preserving the concrete wrapper, quantization metadata, and shared
-storage. `as_strided` also requires unchanged strides and storage offset. These views
-support replicated `DTensor.from_local(..., run_check=False).to_local()` construction;
-full tensor-parallel execution is not established by this support. Shape-changing views
-raise `NotImplementedError`.
+storage. Matrix transposes (`t`, `transpose`, `mT`, and `permute`) also share storage and
+preserve the represented weight, including ConvRot's rotation axis and NVFP4's packing order.
+`as_strided` supports the existing layout or its matrix transpose, with unchanged storage offset.
+Other shape/layout changes raise `NotImplementedError`; transposed weights cannot be made
+contiguous or updated in place.
+
+`F.linear` on DTensors constructed with `DTensor.from_local(..., run_check=False)` uses
+Piper's local quantized linear implementation through the transpose and `mm`/`addmm` path.
+`addmm` supports the linear case: `alpha=1`, `beta=1`, and a bias vector with one value per
+output feature. Other coefficients and bias shapes raise `NotImplementedError`.
+Eager and fullgraph compiled execution support replicated weights, output-feature weight
+shards (`Shard(0)`), and input-feature weight shards (`Shard(1)`) with matching activation
+placements. Quantize each local shard in its own layout; ConvRot feature shards must align
+with rotation groups. Input-feature sharding produces partial outputs that must be summed.
+The numerical reference is the corresponding local quantized computation on each rank;
+sharding can change activation/weight quantization scales relative to a monolithic linear.
+Slicing or redistributing quantized weights is unsupported and raises explicitly. Transposed
+weights support dense activation matrix products; using one as the weight of another `linear`
+is unsupported.
 
 Supported eager and compiled NVFP4 linears share the same prepared projection backend,
 including ConvRot and the affine projections used by fused SwiGLU FFNs and sparse attention.

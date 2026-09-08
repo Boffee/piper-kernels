@@ -91,6 +91,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Preserve ConvRot INT8, Piper NVFP4, and ConvRot NVFP4 weight semantics through matrix
+  transpose and DTensor `linear`. Transposes share quantized storage and retain rotation and
+  packing metadata; `mm`/`addmm` use Piper's local linear implementation in eager and compiled
+  execution. Unsupported quantized slicing and transposed updates raise explicitly.
 - Return correctly shaped empty outputs for plain and ConvRot NVFP4 linears, including
   static/dynamic activation scales and compiled preparation/projection paths.
 - Avoid a second full-size NVFP4 output allocation for scaling/bias, including supported eager
