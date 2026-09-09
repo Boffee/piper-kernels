@@ -273,13 +273,66 @@ Piper's local quantized linear implementation through the transpose and `mm`/`ad
 output feature. Other coefficients and bias shapes raise `NotImplementedError`.
 Eager and fullgraph compiled execution support replicated weights, output-feature weight
 shards (`Shard(0)`), and input-feature weight shards (`Shard(1)`) with matching activation
-placements. Quantize each local shard in its own layout; ConvRot feature shards must align
-with rotation groups. Input-feature sharding produces partial outputs that must be summed.
-The numerical reference is the corresponding local quantized computation on each rank;
-sharding can change activation/weight quantization scales relative to a monolithic linear.
-Slicing or redistributing quantized weights is unsupported and raises explicitly. Transposed
-weights support dense activation matrix products; using one as the weight of another `linear`
-is unsupported.
+placements. ConvRot feature shards must align with rotation groups. Input-feature sharding
+produces partial outputs that must be summed.
+The numerical reference is the corresponding local quantized computation on each rank.
+Redistributing quantized weights is unsupported. Transposed weights support dense activation
+matrix products; using one as the weight of another `linear` is unsupported.
+
+To partition an **already quantized full weight**, use
+`piper_kernels.linear.sharding.shard_quantized_weight(weight, dim=..., start=..., length=...)`.
+It copies packed data and repacks NVFP4 scales without requantizing, preserving the wrapper,
+nibble order, global scales, rotation, and activation-quantization configuration. Each shard
+owns its tensor storage. Create shards on CPU during loading, then move them to CUDA for
+execution, or create them directly on CUDA.
+
+Row partitions (`dim=0`) accept any nonempty contiguous interval, including cuts inside
+NVFP4's 128-row scale tiles. Input-channel partitions (`dim=1`) must align to NVFP4's 16-value
+blocks and ConvRot's rotation groups. NVFP4 accepts ordinary or swizzled scales, flat or
+canonical 2-D, and returns canonical 2-D scales with fresh padding. Empty partitions,
+transposed/noncontiguous storage, nonstandard NVFP4 blocks, and per-expert scales are rejected.
+Ordinary slice/narrow views remain unsupported. Execution requirements still apply; for
+example, ConvRot NVFP4 linear requires swizzled scales.
+
+For standard DTensor plans, install the prepared DTensor parameter before calling
+`parallelize_module`. Each rank must load the same quantized full weight. This example
+assumes an initialized 1-D mesh and an evenly partitioned weight:
+
+```python
+from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+
+from piper_kernels.linear.sharding import shard_quantized_weight
+
+dim = 0  # 0: output rows / ColwiseParallel; 1: input channels / RowwiseParallel
+parts = mesh.size()
+assert full_weight.shape[dim] % parts == 0
+length = full_weight.shape[dim] // parts
+local_weight = shard_quantized_weight(
+    full_weight, dim=dim, start=mesh.get_local_rank() * length, length=length
+).to(mesh.device_type)
+distributed_weight = DTensor.from_local(
+    local_weight,
+    mesh,
+    [Shard(dim)],
+    run_check=False,
+    shape=full_weight.shape,
+    stride=full_weight.stride(),
+)
+out_features, in_features = full_weight.shape
+linear = torch.nn.Linear(in_features, out_features, bias=False, device="meta")
+linear.weight = torch.nn.Parameter(distributed_weight, requires_grad=False)
+plan = ColwiseParallel() if dim == 0 else RowwiseParallel()
+linear = parallelize_module(linear, mesh, plan)
+```
+
+Install bias as a DTensor too: `Shard(0)` for output-row sharding, `Replicate()` for
+input-channel sharding. By default, `ColwiseParallel` takes replicated inputs and returns
+local output shards; `RowwiseParallel` takes input-channel shards and sums partial outputs.
+For sequential execution, use local `F.linear` calls and concatenate row-shard outputs or
+sum column-shard outputs, adding bias once. Column partitions preserve weight values but
+can change dynamic activation scales and accumulation order, so comparisons with an
+unsharded quantized linear require numerical tolerances.
 
 With the corresponding `*_swiglu_ffn_compile_options()` or
 `*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,

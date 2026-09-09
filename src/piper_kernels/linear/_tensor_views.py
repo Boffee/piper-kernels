@@ -143,9 +143,9 @@ def register_view_ops(cls: type[TorchAOBaseTensor]) -> None:
     cls.implements(aten.clone.default)(_clone_dispatch)
     cls.implements(aten.contiguous.default)(_contiguous_dispatch)
     cls.implements_torch_function(torch.Tensor.contiguous)(_contiguous_dispatch)
-    # TorchAO's inherited slicing handlers construct a base NVFP4Tensor. Until
-    # there is a packing/rotation-aware implementation, fail before losing data
-    # interpretation (including during a DTensor redistribution).
+    # TorchAO's inherited slicing handlers construct a base NVFP4Tensor, losing
+    # interpretation metadata. Use shard_quantized_weight for owning partitions:
+    # repacked scales cannot promise the aliasing semantics of these views.
     cls.implements([aten.slice.Tensor, aten.select.int])(unsupported_operation_dispatch)
 
 

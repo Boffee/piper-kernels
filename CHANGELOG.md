@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added `shard_quantized_weight` for aligned, owning row and input-channel partitions of
+  already quantized ConvRot INT8, NVFP4, and ConvRot NVFP4 weights. CPU/CUDA storage
+  slicing preserves quantization metadata and repacks NVFP4 scales without requantizing
+  weights, with a documented integration path for standard DTensor parallel plans.
 - Enabled the shared ConvRot INT8 SwiGLU FFN on supported Linux ROCm devices, including
   indexed gated updates and compiler folding. Fusion eligibility now uses the INT8 backend
   contract instead of NVIDIA capability checks; RX 9070 XT has on-device validation.
