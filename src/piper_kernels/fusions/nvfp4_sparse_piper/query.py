@@ -16,6 +16,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
     validate_routing_mode,
 )
+from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
     PreparedProjection,
@@ -35,7 +36,7 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
@@ -46,9 +47,10 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
     *,
     chunk_start: int = 0,
     chunk_rows: int | None = None,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
-    head_dim = norm_weight.shape[0] if norm_weight.ndim == 1 else 0
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     sequence_length, heads = validate_projection(
         input_qdata,
         input_scale,
@@ -69,6 +71,7 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
         sin,
         norm_epsilon,
         "Q projection",
+        head_dim=head_dim,
     )
     validate_block_lengths(
         block_lengths,
@@ -76,7 +79,6 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
         input_qdata.device,
         "Q projection",
     )
-    operands = (norm_weight, cos, sin)
     if not math.isfinite(softmax_scale) or softmax_scale <= 0:
         raise ValueError("Q projection softmax scale must be finite and positive")
     if chunk_rows is None:
@@ -129,12 +131,12 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
             storage_chunk_start=start,
         )
 
-    consumer_tensors = [input_per_tensor_scale, *operands]
+    consumer_tensors = [input_per_tensor_scale, cos, sin]
     consumer_tensors.extend(
-        operand for operand in (weight_per_tensor_scale, bias) if operand is not None
+        operand
+        for operand in (norm_weight, weight_per_tensor_scale, bias, block_lengths)
+        if operand is not None
     )
-    if block_lengths is not None:
-        consumer_tensors.append(block_lengths)
     # ``run_chunked_projection`` assumes row-zero scale addressing. A local
     # query range therefore projects from the original prepared storage with
     # explicit global row bounds while retaining its bounded BF16 temporary.
@@ -179,7 +181,7 @@ def _launch_query(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
@@ -187,6 +189,8 @@ def _launch_query(  # noqa: PLR0913, PLR0917
     chunk_rows: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project complete query storage for the public standalone boundary."""
     return _launch_query_range(
@@ -205,6 +209,7 @@ def _launch_query(  # noqa: PLR0913, PLR0917
         chunk_rows,
         routing_mode,
         block_lengths,
+        head_dim=head_dim,
     )
 
 
@@ -217,7 +222,7 @@ def project_query(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
@@ -225,6 +230,8 @@ def project_query(  # noqa: PLR0913, PLR0917
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     routing_mode: int = _MINMAX_ROUTING,
     block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_query(
         input_qdata,
@@ -242,6 +249,7 @@ def project_query(  # noqa: PLR0913, PLR0917
         chunk_rows,
         routing_mode,
         block_lengths,
+        head_dim=head_dim,
     )
 
 
@@ -254,7 +262,7 @@ def _project_query_fake(
     _weight_scale: torch.Tensor,
     _weight_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
@@ -262,10 +270,12 @@ def _project_query_fake(
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
     _routing_mode: int = _MINMAX_ROUTING,
     _block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
-    head_dim = norm_weight.shape[0]
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     heads = weight_qdata.shape[0] // head_dim
     return (
         input_qdata.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),

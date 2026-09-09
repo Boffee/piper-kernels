@@ -11,6 +11,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   NVFP4, and ConvRot NVFP4 fusions. Attention, coarse gates, and output projections preserve
   the activation dtype; BF16 remains the default for internal operators. ConvRot NVFP4
   preparation, linears, and GGUF loading also accept FP32 logical weights and activations.
+- Added weightless Q/K RMSNorm (`weight=None`) to the full ConvRot INT8, NVFP4, and
+  ConvRot NVFP4 sparse-Piper fusions. Q and K may independently omit the affine weight;
+  normalization and RoPE remain fused in FP32 without allocating unit-weight tensors.
 - Added `shard_quantized_weight` for aligned, owning row and input-channel partitions of
   already quantized ConvRot INT8, NVFP4, and ConvRot NVFP4 weights. CPU/CUDA storage
   slicing preserves quantization metadata and repacks NVFP4 scales without requantizing

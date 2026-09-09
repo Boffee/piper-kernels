@@ -112,21 +112,28 @@ def _random_operands(
         128,
     ],
 )
+@pytest.mark.parametrize("affine", [True, False])
 def test_fused_query_projection_matches_the_fp32_composed_contract(
+    affine: bool,
     sequence_length: int,
     head_dim: int,
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    if not affine:
+        operands.norm_weight.fill_(1)
     options = {
         "norm_epsilon": 1e-6,
         "softmax_scale": head_dim**-0.5,
     }
 
     actual_query, actual_scale, actual_summary = query_fusion._project_query_op(
-        *operands.as_tuple(),
+        *operands.as_tuple()[:4],
+        operands.norm_weight if affine else None,
+        *operands.as_tuple()[5:],
         options["norm_epsilon"],
         options["softmax_scale"],
         _MINMAX_ROUTING,
+        head_dim=head_dim,
     )
     expected = composed_query_projection(*operands.as_tuple(), **options)
     storage_length = padded_sequence_length(sequence_length)

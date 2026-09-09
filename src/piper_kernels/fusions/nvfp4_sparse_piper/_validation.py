@@ -12,6 +12,7 @@ from piper_kernels.attention.sparse_piper_attention._block_layout import (
     validate_block_lengths as validate_k64_block_lengths,
 )
 from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
+from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 
@@ -55,19 +56,20 @@ def validate_projection(
 def validate_qk_epilogue(
     input_qdata: torch.Tensor,
     sequence_length: int,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
     name: str,
+    *,
+    head_dim: int | None = None,
 ) -> None:
     """Validate the RMSNorm/RoPE inputs shared by Q and K epilogues."""
-    head_dim = norm_weight.shape[0] if norm_weight.ndim == 1 else 0
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     rotary_dim = cos.shape[1] if cos.ndim == 2 else 0
-    operands = (norm_weight, cos, sin)
+    operands = tuple(operand for operand in (norm_weight, cos, sin) if operand is not None)
     if (
-        head_dim not in SUPPORTED_HEAD_DIMS
-        or norm_weight.dtype not in SUPPORTED_DTYPES
+        (norm_weight is not None and norm_weight.dtype not in SUPPORTED_DTYPES)
         or cos.ndim != 2
         or sin.shape != cos.shape
         or cos.shape[0] != sequence_length

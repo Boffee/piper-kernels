@@ -120,7 +120,7 @@ class _SparseProjectionAttention(torch.nn.Module):
                 self, name, torch.nn.Parameter(getattr(self, name).to(dtype), requires_grad=False)
             )
 
-    def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
+    def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor | None) -> torch.Tensor:
         normalized = F.rms_norm(
             projected.view(
                 self.batch,
@@ -232,7 +232,7 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
     def _dynamic_norm_rope(
         self,
         projected: torch.Tensor,
-        norm: torch.Tensor,
+        norm: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
@@ -536,6 +536,7 @@ def _run_explicit_fused_projection(
         model.head_dim**-0.5,
         routing_mode,
         block_lengths,
+        head_dim=model.head_dim,
     )
     key = fused_key._project_key_op(
         input_qdata,
@@ -548,6 +549,7 @@ def _run_explicit_fused_projection(
         1e-5,
         routing_mode,
         block_lengths,
+        head_dim=model.head_dim,
     )
     input_mean = int8_ops.dequantized_input_mean(
         input_qdata,
@@ -1070,14 +1072,18 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("affine", [True, False])
 def test_compile_options_fuse_attention_output_boundary(
-    monkeypatch, head_dim: int, dtype: torch.dtype
+    affine: bool, monkeypatch, head_dim: int, dtype: torch.dtype
 ) -> None:
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(719)
     model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
     model.set_activation_dtype(dtype)
+    if not affine:
+        model.query_norm = None
+        model.key_norm = None
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,
@@ -1317,8 +1323,13 @@ def test_compile_fuses_every_bounded_attention_feature(
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
 @pytest.mark.parametrize("query_chunk_rows", [64, 4096])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("query_affine", [True, False])
 def test_compile_lifetime_chunks_a_projected_coarse_gate(
-    dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch, routing: str, query_chunk_rows: int
+    query_affine: bool,
+    dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+    routing: str,
+    query_chunk_rows: int,
 ) -> None:
     torch.manual_seed(725)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
@@ -1326,6 +1337,8 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
     monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
     model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
     model.set_activation_dtype(dtype)
+    if not query_affine:
+        model.query_norm = None
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,

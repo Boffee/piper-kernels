@@ -63,6 +63,7 @@ def _normalized_rope_pattern(
     *,
     output_users: int = 1,
     activation_dtype: torch.dtype = torch.bfloat16,
+    affine: bool = True,
 ) -> CallFunction:
     # FP32 graphs omit redundant casts around RMSNorm and RoPE.
     low_precision = activation_dtype is not torch.float32
@@ -88,12 +89,18 @@ def _normalized_rope_pattern(
         _users=1,
     )
     inverse_rms = CallFunction(torch.ops.aten.rsqrt.default, variance, _users=1)
-    normalized = CallFunction(torch.ops.aten.mul.Tensor, promoted, inverse_rms, _users=1)
-    scaled = CallFunction(
-        torch.ops.aten.mul.Tensor,
-        normalized,
-        KeywordArg(f"{prefix}_norm_weight"),
-        _users=1 if low_precision else 2,
+    normalized = CallFunction(
+        torch.ops.aten.mul.Tensor, promoted, inverse_rms, _users=1 if affine or low_precision else 2
+    )
+    scaled = (
+        CallFunction(
+            torch.ops.aten.mul.Tensor,
+            normalized,
+            KeywordArg(f"{prefix}_norm_weight"),
+            _users=1 if low_precision else 2,
+        )
+        if affine
+        else normalized
     )
     rounded = (
         CallFunction(
@@ -153,18 +160,22 @@ def sparse_piper_projection_pattern(
     with_coarse: bool = False,
     with_sparse_query_blocks: bool = False,
     activation_dtype: torch.dtype = torch.bfloat16,
+    q_affine: bool = True,
+    k_affine: bool = True,
 ) -> CallFunction:
     """Match projected sparse attention with optional padding, coarse, and Q scopes."""
     operand_users = 2 if with_coarse else 1
     query = _normalized_rope_pattern(
         projection("sparse_q"),
         "sparse_q",
+        affine=q_affine,
         output_users=operand_users,
         activation_dtype=activation_dtype,
     )
     key = _normalized_rope_pattern(
         projection("sparse_k"),
         "sparse_k",
+        affine=k_affine,
         output_users=operand_users,
         activation_dtype=activation_dtype,
     )

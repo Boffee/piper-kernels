@@ -29,8 +29,10 @@ def rmsnorm_rope_tile(
     # Resolve generic libdevice through the compiling target, not a Python
     # default that captures its non-executable declaration before JIT.
     inverse_rms = libdevice.rsqrt(variance) if rsqrt_fn is None else rsqrt_fn(variance)
-    norm_weight = tl.load(norm_weight_ptr + feature_offsets).to(tl.float32)
-    normalized = projection * inverse_rms[:, :, None] * norm_weight[None, None, :]  # pyright: ignore[reportOptionalSubscript]
+    normalized = projection * inverse_rms[:, :, None]  # pyright: ignore[reportOptionalSubscript]
+    if norm_weight_ptr is not None:
+        norm_weight = tl.load(norm_weight_ptr + feature_offsets).to(tl.float32)
+        normalized = normalized * norm_weight[None, None, :]
 
     half_rotary_dim: tl.constexpr = rotary_dim // 2
     paired_features = tl.where(

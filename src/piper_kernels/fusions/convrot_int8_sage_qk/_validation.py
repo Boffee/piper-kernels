@@ -4,7 +4,8 @@ import math
 
 import torch
 
-_SUPPORTED_HEAD_DIMS = (64, 128)
+from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
+
 _SUPPORTED_NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -13,17 +14,16 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
     norm_epsilon: float,
     name: str,
+    head_dim: int | None = None,
 ) -> tuple[int, int, int]:
     """Validate inputs to a fused ConvRot INT8 Q/K projection kernel."""
-    head_dim = norm_weight.shape[0] if norm_weight.ndim == 1 else 0
-    if head_dim not in _SUPPORTED_HEAD_DIMS:
-        raise ValueError(f"{name} projection RMSNorm weight must be a D64/D128 vector")
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
         raise ValueError(f"{name} projection input must be [batch,sequence,features] INT8")
     batch, sequence_length, input_features = input_qdata.shape
@@ -38,7 +38,7 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
             f"{name} projection weight scale must be one FP32 value per output feature"
         )
     heads = weight_qdata.shape[0] // head_dim
-    if norm_weight.dtype not in _SUPPORTED_NORM_DTYPES:
+    if norm_weight is not None and norm_weight.dtype not in _SUPPORTED_NORM_DTYPES:
         raise ValueError(
             f"{name} projection RMSNorm weight must be an FP16/BF16/FP32 D64/D128 vector"
         )
@@ -49,7 +49,11 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
         raise ValueError(f"{name} projection rotary dimension must be even and fit D64/D128")
     if cos.dtype is not torch.float32 or sin.dtype is not cos.dtype:
         raise ValueError(f"{name} projection RoPE cos/sin must use FP32")
-    operands = input_qdata, input_scale, weight_qdata, weight_scale, norm_weight, cos, sin
+    operands = tuple(
+        operand
+        for operand in (input_qdata, input_scale, weight_qdata, weight_scale, norm_weight, cos, sin)
+        if operand is not None
+    )
     if any(operand.device != input_qdata.device for operand in operands):
         raise ValueError(f"{name} projection operands must share a device")
     if any(

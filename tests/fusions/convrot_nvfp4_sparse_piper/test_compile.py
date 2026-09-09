@@ -388,6 +388,7 @@ def _explicit_fused(
         model.head_dim**-0.5,
         4_096,
         model.sparse_attention._routing_mode,
+        head_dim=model.head_dim,
     )
     key = fused_key.project_key(
         *prepared[1],
@@ -401,6 +402,7 @@ def _explicit_fused(
         1e-5,
         4_096,
         model.sparse_attention._routing_mode,
+        head_dim=model.head_dim,
     )
     value_mean = linear_mean(
         *prepared[2],
@@ -476,6 +478,7 @@ def _explicit_fused_projected_gate(
         4_096,
         model.sparse_attention._routing_mode,
         block_lengths,
+        head_dim=model.head_dim,
     )
     key = fused_key.project_key(
         *k_input,
@@ -490,6 +493,7 @@ def _explicit_fused_projected_gate(
         4_096,
         model.sparse_attention._routing_mode,
         block_lengths,
+        head_dim=model.head_dim,
     )
     value_mean = linear_mean(
         *v_input,
@@ -566,7 +570,9 @@ class _TargetCapturePass(CustomInferenceAwareGraphPass):
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("affine", [True, False])
 def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
+    affine: bool,
     monkeypatch,
     dtype: torch.dtype,
     head_dim: int,
@@ -578,6 +584,9 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     torch.manual_seed(967 + dynamic)
     model = _ConvRotSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
     model.set_activation_dtype(dtype)
+    if not affine:
+        model.query_norm = None
+        model.key_norm = None
     input = torch.randn(  # noqa: A001
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -618,7 +627,9 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("key_affine", [True, False])
 def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
+    key_affine: bool,
     dtype: torch.dtype,
     dynamic: bool,
     routing: str,
@@ -630,6 +641,8 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
         routing=routing,
     ).eval()
     model.set_activation_dtype(dtype)
+    if not key_affine:
+        model.key_norm = None
     input = torch.randn(  # noqa: A001
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",

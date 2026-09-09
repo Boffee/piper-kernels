@@ -11,6 +11,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.fusions.convrot_int8_sage_qk._validation import (
     validate_qk_projection_inputs,
 )
+from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 
 from . import _backend
 from ._layout import TILE_ROWS, padded_sequence_length, validate_block_lengths
@@ -21,11 +22,12 @@ def _validate_inputs(
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
     norm_epsilon: float,
+    head_dim: int | None = None,
 ) -> tuple[int, int, int]:
     result = validate_qk_projection_inputs(
         input_qdata,
@@ -37,23 +39,26 @@ def _validate_inputs(
         sin,
         norm_epsilon=norm_epsilon,
         name="K",
+        head_dim=head_dim,
     )
     if result[1] < TILE_ROWS:
         raise ValueError(f"K projection requires at least {TILE_ROWS} sequence rows")
     return result
 
 
-def _launch_key_projection(
+def _launch_key_projection(  # noqa: PLR0913
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     batch, sequence_length, heads = _validate_inputs(
@@ -65,8 +70,9 @@ def _launch_key_projection(
         cos,
         sin,
         norm_epsilon=norm_epsilon,
+        head_dim=head_dim,
     )
-    head_dim = norm_weight.shape[0]
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     storage_sequence_length = padded_sequence_length(sequence_length)
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
@@ -112,17 +118,19 @@ def _launch_key_projection(
     "piper_kernels::convrot_int8_sparse_piper_project_key",
     mutates_args=(),
 )
-def _project_key_op(
+def _project_key_op(  # noqa: PLR0913
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key_projection(
         input_qdata,
@@ -135,6 +143,7 @@ def _project_key_op(
         norm_epsilon,
         routing_mode,
         block_lengths,
+        head_dim=head_dim,
     )
 
 
@@ -144,15 +153,17 @@ def _project_key_op_fake(
     _input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     _cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
     routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
-    head_dim = norm_weight.shape[0]
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     storage_sequence_length = padded_sequence_length(sequence_length)
     heads = weight_qdata.shape[0] // head_dim
     key = input_qdata.new_empty((batch, heads, storage_sequence_length, head_dim))

@@ -26,9 +26,15 @@ from ._helpers import (
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_chunked_qkv_epilogues_match_materialized_fp32_contract(head_dim: int) -> None:
+@pytest.mark.parametrize("affine", [True, False])
+def test_chunked_qkv_epilogues_match_materialized_fp32_contract(
+    head_dim: int, affine: bool
+) -> None:
     heads = 256 // head_dim
     operands = make_operands(head_dim=head_dim, heads=heads)
+    if not affine:
+        operands.query_norm.fill_(1)
+        operands.key_norm.fill_(1)
     q_projection = operands.projection(0)
     k_projection = operands.projection(1)
     v_projection = operands.projection(2)
@@ -61,21 +67,23 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract(head_dim: int) -
     actual_query = query.project_query(
         *q_projection.as_tuple(),
         biases[0],
-        operands.query_norm,
+        operands.query_norm if affine else None,
         operands.cos,
         operands.sin,
         1e-5,
         head_dim**-0.5,
         128,
+        head_dim=head_dim,
     )
     actual_key = key.project_key(
         *k_projection.as_tuple(),
         biases[1],
-        operands.key_norm,
+        operands.key_norm if affine else None,
         operands.cos,
         operands.sin,
         1e-5,
         128,
+        head_dim=head_dim,
     )
     actual_value = value.project_value_with_block_means(
         *v_projection.as_tuple(),
