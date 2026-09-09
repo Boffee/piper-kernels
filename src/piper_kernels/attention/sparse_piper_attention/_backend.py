@@ -89,7 +89,11 @@ def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
         if _nvidia_attention is not None and nvidia_policy.skip_dense_routing(head_dim):
             return _nvidia_attention_skip_dense_routing
         return _nvidia_attention
-    return _amd_attention if amd_policy.supports_target(target) and head_dim == 128 else None
+    return (
+        _amd_attention
+        if amd_policy.supports_target(target) and head_dim in SUPPORTED_HEAD_DIMS
+        else None
+    )
 
 
 def source_files() -> tuple[str, ...]:

@@ -35,6 +35,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     query,
     value,
 )
+from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import triton as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_compile
@@ -105,7 +106,6 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
         sys.platform == "linux"
         and target.is_amd_hip
         and target.is_architecture("gfx1200", "gfx1201")
-        and head_dim == 128
     ):
         expected = amd
     assert _backend.select_projection_backend(operand, head_dim=head_dim) is expected
@@ -193,7 +193,7 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-@pytest.mark.parametrize(("architecture", "head_dim"), [("gfx1100", 128), ("gfx1201", 64)])
+@pytest.mark.parametrize(("architecture", "head_dim"), [("gfx1100", 128), ("gfx1100", 64)])
 def test_unvalidated_projection_rejects_before_output_allocation(
     monkeypatch, operation, architecture, head_dim
 ):
@@ -428,8 +428,13 @@ def test_shared_fusion_does_not_inspect_targets_or_launch_kernels(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
 
 
+def test_shared_projection_launcher_does_not_own_target_policy():
+    _assert_shared_fusion_boundary(Path(projection.__file__).read_text())
+
+
 def test_compiler_cache_keys_include_projection_validation_and_attention_policy():
     assert qk_validation.__file__ in _compile._source_files()
+    assert projection.__file__ in _compile._source_files()
     for compiler in (_compile, nvfp4_compile):
         assert attention_policy.__file__ in compiler._source_files()
 
@@ -484,8 +489,8 @@ def test_amd_projection_compiler_selects_actual_attention_width(
     validate = Mock(return_value=True)
     monkeypatch.setattr(_compile.sparse_piper_compile, "valid_sparse_piper_attention", validate)
     match, _ = _projection_match(head_dim, input_features)
-    assert _compile._valid_sparse_piper_projection(match) is (head_dim == 128)
-    assert validate.called is (head_dim == 128)
+    assert _compile._valid_sparse_piper_projection(match)
+    validate.assert_called_once()
 
 
 @pytest.mark.parametrize("missing", [None, "projection", "linear", "mean", "attention"])
@@ -552,7 +557,9 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
     select.assert_called_once_with(query_node.meta["val"])
 
 
-def _capture_projection(monkeypatch, operation, implementation=nvidia, *, with_bias=False):
+def _capture_projection(
+    monkeypatch, operation, implementation=nvidia, head_dim=128, *, with_bias=False
+):
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": _kernels._convrot_project_quantize_key_kernel,
@@ -565,10 +572,10 @@ def _capture_projection(monkeypatch, operation, implementation=nvidia, *, with_b
     monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
     monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(implementation, "device_context", guard)
+    monkeypatch.setattr(projection, "device_context", guard)
     with FakeTensorMode():
-        operands = _operands()
-        bias = operands[3].new_empty((384,)) if with_bias else None
+        operands = _operands(head_dim=head_dim)
+        bias = operands[3].new_empty((3 * head_dim,)) if with_bias else None
         _call(operation, operands, emit_block_mean=True, bias=bias)
     guard.assert_called_once_with(torch.device("cuda:1"))
     for call in kernel.__getitem__.return_value.call_args_list:
@@ -580,39 +587,70 @@ def _capture_projection(monkeypatch, operation, implementation=nvidia, *, with_b
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-def test_nvidia_launch_schedule_and_fp32_math_are_preserved(monkeypatch, operation):
-    _, kernel = _capture_projection(monkeypatch, operation)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("implementation", [nvidia, amd])
+def test_backend_launch_schedule_and_fp32_math_are_preserved(
+    monkeypatch, operation, head_dim, implementation
+):
+    _, kernel = _capture_projection(monkeypatch, operation, implementation, head_dim)
+    is_amd = implementation is amd
+    heads_per_program = 1 if is_amd and operation != "value" else 2
+    block_m = 64 if operation == "query" or (is_amd and operation == "key") else 128
+    rows = 129 if operation == "query" else 193
+    grid_heads = triton.cdiv(3, heads_per_program)
     grids = [call.args[0] for call in kernel.__getitem__.call_args_list]
-    assert grids == ([(2, 2, 2), (1, 2, 2)] if operation == "query" else [(1, 2, 2)] * 2)
+    assert grids == [(rows // block_m, grid_heads, 2), (1, grid_heads, 2)]
     calls = kernel.__getitem__.return_value.call_args_list
     assert len(calls) == 2
     for index, call in enumerate(calls):
-        assert call.kwargs["block_m"] == (64 if operation == "query" else 128)
-        assert call.kwargs["block_n"] == 256
-        assert call.kwargs["block_k"] == 128
-        assert call.kwargs["num_warps"] == 8
-        assert call.kwargs["num_stages"] == 3
+        assert call.kwargs["block_m"] == block_m
+        assert call.kwargs["block_n"] == head_dim * heads_per_program
+        assert call.kwargs["block_k"] == (64 if is_amd else 128)
+        assert call.kwargs["heads_per_program"] == heads_per_program
+        assert call.kwargs["group_m"] == (8 if is_amd else 0)
+        assert call.kwargs["num_warps"] == (4 if is_amd and operation != "value" else 8)
+        assert call.kwargs["num_stages"] == (2 if is_amd else 3)
+        assert call.kwargs["aligned_projection"] is False
+        assert call.kwargs["mask_block_lengths"] is False
         if operation != "value":
-            assert call.kwargs["rsqrt_fn"] is libdevice.rsqrt_rn
+            assert call.kwargs["rsqrt_fn"] is (None if is_amd else libdevice.rsqrt_rn)
             assert call.kwargs["mask_ragged_tail"] is (index == 1)
+        if operation != "query":
+            assert call.args[-1] == (0 if index == 0 else rows // block_m)
+    if operation == "value":
+        mean = _kernels._project_prepared_input_mean_kernel
+        mean.__getitem__.assert_called_once_with((triton.cdiv(3, 2), 2))
+        assert mean.__getitem__.return_value.call_args.kwargs == {
+            "bias_ptr": None,
+            "input_features": 272,
+            "output_features": 3 * head_dim,
+            "block_n": 2 * head_dim,
+            "block_k": 64 if is_amd else 128,
+            "num_warps": 8,
+        }
 
 
 @pytest.mark.parametrize(
     ("operation", "affine"),
     [("query", True), ("query", False), ("key", True), ("key", False), ("value", True)],
 )
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
     "target",
     [GPUTarget("cuda", 120, 32), GPUTarget("hip", "gfx1200", 32), GPUTarget("hip", "gfx1201", 32)],
 )
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_production_launches_compile_without_intermediate_bf16(
-    monkeypatch, operation, target, affine, with_bias
+    monkeypatch, operation, target, head_dim, affine, with_bias
 ):
     if target.backend == "hip" and sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
     function, kernel = _capture_projection(
-        monkeypatch, operation, nvidia if target.backend == "cuda" else amd, with_bias=with_bias
+        monkeypatch,
+        operation,
+        nvidia if target.backend == "cuda" else amd,
+        head_dim,
+        with_bias=with_bias,
     )
     for call in kernel.__getitem__.return_value.call_args_list:
         arguments = dict(zip(function.arg_names, call.args, strict=False))

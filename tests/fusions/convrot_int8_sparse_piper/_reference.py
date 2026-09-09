@@ -48,7 +48,8 @@ def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *
     head_dim = projected.shape[-1]
     rotary = cos.shape[1]
     projected *= torch.rsqrt(projected.square().mean(-1, keepdim=True) + 1e-5)
-    projected *= norm.double()
+    if norm is not None:
+        projected *= norm.double()
     first, second = projected[:, :rotary].chunk(2, dim=-1)
     rotated = torch.cat((-second, first), -1)
     projected[:, :rotary] = (

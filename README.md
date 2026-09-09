@@ -582,7 +582,8 @@ The SM120 path supports both head widths, pairs two logical K64 tiles in one phy
 recurrence, and uses one centered-V INT8 scale per logical tile. It normally reads packed UINT16
 routes. Full-keep D64 calls use `skip_dense_routing` to visit all blocks without a route list;
 D128 retains the list. The online numerator and pre-rounding denominator remain FP32.
-The RDNA4 native path remains D128-only; D64 uses the portable fallback there.
+The RDNA4 native path supports D64 and D128, including ConvRot INT8 projection and output
+fusions. Both widths retain packed route lists and the four-wave Q64 schedule.
 Unsupported devices use a slow portable implementation of the same quantized Sparse Piper
 arithmetic. A separate exact-BF16 sparse reference serves as its
 quality oracle; it is not the public fallback.

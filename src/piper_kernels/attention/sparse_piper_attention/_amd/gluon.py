@@ -12,6 +12,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 
 from .._launch import validate_attention_launch
 from .._prepared import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
@@ -34,15 +35,6 @@ from ._packing import (
     PackedContext,
     pack_context,
 )
-
-
-@gluon.jit
-def _tile_index(routes, position, routed_count, selected_count, sparse_blocks, use_routes):
-    route = gl.load(routes + gl.minimum(position, routed_count - 1)).to(gl.int32)
-    sparse_tile = gl.where(use_routes, route, position)
-    return gl.where(
-        position < selected_count, sparse_tile, sparse_blocks + position - selected_count
-    )
 
 
 @gluon.jit
@@ -79,6 +71,7 @@ def _sparse_piper_attention_kernel(
     stride_gh: gl.constexpr,
     stride_gn: gl.constexpr,
     heads: gl.constexpr,
+    head_dim: gl.constexpr,
     has_lengths: gl.constexpr,
     has_dense_queries: gl.constexpr,
     has_coarse: gl.constexpr,
@@ -96,7 +89,9 @@ def _sparse_piper_attention_kernel(
     block_layout: gl.constexpr = gl.SliceLayout(1, row_layout)
     blocks = gl.full([1], query_block, gl.int32, block_layout)
     rows = gl.arange(0, 64, gl.SliceLayout(0, row_layout))
+    # The two K64 tiles always produce 128 score columns, independently of D.
     columns = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
+    features = gl.arange(0, head_dim, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
     routes = (
         routes_ptr
         + batch * stride_rb
@@ -108,7 +103,7 @@ def _sparse_piper_attention_kernel(
     selected_count = gl.where(use_routes, routed_count, sparse_blocks)
     tile_count = selected_count + storage_length // 64 - sparse_blocks
     query = query_fragments(
-        query_ptr + bh * query_storage_length * 128, blocks, query_storage_length
+        query_ptr + bh * query_storage_length * head_dim, blocks, query_storage_length, head_dim
     )
     q_scale = gl.load(
         query_scale_ptr
@@ -116,24 +111,32 @@ def _sparse_piper_attention_kernel(
         + blocks[:, None] * 2
         + rows[None, :] // 32
     )
-    numerator = gl.zeros([1, 64, 128], gl.float32, MMA_LAYOUT)
+    numerator = gl.zeros([1, 64, head_dim], gl.float32, MMA_LAYOUT)
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
     parameters = parameters_ptr + bh * (storage_length // 64) * PARAMETER_COUNT
 
     for pair in range(gl.cdiv(tile_count, 2)):
-        tile_0 = _tile_index(
-            routes, pair * 2, routed_count, selected_count, sparse_blocks, use_routes
+        tile_0 = tile_offset(
+            routes, pair * 2, routed_count, selected_count, sparse_blocks, 1, use_routes
         )
-        tile_1 = _tile_index(
+        tile_1 = tile_offset(
             routes,
             gl.minimum(pair * 2 + 1, tile_count - 1),
             routed_count,
             selected_count,
             sparse_blocks,
+            1,
             use_routes,
         )
-        scores = qk_pair(query, key_ptr + bh * storage_length * 128, tile_0, tile_1, storage_length)
+        scores = qk_pair(
+            query,
+            key_ptr + bh * storage_length * head_dim,
+            tile_0,
+            tile_1,
+            storage_length,
+            head_dim,
+        )
         parameters_0 = parameters + tile_0 * PARAMETER_COUNT
         parameters_1 = parameters + tile_1 * PARAMETER_COUNT
         key_scale_0 = gl.load(parameters_0 + KEY_SCALE)
@@ -216,7 +219,7 @@ def _sparse_piper_attention_kernel(
         )
         numerator = pv_pair(
             probabilities,
-            value_ptr + bh * storage_length * 128,
+            value_ptr + bh * storage_length * head_dim,
             tile_0,
             tile_1,
             numerator,
@@ -227,7 +230,7 @@ def _sparse_piper_attention_kernel(
 
     inverse_denominator = 1.0 / (gl.maximum(denominator, 1e-30) * 255.0)
     result = numerator * inverse_denominator[:, :, None]
-    result += gl.load(mean_ptr + bh * 128 + columns)[None, None, :]
+    result += gl.load(mean_ptr + bh * head_dim + features)[None, None, :]
     output_rows = (local_block * 64 + rows).to(gl.int64)
     valid_rows = (global_block * 64 + rows < logical_length) | has_lengths
     if has_coarse:
@@ -236,14 +239,14 @@ def _sparse_piper_attention_kernel(
             + batch * stride_cb
             + head * stride_ch
             + query_block.to(gl.int64) * stride_cq
-            + columns
+            + features
         )
         gate = gl.load(
             gate_ptr
             + batch * stride_gb
             + head * stride_gh
             + output_rows[None, :, None] * stride_gn
-            + columns[None, None, :],
+            + features[None, None, :],
             mask=valid_rows[None, :, None],
             other=0.0,
         ).to(gl.float32)
@@ -253,7 +256,7 @@ def _sparse_piper_attention_kernel(
         + batch * stride_ob
         + head * stride_oh
         + output_rows[None, :, None] * stride_on
-        + columns[None, None, :],
+        + features[None, None, :],
         result.to(output_ptr.dtype.element_ty),
         mask=valid_rows[None, :, None],
     )
@@ -286,8 +289,8 @@ class _ContextLauncher:
 
 def _validate_context(context: _PreparedSparsePiperContext) -> None:
     """Reject unsupported execution modes before packing or launching."""
-    if context.key.shape[-1] != 128:
-        raise ValueError("AMD sparse Piper requires D128")
+    if context.key.shape[-1] not in (64, 128):
+        raise ValueError("AMD sparse Piper requires D64 or D128")
     if context.routes_per_query == 0:
         raise ValueError("AMD sparse Piper does not implement skip_dense_routing")
 
@@ -318,7 +321,7 @@ def _launch_sparse_piper_attention(
     if packed is None:
         packed = pack_context(prepared.context)
     query, context = prepared.query, prepared.context
-    batch, heads, query_length, _ = query.data.shape
+    batch, heads, query_length, head_dim = query.data.shape
     storage_length = context.key.shape[2]
     coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
     gate_strides = (
@@ -356,6 +359,7 @@ def _launch_sparse_piper_attention(
             *coarse_strides,
             *gate_strides,
             heads,
+            head_dim,
             context.block_lengths is not None,
             context.sparse_query_blocks is not None,
             coarse_output is not None,

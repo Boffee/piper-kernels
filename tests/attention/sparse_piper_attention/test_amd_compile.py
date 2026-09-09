@@ -19,12 +19,14 @@ def _compile_attention(
     has_dense_queries,
     has_coarse,
     storage_length=256,
+    head_dim=128,
     output_dtype="bf16",
 ):
     constants = {
         "query_storage_length": storage_length,
         "storage_length": storage_length,
         "heads": 2,
+        "head_dim": head_dim,
         "logical_length": storage_length,
         "sparse_blocks": 3,
         "sparse_query_blocks": 2,
@@ -32,13 +34,13 @@ def _compile_attention(
         "stride_rq": 4,
         "stride_ob": 65536,
         "stride_oh": 32768,
-        "stride_on": 128,
+        "stride_on": head_dim,
         "stride_cb": 1024,
         "stride_ch": 512,
-        "stride_cq": 128,
+        "stride_cq": head_dim,
         "stride_gb": 65536,
-        "stride_gh": 128,
-        "stride_gn": 256,
+        "stride_gh": head_dim,
+        "stride_gn": 2 * head_dim,
         "has_lengths": has_lengths,
         "has_dense_queries": has_dense_queries,
         "has_coarse": has_coarse,
@@ -55,7 +57,7 @@ def _compile_attention(
             "parameters_ptr": "*fp32",
             "mean_ptr": "*fp32",
             "coarse_ptr": "*fp32",
-            "gate_ptr": "*bf16",
+            "gate_ptr": f"*{output_dtype}",
             "lengths_ptr": "*i32",
             "routes_ptr": "*u16",
             "keep_ptr": "*i32",
@@ -75,11 +77,14 @@ def _compile_attention(
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("has_lengths", [False, True])
 @pytest.mark.parametrize("has_dense_queries", [False, True])
 @pytest.mark.parametrize("has_coarse", [False, True])
-def test_fused_amd_compilation(architecture, has_lengths, has_dense_queries, has_coarse):
-    compiled = _compile_attention(architecture, has_lengths, has_dense_queries, has_coarse)
+def test_fused_amd_compilation(architecture, has_lengths, has_dense_queries, has_coarse, head_dim):
+    compiled = _compile_attention(
+        architecture, has_lengths, has_dense_queries, has_coarse, head_dim=head_dim
+    )
     assert compiled.asm["hsaco"]
     matrix_instructions = [
         line.replace(" ", "")
@@ -96,8 +101,12 @@ def test_fused_amd_compilation(architecture, has_lengths, has_dense_queries, has
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("dtype", ["fp16", "fp32"])
-def test_output_dtype_amd_compilation(architecture, dtype):
-    compiled = _compile_attention(architecture, True, True, False, output_dtype=dtype)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("has_coarse", [False, True])
+def test_output_dtype_amd_compilation(architecture, dtype, head_dim, has_coarse):
+    compiled = _compile_attention(
+        architecture, True, True, has_coarse, head_dim=head_dim, output_dtype=dtype
+    )
     assert compiled.asm["hsaco"]
     assert f'!tt.ptr<{dtype.replace("fp", "f")}> loc("output_ptr"' in compiled.asm["ttgir"]
     assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
@@ -105,9 +114,12 @@ def test_output_dtype_amd_compilation(architecture, dtype):
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
-def test_dense_suffix_and_query_word_offsets_can_use_wide_addressing(architecture):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_dense_suffix_and_query_word_offsets_can_use_wide_addressing(architecture, head_dim):
     # Compile only: a small UINT16 sparse prefix does not bound dense storage.
     # This also exceeds the signed-32-bit Q uint64-word-offset range.
-    compiled = _compile_attention(architecture, False, False, False, (1 << 27) + 64)
+    compiled = _compile_attention(
+        architecture, False, False, False, (1 << 31) // (head_dim // 8) + 64, head_dim
+    )
     assert compiled.asm["hsaco"]
     assert re.search(r"arith\.(?:muli|shli) .*: tensor<1x128xi64", compiled.asm["ttgir"])

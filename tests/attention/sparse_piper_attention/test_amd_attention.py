@@ -39,11 +39,13 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("sequence", [64, 65, 127, 128, 193, 320])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
-def test_fused_amd_matches_reference(sequence, routing_mode):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
     generator = torch.Generator(device="cuda").manual_seed(913 + sequence)
     q, k, v = [
-        torch.randn((2, sequence, 2, 128), dtype=torch.bfloat16, device="cuda", generator=generator)
+        torch.randn((2, sequence, 2, head_dim), dtype=dtype, device="cuda", generator=generator)
         for _ in range(3)
     ]
     blocks = max(1, sequence // 64 - 1)
@@ -55,14 +57,14 @@ def test_fused_amd_matches_reference(sequence, routing_mode):
         q.transpose(1, 2),
         routes.indices,
         routes.head_keep_blocks,
-        128**-0.5,
+        head_dim**-0.5,
         sparse_key_blocks=blocks,
         route_head_offsets=routes.route_head_offsets,
         combined_key=k.transpose(1, 2),
         combined_value=v.transpose(1, 2),
     )
     expected = reference_sparse_piper_attention(
-        q, k, v, routes, sparse_key_blocks=blocks, scale=128**-0.5
+        q, k, v, routes, sparse_key_blocks=blocks, scale=head_dim**-0.5
     )
     storage = torch.full((q.numel() + 16,), -123, device=q.device, dtype=q.dtype)
     actual = storage[8:-8].view(q.shape)
@@ -75,17 +77,23 @@ def test_fused_amd_matches_reference(sequence, routing_mode):
 
 
 @pytest.mark.parametrize("global_query_block", [0, 781, 1562])
-def test_long_context_local_query_matches_fp64(global_query_block):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
     # Exercise hundreds of online updates and the final 32-token tail without
     # allocating a complete 100k-token query/output tensor in the test suite.
     generator = torch.Generator(device="cuda").manual_seed(2137)
     sequence, padded, heads = 100000, 100032, 3
     keep = [391, 390, 1]
     key = torch.randint(
-        -31, 32, (1, heads, padded, 128), dtype=torch.int8, device="cuda", generator=generator
+        -31, 32, (1, heads, padded, head_dim), dtype=torch.int8, device="cuda", generator=generator
     )
     value = torch.randint(
-        -128, 128, (1, heads, 128, padded), dtype=torch.int8, device="cuda", generator=generator
+        -128,
+        128,
+        (1, heads, head_dim, padded),
+        dtype=torch.int8,
+        device="cuda",
+        generator=generator,
     )
     multiplier = torch.exp2(
         torch.empty((1, heads, padded // 64, 1), device="cuda").uniform_(
@@ -97,7 +105,7 @@ def test_long_context_local_query_matches_fp64(global_query_block):
         torch.full((1, heads, padded // 64), 0.1, device="cuda"),
         value,
         multiplier,
-        torch.randn((1, heads, 128), device="cuda", generator=generator),
+        torch.randn((1, heads, head_dim), device="cuda", generator=generator),
         torch.tensor(keep, device="cuda", dtype=torch.int32),
         torch.tensor([0, 391, 781, 782], device="cuda", dtype=torch.int32),
         sparse_key_blocks=sequence // 64,
@@ -112,7 +120,7 @@ def test_long_context_local_query_matches_fp64(global_query_block):
     ).to(torch.uint16)
     query = _prepare_sparse_piper_query_from_quantized(
         torch.randint(
-            -31, 32, (1, heads, 64, 128), dtype=torch.int8, device="cuda", generator=generator
+            -31, 32, (1, heads, 64, head_dim), dtype=torch.int8, device="cuda", generator=generator
         ),
         torch.full((1, heads, 2), 0.001, device="cuda"),
         routes.view(1, 1, -1),
@@ -121,8 +129,8 @@ def test_long_context_local_query_matches_fp64(global_query_block):
     )
     prepared = _PreparedSparsePiperAttention(context, query)
     rows = min(64, sequence - global_query_block * 64)
-    guarded = torch.full((heads * rows * 128 + 16,), -123, device="cuda", dtype=torch.bfloat16)
-    output = guarded[8:-8].view(1, heads, rows, 128)
+    guarded = torch.full((heads * rows * head_dim + 16,), -123, device="cuda", dtype=torch.bfloat16)
+    output = guarded[8:-8].view(1, heads, rows, head_dim)
     _launch_sparse_piper_attention(prepared, output)
     for head in range(heads):
         expected = reference_prepared_query(prepared, 0, head, 0)

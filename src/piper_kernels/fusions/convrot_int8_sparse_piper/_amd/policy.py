@@ -6,8 +6,8 @@ from piper_kernels._triton.targets import AcceleratorTarget
 
 
 def supports_head_dim(head_dim: int) -> bool:
-    """RDNA4 projection schedules are validated for D128 only."""
-    return head_dim == 128
+    """Head widths handled by the RDNA4 projection schedules."""
+    return head_dim in (64, 128)
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
