@@ -24,16 +24,16 @@ PARAMETER_COUNT = gl.constexpr(4)
 
 
 @gluon.jit
-def _pack_values(values_ptr, packed_ptr, storage_length: gl.constexpr):
+def _pack_values(values_ptr, packed_ptr, storage_length: gl.constexpr, head_dim: gl.constexpr):
     tile = gl.program_id(0).to(gl.int64)
     head = gl.program_id(1).to(gl.int64)
-    element = gl.arange(0, 128 * 64, gl.BlockedLayout([16], [32], [4], [0]))
+    element = gl.arange(0, head_dim * 64, gl.BlockedLayout([16], [32], [4], [0]))
     column = element // 64
     token = element % 64
     # Swap token bits 3/4 so adjacent WMMA reductions use contiguous words.
     token = (token & ~24) | ((token & 8) << 1) | ((token & 16) >> 1)
-    source = (head * 128 + column) * storage_length + tile * 64 + token
-    target = (head * (storage_length // 64) + tile) * (128 * 64) + element
+    source = (head * head_dim + column) * storage_length + tile * 64 + token
+    target = (head * (storage_length // 64) + tile) * (head_dim * 64) + element
     gl.store(packed_ptr + target, gl.load(values_ptr + source))
 
 
@@ -65,10 +65,10 @@ class PackedContext:
 
 
 def pack_context(context: _PreparedSparsePiperContext) -> PackedContext:
-    batch, heads, storage, _ = context.key.shape
+    batch, heads, storage, head_dim = context.key.shape
     with device_context(context.key.device):
         value = torch.empty(
-            (batch, heads, storage // 64, 128, 64), device=context.key.device, dtype=torch.int8
+            (batch, heads, storage // 64, head_dim, 64), device=context.key.device, dtype=torch.int8
         )
         parameters = torch.empty(
             (batch, heads, storage // 64, PARAMETER_COUNT.value),
@@ -76,7 +76,7 @@ def pack_context(context: _PreparedSparsePiperContext) -> PackedContext:
             dtype=torch.float32,
         )
         _pack_values[(storage // 64, batch * heads)](
-            context.value, value, storage, num_warps=4, num_stages=1
+            context.value, value, storage, head_dim, num_warps=4, num_stages=1
         )
         count = batch * heads * (storage // 64)
         _prepare_parameters[((count + 255) // 256,)](

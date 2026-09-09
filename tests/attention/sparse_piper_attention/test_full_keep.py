@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend, _routes, _routing
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
@@ -16,10 +15,10 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
 )
 
-requires_sm120 = pytest.mark.skipif(
+requires_native = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or _backend.select_attention_backend(torch.empty(0, device="cuda")) is None,
+    reason="requires native sparse attention",
 )
 
 
@@ -87,7 +86,7 @@ def test_full_keep_keeps_input_validation():
 
 @pytest.mark.parametrize("blocks", [3, 513, 65536])
 @pytest.mark.parametrize(
-    "device", ["cpu", pytest.param("cuda", marks=[pytest.mark.gpu, requires_sm120])]
+    "device", ["cpu", pytest.param("cuda", marks=[pytest.mark.gpu, requires_native])]
 )
 def test_canonical_routes_cover_heads_tail_and_uint16_limit(blocks, device):
     routes = torch.empty((2, 3, 2 * blocks), dtype=torch.uint16, device=device)
@@ -104,12 +103,15 @@ def test_canonical_routes_cover_heads_tail_and_uint16_limit(blocks, device):
 
 
 @pytest.mark.gpu
-@requires_sm120
+@requires_native
 @pytest.mark.parametrize("routing", ["minmax", "mean"])
 @pytest.mark.parametrize("sequence", [193, 1797])
-def test_full_keep_attention_matches_score_selected_routes(monkeypatch, routing, sequence):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_full_keep_attention_matches_score_selected_routes(
+    monkeypatch, routing, sequence, head_dim
+):
     operands = [
-        torch.randn(1, sequence, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+        torch.randn(1, sequence, 2, head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(3)
     ]
     attention = SparsePiperAttention((1.0, 1.0), routing=routing)
     with monkeypatch.context() as control:

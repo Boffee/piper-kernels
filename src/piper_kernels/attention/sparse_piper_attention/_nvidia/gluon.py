@@ -16,6 +16,7 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import validate_attention_launch
@@ -405,31 +406,6 @@ def _piper_pv_pair(
     return _rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
-@gluon.jit
-def _native_tile_start(
-    route_base,
-    tile_position,
-    routed_sparse_tile_count,
-    selected_sparse_tile_count,
-    sparse_key_blocks,
-    stride_rr,
-    use_sparse_routes,
-    skip_dense_routing: gl.constexpr,
-):
-    if skip_dense_routing:
-        return tile_position * _GL_BLOCK_N
-    else:
-        safe_route_position = gl.minimum(tile_position, routed_sparse_tile_count - 1)
-        route = gl.load(route_base + safe_route_position * stride_rr).to(gl.int32)
-        sparse_tile = gl.where(use_sparse_routes, route, tile_position)
-        sparse_start = sparse_tile * _GL_BLOCK_N
-        dense_start = (
-            sparse_key_blocks * _GL_BLOCK_N
-            + (tile_position - selected_sparse_tile_count) * _GL_BLOCK_N
-        )
-        return gl.where(tile_position < selected_sparse_tile_count, sparse_start, dense_start)
-
-
 @gluon.jit(
     do_not_specialize=[
         "logical_sequence_length",
@@ -563,7 +539,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
     initial_position_1 = gl.minimum(1, tile_count - 1)
-    initial_n_0 = _native_tile_start(
+    initial_n_0 = tile_offset(
         route_base,
         0,
         routed_sparse_tile_count,
@@ -572,8 +548,9 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         stride_rr,
         use_sparse_routes,
         skip_dense_routing,
+        _GL_BLOCK_N,
     )
-    initial_n_1 = _native_tile_start(
+    initial_n_1 = tile_offset(
         route_base,
         initial_position_1,
         routed_sparse_tile_count,
@@ -582,6 +559,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         stride_rr,
         use_sparse_routes,
         skip_dense_routing,
+        _GL_BLOCK_N,
     )
 
     _issue_tma(
@@ -666,7 +644,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
 
         next_position_0 = tile_position_0 + 2
         next_position_1 = gl.minimum(next_position_0 + 1, tile_count - 1)
-        next_n_0 = _native_tile_start(
+        next_n_0 = tile_offset(
             route_base,
             next_position_0,
             routed_sparse_tile_count,
@@ -675,8 +653,9 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
             stride_rr,
             use_sparse_routes,
             skip_dense_routing,
+            _GL_BLOCK_N,
         )
-        next_n_1 = _native_tile_start(
+        next_n_1 = tile_offset(
             route_base,
             next_position_1,
             routed_sparse_tile_count,
@@ -685,6 +664,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
             stride_rr,
             use_sparse_routes,
             skip_dense_routing,
+            _GL_BLOCK_N,
         )
         gl.barrier()
         _issue_tma_pair(

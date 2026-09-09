@@ -87,7 +87,7 @@ def test_amd_attention_selection_is_independent_and_uses_tensor_device(
     monkeypatch.setattr(_backend, "_amd_attention", backend)
     query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
     assert _backend.select_attention_backend(query) is (
-        backend if architecture in ("gfx1200", "gfx1201") and head_dim == 128 else None
+        backend if architecture in ("gfx1200", "gfx1201") else None
     )
     probe.assert_called_once_with(query.device)
 
@@ -591,7 +591,8 @@ def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch):
 
 @pytest.mark.skipif(_backend.amd_gluon is None, reason="requires Triton import")
 @pytest.mark.parametrize(
-    ("head_dim", "route_count", "message"), [(64, 2, "D128"), (128, 0, "skip_dense_routing")]
+    ("head_dim", "route_count", "message"),
+    [(64, 0, "skip_dense_routing"), (128, 0, "skip_dense_routing")],
 )
 def test_amd_rejects_unsupported_context_before_packing_or_launch(
     monkeypatch, head_dim, route_count, message

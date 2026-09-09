@@ -55,6 +55,7 @@ from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _backend, _kernels, _layout, _output_compile, key, output, query, value
+from . import triton as projection
 
 _COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v25"
 _TILE_ROWS = _layout.TILE_ROWS
@@ -79,6 +80,7 @@ def _source_files() -> tuple[str, ...]:
             _layout.__file__,
             *_backend.source_files(),
             _kernels.__file__,
+            projection.__file__,
             _output_compile.__file__,
             qk_quantization.__file__,
             sparse_piper_kernels.__file__,
