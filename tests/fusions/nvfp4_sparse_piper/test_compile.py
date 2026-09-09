@@ -110,7 +110,7 @@ def _semantic_linear(
 def _normalized_rope(
     graph: torch.fx.Graph,
     projected: torch.fx.Node,
-    norm: torch.fx.Node,
+    norm: torch.fx.Node | None,
     cos: torch.fx.Node,
     sin: torch.fx.Node,
 ) -> torch.fx.Node:
@@ -127,7 +127,11 @@ def _normalized_rope(
     variance = graph.call_function(torch.ops.aten.add.Scalar, args=(mean, 1e-5))
     inverse_rms = graph.call_function(torch.ops.aten.rsqrt.default, args=(variance,))
     normalized = graph.call_function(torch.ops.aten.mul.Tensor, args=(promoted, inverse_rms))
-    scaled = graph.call_function(torch.ops.aten.mul.Tensor, args=(normalized, norm))
+    scaled = (
+        graph.call_function(torch.ops.aten.mul.Tensor, args=(normalized, norm))
+        if norm is not None
+        else normalized
+    )
     rounded = graph.call_function(
         torch.ops.prims.convert_element_type.default,
         args=(scaled, torch.bfloat16),
@@ -176,6 +180,8 @@ def _semantic_attention_graph(
     with_coarse: bool = False,
     with_sparse_query_blocks: bool = False,
     high_first: bool = False,
+    q_affine: bool = True,
+    k_affine: bool = True,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
@@ -225,8 +231,8 @@ def _semantic_attention_graph(
             "sin",
             torch.empty((192, 96), device="cuda", dtype=torch.float32),
         )
-        query = _normalized_rope(graph, projected[0], q_norm, cos, sin)
-        key = _normalized_rope(graph, projected[1], k_norm, cos, sin)
+        query = _normalized_rope(graph, projected[0], q_norm if q_affine else None, cos, sin)
+        key = _normalized_rope(graph, projected[1], k_norm if k_affine else None, cos, sin)
         value = graph.call_function(
             torch.ops.aten.reshape.default,
             args=(projected[2], (1, 192, 2, 128)),
@@ -519,7 +525,7 @@ class _SparseProjectionAttention(torch.nn.Module):
                 self, name, torch.nn.Parameter(getattr(self, name).to(dtype), requires_grad=False)
             )
 
-    def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
+    def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor | None) -> torch.Tensor:
         normalized = F.rms_norm(
             projected.view(
                 self.batch,
@@ -746,6 +752,7 @@ def _run_explicit_attention_output(
         4_096,
         model.sparse_attention._routing_mode,
         block_lengths,
+        head_dim=model.head_dim,
     )
     key = fused_key.project_key(
         *k_input,
@@ -758,6 +765,7 @@ def _run_explicit_attention_output(
         4_096,
         model.sparse_attention._routing_mode,
         block_lengths,
+        head_dim=model.head_dim,
     )
     value_mean = linear_mean(
         *v_input,
@@ -880,13 +888,19 @@ def test_compile_options_install_versioned_idempotent_passes() -> None:
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
+@pytest.mark.parametrize("q_affine", [True, False])
+@pytest.mark.parametrize("k_affine", [True, False])
 def test_prepared_projection_family_fuses_without_materializing_linears(
+    q_affine: bool,
+    k_affine: bool,
     monkeypatch: pytest.MonkeyPatch,
     dynamic: bool,
     preparation_count: int,
     routing_mode: int,
 ) -> None:
-    graph = _semantic_attention_graph(dynamic=dynamic, routing_mode=routing_mode)
+    graph = _semantic_attention_graph(
+        dynamic=dynamic, routing_mode=routing_mode, q_affine=q_affine, k_affine=k_affine
+    )
     monkeypatch.setattr(
         AcceleratorTarget,
         "from_device",
@@ -1163,7 +1177,9 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("affine", [True, False])
 def test_cuda_compile_fuses_static_nvfp4_attention_output(
+    affine: bool,
     monkeypatch,
     dtype: torch.dtype,
     head_dim: int,
@@ -1175,6 +1191,9 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
     torch.manual_seed(829)
     model = _SparseProjectionAttentionOutput(dynamic=dynamic).eval()
     model.set_activation_dtype(dtype)
+    if not affine:
+        model.query_norm = None
+        model.key_norm = None
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -1298,7 +1317,9 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("key_affine", [True, False])
 def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
+    key_affine: bool,
     dtype: torch.dtype,
     dynamic: bool,
     routing: str,
@@ -1310,6 +1331,8 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         routing=routing,
     ).eval()
     model.set_activation_dtype(dtype)
+    if not key_affine:
+        model.key_norm = None
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",

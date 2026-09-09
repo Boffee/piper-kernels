@@ -113,18 +113,24 @@ def _random_operands(
         128,
     ],
 )
+@pytest.mark.parametrize("affine", [True, False])
 def test_fused_key_projection_matches_the_fp32_composed_contract(
-    sequence_length: int, head_dim: int
+    affine: bool, sequence_length: int, head_dim: int
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    if not affine:
+        operands.norm_weight.fill_(1)
     options = {
         "norm_epsilon": 1e-5,
     }
 
     actual_key, actual_scale, actual_max, actual_min = key_fusion._project_key_op(
-        *operands.as_tuple(),
+        *operands.as_tuple()[:4],
+        operands.norm_weight if affine else None,
+        *operands.as_tuple()[5:],
         options["norm_epsilon"],
         _MINMAX_ROUTING,
+        head_dim=head_dim,
     )
     expected = composed_key_projection(*operands.as_tuple(), **options)
     storage_length = padded_sequence_length(sequence_length)

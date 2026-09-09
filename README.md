@@ -571,6 +571,10 @@ not materialized. These full fusion paths support FP16, BF16, and FP32 activatio
 the dtype through attention, coarse-gate buffers, and the final output projection. Quantized
 Q/K/V storage and FP32 accumulation are unchanged; internal operators default to BF16 when
 `output_dtype` is omitted.
+Q and K RMSNorm may independently use `weight=None`; the fused kernels omit the affine
+weight load and multiply. Standalone fused Q/K projection operators require `head_dim=64`
+or `head_dim=128` for weightless norms; compiled graphs infer it from the attention shape.
+Affine norms continue to infer head width from their weight when `head_dim` is omitted.
 
 The SM120 path supports both head widths, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. It normally reads packed UINT16

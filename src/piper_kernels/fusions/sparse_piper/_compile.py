@@ -13,6 +13,7 @@ from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.sparse_piper_attention import _backend, _budget, _dtype
+from piper_kernels.fusions.projected_qk import _validation as projected_qk_validation
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
@@ -73,7 +74,6 @@ def ordered_tuple_output_producer(
     if (
         not isinstance(producer, torch.fx.Node)
         or producer.target is not target
-        or producer.kwargs
         or any(node.args[0] is not producer for node in nodes)
         or tuple(node.args[1] for node in nodes) != tuple(range(len(nodes)))
     ):
@@ -92,7 +92,13 @@ def source_files() -> tuple[str, ...]:
     """Return sources that affect shared sparse-attention validation and policy."""
     return tuple(
         file_name
-        for file_name in (__file__, _dtype.__file__, _budget.__file__, *_backend.source_files())
+        for file_name in (
+            __file__,
+            _dtype.__file__,
+            _budget.__file__,
+            projected_qk_validation.__file__,
+            *_backend.source_files(),
+        )
         if file_name is not None
     )
 
@@ -206,12 +212,7 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
     tile_rows: int,
 ) -> bool:
     """Validate the projection-independent portion of a sparse Piper match."""
-    names = (
-        "sparse_q_norm_weight",
-        "sparse_k_norm_weight",
-        "sparse_cos",
-        "sparse_sin",
-    )
+    names = ("sparse_cos", "sparse_sin")
     if any(not isinstance(match.kwargs[name], torch.fx.Node) for name in names):
         return False
     metadata = {
@@ -256,10 +257,17 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
         return False
 
     for name in ("sparse_q_norm_weight", "sparse_k_norm_weight"):
-        norm = metadata[name]
-        assert norm is not None
+        norm_node = match.kwargs.get(name)
+        if norm_node is None:
+            continue
+        if not isinstance(norm_node, torch.fx.Node):
+            return False
+        norm = preparation_sharing.tensor_metadata(norm_node)
         if (
-            norm.dtype not in _dtype.SUPPORTED_DTYPES
+            norm is None
+            or norm.layout is not torch.strided
+            or not norm.is_contiguous()
+            or norm.dtype not in _dtype.SUPPORTED_DTYPES
             or tuple(norm.shape) != (head_dim,)
             or norm.device != device
         ):

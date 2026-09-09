@@ -591,7 +591,10 @@ def test_nvidia_launch_schedule_and_fp32_math_are_preserved(monkeypatch, operati
     "target",
     [GPUTarget("cuda", 120, 32), GPUTarget("hip", "gfx1200", 32), GPUTarget("hip", "gfx1201", 32)],
 )
-def test_production_launches_compile_without_intermediate_bf16(monkeypatch, operation, target):
+@pytest.mark.parametrize("affine", [True, False])
+def test_production_launches_compile_without_intermediate_bf16(
+    monkeypatch, operation, target, affine
+):
     if target.backend == "hip" and sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
     function, kernel = _capture_projection(
@@ -604,6 +607,8 @@ def test_production_launches_compile_without_intermediate_bf16(monkeypatch, oper
         )
         arguments.setdefault("rsqrt_fn", None)
         arguments.setdefault("group_m", 0)
+        if not affine and operation != "value":
+            arguments["norm_weight_ptr"] = None
         constants, signature = {}, {}
         types = {
             torch.int8: "*i8",
@@ -615,6 +620,9 @@ def test_production_launches_compile_without_intermediate_bf16(monkeypatch, oper
             argument = arguments[parameter.name]
             if parameter.is_constexpr:
                 constants[parameter.name] = argument
+            elif argument is None:
+                constants[parameter.name] = None
+                signature[parameter.name] = "constexpr"
             else:
                 signature[parameter.name] = (
                     types[argument.dtype] if isinstance(argument, torch.Tensor) else "i32"

@@ -354,7 +354,7 @@ def launch_query(  # noqa: PLR0913, PLR0917
     storage_chunk_start: int | None = None,
 ) -> None:
     chunk_rows, output_features = projection.shape
-    head_dim = norm_weight.shape[0]
+    head_dim = query.shape[-1]
     heads = output_features // head_dim
     storage_sequence_length = query.shape[2]
     if storage_chunk_start is None:
@@ -426,7 +426,7 @@ def launch_key(  # noqa: PLR0913, PLR0917
     block_lengths,
 ) -> None:
     chunk_rows, output_features = projection.shape
-    head_dim = norm_weight.shape[0]
+    head_dim = key.shape[-1]
     heads = output_features // head_dim
     storage_sequence_length = key.shape[2]
     has_block_lengths = block_lengths is not None

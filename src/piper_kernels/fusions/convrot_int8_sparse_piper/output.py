@@ -377,7 +377,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     query_input_scale: torch.Tensor,
     query_weight_qdata: torch.Tensor,
     query_weight_scale: torch.Tensor,
-    query_norm_weight: torch.Tensor,
+    query_norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     query_norm_epsilon: float,
@@ -467,6 +467,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             chunk_start=start,
             chunk_rows=rows,
             backend=projection_backend,
+            head_dim=key.shape[-1],
         )
 
     return output_common.run_chunked_projected_query_attention_output(
@@ -490,7 +491,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     query_input_scale: torch.Tensor,
     query_weight_qdata: torch.Tensor,
     query_weight_scale: torch.Tensor,
-    query_norm_weight: torch.Tensor,
+    query_norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     query_norm_epsilon: float,
@@ -578,7 +579,7 @@ def _projected_query_attention_output_op_fake(
     _query_input_scale: torch.Tensor,
     _query_weight_qdata: torch.Tensor,
     _query_weight_scale: torch.Tensor,
-    _query_norm_weight: torch.Tensor,
+    _query_norm_weight: torch.Tensor | None,
     _cos: torch.Tensor,
     _sin: torch.Tensor,
     _query_norm_epsilon: float,

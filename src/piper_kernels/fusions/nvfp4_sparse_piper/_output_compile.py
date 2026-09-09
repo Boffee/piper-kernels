@@ -145,8 +145,14 @@ def _prepared_query_projection(
         (query, query_scale, query_summary),
         torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default,
     )
+    query_value = (
+        preparation_sharing.tensor_metadata(query) if isinstance(query, torch.fx.Node) else None
+    )
     if (
         producer is None
+        or query_value is None
+        or query_value.ndim != 4
+        or (producer.kwargs and producer.kwargs != {"head_dim": query_value.shape[-1]})
         or len(producer.args) not in (14, 15)
         or producer.args[13] != routing_mode
         or (producer.args[14] if len(producer.args) == 15 else None) is not block_lengths

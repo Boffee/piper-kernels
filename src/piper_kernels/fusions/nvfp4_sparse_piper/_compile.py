@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from itertools import product
 
 import torch
 from torch._inductor.custom_graph_pass import (
@@ -244,8 +245,10 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     assert query_projection is not None
     assert key_projection is not None
     assert value_projection is not None
-    q_norm_weight = _matched_node(match, "sparse_q_norm_weight")
-    k_norm_weight = _matched_node(match, "sparse_k_norm_weight")
+    q_norm_weight = match.kwargs.get("sparse_q_norm_weight")
+    assert q_norm_weight is None or isinstance(q_norm_weight, torch.fx.Node)
+    k_norm_weight = match.kwargs.get("sparse_k_norm_weight")
+    assert k_norm_weight is None or isinstance(k_norm_weight, torch.fx.Node)
     cos = _matched_node(match, "sparse_cos")
     sin = _matched_node(match, "sparse_sin")
     input_value = preparation_sharing.tensor_metadata(query_projection.input_qdata)
@@ -289,6 +292,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
                 *block_length_arguments,
             ),
             query_values,
+            kwargs={"head_dim": head_dim},
         )
         key_summary = input_value.new_empty(
             (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
@@ -320,6 +324,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
                 *block_length_arguments,
             ),
             key_values,
+            kwargs={"head_dim": head_dim},
         )
         value_mean_flat = graph.call_function(
             torch.ops.piper_kernels.nvfp4_linear_mean.default,
@@ -398,20 +403,26 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
 
 _patterns = PatternMatcherPass("nvfp4_sparse_piper_projection")
 for _activation_dtype in SUPPORTED_DTYPES:
-    for _with_coarse in (True, False):
-        for _with_block_lengths in (True, False):
-            for _with_sparse_query_blocks in (True, False):
-                register_graph_pattern(
-                    sparse_piper_pattern.sparse_piper_projection_pattern(
-                        _linear_pattern,
-                        activation_dtype=_activation_dtype,
-                        with_block_lengths=_with_block_lengths,
-                        with_coarse=_with_coarse,
-                        with_sparse_query_blocks=_with_sparse_query_blocks,
-                    ),
-                    extra_check=_valid_coarse_projection if _with_coarse else _valid_projection,
-                    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-                )(_replace_projection)
+    for (
+        _q_affine,
+        _k_affine,
+        _with_coarse,
+        _with_block_lengths,
+        _with_sparse_query_blocks,
+    ) in product((True, False), repeat=5):
+        register_graph_pattern(
+            sparse_piper_pattern.sparse_piper_projection_pattern(
+                _linear_pattern,
+                activation_dtype=_activation_dtype,
+                q_affine=_q_affine,
+                k_affine=_k_affine,
+                with_block_lengths=_with_block_lengths,
+                with_coarse=_with_coarse,
+                with_sparse_query_blocks=_with_sparse_query_blocks,
+            ),
+            extra_check=_valid_coarse_projection if _with_coarse else _valid_projection,
+            pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_projection)
 
 
 def _fold_projection(graph: torch.fx.Graph) -> bool:

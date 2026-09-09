@@ -13,6 +13,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
     validate_routing_mode,
 )
+from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
     PreparedProjection,
@@ -31,16 +32,18 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
     chunk_rows: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
-    head_dim = norm_weight.shape[0] if norm_weight.ndim == 1 else 0
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     sequence_length, heads = validate_projection(
         input_qdata,
         input_scale,
@@ -61,6 +64,7 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         sin,
         norm_epsilon,
         "K projection",
+        head_dim=head_dim,
     )
     validate_block_lengths(
         block_lengths,
@@ -68,7 +72,6 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         input_qdata.device,
         "K projection",
     )
-    operands = (norm_weight, cos, sin)
     storage_sequence_length = padded_sequence_length(sequence_length)
     key = torch.empty(
         (1, heads, storage_sequence_length, head_dim),
@@ -120,12 +123,12 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         )
 
     outputs = (key, key_scale, key_summary, key_aux)
-    consumer_tensors = [input_per_tensor_scale, *operands]
+    consumer_tensors = [input_per_tensor_scale, cos, sin]
     consumer_tensors.extend(
-        operand for operand in (weight_per_tensor_scale, bias) if operand is not None
+        operand
+        for operand in (norm_weight, weight_per_tensor_scale, bias, block_lengths)
+        if operand is not None
     )
-    if block_lengths is not None:
-        consumer_tensors.append(block_lengths)
     run_chunked_projection(projection, chunk_rows, consume, (*consumer_tensors, *outputs))
     return outputs
 
@@ -139,13 +142,15 @@ def project_key(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     routing_mode: int = _MINMAX_ROUTING,
     block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_key(
         input_qdata,
@@ -162,6 +167,7 @@ def project_key(  # noqa: PLR0913, PLR0917
         chunk_rows,
         routing_mode,
         block_lengths,
+        head_dim=head_dim,
     )
 
 
@@ -174,17 +180,19 @@ def _project_key_fake(
     _weight_scale: torch.Tensor,
     _weight_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     _cos: torch.Tensor,
     _sin: torch.Tensor,
     _norm_epsilon: float,
     _chunk_rows: int = DEFAULT_CHUNK_ROWS,
     routing_mode: int = _MINMAX_ROUTING,
     _block_lengths: torch.Tensor | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
     storage_sequence_length = padded_sequence_length(sequence_length)
-    head_dim = norm_weight.shape[0]
+    head_dim = resolve_head_dim(norm_weight, head_dim)
     heads = weight_qdata.shape[0] // head_dim
     key = input_qdata.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8)
     key_scale = input_qdata.new_empty(

@@ -387,7 +387,7 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     query_weight_scale: torch.Tensor,
     query_weight_per_tensor_scale: torch.Tensor | None,
     query_bias: torch.Tensor | None,
-    query_norm_weight: torch.Tensor,
+    query_norm_weight: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     query_norm_epsilon: float,
@@ -478,6 +478,7 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             block_lengths,
             chunk_start=start,
             chunk_rows=rows,
+            head_dim=key.shape[-1],
         )
 
     return output_common.run_chunked_projected_query_attention_output(

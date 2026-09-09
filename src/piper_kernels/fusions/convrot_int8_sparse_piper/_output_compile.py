@@ -33,7 +33,7 @@ type _PreparedQueryProjectionNodes = tuple[
     torch.fx.Node,
     torch.fx.Node,
     torch.fx.Node,
-    torch.fx.Node,
+    torch.fx.Node | None,
     torch.fx.Node,
     torch.fx.Node,
     float,
@@ -116,8 +116,14 @@ def _prepared_query_projection(
         (query, query_scale, query_summary),
         torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default,
     )
+    query_value = (
+        preparation_sharing.tensor_metadata(query) if isinstance(query, torch.fx.Node) else None
+    )
     if (
         producer is None
+        or query_value is None
+        or query_value.ndim != 4
+        or (producer.kwargs and producer.kwargs != {"head_dim": query_value.shape[-1]})
         or len(producer.args) not in (10, 11)
         or producer.args[9] != routing_mode
         or (producer.args[10] if len(producer.args) == 11 else None) is not block_lengths
@@ -125,7 +131,8 @@ def _prepared_query_projection(
         return None
     projection = producer.args[:9]
     if (
-        any(not isinstance(value, torch.fx.Node) for value in projection[:7])
+        any(not isinstance(value, torch.fx.Node) for value in (*projection[:4], *projection[5:7]))
+        or (projection[4] is not None and not isinstance(projection[4], torch.fx.Node))
         or not isinstance(projection[7], float)
         or not isinstance(projection[8], float)
     ):

@@ -12,9 +12,11 @@ def emit_tuple_result(
     target: object,
     args: tuple[object, ...],
     values: tuple[torch.Tensor, ...],
+    *,
+    kwargs: dict[str, object] | None = None,
 ) -> tuple[torch.fx.Node, ...]:
     """Emit a tuple-returning custom op and metadata-bearing getitems."""
-    result = graph.call_function(target, args=args)  # pyright: ignore[reportArgumentType]
+    result = graph.call_function(target, args=args, kwargs=kwargs)  # pyright: ignore[reportArgumentType]
     result.meta["val"] = values
     outputs = []
     for index, value in enumerate(values):
