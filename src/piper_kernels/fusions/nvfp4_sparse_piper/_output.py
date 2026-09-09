@@ -329,6 +329,8 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
     gate_projection: PreparedGateProjection | None = None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into a static NVFP4 output."""
     prepared = output_common.prepare_attention(
@@ -373,6 +375,7 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
+        output_dtype=output_dtype,
     )
 
 
@@ -414,6 +417,8 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
     gate_projection: PreparedGateProjection | None = None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Lifetime-chunk NVFP4 Q through routing, attention, and output."""
     prepared = output_common.prepare_attention_context(
@@ -483,6 +488,7 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
+        output_dtype=output_dtype,
     )
 
 

@@ -418,11 +418,12 @@ def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
     or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_sm120_padded_summaries_match_portable_valid_prefix_extrema() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_sm120_padded_summaries_match_portable_valid_prefix_extrema(dtype: torch.dtype) -> None:
     generator = torch.Generator().manual_seed(545)
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
-    query = torch.randn((1, 2, 3 * 64, 128), dtype=torch.bfloat16, generator=generator)
-    key = torch.randn((1, 2, 2 * 64, 128), dtype=torch.bfloat16, generator=generator)
+    query = torch.randn((1, 2, 3 * 64, 128), dtype=dtype, generator=generator)
+    key = torch.randn((1, 2, 2 * 64, 128), dtype=dtype, generator=generator)
     valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
     valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
     query = query.unflatten(2, (3, 64))
@@ -440,7 +441,10 @@ def test_sm120_padded_summaries_match_portable_valid_prefix_extrema() -> None:
     )
 
     for actual_summary, expected_summary in zip(actual, expected, strict=True):
-        torch.testing.assert_close(actual_summary.cpu(), expected_summary, atol=0, rtol=0)
+        tolerance = 1e-6 if dtype is torch.float32 else 0
+        torch.testing.assert_close(
+            actual_summary.cpu(), expected_summary, atol=tolerance, rtol=tolerance
+        )
 
 
 @pytest.mark.gpu

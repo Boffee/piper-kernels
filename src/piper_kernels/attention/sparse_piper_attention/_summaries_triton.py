@@ -14,6 +14,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
+from ._dtype import SUPPORTED_DTYPES
 from ._routing_modes import (
     _MEAN_ROUTING,
     validate_routing_mode,
@@ -106,8 +107,8 @@ def sequence_block_summaries(
         or key.shape[2] < _BLOCK_ROWS
     ):
         raise ValueError("optimized summaries require nonempty ragged Q/K with D64/D128 K")
-    if query.device.type != "cuda" or query.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("optimized summaries require CUDA BF16/FP16 inputs")
+    if query.device.type != "cuda" or query.dtype not in SUPPORTED_DTYPES:
+        raise ValueError("optimized summaries require CUDA FP16/BF16/FP32 inputs")
     if key.device != query.device or key.dtype != query.dtype:
         raise ValueError("optimized summary Q/K sequences must share a device and dtype")
     if query.stride(-1) != 1 or key.stride(-1) != 1:

@@ -10,6 +10,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
+from piper_kernels.attention.sparse_piper_attention._dtype import validate_output_dtype
 
 if TYPE_CHECKING:
     from piper_kernels.attention.sparse_piper_attention._prepared import (
@@ -107,8 +108,11 @@ def new_projected_output(
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None,
     output_features: int,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Allocate the projected compact or valid-front padded output shape."""
+    validate_output_dtype(output_dtype)
     return attention_storage.new_empty(
         (
             attention_storage.shape[0],
@@ -119,7 +123,7 @@ def new_projected_output(
             ),
             output_features,
         ),
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
     )
 
 
@@ -278,7 +282,7 @@ def _query_chunk_ranges(
     return ranges
 
 
-def _run_chunked_attention_pipeline(  # noqa: PLR0915
+def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
     attention_storage: torch.Tensor,
     sequence_length: int,
     has_coarse_residual: bool,
@@ -290,8 +294,10 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0915
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Share buffering, gate, and stream ordering across both Q lifetimes."""
+    validate_output_dtype(output_dtype)
     chunk_ranges = _query_chunk_ranges(sequence_length, query_chunk_rows)
     chunk_count = len(chunk_ranges)
     pipeline_projected_gate = (
@@ -306,7 +312,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0915
     attention_buffers = torch.empty(
         (min(2, chunk_count), batch, capacity, heads, head_dim),
         device=attention_storage.device,
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
     )
     if has_coarse_residual and (coarse_gate is None) == (project_coarse_gate_chunk is None):
         raise ValueError("coarse attention requires exactly one coarse gate source")
@@ -318,7 +324,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0915
         torch.empty(
             (2 if pipeline_projected_gate else 1, batch, capacity, heads, head_dim),
             device=attention_storage.device,
-            dtype=torch.bfloat16,
+            dtype=output_dtype,
         )
         if project_coarse_gate_chunk is not None
         else None
@@ -326,7 +332,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0915
     output = torch.empty(
         (batch, sequence_length, output_features),
         device=attention_storage.device,
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
     )
 
     def coarse_gate_chunk(start: int, rows: int) -> torch.Tensor | None:
@@ -439,6 +445,7 @@ def run_chunked_attention_output(
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Pipeline a materialized Q boundary through bounded attention output."""
     prepared_attention = prepared.attention
@@ -471,6 +478,7 @@ def run_chunked_attention_output(
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=project_coarse_gate_chunk,
+        output_dtype=output_dtype,
     )
 
 
@@ -483,6 +491,7 @@ def run_chunked_projected_query_attention_output(
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Project, route, attend, and consume one bounded Q window at a time."""
 
@@ -520,6 +529,7 @@ def run_chunked_projected_query_attention_output(
         project_chunk,
         projector_tensors,
         project_coarse_gate_chunk=project_coarse_gate_chunk,
+        output_dtype=output_dtype,
     )
 
 

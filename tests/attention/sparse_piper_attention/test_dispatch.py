@@ -31,6 +31,41 @@ def test_public_api_exports_sparse_attention_backend() -> None:
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("ratio", [0.5, 1.0])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_attention_preserves_dtype_and_accuracy(device, head_dim, ratio, dtype):
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or select_attention_backend(torch.empty(1, 193, 2, head_dim, device=device)) is None
+    ):
+        pytest.skip("requires a native sparse-attention backend")
+    operands = tuple(tensor.to(dtype) for tensor in _inputs(device, 193, head_dim))
+    attention = SparsePiperAttention((ratio, ratio))
+    actual = attention(*operands, sparse_key_blocks=3)
+    # The CPU path computes attention from unquantized inputs using the same routing.
+    expected = attention(*(tensor.cpu() for tensor in operands), sparse_key_blocks=3)
+    assert actual.dtype is dtype
+    assert actual.shape == operands[0].shape
+    assert torch.isfinite(actual).all()
+    relative_error = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
+    assert relative_error < 0.03
+
+    # An intermediate store in a narrower dtype would round this value to 1.
+    increment = 2**-10 if dtype is torch.float16 else 2**-20
+    constant = torch.full_like(operands[2], 1 + increment)
+    zeros = torch.zeros_like(operands[0])
+    actual = attention(zeros, zeros, constant, sparse_key_blocks=3)
+    torch.testing.assert_close(actual, constant, atol=0, rtol=0)
+
+
+def test_sparse_attention_rejects_mixed_activation_dtypes():
+    query, key, value = _inputs()
+    with pytest.raises(ValueError, match="share float16, bfloat16, or float32"):
+        SparsePiperAttention((1.0, 1.0))(query.half(), key, value, sparse_key_blocks=3)
+
+
 def test_mean_pool_backend_runs_through_the_common_attention_path() -> None:
     query, key, value = _inputs()
     attention = SparsePiperAttention((0.5, 1.0), routing="mean")

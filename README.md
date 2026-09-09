@@ -150,7 +150,7 @@ The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
 bias-free ConvRot Q/K/V projections, D64/D128 RMSNorm and split-half RoPE for Q/K, followed by
 `sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
-plus routing summaries directly, avoiding the three materialized BF16 projection outputs. Arbitrary
+plus routing summaries directly, avoiding the three materialized projection outputs. Arbitrary
 logical sequence lengths are written directly into internally K64-padded attention storage; only
 the final projection tile is masked, and the result retains the exact logical length. It fails closed
 for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention APIs
@@ -505,7 +505,8 @@ output = attention(
 )
 ```
 
-Inputs use `[batch, sequence, heads, head_dim]` BF16 layout with head dimensions 64 or 128.
+Inputs use `[batch, sequence, heads, head_dim]` FP16, BF16, or FP32 layout with head dimensions 64 or 128.
+The output preserves the input dtype; internal quantization and attention arithmetic are unchanged.
 Without `block_lengths`, every row participates in attention and the sequence length may be
 arbitrary. The operator pads only its internal quantized storage to K64. Supplying one contiguous
 device INT32 length in `[1, 64]` per physical K64 block instead selects valid-front padded
@@ -561,12 +562,15 @@ block scores.
 These composable implementations define the operations and training behavior; compatible compiled
 ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
 and gated residual, including valid-front padded storage. The fused residual combines both terms
-in FP32 and rounds once on output, avoiding the intermediate BF16 rounding of eager composition.
+in FP32 and rounds once on output, avoiding intermediate activation rounding.
 When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
 quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
 residual together with `sparse_query_blocks`. It passes the coarse result and coarse gate into
-each ranged attention launch and projects that chunk directly, so the full BF16 attention output is
-not materialized.
+each ranged attention launch and projects that chunk directly, so the full attention output is
+not materialized. These full fusion paths support FP16, BF16, and FP32 activations, preserving
+the dtype through attention, coarse-gate buffers, and the final output projection. Quantized
+Q/K/V storage and FP32 accumulation are unchanged; internal operators default to BF16 when
+`output_dtype` is omitted.
 
 The SM120 path supports both head widths, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. It normally reads packed UINT16

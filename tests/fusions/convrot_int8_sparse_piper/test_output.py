@@ -399,7 +399,8 @@ def test_attention_output_custom_op_passes_opcheck() -> None:
     assert set(result.values()) == {"SUCCESS"}
 
 
-def test_attention_output_fake_kernel_propagates_shape() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> None:
     output = output_fusion._attention_output_op(
         torch.empty((2, 3, 192, 128), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 6), device="meta", dtype=torch.float32),
@@ -420,10 +421,11 @@ def test_attention_output_fake_kernel_propagates_shape() -> None:
         None,
         128,
         64,
+        output_dtype=dtype,
     )
 
     assert output.shape == (2, 191, _OUTPUT_FEATURES)
-    assert output.dtype is torch.bfloat16
+    assert output.dtype is dtype
 
 
 def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:

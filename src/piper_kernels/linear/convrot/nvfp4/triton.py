@@ -422,8 +422,8 @@ def _validate_input(
     activation_fn: str | None = None,
 ) -> _ValidatedInput:
     validate_group_size(group_size)
-    if input.ndim == 0 or input.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("ConvRot NVFP4 input must be a non-scalar FP16 or BF16 tensor")
+    if input.ndim == 0 or input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("ConvRot NVFP4 input must be a non-scalar FP16, BF16, or FP32 tensor")
     source_features = int(input.shape[-1])
     if source_features < 1:
         raise ValueError("ConvRot NVFP4 requires a nonempty feature dimension")

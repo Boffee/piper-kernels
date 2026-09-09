@@ -51,8 +51,8 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         high_first: bool = False,
     ) -> ConvRotNVFP4Tensor:
         validate_group_size(group_size)
-        if orig_dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("ConvRot NVFP4 logical dtype must be FP16 or BF16")
+        if orig_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError("ConvRot NVFP4 logical dtype must be FP16, BF16, or FP32")
         tensor = super().__new__(
             cls,
             qdata,
@@ -302,7 +302,7 @@ def _supports_convrot_linear(input: object, weight: ConvRotNVFP4Tensor) -> bool:
     return (
         supports_semantic_linear(input, weight)
         and isinstance(input, torch.Tensor)
-        and input.dtype in (torch.float16, torch.bfloat16)
+        and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and input.ndim > 0
         and input.shape[-1] % weight.group_size == 0
     )

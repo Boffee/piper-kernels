@@ -83,6 +83,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_bias: torch.Tensor | None = None,
     *,
     high_first: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         key,
@@ -134,6 +135,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         gate_projection,
+        output_dtype=output_dtype,
     )
 
 
@@ -183,6 +185,7 @@ def _projected_query_attention_output_op_fake(
     _gate_bias: torch.Tensor | None = None,
     *,
     high_first: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     del high_first
     return output_common.new_projected_output(
@@ -190,6 +193,7 @@ def _projected_query_attention_output_op_fake(
         logical_sequence_length,
         block_lengths,
         weight_qdata.shape[0],
+        output_dtype=output_dtype,
     )
 
 
@@ -233,6 +237,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     gate_bias: torch.Tensor | None = None,
     *,
     high_first: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         query,
@@ -275,6 +280,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         gate_projection,
+        output_dtype=output_dtype,
     )
 
 
@@ -315,6 +321,7 @@ def _attention_output_op_fake(
     _gate_bias: torch.Tensor | None = None,
     *,
     high_first: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     del high_first
     return output_common.new_projected_output(
@@ -322,6 +329,7 @@ def _attention_output_op_fake(
         logical_sequence_length,
         block_lengths,
         weight_qdata.shape[0],
+        output_dtype=output_dtype,
     )
 
 

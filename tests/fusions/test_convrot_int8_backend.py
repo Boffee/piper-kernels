@@ -142,19 +142,20 @@ def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device
     assert all(call.args[0] is value for call in select.call_args_list)
 
 
-def test_sparse_output_uses_operations_and_preserves_output_views(monkeypatch, operations):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_sparse_output_uses_operations_and_preserves_output_views(monkeypatch, operations, dtype):
     backend, select = operations
-    value = torch.linspace(-1, 1, 2 * 5 * 128).reshape(2, 5, 128).to(torch.bfloat16)
+    value = torch.linspace(-1, 1, 2 * 5 * 128).reshape(2, 5, 128).to(dtype)
     storage = torch.empty(2, 1, 5, 128, dtype=torch.int8)
     weight, scale, bias = _weight(7, 128)
-    monkeypatch.setattr(sparse_output, "_validate_output_projection", lambda *args: (128, 7))
+    monkeypatch.setattr(sparse_output, "_validate_output_projection", Mock(return_value=(128, 7)))
     width, project, prepared = sparse_output._prepare_output_chunk_projector(
-        storage, 5, weight, scale, bias, 16, 5, 3, backend=backend
+        storage, 5, weight, scale, bias, 16, 5, 3, backend=backend, output_dtype=dtype
     )
     assert width == 7
-    backing = torch.full((2, 5, 9), -999, dtype=torch.bfloat16)
+    backing = torch.full((2, 5, 9), -999, dtype=dtype)
     output = backing[..., 1:-1]
-    chunk = torch.empty(2, 3, 1, 128, dtype=torch.bfloat16)
+    chunk = torch.empty(2, 3, 1, 128, dtype=dtype)
     for start, rows in ((0, 3), (3, 2)):
         chunk[:, :rows, 0].copy_(value[:, start : start + rows])
         project(chunk, output, start, rows)

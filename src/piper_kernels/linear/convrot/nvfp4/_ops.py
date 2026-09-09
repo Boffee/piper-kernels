@@ -74,8 +74,8 @@ def linear(
         "ConvRot NVFP4 linear",
         allow_empty=True,
     )
-    if input.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("ConvRot NVFP4 linear input must be FP16 or BF16")
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("ConvRot NVFP4 linear input must be FP16, BF16, or FP32")
     if isinstance(shape.input_features, int) and shape.input_features % group_size:
         raise ValueError(
             f"ConvRot NVFP4 input features {shape.input_features} must be divisible "

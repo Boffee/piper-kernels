@@ -12,6 +12,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
+from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _bias
@@ -88,7 +89,7 @@ def _prepared_gate_projection(
         or linear.target is not torch.ops.piper_kernels.convrot_int8_linear_prepared.default
         or linear.kwargs
         or len(linear.args) != 6
-        or linear.args[5] is not torch.bfloat16
+        or linear.args[5] not in SUPPORTED_DTYPES
     ):
         return None
     input_qdata, input_scale, weight_qdata, weight_scale, bias, _logical_dtype = linear.args
@@ -174,9 +175,10 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
         or projected.ndim != 3
         or weight.ndim != 2
         or query.dtype is not torch.int8
-        or attention.dtype is not torch.bfloat16
-        or reshaped.dtype is not torch.bfloat16
-        or projected.dtype is not torch.bfloat16
+        or attention.dtype not in SUPPORTED_DTYPES
+        or attention_node.kwargs.get("output_dtype", torch.bfloat16) is not attention.dtype
+        or reshaped.dtype is not attention.dtype
+        or projected.dtype is not attention.dtype
         or weight.dtype is not torch.int8
         or scale.dtype is not torch.float32
     ):
@@ -328,6 +330,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                 *bounded_arguments,
                 *gate_arguments,
             ),
+            kwargs={"output_dtype": original.meta["val"].dtype},
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)

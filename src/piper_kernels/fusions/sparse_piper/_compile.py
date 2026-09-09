@@ -12,7 +12,7 @@ from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
-from piper_kernels.attention.sparse_piper_attention import _backend, _budget
+from piper_kernels.attention.sparse_piper_attention import _backend, _budget, _dtype
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
@@ -92,7 +92,7 @@ def source_files() -> tuple[str, ...]:
     """Return sources that affect shared sparse-attention validation and policy."""
     return tuple(
         file_name
-        for file_name in (__file__, _budget.__file__, *_backend.source_files())
+        for file_name in (__file__, _dtype.__file__, _budget.__file__, *_backend.source_files())
         if file_name is not None
     )
 
@@ -114,7 +114,7 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
         and output is not None
         and gate.layout is torch.strided
         and gate.ndim == 4
-        and gate.dtype is torch.bfloat16
+        and gate.dtype is output.dtype
         and gate.device == output.device
         and gate.stride(-1) == 1
         and len(gate.shape) == len(output.shape)
@@ -144,6 +144,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     coarse_gate: Argument | None = None,
     coarse_scale: Argument | None = None,
     coarse_key_blocks: Argument | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.fx.Node:
     """Emit the shared fine or coarse quantized sparse-attention call."""
     coarse_arguments = block_mean, coarse_gate, coarse_scale, coarse_key_blocks
@@ -166,6 +167,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
                 coarse_key_blocks,
                 sparse_query_blocks,
             ),
+            kwargs={"output_dtype": output_dtype},
         )
     return graph.call_function(
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
@@ -180,6 +182,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
                 sparse_query_blocks,
             ),
         ),
+        kwargs={"output_dtype": output_dtype},
     )
 
 
@@ -241,7 +244,7 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
         != preparation_sharing.dimension_key(sequence_length)
         or static_int(shape[2]) != heads
         or static_int(shape[3]) != head_dim
-        or output.dtype is not torch.bfloat16
+        or output.dtype not in _dtype.SUPPORTED_DTYPES
         or output.device != device
         or preparation_sharing.dimension_key(output.shape[0])
         != preparation_sharing.dimension_key(batch)
@@ -256,7 +259,7 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
         norm = metadata[name]
         assert norm is not None
         if (
-            norm.dtype is not torch.bfloat16
+            norm.dtype not in _dtype.SUPPORTED_DTYPES
             or tuple(norm.shape) != (head_dim,)
             or norm.device != device
         ):

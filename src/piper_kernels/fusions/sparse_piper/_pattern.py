@@ -47,23 +47,37 @@ def optional_attention_layout_arguments[ArgumentT](
     return (block_lengths,) if block_lengths is not None else ()
 
 
+def _rope_table_pattern(name: str, activation_dtype: torch.dtype) -> CallFunction:
+    table: KeywordArg | CallFunction = KeywordArg(name)
+    if activation_dtype is not torch.float32:
+        table = CallFunction(
+            torch.ops.prims.convert_element_type.default, table, activation_dtype, _users=1
+        )
+    table = CallFunction(torch.ops.aten.unsqueeze.default, table, 0, _users=1)
+    return CallFunction(torch.ops.aten.unsqueeze.default, table, 2, _users=1)
+
+
 def _normalized_rope_pattern(
     projection: CallFunction,
     prefix: str,
     *,
     output_users: int = 1,
+    activation_dtype: torch.dtype = torch.bfloat16,
 ) -> CallFunction:
+    # FP32 graphs omit redundant casts around RMSNorm and RoPE.
+    low_precision = activation_dtype is not torch.float32
     reshaped = CallFunction(
         torch.ops.aten.reshape.default,
         projection,
         KeywordArg("sparse_attention_shape"),
-        _users=1,
+        _users=1 if low_precision else 2,
     )
-    promoted = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        reshaped,
-        torch.float32,
-        _users=2,
+    promoted = (
+        CallFunction(
+            torch.ops.prims.convert_element_type.default, reshaped, torch.float32, _users=2
+        )
+        if low_precision
+        else reshaped
     )
     squared = CallFunction(torch.ops.aten.pow.Tensor_Scalar, promoted, 2, _users=1)
     mean = CallFunction(torch.ops.aten.mean.dim, squared, [3], True, _users=1)
@@ -79,13 +93,14 @@ def _normalized_rope_pattern(
         torch.ops.aten.mul.Tensor,
         normalized,
         KeywordArg(f"{prefix}_norm_weight"),
-        _users=1,
+        _users=1 if low_precision else 2,
     )
-    rounded = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        scaled,
-        torch.bfloat16,
-        _users=2,
+    rounded = (
+        CallFunction(
+            torch.ops.prims.convert_element_type.default, scaled, activation_dtype, _users=2
+        )
+        if low_precision
+        else scaled
     )
     rotary = CallFunction(
         torch.ops.aten.slice.Tensor,
@@ -104,14 +119,7 @@ def _normalized_rope_pattern(
     )
     first = CallFunction(operator.getitem, split, 0, _users=1)
     second = CallFunction(operator.getitem, split, 1, _users=1)
-    cos = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        KeywordArg("sparse_cos"),
-        torch.bfloat16,
-        _users=1,
-    )
-    cos = CallFunction(torch.ops.aten.unsqueeze.default, cos, 0, _users=1)
-    cos = CallFunction(torch.ops.aten.unsqueeze.default, cos, 2, _users=1)
+    cos = _rope_table_pattern("sparse_cos", activation_dtype)
     direct = CallFunction(torch.ops.aten.mul.Tensor, rotary, cos, _users=1)
     rotated = CallFunction(
         torch.ops.aten.cat.default,
@@ -119,14 +127,7 @@ def _normalized_rope_pattern(
         -1,
         _users=1,
     )
-    sin = CallFunction(
-        torch.ops.prims.convert_element_type.default,
-        KeywordArg("sparse_sin"),
-        torch.bfloat16,
-        _users=1,
-    )
-    sin = CallFunction(torch.ops.aten.unsqueeze.default, sin, 0, _users=1)
-    sin = CallFunction(torch.ops.aten.unsqueeze.default, sin, 2, _users=1)
+    sin = _rope_table_pattern("sparse_sin", activation_dtype)
     rotated = CallFunction(torch.ops.aten.mul.Tensor, rotated, sin, _users=1)
     rotary_output = CallFunction(torch.ops.aten.add.Tensor, direct, rotated, _users=1)
     passthrough = CallFunction(
@@ -151,6 +152,7 @@ def sparse_piper_projection_pattern(
     with_block_lengths: bool = False,
     with_coarse: bool = False,
     with_sparse_query_blocks: bool = False,
+    activation_dtype: torch.dtype = torch.bfloat16,
 ) -> CallFunction:
     """Match projected sparse attention with optional padding, coarse, and Q scopes."""
     operand_users = 2 if with_coarse else 1
@@ -158,11 +160,13 @@ def sparse_piper_projection_pattern(
         projection("sparse_q"),
         "sparse_q",
         output_users=operand_users,
+        activation_dtype=activation_dtype,
     )
     key = _normalized_rope_pattern(
         projection("sparse_k"),
         "sparse_k",
         output_users=operand_users,
+        activation_dtype=activation_dtype,
     )
     value = CallFunction(
         torch.ops.aten.reshape.default,

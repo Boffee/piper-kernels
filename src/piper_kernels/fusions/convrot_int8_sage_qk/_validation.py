@@ -5,6 +5,7 @@ import math
 import torch
 
 _SUPPORTED_HEAD_DIMS = (64, 128)
+_SUPPORTED_NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def validate_qk_projection_inputs(  # noqa: PLR0912
@@ -37,8 +38,10 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
             f"{name} projection weight scale must be one FP32 value per output feature"
         )
     heads = weight_qdata.shape[0] // head_dim
-    if norm_weight.dtype is not torch.bfloat16:
-        raise ValueError(f"{name} projection RMSNorm weight must be a BF16 D64/D128 vector")
+    if norm_weight.dtype not in _SUPPORTED_NORM_DTYPES:
+        raise ValueError(
+            f"{name} projection RMSNorm weight must be an FP16/BF16/FP32 D64/D128 vector"
+        )
     if cos.ndim != 2 or sin.shape != cos.shape or cos.shape[0] != sequence_length:
         raise ValueError(f"{name} projection RoPE cos/sin must match the sequence")
     rotary_dim = cos.shape[1]

@@ -206,11 +206,12 @@ def test_route_and_coarse_builder_places_out_of_order_query_chunks_by_offset() -
     or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_sm120_padded_summaries_match_portable_valid_prefix_means() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_sm120_padded_summaries_match_portable_valid_prefix_means(dtype: torch.dtype) -> None:
     generator = torch.Generator().manual_seed(73)
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
-    query = torch.randn((1, 2, 3 * 64, 128), dtype=torch.bfloat16, generator=generator)
-    key = torch.randn((1, 2, 2 * 64, 128), dtype=torch.bfloat16, generator=generator)
+    query = torch.randn((1, 2, 3 * 64, 128), dtype=dtype, generator=generator)
+    key = torch.randn((1, 2, 2 * 64, 128), dtype=dtype, generator=generator)
     valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
     valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
     query = query.unflatten(2, (3, 64))

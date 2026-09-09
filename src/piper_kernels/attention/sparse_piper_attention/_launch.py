@@ -6,6 +6,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 
+from ._dtype import SUPPORTED_DTYPES
 from ._prepared import _PreparedSparsePiperAttention
 
 
@@ -86,7 +87,7 @@ def validate_attention_launch(
     )
     if (
         output.shape != (batch, heads, output_sequence_length, head_dim)
-        or output.dtype is not torch.bfloat16
+        or output.dtype not in SUPPORTED_DTYPES
         or output.device != query.device
         or output.stride(-1) != 1
     ):
@@ -108,7 +109,7 @@ def validate_attention_launch(
             raise ValueError("sparse Piper coarse output must be FP32 [batch,heads,Q64,D64/D128]")
         if (
             coarse_gate.shape != (batch, output_sequence_length, heads, head_dim)
-            or coarse_gate.dtype is not torch.bfloat16
+            or coarse_gate.dtype is not output.dtype
             or coarse_gate.device != query.device
             or coarse_gate.stride(-1) != 1
         ):

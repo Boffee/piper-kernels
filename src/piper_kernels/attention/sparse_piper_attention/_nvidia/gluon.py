@@ -801,11 +801,11 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     if mask_output_tail:
         gl.store(
             output_ptr + output_offsets,
-            output.to(gl.bfloat16),
+            output.to(output_ptr.dtype.element_ty),
             mask=valid_queries[:, None],
         )
     else:
-        gl.store(output_ptr + output_offsets, output.to(gl.bfloat16))
+        gl.store(output_ptr + output_offsets, output.to(output_ptr.dtype.element_ty))
 
     # Every warp must finish its final waits before any warp invalidates the
     # shared barriers.
