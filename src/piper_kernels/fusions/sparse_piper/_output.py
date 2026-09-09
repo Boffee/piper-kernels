@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 DEFAULT_QUERY_CHUNK_ROWS = 4_096
 _MIN_PROJECTED_GATE_PIPELINE_CHUNKS = 8
 
+type AttentionProjector = Callable[[torch.Tensor], torch.Tensor]
 type ChunkProjector = Callable[[torch.Tensor, torch.Tensor, int, int], None]
 type CoarseGateChunkProjector = Callable[[torch.Tensor, int, int], None]
 type QueryChunkProjector = Callable[[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
@@ -290,29 +291,27 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
     output_features: int,
     query_chunk_rows: int,
     launch_chunk: AttentionChunkLauncher,
-    project_chunk: ChunkProjector,
+    project_chunk: ChunkProjector | None,
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    project_attention: AttentionProjector | None = None,
 ) -> torch.Tensor:
     """Share buffering, gate, and stream ordering across both Q lifetimes."""
     validate_output_dtype(output_dtype)
     chunk_ranges = _query_chunk_ranges(sequence_length, query_chunk_rows)
     chunk_count = len(chunk_ranges)
     pipeline_projected_gate = (
-        project_coarse_gate_chunk is not None and chunk_count >= _MIN_PROJECTED_GATE_PIPELINE_CHUNKS
+        project_attention is None
+        and project_coarse_gate_chunk is not None
+        and chunk_count >= _MIN_PROJECTED_GATE_PIPELINE_CHUNKS
     )
     capacity = min(sequence_length, query_chunk_rows)
     batch, heads, head_dim = (
         attention_storage.shape[0],
         attention_storage.shape[1],
         attention_storage.shape[3],
-    )
-    attention_buffers = torch.empty(
-        (min(2, chunk_count), batch, capacity, heads, head_dim),
-        device=attention_storage.device,
-        dtype=output_dtype,
     )
     if has_coarse_residual and (coarse_gate is None) == (project_coarse_gate_chunk is None):
         raise ValueError("coarse attention requires exactly one coarse gate source")
@@ -329,11 +328,6 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
         if project_coarse_gate_chunk is not None
         else None
     )
-    output = torch.empty(
-        (batch, sequence_length, output_features),
-        device=attention_storage.device,
-        dtype=output_dtype,
-    )
 
     def coarse_gate_chunk(start: int, rows: int) -> torch.Tensor | None:
         if coarse_gate is not None:
@@ -344,6 +338,36 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
         chunk = coarse_gate_buffers[0, :, :rows]
         project_coarse_gate_chunk(chunk, start, rows)
         return chunk
+
+    if project_attention is not None:
+        # A global activation scale requires every attention row before projection.
+        attention = torch.empty(
+            (batch, sequence_length, heads, head_dim),
+            device=attention_storage.device,
+            dtype=output_dtype,
+        )
+        for block_start, block_count, start, rows in chunk_ranges:
+            launch_chunk(
+                attention[:, start : start + rows],
+                block_start,
+                block_count,
+                start,
+                rows,
+                coarse_gate_chunk(start, rows),
+            )
+        return project_attention(attention)
+
+    assert project_chunk is not None
+    attention_buffers = torch.empty(
+        (min(2, chunk_count), batch, capacity, heads, head_dim),
+        device=attention_storage.device,
+        dtype=output_dtype,
+    )
+    output = torch.empty(
+        (batch, sequence_length, output_features),
+        device=attention_storage.device,
+        dtype=output_dtype,
+    )
 
     if chunk_count == 1:
         block_start, block_count, start, rows = chunk_ranges[0]
@@ -441,11 +465,12 @@ def run_chunked_attention_output(
     prepared: _PreparedAttentionOutput,
     output_features: int,
     query_chunk_rows: int,
-    project_chunk: ChunkProjector,
+    project_chunk: ChunkProjector | None,
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    project_attention: AttentionProjector | None = None,
 ) -> torch.Tensor:
     """Pipeline a materialized Q boundary through bounded attention output."""
     prepared_attention = prepared.attention
@@ -479,6 +504,7 @@ def run_chunked_attention_output(
         projector_tensors,
         project_coarse_gate_chunk=project_coarse_gate_chunk,
         output_dtype=output_dtype,
+        project_attention=project_attention,
     )
 
 
@@ -487,11 +513,12 @@ def run_chunked_projected_query_attention_output(
     output_features: int,
     query_chunk_rows: int,
     project_query_chunk: QueryChunkProjector,
-    project_chunk: ChunkProjector,
+    project_chunk: ChunkProjector | None,
     projector_tensors: Sequence[torch.Tensor],
     *,
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    project_attention: AttentionProjector | None = None,
 ) -> torch.Tensor:
     """Project, route, attend, and consume one bounded Q window at a time."""
 
@@ -530,6 +557,7 @@ def run_chunked_projected_query_attention_output(
         projector_tensors,
         project_coarse_gate_chunk=project_coarse_gate_chunk,
         output_dtype=output_dtype,
+        project_attention=project_attention,
     )
 
 

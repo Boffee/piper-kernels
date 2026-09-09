@@ -105,11 +105,13 @@ def _resolve_route_layout(
     if route_head_offset_values[-1] > torch.iinfo(torch.int32).max:
         raise ValueError("sparse Piper packed routes exceed INT32 offset capacity")
 
+    # Pinned staging makes the metadata copy legal during CUDA graph capture.
     metadata = torch.tensor(
         (*head_keep_block_values, *route_head_offset_values),
-        device=device,
+        device="cpu",
         dtype=torch.int32,
-    )
+        pin_memory=device.type == "cuda",
+    ).to(device, non_blocking=True)
     heads = len(head_keep_block_values)
     return _ResolvedRouteLayout(
         head_keep_blocks=metadata[:heads],

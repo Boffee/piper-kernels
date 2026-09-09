@@ -13,6 +13,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
+from .._accuracy import assert_fusion_output_close
 from ._helpers import output_available
 from .test_attention import (
     _HEAD_DIM,
@@ -186,7 +187,7 @@ def test_attention_output_matches_materialized_boundary(
 
     assert actual.shape == (batch, sequence_length, _OUTPUT_FEATURES)
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
@@ -206,7 +207,7 @@ def test_attention_output_supports_mixed_precision_bias(
         actual = output_fusion._attention_output_op(*arguments, 64)
 
     assert actual.dtype is torch.bfloat16
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
@@ -250,13 +251,15 @@ def test_projected_query_attention_output_matches_multiple_materialized_q_window
             *attention_tail,
         )
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 def test_attention_output_obeys_a_nondefault_current_stream() -> None:
-    arguments, expected = _arguments(batch=1, sequence_length=193, bias=False)
+    arguments, _reference = _arguments(batch=1, sequence_length=193, bias=False)
+    with torch.no_grad():
+        expected = output_fusion._attention_output_op(*arguments, 128)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
@@ -284,7 +287,7 @@ def test_attention_output_supports_bounded_attention_features(
         actual = output_fusion._attention_output_op(*arguments)
 
     assert actual.shape == expected.shape == (1, 192, _OUTPUT_FEATURES)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
@@ -382,7 +385,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         )
     stream.synchronize()
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu

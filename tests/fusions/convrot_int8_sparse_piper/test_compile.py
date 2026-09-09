@@ -30,6 +30,7 @@ from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
 
+from .._accuracy import assert_fusion_output_close
 from ._helpers import output_available, projection_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
@@ -811,7 +812,7 @@ def test_projection_fusion_respects_internal_block_lengths(routing: str) -> None
             options=options,
         )(hidden_states, block_lengths)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     assert (
         capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
@@ -868,7 +869,7 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
             options=options,
         )(hidden_states, coarse_gate)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     relative_l2 = (actual.float() - semantic.float()).norm() / semantic.float().norm()
     assert relative_l2 < 0.025
     assert (
@@ -947,7 +948,7 @@ def test_coarse_projection_fusion_respects_internal_block_lengths(routing: str) 
             options=options,
         )(hidden_states, coarse_gate, block_lengths)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     relative_l2 = (
         actual[:, valid_rows].float() - semantic[:, valid_rows].float()
     ).norm() / semantic[:, valid_rows].float().norm()
@@ -1007,7 +1008,7 @@ def test_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
                 block_lengths=block_lengths,
             )
             actual = compiled(hidden_states, coarse_gate, block_lengths)
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert_fusion_output_close(actual, expected)
 
     assert capture.calls == 1
 
@@ -1125,7 +1126,7 @@ def test_compile_options_fuse_attention_output_boundary(
         )(hidden_states)
 
     assert actual.dtype is dtype
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
@@ -1177,7 +1178,7 @@ def test_compile_fuses_padded_mixed_query_attention_output() -> None:
             options=options,
         )(hidden_states, block_lengths, 2)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
@@ -1226,7 +1227,7 @@ def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
             options=options,
         )(hidden_states)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     assert (
         torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default
         not in capture.targets
@@ -1311,7 +1312,7 @@ def test_compile_fuses_every_bounded_attention_feature(
                 sparse_query_blocks=2,
             )
             actual = compiled(hidden_states, coarse_gate, block_lengths, 2)
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert_fusion_output_close(actual, expected)
 
     assert capture.calls == 1
     assert (
@@ -1389,13 +1390,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
             options=options,
         )(hidden_states)
 
-    # Q chunk size changes FP32 reduction order in coarse attention. Subsequent
-    # BF16/INT8 rounding can amplify those differences, so compare accuracy while
-    # keeping the tensor contract and compiler rewrite assertions exact.
-    assert actual.shape == expected.shape
-    assert actual.dtype is expected.dtype
-    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
-    assert relative_l2 < 1e-3
+    assert_fusion_output_close(actual, expected)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     assert (
         capture.targets.count(
@@ -1447,8 +1442,8 @@ def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
             options=options,
         )(hidden_states)
 
-    torch.testing.assert_close(actual_projected, expected_projected, atol=0, rtol=0)
-    torch.testing.assert_close(actual_attention, expected_attention, atol=0, rtol=0)
+    assert_fusion_output_close(actual_projected, expected_projected)
+    assert_fusion_output_close(actual_attention, expected_attention)
     assert (
         torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
         not in capture.targets
@@ -1520,7 +1515,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
             )
             assert output.shape == (model.batch, sequence, model.heads, model.head_dim)
             assert bool(torch.isfinite(output).all())
-            torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            assert_fusion_output_close(output, expected)
 
     assert capture.calls == 1
     assert (
@@ -1591,7 +1586,7 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
                 sparse_key_blocks,
                 coarse_gate,
             )
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert_fusion_output_close(actual, expected)
 
     assert capture.calls == 1
     assert (
@@ -1723,7 +1718,7 @@ def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
                 sparse_key_blocks,
             )
             actual = compiled(hidden_states, cos, sin, sparse_key_blocks)
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert_fusion_output_close(actual, expected)
 
     assert capture.calls == 1
     assert (

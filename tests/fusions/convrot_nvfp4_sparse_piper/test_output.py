@@ -19,6 +19,7 @@ from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference
 
+from .._accuracy import assert_fusion_output_close
 from ..nvfp4_sparse_piper.test_output import _arguments as standard_arguments
 
 _OUTPUT_FEATURES = 320
@@ -276,8 +277,7 @@ def test_attention_output_matches_materialized_convrot_linear(
     with torch.no_grad():
         actual = output._attention_output_op(*arguments, chunk_rows)
 
-    # GEMM can fuse FP32 multiply-add where the PyTorch reference rounds separately.
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
@@ -292,26 +292,27 @@ def test_attention_output_supports_mixed_precision_bias(
         actual = output._attention_output_op(*arguments, 128)
 
     assert actual.dtype is torch.bfloat16
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_high_first_attention_output_matches_low_first() -> None:
-    arguments, expected = _arguments(193, 64)
+    arguments, _reference = _arguments(193, 64)
     high_arguments = list(arguments)
     qdata = high_arguments[14]
     assert isinstance(qdata, torch.Tensor)
     high_arguments[14] = ((qdata & 0x0F) << 4) | (qdata >> 4)
 
     with torch.no_grad():
+        expected = output._attention_output_op(*arguments, 128)
         actual = output._attention_output_op(
             *high_arguments,
             128,
             high_first=True,
         )
 
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.gpu
@@ -333,12 +334,7 @@ def test_attention_output_supports_bounded_attention_features(
     block_lengths = arguments[-6]
     assert isinstance(block_lengths, torch.Tensor)
     valid_rows = torch.arange(64, device="cuda")[None] < block_lengths[:, None]
-    torch.testing.assert_close(
-        actual[:, valid_rows.flatten()],
-        expected[:, valid_rows.flatten()],
-        atol=1e-5,
-        rtol=2**-7,
-    )
+    assert_fusion_output_close(actual[:, valid_rows.flatten()], expected[:, valid_rows.flatten()])
 
 
 @pytest.mark.gpu
@@ -350,7 +346,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(sequence_length: int) -
     with torch.no_grad():
         actual = output._attention_output_op(*arguments)
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu

@@ -1,4 +1,4 @@
-"""Bounded sparse attention followed by a static ConvRot NVFP4 projection."""
+"""Bounded sparse attention followed by a ConvRot NVFP4 projection."""
 
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 
-_DEFAULT_QUERY_CHUNK_ROWS = _output.DEFAULT_QUERY_CHUNK_ROWS
-
 
 @dataclass(frozen=True, slots=True)
 class _ConvRotPreparation:
@@ -23,6 +21,9 @@ class _ConvRotPreparation:
 
     def __post_init__(self) -> None:
         validate_group_size(self.group_size)
+
+    def dynamic_scale(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
+        return convrot_nvfp4_backend.dynamic_scale(input, self.group_size)
 
     def prepare_static_out(
         self,
@@ -70,10 +71,10 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
-    activation_per_tensor_scale: torch.Tensor,
+    activation_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     group_size: int,
-    query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    query_chunk_rows: int | None = None,
     block_lengths: torch.Tensor | None = None,
     block_mean: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
@@ -90,6 +91,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
+    dynamic_activation_scale: bool = False,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         key,
@@ -142,6 +144,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         gate_projection,
         output_dtype=output_dtype,
+        dynamic_activation_scale=dynamic_activation_scale,
     )
 
 
@@ -173,10 +176,10 @@ def _projected_query_attention_output_op_fake(
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
     _weight_per_tensor_scale: torch.Tensor | None,
-    _activation_per_tensor_scale: torch.Tensor,
+    _activation_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
     group_size: int,
-    _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    _query_chunk_rows: int | None = None,
     block_lengths: torch.Tensor | None = None,
     _block_mean: torch.Tensor | None = None,
     _coarse_gate: torch.Tensor | None = None,
@@ -193,8 +196,9 @@ def _projected_query_attention_output_op_fake(
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
+    dynamic_activation_scale: bool = False,
 ) -> torch.Tensor:
-    del high_first
+    del high_first, dynamic_activation_scale
     validate_group_size(group_size)
     input_features = 2 * weight_qdata.shape[1]
     if isinstance(input_features, int) and input_features % group_size:
@@ -233,10 +237,10 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
-    activation_per_tensor_scale: torch.Tensor,
+    activation_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     group_size: int,
-    query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    query_chunk_rows: int | None = None,
     block_lengths: torch.Tensor | None = None,
     block_mean: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
@@ -253,6 +257,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
+    dynamic_activation_scale: bool = False,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         query,
@@ -296,6 +301,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         gate_projection,
         output_dtype=output_dtype,
+        dynamic_activation_scale=dynamic_activation_scale,
     )
 
 
@@ -318,10 +324,10 @@ def _attention_output_op_fake(
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
     _weight_per_tensor_scale: torch.Tensor | None,
-    _activation_per_tensor_scale: torch.Tensor,
+    _activation_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
     group_size: int,
-    _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    _query_chunk_rows: int | None = None,
     block_lengths: torch.Tensor | None = None,
     _block_mean: torch.Tensor | None = None,
     _coarse_gate: torch.Tensor | None = None,
@@ -338,8 +344,9 @@ def _attention_output_op_fake(
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
+    dynamic_activation_scale: bool = False,
 ) -> torch.Tensor:
-    del high_first
+    del high_first, dynamic_activation_scale
     validate_group_size(group_size)
     input_features = 2 * weight_qdata.shape[1]
     if isinstance(input_features, int) and input_features % group_size:

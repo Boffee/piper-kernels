@@ -567,7 +567,13 @@ When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immedi
 quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
 residual together with `sparse_query_blocks`. It passes the coarse result and coarse gate into
 each ranged attention launch and projects that chunk directly, so the full attention output is
-not materialized. These full fusion paths support FP16, BF16, and FP32 activations, preserving
+not materialized. NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
+they materialize attention, compute one global activation scale (after rotation for ConvRot),
+and pack/project successive chunks. When the output width does not exceed the attention width,
+the final contiguous output reuses the attention allocation; narrower outputs retain that larger
+backing storage. Wider outputs use a separate allocation. Dynamic scaling defaults to 32,768-row
+query windows, while static NVFP4 output keeps 8,192-row windows and attention/projection overlap.
+These full fusion paths support FP16, BF16, and FP32 activations, preserving
 the dtype through attention, coarse-gate buffers, and the final output projection. Quantized
 Q/K/V storage and FP32 accumulation are unchanged; internal operators default to BF16 when
 `output_dtype` is omitted.
