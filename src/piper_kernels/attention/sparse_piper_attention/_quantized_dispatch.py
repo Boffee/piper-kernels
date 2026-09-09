@@ -8,6 +8,7 @@ import torch
 
 from . import _backend
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
+from ._dtype import validate_output_dtype
 from ._interfaces import LaunchAttention
 from ._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -266,7 +267,10 @@ def _new_quantized_attention_output(
     query: torch.Tensor,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    validate_output_dtype(output_dtype)
     return query.new_empty(
         (
             query.shape[0],
@@ -278,7 +282,7 @@ def _new_quantized_attention_output(
             query.shape[1],
             query.shape[3],
         ),
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
     )
 
 
@@ -326,6 +330,8 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Run quantized sparse Piper with compact or internally padded K64 storage.
 
@@ -341,6 +347,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         query,
         logical_sequence_length,
         block_lengths,
+        output_dtype=output_dtype,
     )
     prepared = _prepare_quantized_sparse_piper_attention(
         query,
@@ -389,12 +396,15 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     block_lengths: torch.Tensor | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Run quantized sparse attention plus a gated, independently scoped residual."""
     output = _new_quantized_attention_output(
         query,
         logical_sequence_length,
         block_lengths,
+        output_dtype=output_dtype,
     )
     prepared, coarse_output = _prepare_quantized_sparse_piper_attention_with_coarse(
         query,
@@ -444,11 +454,14 @@ def _sparse_piper_attention_from_quantized_op_fake(
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
     _sparse_query_blocks: int | None = None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     return _new_quantized_attention_output(
         query,
         logical_sequence_length,
         _block_lengths,
+        output_dtype=output_dtype,
     )
 
 
@@ -474,9 +487,12 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     _block_lengths: torch.Tensor | None = None,
     _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     return _new_quantized_attention_output(
         query,
         logical_sequence_length,
         _block_lengths,
+        output_dtype=output_dtype,
     )

@@ -18,6 +18,7 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
+from ._dtype import SUPPORTED_DTYPES
 from ._routing import packed_routes_from_sequences
 from ._routing_modes import (
     _ROUTING_NAME_BY_MODE,
@@ -63,7 +64,7 @@ class SparsePiperAttention(torch.nn.Module):
     ) -> torch.Tensor:
         """Route leading query blocks over a sparse K64 prefix and dense suffix.
 
-        Without ``block_lengths``, Q/K/V use compact BF16
+        Without ``block_lengths``, Q/K/V use compact FP16, BF16, or FP32
         ``[batch, sequence, heads, head_dim]`` storage. Supplying one valid-prefix
         length per physical K64 block selects internally padded storage and
         returns that same physical layout; padded query outputs are unspecified.
@@ -132,10 +133,10 @@ def _validate_inputs(
         raise ValueError("sparse Piper Q/K/V must use [batch,sequence,heads,features]")
     if query.shape != key.shape or key.shape != value.shape:
         raise ValueError("sparse Piper requires equal Q/K/V shapes")
-    if query.dtype is not torch.bfloat16 or any(
+    if query.dtype not in SUPPORTED_DTYPES or any(
         tensor.dtype is not query.dtype for tensor in tensors
     ):
-        raise ValueError("sparse Piper Q/K/V must use bfloat16")
+        raise ValueError("sparse Piper Q/K/V must share float16, bfloat16, or float32 dtype")
     if any(tensor.device != query.device for tensor in tensors):
         raise ValueError("sparse Piper Q/K/V must share a device")
     if any(tensor.layout is not torch.strided or tensor.stride(-1) != 1 for tensor in tensors):

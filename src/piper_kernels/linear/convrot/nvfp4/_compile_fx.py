@@ -52,7 +52,7 @@ def validated_semantic_linear(
         return None
     input_value, shape = validated
     if (
-        input_value.dtype not in (torch.float16, torch.bfloat16)
+        input_value.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or not isinstance(shape.input_features, int)
         or shape.input_features % operands.group_size
     ):

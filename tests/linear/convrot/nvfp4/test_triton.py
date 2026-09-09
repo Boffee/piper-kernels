@@ -59,6 +59,8 @@ def test_rotation_chunk_sizes_reject_widths_beyond_three_chunks() -> None:
     ("group_size", "input_features", "dtype"),
     [
         (16, 5_376, torch.float16),
+        (16, 5_376, torch.float32),
+        (256, 5_376, torch.float32),
         (16, 5_376, torch.bfloat16),
         (64, 5_376, torch.bfloat16),
         (256, 5_376, torch.bfloat16),

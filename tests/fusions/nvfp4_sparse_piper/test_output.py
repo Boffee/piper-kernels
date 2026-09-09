@@ -508,7 +508,8 @@ def test_attention_output_custom_op_passes_opcheck() -> None:
     assert set(result.values()) == {"SUCCESS"}
 
 
-def test_attention_output_fake_kernel_propagates_shape() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> None:
     actual = output._attention_output_op(
         torch.empty((1, 2, 192, 128), device="meta", dtype=torch.int8),
         torch.empty((1, 2, 6), device="meta", dtype=torch.float32),
@@ -530,10 +531,11 @@ def test_attention_output_fake_kernel_propagates_shape() -> None:
         torch.empty((), device="meta", dtype=torch.float32),
         None,
         128,
+        output_dtype=dtype,
     )
 
     assert actual.shape == (1, 191, _OUTPUT_FEATURES)
-    assert actual.dtype is torch.bfloat16
+    assert actual.dtype is dtype
 
 
 @pytest.mark.gpu

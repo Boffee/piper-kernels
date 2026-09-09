@@ -176,13 +176,13 @@ def test_pass_leaves_eligible_singleton_semantic() -> None:
         "unsupported-group",
         "boolean-group",
         "wrong-group-width",
-        "fp32-input",
+        "fp64-input",
     ],
 )
 def test_pass_fails_closed_for_malformed_semantic_linears(case: str) -> None:
     graph = torch.fx.Graph()
     input_features = 240 if case == "wrong-group-width" else 256
-    input_dtype = torch.float32 if case == "fp32-input" else torch.bfloat16
+    input_dtype = torch.float64 if case == "fp64-input" else torch.bfloat16
     operands = list(
         _operands(
             graph,

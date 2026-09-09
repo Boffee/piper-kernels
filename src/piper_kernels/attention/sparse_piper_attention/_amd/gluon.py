@@ -254,7 +254,7 @@ def _sparse_piper_attention_kernel(
         + head * stride_oh
         + output_rows[None, :, None] * stride_on
         + columns[None, None, :],
-        result.to(gl.bfloat16),
+        result.to(output_ptr.dtype.element_ty),
         mask=valid_rows[None, :, None],
     )
 

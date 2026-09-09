@@ -276,8 +276,9 @@ def test_score_fallback_keeps_autograd(monkeypatch):
         (AcceleratorTarget("xpu"), False, False),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_auxiliary_selection_is_independent_of_attention(
-    monkeypatch, target, routes_supported, summaries_supported
+    monkeypatch, target, routes_supported, summaries_supported, dtype
 ):
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
@@ -294,7 +295,7 @@ def test_auxiliary_selection_is_independent_of_attention(
     query = SimpleNamespace(
         device=torch.device("cuda:1"),
         shape=(1, 1, 128, 128),
-        dtype=torch.bfloat16,
+        dtype=dtype,
         stride=lambda dim: 1,
     )
     routes = SimpleNamespace(device=query.device)
@@ -314,7 +315,7 @@ def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
     key = torch.empty_like(query)
     if invalid == "dtype":
-        query, key = query.float(), key.float()
+        query, key = query.double(), key.double()
     elif invalid == "width":
         query, key = query[..., :32], key[..., :32]
     elif invalid == "stride":

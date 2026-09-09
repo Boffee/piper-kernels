@@ -8,6 +8,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
 from ._amd import policy as amd_policy
+from ._dtype import SUPPORTED_DTYPES
 from ._interfaces import AttentionBackend, MinmaxScores, SelectRoutes, SequenceSummaries
 from ._nvidia import policy as nvidia_policy
 
@@ -160,7 +161,7 @@ def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
 
 
 def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> SequenceSummaries | None:
-    """Preserve the existing summary kernel's device and tensor constraints."""
+    """Select native Q/K summaries for a supported device, layout, and dtype."""
     if _summary_backend is None:
         return None
     if not (
@@ -170,7 +171,7 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
         and key.shape[-1] == query.shape[-1]
         and query.stride(-1) == 1
         and key.stride(-1) == 1
-        and query.dtype in (torch.bfloat16, torch.float16)
+        and query.dtype in SUPPORTED_DTYPES
         and key.dtype == query.dtype
     ):
         return None

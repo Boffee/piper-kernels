@@ -109,6 +109,17 @@ class _SparseProjectionAttention(torch.nn.Module):
         self.register_buffer("sin", sin)
         self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
+    def set_activation_dtype(self, dtype: torch.dtype) -> None:
+        for projection in self.modules():
+            if isinstance(projection, torch.nn.Linear):
+                projection.weight = torch.nn.Parameter(
+                    projection.weight.to(dtype), requires_grad=False
+                )
+        for name in ("query_norm", "key_norm"):
+            setattr(
+                self, name, torch.nn.Parameter(getattr(self, name).to(dtype), requires_grad=False)
+            )
+
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
         normalized = F.rms_norm(
             projected.view(
@@ -124,8 +135,8 @@ class _SparseProjectionAttention(torch.nn.Module):
         rotary = normalized[..., : self.rotary_dim]
         first, second = rotary.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        cos = self.cos.to(torch.bfloat16)[None, :, None, :]
-        sin = self.sin.to(torch.bfloat16)[None, :, None, :]
+        cos = self.cos.to(projected.dtype)[None, :, None, :]
+        sin = self.sin.to(projected.dtype)[None, :, None, :]
         rotary = rotary * cos + rotated * sin
         return torch.cat((rotary, normalized[..., self.rotary_dim :]), dim=-1).contiguous()
 
@@ -562,6 +573,7 @@ def _run_explicit_fused_projection(
             routing_mode,
             block_lengths,
             sparse_query_blocks,
+            output_dtype=hidden_states.dtype,
         )
     assert coarse_scale is not None
     assert coarse_key_blocks is not None
@@ -583,6 +595,7 @@ def _run_explicit_fused_projection(
         block_lengths,
         coarse_key_blocks,
         sparse_query_blocks,
+        output_dtype=hidden_states.dtype,
     )
 
 
@@ -1056,17 +1069,21 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
         128,
     ],
 )
-def test_compile_options_fuse_attention_output_boundary(monkeypatch, head_dim: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_compile_options_fuse_attention_output_boundary(
+    monkeypatch, head_dim: int, dtype: torch.dtype
+) -> None:
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(719)
     model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
+    model.set_activation_dtype(dtype)
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,
         model.input_features,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     capture = _TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
@@ -1089,6 +1106,7 @@ def test_compile_options_fuse_attention_output_boundary(monkeypatch, head_dim: i
             options=options,
         )(hidden_states)
 
+    assert actual.dtype is dtype
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert (
         capture.targets.count(
@@ -1298,20 +1316,22 @@ def test_compile_fuses_every_bounded_attention_feature(
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
 @pytest.mark.parametrize("query_chunk_rows", [64, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_compile_lifetime_chunks_a_projected_coarse_gate(
-    monkeypatch: pytest.MonkeyPatch, routing: str, query_chunk_rows: int
+    dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch, routing: str, query_chunk_rows: int
 ) -> None:
     torch.manual_seed(725)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
     # Eight chunks exercise gate production while Q/attention/output reuse slots.
     monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
     model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
+    model.set_activation_dtype(dtype)
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,
         model.input_features,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     coarse_gate = model.gate(hidden_states).reshape(
         model.batch,

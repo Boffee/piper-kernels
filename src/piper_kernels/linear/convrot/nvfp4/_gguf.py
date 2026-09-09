@@ -28,8 +28,8 @@ def convert(
 ) -> _Conversion:
     """Decode, rotate, and quantize one packed GGUF matrix."""
     validate_group_size(group_size)
-    if logical_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("ConvRot NVFP4 GGUF logical dtype must be FP16 or BF16")
+    if logical_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("ConvRot NVFP4 GGUF logical dtype must be FP16, BF16, or FP32")
     if compute_per_tensor_scale and per_tensor_scale is not None:
         raise ValueError("NVFP4 from_gguf cannot both compute and receive a per-tensor scale")
     raw, normalized, rows, features = prepare_packed_matrix(data, quant_type)

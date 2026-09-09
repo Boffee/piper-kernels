@@ -734,9 +734,14 @@ def _cuda_case(
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("group_size", [16, 64, 256])
-def test_cuda_linear_matches_materialized_rotation(dynamic: bool, group_size: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cuda_linear_matches_materialized_rotation(
+    dynamic: bool, group_size: int, dtype: torch.dtype
+) -> None:
     torch.manual_seed(612 + group_size + dynamic)
     activation, _torchao_weight, weight, bias = _cuda_case(dynamic, group_size)
+    activation = activation.to(dtype)
+    weight = weight.to(dtype)
     rotated_input = rotate_groups(activation.float(), group_size)
     prepared_input = nvfp4_ops._prepare_compiled(
         rotated_input,

@@ -17,6 +17,7 @@ from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
+from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -99,7 +100,7 @@ def _prepared_gate_projection(
     ):
         return None
     operands = _compile_fx.PreparedLinearNodes.from_call(linear)
-    if operands is None or operands.logical_dtype is not torch.bfloat16:
+    if operands is None or operands.logical_dtype not in SUPPORTED_DTYPES:
         return None
     shape = _compile_fx.validated_prepared_linear(
         operands,
@@ -110,7 +111,7 @@ def _prepared_gate_projection(
         shape is None
         or gate_value is None
         or gate_value.ndim != 4
-        or gate_value.dtype is not torch.bfloat16
+        or gate_value.dtype not in SUPPORTED_DTYPES
         or gate_value.shape[0] != 1
         or not _same_dimension(gate_value.shape[1], shape.rows)
         or not _same_dimension(
@@ -187,7 +188,7 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
         query.ndim != 4
         or query.dtype is not torch.int8
         or projected.ndim != 3
-        or projected.dtype is not torch.bfloat16
+        or projected.dtype not in SUPPORTED_DTYPES
         or query.device.type != "cuda"
     ):
         return False
@@ -210,7 +211,8 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
         or head_dim not in SUPPORTED_HEAD_DIMS
         or attention is None
         or attention.ndim != 4
-        or attention.dtype is not torch.bfloat16
+        or attention.dtype is not projected.dtype
+        or attention_node.kwargs.get("output_dtype", torch.bfloat16) is not attention.dtype
         or attention.device != query.device
         or attention.layout is not torch.strided
         or not attention.is_contiguous()
@@ -311,7 +313,7 @@ def _replace_attention_output_with_target(
                 *bounded_arguments,
                 *gate_arguments,
             ),
-            kwargs={"high_first": high_first},
+            kwargs={"high_first": high_first, "output_dtype": original.meta["val"].dtype},
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)

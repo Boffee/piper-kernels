@@ -34,6 +34,7 @@ from piper_kernels.attention.sparse_piper_attention import (
     dispatch,
     residual,
 )
+from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     is_valid_routing_mode,
@@ -149,7 +150,7 @@ def _semantic_gate_projection(
         gate_value is None
         or weight_value is None
         or scale_value is None
-        or gate_value.dtype is not torch.bfloat16
+        or gate_value.dtype not in SUPPORTED_DTYPES
         or weight_value.dtype is not torch.int8
         or weight_value.ndim != 2
         or scale_value.dtype is not torch.float32
@@ -204,7 +205,7 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
         return False
     batch, sequence_length = input_value.shape[:2]
     heads = output_features // head_dim
-    if input_value.dtype is not torch.bfloat16 or (
+    if input_value.dtype not in SUPPORTED_DTYPES or (
         isinstance(sequence_length, int) and sequence_length < _TILE_ROWS
     ):
         return False
@@ -324,7 +325,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                         gate_weight_qdata,
                         gate_weight_scale,
                         gate_bias,
-                        torch.bfloat16,
+                        input_value.dtype,
                     ),
                 )
                 prepared_gate_linear.meta = gate_linear.meta.copy()
@@ -475,6 +476,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             coarse_gate=prepared_coarse_gate,
             coarse_scale=coarse_scale,
             coarse_key_blocks=coarse_key_blocks,
+            output_dtype=original.meta["val"].dtype,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -483,23 +485,25 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
 
 
 _patterns = PatternMatcherPass("convrot_int8_sparse_piper_projection")
-for _with_coarse in (True, False):
-    for _with_block_lengths in (True, False):
-        for _with_sparse_query_blocks in (True, False):
-            register_graph_pattern(
-                sparse_piper_pattern.sparse_piper_projection_pattern(
-                    _linear_pattern,
-                    with_block_lengths=_with_block_lengths,
-                    with_coarse=_with_coarse,
-                    with_sparse_query_blocks=_with_sparse_query_blocks,
-                ),
-                extra_check=(
-                    _valid_sparse_piper_coarse_residual_projection
-                    if _with_coarse
-                    else _valid_sparse_piper_projection
-                ),
-                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-            )(_replace_sparse_piper_projection)
+for _activation_dtype in SUPPORTED_DTYPES:
+    for _with_coarse in (True, False):
+        for _with_block_lengths in (True, False):
+            for _with_sparse_query_blocks in (True, False):
+                register_graph_pattern(
+                    sparse_piper_pattern.sparse_piper_projection_pattern(
+                        _linear_pattern,
+                        activation_dtype=_activation_dtype,
+                        with_block_lengths=_with_block_lengths,
+                        with_coarse=_with_coarse,
+                        with_sparse_query_blocks=_with_sparse_query_blocks,
+                    ),
+                    extra_check=(
+                        _valid_sparse_piper_coarse_residual_projection
+                        if _with_coarse
+                        else _valid_sparse_piper_projection
+                    ),
+                    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+                )(_replace_sparse_piper_projection)
 
 
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:

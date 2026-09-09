@@ -11,6 +11,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_D
 from piper_kernels.attention.sparse_piper_attention._block_layout import (
     validate_block_lengths as validate_k64_block_lengths,
 )
+from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 
@@ -66,7 +67,7 @@ def validate_qk_epilogue(
     operands = (norm_weight, cos, sin)
     if (
         head_dim not in SUPPORTED_HEAD_DIMS
-        or norm_weight.dtype is not torch.bfloat16
+        or norm_weight.dtype not in SUPPORTED_DTYPES
         or cos.ndim != 2
         or sin.shape != cos.shape
         or cos.shape[0] != sequence_length
@@ -77,7 +78,7 @@ def validate_qk_epilogue(
         or any(operand.device != input_qdata.device for operand in operands)
         or any(not operand.is_contiguous() for operand in operands)
     ):
-        raise ValueError(f"{name} requires contiguous BF16 norm and FP32 split-half RoPE")
+        raise ValueError(f"{name} requires contiguous FP16/BF16/FP32 norm and FP32 split-half RoPE")
     if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
         raise ValueError(f"{name} norm epsilon must be finite and positive")
 

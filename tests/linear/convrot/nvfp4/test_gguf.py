@@ -50,13 +50,15 @@ def test_from_gguf_matches_materialized_reference(quant_type: GGUFQuantizationTy
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_copy_from_gguf_refills_existing_storage_and_scale() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_copy_from_gguf_refills_existing_storage_and_scale(dtype: torch.dtype) -> None:
     first = finite_packed(GGUFQuantizationType.IQ4_XS)
     second = finite_packed(GGUFQuantizationType.IQ4_XS)
     weight = ConvRotNVFP4Tensor.from_gguf(
         first.cuda(),
         quant_type=GGUFQuantizationType.IQ4_XS,
         group_size=64,
+        logical_dtype=dtype,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
     )
@@ -64,6 +66,7 @@ def test_copy_from_gguf_refills_existing_storage_and_scale() -> None:
         second.cuda(),
         quant_type=GGUFQuantizationType.IQ4_XS,
         group_size=64,
+        logical_dtype=dtype,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
     )
@@ -78,6 +81,7 @@ def test_copy_from_gguf_refills_existing_storage_and_scale() -> None:
     )
 
     assert result is weight
+    assert weight.dtype is dtype
     assert weight.qdata is qdata
     assert weight.scale is scale
     assert weight.per_tensor_scale is per_tensor_scale

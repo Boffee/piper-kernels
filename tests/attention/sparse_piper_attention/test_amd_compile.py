@@ -14,7 +14,12 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is
 
 
 def _compile_attention(
-    architecture, has_lengths, has_dense_queries, has_coarse, storage_length=256
+    architecture,
+    has_lengths,
+    has_dense_queries,
+    has_coarse,
+    storage_length=256,
+    output_dtype="bf16",
 ):
     constants = {
         "query_storage_length": storage_length,
@@ -55,7 +60,7 @@ def _compile_attention(
             "routes_ptr": "*u16",
             "keep_ptr": "*i32",
             "route_offsets_ptr": "*i32",
-            "output_ptr": "*bf16",
+            "output_ptr": f"*{output_dtype}",
         }
     )
     return triton.compile(
@@ -87,6 +92,16 @@ def test_fused_amd_compilation(architecture, has_lengths, has_dense_queries, has
     # Keep rotated QK, online softmax, and the optional coarse epilogue in FP32.
     assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final BF16 store only
+
+
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+@pytest.mark.parametrize("dtype", ["fp16", "fp32"])
+def test_output_dtype_amd_compilation(architecture, dtype):
+    compiled = _compile_attention(architecture, True, True, False, output_dtype=dtype)
+    assert compiled.asm["hsaco"]
+    assert f'!tt.ptr<{dtype.replace("fp", "f")}> loc("output_ptr"' in compiled.asm["ttgir"]
+    assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
+    assert compiled.asm["ttgir"].count("arith.truncf") == (1 if dtype == "fp16" else 0)
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])

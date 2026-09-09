@@ -504,6 +504,21 @@ class _SparseProjectionAttention(torch.nn.Module):
         self.register_buffer("sin", angles.sin().contiguous())
         self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
+    def set_activation_dtype(self, dtype: torch.dtype) -> None:
+        for projection in self.modules():
+            if isinstance(projection, torch.nn.Linear):
+                projection.weight = torch.nn.Parameter(
+                    projection.weight.to(dtype), requires_grad=False
+                )
+                if projection.bias is not None:
+                    projection.bias = torch.nn.Parameter(
+                        projection.bias.to(dtype), requires_grad=False
+                    )
+        for name in ("query_norm", "key_norm"):
+            setattr(
+                self, name, torch.nn.Parameter(getattr(self, name).to(dtype), requires_grad=False)
+            )
+
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
         normalized = F.rms_norm(
             projected.view(
@@ -519,8 +534,8 @@ class _SparseProjectionAttention(torch.nn.Module):
         rotary = normalized[..., : self.rotary_dim]
         first, second = rotary.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        cos = self.cos.to(torch.bfloat16)[None, :, None, :]
-        sin = self.sin.to(torch.bfloat16)[None, :, None, :]
+        cos = self.cos.to(projected.dtype)[None, :, None, :]
+        sin = self.sin.to(projected.dtype)[None, :, None, :]
         rotary = rotary * cos + rotated * sin
         return torch.cat((rotary, normalized[..., self.rotary_dim :]), dim=-1).contiguous()
 
@@ -778,6 +793,7 @@ def _run_explicit_attention_output(
             model.sequence_length,
             model.sparse_attention._routing_mode,
             *optional_arguments,
+            output_dtype=hidden_states.dtype,
         )
     else:
         assert isinstance(model, _BoundedSparseProjectionAttentionOutput)
@@ -796,6 +812,7 @@ def _run_explicit_attention_output(
             block_lengths,
             model.coarse_key_blocks,
             sparse_query_blocks,
+            output_dtype=hidden_states.dtype,
         )
     output_weight = model.output.weight
     assert isinstance(output_weight, PiperNVFP4Tensor)
@@ -820,9 +837,11 @@ def _run_explicit_attention_output(
         [scaling_type.BlockWise1x16, scaling_type.TensorWise],
         [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
         [swizzle_type.SWIZZLE_32_4_4, swizzle_type.NO_SWIZZLE],
-        bias=model.output.bias,
+        bias=None if hidden_states.dtype is torch.float32 else model.output.bias,
         output_dtype=hidden_states.dtype,
     )
+    if hidden_states.dtype is torch.float32 and model.output.bias is not None:
+        result.add_(model.output.bias)
     return result.view(model.batch, model.sequence_length, model.output_features)
 
 
@@ -1033,7 +1052,7 @@ def test_high_first_output_fold_preserves_order_metadata(
 
     fused = torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
     node = next(node for node in graph.nodes if node.target is fused)
-    assert node.kwargs == {"high_first": True}
+    assert node.kwargs == {"high_first": True, "output_dtype": torch.bfloat16}
     graph.lint()
 
 
@@ -1143,8 +1162,10 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cuda_compile_fuses_static_nvfp4_attention_output(
     monkeypatch,
+    dtype: torch.dtype,
     head_dim: int,
     dynamic: bool,
     preparation_count: int,
@@ -1153,10 +1174,11 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(829)
     model = _SparseProjectionAttentionOutput(dynamic=dynamic).eval()
+    model.set_activation_dtype(dtype)
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     capture = _TargetCapturePass()
     with torch.no_grad():
@@ -1168,6 +1190,7 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
             options=_options_with_capture(capture),
         )(hidden_states)
 
+    assert actual.dtype is dtype
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
@@ -1274,7 +1297,9 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
+    dtype: torch.dtype,
     dynamic: bool,
     routing: str,
     preparation_count: int,
@@ -1284,10 +1309,11 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         dynamic=dynamic,
         routing=routing,
     ).eval()
+    model.set_activation_dtype(dtype)
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
@@ -1298,7 +1324,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
             *gate_input,
             *_nvfp4_storage(model.gate.weight),
             model.gate.bias,
-            torch.bfloat16,
+            dtype,
         ).view(
             model.batch,
             model.sequence_length,

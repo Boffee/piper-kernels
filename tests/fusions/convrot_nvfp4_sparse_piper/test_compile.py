@@ -277,7 +277,7 @@ def test_high_first_convrot_output_fold_preserves_order_metadata(
 
     fused = torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
     node = next(node for node in graph.nodes if node.target is fused)
-    assert node.kwargs == {"high_first": True}
+    assert node.kwargs == {"high_first": True, "output_dtype": torch.bfloat16}
     graph.lint()
 
 
@@ -438,6 +438,7 @@ def _explicit_fused(
         model.output.bias,
         output_weight.group_size,
         8_192,
+        output_dtype=input.dtype,
     )
 
 
@@ -516,7 +517,7 @@ def _explicit_fused_projected_gate(
         gate_weight.scale,
         gate_weight.per_tensor_scale,
         model.gate.bias,
-        torch.bfloat16,
+        input.dtype,
     ).view(model.batch, model.sequence_length, model.heads, model.head_dim)
     return _attention_output_op(
         *query,
@@ -540,6 +541,7 @@ def _explicit_fused_projected_gate(
         model.coarse_scale,
         model.coarse_key_blocks,
         sparse_query_blocks,
+        output_dtype=input.dtype,
     )
 
 
@@ -563,8 +565,10 @@ class _TargetCapturePass(CustomInferenceAwareGraphPass):
     [(False, "minmax"), (True, "minmax"), (False, "mean")],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     monkeypatch,
+    dtype: torch.dtype,
     head_dim: int,
     dynamic: bool,
     routing: str,
@@ -573,10 +577,11 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     monkeypatch.setattr(_SparseProjectionAttentionOutput, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(967 + dynamic)
     model = _ConvRotSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
+    model.set_activation_dtype(dtype)
     input = torch.randn(  # noqa: A001
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     capture = _TargetCapturePass()
     options = convrot_nvfp4_sparse_piper_compile_options()
@@ -588,6 +593,7 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
         torch._dynamo.reset()
         actual = torch.compile(model, fullgraph=True, options=options)(input)
 
+    assert actual.dtype is dtype
     assert torch.equal(actual, expected)
     assert (
         capture.targets.count(
@@ -611,7 +617,9 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
+    dtype: torch.dtype,
     dynamic: bool,
     routing: str,
     preparation_count: int,
@@ -621,10 +629,11 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
         dynamic=dynamic,
         routing=routing,
     ).eval()
+    model.set_activation_dtype(dtype)
     input = torch.randn(  # noqa: A001
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
