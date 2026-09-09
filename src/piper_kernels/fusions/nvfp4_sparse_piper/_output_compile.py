@@ -1,4 +1,4 @@
-"""Compiler folding for sparse Piper attention followed by static NVFP4."""
+"""Compiler folding for sparse Piper attention followed by NVFP4."""
 
 from __future__ import annotations
 
@@ -24,7 +24,10 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
-from . import output
+from . import (
+    _output,
+    output,  # noqa: F401 - register output operators
+)
 
 type _PreparedGateProjectionNodes = tuple[
     torch.fx.Node,
@@ -57,7 +60,7 @@ def _attention_output_pattern(
         KeywordArg("output_weight_per_tensor_scale"),
         KeywordArg("output_activation_scale"),
         KeywordArg("output_bias"),
-        False,
+        KeywordArg("output_dynamic_activation_scale"),
         *((KeywordArg("output_high_first"),) if with_high_first else ()),
     )
 
@@ -164,7 +167,6 @@ def _prepared_query_projection(
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
     required_names = (
         "output_query",
-        "output_activation_scale",
         "output_weight_qdata",
         "output_weight_scale",
     )
@@ -177,16 +179,12 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
     if any(value is None for value in metadata.values()):
         return False
     query = metadata["output_query"]
-    activation_scale = metadata["output_activation_scale"]
     weight_qdata = metadata["output_weight_qdata"]
     weight_scale = metadata["output_weight_scale"]
     projected = preparation_sharing.tensor_metadata(match.output_node())
-    if any(
-        value is None for value in (query, activation_scale, weight_qdata, weight_scale, projected)
-    ):
+    if any(value is None for value in (query, weight_qdata, weight_scale, projected)):
         return False
     assert query is not None
-    assert activation_scale is not None
     assert weight_qdata is not None
     assert weight_scale is not None
     assert projected is not None
@@ -243,12 +241,15 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
         match.kwargs["output_weight_per_tensor_scale"]
     )
     bias_valid, bias = _optional_tensor_metadata(match.kwargs["output_bias"])
-    if not weight_global_valid or not bias_valid:
+    activation_valid, activation_scale = _optional_tensor_metadata(
+        match.kwargs["output_activation_scale"]
+    )
+    if not weight_global_valid or not bias_valid or not activation_valid:
         return False
     try:
         nvfp4_validation.validate_activation_scale(
             activation_scale,
-            False,
+            match.kwargs["output_dynamic_activation_scale"],
             query.device,
             "fused sparse Piper NVFP4 compiler output",
         )
@@ -276,12 +277,14 @@ def _replace_attention_output_with_target(
     target: Callable[..., torch.Tensor],
     projected_query_target: Callable[..., torch.Tensor],
     projection_arguments: tuple[Argument, ...],
-    query_chunk_rows: int,
     high_first: Argument,
 ) -> None:
     """Emit one NVFP4 output operator with a materialized or deferred gate."""
     original = match.output_node()
     graph = match.graph
+    query_chunk_rows = _output.default_query_chunk_rows(
+        match.kwargs["output_dynamic_activation_scale"]
+    )
     bounded_arguments = sparse_piper_pattern.bounded_attention_arguments(match)
     block_lengths, block_mean, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
         bounded_arguments
@@ -319,7 +322,11 @@ def _replace_attention_output_with_target(
                 *bounded_arguments,
                 *gate_arguments,
             ),
-            kwargs={"high_first": high_first, "output_dtype": original.meta["val"].dtype},
+            kwargs={
+                "high_first": high_first,
+                "output_dtype": original.meta["val"].dtype,
+                "dynamic_activation_scale": match.kwargs["output_dynamic_activation_scale"],
+            },
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -339,7 +346,6 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
             match.kwargs["output_activation_scale"],
             match.kwargs["output_bias"],
         ),
-        output._DEFAULT_QUERY_CHUNK_ROWS,
         match.kwargs.get("output_high_first", False),
     )
 

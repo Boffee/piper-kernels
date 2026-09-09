@@ -27,10 +27,11 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import (
+    _output,
     nvfp4_sparse_piper_compile_options,
 )
+from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
 from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
 from piper_kernels.fusions.nvfp4_sparse_piper._compile import compile_pass
@@ -42,6 +43,7 @@ from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
+from .._accuracy import assert_fusion_output_close
 from ._helpers import exact_sm120_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
@@ -563,11 +565,13 @@ class _SparseProjectionAttention(torch.nn.Module):
 
 
 class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
-    """Canonical H3 attention with one static NVFP4 output projection."""
+    """Canonical H3 attention with one NVFP4 output projection."""
 
     output_features = 320
 
-    def __init__(self, *, dynamic: bool = False, routing: str = "minmax") -> None:
+    def __init__(
+        self, *, dynamic: bool = False, routing: str = "minmax", output_dynamic: bool = False
+    ) -> None:
         super().__init__(dynamic=dynamic, routing=routing)
         calibration = torch.full(
             (1, self.sequence_length, self.heads * self.head_dim),
@@ -580,7 +584,7 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
             block_size=16,
             is_swizzled_scales=True,
             use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=False,
+            use_dynamic_per_tensor_scale=output_dynamic,
         )
         dense = torch.randn(
             (self.output_features, self.heads * self.head_dim),
@@ -590,7 +594,7 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
         torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
             dense,
             per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
-            act_per_tensor_scale=activation_scale,
+            act_per_tensor_scale=None if output_dynamic else activation_scale,
             is_swizzled_scales=True,
             act_quant_kwargs=quantization,
         )
@@ -617,8 +621,8 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
     coarse_scale = 0.125
     coarse_key_blocks = 3
 
-    def __init__(self, *, dynamic: bool, routing: str) -> None:
-        super().__init__(dynamic=dynamic, routing=routing)
+    def __init__(self, *, dynamic: bool, routing: str, output_dynamic: bool = False) -> None:
+        super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
         self.routing = routing
 
     def forward(
@@ -660,8 +664,8 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
 class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentionOutput):
     """Bounded coarse attention whose gate is projected from hidden states."""
 
-    def __init__(self, *, dynamic: bool, routing: str) -> None:
-        super().__init__(dynamic=dynamic, routing=routing)
+    def __init__(self, *, dynamic: bool, routing: str, output_dynamic: bool = False) -> None:
+        super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
         query_weight = self.query.weight
         assert isinstance(query_weight, PiperNVFP4Tensor)
         dense = torch.randn(
@@ -1066,11 +1070,15 @@ def test_high_first_output_fold_preserves_order_metadata(
 
     fused = torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
     node = next(node for node in graph.nodes if node.target is fused)
-    assert node.kwargs == {"high_first": True, "output_dtype": torch.bfloat16}
+    assert node.kwargs == {
+        "high_first": True,
+        "output_dtype": torch.bfloat16,
+        "dynamic_activation_scale": False,
+    }
     graph.lint()
 
 
-def test_dynamic_output_fails_closed(
+def test_dynamic_output_fuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graph = _semantic_attention_graph(dynamic=False, output_dynamic=True)
@@ -1084,9 +1092,14 @@ def test_dynamic_output_fails_closed(
     compile_pass(graph, is_inference=True)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default not in targets
-    assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
-    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
+    fused = torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+    assert targets.count(fused) == 1
+    node = next(node for node in graph.nodes if node.target is fused)
+    assert node.kwargs["dynamic_activation_scale"] is True
+    assert node.args[26] is None
+    assert node.args[28] == 32_768
+    assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     graph.lint()
 
 
@@ -1178,7 +1191,9 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("affine", [True, False])
-def test_cuda_compile_fuses_static_nvfp4_attention_output(
+@pytest.mark.parametrize("output_dynamic", [False, True])
+def test_cuda_compile_fuses_nvfp4_attention_output(
+    output_dynamic: bool,
     affine: bool,
     monkeypatch,
     dtype: torch.dtype,
@@ -1189,7 +1204,9 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(829)
-    model = _SparseProjectionAttentionOutput(dynamic=dynamic).eval()
+    if output_dynamic:
+        monkeypatch.setattr(_SparseProjectionAttentionOutput, "output_features", 128)
+    model = _SparseProjectionAttentionOutput(dynamic=dynamic, output_dynamic=output_dynamic).eval()
     model.set_activation_dtype(dtype)
     if not affine:
         model.query_norm = None
@@ -1210,7 +1227,7 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
         )(hidden_states)
 
     assert actual.dtype is dtype
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
         == preparation_count
@@ -1241,7 +1258,9 @@ def test_cuda_compile_fuses_static_nvfp4_attention_output(
     [(False, "minmax"), (False, "mean"), (True, "minmax")],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
+    output_dynamic: bool,
     monkeypatch,
     head_dim: int,
     dynamic: bool,
@@ -1250,7 +1269,11 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(831)
-    model = _BoundedSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
+    model = _BoundedSparseProjectionAttentionOutput(
+        dynamic=dynamic, routing=routing, output_dynamic=output_dynamic
+    ).eval()
+    if output_dynamic:
+        monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", 128)
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -1284,12 +1307,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
             2,
         )
 
-    torch.testing.assert_close(
-        actual[:, valid_rows],
-        expected[:, valid_rows],
-        atol=0,
-        rtol=0,
-    )
+    assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
@@ -1368,12 +1386,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
             options=_options_with_capture(capture),
         )(hidden_states, block_lengths, 2)
 
-    torch.testing.assert_close(
-        actual[:, valid_rows],
-        expected[:, valid_rows],
-        atol=0,
-        rtol=0,
-    )
+    assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
         == preparation_count

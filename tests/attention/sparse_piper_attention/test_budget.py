@@ -50,3 +50,23 @@ def test_ratio_profile_rejects_invalid_values(ratios: tuple[float, ...]) -> None
 def test_ratio_profile_rejects_integer_tensor() -> None:
     with pytest.raises(TypeError, match="floating-point"):
         _normalize_head_keep_ratios(torch.tensor([1], dtype=torch.int32))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_route_metadata_survives_graph_capture_and_host_allocation_reuse() -> None:
+    graphs, layouts = [], []
+    for units in ((250_000, 500_000), (750_000, 1_000_000)):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            layout = _resolve_route_layout(units, 64, torch.device("cuda"))
+        graphs.append(graph)
+        layouts.append(layout)
+    for _ in range(16):
+        torch.empty(5, dtype=torch.int32, pin_memory=True).fill_(-1)
+    for graph in reversed(graphs):
+        graph.replay()
+    assert layouts[0].head_keep_blocks.tolist() == [16, 32]
+    assert layouts[0].route_head_offsets.tolist() == [0, 16, 48]
+    assert layouts[1].head_keep_blocks.tolist() == [48, 64]
+    assert layouts[1].route_head_offsets.tolist() == [0, 48, 112]

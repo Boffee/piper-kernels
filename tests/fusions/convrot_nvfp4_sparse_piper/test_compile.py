@@ -23,15 +23,13 @@ from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper._compile import (
     compile_pass as fusion_compile_pass,
 )
-from piper_kernels.fusions.convrot_nvfp4_sparse_piper.output import (
-    _attention_output_op,
-)
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import (
     convrot_nvfp4_swiglu_ffn_compile_options,
 )
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn._compile import (
     compile_pass as ffn_compile_pass,
 )
+from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
 from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
@@ -45,6 +43,7 @@ from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
+from .._accuracy import assert_fusion_output_close
 from ..nvfp4_sparse_piper.test_compile import (
     _ProjectedGateCoarseSparseAttentionOutput,
     _quantized_attention_output_graph,
@@ -277,21 +276,28 @@ def test_high_first_convrot_output_fold_preserves_order_metadata(
 
     fused = torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
     node = next(node for node in graph.nodes if node.target is fused)
-    assert node.kwargs == {"high_first": True, "output_dtype": torch.bfloat16}
+    assert node.kwargs == {
+        "high_first": True,
+        "output_dtype": torch.bfloat16,
+        "dynamic_activation_scale": False,
+    }
     graph.lint()
 
 
-def test_dynamic_convrot_output_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dynamic_convrot_output_fuses(monkeypatch: pytest.MonkeyPatch) -> None:
     graph = _convrot_graph(dynamic=False, output_dynamic=True)
-
     _run_passes(graph, monkeypatch)
-
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert (
-        torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default not in targets
+    fused = (
+        torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_projected_query_attention_output.default
     )
-    assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
-    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == 1
+    assert targets.count(fused) == 1
+    node = next(node for node in graph.nodes if node.target is fused)
+    assert node.kwargs["dynamic_activation_scale"] is True
+    assert node.args[26] is None
+    assert node.args[29] == 32_768
+    assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
 
 
@@ -310,8 +316,10 @@ def _convert_weight(weight: torch.Tensor) -> ConvRotNVFP4Tensor:
 
 
 class _ConvRotSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
-    def __init__(self, *, dynamic: bool, routing: str = "minmax") -> None:
-        super().__init__(dynamic=dynamic, routing=routing)
+    def __init__(
+        self, *, dynamic: bool, routing: str = "minmax", output_dynamic: bool = False
+    ) -> None:
+        super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
         for projection in (self.query, self.key, self.value, self.output):
             projection.weight = torch.nn.Parameter(
                 _convert_weight(projection.weight),
@@ -322,8 +330,8 @@ class _ConvRotSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
 class _ConvRotProjectedGateCoarseAttentionOutput(_ProjectedGateCoarseSparseAttentionOutput):
     """Coarse sparse attention with ConvRot NVFP4 Q/K/V/gate/output linears."""
 
-    def __init__(self, *, dynamic: bool, routing: str) -> None:
-        super().__init__(dynamic=dynamic, routing=routing)
+    def __init__(self, *, dynamic: bool, routing: str, output_dynamic: bool = False) -> None:
+        super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
         for projection in (self.query, self.key, self.value, self.gate, self.output):
             projection.weight = torch.nn.Parameter(
                 _convert_weight(projection.weight),
@@ -349,26 +357,32 @@ def _prepared_input(
     )
 
 
-def _explicit_fused(
+def _project_materialized_attention(
+    attention: torch.Tensor, projection: torch.nn.Linear
+) -> torch.Tensor:
+    weight = projection.weight
+    assert isinstance(weight, ConvRotNVFP4Tensor)
+    assert weight.act_quant_kwargs is not None
+    return convrot_nvfp4_ops.linear(
+        attention.flatten(2),
+        weight.qdata,
+        weight.scale,
+        weight.per_tensor_scale,
+        weight.act_per_tensor_scale,
+        projection.bias,
+        weight.act_quant_kwargs.use_dynamic_per_tensor_scale,
+        weight.group_size,
+        weight.high_first,
+    )
+
+
+def _run_explicit_attention_output(
     model: _ConvRotSparseProjectionAttentionOutput,
     input: torch.Tensor,  # noqa: A002
 ) -> torch.Tensor:
-    prepared = []
-    for projection in (model.query, model.key, model.value):
-        weight = projection.weight
-        assert isinstance(weight, ConvRotNVFP4Tensor)
-        quantization = weight.act_quant_kwargs
-        assert quantization is not None
-        prepared.append(
-            convrot_nvfp4_ops.prepare_input(
-                input,
-                weight.act_per_tensor_scale,
-                quantization.use_dynamic_per_tensor_scale,
-                weight.group_size,
-                None,
-                weight.high_first,
-            )
-        )
+    q_input, k_input, v_input = (
+        _prepared_input(input, projection) for projection in (model.query, model.key, model.value)
+    )
     q_weight = model.query.weight
     k_weight = model.key.weight
     v_weight = model.value.weight
@@ -376,7 +390,7 @@ def _explicit_fused(
     assert isinstance(k_weight, ConvRotNVFP4Tensor)
     assert isinstance(v_weight, ConvRotNVFP4Tensor)
     query = fused_query.project_query(
-        *prepared[0],
+        *q_input,
         q_weight.qdata,
         q_weight.scale,
         q_weight.per_tensor_scale,
@@ -391,7 +405,7 @@ def _explicit_fused(
         head_dim=model.head_dim,
     )
     key = fused_key.project_key(
-        *prepared[1],
+        *k_input,
         k_weight.qdata,
         k_weight.scale,
         k_weight.per_tensor_scale,
@@ -405,7 +419,7 @@ def _explicit_fused(
         head_dim=model.head_dim,
     )
     value_mean = linear_mean(
-        *prepared[2],
+        *v_input,
         v_weight.qdata,
         v_weight.scale,
         v_weight.per_tensor_scale,
@@ -414,7 +428,7 @@ def _explicit_fused(
         model.sequence_length,
     ).view(model.batch, model.heads, model.head_dim)
     value = fused_value.project_value(
-        *prepared[2],
+        *v_input,
         v_weight.qdata,
         v_weight.scale,
         v_weight.per_tensor_scale,
@@ -422,9 +436,7 @@ def _explicit_fused(
         value_mean,
         4_096,
     )
-    output_weight = model.output.weight
-    assert isinstance(output_weight, ConvRotNVFP4Tensor)
-    return _attention_output_op(
+    attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
         *query,
         *key,
         *value,
@@ -433,18 +445,12 @@ def _explicit_fused(
         model.sparse_key_blocks,
         model.sequence_length,
         model.sparse_attention._routing_mode,
-        output_weight.qdata,
-        output_weight.scale,
-        output_weight.per_tensor_scale,
-        output_weight.act_per_tensor_scale,
-        model.output.bias,
-        output_weight.group_size,
-        8_192,
         output_dtype=input.dtype,
     )
+    return _project_materialized_attention(attention, model.output)
 
 
-def _explicit_fused_projected_gate(
+def _run_explicit_projected_gate_output(
     model: _ConvRotProjectedGateCoarseAttentionOutput,
     input: torch.Tensor,  # noqa: A002
     block_lengths: torch.Tensor,
@@ -458,12 +464,10 @@ def _explicit_fused_projected_gate(
     k_weight = model.key.weight
     v_weight = model.value.weight
     gate_weight = model.gate.weight
-    output_weight = model.output.weight
     assert isinstance(q_weight, ConvRotNVFP4Tensor)
     assert isinstance(k_weight, ConvRotNVFP4Tensor)
     assert isinstance(v_weight, ConvRotNVFP4Tensor)
     assert isinstance(gate_weight, ConvRotNVFP4Tensor)
-    assert isinstance(output_weight, ConvRotNVFP4Tensor)
     query = fused_query.project_query(
         *q_input,
         q_weight.qdata,
@@ -523,30 +527,26 @@ def _explicit_fused_projected_gate(
         model.gate.bias,
         input.dtype,
     ).view(model.batch, model.sequence_length, model.heads, model.head_dim)
-    return _attention_output_op(
+    attention = (
+        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+    )(
         *query,
         *key,
         *value[:2],
         value_mean,
+        value[2],
+        coarse_gate,
         list(model.sparse_attention._head_keep_ratio_units),
         model.sparse_key_blocks,
         model.sequence_length,
         model.sparse_attention._routing_mode,
-        output_weight.qdata,
-        output_weight.scale,
-        output_weight.per_tensor_scale,
-        output_weight.act_per_tensor_scale,
-        model.output.bias,
-        output_weight.group_size,
-        8_192,
-        block_lengths,
-        value[2],
-        coarse_gate,
         model.coarse_scale,
+        block_lengths,
         model.coarse_key_blocks,
         sparse_query_blocks,
         output_dtype=input.dtype,
     )
+    return _project_materialized_attention(attention, model.output)
 
 
 class _TargetCapturePass(CustomInferenceAwareGraphPass):
@@ -571,7 +571,9 @@ class _TargetCapturePass(CustomInferenceAwareGraphPass):
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
+    output_dynamic: bool,
     affine: bool,
     monkeypatch,
     dtype: torch.dtype,
@@ -582,7 +584,11 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     monkeypatch.setattr(_SparseProjectionAttentionOutput, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttentionOutput, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(967 + dynamic)
-    model = _ConvRotSparseProjectionAttentionOutput(dynamic=dynamic, routing=routing).eval()
+    if output_dynamic:
+        monkeypatch.setattr(_SparseProjectionAttentionOutput, "output_features", 128)
+    model = _ConvRotSparseProjectionAttentionOutput(
+        dynamic=dynamic, routing=routing, output_dynamic=output_dynamic
+    ).eval()
     model.set_activation_dtype(dtype)
     if not affine:
         model.query_norm = None
@@ -598,12 +604,12 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     assert isinstance(passes, tuple)
     options[_POST_GRAD_PRE_PASS] = (*passes, capture)
     with torch.no_grad():
-        expected = _explicit_fused(model, input)
+        expected = _run_explicit_attention_output(model, input)
         torch._dynamo.reset()
         actual = torch.compile(model, fullgraph=True, options=options)(input)
 
     assert actual.dtype is dtype
-    assert torch.equal(actual, expected)
+    assert_fusion_output_close(actual, expected)
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_projected_query_attention_output.default
@@ -628,7 +634,10 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("key_affine", [True, False])
+@pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
+    output_dynamic: bool,
+    monkeypatch,
     key_affine: bool,
     dtype: torch.dtype,
     dynamic: bool,
@@ -639,7 +648,10 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
     model = _ConvRotProjectedGateCoarseAttentionOutput(
         dynamic=dynamic,
         routing=routing,
+        output_dynamic=output_dynamic,
     ).eval()
+    if output_dynamic:
+        monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", 128)
     model.set_activation_dtype(dtype)
     if not key_affine:
         model.key_norm = None
@@ -656,7 +668,7 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
     assert isinstance(passes, tuple)
     options[_POST_GRAD_PRE_PASS] = (*passes, capture)
     with torch.no_grad():
-        expected = _explicit_fused_projected_gate(model, input, block_lengths, 2)
+        expected = _run_explicit_projected_gate_output(model, input, block_lengths, 2)
         torch._dynamo.reset()
         actual = torch.compile(model, fullgraph=True, options=options)(
             input,
@@ -664,12 +676,7 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
             2,
         )
 
-    torch.testing.assert_close(
-        actual[:, valid_rows],
-        expected[:, valid_rows],
-        atol=0,
-        rtol=0,
-    )
+    assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default)
         == preparation_count

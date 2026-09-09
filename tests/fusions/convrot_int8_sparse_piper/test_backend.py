@@ -394,7 +394,10 @@ def test_output_fusion_selects_once_before_preparation_and_reuses_backend(
         select_projection.assert_not_called()
 
 
-def test_shared_output_validation_has_no_target_policy_but_nvfp4_still_does(monkeypatch):
+@pytest.mark.parametrize("dynamic_activation_scale", [False, True])
+def test_shared_output_validation_has_no_target_policy_but_nvfp4_still_does(
+    monkeypatch, dynamic_activation_scale
+):
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
@@ -402,7 +405,9 @@ def test_shared_output_validation_has_no_target_policy_but_nvfp4_still_does(monk
         storage = torch.empty((1, 1, 64, 128), dtype=torch.int8, device="cuda:1")
         assert output_common.validate_attention_output(storage, 64, 128) == 128
         with pytest.raises(ValueError, match="requires exact NVIDIA SM120"):
-            nvfp4_output._validate_output_projection(storage, None, None, None, None, None, 64, 128)
+            nvfp4_output._validate_output_projection(
+                storage, None, None, None, None, None, 64, 128, dynamic_activation_scale
+            )
 
 
 def _assert_shared_fusion_boundary(source):

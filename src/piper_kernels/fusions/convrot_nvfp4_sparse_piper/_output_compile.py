@@ -1,4 +1,4 @@
-"""Fold sparse attention followed by a static ConvRot NVFP4 projection."""
+"""Fold sparse attention followed by a ConvRot NVFP4 projection."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from piper_kernels.fusions.nvfp4_sparse_piper import (
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear.convrot._rotation import validate_group_size
 
-from . import output
+from . import output  # noqa: F401 - register output operators
 
 
 def _attention_output_pattern(
@@ -39,7 +39,7 @@ def _attention_output_pattern(
         KeywordArg("output_weight_per_tensor_scale"),
         KeywordArg("output_activation_scale"),
         KeywordArg("output_bias"),
-        False,
+        KeywordArg("output_dynamic_activation_scale"),
         KeywordArg("output_group_size"),
         *((KeywordArg("output_high_first"),) if with_high_first else ()),
     )
@@ -74,7 +74,6 @@ def _replace_attention_output(match: Match, **_unused: object) -> None:
             match.kwargs["output_bias"],
             match.kwargs["output_group_size"],
         ),
-        output._DEFAULT_QUERY_CHUNK_ROWS,
         match.kwargs.get("output_high_first", False),
     )
 

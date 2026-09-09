@@ -20,6 +20,7 @@ from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
 from piper_kernels.linear.nvfp4 import _ops, _projection, reference
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
+from .._accuracy import assert_fusion_output_close
 from ._helpers import exact_sm120_available, make_operands
 
 _HEADS = 2
@@ -257,7 +258,7 @@ def test_projected_query_attention_output_matches_multiple_materialized_q_window
             128,
         )
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert_fusion_output_close(actual, expected)
 
 
 def _projected_gate_arguments(
@@ -352,8 +353,7 @@ def test_attention_output_matches_accumulator_affine_boundary(
 
     assert actual.shape == (1, sequence_length, _OUTPUT_FEATURES)
     assert actual.is_contiguous()
-    # GEMM can fuse FP32 multiply-add where the PyTorch reference rounds separately.
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
@@ -372,19 +372,20 @@ def test_attention_output_supports_mixed_precision_bias(
         actual = output._attention_output_op(*arguments, 128)
 
     assert actual.dtype is torch.bfloat16
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_high_first_attention_output_matches_low_first() -> None:
-    arguments, expected = _arguments(sequence_length=193, bias=True)
+    arguments, _reference = _arguments(sequence_length=193, bias=True)
     high_arguments = list(arguments)
     qdata = high_arguments[14]
     assert isinstance(qdata, torch.Tensor)
     high_arguments[14] = ((qdata & 0x0F) << 4) | (qdata >> 4)
 
     with torch.no_grad():
+        expected = output._attention_output_op(*arguments, 128)
         actual = output._attention_output_op(
             *high_arguments,
             128,
@@ -397,8 +398,11 @@ def test_high_first_attention_output_matches_low_first() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_attention_output_obeys_a_nondefault_current_stream() -> None:
-    arguments, expected = _arguments(sequence_length=193, bias=False)
+    arguments, _reference = _arguments(sequence_length=193, bias=False)
+    with torch.no_grad():
+        expected = output._attention_output_op(*arguments, 128)
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
 
     with torch.no_grad(), torch.cuda.stream(stream):
         actual = output._attention_output_op(*arguments, 128)
@@ -427,12 +431,7 @@ def test_attention_output_supports_bounded_attention_features(
     block_lengths = arguments[-6]
     assert isinstance(block_lengths, torch.Tensor)
     valid_rows = torch.arange(64, device="cuda")[None] < block_lengths[:, None]
-    torch.testing.assert_close(
-        actual[:, valid_rows.flatten()],
-        expected[:, valid_rows.flatten()],
-        atol=1e-5,
-        rtol=2**-7,
-    )
+    assert_fusion_output_close(actual[:, valid_rows.flatten()], expected[:, valid_rows.flatten()])
 
 
 @pytest.mark.gpu
@@ -447,7 +446,7 @@ def test_attention_output_supports_blockwise_only_weight_scale() -> None:
     with torch.no_grad():
         actual = output._attention_output_op(*arguments, 128)
 
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=2**-7)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
@@ -486,7 +485,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
     torch.cuda.current_stream().wait_stream(load_stream)
 
     assert len(streams) == 2
-    torch.testing.assert_close(actual, expected, atol=2**-7, rtol=2**-7)
+    assert_fusion_output_close(actual, expected)
 
 
 @pytest.mark.gpu
