@@ -49,6 +49,7 @@ def project_query(
     chunk_start: int,
     chunk_rows: int,
     out: QueryOutput,
+    bias: torch.Tensor | None = None,
 ) -> None:
     """Launch Q32 quantization and Q64 summaries for a validated query window."""
     query, query_scale, query_summary = out
@@ -81,6 +82,7 @@ def project_query(
                 chunk_start + chunk_rows,
                 storage_sequence_length,
                 input_features=input_qdata.shape[2],
+                bias_ptr=bias,
                 heads=heads,
                 heads_per_program=_QK_HEADS_PER_PROGRAM,
                 head_dim=_HEAD_DIM,
@@ -123,6 +125,7 @@ def project_key(
     block_lengths: torch.Tensor | None,
     *,
     out: KeyOutput,
+    bias: torch.Tensor | None = None,
 ) -> None:
     """Launch K64 quantization and routing summaries for global key storage."""
     key, key_scale, key_summary, key_aux = out
@@ -159,6 +162,7 @@ def project_key(
                 storage_sequence_length,
                 row_block_offset,
                 input_features=input_qdata.shape[2],
+                bias_ptr=bias,
                 heads=heads,
                 heads_per_program=_QK_HEADS_PER_PROGRAM,
                 head_dim=_HEAD_DIM,
@@ -197,6 +201,7 @@ def project_value(
     *,
     emit_block_mean: bool,
     out: ValueOutput,
+    bias: torch.Tensor | None = None,
 ) -> None:
     """Launch projected means and centered tile-scaled INT8 values."""
     value, value_scale_multiplier, value_mean, block_mean = out
@@ -212,6 +217,7 @@ def project_value(
             weight_qdata,
             weight_scale,
             value_mean,
+            bias_ptr=bias,
             input_features=input_qdata.shape[2],
             output_features=heads * _HEAD_DIM,
             block_n=_VALUE_BLOCK_N,
@@ -241,6 +247,7 @@ def project_value(
                 storage_sequence_length,
                 row_block_offset,
                 input_features=input_qdata.shape[2],
+                bias_ptr=bias,
                 heads=heads,
                 heads_per_program=_VALUE_HEADS_PER_PROGRAM,
                 head_dim=_HEAD_DIM,

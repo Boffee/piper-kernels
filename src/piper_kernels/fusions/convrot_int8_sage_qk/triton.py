@@ -35,6 +35,7 @@ def project_rmsnorm_rope_tile(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     rsqrt_fn: tl.constexpr = None,  # pyright: ignore[reportArgumentType]
+    bias_ptr=None,
 ):
     """Return one FP32 normalized and rotated projection tile."""
     projection = convrot_int8_kernels.scaled_int8_matmul(
@@ -52,6 +53,11 @@ def project_rmsnorm_rope_tile(
         block_k,
         aligned_projection,
     )
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + weight_offsets, weight_offsets < output_features, 0).to(
+            tl.float32
+        )
+        projection += bias[None, :]
     projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
     return projected_qk.rmsnorm_rope_tile(
         projection,

@@ -69,6 +69,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     block_k: tl.constexpr,
     rsqrt_fn: tl.constexpr = None,
     group_m: tl.constexpr = 0,
+    bias_ptr=None,
 ):
     """Project a Q64 tile and emit Q32 INT8 plus route summaries."""
     tl.static_assert(block_m == 64)
@@ -114,6 +115,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         block_n,
         block_k,
         rsqrt_fn,
+        bias_ptr=bias_ptr,
     )
 
     sparse_piper_kernels.store_query_tile(
@@ -175,6 +177,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     block_k: tl.constexpr,
     rsqrt_fn: tl.constexpr = None,
     group_m: tl.constexpr = 0,
+    bias_ptr=None,
 ):
     """Project K once and emit INT8 operands plus route summaries."""
     row_block, head_block = _projection_tile_ids(group_m)
@@ -210,6 +213,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         block_n,
         block_k,
         rsqrt_fn,
+        bias_ptr=bias_ptr,
     )
     sparse_piper_kernels.store_key_tile(
         key,
@@ -244,6 +248,7 @@ def _project_prepared_input_mean_kernel(
     output_features: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    bias_ptr=None,
 ):
     """Project one represented-input mean without quantizing that compact row."""
     output_block = tl.program_id(0)
@@ -273,9 +278,14 @@ def _project_prepared_input_mean_kernel(
         mask=output_offsets < output_features,
         other=0.0,
     )
+    projected_mean = accumulator * weight_scale
+    if bias_ptr is not None:
+        projected_mean += tl.load(
+            bias_ptr + output_offsets, output_offsets < output_features, 0
+        ).to(tl.float32)
     tl.store(
         value_mean_ptr + batch * output_features + output_offsets,
-        accumulator * weight_scale,
+        projected_mean,
         mask=output_offsets < output_features,
     )
 
@@ -306,6 +316,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_m: tl.constexpr = 0,
+    bias_ptr=None,
 ):
     """Project two heads over two K64 tiles and emit sparse Piper's V format."""
     tl.static_assert(block_m == 2 * _JIT_VALUE_TILE_ROWS)
@@ -336,6 +347,11 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         block_k,
         aligned_projection,
     )
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + weight_offsets, weight_offsets < heads * head_dim, 0).to(
+            tl.float32
+        )
+        projection += bias[None, :]
     projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
     sparse_piper_kernels.store_value_tile(
         projection,

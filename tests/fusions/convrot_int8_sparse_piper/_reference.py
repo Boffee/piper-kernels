@@ -146,6 +146,8 @@ def _materialized_fp32_qk(
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
+    *,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch, sequence_length, _input_features = input_qdata.shape
     head_dim = norm_weight.shape[0]
@@ -155,7 +157,7 @@ def _materialized_fp32_qk(
         input_scale,
         weight_qdata,
         weight_scale,
-        None,
+        bias,
         torch.float32,
     ).view(batch, sequence_length, heads, head_dim)
     normalized = F.rms_norm(projected, (head_dim,), norm_weight.float(), norm_epsilon)
@@ -178,6 +180,7 @@ def composed_query_projection(
     *,
     norm_epsilon: float,
     softmax_scale: float,
+    bias: torch.Tensor | None = None,
 ) -> ProjectedQuery:
     """Materialize the FP32 operations fused by one-pass query projection."""
     sequence_length = input_qdata.shape[1]
@@ -190,6 +193,7 @@ def composed_query_projection(
         cos,
         sin,
         norm_epsilon,
+        bias=bias,
     )
     storage_length = padded_sequence_length(sequence_length)
     blocks, valid = _padded_blocks(query.float())
@@ -215,6 +219,7 @@ def composed_key_projection(
     sin: torch.Tensor,
     *,
     norm_epsilon: float,
+    bias: torch.Tensor | None = None,
 ) -> ProjectedKey:
     """Materialize the FP32 operations fused by one-pass key projection."""
     batch, sequence_length, _input_features = input_qdata.shape
@@ -229,6 +234,7 @@ def composed_key_projection(
         cos,
         sin,
         norm_epsilon,
+        bias=bias,
     )
     storage_length = padded_sequence_length(sequence_length)
     key_int8, key_scale = qk_quantization.prepare_key(
@@ -277,6 +283,8 @@ def composed_value_projection(
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     head_dim: int = 128,
+    *,
+    bias: torch.Tensor | None = None,
 ) -> ProjectedValue:
     """Materialize the FP32 operations fused by one-pass value projection."""
     batch, sequence_length, _input_features = input_qdata.shape
@@ -286,12 +294,14 @@ def composed_value_projection(
         heads,
         head_dim,
     )
+    if bias is not None:
+        value_mean += bias.float().view(1, heads, head_dim)
     projected = int8_ops.linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,
         weight_scale,
-        None,
+        bias,
         torch.float32,
     ).view(batch, sequence_length, heads, head_dim)
     projected_blocks, valid = _padded_blocks(projected.permute(0, 2, 1, 3).float())

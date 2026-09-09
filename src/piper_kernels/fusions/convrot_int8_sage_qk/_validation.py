@@ -5,11 +5,12 @@ import math
 import torch
 
 from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
+from piper_kernels.linear import _bias
 
 _SUPPORTED_NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-def validate_qk_projection_inputs(  # noqa: PLR0912
+def validate_qk_projection_inputs(  # noqa: PLR0912, PLR0913
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -21,6 +22,7 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
     norm_epsilon: float,
     name: str,
     head_dim: int | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     """Validate inputs to a fused ConvRot INT8 Q/K projection kernel."""
     head_dim = resolve_head_dim(norm_weight, head_dim)
@@ -49,9 +51,22 @@ def validate_qk_projection_inputs(  # noqa: PLR0912
         raise ValueError(f"{name} projection rotary dimension must be even and fit D64/D128")
     if cos.dtype is not torch.float32 or sin.dtype is not cos.dtype:
         raise ValueError(f"{name} projection RoPE cos/sin must use FP32")
+    if bias is not None:
+        _bias.validate_dtype(bias, f"{name} projection")
+        if bias.shape != (weight_qdata.shape[0],):
+            raise ValueError(f"{name} projection bias must have one value per output feature")
     operands = tuple(
         operand
-        for operand in (input_qdata, input_scale, weight_qdata, weight_scale, norm_weight, cos, sin)
+        for operand in (
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            norm_weight,
+            cos,
+            sin,
+            bias,
+        )
         if operand is not None
     )
     if any(operand.device != input_qdata.device for operand in operands):

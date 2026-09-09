@@ -49,13 +49,12 @@ class _SparseProjectionAttention(torch.nn.Module):
     def __init__(
         self,
         *,
-        value_bias: bool = False,
         strided_rope: bool = False,
         routing: str = "minmax",
     ) -> None:
         super().__init__()
         projections = []
-        for bias in (False, False, value_bias):
+        for _ in range(3):
             weight = ConvRotInt8Tensor.from_quantized(
                 torch.randint(
                     -127,
@@ -77,13 +76,11 @@ class _SparseProjectionAttention(torch.nn.Module):
             projection = torch.nn.Linear(
                 self.input_features,
                 self.heads * self.head_dim,
-                bias=bias,
+                bias=False,
                 device="cuda",
                 dtype=torch.bfloat16,
             )
             projection.weight = torch.nn.Parameter(weight, requires_grad=False)
-            if projection.bias is not None:
-                projection.bias.requires_grad_(False)
             projections.append(projection)
         self.query, self.key, self.value = projections
         self.query_norm = torch.nn.Parameter(
@@ -118,6 +115,13 @@ class _SparseProjectionAttention(torch.nn.Module):
         for name in ("query_norm", "key_norm"):
             setattr(
                 self, name, torch.nn.Parameter(getattr(self, name).to(dtype), requires_grad=False)
+            )
+
+    def set_projection_bias(self, dtype: torch.dtype) -> None:
+        for projection in (self.query, self.key, self.value):
+            projection.bias = torch.nn.Parameter(
+                torch.randn(projection.out_features, device="cuda", dtype=dtype),
+                requires_grad=False,
             )
 
     def _norm_rope(self, projected: torch.Tensor, norm: torch.Tensor | None) -> torch.Tensor:
@@ -537,6 +541,7 @@ def _run_explicit_fused_projection(
         routing_mode,
         block_lengths,
         head_dim=model.head_dim,
+        bias=model.query.bias,
     )
     key = fused_key._project_key_op(
         input_qdata,
@@ -550,6 +555,7 @@ def _run_explicit_fused_projection(
         routing_mode,
         block_lengths,
         head_dim=model.head_dim,
+        bias=model.key.bias,
     )
     input_mean = int8_ops.dequantized_input_mean(
         input_qdata,
@@ -564,7 +570,9 @@ def _run_explicit_fused_projection(
         model.value.weight.scale,
     )
     if coarse_gate is None:
-        value = fused_value._project_value_op(*projection_arguments, block_lengths, model.head_dim)
+        value = fused_value._project_value_op(
+            *projection_arguments, block_lengths, model.head_dim, bias=model.value.bias
+        )
         return _sparse_piper_attention_from_quantized_op(
             *query,
             *key,
@@ -583,6 +591,7 @@ def _run_explicit_fused_projection(
         *projection_arguments,
         block_lengths,
         model.head_dim,
+        bias=model.value.bias,
     )
     return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
         *query,
@@ -1073,14 +1082,17 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("qkv_bias", [False, True])
 def test_compile_options_fuse_attention_output_boundary(
-    affine: bool, monkeypatch, head_dim: int, dtype: torch.dtype
+    qkv_bias: bool, affine: bool, monkeypatch, head_dim: int, dtype: torch.dtype
 ) -> None:
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(719)
     model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
     model.set_activation_dtype(dtype)
+    if qkv_bias:
+        model.set_projection_bias(dtype)
     if not affine:
         model.query_norm = None
         model.key_norm = None
@@ -1337,6 +1349,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
     monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
     model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
     model.set_activation_dtype(dtype)
+    model.set_projection_bias(dtype)
     if not query_affine:
         model.query_norm = None
     hidden_states = torch.randn(
@@ -1726,16 +1739,9 @@ def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     not projection_available(),
     reason="requires fused sparse projection support",
 )
-@pytest.mark.parametrize(
-    "model_options",
-    [{"value_bias": True}, {"strided_rope": True}],
-    ids=("projection-bias", "strided-rope"),
-)
-def test_sparse_piper_projection_fails_closed_for_incompatible_operands(
-    model_options: dict[str, bool],
-) -> None:
+def test_sparse_piper_projection_fails_closed_for_strided_rope() -> None:
     torch.manual_seed(703)
-    model = _SparseProjectionAttention(**model_options).eval()
+    model = _SparseProjectionAttention(strided_rope=True).eval()
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,

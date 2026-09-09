@@ -28,6 +28,7 @@ def _validate_inputs(
     *,
     norm_epsilon: float,
     head_dim: int | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     result = validate_qk_projection_inputs(
         input_qdata,
@@ -40,6 +41,7 @@ def _validate_inputs(
         norm_epsilon=norm_epsilon,
         name="K",
         head_dim=head_dim,
+        bias=bias,
     )
     if result[1] < TILE_ROWS:
         raise ValueError(f"K projection requires at least {TILE_ROWS} sequence rows")
@@ -59,6 +61,7 @@ def _launch_key_projection(  # noqa: PLR0913
     block_lengths: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_routing_mode(routing_mode)
     batch, sequence_length, heads = _validate_inputs(
@@ -71,6 +74,7 @@ def _launch_key_projection(  # noqa: PLR0913
         sin,
         norm_epsilon=norm_epsilon,
         head_dim=head_dim,
+        bias=bias,
     )
     head_dim = resolve_head_dim(norm_weight, head_dim)
     storage_sequence_length = padded_sequence_length(sequence_length)
@@ -110,6 +114,7 @@ def _launch_key_projection(  # noqa: PLR0913
         routing_mode,
         block_lengths,
         out=(key, key_scale, key_summary, key_aux),
+        bias=bias,
     )
     return key, key_scale, key_summary, key_aux
 
@@ -118,7 +123,7 @@ def _launch_key_projection(  # noqa: PLR0913
     "piper_kernels::convrot_int8_sparse_piper_project_key",
     mutates_args=(),
 )
-def _project_key_op(  # noqa: PLR0913
+def _project_key_op(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -129,6 +134,7 @@ def _project_key_op(  # noqa: PLR0913
     norm_epsilon: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -144,6 +150,7 @@ def _project_key_op(  # noqa: PLR0913
         routing_mode,
         block_lengths,
         head_dim=head_dim,
+        bias=bias,
     )
 
 
@@ -159,6 +166,7 @@ def _project_key_op_fake(
     _norm_epsilon: float,
     routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
+    _bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -407,6 +407,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     gate_projection: _PreparedGateProjection | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    query_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output."""
     projection_backend = fusion_backend.require_projection_backend(
@@ -468,6 +469,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             chunk_rows=rows,
             backend=projection_backend,
             head_dim=key.shape[-1],
+            bias=query_bias,
         )
 
     return output_common.run_chunked_projected_query_attention_output(
@@ -523,6 +525,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_qdata: torch.Tensor | None = None,
     gate_weight_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    query_bias: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -570,6 +573,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         gate_projection,
         output_dtype=output_dtype,
+        query_bias=query_bias,
     )
 
 
@@ -611,6 +615,7 @@ def _projected_query_attention_output_op_fake(
     _gate_weight_qdata: torch.Tensor | None = None,
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    _query_bias: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:

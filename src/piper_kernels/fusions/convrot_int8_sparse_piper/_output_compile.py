@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch._inductor.pattern_matcher import (
     CallFunction,
@@ -110,7 +112,7 @@ def _prepared_query_projection(
     query_summary: torch.fx.Node,
     routing_mode: int,
     block_lengths: Argument | None,
-) -> _PreparedQueryProjectionNodes | None:
+) -> tuple[_PreparedQueryProjectionNodes, torch.fx.Node | None] | None:
     """Recover one shared ConvRot INT8 Q producer from its three tuple outputs."""
     producer = sparse_piper_compile.ordered_tuple_output_producer(
         (query, query_scale, query_summary),
@@ -123,13 +125,18 @@ def _prepared_query_projection(
         producer is None
         or query_value is None
         or query_value.ndim != 4
-        or (producer.kwargs and producer.kwargs != {"head_dim": query_value.shape[-1]})
-        or len(producer.args) not in (10, 11)
+        or producer.kwargs.keys() - {"head_dim", "bias"}
+        or producer.kwargs.get("head_dim", query_value.shape[-1]) != query_value.shape[-1]
+        or len(producer.args) not in (10, 11, 12)
+        or (len(producer.args) == 12 and "bias" in producer.kwargs)
         or producer.args[9] != routing_mode
-        or (producer.args[10] if len(producer.args) == 11 else None) is not block_lengths
+        or (producer.args[10] if len(producer.args) >= 11 else None) is not block_lengths
     ):
         return None
-    projection = producer.args[:9]
+    projection = cast(_PreparedQueryProjectionNodes, producer.args[:9])
+    bias = producer.kwargs.get("bias", producer.args[11] if len(producer.args) == 12 else None)
+    if bias is not None and not isinstance(bias, torch.fx.Node):
+        return None
     if (
         any(not isinstance(value, torch.fx.Node) for value in (*projection[:4], *projection[5:7]))
         or (projection[4] is not None and not isinstance(projection[4], torch.fx.Node))
@@ -137,7 +144,7 @@ def _prepared_query_projection(
         or not isinstance(projection[8], float)
     ):
         return None
-    return projection  # type: ignore[return-value]
+    return projection, bias
 
 
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
@@ -297,6 +304,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
         output_routing_mode,
         block_lengths,
     )
+    output_kwargs: dict[str, Argument] = {"output_dtype": original.meta["val"].dtype}
     with graph.inserting_before(original):
         attention_tail = (
             output_key,
@@ -328,7 +336,9 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                 torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output
             )
             target = projected_query_output.default
-            common_arguments = (*query_projection, *attention_tail)
+            projection_arguments, query_bias = query_projection
+            common_arguments = (*projection_arguments, *attention_tail)
+            output_kwargs["query_bias"] = query_bias
         replacement = graph.call_function(
             target,
             args=(
@@ -337,7 +347,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                 *bounded_arguments,
                 *gate_arguments,
             ),
-            kwargs={"output_dtype": original.meta["val"].dtype},
+            kwargs=output_kwargs,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)

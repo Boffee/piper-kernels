@@ -85,10 +85,16 @@ def _random_operands(
         128,
     ],
 )
+@pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
 def test_fused_value_projection_matches_the_fp32_composed_contract(
-    sequence_length: int, head_dim: int
+    bias_dtype: torch.dtype | None, sequence_length: int, head_dim: int
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    bias = (
+        torch.randn(2 * head_dim, device="cuda", dtype=bias_dtype)
+        if bias_dtype is not None
+        else None
+    )
     input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
@@ -99,12 +105,14 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
         input_mean,
         *operands.as_tuple()[2:],
         head_dim=head_dim,
+        bias=bias,
     )
     expected = composed_value_projection(
         *operands.as_tuple()[:2],
         input_mean,
         *operands.as_tuple()[2:],
         head_dim=head_dim,
+        bias=bias,
     )
     storage_length = padded_sequence_length(sequence_length)
 
@@ -232,8 +240,10 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
-def test_value_projection_custom_ops_pass_opcheck() -> None:
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_value_projection_custom_ops_pass_opcheck(with_bias: bool) -> None:
     operands = _random_operands()
+    bias = torch.randn(256, device="cuda") if with_bias else None
     input_mean = int8_ops.dequantized_input_mean(
         operands.input_qdata,
         operands.input_scale,
@@ -248,6 +258,7 @@ def test_value_projection_custom_ops_pass_opcheck() -> None:
             operands.weight_qdata,
             operands.weight_scale,
         ),
+        kwargs={"bias": bias},
     )
     summarized_value_result = torch.library.opcheck(
         value_fusion._project_value_with_block_means_op,
@@ -259,6 +270,7 @@ def test_value_projection_custom_ops_pass_opcheck() -> None:
             operands.weight_scale,
             torch.tensor([64], device="cuda", dtype=torch.int32),
         ),
+        kwargs={"bias": bias},
     )
 
     assert set(value_result.values()) == {"SUCCESS"}
