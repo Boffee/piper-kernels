@@ -112,7 +112,7 @@ def _linear_pattern(prefix: str) -> CallFunction:
         KeywordArg("sparse_input"),
         KeywordArg(f"{prefix}_weight_qdata"),
         KeywordArg(f"{prefix}_weight_scale"),
-        None,
+        KeywordArg(f"{prefix}_bias"),
         KeywordArg("sparse_group_size"),
         _users=1,
     )
@@ -161,7 +161,7 @@ def _semantic_gate_projection(
     return linear, weight_qdata, weight_scale, bias
 
 
-def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
+def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912
     if not is_valid_routing_mode(match.kwargs["sparse_routing_mode"]):
         return False
     nodes = (
@@ -236,6 +236,21 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911
         ):
             return False
 
+        bias_node = match.kwargs[f"{prefix}_bias"]
+        if bias_node is not None:
+            if not isinstance(bias_node, torch.fx.Node):
+                return False
+            bias = preparation_sharing.tensor_metadata(bias_node)
+            if (
+                bias is None
+                or bias.shape != (output_features,)
+                or not _bias.is_supported_dtype(bias.dtype)
+                or bias.device != input_value.device
+                or bias.layout is not torch.strided
+                or not bias.is_contiguous()
+            ):
+                return False
+
     return sparse_piper_compile.valid_sparse_piper_attention(
         match,
         batch=batch,
@@ -274,6 +289,9 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     sparse_key_blocks: Argument,
     sparse_softmax_scale: float,
     sparse_routing_mode: int,
+    sparse_q_bias: torch.fx.Node | None = None,
+    sparse_k_bias: torch.fx.Node | None = None,
+    sparse_v_bias: torch.fx.Node | None = None,
     sparse_q_norm_weight: torch.fx.Node | None = None,
     sparse_k_norm_weight: torch.fx.Node | None = None,
     sparse_block_lengths: torch.fx.Node | None = None,
@@ -366,7 +384,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 *block_length_arguments,
             ),
             query_values,
-            kwargs={"head_dim": head_dim},
+            kwargs={"head_dim": head_dim, "bias": sparse_q_bias},
         )
         key_values = (
             input_value.new_empty(
@@ -405,7 +423,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             torch.ops.piper_kernels.convrot_int8_sparse_piper_project_key.default,
             (*key_arguments, sparse_routing_mode, *block_length_arguments),
             key_values,
-            kwargs={"head_dim": head_dim},
+            kwargs={"head_dim": head_dim, "bias": sparse_k_bias},
         )
         input_mean = graph.call_function(
             torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
@@ -452,6 +470,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 head_dim,
             ),
             value_values,
+            kwargs={"bias": sparse_v_bias},
         )
         value, value_scale_multiplier, value_mean = value_projection[:3]
         attention_arguments = (

@@ -24,7 +24,7 @@ from ._layout import (
 )
 
 
-def _validate_inputs(
+def _validate_inputs(  # noqa: PLR0913
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -36,6 +36,7 @@ def _validate_inputs(
     norm_epsilon: float,
     softmax_scale: float,
     head_dim: int | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     result = validate_qk_projection_inputs(
         input_qdata,
@@ -48,6 +49,7 @@ def _validate_inputs(
         norm_epsilon=norm_epsilon,
         name="Q",
         head_dim=head_dim,
+        bias=bias,
     )
     if result[1] < TILE_ROWS:
         raise ValueError(f"Q projection requires at least {TILE_ROWS} sequence rows")
@@ -73,6 +75,7 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
     chunk_rows: int | None = None,
     backend: ProjectionBackend | None = None,
     head_dim: int | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project a Q window, reusing the fusion's selected backend when supplied."""
     validate_routing_mode(routing_mode)
@@ -87,6 +90,7 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         norm_epsilon=norm_epsilon,
         softmax_scale=softmax_scale,
         head_dim=head_dim,
+        bias=bias,
     )
     if chunk_rows is None:
         chunk_rows = sequence_length
@@ -137,6 +141,7 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         chunk_start=chunk_start,
         chunk_rows=chunk_rows,
         out=(query, query_scale, query_summary),
+        bias=bias,
     )
     return query, query_scale, query_summary
 
@@ -155,6 +160,7 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
     block_lengths: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project the complete query storage for the public standalone boundary."""
     return _launch_query_projection_range(
@@ -170,6 +176,7 @@ def _launch_query_projection(  # noqa: PLR0913, PLR0917
         routing_mode,
         block_lengths,
         head_dim=head_dim,
+        bias=bias,
     )
 
 
@@ -186,6 +193,7 @@ def _project_query_op(  # noqa: PLR0913, PLR0917
     softmax_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -202,6 +210,7 @@ def _project_query_op(  # noqa: PLR0913, PLR0917
         routing_mode,
         block_lengths,
         head_dim=head_dim,
+        bias=bias,
     )
 
 
@@ -218,6 +227,7 @@ def _project_query_op_fake(
     _softmax_scale: float,
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
+    _bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -113,12 +113,19 @@ def _random_operands(
     ],
 )
 @pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
 def test_fused_query_projection_matches_the_fp32_composed_contract(
+    bias_dtype: torch.dtype | None,
     affine: bool,
     sequence_length: int,
     head_dim: int,
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    bias = (
+        torch.randn(2 * head_dim, device="cuda", dtype=bias_dtype)
+        if bias_dtype is not None
+        else None
+    )
     if not affine:
         operands.norm_weight.fill_(1)
     options = {
@@ -134,8 +141,9 @@ def test_fused_query_projection_matches_the_fp32_composed_contract(
         options["softmax_scale"],
         _MINMAX_ROUTING,
         head_dim=head_dim,
+        bias=bias,
     )
-    expected = composed_query_projection(*operands.as_tuple(), **options)
+    expected = composed_query_projection(*operands.as_tuple(), bias=bias, **options)
     storage_length = padded_sequence_length(sequence_length)
 
     assert actual_query.shape == (1, 2, storage_length, head_dim)
@@ -262,12 +270,15 @@ def test_fused_query_projection_ignores_internal_padding(routing_mode: int) -> N
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
-def test_fused_query_projection_custom_op_passes_opcheck() -> None:
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_fused_query_projection_custom_op_passes_opcheck(with_bias: bool) -> None:
     operands = _random_operands()
+    bias = torch.randn(256, device="cuda") if with_bias else None
 
     result = torch.library.opcheck(
         query_fusion._project_query_op,
         (*operands.as_tuple(), 1e-6, 128**-0.5, _MINMAX_ROUTING),
+        kwargs={"bias": bias},
     )
 
     assert set(result.values()) == {"SUCCESS"}
@@ -275,6 +286,7 @@ def test_fused_query_projection_custom_op_passes_opcheck() -> None:
     mean_result = torch.library.opcheck(
         query_fusion._project_query_op,
         (*operands.as_tuple(), 1e-6, 128**-0.5, _MEAN_ROUTING),
+        kwargs={"bias": bias},
     )
     assert set(mean_result.values()) == {"SUCCESS"}
 

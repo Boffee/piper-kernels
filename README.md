@@ -148,13 +148,13 @@ The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by
 `convrot_int8_sparse_piper_compile_options` from
 `piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary
 ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
-bias-free ConvRot Q/K/V projections, D64/D128 RMSNorm and split-half RoPE for Q/K, followed by
-`sparse_piper_attention`. The rewrite shares input preparation and emits quantized Q/K/V
-plus routing summaries directly, avoiding the three materialized projection outputs. Arbitrary
-logical sequence lengths are written directly into internally K64-padded attention storage; only
-the final projection tile is masked, and the result retains the exact logical length. It fails closed
-for unsupported shapes, layouts, or parameters; the ordinary ConvRot and sparse-attention APIs
-remain independent.
+ConvRot Q/K/V projections with optional FP16/BF16/FP32 bias, D64/D128 RMSNorm and split-half
+RoPE for Q/K, followed by `sparse_piper_attention`. The rewrite shares input preparation and
+emits quantized Q/K/V plus routing summaries directly, avoiding the three materialized projection
+outputs. Arbitrary logical sequence lengths are written directly into internally K64-padded
+attention storage; only the final projection tile is masked, and the result retains the exact logical
+length. It fails closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and
+sparse-attention APIs remain independent.
 
 Because no projected activation is externally observable in the fused region, projection,
 RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise
@@ -575,6 +575,8 @@ Q and K RMSNorm may independently use `weight=None`; the fused kernels omit the 
 weight load and multiply. Standalone fused Q/K projection operators require `head_dim=64`
 or `head_dim=128` for weightless norms; compiled graphs infer it from the attention shape.
 Affine norms continue to infer head width from their weight when `head_dim` is omitted.
+ConvRot INT8 Q/K/V projection biases are added in FP32 inside the existing fused kernels,
+including the global V mean and coarse block means used by centered attention.
 
 The SM120 path supports both head widths, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. It normally reads packed UINT16

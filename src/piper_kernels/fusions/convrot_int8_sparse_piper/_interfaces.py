@@ -41,6 +41,7 @@ class ProjectionBackend(Protocol):
         chunk_start: int,
         chunk_rows: int,
         out: QueryOutput,
+        bias: torch.Tensor | None = None,
     ) -> None:
         """Fill (Q[B,H,S,D], scales[B,H,S/32], summaries[B,H,S/64,D]), D=64 or 128.
 
@@ -62,6 +63,7 @@ class ProjectionBackend(Protocol):
         block_lengths: torch.Tensor | None,
         *,
         out: KeyOutput,
+        bias: torch.Tensor | None = None,
     ) -> None:
         """Fill (K[B,H,S,D], scales[B,H,S/64], summaries, auxiliary), D=64 or 128.
 
@@ -80,6 +82,7 @@ class ProjectionBackend(Protocol):
         *,
         emit_block_mean: bool,
         out: ValueOutput,
+        bias: torch.Tensor | None = None,
     ) -> None:
         """Fill (V[B,H,D,S], multipliers[B,H,S/64,1], mean, block_mean), D=64 or 128.
 

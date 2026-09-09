@@ -3,6 +3,7 @@
 import ast
 import builtins
 import importlib.util
+import operator
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -53,14 +54,14 @@ def _operands(sequence=193, heads=3, head_dim=128):
     )
 
 
-def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False):
+def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False, *, bias=None):
     head_dim = operands[4].shape[0]
     if operation == "query":
         return query._launch_query_projection_range(
-            *operands, 1e-6, head_dim**-0.5, routing, chunk_start=64, chunk_rows=129
+            *operands, 1e-6, head_dim**-0.5, routing, chunk_start=64, chunk_rows=129, bias=bias
         )
     if operation == "key":
-        return key._launch_key_projection(*operands, 1e-6, routing)
+        return key._launch_key_projection(*operands, 1e-6, routing, bias=bias)
     qdata, scale, weight, weight_scale, *_ = operands
     mean = qdata.new_empty((2, 272), dtype=torch.float32)
     return value._launch_value_projection(
@@ -72,6 +73,7 @@ def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False):
         None,
         emit_block_mean=emit_block_mean,
         head_dim=head_dim,
+        bias=bias,
     )
 
 
@@ -171,9 +173,9 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
     assert (
         set(execute.call_args.kwargs)
         == {
-            "query": {"out", "chunk_start", "chunk_rows"},
-            "key": {"out"},
-            "value": {"out", "emit_block_mean"},
+            "query": {"out", "chunk_start", "chunk_rows", "bias"},
+            "key": {"out", "bias"},
+            "value": {"out", "emit_block_mean", "bias"},
         }[operation]
     )
     if operation == "query":
@@ -462,6 +464,7 @@ def _projection_match(head_dim, input_features=256):
     for kind in ("q", "k", "v"):
         operand(f"sparse_{kind}_weight_qdata", (2 * head_dim, input_features), torch.int8)
         operand(f"sparse_{kind}_weight_scale", (2 * head_dim, 1), torch.float32)
+        arguments[f"sparse_{kind}_bias"] = None
     operand("attention_output", (1, 128, 2, head_dim), torch.bfloat16)
     match = SimpleNamespace(kwargs=arguments, output_node=lambda: arguments["attention_output"])
     return match, input_value
@@ -549,7 +552,7 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
     select.assert_called_once_with(query_node.meta["val"])
 
 
-def _capture_projection(monkeypatch, operation, implementation=nvidia):
+def _capture_projection(monkeypatch, operation, implementation=nvidia, *, with_bias=False):
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": _kernels._convrot_project_quantize_key_kernel,
@@ -558,13 +561,21 @@ def _capture_projection(monkeypatch, operation, implementation=nvidia):
     function = functions[operation]
     kernel = MagicMock()
     monkeypatch.setattr(_kernels, function.__name__, kernel)
-    monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", MagicMock())
+    mean_kernel = MagicMock()
+    monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
     monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(implementation, "device_context", guard)
     with FakeTensorMode():
-        _call(operation, _operands(), emit_block_mean=True)
+        operands = _operands()
+        bias = operands[3].new_empty((384,)) if with_bias else None
+        _call(operation, operands, emit_block_mean=True, bias=bias)
     guard.assert_called_once_with(torch.device("cuda:1"))
+    for call in kernel.__getitem__.return_value.call_args_list:
+        assert call.kwargs["bias_ptr"] is bias
+    if operation == "value":
+        mean_kernel.__getitem__.return_value.assert_called_once()
+        assert mean_kernel.__getitem__.return_value.call_args.kwargs["bias_ptr"] is bias
     return function, kernel
 
 
@@ -586,19 +597,22 @@ def test_nvidia_launch_schedule_and_fp32_math_are_preserved(monkeypatch, operati
             assert call.kwargs["mask_ragged_tail"] is (index == 1)
 
 
-@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize(
+    ("operation", "affine"),
+    [("query", True), ("query", False), ("key", True), ("key", False), ("value", True)],
+)
 @pytest.mark.parametrize(
     "target",
     [GPUTarget("cuda", 120, 32), GPUTarget("hip", "gfx1200", 32), GPUTarget("hip", "gfx1201", 32)],
 )
-@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("with_bias", [False, True])
 def test_production_launches_compile_without_intermediate_bf16(
-    monkeypatch, operation, target, affine
+    monkeypatch, operation, target, affine, with_bias
 ):
     if target.backend == "hip" and sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
     function, kernel = _capture_projection(
-        monkeypatch, operation, nvidia if target.backend == "cuda" else amd
+        monkeypatch, operation, nvidia if target.backend == "cuda" else amd, with_bias=with_bias
     )
     for call in kernel.__getitem__.return_value.call_args_list:
         arguments = dict(zip(function.arg_names, call.args, strict=False))
@@ -638,3 +652,55 @@ def test_production_launches_compile_without_intermediate_bf16(
             assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
             assert compiled.metadata.shared <= 65536
         assert "arith.truncf" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize("invalid", ["size", "rank", "dtype", "device", "strides"])
+def test_projection_rejects_invalid_bias_before_backend_selection(monkeypatch, operation, invalid):
+    select = Mock(side_effect=AssertionError("backend must not be selected"))
+    monkeypatch.setattr(_backend, "require_projection_backend", select)
+    with FakeTensorMode():
+        operands = _operands()
+        bias = torch.empty(384, device="cuda:1", dtype=torch.float32)
+        if invalid == "size":
+            bias = torch.empty(383, device="cuda:1")
+        elif invalid == "rank":
+            bias = torch.empty((1, 384), device="cuda:1")
+        elif invalid == "dtype":
+            bias = bias.to(torch.int8)
+        elif invalid == "device":
+            bias = bias.to("cpu")
+        elif invalid == "strides":
+            bias = torch.empty_strided((384,), (2,), device="cuda:1")
+        with pytest.raises(ValueError, match=r"bias|device|contiguous"):
+            _call(operation, operands, bias=bias)
+    select.assert_not_called()
+
+
+@pytest.mark.parametrize("bias_argument", ["positional", "keyword", "duplicate"])
+def test_output_folding_preserves_query_bias(bias_argument):
+    graph = torch.fx.Graph()
+    projection_tensors = tuple(
+        graph.placeholder(name)
+        for name in ("input", "input_scale", "weight", "weight_scale", "norm", "cos", "sin")
+    )
+    projection = (*projection_tensors, 1e-5, 64**-0.5)
+    bias = graph.placeholder("bias")
+    arguments = (*projection, _MINMAX_ROUTING, None)
+    keywords = {"head_dim": 64}
+    if bias_argument != "keyword":
+        arguments += (bias,)
+    if bias_argument != "positional":
+        keywords["bias"] = bias
+    producer = graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default,
+        args=arguments,
+        kwargs=keywords,
+    )
+    outputs = tuple(graph.call_function(operator.getitem, args=(producer, i)) for i in range(3))
+    outputs[0].meta["val"] = torch.empty((1, 2, 64, 64), dtype=torch.int8, device="meta")
+    recovered = _output_compile._prepared_query_projection(*outputs, _MINMAX_ROUTING, None)
+    if bias_argument == "duplicate":
+        assert recovered is None
+    else:
+        assert recovered == (projection, bias)

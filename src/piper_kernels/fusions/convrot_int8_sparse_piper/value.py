@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels.linear import _bias
+
 from . import _backend
 from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, padded_sequence_length, validate_block_lengths
 
@@ -15,6 +17,8 @@ def _validate_inputs(
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     head_dim: int = 128,
+    *,
+    bias: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if head_dim not in SUPPORTED_HEAD_DIMS:
         raise ValueError("V projection requires head_dim=64 or 128")
@@ -31,10 +35,20 @@ def _validate_inputs(
         raise ValueError("V projection weight must map the input to complete D64/D128 heads")
     if weight_scale.shape != (weight_qdata.shape[0], 1) or weight_scale.dtype is not torch.float32:
         raise ValueError("V projection weight scale must be one FP32 value per output feature")
-    operands = input_qdata, input_scale, input_mean, weight_qdata, weight_scale
+    if bias is not None:
+        _bias.validate_dtype(bias, "V projection")
+        if bias.shape != (weight_qdata.shape[0],):
+            raise ValueError("V projection bias must have one value per output feature")
+    operands = tuple(
+        operand
+        for operand in (input_qdata, input_scale, input_mean, weight_qdata, weight_scale, bias)
+        if operand is not None
+    )
     if any(operand.device != input_qdata.device for operand in operands):
         raise ValueError("V projection operands must share a device")
-    if any(not operand.is_contiguous() for operand in operands):
+    if any(
+        operand.layout is not torch.strided or not operand.is_contiguous() for operand in operands
+    ):
         raise ValueError("V projection operands must be contiguous")
     if sequence_length < TILE_ROWS:
         raise ValueError(f"V projection requires at least {TILE_ROWS} sequence rows")
@@ -51,6 +65,7 @@ def _launch_value_projection(
     *,
     emit_block_mean: bool,
     head_dim: int = 128,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, heads = _validate_inputs(
         input_qdata,
@@ -59,6 +74,7 @@ def _launch_value_projection(
         weight_qdata,
         weight_scale,
         head_dim,
+        bias=bias,
     )
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     storage_sequence_length = padded_sequence_length(sequence_length)
@@ -96,6 +112,7 @@ def _launch_value_projection(
         block_lengths,
         emit_block_mean=emit_block_mean,
         out=(value, value_scale_multiplier, value_mean, block_mean),
+        bias=bias,
     )
     return value, value_scale_multiplier, value_mean, block_mean
 
@@ -112,6 +129,7 @@ def _project_value_op(
     weight_scale: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
     head_dim: int = 128,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     value, value_scale_multiplier, value_mean, _block_mean = _launch_value_projection(
         input_qdata,
@@ -122,6 +140,7 @@ def _project_value_op(
         block_lengths,
         emit_block_mean=False,
         head_dim=head_dim,
+        bias=bias,
     )
     return value, value_scale_multiplier, value_mean
 
@@ -157,6 +176,7 @@ def _project_value_op_fake(
     _weight_scale: torch.Tensor,
     _block_lengths: torch.Tensor | None = None,
     head_dim: int = 128,
+    _bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     value, value_scale_multiplier, value_mean, _block_mean = _fake_value_projection(
         input_qdata,
@@ -178,6 +198,7 @@ def _project_value_with_block_means_op(
     weight_scale: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
     head_dim: int = 128,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _launch_value_projection(
         input_qdata,
@@ -188,6 +209,7 @@ def _project_value_with_block_means_op(
         block_lengths,
         emit_block_mean=True,
         head_dim=head_dim,
+        bias=bias,
     )
 
 
@@ -200,5 +222,6 @@ def _project_value_with_block_means_op_fake(
     _weight_scale: torch.Tensor,
     _block_lengths: torch.Tensor | None = None,
     head_dim: int = 128,
+    _bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _fake_value_projection(input_qdata, weight_qdata, head_dim)
