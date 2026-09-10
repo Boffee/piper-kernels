@@ -98,6 +98,8 @@ def store_query_tile(
     scale_rows: tl.constexpr,
 ):
     """Quantize and store one transformed sparse-Piper query tile and route summary."""
+    # Head-major operands can exceed 2**31 elements for long video sequences.
+    head_offsets = head_offsets.to(tl.int64)
     feature_offsets = tl.arange(0, head_dim)
     valid_rows = global_sequence_offsets < logical_sequence_length
     block_length = block_m
@@ -145,8 +147,7 @@ def store_query_tile(
         scale_rows,
     )
     query_offsets = (
-        batch * heads * storage_sequence_length * head_dim
-        + head_offsets[:, None, None] * storage_sequence_length * head_dim
+        (batch * heads + head_offsets[:, None, None]) * storage_sequence_length * head_dim
         + storage_sequence_offsets[None, :, None] * head_dim
         + feature_offsets[None, None, :]
     )
@@ -190,6 +191,7 @@ def store_key_tile(
     scale_rows: tl.constexpr,
 ):
     """Quantize and store one transformed sparse-Piper key tile and route summaries."""
+    head_offsets = head_offsets.to(tl.int64)
     feature_offsets = tl.arange(0, head_dim)
     local_tile_offsets = tl.arange(0, block_m // scale_rows)
     tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
@@ -275,6 +277,7 @@ def store_value_tile(
     scale_rows: tl.constexpr,
 ):
     """Center, quantize, and optionally mean-pool one sparse-Piper value tile."""
+    head_offsets = head_offsets.to(tl.int64)
     feature_offsets = tl.arange(0, head_dim)
     value_mean = tl.load(
         value_mean_ptr
