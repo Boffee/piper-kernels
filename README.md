@@ -75,8 +75,8 @@ INT8-only fusion packages use the explicit `convrot_int8` prefix:
 
 Update imports under `piper_kernels.fusions`, compile-option helper names, and any direct
 `torch.ops.piper_kernels` calls using these prefixes. The old names are not retained as aliases.
-Shared rotation code remains under `linear.convrot`; `ConvRotInt8Tensor`,
-`convrot_int8_linear`, `convrot_int8_compile_options`, and all NVFP4 names are unchanged.
+Shared weight rotation lives under `weights.convrot`, with reusable accelerator
+primitives under `_triton`. Linear operators and compile options live under `linear.convrot`.
 
 Quantize a dense weight, or wrap existing checkpoint storage without dequantizing it,
 then use the resulting tensor as a normal linear weight:
@@ -242,6 +242,20 @@ or NVFP4 kernels.
 
 The repository's default `uv` development sources still select CUDA; use a separate
 ROCm environment rather than `uv sync` in that environment.
+
+## ConvRot INT8 Conv3D
+
+`ConvRotInt8Tensor` also supports causal 3×3×3 convolution weights through the same
+`from_hp()`, `from_quantized()`, and `dequantize()` API. It carries packed INT8
+weights, FP32 weight scales, and an optional FP32 `act_per_tensor_scale` tensor.
+`piper_kernels.conv3d.convrot.int8.ConvRotInt8Conv3d` consumes that weight with a
+fixed activation scale. The optimized backend targets SM120, with a portable
+reference elsewhere. Loading contiguous checkpoint tensors preserves mmap
+storage. H3 encoder compile options fuse framewise GroupNorm, SiLU, padding,
+and residuals around explicitly installed quantized convolutions.
+
+See [ConvRot INT8 Conv3D](src/piper_kernels/conv3d/convrot/int8/README.md) for
+checkpoint conversion, loading, supported shapes, and engine integration.
 
 ## NVFP4 construction
 

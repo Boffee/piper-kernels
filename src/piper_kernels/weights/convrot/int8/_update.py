@@ -21,6 +21,8 @@ def _validate_storage(
     *,
     operation: str,
 ) -> None:
+    if qdata.ndim != 2:
+        raise ValueError(f"{operation} requires 2-D qdata")
     validate_storage(qdata, scale, group_size, dtype)
     if qdata.device.type == "meta":
         raise ValueError(f"{operation} cannot update a meta tensor without values")

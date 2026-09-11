@@ -23,6 +23,30 @@ _DEVICES = [
 ]
 
 
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+@pytest.mark.parametrize("operation", ["add", "addmm"])
+def test_update_storage_entrypoints_reject_convolution_weights(device, operation):
+    from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
+
+    qdata = torch.empty(2, 3, 3, 3, 64, dtype=torch.int8, device=device)
+    scale = torch.ones(2, 1, device=device)
+    calls = {
+        "add": lambda: _update.add_(
+            qdata, scale, torch.float32, 64, torch.empty(qdata.shape, device=device)
+        ),
+        "addmm": lambda: _update.addmm_(
+            qdata,
+            scale,
+            torch.float32,
+            64,
+            torch.empty(2, 1, device=device),
+            torch.empty(1, 3, device=device),
+        ),
+    }
+    with pytest.raises(ValueError, match="requires 2-D qdata"):
+        calls[operation]()
+
+
 @pytest.mark.parametrize(("beta", "alpha"), [(1, 1), (0.25, 1.75), (0, -0.5)])
 def test_addmm_updates_logical_weight_and_requantizes_in_place(
     beta: float,

@@ -212,3 +212,13 @@ def test_operations_revalidate_canonical_storage_layout(
 
     with pytest.raises(ValueError, match="qdata and scale must be contiguous"):
         call()
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_linear_storage_entrypoint_rejects_convolution_weights(device):
+    from piper_kernels.linear.convrot.int8 import dispatch  # noqa: PLC0415
+
+    qdata = torch.empty(2, 3, 3, 3, 64, dtype=torch.int8, device=device)
+    scale = torch.ones(2, 1, device=device)
+    with pytest.raises(ValueError, match="requires 2-D qdata"):
+        dispatch.linear(torch.empty(1, 3, device=device), qdata, scale, torch.float32, 64)

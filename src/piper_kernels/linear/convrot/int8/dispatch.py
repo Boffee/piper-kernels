@@ -110,6 +110,8 @@ def linear(
     internal storage-level ABI. Consumers should call
     :func:`torch.nn.functional.linear` with a ``ConvRotInt8Tensor`` weight.
     """
+    if qdata.ndim != 2:
+        raise ValueError("ConvRot INT8 linear requires 2-D qdata")
     in_features = qdata.shape[1]
     bias = _validate_linear(
         input,
