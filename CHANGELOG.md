@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc6] - 2026-09-11
+
 ### Added
 
 - Add static-scale causal ConvRot INT8 Conv3D operators, a thin convolution layer,
