@@ -1,81 +1,23 @@
-"""Portable reference operations for the H3 VAE ConvRot INT8 convolutions."""
+"""Portable reference operations for static-scale ConvRot INT8 convolutions."""
 
 from __future__ import annotations
 
 import torch
 from torch.nn import functional
 
-from piper_kernels.linear.convrot._rotation import rotate_groups, validate_group_size
-from piper_kernels.linear.convrot.int8.reference import dynamic_quantize_rows
-
-
-def _rotate_weight_groups(value: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Apply ConvRot's H4 Kronecker transform without a dense CPU matmul."""
-    if value.device.type != "cpu":
-        return rotate_groups(value.float(), group_size)
-
-    features = value.shape[-1]
-    rotated = value.float().reshape(-1, features // group_size, group_size)
-    stride = 1
-    while stride < group_size:
-        stage = rotated.reshape(
-            *rotated.shape[:-1],
-            group_size // (4 * stride),
-            4,
-            stride,
-        )
-        first, second, third, fourth = stage.unbind(-2)
-        rotated = torch.stack(
-            (
-                first + second + third - fourth,
-                first + second - third + fourth,
-                first - second + third + fourth,
-                -first + second + third + fourth,
-            ),
-            dim=-2,
-        ).reshape(rotated.shape)
-        stride *= 4
-    return rotated.mul_(group_size**-0.5).reshape(value.shape)
-
-
-def quantize_weight(
-    weight: torch.Tensor,
-    group_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize one OI-DHW weight after rotating each spatial-channel row."""
-    validate_group_size(group_size)
-    if weight.ndim != 5 or tuple(weight.shape[2:]) != (3, 3, 3):
-        raise ValueError(
-            f"H3 VAE ConvRot weight must have shape [out, in, 3, 3, 3], got {tuple(weight.shape)}"
-        )
-    if weight.shape[1] % group_size:
-        raise ValueError(
-            f"H3 VAE ConvRot input channels {weight.shape[1]} must be divisible "
-            f"by group size {group_size}"
-        )
-    if weight.device.type == "meta":
-        raise ValueError("H3 VAE ConvRot cannot quantize a meta weight")
-    if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError(
-            f"H3 VAE ConvRot weight must be float16, bfloat16, or float32, got {weight.dtype}"
-        )
-
-    logical = weight.detach().float()
-    channel_last = logical.permute(0, 2, 3, 4, 1).contiguous()
-    rotated = _rotate_weight_groups(channel_last, group_size)
-    qdata, scale = dynamic_quantize_rows(rotated.flatten(1))
-    return qdata.view_as(rotated).contiguous(), scale.flatten().contiguous()
+from piper_kernels.weights.convrot._rotation import rotate_groups
 
 
 def _prepare_input(
     input: torch.Tensor,  # noqa: A002
     group_size: int,
-    input_scale: float,
+    input_scale: torch.Tensor,
 ) -> torch.Tensor:
-    tokens = input.permute(0, 2, 3, 4, 1).contiguous()
-    rotated = rotate_groups(tokens.float(), group_size)
-    logical_scale = torch.tensor(input_scale, device=input.device, dtype=torch.float32)
-    return (rotated / logical_scale).float().round().clamp(-128, 127).to(torch.int8)
+    tokens = input.permute(0, 2, 3, 4, 1).to(
+        dtype=torch.float32, memory_format=torch.contiguous_format
+    )
+    rotated = rotate_groups(tokens, group_size)
+    return (rotated / input_scale).round().clamp(-128, 127).to(torch.int8)
 
 
 def _prepare_group_norm_silu_input(
@@ -85,7 +27,7 @@ def _prepare_group_norm_silu_input(
     norm_groups: int,
     norm_epsilon: float,
     group_size: int,
-    input_scale: float,
+    input_scale: torch.Tensor,
 ) -> torch.Tensor:
     batch, channels, frames, height, width = input.shape
     channels_per_group = channels // norm_groups
@@ -126,7 +68,7 @@ def _convolution(
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
-    input_scale: float,
+    input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
     symmetric_spatial_padding: bool,
@@ -141,9 +83,7 @@ def _convolution(
         activation = functional.pad(activation, (0, 1, 0, 1, 0, 0), mode="reflect")
     activation = functional.pad(activation, (0, 0, 0, 0, 2, 0))
 
-    weight = (
-        weight_qdata.float().mul(weight_scale.float().view(-1, 1, 1, 1, 1)).permute(0, 4, 1, 2, 3)
-    )
+    weight = weight_qdata.float().mul(weight_scale.view(-1, 1, 1, 1, 1)).permute(0, 4, 1, 2, 3)
     output = functional.conv3d(
         activation,
         weight,
@@ -152,7 +92,7 @@ def _convolution(
     )
     if residual is not None:
         output = output + residual.float()
-    return output.to(output_dtype)
+    return output.to(dtype=output_dtype, memory_format=torch.contiguous_format)
 
 
 def conv3d(
@@ -161,7 +101,7 @@ def conv3d(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
-    input_scale: float,
+    input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
     symmetric_spatial_padding: bool,
@@ -194,7 +134,7 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
-    input_scale: float,
+    input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
     symmetric_spatial_padding: bool,
@@ -225,4 +165,4 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
     )
 
 
-__all__ = ["conv3d", "group_norm_silu_conv3d", "quantize_weight"]
+__all__ = ["conv3d", "group_norm_silu_conv3d"]

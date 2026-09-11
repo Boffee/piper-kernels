@@ -1,4 +1,4 @@
-"""Triton kernels for the MiniMax-H3 VAE ConvRot INT8 encoder."""
+"""Triton kernels for static-scale ConvRot INT8 causal convolutions."""
 
 # pyright: reportCallIssue=false
 
@@ -9,10 +9,13 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from piper_kernels._triton import convrot as rotation_backend
+from piper_kernels._triton import convrot_int8 as int8_kernels
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import triton as rotation_backend
-from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
+
+from . import _policy
+from ._validation import _output_shape
 
 
 @triton.jit
@@ -31,6 +34,7 @@ def _prepare_channelwise_kernel(
     channels: tl.constexpr,
     group_size: tl.constexpr,
     input_scale,
+    accelerator_backend: tl.constexpr,
     block_m: tl.constexpr,
 ):
     """Fuse NCTHW-to-NTHWC conversion, Hadamard rotation, and fixed quantization."""
@@ -43,11 +47,11 @@ def _prepare_channelwise_kernel(
     y = spatial // input_width
     x = spatial % input_width
     pointers = input_ptr + (
-        batch[:, None] * stride_batch
-        + channel_offsets[None, :] * stride_channel
-        + frame[:, None] * stride_frame
-        + y[:, None] * stride_height
-        + x[:, None] * stride_width
+        batch[:, None].to(tl.int64) * stride_batch
+        + channel_offsets[None, :].to(tl.int64) * stride_channel
+        + frame[:, None].to(tl.int64) * stride_frame
+        + y[:, None].to(tl.int64) * stride_height
+        + x[:, None].to(tl.int64) * stride_width
     )
     valid = token_offsets < token_count
     values = tl.load(pointers, mask=valid[:, None], other=0.0).to(tl.float32)
@@ -59,9 +63,9 @@ def _prepare_channelwise_kernel(
     )
     values = tl.reshape(values, (block_m, channels))
     values = values * (group_size**-0.5)
-    quantized = int8_kernels._quantize_int8(values, input_scale, "cuda")
+    quantized = int8_kernels._quantize_int8(values, tl.load(input_scale), accelerator_backend)
     tl.store(
-        output_ptr + token_offsets[:, None] * channels + channel_offsets[None, :],
+        output_ptr + token_offsets[:, None].to(tl.int64) * channels + channel_offsets[None, :],
         quantized,
         mask=valid[:, None],
     )
@@ -70,8 +74,8 @@ def _prepare_channelwise_kernel(
 @triton.jit
 def _group_norm_partial_stats_kernel(
     input_ptr,
-    partial_sum_ptr,
-    partial_square_sum_ptr,
+    partial_mean_ptr,
+    partial_m2_ptr,
     spatial_size: tl.constexpr,
     input_width: tl.constexpr,
     frames: tl.constexpr,
@@ -99,44 +103,44 @@ def _group_norm_partial_stats_kernel(
     y = spatial // input_width
     x = spatial % input_width
     pointers = input_ptr + (
-        batch * stride_batch
-        + channel * stride_channel
-        + frame * stride_frame
-        + y * stride_height
-        + x * stride_width
+        batch.to(tl.int64) * stride_batch
+        + channel.to(tl.int64) * stride_channel
+        + frame.to(tl.int64) * stride_frame
+        + y.to(tl.int64) * stride_height
+        + x.to(tl.int64) * stride_width
     )
     values = tl.load(pointers, mask=valid, other=0.0).to(tl.float32)
     chunk_count: tl.constexpr = tl.cdiv(reduction_size, stats_block)
     output_offset = stats_row * chunk_count + chunk
-    tl.store(partial_sum_ptr + output_offset, tl.sum(values, axis=0))
-    tl.store(partial_square_sum_ptr + output_offset, tl.sum(values * values, axis=0))
+    count = tl.minimum(reduction_size - chunk * stats_block, stats_block)
+    mean = tl.sum(values, axis=0) / count
+    centered = tl.where(valid, values - mean, 0.0)
+    tl.store(partial_mean_ptr + output_offset, mean)
+    tl.store(partial_m2_ptr + output_offset, tl.sum(centered * centered, axis=0))
 
 
 @triton.jit
 def _group_norm_finalize_stats_kernel(
-    partial_sum_ptr,
-    partial_square_sum_ptr,
+    partial_mean_ptr,
+    partial_m2_ptr,
     mean_ptr,
     rstd_ptr,
     reduction_size: tl.constexpr,
     chunk_count: tl.constexpr,
     finalize_block: tl.constexpr,
+    stats_block: tl.constexpr,
     epsilon: tl.constexpr,
 ):
     stats_row = tl.program_id(0)
     offsets = tl.arange(0, finalize_block)
     valid = offsets < chunk_count
     partial_offsets = stats_row * chunk_count + offsets
-    total = tl.sum(
-        tl.load(partial_sum_ptr + partial_offsets, mask=valid, other=0.0),
-        axis=0,
-    )
-    square_total = tl.sum(
-        tl.load(partial_square_sum_ptr + partial_offsets, mask=valid, other=0.0),
-        axis=0,
-    )
-    mean = total / reduction_size
-    variance = tl.maximum(square_total / reduction_size - mean * mean, 0.0)
+    counts = tl.where(valid, tl.minimum(reduction_size - offsets * stats_block, stats_block), 0)
+    partial_means = tl.load(partial_mean_ptr + partial_offsets, mask=valid, other=0.0)
+    partial_m2 = tl.load(partial_m2_ptr + partial_offsets, mask=valid, other=0.0)
+    mean = tl.sum(partial_means * counts, axis=0) / reduction_size
+    delta = partial_means - mean
+    variance = tl.sum(partial_m2 + delta * delta * counts, axis=0) / reduction_size
     tl.store(mean_ptr + stats_row, mean)
     tl.store(rstd_ptr + stats_row, tl.rsqrt(variance + epsilon))
 
@@ -146,6 +150,8 @@ def _prepare_group_norm_silu_kernel(
     input_ptr,
     affine_weight_ptr,
     affine_bias_ptr,
+    affine_weight_stride: tl.constexpr,
+    affine_bias_stride: tl.constexpr,
     mean_ptr,
     rstd_ptr,
     output_ptr,
@@ -164,6 +170,7 @@ def _prepare_group_norm_silu_kernel(
     channels_per_group: tl.constexpr,
     group_size: tl.constexpr,
     input_scale,
+    accelerator_backend: tl.constexpr,
     block_m: tl.constexpr,
 ):
     """Fuse isolated GroupNorm, SiLU, channel rotation, and fixed quantization."""
@@ -176,11 +183,11 @@ def _prepare_group_norm_silu_kernel(
     y = spatial // input_width
     x = spatial % input_width
     pointers = input_ptr + (
-        batch[:, None] * stride_batch
-        + channel_offsets[None, :] * stride_channel
-        + frame[:, None] * stride_frame
-        + y[:, None] * stride_height
-        + x[:, None] * stride_width
+        batch[:, None].to(tl.int64) * stride_batch
+        + channel_offsets[None, :].to(tl.int64) * stride_channel
+        + frame[:, None].to(tl.int64) * stride_frame
+        + y[:, None].to(tl.int64) * stride_height
+        + x[:, None].to(tl.int64) * stride_width
     )
     valid = token_offsets < token_count
     values = tl.load(pointers, mask=valid[:, None], other=0.0).to(tl.float32)
@@ -188,8 +195,8 @@ def _prepare_group_norm_silu_kernel(
     stats_row = (batch[:, None] * frames + frame[:, None]) * groups + group[None, :]
     mean = tl.load(mean_ptr + stats_row, mask=valid[:, None], other=0.0)
     rstd = tl.load(rstd_ptr + stats_row, mask=valid[:, None], other=0.0)
-    affine_weight = tl.load(affine_weight_ptr + channel_offsets)
-    affine_bias = tl.load(affine_bias_ptr + channel_offsets)
+    affine_weight = tl.load(affine_weight_ptr + channel_offsets * affine_weight_stride)
+    affine_bias = tl.load(affine_bias_ptr + channel_offsets * affine_bias_stride)
     values = (values - mean) * rstd * affine_weight[None, :] + affine_bias[None, :]
     values = values * tl.sigmoid(values)
     values = tl.reshape(values, (block_m * channels,))
@@ -200,9 +207,9 @@ def _prepare_group_norm_silu_kernel(
     )
     values = tl.reshape(values, (block_m, channels))
     values = values * (group_size**-0.5)
-    quantized = int8_kernels._quantize_int8(values, input_scale, "cuda")
+    quantized = int8_kernels._quantize_int8(values, tl.load(input_scale), accelerator_backend)
     tl.store(
-        output_ptr + token_offsets[:, None] * channels + channel_offsets[None, :],
+        output_ptr + token_offsets[:, None].to(tl.int64) * channels + channel_offsets[None, :],
         quantized,
         mask=valid[:, None],
     )
@@ -232,6 +239,7 @@ def _conv3d_kernel(  # noqa: PLR0915
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    bias_stride: tl.constexpr,
     has_bias: tl.constexpr,
     has_residual: tl.constexpr,
     symmetric_spatial_padding: tl.constexpr,
@@ -260,7 +268,7 @@ def _conv3d_kernel(  # noqa: PLR0915
     reduction_offsets = tl.arange(0, block_k)
     accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
 
-    for reduction_start in tl.range(
+    for reduction_start in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
         0,
         reduction,
         block_k,
@@ -305,7 +313,7 @@ def _conv3d_kernel(  # noqa: PLR0915
             valid_input &= (input_y >= 0) & (input_y < input_height)
             valid_input &= (input_x >= 0) & (input_x < input_width)
         input_token = (
-            (batch[:, None] * input_frames + input_frame) * input_height + input_y
+            (batch[:, None].to(tl.int64) * input_frames + input_frame) * input_height + input_y
         ) * input_width + input_x
         input_values = tl.load(
             input_ptr + input_token * input_channels + input_channel[None, :],
@@ -315,7 +323,9 @@ def _conv3d_kernel(  # noqa: PLR0915
         if use_weight_descriptor:
             weight_values = weight_ptr.load([tl.program_id(1) * block_n, reduction_start]).T
         else:
-            weight_pointers = weight_ptr + channel_offsets[None, :] * reduction + k[:, None]
+            weight_pointers = (
+                weight_ptr + channel_offsets[None, :].to(tl.int64) * reduction + k[:, None]
+            )
             weight_values = tl.load(
                 weight_pointers,
                 mask=(k[:, None] < reduction) & valid_channels[None, :],
@@ -323,7 +333,7 @@ def _conv3d_kernel(  # noqa: PLR0915
             )
         accumulator += tl.dot(input_values, weight_values)
 
-    output = accumulator.to(tl.float32) * input_scale
+    output = accumulator.to(tl.float32) * tl.load(input_scale)
     weight_scale = tl.load(
         weight_scale_ptr + channel_offsets,
         mask=valid_channels,
@@ -331,15 +341,15 @@ def _conv3d_kernel(  # noqa: PLR0915
     )
     output *= weight_scale[None, :]
     if has_bias:
-        bias = tl.load(bias_ptr + channel_offsets, mask=valid_channels, other=0.0)
+        bias = tl.load(bias_ptr + channel_offsets * bias_stride, mask=valid_channels, other=0.0)
         output += bias[None, :]
     if has_residual:
         residual_pointers = residual_ptr + (
-            batch[:, None] * residual_stride_batch
-            + channel_offsets[None, :] * residual_stride_channel
-            + output_frame[:, None] * residual_stride_frame
-            + output_y[:, None] * residual_stride_height
-            + output_x[:, None] * residual_stride_width
+            batch[:, None].to(tl.int64) * residual_stride_batch
+            + channel_offsets[None, :].to(tl.int64) * residual_stride_channel
+            + output_frame[:, None].to(tl.int64) * residual_stride_frame
+            + output_y[:, None].to(tl.int64) * residual_stride_height
+            + output_x[:, None].to(tl.int64) * residual_stride_width
         )
         residual = tl.load(
             residual_pointers,
@@ -348,7 +358,7 @@ def _conv3d_kernel(  # noqa: PLR0915
         )
         output += residual.to(tl.float32)
     output_pointers = output_ptr + (
-        (batch[:, None] * output_channels + channel_offsets[None, :]) * output_volume
+        (batch[:, None].to(tl.int64) * output_channels + channel_offsets[None, :]) * output_volume
         + output_position[:, None]
     )
     tl.store(
@@ -356,62 +366,6 @@ def _conv3d_kernel(  # noqa: PLR0915
         output,
         mask=valid_rows[:, None] & valid_channels[None, :],
     )
-
-
-def _output_dimensions(input_shape, stride, *, symmetric_padding, right_padding):
-    _, _, frames, height, width = input_shape
-    spatial_padding = 2 if symmetric_padding else int(right_padding)
-    return (
-        (frames - 1) // stride[0] + 1,
-        (height + spatial_padding - 3) // stride[1] + 1,
-        (width + spatial_padding - 3) // stride[2] + 1,
-    )
-
-
-def _convolution_plan(input_qdata, output_shape):
-    batch, _, _, _, channels = input_qdata.shape
-    _, outputs, frames, height, width = output_shape
-    rows = batch * frames * height * width
-    plan = (64, 128, 128, 4, 3, 3)
-    if channels == 128:
-        plan = (128, 128, 64, 4, 3, 3)
-    elif channels == 256 and rows >= 200_000:
-        plan = (128, 128, 64, 4, 4, 4)
-    elif channels == 256 and rows >= 30_000:
-        plan = (128, 128, 64, 4, 2, 2)
-    elif channels == 256 and outputs == 256:
-        plan = (64, 128, 128, 4, 3, 3)
-    elif channels == 256 or (channels == 512 and rows >= 5_000):
-        plan = (128, 128, 128, 8, 3, 3)
-    elif channels == 512 and outputs > 512:
-        plan = (64, 128, 128, 4, 3, 3)
-    elif channels == 512:
-        plan = (32, 128, 256, 8, 3, 3)
-    elif outputs <= 64:
-        plan = (64, 64, 64, 4, 3, 3)
-    return plan
-
-
-def _preparation_plan(input, *, group_norm):  # noqa: A002
-    batch, channels, frames, height, width = input.shape
-    rows = batch * frames * height * width
-    plan = (8, 8)
-    if channels == 128:
-        plan = (64, 4)
-    elif channels == 256:
-        if group_norm and rows >= 200_000:
-            plan = (32, 4)
-        elif group_norm:
-            plan = (16, 4)
-        elif rows >= 200_000:
-            plan = (64, 4)
-        else:
-            plan = (32, 8)
-    elif channels == 512 and group_norm and rows >= 5_000:
-        plan = (16, 8)
-    elif channels == 512 and not group_norm and rows >= 5_000:
-        plan = (32, 8)
-    return plan
 
 
 def _prepare_input(input, group_size, input_scale):  # noqa: A002
@@ -423,7 +377,7 @@ def _prepare_input(input, group_size, input_scale):  # noqa: A002
         device=input.device,
         dtype=torch.int8,
     )
-    block_m, num_warps = _preparation_plan(input, group_norm=False)
+    block_m, num_warps = _policy.preparation_plan(channels, token_count, group_norm=False)
     with device_context(input.device):
         _prepare_channelwise_kernel[(triton.cdiv(token_count, block_m),)](
             input,
@@ -440,6 +394,7 @@ def _prepare_input(input, group_size, input_scale):  # noqa: A002
             channels=channels,
             group_size=group_size,
             input_scale=input_scale,
+            accelerator_backend="cuda",
             block_m=block_m,
             num_warps=num_warps,
         )
@@ -461,19 +416,19 @@ def _prepare_group_norm_silu_input(
     stats_rows = batch * frames * norm_groups
     stats_block = 4096
     chunk_count = int(triton.cdiv(reduction_size, stats_block))
-    partial_sum = torch.empty(
+    partial_mean = torch.empty(
         (stats_rows, chunk_count),
         device=input.device,
         dtype=torch.float32,
     )
-    partial_square_sum = torch.empty_like(partial_sum)
+    partial_m2 = torch.empty_like(partial_mean)
     mean = torch.empty(stats_rows, device=input.device, dtype=torch.float32)
     rstd = torch.empty_like(mean)
     with device_context(input.device):
         _group_norm_partial_stats_kernel[(stats_rows, chunk_count)](
             input,
-            partial_sum,
-            partial_square_sum,
+            partial_mean,
+            partial_m2,
             spatial_size=height * width,
             input_width=width,
             frames=frames,
@@ -489,13 +444,14 @@ def _prepare_group_norm_silu_input(
         )
         finalize_block = triton.next_power_of_2(chunk_count)
         _group_norm_finalize_stats_kernel[(stats_rows,)](
-            partial_sum,
-            partial_square_sum,
+            partial_mean,
+            partial_m2,
             mean,
             rstd,
             reduction_size=reduction_size,
             chunk_count=chunk_count,
             finalize_block=finalize_block,
+            stats_block=stats_block,
             epsilon=norm_epsilon,
             num_warps=4,
         )
@@ -506,11 +462,13 @@ def _prepare_group_norm_silu_input(
             device=input.device,
             dtype=torch.int8,
         )
-        block_m, num_warps = _preparation_plan(input, group_norm=True)
+        block_m, num_warps = _policy.preparation_plan(channels, token_count, group_norm=True)
         _prepare_group_norm_silu_kernel[(triton.cdiv(token_count, block_m),)](
             input,
             norm_weight,
             norm_bias,
+            norm_weight.stride(0),
+            norm_bias.stride(0),
             mean,
             rstd,
             qdata,
@@ -529,6 +487,7 @@ def _prepare_group_norm_silu_input(
             channels_per_group=channels_per_group,
             group_size=group_size,
             input_scale=input_scale,
+            accelerator_backend="cuda",
             block_m=block_m,
             num_warps=num_warps,
         )
@@ -549,32 +508,27 @@ def _conv3d_prepared(
     output_dtype,
 ):
     batch, input_frames, input_height, input_width, input_channels = input_qdata.shape
-    output_frames, output_height, output_width = _output_dimensions(
-        (batch, input_channels, input_frames, input_height, input_width),
-        stride,
-        symmetric_padding=symmetric_spatial_padding,
-        right_padding=right_spatial_padding,
-    )
     output_channels = weight_qdata.shape[0]
-    output_shape = (
-        batch,
+    output_shape = _output_shape(
+        (batch, input_channels, input_frames, input_height, input_width),
         output_channels,
-        output_frames,
-        output_height,
-        output_width,
+        stride,
+        symmetric_spatial_padding,
+        right_spatial_padding,
     )
+    _, _, output_frames, output_height, output_width = output_shape
     output = torch.empty(output_shape, device=input_qdata.device, dtype=output_dtype)
     bias_pointer = bias if bias is not None else output
     residual_pointer = residual if residual is not None else output
     residual_strides = residual.stride() if residual is not None else output.stride()
-    block_m, block_n, block_k, num_warps, num_stages, loop_num_stages = _convolution_plan(
-        input_qdata, output_shape
-    )
+    rows = batch * output_frames * output_height * output_width
+    plan = _policy.convolution_plan(input_channels, output_channels, rows)
     target = AcceleratorTarget.from_device(input_qdata.device)
     use_weight_descriptor = (
         target.is_cuda_capability(12, 0)
+        and weight_qdata.data_ptr() % 16 == 0
         and input_channels == 128
-        and output_channels % block_n == 0
+        and output_channels % plan.block_n == 0
         and (output_height >= 256 or output_channels > 128)
     )
     with device_context(input_qdata.device):
@@ -583,13 +537,14 @@ def _conv3d_prepared(
                 base=weight_qdata,
                 shape=[output_channels, 27 * input_channels],
                 strides=[27 * input_channels, 1],
-                block_shape=[block_n, block_k],
+                block_shape=[plan.block_n, plan.block_k],
             )
             if use_weight_descriptor
             else weight_qdata
         )
-        rows = batch * output_frames * output_height * output_width
-        _conv3d_kernel[(triton.cdiv(rows, block_m), triton.cdiv(output_channels, block_n))](
+        _conv3d_kernel[
+            (triton.cdiv(rows, plan.block_m), triton.cdiv(output_channels, plan.block_n))
+        ](
             input_qdata,
             weight_argument,
             weight_scale,
@@ -609,9 +564,10 @@ def _conv3d_prepared(
             stride_frames=stride[0],
             stride_height=stride[1],
             stride_width=stride[2],
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
+            block_m=plan.block_m,
+            block_n=plan.block_n,
+            block_k=plan.block_k,
+            bias_stride=bias.stride(0) if bias is not None else 1,
             has_bias=bias is not None,
             has_residual=residual is not None,
             symmetric_spatial_padding=symmetric_spatial_padding,
@@ -622,9 +578,9 @@ def _conv3d_prepared(
             residual_stride_frame=residual_strides[2],
             residual_stride_height=residual_strides[3],
             residual_stride_width=residual_strides[4],
-            loop_num_stages=loop_num_stages,
-            num_warps=num_warps,
-            num_stages=num_stages,
+            loop_num_stages=plan.num_stages,
+            num_warps=plan.num_warps,
+            num_stages=plan.num_stages,
         )
     return output
 

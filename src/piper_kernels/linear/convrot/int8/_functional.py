@@ -21,6 +21,7 @@ def convrot_int8_linear(
     activation_fn: InputActivation | None = None,
 ) -> torch.Tensor:
     """Apply an optional input activation followed by a ConvRot INT8 linear."""
+    weight._require_matrix("linear")
     require_untransposed(weight, "linear")
     converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
     assert isinstance(converted_weight, ConvRotInt8Tensor)

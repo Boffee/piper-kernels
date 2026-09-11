@@ -33,9 +33,9 @@ def test_dequantize_accepts_an_output_dtype(output_dtype: torch.dtype) -> None:
 
     actual = wrapped.dequantize(output_dtype)
     expected = rotate_groups(
-        qdata.to(output_dtype) * scale.to(output_dtype),
+        qdata.float() * scale,
         16,
-    )
+    ).to(output_dtype)
 
     assert actual.dtype is output_dtype
     assert torch.equal(actual, expected)
