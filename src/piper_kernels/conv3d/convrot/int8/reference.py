@@ -16,7 +16,8 @@ def _prepare_input(
     tokens = input.permute(0, 2, 3, 4, 1).to(
         dtype=torch.float32, memory_format=torch.contiguous_format
     )
-    rotated = rotate_groups(tokens, group_size)
+    with torch.autocast(device_type=input.device.type, enabled=False):
+        rotated = rotate_groups(tokens, group_size)
     return (rotated / input_scale).round().clamp(-128, 127).to(torch.int8)
 
 
@@ -74,7 +75,6 @@ def _convolution(
     symmetric_spatial_padding: bool,
     right_spatial_padding: bool,
     residual: torch.Tensor | None,
-    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     activation = prepared.permute(0, 4, 1, 2, 3).float().mul(input_scale)
     if symmetric_spatial_padding:
@@ -84,15 +84,17 @@ def _convolution(
     activation = functional.pad(activation, (0, 0, 0, 0, 2, 0))
 
     weight = weight_qdata.float().mul(weight_scale.view(-1, 1, 1, 1, 1)).permute(0, 4, 1, 2, 3)
-    output = functional.conv3d(
-        activation,
-        weight,
-        None if bias is None else bias.float(),
-        stride=stride,
-    )
+    # The portable INT8 reference accumulates in FP32 even inside caller autocast.
+    with torch.autocast(device_type=activation.device.type, enabled=False):
+        output = functional.conv3d(
+            activation,
+            weight,
+            None if bias is None else bias.float(),
+            stride=stride,
+        )
     if residual is not None:
         output = output + residual.float()
-    return output.to(dtype=output_dtype, memory_format=torch.contiguous_format)
+    return output.to(dtype=torch.float16, memory_format=torch.contiguous_format)
 
 
 def conv3d(
@@ -120,7 +122,6 @@ def conv3d(
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
-        output_dtype=input.dtype,
     )
 
 
@@ -161,7 +162,6 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
-        output_dtype=input.dtype,
     )
 
 

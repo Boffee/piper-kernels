@@ -101,7 +101,7 @@ def _conv3d_fake(
         right_spatial_padding,
         residual,
     )
-    return input.new_empty(shape)
+    return input.new_empty(shape, dtype=torch.float16)
 
 
 @torch.library.custom_op(
@@ -189,7 +189,7 @@ def _group_norm_silu_conv3d_fake(  # noqa: PLR0913, PLR0917
         residual,
     )
     _validate_norm(input, norm_weight, norm_bias, norm_groups, norm_epsilon)
-    return input.new_empty(shape)
+    return input.new_empty(shape, dtype=torch.float16)
 
 
 def _padding_flags(padding: SpatialPadding) -> tuple[bool, bool]:

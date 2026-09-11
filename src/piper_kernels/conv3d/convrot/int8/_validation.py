@@ -76,8 +76,8 @@ def _validate_common(
 ) -> tuple[int, int, int, int, int]:
     if input.ndim != 5:
         raise ValueError(f"ConvRot INT8 Conv3D input must be NCTHW, got {tuple(input.shape)}")
-    if input.dtype is not torch.float16:
-        raise ValueError(f"ConvRot INT8 Conv3D input must be float16, got {input.dtype}")
+    if input.dtype not in (torch.float16, torch.float32):
+        raise ValueError(f"ConvRot INT8 Conv3D input must be float16 or float32, got {input.dtype}")
     if input.layout is not torch.strided:
         raise ValueError("ConvRot INT8 Conv3D input must use strided layout")
     if any(size <= 0 for size in input.shape):
@@ -107,8 +107,8 @@ def _validate_common(
     if residual is not None:
         if residual.layout is not torch.strided:
             raise ValueError("ConvRot INT8 Conv3D residual must use strided layout")
-        if residual.device != input.device or residual.dtype is not input.dtype:
-            raise ValueError("ConvRot INT8 Conv3D residual must match the input device and dtype")
+        if residual.device != input.device or residual.dtype is not torch.float16:
+            raise ValueError("ConvRot INT8 Conv3D residual must be float16 on the input device")
         if tuple(residual.shape) != expected_shape:
             raise ValueError(
                 f"ConvRot INT8 Conv3D residual must have shape {expected_shape}, "

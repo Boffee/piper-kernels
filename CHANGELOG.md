@@ -10,7 +10,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Add static-scale causal ConvRot INT8 Conv3D operators, a thin convolution layer,
   and H3 encoder graph fusion. Shared `ConvRotInt8Tensor` weights support offline
   quantization, FP32 dequantization, and mmap-preserving loading of convolution
-  storage and its optional activation scale.
+  storage and its optional activation scale. FP16 and FP32 activations feed INT8
+  preparation directly, including GroupNorm under CUDA autocast; outputs remain FP16.
 - Added FP16 and FP32 activation support to sparse Piper attention and its full ConvRot INT8,
   NVFP4, and ConvRot NVFP4 fusions. Attention, coarse gates, and output projections preserve
   the activation dtype; BF16 remains the default for internal operators. ConvRot NVFP4

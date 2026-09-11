@@ -54,12 +54,14 @@ def _weight(
         ("none", (1, 1, 1), (2, 32, 5, 14, 16)),
     ],
 )
-def test_fake_conv3d_preserves_shape_and_dtype(
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_fake_conv3d_preserves_shape_and_output_dtype(
     padding: str,
     stride: tuple[int, int, int],
     expected: tuple[int, ...],
+    dtype: torch.dtype,
 ) -> None:
-    input = torch.empty(2, 128, 5, 16, 18, device="meta", dtype=torch.float16)  # noqa: A001
+    input = torch.empty(2, 128, 5, 16, 18, device="meta", dtype=dtype)  # noqa: A001
     qdata = torch.empty(32, 3, 3, 3, 128, device="meta", dtype=torch.int8)
     scale = torch.empty(32, device="meta", dtype=torch.float32)
 
@@ -74,12 +76,12 @@ def test_fake_conv3d_preserves_shape_and_dtype(
     assert output.dtype is torch.float16
 
 
-def test_conv3d_rejects_non_fp16_input() -> None:
+def test_conv3d_rejects_unsupported_input_dtype() -> None:
     qdata = torch.empty(32, 3, 3, 3, 128, dtype=torch.int8)
     scale = torch.ones(32, dtype=torch.float32)
     with pytest.raises(ValueError, match="input must be float16"):
         conv3d(
-            torch.empty(1, 128, 3, 8, 8),
+            torch.empty(1, 128, 3, 8, 8, dtype=torch.float64),
             _packed(qdata, scale, input_scale=0.01),
             padding="reflect",
         )
@@ -109,8 +111,9 @@ def test_eager_and_fake_reject_unsupported_shapes(device, shape, padding, messag
         )
 
 
-def test_custom_ops_schema_fake_and_dynamic_compile_contracts():
-    input = torch.randn(1, 64, 2, 3, 3, dtype=torch.float16)  # noqa: A001
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_custom_ops_schema_fake_and_dynamic_compile_contracts(dtype):
+    input = torch.randn(1, 64, 2, 3, 3, dtype=dtype)  # noqa: A001
     qdata = torch.zeros(4, 3, 3, 3, 64, dtype=torch.int8)
     scale = torch.ones(4, 1)
     conv_args = (qdata, scale, None, 64, torch.tensor(0.02), [1, 1, 1], True, False, None)
@@ -183,17 +186,19 @@ def test_public_fusion_rejects_trainable_normalization(gradient):
         ((1, 64, 1, 2, 2), 7, "reflect", (1, 1, 1), False),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_triton_conv3d_matches_reference(
     shape: tuple[int, ...],
     outputs: int,
     padding: str,
     stride: tuple[int, int, int],
     residual_enabled: bool,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(5678)
     batch, channels, frames, height, width = shape
     input = torch.randn(  # noqa: A001
-        batch, channels, frames, width, height, device="cuda", dtype=torch.float16
+        batch, channels, frames, width, height, device="cuda", dtype=dtype
     ).transpose(3, 4)
     weight = _weight(outputs, channels, device="cuda")
     bias = torch.randn(outputs * 2, device="cuda", dtype=torch.float16)[::2].mul_(0.01)
@@ -249,10 +254,11 @@ def test_triton_conv3d_matches_reference(
 @pytest.mark.parametrize(
     ("channels", "height", "width"), [(128, 16, 16), (256, 33, 35), (512, 5, 7), (1024, 3, 3)]
 )
-def test_triton_group_norm_silu_conv3d_matches_reference(channels, height, width) -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_triton_group_norm_silu_conv3d_matches_reference(channels, height, width, dtype) -> None:
     torch.manual_seed(9012)
     input = torch.randn(  # noqa: A001
-        2, channels, 3, width, height, device="cuda", dtype=torch.float16
+        2, channels, 3, width, height, device="cuda", dtype=dtype
     ).transpose(3, 4)
     norm_weight = torch.randn(channels * 2, device="cuda")[::2]
     norm_bias = torch.randn(channels * 2, device="cuda")[::2]

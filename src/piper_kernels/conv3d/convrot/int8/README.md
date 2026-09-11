@@ -4,7 +4,8 @@
 `ConvRotInt8Conv3d` is a thin inference layer consuming a convolution weight,
 plus bias, stride, and spatial padding. Quantization state belongs to the weight.
 
-- Input and output: FP16 NCTHW, including noncontiguous inputs and residuals.
+- Input: FP16 or FP32 NCTHW, including noncontiguous inputs. Output and residual: FP16.
+  FP32 inputs retain normalization precision through INT8 preparation.
 - Logical weight: `[out, in, 3, 3, 3]`, with FP16, BF16, or FP32 logical dtype.
 - Packed `qdata`: contiguous INT8 `[out, 3, 3, 3, in]`.
 - Weight `scale`: contiguous FP32 `[out, 1]`, one per output channel.

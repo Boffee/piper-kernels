@@ -505,7 +505,6 @@ def _conv3d_prepared(
     symmetric_spatial_padding,
     right_spatial_padding,
     residual,
-    output_dtype,
 ):
     batch, input_frames, input_height, input_width, input_channels = input_qdata.shape
     output_channels = weight_qdata.shape[0]
@@ -517,7 +516,7 @@ def _conv3d_prepared(
         right_spatial_padding,
     )
     _, _, output_frames, output_height, output_width = output_shape
-    output = torch.empty(output_shape, device=input_qdata.device, dtype=output_dtype)
+    output = torch.empty(output_shape, device=input_qdata.device, dtype=torch.float16)
     bias_pointer = bias if bias is not None else output
     residual_pointer = residual if residual is not None else output
     residual_strides = residual.stride() if residual is not None else output.stride()
@@ -609,7 +608,6 @@ def conv3d(
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
-        output_dtype=input.dtype,
     )
 
 
@@ -649,7 +647,6 @@ def group_norm_silu_conv3d(
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
-        output_dtype=input.dtype,
     )
 
 

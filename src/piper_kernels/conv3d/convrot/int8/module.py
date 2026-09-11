@@ -9,7 +9,7 @@ from ._validation import _validate_config, _validate_weight
 
 
 class ConvRotInt8Conv3d(torch.nn.Module):
-    """Inference-only causal 3x3x3 layer with a quantized weight and FP16 input/output.
+    """Inference-only causal 3x3x3 layer with FP16/FP32 activations and FP16 output.
 
     Create or load ``weight`` through ``ConvRotInt8Tensor.from_hp`` or
     ``from_quantized``. Its FP32 ``act_per_tensor_scale`` must be present.
