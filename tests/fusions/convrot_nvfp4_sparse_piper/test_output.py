@@ -15,9 +15,9 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import output
-from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference
+from piper_kernels.weights.convrot._rotation import rotate_groups
 
 from .._accuracy import assert_fusion_output_close
 from ..nvfp4_sparse_piper.test_output import _arguments as standard_arguments

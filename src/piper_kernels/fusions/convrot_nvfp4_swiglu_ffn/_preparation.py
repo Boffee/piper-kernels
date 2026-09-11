@@ -10,12 +10,18 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton import convrot as rotation
+from piper_kernels._triton.convrot_nvfp4 import (
+    _preparation_num_warps,
+    _rotated_row_amax_kernel,
+)
+from piper_kernels._triton.input_activations import swiglu
+from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
+from piper_kernels._triton.nvfp4 import encode_nvfp4_blocks, swizzled_scale_offsets
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.linear._triton_input_activations import swiglu
-from piper_kernels.linear.convrot import triton as rotation
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend
-from piper_kernels.linear.nvfp4 import _layout
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
+from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
 
 # RTX 5090 measurements favored reuse up to 32 MiB; larger buffers added enough
 # memory traffic to favor recomputation. Reproduce with benchmark_nvfp4_ffn.py
@@ -75,7 +81,7 @@ def _swiglu_quantize_kernel(
     rotated = rotation.rotate_hadamard_groups(swiglu(value, gate), block_size, group_size) * (
         group_size**-0.5
     )
-    packed, scales = nvfp4_backend.encode_nvfp4_blocks(
+    packed, scales = encode_nvfp4_blocks(
         tl.reshape(rotated, (block_size // 16, 16)),
         tl.load(global_scale_ptr),
         block_size // 16,
@@ -88,7 +94,7 @@ def _swiglu_quantize_kernel(
         qdata_offsets < elements // 2,
     )
     blocks = start // 16 + tl.arange(0, block_size // 16)
-    scale_offsets = nvfp4_backend.swizzled_scale_offsets(
+    scale_offsets = swizzled_scale_offsets(
         blocks // (features // 16), blocks % (features // 16), tl.cdiv(features, 64)
     )
     tl.store(scale_ptr + scale_offsets, scales, blocks < elements // 16)
@@ -135,16 +141,16 @@ def prepare(
                     chunk_size,
                     num_warps=warps,
                 )
-                global_scale = nvfp4_backend.dynamic_scale(row_amax)
+                global_scale = nvfp4_dynamic_scale(row_amax)
                 qdata, scale = nvfp4_backend._prepare_static_storage(
                     rotated, global_scale, swiglu=False, high_first=high_first
                 )
                 return qdata, scale, global_scale
             chunk_count = sum(chunk > 0 for chunk in chunks)
-            amax_warps, _ = convrot_backend._preparation_num_warps(chunks, group_size)
+            amax_warps, _ = _preparation_num_warps(chunks, group_size)
             if chunk_count == 1 and chunks[0] >= 8_192:
                 amax_warps = 8
-            convrot_backend._rotated_row_amax_kernel[(rows,)](
+            _rotated_row_amax_kernel[(rows,)](
                 contiguous_input,
                 row_amax,
                 features,
@@ -157,9 +163,9 @@ def prepare(
                 -1,
                 num_warps=amax_warps,
             )
-            per_tensor_scale = nvfp4_backend.dynamic_scale(row_amax)
+            per_tensor_scale = nvfp4_dynamic_scale(row_amax)
         assert per_tensor_scale is not None
-        qdata, scale = _layout.prepare_activation_storage(contiguous_input, rows, features)
+        qdata, scale = prepare_activation_storage(contiguous_input, rows, features)
         block_size = 1_024
         _swiglu_quantize_kernel[(triton.cdiv(rows * features, block_size),)](
             contiguous_input,

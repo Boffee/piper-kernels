@@ -24,10 +24,10 @@ from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import convrot_nvfp4_swiglu_ffn_compile_options
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
 from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
-from piper_kernels.linear.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
-from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
-from piper_kernels.linear.nvfp4._layout import swap_packed_pairs
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 
 from .convrot_int8_sparse_piper.test_compile import _MeanPoolSparseProjectionAttentionOutput
 from .convrot_nvfp4_sparse_piper.test_compile import _ConvRotSparseProjectionAttentionOutput

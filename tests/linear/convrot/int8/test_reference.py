@@ -4,9 +4,11 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
-from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
-from piper_kernels.linear.convrot.int8.reference import dynamic_quantize_rows, linear
+from piper_kernels.linear.convrot import convrot_int8_linear
+from piper_kernels.linear.convrot.int8.reference import linear
+from piper_kernels.weights.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8._quantization import dynamic_quantize_rows
 
 
 @pytest.mark.parametrize(
@@ -30,9 +32,7 @@ def test_int8_normalization_avoids_bfloat16_double_rounding(device) -> None:
     actual, scale = dynamic_quantize_rows(values)
     assert torch.equal(actual, expected)
     if device == "cuda":
-        from piper_kernels.linear.convrot.int8._kernels.triton import (  # noqa: PLC0415
-            quantize_rows_kernel,
-        )
+        from piper_kernels._triton.convrot_int8 import quantize_rows_kernel  # noqa: PLC0415
 
         output = torch.empty_like(expected)
         output_scale = torch.empty_like(scale)

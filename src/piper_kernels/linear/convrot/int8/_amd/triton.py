@@ -9,20 +9,20 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._input_activations import apply_input_activation, input_activation_width
-from piper_kernels.linear._triton_input_activations import gelu_tanh, swiglu
-from piper_kernels.linear.convrot import triton as convrot_backend
-
-from .._kernels.triton import (
+from piper_kernels._input_activations import apply_input_activation, input_activation_width
+from piper_kernels._triton import convrot as convrot_backend
+from piper_kernels._triton.convrot_int8 import (
     _quantize_int8,
-    int8_matmul_kernel,
     int8_scale_from_max,
     normalize_for_int8,
     quantize_rows_kernel,
     round_to_int8,
 )
+from piper_kernels._triton.input_activations import gelu_tanh, swiglu
+from piper_kernels._triton.runtime import device_context
+from piper_kernels._triton.targets import AcceleratorTarget
+
+from .._kernels.triton import int8_matmul_kernel
 from .._plan import LinearExecutionPlan
 from . import policy
 

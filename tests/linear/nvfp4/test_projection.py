@@ -8,7 +8,8 @@ import torch
 from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, unpack_uint4
 from torchao.prototype.mx_formats.utils import from_blocked
 
-from piper_kernels.linear.nvfp4 import _layout, _ops, _projection, reference
+from piper_kernels.linear.nvfp4 import _ops, _projection, reference
+from piper_kernels.weights.nvfp4 import _layout
 
 pytestmark = [
     pytest.mark.gpu,

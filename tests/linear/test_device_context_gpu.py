@@ -3,15 +3,18 @@
 import pytest
 import torch
 
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import triton as piper_attention
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention
 from piper_kernels.gguf import GGUFQuantizationType
-from piper_kernels.linear.convrot.int8 import ConvRotInt8Tensor, _backend, _generic
-from piper_kernels.linear.convrot.int8._generic import triton as generic
+from piper_kernels.linear.convrot.int8 import _backend, _generic
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
 from piper_kernels.linear.nvfp4 import triton as nvfp4
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 pytestmark = [
     pytest.mark.gpu,
@@ -36,7 +39,9 @@ def test_operations_use_operand_device_and_its_current_stream(
     monkeypatch, execution_device, operation
 ):
     if operation == "gguf_tiled":
-        monkeypatch.setattr(generic, "select_conversion_chunks", lambda target, width: None)
+        monkeypatch.setattr(
+            int8_weight_triton, "select_conversion_chunks", lambda target, width: None
+        )
 
     with torch.cuda.device(0):
         original_stream = torch.cuda.current_stream(execution_device)
@@ -61,9 +66,9 @@ def test_operations_use_operand_device_and_its_current_stream(
                 if operation in ("add", "addmm"):
                     output, output_scale = qdata.clone(), scale.clone()
                     if operation == "add":
-                        _generic.add_(output, output_scale, update, 256, 0.5)
+                        int8_updates.add_(output, output_scale, update, 256, 0.5)
                     else:
-                        _generic.addmm_(output, output_scale, mat1, mat2, 256, 1.0, 0.5)
+                        int8_updates.addmm_(output, output_scale, mat1, mat2, 256, 1.0, 0.5)
                     return output, output_scale
                 assert backend is not None
                 prepared = backend.prepare_input(value, 256)
@@ -123,7 +128,7 @@ def test_nvidia_attention_and_preparation_use_operand_context(execution_device, 
                 matrix = value.reshape(-1, 256)
                 if operation == "convrot_nvfp4":
                     return convrot_nvfp4.prepare_dynamic(matrix, 256)
-                return nvfp4.prepare_static(matrix, nvfp4.dynamic_scale(matrix))
+                return nvfp4.prepare_static(matrix, nvfp4_primitives.dynamic_scale(matrix))
 
             expected = run()
             with torch.cuda.device(0):

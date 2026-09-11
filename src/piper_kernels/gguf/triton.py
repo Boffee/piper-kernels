@@ -9,7 +9,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from piper_kernels.linear.convrot import triton as convrot_backend
+from piper_kernels._triton import convrot as convrot_backend
 
 from ._types import GGUFQuantizationType
 

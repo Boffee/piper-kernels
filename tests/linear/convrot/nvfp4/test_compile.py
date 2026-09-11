@@ -16,13 +16,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels.linear.convrot._rotation import rotate_groups
-from piper_kernels.linear.convrot.nvfp4 import (
-    ConvRotNVFP4Tensor,
-    convrot_nvfp4_compile_options,
-)
+from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
 from piper_kernels.linear.convrot.nvfp4._compile import compile_pass
-from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 
 def _placeholder(graph: torch.fx.Graph, name: str, value: torch.Tensor) -> torch.fx.Node:

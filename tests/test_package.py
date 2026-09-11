@@ -34,17 +34,11 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
     convrot_nvfp4_sparse_piper_compile_options,
 )
-from piper_kernels.linear.convrot import (
-    SUPPORTED_GROUP_SIZES,
-    ConvRotInt8Tensor,
-    convrot_int8_compile_options,
-    convrot_int8_linear,
-)
-from piper_kernels.linear.convrot.nvfp4 import (
-    ConvRotNVFP4Tensor,
-    convrot_nvfp4_compile_options,
-    convrot_nvfp4_linear,
-)
+from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
+from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options, convrot_nvfp4_linear
+from piper_kernels.weights.convrot import SUPPORTED_GROUP_SIZES
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
 
 def test_removed_convrot_root_package_is_not_importable() -> None:
@@ -77,7 +71,8 @@ builtins.__import__ = without_triton
 importlib.util.find_spec = find_spec
 
 import torch
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 
@@ -88,8 +83,6 @@ weight = ConvRotInt8Tensor.from_quantized(
 result = convrot_int8_linear(torch.ones(2, 32), weight)
 assert result.shape == (2, 7)
 assert _backend.select_linear_backend(torch.ones(1)) is None
-assert _backend._generic_backend is None
-assert _backend.select_gguf_converter(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert generic_dispatch._triton_backend is None
@@ -109,7 +102,7 @@ assert "piper_kernels.fusions.convrot_int8_sage_qk.triton" not in sys.modules
 assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)
-_generic.add_(weight.qdata, weight.scale, torch.ones(7, 32), 16, 1.0)
+weight.add_(torch.ones(7, 32))
 assert torch.isfinite(weight.dequantize()).all()
 """
     subprocess.run([sys.executable, "-c", script], check=True)
@@ -263,10 +256,10 @@ def test_public_packages_import() -> None:
     assert piper_kernels.linear.convrot.__name__ == "piper_kernels.linear.convrot"
     assert piper_kernels.linear.convrot.int8.__name__ == "piper_kernels.linear.convrot.int8"
     assert piper_kernels.linear.convrot.nvfp4.__name__ == "piper_kernels.linear.convrot.nvfp4"
-    assert piper_kernels.linear.convrot.SUPPORTED_GROUP_SIZES is SUPPORTED_GROUP_SIZES
-    assert piper_kernels.linear.convrot.ConvRotInt8Tensor is ConvRotInt8Tensor
-    assert piper_kernels.linear.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
-    assert piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor is ConvRotNVFP4Tensor
+    assert piper_kernels.weights.convrot.SUPPORTED_GROUP_SIZES is SUPPORTED_GROUP_SIZES
+    assert piper_kernels.weights.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
+    assert piper_kernels.weights.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
+    assert piper_kernels.weights.convrot.nvfp4.ConvRotNVFP4Tensor is ConvRotNVFP4Tensor
     assert (
         piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_compile_options
         is convrot_nvfp4_compile_options
@@ -274,21 +267,18 @@ def test_public_packages_import() -> None:
     assert piper_kernels.linear.convrot.convrot_int8_compile_options is convrot_int8_compile_options
     assert piper_kernels.linear.convrot.convrot_int8_linear is convrot_int8_linear
     assert piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_linear is convrot_nvfp4_linear
-    assert convrot_int8_linear.__module__ == "piper_kernels.linear.convrot.int8.tensor"
+    assert convrot_int8_linear.__module__ == "piper_kernels.linear.convrot.int8._functional"
     assert not hasattr(piper_kernels.linear.convrot, "convrot_linear")
     assert not hasattr(piper_kernels.linear.convrot, "convrot_compile_options")
     assert not hasattr(piper_kernels.linear.convrot.int8, "convrot_int8_linear")
     assert not hasattr(piper_kernels.linear.convrot, "linear_input_act")
     assert not hasattr(piper_kernels.linear.convrot.int8, "linear_input_act")
     assert piper_kernels.linear.convrot.__all__ == [
-        "SUPPORTED_GROUP_SIZES",
-        "ConvRotInt8Tensor",
         "convrot_int8_compile_options",
         "convrot_int8_linear",
     ]
-    assert piper_kernels.linear.convrot.int8.__all__ == ["ConvRotInt8Tensor"]
+    assert not hasattr(piper_kernels.linear.convrot.int8, "ConvRotInt8Tensor")
     assert piper_kernels.linear.convrot.nvfp4.__all__ == [
-        "ConvRotNVFP4Tensor",
         "convrot_nvfp4_compile_options",
         "convrot_nvfp4_linear",
         "dynamic_scale",

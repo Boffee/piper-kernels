@@ -9,10 +9,10 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import _compile as ffn_compile
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as ffn
-from piper_kernels.linear._input_activations import apply_input_activation
 from piper_kernels.linear.convrot.int8 import _backend, reference
 
 

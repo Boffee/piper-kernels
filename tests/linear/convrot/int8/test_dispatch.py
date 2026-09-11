@@ -3,7 +3,8 @@
 import pytest
 import torch
 
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
+from piper_kernels.linear.convrot import convrot_int8_linear
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
 def _weight(

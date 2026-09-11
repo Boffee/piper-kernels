@@ -5,10 +5,11 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton import convrot_int8 as kernels_weights
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 from piper_kernels.linear.convrot.int8._nvidia import policy
-from piper_kernels.linear.convrot.int8._plan import fused_preparation_chunks
+from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 
 @pytest.mark.parametrize("architecture", [75, 89, 120])
@@ -17,7 +18,7 @@ def test_nvidia_preparation_compiles_without_a_device(architecture):
     plan = policy.select_execution_plan(target, in_features=5376)
     chunk_count, chunk_size = fused_preparation_chunks(5376)
     source = ASTSource(
-        kernels.rotate_quantize_rows_kernel,
+        kernels_weights.rotate_quantize_rows_kernel,
         {"x_ptr": "*fp16", "q_ptr": "*i8", "scale_ptr": "*fp32", "row_width": "i32"},
         constexprs={
             "chunk_size": chunk_size,

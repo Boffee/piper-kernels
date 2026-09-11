@@ -1,10 +1,10 @@
-"""Dispatch generic preparation and weight updates between Triton and PyTorch."""
+"""Dispatch generic activation preparation between Triton and PyTorch."""
 
 import torch
 
+from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton import runtime
-from piper_kernels.linear._input_activations import apply_input_activation
-from piper_kernels.linear.convrot._rotation import validate_group_size
+from piper_kernels.weights.convrot._rotation import validate_group_size
 
 from .. import reference
 from .._interfaces import PreparedInput
@@ -66,41 +66,3 @@ def prepare_input(
         for output, prepared_value in zip(out, prepared, strict=True):
             output.copy_(prepared_value)
     return out
-
-
-def add_(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    update: torch.Tensor,
-    group_size: int,
-    alpha: float,
-    rounding_seed: int | None = None,
-) -> None:
-    """Update via shared Triton primitives where available, otherwise PyTorch."""
-    if alpha == 0 or qdata.numel() == 0:
-        return
-    if _use_triton(qdata):
-        assert _triton_backend is not None
-        _triton_backend.add_(qdata, scale, update, group_size, alpha, rounding_seed)
-    else:
-        reference.add_(qdata, scale, update, group_size, alpha, rounding_seed)
-
-
-def addmm_(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    group_size: int,
-    beta: float,
-    alpha: float,
-    rounding_seed: int | None = None,
-) -> None:
-    """Share update orchestration independently of INT8 GEMM target support."""
-    if (beta == 1 and alpha == 0) or qdata.numel() == 0:
-        return
-    if _use_triton(qdata):
-        assert _triton_backend is not None
-        _triton_backend.addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
-    else:
-        reference.addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)

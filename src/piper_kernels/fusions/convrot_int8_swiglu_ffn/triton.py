@@ -8,7 +8,8 @@ import torch
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear import _bias
-from piper_kernels.linear.convrot.int8 import _backend, reference
+from piper_kernels.linear.convrot.int8 import _backend
+from piper_kernels.weights.convrot.int8._quantization import validate_storage
 
 _DEFAULT_CHUNK_ROWS = 4_096
 
@@ -65,7 +66,7 @@ def _validate_inputs(
         (value_weight_qdata, value_weight_scale, value_group_size),
         (down_weight_qdata, down_weight_scale, down_group_size),
     ):
-        reference.validate_storage(weight_qdata, weight_scale, group_size, input.dtype)
+        validate_storage(weight_qdata, weight_scale, group_size, input.dtype)
         if weight_qdata.device != input.device or weight_scale.device != input.device:
             raise ValueError("ConvRot INT8 FFN operands must share a device")
 

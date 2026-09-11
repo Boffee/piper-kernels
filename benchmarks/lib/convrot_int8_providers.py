@@ -7,10 +7,11 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_linear
+from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 from .convrot import ConvRotConfig, ConvRotInputs, ConvRotShape, make_convrot_inputs
 from .providers import BenchmarkProvider

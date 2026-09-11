@@ -7,9 +7,9 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton import convrot_int8 as kernels_weights
+from piper_kernels._triton.convrot import rotate_groups_kernel
 from piper_kernels.gguf import GGUFQuantizationType
-from piper_kernels.linear.convrot.int8._kernels import triton as kernels
-from piper_kernels.linear.convrot.triton import rotate_groups_kernel
 
 _TARGETS = [
     GPUTarget("cuda", 70, 32),
@@ -44,7 +44,7 @@ def test_generic_primitives_compile(target, dtype, operation):
             "accelerator_backend": target.backend,
         }
         if operation == "quantize":
-            kernel = kernels.quantize_rows_kernel
+            kernel = kernels_weights.quantize_rows_kernel
             signature = {
                 "x_ptr": f"*{dtype}",
                 "q_ptr": "*i8",
@@ -52,7 +52,7 @@ def test_generic_primitives_compile(target, dtype, operation):
                 "row_width": "i32",
             }
         else:
-            kernel = kernels.requantize_update_rows_kernel
+            kernel = kernels_weights.requantize_update_rows_kernel
             signature = {
                 "q_ptr": "*i8",
                 "scale_ptr": "*fp32",
@@ -82,7 +82,7 @@ def test_generic_primitives_compile(target, dtype, operation):
 def test_generic_gguf_tiles_compile(target, quant_type, write_maxima):
     compiled = triton.compile(
         ASTSource(
-            kernels.convert_gguf_tiles_kernel,
+            kernels_weights.convert_gguf_tiles_kernel,
             {
                 "data_ptr": "*u8",
                 "q_ptr": "*i8",
@@ -109,7 +109,7 @@ def test_generic_gguf_tiles_compile(target, quant_type, write_maxima):
 def test_generic_gguf_scale_reduction_compiles(target):
     compiled = triton.compile(
         ASTSource(
-            kernels.gguf_row_scales_kernel,
+            kernels_weights.gguf_row_scales_kernel,
             {"maxima_ptr": "*fp32", "scale_ptr": "*fp32", "tiles_per_row": "i32"},
             constexprs={"block_size": 128, "reciprocal_scale": target.backend == "hip"},
         ),
@@ -124,7 +124,7 @@ def test_generic_gguf_scale_reduction_compiles(target):
 def test_shared_fused_gguf_compiles(target, quant_type):
     compiled = triton.compile(
         ASTSource(
-            kernels.rotate_quantize_rows_kernel,
+            kernels_weights.rotate_quantize_rows_kernel,
             {"x_ptr": "*u8", "q_ptr": "*i8", "scale_ptr": "*fp32", "row_width": "i32"},
             constexprs={
                 "chunk_size": 2048,

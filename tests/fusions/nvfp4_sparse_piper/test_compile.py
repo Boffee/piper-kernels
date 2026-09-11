@@ -38,10 +38,10 @@ from piper_kernels.fusions.nvfp4_sparse_piper._compile import compile_pass
 from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
     _fold_attention_output,
 )
-from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 from piper_kernels.linear.nvfp4.triton import linear_mean
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
 from ._helpers import exact_sm120_available

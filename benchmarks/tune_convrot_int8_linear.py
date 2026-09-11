@@ -42,8 +42,8 @@ from lib.tuning import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
 from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_plan
+from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

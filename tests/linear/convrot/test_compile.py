@@ -7,14 +7,11 @@ import pytest
 import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
-from piper_kernels.linear.convrot import (
-    ConvRotInt8Tensor,
-    convrot_int8_compile_options,
-    convrot_int8_linear,
-)
+from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.int8._compile import (
     compile_pass,
 )
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
 def _placeholder(

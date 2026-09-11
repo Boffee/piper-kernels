@@ -9,19 +9,23 @@ import torch
 import triton
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from piper_kernels._triton import convrot as rotation
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import _policy as sage_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates
 from piper_kernels.gguf import GGUFQuantizationType
-from piper_kernels.linear.convrot import triton as rotation
-from piper_kernels.linear.convrot.int8 import _backend, _generic, _gguf
+from piper_kernels.linear.convrot.int8 import _generic
 from piper_kernels.linear.convrot.int8._amd import triton as amd
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic
 from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
-from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
-from piper_kernels.linear.nvfp4 import triton as nvfp4
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _gguf
+from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
+from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
+from piper_kernels.weights.convrot.nvfp4 import triton as convrot_nvfp4_weight_triton
 
 
 @pytest.fixture
@@ -79,7 +83,7 @@ def launches(monkeypatch):
 
 def test_gguf_and_generic_operations_accept_supported_noncurrent_gpu(launches):
     value = SimpleNamespace(device=torch.device("cuda:0"), shape=(2, 256), numel=lambda: 512)
-    assert _backend.select_gguf_converter(value) is generic.convert_gguf_out
+    assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out
     assert generic_dispatch._use_triton(value)
     assert launches.queries == [0, 0]
     assert launches.current == 1
@@ -95,7 +99,7 @@ def test_gguf_probes_and_launches_on_tensor_device_then_restores_caller(launches
         "convert_gguf_tiles_kernel",
         "gguf_row_scales_kernel",
     ):
-        launches.watch(generic, name)
+        launches.watch(int8_weight_triton, name)
     with FakeTensorMode():
         data = torch.empty(2, 16384 if tiled else 256, device="cuda:0")
         error_context = (
@@ -127,7 +131,7 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation):
     for module, name in (
         (rotation, "rotate_groups_kernel"),
         (generic, "quantize_rows_kernel"),
-        (generic, "requantize_update_rows_kernel"),
+        (int8_weight_triton, "requantize_update_rows_kernel"),
     ):
         launches.watch(module, name)
     with FakeTensorMode():
@@ -137,9 +141,9 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation):
         if operation == "prepare_input":
             _generic.prepare_input(value, 256)
         elif operation == "add_":
-            _generic.add_(qdata, scale, value, 256, 0.5)
+            int8_updates.add_(qdata, scale, value, 256, 0.5)
         else:
-            _generic.addmm_(
+            int8_updates.addmm_(
                 qdata,
                 scale,
                 value[:, :16],
@@ -185,13 +189,13 @@ def test_prepared_paired_projection_owns_context_for_all_launches(launches, back
 
 
 def test_nvfp4_scale_and_gguf_launchers_own_context(launches):
-    launches.watch(nvfp4, "_amax_partial_kernel")
-    launches.watch(nvfp4, "_amax_scale_kernel")
-    launches.watch(convrot_nvfp4, "_rotate_quantize_nvfp4_kernel")
+    launches.watch(nvfp4_primitives, "_amax_partial_kernel")
+    launches.watch(nvfp4_primitives, "_amax_scale_kernel")
+    launches.watch(convrot_nvfp4_weight_triton, "_rotate_quantize_nvfp4_kernel")
     with FakeTensorMode():
         value = torch.empty(3, 256, device="cuda:0")
-        per_tensor_scale = nvfp4.dynamic_scale(value)
-        convrot_nvfp4._gguf_prepare_out(
+        per_tensor_scale = nvfp4_primitives.dynamic_scale(value)
+        convrot_nvfp4_weight_triton._gguf_prepare_out(
             value,
             int(GGUFQuantizationType.F32),
             256,

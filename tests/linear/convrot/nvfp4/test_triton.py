@@ -3,12 +3,13 @@
 import pytest
 import torch
 
-from piper_kernels.linear._input_activations import apply_input_activation
-from piper_kernels.linear.convrot import triton as convrot_backend
-from piper_kernels.linear.convrot._rotation import rotate_groups
+from piper_kernels._input_activations import apply_input_activation
+from piper_kernels._triton import convrot as convrot_backend
+from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
-from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 
 def _exact_sm120_available() -> bool:
@@ -45,12 +46,12 @@ def test_rotation_chunk_sizes_support_general_aligned_widths(
     input_features: int,
     expected: tuple[int, int, int],
 ) -> None:
-    assert convrot_nvfp4._rotation_chunk_sizes(input_features, 16) == expected
+    assert convrot_nvfp4_primitives._rotation_chunk_sizes(input_features, 16) == expected
 
 
 def test_rotation_chunk_sizes_reject_widths_beyond_three_chunks() -> None:
     with pytest.raises(ValueError, match="exceeds three"):
-        convrot_nvfp4._rotation_chunk_sizes(49_168, 16)
+        convrot_nvfp4_primitives._rotation_chunk_sizes(49_168, 16)
 
 
 @pytest.mark.gpu

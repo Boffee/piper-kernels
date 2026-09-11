@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
@@ -19,7 +20,7 @@ class _StandardPreparation:
     high_first: bool
 
     def dynamic_scale(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-        return nvfp4_backend.dynamic_scale(input)
+        return nvfp4_dynamic_scale(input)
 
     def prepare_static_out(
         self,

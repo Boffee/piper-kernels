@@ -17,10 +17,10 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels._triton import convrot as convrot_triton
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
-from piper_kernels.linear.convrot import triton as convrot_triton
 
 from . import _compile_fx
 

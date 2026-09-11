@@ -2,8 +2,9 @@
 
 import torch
 
+from piper_kernels._input_activations import input_activation_width
 from piper_kernels.linear import _bias
-from piper_kernels.linear._input_activations import input_activation_width
+from piper_kernels.weights.convrot.int8._quantization import validate_storage
 
 from . import _backend, _ops, reference
 
@@ -18,7 +19,7 @@ def _validate_linear(
     expected_features: int,
 ) -> torch.Tensor | None:
     """Validate one linear and canonicalize its optional bias."""
-    reference.validate_storage(qdata, scale, group_size, dtype)
+    validate_storage(qdata, scale, group_size, dtype)
     if input.ndim == 0 or input.shape[-1] != expected_features:
         actual = 0 if input.ndim == 0 else input.shape[-1]
         raise ValueError(

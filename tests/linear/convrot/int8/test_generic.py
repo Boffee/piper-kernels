@@ -6,13 +6,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._input_activations import apply_input_activation
-from piper_kernels.linear.convrot import ConvRotInt8Tensor
-from piper_kernels.linear.convrot._rotation import rotate_groups
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops, reference
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _quantization as int8_quantization
+from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 _DEVICES = [
     "cpu",
@@ -34,14 +37,13 @@ def test_generic_update_selection_does_not_query_architecture(monkeypatch, devic
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("architecture queried"))
     )
-    assert _backend.select_add(value) is _generic.add_
-    assert _backend.select_addmm(value) is _generic.addmm_
+    assert int8_updates.select_add(value) is int8_updates.add_
+    assert int8_updates.select_addmm(value) is int8_updates.addmm_
     assert _backend.select_preparation_backend(value) is _generic
 
 
-@pytest.mark.parametrize("operation", ["prepare_input", "add_", "addmm_"])
-def test_generic_package_reexports_dispatch(operation):
-    assert getattr(_generic, operation) is getattr(generic_dispatch, operation)
+def test_generic_package_exports_preparation():
+    assert _generic.prepare_input is generic_dispatch.prepare_input
 
 
 @pytest.mark.gpu
@@ -54,11 +56,11 @@ def test_rocm_uses_shared_triton_without_a_tuned_backend(monkeypatch):
     value = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
     assert generic_dispatch._use_triton(value)
     prepare = Mock(wraps=generic_triton.prepare_input)
-    add = Mock(wraps=generic_triton.add_)
-    addmm = Mock(wraps=generic_triton.addmm_)
+    add = Mock(wraps=int8_weight_triton.add_)
+    addmm = Mock(wraps=int8_weight_triton.addmm_)
     monkeypatch.setattr(generic_triton, "prepare_input", prepare)
-    monkeypatch.setattr(generic_triton, "add_", add)
-    monkeypatch.setattr(generic_triton, "addmm_", addmm)
+    monkeypatch.setattr(int8_weight_triton, "add_", add)
+    monkeypatch.setattr(int8_weight_triton, "addmm_", addmm)
     _ops.prepare_input(value, 256)
     weight = ConvRotInt8Tensor.from_hp(value, group_size=256)
     weight.add_(value)
@@ -111,43 +113,6 @@ def test_generic_quantize_dequantize_roundtrip(device, dtype, group_size):
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("operation", ["add", "addmm"])
-@pytest.mark.parametrize("fallback", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("seed", [None, 123])
-def test_updates_work_without_tuned_backends(monkeypatch, device, operation, fallback, dtype, seed):
-    monkeypatch.setattr(_backend, "_amd_backend", None)
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    if fallback:
-        monkeypatch.setattr(generic_dispatch, "_triton_backend", None)
-    torch.manual_seed(671)
-    value = torch.randn(17, 256, device=device, dtype=dtype)
-    weight = ConvRotInt8Tensor.from_hp(value, group_size=64)
-    replay = weight.clone()
-    qdata, scale = weight.qdata, weight.scale
-    before = weight.dequantize(torch.float32)
-    update = torch.randn(17, 512, device=device, dtype=dtype)[:, ::2]
-    left = torch.randn(17, 3, device=device, dtype=dtype)
-    right = torch.randn(3, 512, device=device, dtype=dtype)[:, ::2]
-    if operation == "add":
-        weight.add_(update, alpha=0.25, rounding_seed=seed)
-        replay.add_(update, alpha=0.25, rounding_seed=seed)
-        expected = before + 0.25 * update.float()
-    else:
-        weight.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
-        replay.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
-        expected = 0.5 * before + 0.25 * (left.float() @ right.float())
-    actual = weight.dequantize(torch.float32)
-    relative_rms = (actual - expected).square().mean().sqrt() / expected.square().mean().sqrt()
-    assert relative_rms.item() < 0.04
-    assert actual.isfinite().all()
-    assert weight.qdata is qdata
-    assert weight.scale is scale
-    assert torch.equal(weight.qdata, replay.qdata)
-    assert torch.equal(weight.scale, replay.scale)
-
-
-@pytest.mark.parametrize("device", _DEVICES)
 def test_generic_preparation_custom_op_compiles_without_tuned_backend(monkeypatch, device):
     monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
@@ -195,25 +160,8 @@ def test_generic_preparation_zero_and_tiny_scales(device, magnitude, dtype):
     if device == "cuda":
         # The generic GPU path materializes a compact rotation workspace.
         rotated = rotated.to(dtype)
-    expected_qdata, expected_scale = reference.dynamic_quantize_rows(rotated)
+    expected_qdata, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     expected_scale = expected_scale.squeeze(-1)
     assert torch.equal(qdata, expected_qdata)
     torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=0)
     assert scale.isfinite().all()
-
-
-def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
-    qdata, scale = torch.zeros(2, 32, dtype=torch.int8), torch.ones(2, 1)
-
-    def partial_update(*args):
-        qdata.fill_(3)
-        raise RuntimeError("kernel execution failed")
-
-    fallback = Mock(side_effect=AssertionError("unsafe retry"))
-    monkeypatch.setattr(generic_dispatch, "_use_triton", lambda value: True)
-    monkeypatch.setattr(generic_triton, "add_", partial_update)
-    monkeypatch.setattr(reference, "add_", fallback)
-    with pytest.raises(RuntimeError, match="kernel execution failed"):
-        _generic.add_(qdata, scale, torch.ones(2, 32), 16, 1.0)
-    assert (qdata == 3).all()
-    fallback.assert_not_called()

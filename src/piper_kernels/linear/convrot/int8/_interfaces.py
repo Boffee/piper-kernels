@@ -64,10 +64,4 @@ class LinearBackend(PreparationBackend, Protocol):
     ) -> torch.Tensor: ...
 
 
-type Add = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int, float, int | None], None]
-type Addmm = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, float, float, int | None],
-    None,
-]
-type GGUFConvert = Callable[[torch.Tensor, int, int, torch.Tensor, torch.Tensor], None]
 type DequantizedMean = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]
