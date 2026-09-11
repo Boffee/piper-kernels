@@ -6,11 +6,11 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.linear._input_activations import (
+from piper_kernels._input_activations import (
     InputActivation,
     input_activation_width,
 )
-from piper_kernels.linear.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 type ConvRotInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 

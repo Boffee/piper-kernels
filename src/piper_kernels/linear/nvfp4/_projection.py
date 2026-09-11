@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import torch
 
-from . import _layout
-from . import triton as nvfp4_backend
+from piper_kernels.weights.nvfp4 import _layout
+
+from . import triton as triton_backend
 
 _SCALE_ELEMENTS_PER_TILE = _layout.SCALE_ROW_TILE * _layout.SCALE_COLUMN_TILE // _layout.BLOCK_SIZE
 _BLOCKWISE_RECIPE = torch.nn.functional.ScalingType.BlockWise1x16.value
@@ -166,7 +167,7 @@ def matmul_prepared_chunk_affine_out(
             None,
             output_chunk,
         )
-        nvfp4_backend.add_bias_out(output_chunk, bias, output_chunk)
+        triton_backend.add_bias_out(output_chunk, bias, output_chunk)
         return output_chunk
 
     rows, features = output_chunk.shape
@@ -187,7 +188,7 @@ def matmul_prepared_chunk_affine_out(
             None,
             accumulated,
         )
-        nvfp4_backend.add_bias_out(
+        triton_backend.add_bias_out(
             accumulated,
             bias,
             output_chunk[start:stop],

@@ -8,8 +8,8 @@ import torch
 
 from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.sparse_piper import _output as output_common
-from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
+from piper_kernels.weights.convrot._rotation import validate_group_size
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,20 +9,18 @@ import math
 import torch
 import triton
 
-from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._input_activations import (
+from piper_kernels._input_activations import (
     apply_input_activation,
     input_activation_width,
 )
-from piper_kernels.linear.convrot import triton as convrot_backend
+from piper_kernels._triton import convrot as convrot_backend
+from piper_kernels._triton.convrot_int8 import quantize_rows_kernel, rotate_quantize_rows_kernel
+from piper_kernels._triton.runtime import device_context
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
-from .._kernels.triton import (
-    int8_matmul_kernel,
-    quantize_rows_kernel,
-    rotate_quantize_rows_kernel,
-)
-from .._plan import LinearExecutionPlan, fused_preparation_chunks
+from .._kernels.triton import int8_matmul_kernel
+from .._plan import LinearExecutionPlan
 from . import policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16

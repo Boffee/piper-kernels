@@ -7,7 +7,7 @@ from collections.abc import Callable
 import torch
 from torch._inductor.pattern_matcher import CallFunction, KeywordArg, Match
 
-from piper_kernels.linear import _input_activations as input_activations
+from piper_kernels import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 type LinearPattern = Callable[[CallFunction], CallFunction]

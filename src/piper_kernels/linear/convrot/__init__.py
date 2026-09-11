@@ -1,10 +1,8 @@
-"""Rotated quantized weights and functional linear operators."""
+"""ConvRot linear operators and compiler integration."""
 
 from collections.abc import Mapping
 
-from ._rotation import SUPPORTED_GROUP_SIZES
-from .int8 import ConvRotInt8Tensor
-from .int8.tensor import convrot_int8_linear
+from .int8._functional import convrot_int8_linear
 
 
 def convrot_int8_compile_options(
@@ -23,8 +21,6 @@ def convrot_int8_compile_options(
 
 
 __all__ = [
-    "SUPPORTED_GROUP_SIZES",
-    "ConvRotInt8Tensor",
     "convrot_int8_compile_options",
     "convrot_int8_linear",
 ]

@@ -22,8 +22,9 @@ in FP32 until the final BF16 store.
 |---|---|
 | `piper_kernels` | Public dense and sparse Piper Attention plus SageAttention2++ operators |
 | `piper_kernels.attention` | Attention dispatch, portable references, and optimized backends |
-| `piper_kernels.linear` | Linear operators, tensor formats, and optimized backends |
-| `piper_kernels.linear.convrot` | ConvRot INT8 and NVFP4 tensors, linear operators, and compiler integrations |
+| `piper_kernels.weights` | Quantized weight formats, conversion, updates, and sharding |
+| `piper_kernels.linear` | Linear operators and optimized backends |
+| `piper_kernels.linear.convrot` | ConvRot linear operators and compiler integrations |
 
 ## Triton setup
 
@@ -38,6 +39,29 @@ current driver, and the Visual C++ Redistributable for Visual Studio 2015-2022. 
 Windows wheel bundles its CUDA toolchain and TinyCC, so a separate CUDA toolkit or Visual
 Studio install is not required for Piper's Triton kernels. The base package remains
 portable and does not require either Triton distribution.
+
+## Shared weight formats
+
+Import weight types independently of the operator that executes them:
+
+```python
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+```
+
+The weight packages own packed storage, scales, quantization/dequantization,
+GGUF conversion, in-place updates, and sharding. Importing, quantizing, loading,
+or updating a weight does not load Piper's linear operators. Tensor dispatch
+loads linear execution when `torch.nn.functional.linear` or a matrix product
+uses the weight. Operator kernels and graph optimizations remain under `linear`;
+reusable rotation and packing primitives live under `_triton`.
+
+The former tensor exports under `linear` have been removed. Callers must update
+imports together with their Piper Kernels dependency. Packed checkpoint data and
+scale layouts are unchanged, including direct wrapping of mmap storage. Pickled
+Python tensor subclasses now use the new class module paths; checkpoints saved
+with the old paths must be re-exported. No legacy import aliases are provided.
 
 ## ConvRot INT8
 
@@ -60,11 +84,8 @@ then use the resulting tensor as a normal linear weight:
 ```python
 import torch
 
-from piper_kernels.linear.convrot import (
-    ConvRotInt8Tensor,
-    convrot_int8_compile_options,
-    convrot_int8_linear,
-)
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 
 weight = ConvRotInt8Tensor.from_hp(dense_weight, group_size=256)
 checkpoint_weight = ConvRotInt8Tensor.from_quantized(
@@ -228,8 +249,8 @@ Piper's ordinary and ConvRot NVFP4 wrappers can quantize a floating-point weight
 exposing TorchAO storage construction to the caller:
 
 ```python
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
-from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
 activation_quantization = QuantizeTensorToNVFP4Kwargs(
@@ -257,7 +278,7 @@ rotated_weight = ConvRotNVFP4Tensor.from_hp(
 For ConvRot, the global NVFP4 scale is derived after rotation. This keeps rotation and
 quantization in one package-owned operation and prevents callers from accidentally scaling the
 logical basis instead of the stored basis. `SUPPORTED_GROUP_SIZES` is exported from
-`piper_kernels.linear.convrot` for format-policy validation.
+`piper_kernels.weights.convrot` for format-policy validation.
 
 `ConvRotInt8Tensor`, `PiperNVFP4Tensor`, and `ConvRotNVFP4Tensor` support same-shape
 `view` and `view_as`, preserving the concrete wrapper, quantization metadata, and shared
@@ -280,7 +301,7 @@ Redistributing quantized weights is unsupported. Transposed weights support dens
 matrix products; using one as the weight of another `linear` is unsupported.
 
 To partition an **already quantized full weight**, use
-`piper_kernels.linear.sharding.shard_quantized_weight(weight, dim=..., start=..., length=...)`.
+`piper_kernels.weights.sharding.shard_quantized_weight(weight, dim=..., start=..., length=...)`.
 It copies packed data and repacks NVFP4 scales without requantizing, preserving the wrapper,
 nibble order, global scales, rotation, and activation-quantization configuration. Each shard
 owns its tensor storage. Create shards on CPU during loading, then move them to CUDA for
@@ -302,7 +323,7 @@ assumes an initialized 1-D mesh and an evenly partitioned weight:
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 
-from piper_kernels.linear.sharding import shard_quantized_weight
+from piper_kernels.weights.sharding import shard_quantized_weight
 
 dim = 0  # 0: output rows / ColwiseParallel; 1: input channels / RowwiseParallel
 parts = mesh.size()

@@ -6,9 +6,13 @@ import pytest
 import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
-from piper_kernels.linear._input_activations import apply_input_activation
+from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import convrot_int8_compile_options
-from piper_kernels.linear.convrot.int8 import _backend, _ops, _update, dispatch, reference
+from piper_kernels.linear.convrot.int8 import _backend, _ops, dispatch, reference
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _ops as int8_update_ops
+from piper_kernels.weights.convrot.int8 import _update
+from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
 
 
 class _RecordingBackend:
@@ -147,8 +151,8 @@ def test_fake_schemas_need_no_implementation(monkeypatch):
 
     monkeypatch.setattr(_backend, "select_linear_backend", unexpected_selection)
     monkeypatch.setattr(_backend, "select_preparation_backend", unexpected_selection)
-    monkeypatch.setattr(_backend, "select_add", unexpected_selection)
-    monkeypatch.setattr(_backend, "select_addmm", unexpected_selection)
+    monkeypatch.setattr(int8_updates, "select_add", unexpected_selection)
+    monkeypatch.setattr(int8_updates, "select_addmm", unexpected_selection)
     value = torch.empty(2, 3, 64, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(7, 32, device="meta", dtype=torch.int8)
     scale = torch.empty(7, 1, device="meta")
@@ -156,8 +160,8 @@ def test_fake_schemas_need_no_implementation(monkeypatch):
     result = _ops.linear(value, weight, scale, None, 16, "swiglu")
     qdata, row_scale = _ops.prepare_input(value, 16, "swiglu")
     projected = _ops.linear_prepared(qdata, row_scale, weight, scale, None, value.dtype)
-    _ops.add_(weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0)
-    _ops.addmm_(
+    int8_update_ops.add_(weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0)
+    int8_update_ops.addmm_(
         weight,
         scale,
         torch.empty(7, 2, device="meta"),
@@ -183,14 +187,14 @@ def test_linear_only_implementation_preserves_weight_update_fallback(monkeypatch
     expected_weight, expected_scale = weight.clone(), scale.clone()
     delta = torch.ones_like(weight, dtype=torch.float32)
     if operation == "add":
-        assert _backend.select_add(weight) is None
+        assert int8_updates.select_add(weight) is None
         _update.add_(weight, scale, torch.float32, 16, delta)
-        reference.add_(expected_weight, expected_scale, delta, 16, 1.0)
+        int8_update_reference.add_(expected_weight, expected_scale, delta, 16, 1.0)
     else:
-        assert _backend.select_addmm(weight) is None
+        assert int8_updates.select_addmm(weight) is None
         mat1, mat2 = torch.ones(7, 2), torch.ones(2, 32)
         _update.addmm_(weight, scale, torch.float32, 16, mat1, mat2)
-        reference.addmm_(expected_weight, expected_scale, mat1, mat2, 16, 1.0, 1.0)
+        int8_update_reference.addmm_(expected_weight, expected_scale, mat1, mat2, 16, 1.0, 1.0)
 
     assert torch.equal(weight, expected_weight)
     assert torch.equal(scale, expected_scale)

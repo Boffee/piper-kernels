@@ -10,9 +10,10 @@ from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
-from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
+from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
+from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 DEFAULT_CHUNK_ROWS = 1_536
 
@@ -311,7 +312,7 @@ def run_chunked_swiglu_ffn(
     output_2d = output.reshape(rows, output_features)
     base_2d = None if gated_updates is None else gated_updates.base.reshape(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
-    source_storage = nvfp4_layout.prepare_activation_storage(
+    source_storage = prepare_activation_storage(
         input,
         workspace_rows,
         input_features,

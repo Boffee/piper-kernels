@@ -9,8 +9,8 @@ import torch
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
 from piper_kernels.fusions.nvfp4_swiglu_ffn._preparation import StandardPreparation
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
-from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
+from piper_kernels.weights.convrot._rotation import validate_group_size
 
 from . import _preparation as swiglu_preparation
 

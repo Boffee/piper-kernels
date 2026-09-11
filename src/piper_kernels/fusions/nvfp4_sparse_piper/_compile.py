@@ -19,6 +19,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_triton,
@@ -42,10 +43,11 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _chunking as nvfp4_chunking
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx
-from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
+from piper_kernels.linear.nvfp4 import _storage as nvfp4_storage
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
+from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
 
@@ -78,8 +80,10 @@ def _source_files() -> tuple[str, ...]:
             nvfp4_layout.__file__,
             projected_qk_triton.__file__,
             nvfp4_projection.__file__,
+            nvfp4_storage.__file__,
             nvfp4_validation.__file__,
             nvfp4_triton.__file__,
+            nvfp4_primitives.__file__,
             _quantized_dispatch.__file__,
             dispatch.__file__,
             _compile_fx.__file__,

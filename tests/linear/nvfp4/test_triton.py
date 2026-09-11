@@ -7,9 +7,10 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels.linear.nvfp4 import _layout
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
+from piper_kernels.weights.nvfp4 import _layout
 
 
 def _exact_sm120_available() -> bool:
@@ -29,7 +30,7 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
     )
 
     expected = per_tensor_amax_to_scale(input.abs().amax())
-    actual = nvfp4_triton.dynamic_scale(input)
+    actual = nvfp4_primitives.dynamic_scale(input)
 
     assert torch.equal(actual, expected)
 
@@ -393,7 +394,7 @@ def test_dynamic_scale_small_final_reduction_boundaries(count, dtype):
     values[-1] = -123
     out = torch.empty((), device="cuda", dtype=torch.float32)
     expected = per_tensor_amax_to_scale(values.float().abs().amax())
-    actual = nvfp4_triton.dynamic_scale(values, out=out)
+    actual = nvfp4_primitives.dynamic_scale(values, out=out)
     assert actual is out
     assert torch.equal(actual, expected)
 
@@ -404,6 +405,6 @@ def test_dynamic_scale_small_final_reduction_boundaries(count, dtype):
 def test_dynamic_scale_small_reduction_extremes(maximum):
     values = torch.zeros(1_797, device="cuda", dtype=torch.float32)
     values[-1] = maximum
-    actual = nvfp4_triton.dynamic_scale(values)
+    actual = nvfp4_primitives.dynamic_scale(values)
     expected = per_tensor_amax_to_scale(values.abs().amax())
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)

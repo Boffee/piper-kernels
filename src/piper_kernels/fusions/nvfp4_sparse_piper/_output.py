@@ -8,7 +8,8 @@ from typing import Protocol, cast
 import torch
 
 from piper_kernels.fusions.sparse_piper import _output as output_common
-from piper_kernels.linear.nvfp4 import _layout, _projection, _validation
+from piper_kernels.linear.nvfp4 import _projection, _validation
+from piper_kernels.weights.nvfp4 import _layout
 
 from . import query as query_projection
 

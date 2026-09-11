@@ -5,6 +5,7 @@ import torch
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
 from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
@@ -132,7 +133,7 @@ def test_dynamic_source_preparation_uses_one_global_scale_and_bounded_chunks(
     operands = make_operands(rows=385, dynamic=True, seed=906)
     scale_rows: list[int] = []
     prepared_rows: list[int] = []
-    original_dynamic_scale = nvfp4_backend.dynamic_scale
+    original_dynamic_scale = nvfp4_primitives.dynamic_scale
     original_prepare_static_out = nvfp4_backend.prepare_static_out
 
     def dynamic_scale(input: torch.Tensor) -> torch.Tensor:  # noqa: A002
@@ -153,7 +154,7 @@ def test_dynamic_source_preparation_uses_one_global_scale_and_bounded_chunks(
             high_first=high_first,
         )
 
-    monkeypatch.setattr(nvfp4_backend, "dynamic_scale", dynamic_scale)
+    monkeypatch.setattr(nvfp4_primitives, "dynamic_scale", dynamic_scale)
     monkeypatch.setattr(nvfp4_backend, "prepare_static_out", prepare_static_out)
 
     _chunked_swiglu_ffn_op(*operands.arguments(128))

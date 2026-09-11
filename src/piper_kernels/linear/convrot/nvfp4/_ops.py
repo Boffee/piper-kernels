@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.linear._input_activations import input_activation_width
-from piper_kernels.linear.convrot._rotation import validate_group_size
-from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
+from piper_kernels._input_activations import input_activation_width
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
+from piper_kernels.weights.convrot._rotation import validate_group_size
+from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import triton as convrot_nvfp4
 

@@ -33,8 +33,6 @@ from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
 from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
-from piper_kernels.linear.convrot._rotation import rotate_groups
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
 from piper_kernels.linear.convrot.nvfp4._compile import (
     compile_pass as convrot_nvfp4_compile_pass,
@@ -42,6 +40,8 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 from piper_kernels.linear.nvfp4.triton import linear_mean
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
 from ..nvfp4_sparse_piper.test_compile import (

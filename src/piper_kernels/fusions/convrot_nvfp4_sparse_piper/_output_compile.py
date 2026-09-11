@@ -15,7 +15,7 @@ from piper_kernels.fusions.nvfp4_sparse_piper import (
     _output_compile as nvfp4_output_compile,
 )
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
-from piper_kernels.linear.convrot._rotation import validate_group_size
+from piper_kernels.weights.convrot._rotation import validate_group_size
 
 from . import output  # noqa: F401 - register output operators
 

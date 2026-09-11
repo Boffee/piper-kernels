@@ -18,12 +18,14 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
+from piper_kernels.weights.nvfp4 import _layout
 
-from . import _compile_fx, _layout, _ops, _validation
+from . import _compile_fx, _ops, _storage, _validation
 from . import triton as nvfp4_triton
 
 _COMPILE_PASS_VERSION = "nvfp4-compile-v4"
@@ -208,8 +210,10 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 _compile_fx.__file__,
                 _layout.__file__,
                 _ops.__file__,
+                _storage.__file__,
                 _validation.__file__,
                 nvfp4_triton.__file__,
+                nvfp4_primitives.__file__,
             ),
             extra=_COMPILE_PASS_VERSION,
         )

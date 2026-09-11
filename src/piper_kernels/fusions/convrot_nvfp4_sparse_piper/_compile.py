@@ -10,12 +10,14 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 
+from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_sparse_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot import _rotation as convrot_rotation
 from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
 from piper_kernels.linear.convrot.nvfp4 import _compile_fx as convrot_nvfp4_compile_fx
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_triton
+from piper_kernels.weights.convrot import _rotation as convrot_rotation
 
 from . import _output_compile, output
 
@@ -38,6 +40,8 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             convrot_rotation.__file__,
             convrot_nvfp4_compile_fx.__file__,
             convrot_nvfp4_triton.__file__,
+            nvfp4_primitives.__file__,
+            convrot_nvfp4_primitives.__file__,
             *nvfp4_sparse_compile._source_files(),
         )
         return get_hash_for_files(

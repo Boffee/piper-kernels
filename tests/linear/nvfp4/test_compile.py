@@ -14,8 +14,9 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor, nvfp4_compile_options
+from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 
 def _placeholder(graph: torch.fx.Graph, name: str, value: torch.Tensor) -> torch.fx.Node:

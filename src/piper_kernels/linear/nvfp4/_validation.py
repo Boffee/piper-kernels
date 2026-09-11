@@ -9,8 +9,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _bias
-
-from . import _layout
+from piper_kernels.weights.nvfp4 import _layout
 
 _LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 

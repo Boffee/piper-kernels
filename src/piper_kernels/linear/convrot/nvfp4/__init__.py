@@ -1,10 +1,10 @@
-"""NVFP4 tensors and activation preparation in the ConvRot basis."""
+"""Linear operators and activation preparation in the ConvRot NVFP4 basis."""
 
 from collections.abc import Mapping
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-from .tensor import ConvRotNVFP4Tensor, convrot_nvfp4_linear
+from ._functional import convrot_nvfp4_linear
 
 if TYPE_CHECKING:
     from .triton import dynamic_scale, prepare_dynamic, prepare_static, prepare_static_out
@@ -36,7 +36,6 @@ def convrot_nvfp4_compile_options(
 
 
 __all__ = [
-    "ConvRotNVFP4Tensor",
     "convrot_nvfp4_compile_options",
     "convrot_nvfp4_linear",
     "dynamic_scale",

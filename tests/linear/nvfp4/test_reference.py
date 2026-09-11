@@ -14,8 +14,9 @@ def test_reference_and_tensor_imports_do_not_load_nvfp4_backends():
     script = """
 import sys
 import torch
-from piper_kernels.linear.nvfp4 import PiperNVFP4Tensor, reference
-from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.linear.nvfp4 import reference
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
 for group_size in (0, 16):
     prepared = reference.prepare_input(torch.ones(2, 32), None, True, group_size=group_size)

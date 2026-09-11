@@ -1,5 +1,5 @@
-"""Generic preparation and weight updates; tuned linear backends are optional."""
+"""Generic activation preparation without a tuned linear backend."""
 
-from .dispatch import add_, addmm_, prepare_input
+from .dispatch import prepare_input
 
-__all__ = ["add_", "addmm_", "prepare_input"]
+__all__ = ["prepare_input"]

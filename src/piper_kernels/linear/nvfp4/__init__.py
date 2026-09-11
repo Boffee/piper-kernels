@@ -1,8 +1,6 @@
-"""NVFP4 tensors and inference graph optimizations."""
+"""NVFP4 linear operators and inference graph optimizations."""
 
 from collections.abc import Mapping
-
-from .tensor import PiperNVFP4Tensor
 
 
 def nvfp4_compile_options(
@@ -20,4 +18,4 @@ def nvfp4_compile_options(
     return compile_options(options)
 
 
-__all__ = ["PiperNVFP4Tensor", "nvfp4_compile_options"]
+__all__ = ["nvfp4_compile_options"]

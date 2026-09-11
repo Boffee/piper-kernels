@@ -7,20 +7,20 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._input_activations import apply_input_activation
-from piper_kernels.linear.convrot import (
-    ConvRotInt8Tensor,
-    convrot_int8_compile_options,
-    convrot_int8_linear,
-)
-from piper_kernels.linear.convrot._rotation import rotate_groups
+from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
-from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
+from piper_kernels.weights.convrot.int8 import _quantization as int8_quantization
+from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -37,9 +37,9 @@ def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architectu
     monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
     assert _backend.select_linear_backend(value) is amd
-    assert _backend.select_add(value) is _generic.add_
-    assert _backend.select_addmm(value) is _generic.addmm_
-    assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out
+    assert int8_updates.select_add(value) is int8_updates.add_
+    assert int8_updates.select_addmm(value) is int8_updates.addmm_
+    assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out
     assert _backend.select_dequantized_mean(value) is generic_mean.dequantized_input_mean
 
 
@@ -67,8 +67,8 @@ def test_amd_missing_runtime_falls_back(monkeypatch):
     value = SimpleNamespace(device=torch.device("cuda"))
     assert _backend.select_linear_backend(value) is None
     assert _backend.select_preparation_backend(value) is _generic
-    assert _backend.select_add(value) is _generic.add_
-    assert _backend.select_addmm(value) is _generic.addmm_
+    assert int8_updates.select_add(value) is int8_updates.add_
+    assert int8_updates.select_addmm(value) is int8_updates.addmm_
 
 
 @pytest.mark.parametrize(
@@ -164,7 +164,7 @@ def test_amd_preparation_matches_rotation_and_populates_storage(dtype, width, ac
     if not plan.fuse_rotation_quantization:
         # The split path stores a compact materialized rotation.
         rotated = rotated.to(activated.dtype)
-    _, expected_scale = reference.dynamic_quantize_rows(rotated)
+    _, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     assert actual is output
     # Nearest rounding has half a quantization step of error. Allow a small
     # margin for FP32 activation/reduction ordering, not intermediate BF16 casts.
@@ -195,7 +195,7 @@ def test_amd_public_linear_matches_reference(group_size, dtype, activation):
     expected = reference.linear_prepared(*prepared, qdata, scale, dtype, bias)
     torch.testing.assert_close(actual, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-6)
     rotated = rotate_groups(apply_input_activation(value, activation).float(), group_size)
-    _, expected_scale = reference.dynamic_quantize_rows(rotated)
+    _, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     decoded = prepared[0].float() * prepared[1][..., None]
     assert ((decoded - rotated).abs() <= 0.51 * prepared[1][..., None] + 1e-7).all()
     torch.testing.assert_close(
@@ -218,7 +218,7 @@ def test_amd_preparation_zero_and_tiny_scales(dtype, width, magnitude):
     rotated = rotate_groups(value.float(), 256)
     if not amd.default_execution_plan(actual[0]).fuse_rotation_quantization:
         rotated = rotated.to(dtype)
-    expected_qdata, expected_scale = reference.dynamic_quantize_rows(rotated)
+    expected_qdata, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     expected = expected_qdata, expected_scale.squeeze(-1)
     assert torch.equal(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)

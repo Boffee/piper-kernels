@@ -49,8 +49,8 @@ from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
 from lib.timing import ClockDomain, PhaseTimings, Timing
 
+from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._input_activations import apply_input_activation
 
 
 def _environment() -> EnvironmentInfo:

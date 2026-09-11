@@ -25,10 +25,11 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import value as fused_value
 from piper_kernels.fusions.convrot_int8_sparse_piper._compile import (
     compile_pass as fusion_compile_pass,
 )
-from piper_kernels.linear.convrot import ConvRotInt8Tensor, convrot_int8_compile_options
+from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 from .._accuracy import assert_fusion_output_close
 from ._helpers import output_available, projection_available

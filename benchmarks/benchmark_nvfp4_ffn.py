@@ -17,6 +17,7 @@ from lib.environment import EnvironmentInfo, capture_environment
 from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
 from lib.timing import ClockDomain, PhaseTimings, Timing, _linear_quantile
 
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation as rotated_preparation
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import triton as convrot_ffn
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
@@ -77,7 +78,9 @@ def _workload(case: Case) -> tuple[torch.Tensor, tuple[_core.LinearOperands, ...
     ):
         dense = torch.randn(height, width, device="cuda", dtype=case.dtype) / math.sqrt(width)
         packed = (
-            nvfp4.prepare_static(dense, nvfp4.dynamic_scale(dense), high_first=case.high_first)
+            nvfp4.prepare_static(
+                dense, nvfp4_primitives.dynamic_scale(dense), high_first=case.high_first
+            )
             if case.group_size is None
             else convrot_nvfp4.prepare_dynamic(dense, case.group_size, high_first=case.high_first)
         )

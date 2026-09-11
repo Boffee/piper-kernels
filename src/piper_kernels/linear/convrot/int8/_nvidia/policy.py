@@ -7,8 +7,9 @@ supported NVIDIA targets. Hardware support does not imply per-target tuning.
 from dataclasses import dataclass
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
-from .._plan import LinearExecutionPlan, fused_preparation_chunks
+from .._plan import LinearExecutionPlan
 
 _FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)

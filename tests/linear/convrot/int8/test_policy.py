@@ -9,7 +9,8 @@ from piper_kernels.linear.convrot.int8._nvidia.policy import (
     NvidiaExecutionPlan,
     select_execution_plan,
 )
-from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan, fused_preparation_chunks
+from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
+from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 _SM120 = AcceleratorTarget("cuda", "sm120")
 

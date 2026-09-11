@@ -8,10 +8,11 @@ from dataclasses import dataclass
 import torch
 from torch._inductor.pattern_matcher import Match
 
-from piper_kernels.linear import _input_activations as input_activations
+from piper_kernels import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.weights.nvfp4 import _layout
 
-from . import _layout, _validation
+from . import _validation
 
 type PreparedInputNodes = tuple[
     torch.fx.Node,

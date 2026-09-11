@@ -35,12 +35,12 @@ from lib.triton_inspection import (
     inspect_provider,
 )
 
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._input_activations import (
+from piper_kernels._input_activations import (
     apply_input_activation,
 )
-from piper_kernels.linear.convrot import triton as convrot_backend
-from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
+from piper_kernels._triton import convrot as convrot_backend
+from piper_kernels._triton import convrot_int8 as int8_kernels_weights
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_policy
 from piper_kernels.linear.convrot.int8._nvidia import triton as triton_backend
 
@@ -74,7 +74,7 @@ class PreparationPhaseResult:
 
 
 _PHASE_PROVENANCE = {
-    "rotate": "piper_kernels.linear.convrot.triton.rotate_input",
+    "rotate": "piper_kernels._triton.convrot.rotate_input",
     "quantize": "piper_kernels.linear.convrot.int8._nvidia.triton.quantize_input",
     "split": "Piper rotate_input followed by quantize_input",
     "fused": "piper_kernels.linear.convrot.int8._nvidia.triton.fused_rotate_quantize_input",
@@ -488,11 +488,11 @@ def _inspection_provider(
     args: argparse.Namespace,
     preparation_configuration: _PreparationConfiguration,
 ) -> BenchmarkProvider[None, None]:
-    jit_functions = {"fused": int8_kernels.rotate_quantize_rows_kernel}
+    jit_functions = {"fused": int8_kernels_weights.rotate_quantize_rows_kernel}
     if args.input_activation is None:
         jit_functions = {
             "rotate": convrot_backend.rotate_groups_kernel,
-            "quantize": int8_kernels.quantize_rows_kernel,
+            "quantize": int8_kernels_weights.quantize_rows_kernel,
             **jit_functions,
         }
     return BenchmarkProvider(

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.linear import _input_activations as input_activations
+from piper_kernels import _input_activations as input_activations
+from piper_kernels.weights.nvfp4 import _layout
 
-from . import _layout, _projection, _validation, reference
+from . import _projection, _validation, reference
 from . import triton as nvfp4_triton
 
 

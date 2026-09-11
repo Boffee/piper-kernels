@@ -7,12 +7,12 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.linear import _input_activations as input_activations
+from piper_kernels import _input_activations as input_activations
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot._rotation import validate_group_size
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
-from piper_kernels.linear.nvfp4 import _layout as nvfp4_layout
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
+from piper_kernels.weights.convrot._rotation import validate_group_size
+from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 type PreparedInputNodes = nvfp4_compile_fx.PreparedInputNodes
 

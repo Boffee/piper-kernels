@@ -9,8 +9,8 @@ import torch
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
-from piper_kernels.linear.convrot.int8 import reference
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
+from piper_kernels.weights.convrot.int8._quantization import validate_storage
 
 from . import _backend as fusion_backend
 from . import query as query_projection
@@ -167,7 +167,7 @@ def _validate_output_projection(
         query_chunk_rows,
     )
 
-    reference.validate_storage(
+    validate_storage(
         weight_qdata,
         weight_scale,
         group_size,

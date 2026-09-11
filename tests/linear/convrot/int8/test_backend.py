@@ -9,11 +9,14 @@ import torch
 
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8 import _backend, _update, dispatch
+from piper_kernels.linear.convrot.int8 import _backend, dispatch
 from piper_kernels.linear.convrot.int8._amd import triton as amd
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
-from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
+from piper_kernels.weights.convrot.int8 import _update
+from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 
 @pytest.mark.parametrize(
@@ -62,10 +65,10 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
     monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
 
-    assert _backend.select_gguf_converter(value) is generic_triton.convert_gguf_out
+    assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out
     assert _backend.select_dequantized_mean(value) is generic_mean.dequantized_input_mean
-    assert _backend.select_add(value) is not None
-    assert _backend.select_addmm(value) is not None
+    assert int8_updates.select_add(value) is not None
+    assert int8_updates.select_addmm(value) is not None
 
 
 @pytest.mark.parametrize(
@@ -168,11 +171,11 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
         assert actual is expected_output
         execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu")
     elif operation == "add_":
-        monkeypatch.setattr(_backend, "select_add", lambda value: execute)
+        monkeypatch.setattr(int8_updates, "select_add", lambda value: execute)
         _update.add_(qdata, scale, torch.float32, 16, update, alpha=2, rounding_seed=2**64 - 1)
         execute.assert_called_once_with(qdata, scale, update, 16, 2.0, -1)
     else:
-        monkeypatch.setattr(_backend, "select_addmm", lambda value: execute)
+        monkeypatch.setattr(int8_updates, "select_addmm", lambda value: execute)
         _update.addmm_(
             qdata, scale, torch.float32, 16, mat1, mat2, beta=3, alpha=2, rounding_seed=2**64 - 1
         )

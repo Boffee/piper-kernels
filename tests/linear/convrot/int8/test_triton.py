@@ -8,24 +8,19 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import (
-    ConvRotInt8Tensor,
-    convrot_int8_compile_options,
-    convrot_int8_linear,
-)
-from piper_kernels.linear.convrot import triton as convrot_backend
-from piper_kernels.linear.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
 from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
 from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
-from piper_kernels.linear.convrot.int8.reference import add_ as reference_add_
-from piper_kernels.linear.convrot.int8.reference import (
-    addmm_,
-    linear,
-    linear_prepared,
-)
+from piper_kernels.linear.convrot.int8.reference import linear, linear_prepared
+from piper_kernels.weights.convrot._rotation import build_hadamard, rotate_groups
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8 import _ops as int8_update_ops
+from piper_kernels.weights.convrot.int8._update_reference import add_ as reference_add_
+from piper_kernels.weights.convrot.int8._update_reference import addmm_
 
 
 @triton.jit
@@ -855,7 +850,7 @@ def test_cuda_semantic_addmm_custom_op_passes_opcheck() -> None:
     mat2 = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
 
     result = torch.library.opcheck(
-        int8_ops.addmm_,
+        int8_update_ops.addmm_,
         (qdata, scale, mat1, mat2, 64, 0.5, 1.25, 123),
     )
 
@@ -871,7 +866,7 @@ def test_cuda_semantic_add_custom_op_passes_opcheck() -> None:
     update = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
 
     result = torch.library.opcheck(
-        int8_ops.add_,
+        int8_update_ops.add_,
         (qdata, scale, update, 64, 1.25, 123),
     )
 

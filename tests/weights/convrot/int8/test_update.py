@@ -1,0 +1,352 @@
+"""ConvRot INT8 updates preserve logical values, packed storage, and replay."""
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
+
+_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=[
+            pytest.mark.gpu,
+            pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU"),
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize(("beta", "alpha"), [(1, 1), (0.25, 1.75), (0, -0.5)])
+def test_addmm_updates_logical_weight_and_requantizes_in_place(
+    beta: float,
+    alpha: float,
+) -> None:
+    torch.manual_seed(21)
+    weight = torch.randn(7, 32)
+    mat1 = torch.randn(7, 5)
+    mat2 = torch.randn(5, 32)
+    wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
+    qdata = wrapped.qdata
+    scale = wrapped.scale
+    logical_before = wrapped.dequantize()
+    expected = ConvRotInt8Tensor.from_hp(
+        torch.addmm(logical_before, mat1, mat2, beta=beta, alpha=alpha),
+        group_size=16,
+    )
+
+    result = wrapped.addmm_(mat1, mat2, beta=beta, alpha=alpha)
+
+    assert result is wrapped
+    assert wrapped.qdata is qdata
+    assert wrapped.scale is scale
+    assert torch.equal(wrapped.qdata, expected.qdata)
+    assert torch.allclose(wrapped.scale, expected.scale, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+@pytest.mark.parametrize("alpha", [1, 0.25, -0.5])
+def test_add_updates_logical_weight_and_requantizes_in_place(
+    group_size: int,
+    alpha: float,
+) -> None:
+    torch.manual_seed(22 + group_size)
+    weight = torch.randn(7, 256)
+    update = torch.randn_like(weight)
+    wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=group_size)
+    qdata = wrapped.qdata
+    scale = wrapped.scale
+    logical_before = wrapped.dequantize()
+    expected = ConvRotInt8Tensor.from_hp(
+        torch.add(logical_before, update, alpha=alpha),
+        group_size=group_size,
+    )
+
+    result = wrapped.add_(update, alpha=alpha)
+
+    assert result is wrapped
+    assert wrapped.qdata is qdata
+    assert wrapped.scale is scale
+    assert torch.equal(wrapped.qdata, expected.qdata)
+    assert torch.allclose(wrapped.scale, expected.scale, rtol=1e-6, atol=1e-7)
+
+
+def test_aten_add_tensor_dispatches_to_convrot_update() -> None:
+    torch.manual_seed(23)
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    expected = wrapped.clone()
+    update = torch.randn(7, 32)
+
+    expected.add_(update, alpha=0.25)
+    result = torch.ops.aten.add_.Tensor(wrapped, update, alpha=0.25)
+
+    assert result is wrapped
+    assert torch.equal(wrapped.qdata, expected.qdata)
+    assert torch.equal(wrapped.scale, expected.scale)
+
+
+def test_addmm_no_op_does_not_requantize_storage() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    mat1 = torch.randn(7, 5)
+    mat2 = torch.randn(5, 32)
+    qdata_before = wrapped.qdata.clone()
+    scale_before = wrapped.scale.clone()
+    qdata_version = wrapped.qdata._version
+    scale_version = wrapped.scale._version
+
+    wrapped.addmm_(mat1, mat2, alpha=0)
+
+    assert torch.equal(wrapped.qdata, qdata_before)
+    assert torch.equal(wrapped.scale, scale_before)
+    assert wrapped.qdata._version == qdata_version
+    assert wrapped.scale._version == scale_version
+
+
+def test_add_no_op_does_not_requantize_storage() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    update = torch.randn(7, 32)
+    qdata_before = wrapped.qdata.clone()
+    scale_before = wrapped.scale.clone()
+    qdata_version = wrapped.qdata._version
+    scale_version = wrapped.scale._version
+
+    wrapped.add_(update, alpha=0)
+
+    assert torch.equal(wrapped.qdata, qdata_before)
+    assert torch.equal(wrapped.scale, scale_before)
+    assert wrapped.qdata._version == qdata_version
+    assert wrapped.scale._version == scale_version
+
+
+def _stochastic_update_fixture(
+    *,
+    rows: int = 128,
+    cols: int = 128,
+) -> tuple[ConvRotInt8Tensor, torch.Tensor]:
+    rotated_update = torch.ones(rows, cols, dtype=torch.bfloat16)
+    rotated_update[:, -1] = 2.0
+    update = rotate_groups(rotated_update, 16)
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.zeros(rows, cols, dtype=torch.int8),
+        torch.ones(rows, 1, dtype=torch.float32),
+        group_size=16,
+        logical_dtype=torch.bfloat16,
+    )
+    return weight, update
+
+
+def _stochastic_addmm_fixture(
+    *,
+    rows: int = 128,
+    cols: int = 128,
+) -> tuple[ConvRotInt8Tensor, torch.Tensor, torch.Tensor]:
+    weight, update = _stochastic_update_fixture(rows=rows, cols=cols)
+    return weight, torch.eye(rows, dtype=torch.bfloat16), update
+
+
+def test_add_stochastic_rounding_replays_without_consuming_global_rng() -> None:
+    seed = (1 << 64) - 1
+    first, update = _stochastic_update_fixture()
+    replay = first.clone()
+    other = first.clone()
+    deterministic = first.clone()
+    torch.manual_seed(1702)
+    rng_before = torch.random.get_rng_state()
+
+    first.add_(update, rounding_seed=seed)
+    replay.add_(update, rounding_seed=seed)
+    other.add_(update, rounding_seed=seed - 1)
+    deterministic.add_(update)
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert torch.equal(first.qdata, replay.qdata)
+    assert torch.equal(first.scale, replay.scale)
+    assert not torch.equal(first.qdata, other.qdata)
+    assert torch.equal(first.scale, other.scale)
+    assert torch.equal(first.scale, deterministic.scale)
+
+
+def test_addmm_stochastic_rounding_replays_without_consuming_global_rng() -> None:
+    seed = (1 << 64) - 1
+    first, mat1, mat2 = _stochastic_addmm_fixture()
+    replay = first.clone()
+    other = first.clone()
+    deterministic = first.clone()
+    torch.manual_seed(1701)
+    rng_before = torch.random.get_rng_state()
+
+    first.addmm_(mat1, mat2, beta=0, rounding_seed=seed)
+    replay.addmm_(mat1, mat2, beta=0, rounding_seed=seed)
+    other.addmm_(mat1, mat2, beta=0, rounding_seed=seed - 1)
+    deterministic.addmm_(mat1, mat2, beta=0)
+
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert torch.equal(first.qdata, replay.qdata)
+    assert torch.equal(first.scale, replay.scale)
+    assert not torch.equal(first.qdata, other.qdata)
+    assert torch.equal(first.scale, other.scale)
+    assert torch.equal(first.scale, deterministic.scale)
+
+
+def test_addmm_stochastic_rounding_uses_unbiased_fp32_scaled_probability() -> None:
+    weight, mat1, mat2 = _stochastic_addmm_fixture(rows=256, cols=256)
+
+    weight.addmm_(mat1, mat2, beta=0, rounding_seed=12345)
+
+    samples = weight.qdata[:, :-1]
+    assert bool(((samples == 63) | (samples == 64)).all())
+    assert samples.to(torch.float32).mean().item() == pytest.approx(63.5, abs=0.01)
+    assert bool((weight.qdata[:, -1] == 127).all())
+    torch.testing.assert_close(
+        weight.scale,
+        torch.full_like(weight.scale, 2.0 / 127.0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rounding_seed", "error"),
+    [
+        (True, TypeError),
+        (1.5, TypeError),
+        (-1, ValueError),
+        (1 << 64, ValueError),
+    ],
+)
+def test_addmm_rejects_invalid_stochastic_rounding_seed(
+    rounding_seed: object,
+    error: type[Exception],
+) -> None:
+    weight, mat1, mat2 = _stochastic_addmm_fixture(rows=4, cols=16)
+    qdata_before = weight.qdata.clone()
+    scale_before = weight.scale.clone()
+
+    with pytest.raises(error, match="unsigned 64-bit integer"):
+        weight.addmm_(mat1, mat2, rounding_seed=rounding_seed)  # type: ignore[arg-type]
+
+    assert torch.equal(weight.qdata, qdata_before)
+    assert torch.equal(weight.scale, scale_before)
+
+
+@pytest.mark.parametrize(
+    ("mat1", "mat2", "message"),
+    [
+        (torch.empty(7, 5, 1), torch.empty(5, 32), "matrices must be 2-D"),
+        (torch.empty(8, 5), torch.empty(5, 32), "shape mismatch"),
+        (torch.empty(7, 5), torch.empty(6, 32), "shape mismatch"),
+        (torch.empty(7, 5), torch.empty(5, 48), "shape mismatch"),
+        (torch.empty(7, 5, dtype=torch.float16), torch.empty(5, 32), "logical dtype"),
+    ],
+)
+def test_addmm_rejects_invalid_matrices(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    message: str,
+) -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+
+    with pytest.raises(ValueError, match=message):
+        wrapped.addmm_(mat1, mat2)
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        (torch.empty(7, 16), "shape mismatch"),
+        (torch.empty(7, 32, dtype=torch.float16), "logical dtype"),
+        (torch.ones(7, 32).to_sparse(), "strided layout"),
+    ],
+)
+def test_add_rejects_invalid_update(update: torch.Tensor, message: str) -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+
+    with pytest.raises(ValueError, match=message):
+        wrapped.add_(update)
+
+
+def test_addmm_rejects_autograd_inputs() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    mat1 = torch.randn(7, 5, requires_grad=True)
+    mat2 = torch.randn(5, 32)
+
+    with pytest.raises(RuntimeError, match="does not support autograd"):
+        wrapped.addmm_(mat1, mat2)
+
+    with torch.no_grad():
+        assert wrapped.addmm_(mat1, mat2) is wrapped
+
+
+def test_add_rejects_autograd_inputs() -> None:
+    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    update = torch.randn(7, 32, requires_grad=True)
+
+    with pytest.raises(RuntimeError, match="does not support autograd"):
+        wrapped.add_(update)
+
+    with torch.no_grad():
+        assert wrapped.add_(update) is wrapped
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("operation", ["add", "addmm"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("seed", [None, 123])
+def test_updates_preserve_storage_and_replay(monkeypatch, device, operation, fallback, dtype, seed):
+    if fallback:
+        monkeypatch.setattr(int8_updates, "_triton_backend", None)
+    reference_update = Mock(wraps=getattr(int8_update_reference, operation + "_"))
+    monkeypatch.setattr(int8_update_reference, operation + "_", reference_update)
+    torch.manual_seed(671)
+    value = torch.randn(17, 256, device=device, dtype=dtype)
+    weight = ConvRotInt8Tensor.from_hp(value, group_size=64)
+    replay = weight.clone()
+    qdata, scale = weight.qdata, weight.scale
+    before = weight.dequantize(torch.float32)
+    update = torch.randn(17, 512, device=device, dtype=dtype)[:, ::2]
+    left = torch.randn(17, 3, device=device, dtype=dtype)
+    right = torch.randn(3, 512, device=device, dtype=dtype)[:, ::2]
+    if operation == "add":
+        weight.add_(update, alpha=0.25, rounding_seed=seed)
+        replay.add_(update, alpha=0.25, rounding_seed=seed)
+        expected = before + 0.25 * update.float()
+    else:
+        weight.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
+        replay.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
+        expected = 0.5 * before + 0.25 * (left.float() @ right.float())
+    actual = weight.dequantize(torch.float32)
+    relative_rms = (actual - expected).square().mean().sqrt() / expected.square().mean().sqrt()
+    assert relative_rms.item() < 0.04
+    assert actual.isfinite().all()
+    assert weight.qdata is qdata
+    assert weight.scale is scale
+    assert torch.equal(weight.qdata, replay.qdata)
+    assert torch.equal(weight.scale, replay.scale)
+    if device == "cpu" or fallback:
+        assert reference_update.call_count == 2
+    elif int8_updates._use_triton(qdata):
+        reference_update.assert_not_called()
+
+
+def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
+    qdata, scale = torch.zeros(2, 32, dtype=torch.int8), torch.ones(2, 1)
+
+    def partial_update(*args):
+        qdata.fill_(3)
+        raise RuntimeError("kernel execution failed")
+
+    fallback = Mock(side_effect=AssertionError("unsafe retry"))
+    monkeypatch.setattr(int8_updates, "_use_triton", lambda value: True)
+    monkeypatch.setattr(int8_updates, "_triton_backend", SimpleNamespace(add_=partial_update))
+    monkeypatch.setattr(int8_update_reference, "add_", fallback)
+    with pytest.raises(RuntimeError, match="kernel execution failed"):
+        int8_updates.add_(qdata, scale, torch.ones(2, 32), 16, 1.0)
+    assert (qdata == 3).all()
+    fallback.assert_not_called()
