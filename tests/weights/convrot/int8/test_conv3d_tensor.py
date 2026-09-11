@@ -22,15 +22,18 @@ def test_quantization_and_dequantization_use_spatial_channel_groups(group_size, 
     assert weight.act_per_tensor_scale is None  # Weight conversion requires no activation data.
     torch.testing.assert_close(weight.qdata.flatten(1), expected_qdata)
     torch.testing.assert_close(weight.scale, expected_scale)
+    # FP64 gives an independent inverse-rotation oracle across CPU BLAS implementations.
     dequantized = (
         rotate_groups(
-            weight.qdata.float() * weight.scale.view(-1, 1, 1, 1, 1),
+            weight.qdata.double() * weight.scale.double().view(-1, 1, 1, 1, 1),
             group_size,
         )
         .permute(0, 4, 1, 2, 3)
         .contiguous()
     )
-    torch.testing.assert_close(weight.dequantize(torch.float32), dequantized, atol=2e-8, rtol=2e-6)
+    torch.testing.assert_close(
+        weight.dequantize(torch.float32), dequantized.float(), atol=2e-8, rtol=2e-6
+    )
     assert weight.dequantize().dtype is dtype
     # Quantization should be a useful approximation of the original logical weight.
     assert (weight.dequantize(torch.float32) - source.float()).square().mean().sqrt() < 0.0003
