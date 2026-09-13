@@ -93,6 +93,19 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
         capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default)
         == preparations
     )
+    if mode in ("distinct", "mixed"):
+        preparation_positions = [
+            index
+            for index, target in enumerate(capture.targets)
+            if target is torch.ops.piper_kernels.convrot_int8_prepare_input.default
+        ]
+        # V preparation must wait until K has consumed its independently prepared input.
+        assert (
+            capture.targets.index(
+                torch.ops.piper_kernels.convrot_int8_sparse_piper_project_key.default
+            )
+            < preparation_positions[-1]
+        )
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default

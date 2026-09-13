@@ -120,8 +120,8 @@ def rotate_quantize_rows_kernel(
 ):
     """Rotate and quantize a row held as one, two, or three equal chunks.
 
-    Keep every rotated chunk live until the shared row scale is known, avoiding
-    both recomputation and a global-memory intermediate.
+    Dynamic scaling keeps rotated chunks live until the row maximum is known.
+    Static scaling quantizes and stores each chunk immediately.
     """
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
@@ -135,6 +135,36 @@ def rotate_quantize_rows_kernel(
             gguf_quant_type,
         )
     output_row_offset = row_i64 * row_width
+
+    if static_scale_ptr is not None:
+        scale = tl.load(static_scale_ptr)
+        for chunk in tl.static_range(chunk_count):  # pyright: ignore[reportGeneralTypeIssues]
+            values = _load_weight_chunk(
+                x_ptr,
+                input_row_offset,
+                packed_row_offset,
+                row_width,
+                chunk * chunk_size,
+                chunk_offsets,
+                chunk_size,
+                group_size,
+                inverse_sqrt_group,
+                activation_fn,
+                accelerator_backend,
+                gguf_quant_type,
+            )
+            _store_quantized_chunk(
+                q_ptr,
+                output_row_offset,
+                row_width,
+                chunk * chunk_size,
+                chunk_offsets,
+                values,
+                scale,
+                accelerator_backend,
+            )
+        tl.store(scale_ptr + row_i64, scale)
+        return
 
     values0 = _load_weight_chunk(
         x_ptr,
@@ -190,10 +220,7 @@ def rotate_quantize_rows_kernel(
             tl.max(tl.abs(values2).to(tl.float32), axis=0),
         )
 
-    if static_scale_ptr is None:
-        scale = tl.maximum(int8_scale_from_max(row_max, accelerator_backend == "hip"), 1e-30)
-    else:
-        scale = tl.load(static_scale_ptr)
+    scale = tl.maximum(int8_scale_from_max(row_max, accelerator_backend == "hip"), 1e-30)
     _store_quantized_chunk(
         q_ptr,
         output_row_offset,

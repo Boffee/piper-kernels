@@ -353,9 +353,6 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
                 )
             return preparations[input_scale]
 
-        q_input, q_scales, _ = prepare(sparse_q_input_scale)
-        k_input, k_scales, _ = prepare(sparse_k_input_scale)
-        v_input, v_scales, _ = prepare(sparse_v_input_scale)
         prepared_coarse_gate = coarse_gate
         if coarse_gate is not None:
             gate_projection = _semantic_gate_projection(
@@ -400,6 +397,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
                 dtype=torch.float32,
             ),
         )
+        q_input, q_scales, _ = prepare(sparse_q_input_scale)
         query, query_scale, query_summary = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default,
@@ -441,6 +439,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
                 )
             ),
         )
+        k_input, k_scales, _ = prepare(sparse_k_input_scale)
         key_arguments = (
             k_input,
             k_scales,
@@ -458,6 +457,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
             key_values,
             kwargs={"head_dim": head_dim, "bias": sparse_k_bias},
         )
+        v_input, v_scales, _ = prepare(sparse_v_input_scale)
         input_mean = graph.call_function(
             torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
             args=(v_input, v_scales, *block_length_arguments),
