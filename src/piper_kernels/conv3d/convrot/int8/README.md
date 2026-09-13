@@ -51,9 +51,9 @@ Dequantization applies the scales and inverse rotation in FP32, restores the
 logical layout, and casts to the requested dtype (default: the logical dtype).
 The result approximates the original weight; quantization is lossy.
 
-Linear execution remains dynamically scaled. Passing a static activation scale
-for a 2-D weight is currently unsupported. Matrix transpose, linear execution,
-GGUF conversion, matrix updates, and weight sharding remain 2-D operations.
+Linear execution uses the stored static input scale when present and dynamic
+per-row scaling otherwise. Matrix transpose, linear execution, GGUF conversion,
+matrix updates, and weight sharding remain 2-D operations.
 
 ## Save offline and load without copying
 
@@ -72,7 +72,7 @@ weight = ConvRotInt8Tensor.from_quantized(
     loaded_scale,
     group_size=64,
     logical_dtype=torch.float16,
-    act_per_tensor_scale=loaded_activation_scale,
+    act_per_tensor_scale=loaded_input_scale,
 )
 conv = ConvRotInt8Conv3d(weight, loaded_bias, stride=(1, 1, 1), padding="reflect")
 output = conv(activation)
@@ -101,8 +101,8 @@ weight tensors and observe weight and activation-scale replacement.
 
 ## MiniMax-H3 integration
 
-`piper_kernels.specializations.minimax_h3_vae.conv3d.P995_ACTIVATION_SCALES`
-contains candidate activation scales for 29 encoder convolutions. Existing H3
+`piper_kernels.specializations.minimax_h3_vae.conv3d.P995_INPUT_SCALES`
+contains candidate input scales for 29 encoder convolutions. Existing H3
 selection uses rotation groups of 64 for 128 input channels and 256 otherwise.
 RGB input convolutions and 1x1 shortcuts are excluded. These constants are
 candidate calibration data; the engine owns checkpoint compatibility and quality
