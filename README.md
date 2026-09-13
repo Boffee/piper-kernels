@@ -16,6 +16,33 @@ compact workspaces remain where they reduce storage or execution cost.
 Sparse attention's fused coarse residual keeps the fine output and gated coarse contribution
 in FP32 until the final BF16 store.
 
+## Validation contract
+
+This is a library-wide API and development contract. It applies to inference operators,
+dispatch, compiler rewrites, fake/meta implementations, and weight wrappers, including
+construction, reconstruction, views, and device moves. New implementations must preserve it.
+
+- Validation may inspect host metadata: shapes, dtypes, devices, layouts/strides, gradient
+  flags, and Python configuration values. Keep checks for supported storage and operations.
+- Numerical tensor contents are caller preconditions on every device. For example, callers
+  must supply a finite positive ConvRot INT8 static input scale. This requirement does not
+  promise runtime rejection of zero, negative, NaN, or infinite supplied scales.
+- These paths must not inspect tensor contents solely for input validation. Do not introduce
+  host readbacks (`.item()`, `bool(tensor)`, `.cpu()`), synchronization, tensor scans/reductions,
+  device assertions, validation kernel launches, or temporary device allocations for that
+  purpose. Validation must work without tensor contents during tracing and fake/meta execution
+  and must not introduce barriers to CUDA graph capture.
+- Exporters, checkpoint loaders, and other callers own any required numerical validation at
+  ingestion. Any dedicated tensor-content validation API must be explicitly invoked outside
+  inference, compilation, and weight wrapping; it must not run implicitly in those paths.
+
+GPU value readbacks synchronize execution, and additional validation kernels and allocations
+consume inference time and memory. Guards needed by the numerical algorithm remain required:
+for example, deriving a usable dynamic scale for an all-zero input is valid-input handling.
+Documented quantization/conversion work outside the paths above may also check the values it
+uses to construct a quantized representation. Neither permits adding content-validation work
+to inference. Callers can rely on this boundary when composing and capturing kernels.
+
 ## Operators
 
 | Package | Role |

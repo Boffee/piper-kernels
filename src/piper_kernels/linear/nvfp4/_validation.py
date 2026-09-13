@@ -66,7 +66,10 @@ def validate_activation_scale(
     device: torch.device,
     name: str,
 ) -> None:
-    """Validate one NVFP4 activation's global-scale configuration."""
+    """Validate metadata for one NVFP4 activation's global-scale configuration.
+
+    Scale values are caller preconditions; see README.md#validation-contract.
+    """
     if not isinstance(dynamic_activation_scale, bool):
         raise ValueError(f"{name} dynamic activation scale flag must be boolean")
     if not _valid_scalar(activation_per_tensor_scale) or (
