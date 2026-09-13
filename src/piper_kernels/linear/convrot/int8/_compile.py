@@ -24,7 +24,7 @@ from piper_kernels.linear import _projection_views as projection_views
 
 from . import _compile_fx
 
-_COMPILE_PASS_VERSION = "convrot-compile-v6"
+_COMPILE_PASS_VERSION = "convrot-compile-v7"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -58,16 +58,19 @@ class _PreparationRule:
         self,
         node: torch.fx.Node,
     ) -> preparation_sharing.PreparationMatchKey | None:
-        if node.kwargs or len(node.args) not in (5, 6):
+        if node.kwargs or len(node.args) not in (5, 6, 7):
             return None
-        arguments = (*node.args, None) if len(node.args) == 5 else node.args
-        input_node, weight_qdata, _weight_scale, _bias, group_size, activation_fn = arguments
+        arguments = node.args + (None,) * (7 - len(node.args))
+        input_node, weight_qdata, _weight_scale, _bias, group_size, activation_fn, input_scale = (
+            arguments
+        )
         if (
             not isinstance(input_node, torch.fx.Node)
             or not isinstance(weight_qdata, torch.fx.Node)
             or not isinstance(group_size, int)
             or isinstance(group_size, bool)
             or activation_fn is not None
+            or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
         ):
             return None
 
@@ -87,6 +90,7 @@ class _PreparationRule:
             group_size,
             preparation_sharing.dimension_key(weight_qdata_value.shape[1]),
             input_value.dtype,
+            input_scale,
         )
         return key, key
 
@@ -95,11 +99,14 @@ class _PreparationRule:
         graph: torch.fx.Graph,
         first: torch.fx.Node,
     ) -> _PreparedInputNodes:
-        arguments = (*first.args, None) if len(first.args) == 5 else first.args
-        input_node, _weight_qdata, _weight_scale, _bias, group_size, _activation_fn = arguments
+        arguments = first.args + (None,) * (7 - len(first.args))
+        input_node, _weight_qdata, _weight_scale, _bias, group_size, _activation_fn, input_scale = (
+            arguments
+        )
         assert isinstance(input_node, torch.fx.Node)
         assert isinstance(group_size, int)
         assert not isinstance(group_size, bool)
+        assert input_scale is None or isinstance(input_scale, torch.fx.Node)
         input_value = preparation_sharing.tensor_metadata(input_node)
         assert input_value is not None
         return _compile_fx.emit_prepared_input(
@@ -108,6 +115,7 @@ class _PreparationRule:
             group_size,
             None,
             tuple(input_value.shape),
+            input_scale,
         )
 
     def replace(
@@ -116,8 +124,7 @@ class _PreparationRule:
         node: torch.fx.Node,
         prepared: _PreparedInputNodes,
     ) -> torch.fx.Node:
-        arguments = (*node.args, None) if len(node.args) == 5 else node.args
-        _input, weight_qdata, weight_scale, bias, _group_size, _activation_fn = arguments
+        _input, weight_qdata, weight_scale, bias = node.args[:4]
         assert isinstance(weight_qdata, torch.fx.Node)
         assert isinstance(weight_scale, torch.fx.Node)
         assert bias is None or isinstance(bias, torch.fx.Node)
@@ -144,6 +151,8 @@ def _linear_pattern(input_pattern: CallFunction) -> CallFunction:
         KeywordArg("weight_scale"),
         KeywordArg("bias"),
         KeywordArg("group_size"),
+        None,
+        KeywordArg("input_scale"),
     )
 
 
@@ -168,6 +177,7 @@ def _replace_gelu_tanh(
     weight_scale: torch.fx.Node,
     bias: torch.fx.Node | None,
     group_size: int,
+    input_scale: torch.fx.Node | None = None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -181,6 +191,7 @@ def _replace_gelu_tanh(
             group_size,
             "gelu_tanh",
             tuple(input_value.shape),
+            input_scale,
         )
         replacement = _emit_linear_prepared(
             graph,
@@ -210,7 +221,8 @@ for _promote_input in (False, True):
 
 
 def _fold_gelu_tanh_inputs(graph: torch.fx.Graph) -> bool:
-    changed = _gelu_tanh_patterns.apply(graph) > 0
+    with _compile_fx.canonical_linear_calls(graph):
+        changed = _gelu_tanh_patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()

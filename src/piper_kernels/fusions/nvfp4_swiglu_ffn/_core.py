@@ -10,6 +10,7 @@ from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
+from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
@@ -120,19 +121,6 @@ def linear_operands(  # noqa: PLR0913, PLR0917 - explicit custom-op projection o
             down_dynamic_activation_scale,
             down_high_first,
         ),
-    )
-
-
-def _same_tensor_storage(left: torch.Tensor | None, right: torch.Tensor | None) -> bool:
-    if left is None or right is None:
-        return left is right
-    return bool(
-        left.shape == right.shape
-        and left.stride() == right.stride()
-        and left.dtype is right.dtype
-        and left.device == right.device
-        and left.storage_offset() == right.storage_offset()
-        and left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
     )
 
 
@@ -290,7 +278,7 @@ def run_chunked_swiglu_ffn(
     ) or (
         not gate.dynamic_activation_scale
         and not value.dynamic_activation_scale
-        and _same_tensor_storage(
+        and same_tensor_storage(
             gate.activation_per_tensor_scale,
             value.activation_per_tensor_scale,
         )

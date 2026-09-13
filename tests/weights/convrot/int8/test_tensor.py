@@ -220,3 +220,61 @@ def test_rejects_unsupported_group_size(group_size: int) -> None:
             torch.empty(8, 1, dtype=torch.float32),
             group_size=group_size,
         )
+
+
+@pytest.mark.parametrize("operation", ["clone", "detach", "alias", "float", "copy", "flatten"])
+@pytest.mark.parametrize("shape", [(4, 64), (4, 64, 3, 3, 3)])
+def test_activation_scale_survives_tensor_lifecycle(operation, shape):
+    scale = torch.tensor(0.02)
+    weight = ConvRotInt8Tensor.from_hp(
+        torch.randn(shape, dtype=torch.float16),
+        group_size=64,
+        act_per_tensor_scale=scale,
+    )
+    if operation == "clone":
+        result = weight.clone()
+    elif operation == "detach":
+        result = weight.detach()
+    elif operation == "alias":
+        result = torch.ops.aten.alias.default(weight)
+    elif operation == "float":
+        result = weight.float()
+    elif operation == "copy":
+        result = weight.to(dtype=torch.float32, copy=True)
+    else:
+        names, metadata = weight.__tensor_flatten__()
+        assert names == ["qdata", "scale", "act_per_tensor_scale"]
+        result = ConvRotInt8Tensor.__tensor_unflatten__(
+            {name: getattr(weight, name) for name in names},
+            metadata,
+            None,
+            None,
+        )
+    assert isinstance(result, ConvRotInt8Tensor)
+    assert result.shape == weight.shape
+    assert result.scale.dtype is torch.float32
+    assert result.act_per_tensor_scale.dtype is torch.float32
+    torch.testing.assert_close(result.act_per_tensor_scale, scale)
+    assert (result.act_per_tensor_scale.data_ptr() != scale.data_ptr()) == (
+        operation in ("clone", "copy")
+    )
+    torch.testing.assert_close(result.dequantize(torch.float32), weight.dequantize(torch.float32))
+
+
+def test_static_linear_scale_survives_transpose_and_weight_updates():
+    input_scale = torch.tensor(0.02)
+    weight = ConvRotInt8Tensor.from_hp(
+        torch.randn(4, 64), group_size=64, act_per_tensor_scale=input_scale
+    )
+    transposed = weight.t()
+    assert transposed.act_per_tensor_scale is input_scale
+    assert transposed.t().act_per_tensor_scale is input_scale
+    expected = weight.clone()
+    expected.act_per_tensor_scale = None
+    for value in (weight, expected):
+        value.add_(torch.ones(4, 64))
+        value.addmm_(torch.ones(4, 2), torch.ones(2, 64))
+    torch.testing.assert_close(weight.qdata, expected.qdata)
+    torch.testing.assert_close(weight.scale, expected.scale)
+    assert weight.act_per_tensor_scale is input_scale
+    assert input_scale.item() == pytest.approx(0.02)

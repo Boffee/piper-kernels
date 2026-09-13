@@ -13,13 +13,20 @@ from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 
 @pytest.mark.parametrize("architecture", [75, 89, 120])
-def test_nvidia_preparation_compiles_without_a_device(architecture):
+@pytest.mark.parametrize("static", [False, True])
+def test_nvidia_preparation_compiles_without_a_device(architecture, static):
     target = AcceleratorTarget("cuda", f"sm{architecture}")
     plan = policy.select_execution_plan(target, in_features=5376)
     chunk_count, chunk_size = fused_preparation_chunks(5376)
     source = ASTSource(
         kernels_weights.rotate_quantize_rows_kernel,
-        {"x_ptr": "*fp16", "q_ptr": "*i8", "scale_ptr": "*fp32", "row_width": "i32"},
+        {
+            "x_ptr": "*fp16",
+            "q_ptr": "*i8",
+            "scale_ptr": "*fp32",
+            "row_width": "i32",
+            **({"static_scale_ptr": "*fp32"} if static else {}),
+        },
         constexprs={
             "chunk_size": chunk_size,
             "chunk_count": chunk_count,
@@ -28,6 +35,7 @@ def test_nvidia_preparation_compiles_without_a_device(architecture):
             "activation_fn": "gelu_tanh",
             "accelerator_backend": "cuda",
             "gguf_quant_type": -1,
+            **({} if static else {"static_scale_ptr": None}),
         },
     )
     compiled = triton.compile(
@@ -36,6 +44,9 @@ def test_nvidia_preparation_compiles_without_a_device(architecture):
         options={"num_warps": plan.fused_num_warps},
     )
     assert compiled.asm["cubin"]
+
+    if static:
+        assert "tt.reduce" not in compiled.asm["ttir"]
 
 
 @pytest.mark.parametrize(

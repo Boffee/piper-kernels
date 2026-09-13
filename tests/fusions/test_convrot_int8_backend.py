@@ -19,8 +19,12 @@ from piper_kernels.linear.convrot.int8 import _backend, reference
 @pytest.fixture
 def operations(monkeypatch):
     # Deliberately exposes no target, execution plan, or vendor kernel utilities.
-    def prepare(input, group_size, activation_fn=None, *, out):  # noqa: A002
-        prepared = reference.prepare_input(apply_input_activation(input, activation_fn), group_size)
+    def prepare(input, group_size, activation_fn=None, input_scale=None, *, out=None):  # noqa: A002
+        prepared = reference.prepare_input(
+            apply_input_activation(input, activation_fn), group_size, input_scale=input_scale
+        )
+        if out is None:
+            return prepared
         for destination, source in zip(out, prepared, strict=True):
             destination.copy_(source)
         return out
@@ -70,7 +74,7 @@ def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(operation
     chunks = (10 + chunk_rows - 1) // chunk_rows
     assert backend.prepare_input.call_count == backend.linear_prepared.call_count == 2 * chunks
     preparations = backend.prepare_input.call_args_list
-    assert [call.kwargs["activation_fn"] for call in preparations] == [None, "swiglu"] * chunks
+    assert [call.kwargs.get("activation_fn") for call in preparations] == [None, "swiglu"] * chunks
     assert len({call.kwargs["out"][0].data_ptr() for call in preparations}) == 1
     assert len({call.kwargs["out"][1].data_ptr() for call in preparations}) == 1
     for index, call in enumerate(backend.linear_prepared.call_args_list):
@@ -96,7 +100,7 @@ def test_ffn_rejects_missing_backend_before_allocating_workspace(monkeypatch):
     allocate.assert_not_called()
 
 
-def _semantic_ffn_graph(device):
+def _semantic_ffn_graph(device, output_features=20):
     graph = torch.fx.Graph()
 
     def placeholder(name, shape, dtype):
@@ -120,7 +124,7 @@ def _semantic_ffn_graph(device):
     multiplied = graph.call_function(torch.ops.aten.mul.Tensor, (up, activated))
     for node in (activated, multiplied):
         node.meta["val"] = torch.empty(5, 32, dtype=torch.bfloat16, device=device)
-    output = linear("down", multiplied, 32, 20)
+    output = linear("down", multiplied, 32, output_features)
     graph.output(output)
     return torch.fx.GraphModule(torch.nn.Module(), graph), value.meta["val"]
 
@@ -140,6 +144,28 @@ def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device
     )
     assert select.called
     assert all(call.args[0] is value for call in select.call_args_list)
+
+
+@pytest.mark.parametrize("argument_count", [5, 6, 7])
+def test_ffn_compiler_preserves_unfused_consumers(monkeypatch, argument_count):
+    monkeypatch.setattr(_backend, "select_linear_backend", Mock(return_value=object()))
+    with FakeTensorMode():
+        module, _value = _semantic_ffn_graph("cpu", output_features=32)
+        graph = module.graph
+        output = next(node for node in graph.nodes if node.op == "output")
+        down = output.args[0]
+        with graph.inserting_before(output):
+            consumer = graph.call_function(
+                torch.ops.piper_kernels.convrot_int8_linear.default,
+                (down, *down.args[1:], *((None,) * (argument_count - 5))),
+            )
+        consumer.meta = down.meta.copy()
+        output.args = (consumer,)
+        ffn_compile.compile_pass(graph, is_inference=True)
+        graph.lint()
+    assert len(consumer.args) == argument_count
+    assert consumer.args[0].target == torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default
+    assert down not in graph.nodes
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -213,3 +239,26 @@ def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module
             }
             if module in (ffn, ffn_compile):
                 assert node.attr not in {"from_device", "cuda_capability_at_least"}
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_sparse_gate_prepares_only_requested_rows(operations, static):
+    backend, select = operations
+    storage = torch.empty(2, 1, 5, 128, dtype=torch.int8)
+    value = torch.linspace(-1, 1, 2 * 5 * 16).reshape(2, 5, 16).to(torch.bfloat16)
+    input_scale = torch.tensor(0.02) if static else None
+    weight, weight_scale, bias = _weight(128, 16)
+    gate = sparse_output._prepare_gate_projection(
+        storage, 5, None, value, input_scale, weight, weight_scale, bias, 16
+    )
+    output = torch.full((2, 3, 1, 128), -999, dtype=torch.bfloat16)
+    gate.project(output, 2, 2)
+    prepared = reference.prepare_input(value[:, 2:4], 16, input_scale=input_scale)
+    expected = reference.linear_prepared(*prepared, weight, weight_scale, torch.bfloat16, bias)
+    torch.testing.assert_close(output[:, :2, 0], expected, rtol=0, atol=0)
+    assert torch.all(output[:, 2] == -999)
+    select.assert_called_once_with(value)
+    assert backend.prepare_input.call_count == backend.linear_prepared.call_count == 2
+    for call in backend.prepare_input.call_args_list:
+        assert call.args[0].shape == (2, 16)
+        assert call.kwargs["input_scale"] is input_scale

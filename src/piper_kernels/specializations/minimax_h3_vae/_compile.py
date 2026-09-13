@@ -115,25 +115,35 @@ def _specialize_linears(
             continue
         with graph.inserting_before(node):
             if node.target == _LINEAR_TARGET:
-                arguments = (*node.args, None) if len(node.args) == 5 else node.args
-                input_node, weight_qdata, weight_scale, bias, group_size, activation_fn = arguments
+                arguments = node.args + (None,) * (7 - len(node.args))
+                (
+                    input_node,
+                    weight_qdata,
+                    weight_scale,
+                    bias,
+                    group_size,
+                    activation_fn,
+                    input_scale,
+                ) = arguments
                 assert isinstance(input_node, torch.fx.Node)
                 assert isinstance(weight_qdata, torch.fx.Node)
                 assert isinstance(weight_scale, torch.fx.Node)
                 assert bias is None or isinstance(bias, torch.fx.Node)
                 assert isinstance(group_size, int)
                 assert activation_fn is None or isinstance(activation_fn, str)
+                assert input_scale is None or isinstance(input_scale, torch.fx.Node)
                 prepared = convrot_int8_compile_fx.emit_prepared_input(
                     graph,
                     input_node,
                     group_size,
                     activation_fn,
                     (*input_value.shape[:-1], weight_value.shape[1]),
+                    input_scale,
                 )
-                input_qdata, input_scale, logical_dtype = prepared
+                input_qdata, row_scales, logical_dtype = prepared
                 replacement_args = (
                     input_qdata,
-                    input_scale,
+                    row_scales,
                     weight_qdata,
                     weight_scale,
                     bias,

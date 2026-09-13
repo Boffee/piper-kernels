@@ -17,6 +17,7 @@ class PreparationBackend(Protocol):
         input: torch.Tensor,  # noqa: A002
         group_size: int,
         activation_fn: str | None = None,
+        input_scale: torch.Tensor | None = None,
         *,
         out: PreparedInput | None = None,
     ) -> PreparedInput: ...
@@ -30,7 +31,7 @@ class LinearBackend(PreparationBackend, Protocol):
 
     Prepared inputs contain contiguous INT8 data of shape ``[..., K]`` and FP32
     row scales of shape ``[...]``. Preparation depends on input width, dtype,
-    group size, and activation, never on the consuming weight or output width.
+    group size, activation, and optional static input scale, never on output width.
     Projections apply row scales after INT32 accumulation and preserve the
     existing bias and logical-dtype rounding contract.
 
@@ -48,6 +49,7 @@ class LinearBackend(PreparationBackend, Protocol):
         bias: torch.Tensor | None,
         group_size: int,
         activation_fn: str | None = None,
+        input_scale: torch.Tensor | None = None,
     ) -> torch.Tensor: ...
 
     def linear_prepared(

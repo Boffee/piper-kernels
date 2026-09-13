@@ -53,6 +53,7 @@ def _arguments(
     sequence_length: int,
     bias: bool,
     bias_dtype: torch.dtype = torch.bfloat16,
+    input_scale: torch.Tensor | None = None,
 ) -> tuple[tuple[object, ...], torch.Tensor]:
     operands = _operands(batch=batch, sequence_length=sequence_length)
     prepared_query, prepared_key, prepared_value = _prepare(operands)
@@ -87,6 +88,7 @@ def _arguments(
             scale,
             projected_bias,
             _HEADS * _HEAD_DIM,
+            input_scale=input_scale,
         )
     return arguments, expected
 
@@ -170,20 +172,26 @@ def _padded_arguments(
     ("batch", "sequence_length", "query_chunk_rows", "bias"),
     [(1, 64, 64, False), (1, 65, 64, True), (2, 193, 128, True)],
 )
+@pytest.mark.parametrize("static", [False, True])
 def test_attention_output_matches_materialized_boundary(
     batch: int,
     sequence_length: int,
     query_chunk_rows: int,
     bias: bool,
+    static: bool,
 ) -> None:
+    input_scale = torch.tensor(0.04, device="cuda") if static else None
     arguments, expected = _arguments(
         batch=batch,
         sequence_length=sequence_length,
         bias=bias,
+        input_scale=input_scale,
     )
 
     with torch.no_grad():
-        actual = output_fusion._attention_output_op(*arguments, query_chunk_rows)
+        actual = output_fusion._attention_output_op(
+            *arguments, query_chunk_rows, output_input_scale=input_scale
+        )
 
     assert actual.shape == (batch, sequence_length, _OUTPUT_FEATURES)
     assert actual.is_contiguous()
@@ -390,13 +398,15 @@ def test_attention_output_projects_a_bounded_coarse_gate(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
-def test_attention_output_custom_op_passes_opcheck() -> None:
+@pytest.mark.parametrize("static", [False, True])
+def test_attention_output_custom_op_passes_opcheck(static: bool) -> None:
     arguments, _expected = _arguments(batch=1, sequence_length=128, bias=True)
 
     with torch.no_grad():
         result = torch.library.opcheck(
             output_fusion._attention_output_op,
             (*arguments, 64),
+            {"output_input_scale": torch.tensor(0.04, device="cuda") if static else None},
         )
 
     assert set(result.values()) == {"SUCCESS"}

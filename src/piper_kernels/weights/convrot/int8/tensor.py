@@ -30,7 +30,8 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
     Convolution execution requires a finite positive FP32 scalar tensor in
     ``act_per_tensor_scale``, on the weight device. It is checkpoint storage,
     moved and serialized with the weight, as in ConvRot NVFP4. Linear execution
-    currently uses dynamic activation scales and requires this field to be None.
+    uses this scale when present, or dynamic per-row scaling when it is None.
+    Calibrate the input after any activation and rotation for the chosen group size.
     Weight conversion and dequantization alone do not need an activation scale.
     """
 
@@ -56,10 +57,6 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             raise TypeError("ConvRot INT8 transposed must be bool")
         if qdata.ndim == 5 and transposed:
             raise NotImplementedError("ConvRot INT8 transpose requires a 2-D weight")
-        if qdata.ndim == 2 and act_per_tensor_scale is not None:
-            raise NotImplementedError(
-                "ConvRot INT8 static activation scaling currently requires a Conv3D weight"
-            )
         shape = (
             (qdata.shape[0], qdata.shape[4], *qdata.shape[1:4]) if qdata.ndim == 5 else qdata.shape
         )
@@ -208,10 +205,6 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
     def _require_matrix(self, operation: str) -> None:
         if self.ndim != 2:
             raise NotImplementedError(f"ConvRot INT8 {operation} requires a 2-D weight")
-        if self.act_per_tensor_scale is not None:
-            raise NotImplementedError(
-                "ConvRot INT8 static activation scaling currently requires a Conv3D weight"
-            )
 
     def _validate_memory_format(self, memory_format: object) -> None:
         if memory_format not in (None, torch.preserve_format):
@@ -283,6 +276,18 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
 
     def _stable_hash_for_caching(self) -> str:
         """Return a metadata fingerprint for AOTAutograd's cross-process cache."""
+        if self.act_per_tensor_scale is not None:
+            # AOT's wrapper cache key omits aliases between inner tensors of different
+            # weights. Reusing a graph traced with a shared input scale can silently
+            # substitute that scale for an independent one. Keep Dynamo/Inductor
+            # compilation and runtime graph reuse, but bypass this unsafe outer cache.
+            from torch._functorch._aot_autograd.autograd_cache import (  # noqa: PLC0415
+                BypassAOTAutogradCache,
+            )
+
+            raise BypassAOTAutogradCache(
+                "ConvRot INT8 static input scales may alias across weights"
+            )
         return repr(
             (
                 type(self).__qualname__,
@@ -292,7 +297,6 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
                 str(self.dtype),
                 self.group_size,
                 self.transposed,
-                self.act_per_tensor_scale is not None,
                 tuple(self.qdata.shape),
                 self.qdata.stride(),
                 tuple(self.scale.shape),

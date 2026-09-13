@@ -5,6 +5,7 @@ import torch
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels.weights.convrot._rotation import validate_group_size
+from piper_kernels.weights.convrot.int8._quantization import validate_activation_scale
 
 from .. import reference
 from .._interfaces import PreparedInput
@@ -31,11 +32,13 @@ def prepare_input(
     input: torch.Tensor,  # noqa: A002
     group_size: int,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
     *,
     out: PreparedInput | None = None,
 ) -> PreparedInput:
     """Rotate and quantize without requiring a tuned INT8 matrix backend."""
     validate_group_size(group_size)
+    validate_activation_scale(input_scale, input.device)
     if input.ndim == 0 or input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("ConvRot preparation requires floating-point input with a feature axis")
     value = apply_input_activation(input, activation_fn).contiguous()
@@ -57,12 +60,15 @@ def prepare_input(
     ):
         raise ValueError("ConvRot preparation output storage is incompatible")
     if value.numel() == 0:
-        out[1].fill_(1e-30)
+        if input_scale is None:
+            out[1].fill_(1e-30)
+        else:
+            out[1].copy_(input_scale)
     elif _use_triton(value):
         assert _triton_backend is not None
-        _triton_backend.prepare_input(value, group_size, out=out)
+        _triton_backend.prepare_input(value, group_size, input_scale, out=out)
     else:
-        prepared = reference.prepare_input(value, group_size)
+        prepared = reference.prepare_input(value, group_size, input_scale)
         for output, prepared_value in zip(out, prepared, strict=True):
             output.copy_(prepared_value)
     return out

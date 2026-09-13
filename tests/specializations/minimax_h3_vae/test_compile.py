@@ -81,7 +81,8 @@ def _run_passes(
         specialization_compile_pass(graph, is_inference=False)
 
 
-def test_pass_specializes_h3_linears_after_generic_preparation_sharing() -> None:
+@pytest.mark.parametrize("static", [False, True])
+def test_pass_specializes_h3_linears_after_generic_preparation_sharing(static) -> None:
     graph = torch.fx.Graph()
     activation = _placeholder(
         graph,
@@ -118,9 +119,20 @@ def test_pass_specializes_h3_linears_after_generic_preparation_sharing() -> None
     )
     w1_scale = _placeholder(graph, "w1_scale", torch.empty(16_384, 1, device="meta"))
     ffn = _linear(graph, ffn_activation, w1_qdata, w1_scale)
+    if static:
+        with graph.inserting_before(query):
+            input_scale = _placeholder(graph, "input_scale", torch.empty((), device="meta"))
+        for node in (query, key, value, ffn):
+            node.args = (*node.args, None, input_scale)
     graph.output((attention, ffn))
 
     _run_passes(graph)
+    if static:
+        assert all(
+            node.args[-1] is input_scale
+            for node in graph.nodes
+            if node.target == torch.ops.piper_kernels.convrot_int8_prepare_input.default
+        )
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 2

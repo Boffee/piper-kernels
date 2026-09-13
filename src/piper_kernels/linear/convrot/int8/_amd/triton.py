@@ -84,6 +84,7 @@ def rotate_quantize_rows_kernel(
     inverse_sqrt_group: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
+    static_scale_ptr=None,
 ):
     """Rotate and quantize one complete row without a global-memory intermediate."""
     row = tl.program_id(0)
@@ -116,7 +117,12 @@ def rotate_quantize_rows_kernel(
             values = gelu_tanh(values, accelerator_backend)
 
     values = convrot_backend.rotate_hadamard_groups(values, block_size, group_size)
-    if accelerator_backend != "hip" or x_ptr.dtype.element_ty == tl.float16 or block_size <= 8_192:
+    if static_scale_ptr is not None:
+        scale = tl.load(static_scale_ptr)
+        scaled = normalize_for_int8(values * inverse_sqrt_group, scale)
+    elif (
+        accelerator_backend != "hip" or x_ptr.dtype.element_ty == tl.float16 or block_size <= 8_192
+    ):
         scaled, scale = _normalize_rotated_values(
             values,
             inverse_sqrt_group,
@@ -170,6 +176,7 @@ def rotate_quantize_rows_chunked_kernel(
     inverse_sqrt_group: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
+    static_scale_ptr=None,
 ):
     """Rotate a BF16 input row in FP32 chunks before terminal INT8 quantization.
 
@@ -230,10 +237,16 @@ def rotate_quantize_rows_chunked_kernel(
     # All supported group normalizations are exact powers of two. Quantizing
     # the unnormalized FP32 values and applying that factor once to the scale
     # preserves the logical result while avoiding a vector multiply per chunk.
-    normalization_scale = _amd_normalization_scale(
-        absolute_max,
-        inverse_sqrt_group,
-    )
+    if static_scale_ptr is None:
+        normalization_scale = _amd_normalization_scale(absolute_max, inverse_sqrt_group)
+        scale = normalization_scale * inverse_sqrt_group
+    else:
+        scale = tl.load(static_scale_ptr)
+        normalization_scale = scale
+        values0 = values0 * inverse_sqrt_group
+        values1 = values1 * inverse_sqrt_group
+        if block2:
+            values2 = values2 * inverse_sqrt_group  # pyright: ignore[reportPossiblyUnboundVariable]
     quantized0 = _quantize_int8(values0, normalization_scale, accelerator_backend)
     quantized1 = _quantize_int8(values1, normalization_scale, accelerator_backend)
     tl.store(q_ptr + output_row_offset + offsets0, quantized0, mask=mask0)
@@ -241,7 +254,7 @@ def rotate_quantize_rows_chunked_kernel(
     if block2:
         quantized2 = _quantize_int8(values2, normalization_scale, accelerator_backend)  # pyright: ignore[reportPossiblyUnboundVariable]
         tl.store(q_ptr + output_row_offset + offsets2, quantized2, mask=mask2)  # pyright: ignore[reportPossiblyUnboundVariable]
-    tl.store(scale_ptr + row_i64, normalization_scale * inverse_sqrt_group)
+    tl.store(scale_ptr + row_i64, scale)
 
 
 def _uses_amd_chunked_preparation(
@@ -256,11 +269,12 @@ def _uses_amd_chunked_preparation(
 def _launch_amd_chunked_preparation(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
+    row_scales: torch.Tensor,
     group_size: int,
     activation_fn: str | None,
     num_warps: int,
     blocks: tuple[int, int, int],
+    input_scale: torch.Tensor | None = None,
 ) -> None:
     """Launch AMD's chunked fused rotation and quantization path."""
     m, k = input_qdata.shape
@@ -268,7 +282,7 @@ def _launch_amd_chunked_preparation(
         rotate_quantize_rows_chunked_kernel[(m,)](
             input,
             input_qdata,
-            input_scale,
+            row_scales,
             k,
             block0=blocks[0],
             block1=blocks[1],
@@ -276,6 +290,7 @@ def _launch_amd_chunked_preparation(
             group_size=group_size,
             inverse_sqrt_group=group_size**-0.5,
             activation_fn=activation_fn,
+            static_scale_ptr=input_scale,
             accelerator_backend="hip",
             num_warps=num_warps,
         )
@@ -284,11 +299,12 @@ def _launch_amd_chunked_preparation(
 def _launch_full_row_preparation(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
+    row_scales: torch.Tensor,
     group_size: int,
     activation_fn: str | None,
     num_warps: int,
     target: AcceleratorTarget,
+    input_scale: torch.Tensor | None = None,
 ) -> None:
     """Launch the shared full-row fused rotation and quantization path."""
     m, k = input_qdata.shape
@@ -296,12 +312,13 @@ def _launch_full_row_preparation(
         rotate_quantize_rows_kernel[(m,)](
             input,
             input_qdata,
-            input_scale,
+            row_scales,
             k,
             block_size=max(128, triton.next_power_of_2(k)),
             group_size=group_size,
             inverse_sqrt_group=group_size**-0.5,
             activation_fn=activation_fn,
+            static_scale_ptr=input_scale,
             accelerator_backend=target.backend,
             num_warps=num_warps,
         )
@@ -310,10 +327,11 @@ def _launch_full_row_preparation(
 def fused_rotate_quantize_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
+    row_scales: torch.Tensor,
     group_size: int,
     *,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
     num_warps: int,
     target: AcceleratorTarget | None = None,
 ) -> None:
@@ -342,21 +360,23 @@ def fused_rotate_quantize_input(
         _launch_amd_chunked_preparation(
             input,
             input_qdata,
-            input_scale,
+            row_scales,
             group_size,
             activation_fn,
             num_warps,
             blocks,
+            input_scale,
         )
         return
     _launch_full_row_preparation(
         input,
         input_qdata,
-        input_scale,
+        row_scales,
         group_size,
         activation_fn,
         num_warps,
         target,
+        input_scale,
     )
 
 
@@ -382,8 +402,9 @@ def _amd_matmul_compiler_options(
 def quantize_input(
     rotated: torch.Tensor,
     input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
+    row_scales: torch.Tensor,
     *,
+    input_scale: torch.Tensor | None = None,
     num_warps: int,
 ) -> None:
     """Apply the portable split-path rowwise quantization."""
@@ -392,11 +413,12 @@ def quantize_input(
         quantize_rows_kernel[(m,)](
             rotated,
             input_qdata,
-            input_scale,
+            row_scales,
             k,
             block_size=max(128, triton.next_power_of_2(k)),
             accelerator_backend="hip",
             reciprocal_scale=True,
+            static_scale_ptr=input_scale,
             num_warps=num_warps,
         )
 
@@ -420,6 +442,7 @@ def prepare_input_with_plan(
     group_size: int,
     *,
     activation_fn: str | None,
+    input_scale: torch.Tensor | None = None,
     execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -433,22 +456,23 @@ def prepare_input_with_plan(
             device=input.device,
             dtype=torch.int8,
         )
-        input_scale = torch.empty(m, device=input.device, dtype=torch.float32)
+        row_scales = torch.empty(m, device=input.device, dtype=torch.float32)
         result = (
             input_qdata.reshape(*input.shape[:-1], in_features),
-            input_scale.reshape(input.shape[:-1]),
+            row_scales.reshape(input.shape[:-1]),
         )
     else:
         result = out
     input_qdata = result[0].reshape(m, in_features)
-    input_scale = result[1].reshape(m)
+    row_scales = result[1].reshape(m)
     if execution_plan.fuse_rotation_quantization:
         fused_rotate_quantize_input(
             input_2d,
             input_qdata,
-            input_scale,
+            row_scales,
             group_size,
             activation_fn=activation_fn,
+            input_scale=input_scale,
             num_warps=execution_plan.fused_num_warps,
             target=target,
         )
@@ -464,7 +488,8 @@ def prepare_input_with_plan(
         quantize_input(
             rotated,
             input_qdata,
-            input_scale,
+            row_scales,
+            input_scale=input_scale,
             num_warps=execution_plan.quantization_num_warps,
         )
     return result
@@ -475,6 +500,7 @@ def _prepare_input_with_production_plan(
     group_size: int,
     *,
     activation_fn: str | None,
+    input_scale: torch.Tensor | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prepare an ordinary or activated input under production policy."""
@@ -489,6 +515,7 @@ def _prepare_input_with_production_plan(
         in_features,
         group_size,
         activation_fn=activation_fn,
+        input_scale=input_scale,
         execution_plan=plan,
         target=target,
         out=out,
@@ -608,6 +635,7 @@ def run_linear(
     group_size: int,
     *,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
     execution_plan: LinearExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run ConvRot input preparation and INT8 GEMM under one plan."""
@@ -625,17 +653,18 @@ def run_linear(
         if execution_plan is not None
         else default_execution_plan(weight_qdata, target=target)
     )
-    input_qdata, input_scale = prepare_input_with_plan(
+    input_qdata, row_scales = prepare_input_with_plan(
         input,
         k,
         group_size,
         activation_fn=activation_fn,
+        input_scale=input_scale,
         execution_plan=plan,
         target=target,
     )
     return execute_prepared_linear(
         input_qdata,
-        input_scale,
+        row_scales,
         weight_qdata,
         weight_scale,
         bias,
@@ -651,8 +680,9 @@ def linear(
     bias: torch.Tensor | None,
     group_size: int,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run ConvRot input rotation, dynamic quantization, and INT8 GEMM."""
+    """Run ConvRot input rotation, quantization, and INT8 GEMM."""
     return run_linear(
         input,
         weight_qdata,
@@ -660,6 +690,7 @@ def linear(
         bias,
         group_size,
         activation_fn=activation_fn,
+        input_scale=input_scale,
     )
 
 
@@ -667,6 +698,7 @@ def prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
     *,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -675,6 +707,7 @@ def prepare_input(
         input,
         group_size,
         activation_fn=activation_fn,
+        input_scale=input_scale,
         out=out,
     )
 

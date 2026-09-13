@@ -16,6 +16,33 @@ compact workspaces remain where they reduce storage or execution cost.
 Sparse attention's fused coarse residual keeps the fine output and gated coarse contribution
 in FP32 until the final BF16 store.
 
+## Validation contract
+
+This is a library-wide API and development contract. It applies to inference operators,
+dispatch, compiler rewrites, fake/meta implementations, and weight wrappers, including
+construction, reconstruction, views, and device moves. New implementations must preserve it.
+
+- Validation may inspect host metadata: shapes, dtypes, devices, layouts/strides, gradient
+  flags, and Python configuration values. Keep checks for supported storage and operations.
+- Numerical tensor contents are caller preconditions on every device. For example, callers
+  must supply a finite positive ConvRot INT8 static input scale. This requirement does not
+  promise runtime rejection of zero, negative, NaN, or infinite supplied scales.
+- These paths must not inspect tensor contents solely for input validation. Do not introduce
+  host readbacks (`.item()`, `bool(tensor)`, `.cpu()`), synchronization, tensor scans/reductions,
+  device assertions, validation kernel launches, or temporary device allocations for that
+  purpose. Validation must work without tensor contents during tracing and fake/meta execution
+  and must not introduce barriers to CUDA graph capture.
+- Exporters, checkpoint loaders, and other callers own any required numerical validation at
+  ingestion. Any dedicated tensor-content validation API must be explicitly invoked outside
+  inference, compilation, and weight wrapping; it must not run implicitly in those paths.
+
+GPU value readbacks synchronize execution, and additional validation kernels and allocations
+consume inference time and memory. Guards needed by the numerical algorithm remain required:
+for example, deriving a usable dynamic scale for an all-zero input is valid-input handling.
+Documented quantization/conversion work outside the paths above may also check the values it
+uses to construct a quantized representation. Neither permits adding content-validation work
+to inference. Callers can rely on this boundary when composing and capturing kernels.
+
 ## Operators
 
 | Package | Role |
@@ -119,6 +146,12 @@ weight.add_(dense_update, alpha=adapter_strength, rounding_seed=seed)
 ```
 
 Use `from_quantized(..., logical_dtype=...)` to construct a weight from checkpoint storage.
+Pass `act_per_tensor_scale=input_scale` to either constructor to use a calibrated static input
+scale. It must be a finite positive FP32 scalar tensor on the weight device, calibrated after
+any input activation and ConvRot rotation. The scalar moves and serializes with the weight;
+conversion and dequantization of the weight do not depend on its value. Omitting it selects
+dynamic per-row input scaling. Static preparation skips the row maximum reduction and preserves
+the existing prepared-input and matrix-multiply contracts.
 
 For a weight with shape `[out_features, in_features]`, ordinary and GELU-tanh inputs have
 shape `[..., in_features]`; the SwiGLU input has shape `[..., 2 * in_features]`. The output
@@ -137,12 +170,22 @@ and retain the same semantics. Both
 reject autograd inputs.
 
 For compiled inference, `convrot_int8_compile_options()` installs deterministic post-AOT Inductor
-rewrites. An exclusive tanh-approximate GELU or `chunk(2, dim=-1)` `[up | gate]` SwiGLU chain
-feeding a ConvRot linear becomes an activated input-preparation node followed by a prepared
-linear. This avoids the materialized activated input and lets its source die before the linear
-output is allocated.
+rewrites. An exclusive tanh-approximate GELU feeding a ConvRot linear becomes an activated
+input-preparation node followed by a prepared linear. This avoids the materialized activated
+input and lets its source die before the linear output is allocated.
 Separately, two or more ordinary ConvRot linears fed by the same graph value become one explicit
 input preparation followed by independent prepared GEMMs at the original operation positions.
+Static inputs share preparation only when they use the same scale graph value; different
+static scales and dynamic scaling remain separate.
+GELU input fusion, SwiGLU FFNs, and sparse-attention region fusions support static, dynamic,
+and mixed input scaling. Each projection retains its own input scale. Compatible gate/value
+inputs share FFN preparation and a paired GEMM; distinct scales reuse the bounded preparation
+workspace for separate projections. Sparse attention shares preparation only across compatible
+Q/K/V and coarse-gate inputs, centers V using its own prepared input, and applies the output
+projection's scale inside each attention chunk.
+Static ConvRot INT8 weights bypass PyTorch's AOTAutograd disk cache because its wrapper
+cache key does not distinguish shared from independent input-scale tensors. Compilation,
+Inductor caching, and reuse of the compiled graph remain supported.
 Prepared tensors are ordinary graph values—there is no hidden runtime cache—and unmatched,
 eager, and training paths remain unchanged. Existing post-grad compiler passes in the supplied
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
@@ -598,11 +641,19 @@ These composable implementations define the operations and training behavior; co
 ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
 and gated residual, including valid-front padded storage. The fused residual combines both terms
 in FP32 and rounds once on output, avoiding intermediate activation rounding.
-When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
-quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
-residual together with `sparse_query_blocks`. It passes the coarse result and coarse gate into
+When a compatible ConvRot INT8 projection or statically scaled NVFP4/ConvRot NVFP4 projection
+immediately consumes the quantized attention result, the bounded output rewrite supports
+`block_lengths` and the coarse residual together with `sparse_query_blocks`.
+It passes the coarse result and coarse gate into
 each ranged attention launch and projects that chunk directly, so the full attention output is
-not materialized. NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
+not materialized. ConvRot INT8 retains this bounded path with either static or dynamic per-row
+input scaling. Independent Q/coarse-gate input scales are prepared within each query window,
+avoiding two full-sequence prepared inputs. When the floating-point source is a fresh,
+exclusive intermediate with the same shape and dtype as the projected output, its consumed
+rows become output storage. Compiler ownership checks exclude caller inputs, aliases, and
+escaping values; other cases allocate a separate output. These bounds describe live tensors;
+allocator-reserved memory can additionally depend on cache and library initialization history.
+NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
 they materialize attention, compute one global activation scale (after rotation for ConvRot),
 and pack/project successive chunks. When the output width does not exceed the attention width,
 the final contiguous output reuses the attention allocation; narrower outputs retain that larger

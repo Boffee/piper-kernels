@@ -12,14 +12,17 @@ from piper_kernels.weights.convrot.int8._quantization import dynamic_quantize_ro
 def prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
+    input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate and dynamically quantize a linear input for one or more weights."""
+    """Rotate and quantize a linear input using dynamic or static input scaling."""
     input_2d = input.reshape(math.prod(input.shape[:-1]), input.shape[-1])
-    input_qdata, input_scale = dynamic_quantize_rows(rotate_groups(input_2d.float(), group_size))
-    return (
-        input_qdata.reshape(input.shape),
-        input_scale.reshape(input.shape[:-1]),
-    )
+    rotated = rotate_groups(input_2d.float(), group_size)
+    if input_scale is None:
+        input_qdata, row_scales = dynamic_quantize_rows(rotated)
+    else:
+        input_qdata = (rotated / input_scale).round().clamp(-128, 127).to(torch.int8)
+        row_scales = input_scale.expand(input_2d.shape[0]).clone()
+    return input_qdata.reshape(input.shape), row_scales.reshape(input.shape[:-1])
 
 
 def linear_prepared(
@@ -61,16 +64,14 @@ def linear(
     bias: torch.Tensor | None = None,
     *,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the portable PyTorch ConvRot W8A8 linear implementation."""
     prepared_input = apply_input_activation(input, activation_fn)
-    input_qdata, input_scale = prepare_input(
-        prepared_input,
-        group_size,
-    )
+    input_qdata, row_scales = prepare_input(prepared_input, group_size, input_scale)
     return linear_prepared(
         input_qdata,
-        input_scale,
+        row_scales,
         weight_qdata,
         weight_scale,
         input.dtype,

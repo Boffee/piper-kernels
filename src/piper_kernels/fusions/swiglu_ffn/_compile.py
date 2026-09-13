@@ -33,16 +33,6 @@ def _shape_matches(left: torch.Tensor, right: torch.Tensor) -> bool:
     )
 
 
-def _operator_returns_fresh_tensor(node: torch.fx.Node) -> bool:
-    """Whether an operator's schema guarantees storage independent of its inputs."""
-    if node.op != "call_function":
-        return False
-    schema = getattr(node.target, "_schema", None)
-    return bool(
-        schema is not None and len(schema.returns) == 1 and schema.returns[0].alias_info is None
-    )
-
-
 def valid_gated_updates(match: Match, valid_ffn: FfnValidator) -> bool:
     """Validate indexed gated updates and prove their intermediate safe to reuse."""
     if not valid_ffn(match):
@@ -107,7 +97,7 @@ def valid_gated_updates(match: Match, valid_ffn: FfnValidator) -> bool:
         outputs_valid
         and gates_valid
         and indices_valid
-        and _operator_returns_fresh_tensor(reusable_update_node)
+        and preparation_sharing.operator_returns_fresh_tensor(reusable_update_node)
         and len(reusable_update_node.users) == 1
     )
 

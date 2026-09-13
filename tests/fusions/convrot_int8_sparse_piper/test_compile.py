@@ -525,14 +525,17 @@ def _run_explicit_fused_projection(
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
-    input_qdata, input_scale = int8_ops.prepare_input(
-        hidden_states,
-        model.query.weight.group_size,
+    query_input, key_input, value_input = (
+        int8_ops.prepare_input(
+            hidden_states,
+            projection.weight.group_size,
+            input_scale=projection.weight.act_per_tensor_scale,
+        )
+        for projection in (model.query, model.key, model.value)
     )
     routing_mode = model.sparse_attention._routing_mode
     query = fused_query._project_query_op(
-        input_qdata,
-        input_scale,
+        *query_input,
         model.query.weight.qdata,
         model.query.weight.scale,
         model.query_norm,
@@ -546,8 +549,7 @@ def _run_explicit_fused_projection(
         bias=model.query.bias,
     )
     key = fused_key._project_key_op(
-        input_qdata,
-        input_scale,
+        *key_input,
         model.key.weight.qdata,
         model.key.weight.scale,
         model.key_norm,
@@ -560,13 +562,11 @@ def _run_explicit_fused_projection(
         bias=model.key.bias,
     )
     input_mean = int8_ops.dequantized_input_mean(
-        input_qdata,
-        input_scale,
+        *value_input,
         block_lengths,
     )
     projection_arguments = (
-        input_qdata,
-        input_scale,
+        *value_input,
         input_mean,
         model.value.weight.qdata,
         model.value.weight.scale,
@@ -647,6 +647,7 @@ def _run_explicit_attention_output(
         model.output.weight.scale,
         model.output.bias,
         model.output.weight.group_size,
+        input_scale=model.output.weight.act_per_tensor_scale,
     )
     return projected, attention
 

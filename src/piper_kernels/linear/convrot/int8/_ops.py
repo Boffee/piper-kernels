@@ -19,10 +19,11 @@ def linear(
     bias: torch.Tensor | None,
     group_size: int,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch the stable linear operation to a supported implementation."""
     return _backend.require_linear_backend(input).linear(
-        input, weight_qdata, weight_scale, bias, group_size, activation_fn
+        input, weight_qdata, weight_scale, bias, group_size, activation_fn, input_scale
     )
 
 
@@ -34,6 +35,7 @@ def _linear_fake(
     _bias: torch.Tensor | None,
     _group_size: int,
     _activation_fn: str | None = None,
+    _input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
@@ -43,10 +45,11 @@ def prepare_input(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     group_size: int,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch the stable prepare_input operation to a supported implementation."""
     return _backend.select_preparation_backend(input).prepare_input(
-        input, group_size, activation_fn
+        input, group_size, activation_fn, input_scale
     )
 
 
@@ -55,6 +58,7 @@ def _prepare_input_fake(
     input: torch.Tensor,  # noqa: A002
     _group_size: int,
     activation_fn: str | None = None,
+    _input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_width = input.shape[-1] // input_activation_width(activation_fn)
     return (

@@ -283,7 +283,7 @@ def _query_chunk_ranges(
     return ranges
 
 
-def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
+def _run_chunked_attention_pipeline(  # noqa: PLR0912, PLR0913, PLR0915
     attention_storage: torch.Tensor,
     sequence_length: int,
     has_coarse_residual: bool,
@@ -297,6 +297,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
     project_attention: AttentionProjector | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Share buffering, gate, and stream ordering across both Q lifetimes."""
     validate_output_dtype(output_dtype)
@@ -363,11 +364,21 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913, PLR0915
         device=attention_storage.device,
         dtype=output_dtype,
     )
-    output = torch.empty(
-        (batch, sequence_length, output_features),
-        device=attention_storage.device,
-        dtype=output_dtype,
-    )
+    if out is None:
+        output = torch.empty(
+            (batch, sequence_length, output_features),
+            device=attention_storage.device,
+            dtype=output_dtype,
+        )
+    else:
+        if (
+            out.shape != (batch, sequence_length, output_features)
+            or out.device != attention_storage.device
+            or out.dtype is not output_dtype
+            or not out.is_contiguous()
+        ):
+            raise ValueError("attention output buffer must match the projected output")
+        output = out
 
     if chunk_count == 1:
         block_start, block_count, start, rows = chunk_ranges[0]
@@ -519,6 +530,7 @@ def run_chunked_projected_query_attention_output(
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
     project_attention: AttentionProjector | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project, route, attend, and consume one bounded Q window at a time."""
 
@@ -558,6 +570,7 @@ def run_chunked_projected_query_attention_output(
         project_coarse_gate_chunk=project_coarse_gate_chunk,
         output_dtype=output_dtype,
         project_attention=project_attention,
+        out=out,
     )
 
 
