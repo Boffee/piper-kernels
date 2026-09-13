@@ -26,7 +26,7 @@ _TARGETS = [
 
 @pytest.mark.parametrize("target", _TARGETS)
 @pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp32"])
-@pytest.mark.parametrize("operation", ["rotate", "quantize", "update"])
+@pytest.mark.parametrize("operation", ["rotate", "quantize", "quantize_static", "update"])
 def test_generic_primitives_compile(target, dtype, operation):
     if operation == "rotate":
         kernel = rotate_groups_kernel
@@ -43,7 +43,7 @@ def test_generic_primitives_compile(target, dtype, operation):
             "reciprocal_scale": target.backend == "hip",
             "accelerator_backend": target.backend,
         }
-        if operation == "quantize":
+        if operation in ("quantize", "quantize_static"):
             kernel = kernels_weights.quantize_rows_kernel
             signature = {
                 "x_ptr": f"*{dtype}",
@@ -51,6 +51,10 @@ def test_generic_primitives_compile(target, dtype, operation):
                 "scale_ptr": "*fp32",
                 "row_width": "i32",
             }
+            if operation == "quantize_static":
+                signature["static_scale_ptr"] = "*fp32"
+            else:
+                constants["static_scale_ptr"] = None
         else:
             kernel = kernels_weights.requantize_update_rows_kernel
             signature = {
@@ -134,6 +138,7 @@ def test_shared_fused_gguf_compiles(target, quant_type):
                 "activation_fn": None,
                 "accelerator_backend": target.backend,
                 "gguf_quant_type": int(quant_type),
+                "static_scale_ptr": None,
             },
         ),
         target=target,

@@ -4,7 +4,10 @@ import torch
 
 from piper_kernels._input_activations import input_activation_width
 from piper_kernels.linear import _bias
-from piper_kernels.weights.convrot.int8._quantization import validate_storage
+from piper_kernels.weights.convrot.int8._quantization import (
+    validate_activation_scale,
+    validate_storage,
+)
 
 from . import _backend, _ops, reference
 
@@ -72,6 +75,7 @@ def _run_linear(
     group_size: int,
     bias: torch.Tensor | None,
     activation_fn: str | None,
+    input_scale: torch.Tensor | None,
 ) -> torch.Tensor:
     """Run a validated ConvRot linear through the selected backend."""
     if _backend.select_linear_backend(input) is not None:
@@ -82,6 +86,7 @@ def _run_linear(
             bias,
             group_size,
             activation_fn,
+            input_scale,
         )
     return reference.linear(
         input,
@@ -90,6 +95,7 @@ def _run_linear(
         group_size,
         bias,
         activation_fn=activation_fn,
+        input_scale=input_scale,
     )
 
 
@@ -102,6 +108,7 @@ def linear(
     bias: torch.Tensor | None = None,
     *,
     activation_fn: str | None = None,
+    input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply raw ConvRot INT8 storage to a floating-point activation.
 
@@ -112,6 +119,7 @@ def linear(
     """
     if qdata.ndim != 2:
         raise ValueError("ConvRot INT8 linear requires 2-D qdata")
+    validate_activation_scale(input_scale, qdata.device)
     in_features = qdata.shape[1]
     bias = _validate_linear(
         input,
@@ -124,4 +132,4 @@ def linear(
     )
     if input.device.type == "meta":
         return input.new_empty((*input.shape[:-1], qdata.shape[0]))
-    return _run_linear(input, qdata, scale, group_size, bias, activation_fn)
+    return _run_linear(input, qdata, scale, group_size, bias, activation_fn, input_scale)

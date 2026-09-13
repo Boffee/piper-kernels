@@ -475,6 +475,7 @@ def _projection_match(head_dim, input_features=256):
         operand(f"sparse_{kind}_weight_qdata", (2 * head_dim, input_features), torch.int8)
         operand(f"sparse_{kind}_weight_scale", (2 * head_dim, 1), torch.float32)
         arguments[f"sparse_{kind}_bias"] = None
+        arguments[f"sparse_{kind}_input_scale"] = None
     operand("attention_output", (1, 128, 2, head_dim), torch.bfloat16)
     match = SimpleNamespace(kwargs=arguments, output_node=lambda: arguments["attention_output"])
     return match, input_value
@@ -555,6 +556,7 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
             "output_weight_scale": scale,
             "output_attention_shape": [1, 128, 256],
             "output_group_size": 16,
+            "output_input_scale": None,
             "output_bias": None,
         },
     )

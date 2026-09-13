@@ -66,7 +66,8 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture):
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
 @pytest.mark.parametrize("width", [5376, 9216, 12288, 14336, 16384])
-def test_amd_activated_preparation_compiles(architecture, width):
+@pytest.mark.parametrize("static", [False, True])
+def test_amd_activated_preparation_compiles(architecture, width, static):
     chunked = width != 16384
     plan = policy.select_execution_plan(AcceleratorTarget("hip", architecture), in_features=width)
     constants = {
@@ -74,6 +75,7 @@ def test_amd_activated_preparation_compiles(architecture, width):
         "inverse_sqrt_group": 256**-0.5,
         "activation_fn": "swiglu" if chunked else "gelu_tanh",
         "accelerator_backend": "hip",
+        **({} if static else {"static_scale_ptr": None}),
     }
     if chunked:
         constants.update(
@@ -88,6 +90,7 @@ def test_amd_activated_preparation_compiles(architecture, width):
             "q_ptr": "*i8",
             "scale_ptr": "*fp32",
             "row_width": "i32",
+            **({"static_scale_ptr": "*fp32"} if static else {}),
         },
         constexprs=constants,
     )
@@ -100,3 +103,6 @@ def test_amd_activated_preparation_compiles(architecture, width):
     # BF16 inputs are widened on load; rotated/activated values stay FP32
     # until the terminal integer conversion, on every supported AMD target.
     assert "arith.truncf" not in compiled.asm["ttir"]
+
+    if static:
+        assert "tt.reduce" not in compiled.asm["ttir"]

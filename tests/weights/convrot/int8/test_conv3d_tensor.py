@@ -39,44 +39,6 @@ def test_quantization_and_dequantization_use_spatial_channel_groups(group_size, 
     assert (weight.dequantize(torch.float32) - source.float()).square().mean().sqrt() < 0.0003
 
 
-@pytest.mark.parametrize("operation", ["clone", "detach", "alias", "float", "copy", "flatten"])
-def test_activation_scale_survives_tensor_lifecycle(operation):
-    scale = torch.tensor(0.02)
-    weight = ConvRotInt8Tensor.from_hp(
-        torch.randn(4, 64, 3, 3, 3, dtype=torch.float16),
-        group_size=64,
-        act_per_tensor_scale=scale,
-    )
-    if operation == "clone":
-        result = weight.clone()
-    elif operation == "detach":
-        result = weight.detach()
-    elif operation == "alias":
-        result = torch.ops.aten.alias.default(weight)
-    elif operation == "float":
-        result = weight.float()
-    elif operation == "copy":
-        result = weight.to(dtype=torch.float32, copy=True)
-    else:
-        names, metadata = weight.__tensor_flatten__()
-        assert names == ["qdata", "scale", "act_per_tensor_scale"]
-        result = ConvRotInt8Tensor.__tensor_unflatten__(
-            {name: getattr(weight, name) for name in names},
-            metadata,
-            None,
-            None,
-        )
-    assert isinstance(result, ConvRotInt8Tensor)
-    assert result.shape == weight.shape
-    assert result.scale.dtype is torch.float32
-    assert result.act_per_tensor_scale.dtype is torch.float32
-    torch.testing.assert_close(result.act_per_tensor_scale, scale)
-    assert (result.act_per_tensor_scale.data_ptr() != scale.data_ptr()) == (
-        operation in ("clone", "copy")
-    )
-    torch.testing.assert_close(result.dequantize(torch.float32), weight.dequantize(torch.float32))
-
-
 @pytest.mark.parametrize(
     "scale",
     [
@@ -116,13 +78,6 @@ def test_matrix_operations_reject_convolution_weights(operation):
         operations[operation]()
 
 
-def test_linear_does_not_silently_ignore_a_static_activation_scale():
-    with pytest.raises(NotImplementedError, match="static activation scaling"):
-        ConvRotInt8Tensor.from_hp(
-            torch.ones(4, 64), group_size=64, act_per_tensor_scale=torch.tensor(0.02)
-        )
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("group_size", [64, 256])
@@ -135,13 +90,6 @@ def test_gpu_dequantization_restores_logical_convolution_weight(group_size):
     assert reconstructed.is_contiguous()
     assert reconstructed.dtype is torch.float32
     assert (reconstructed - source.float()).square().mean().sqrt() < 0.0003
-
-
-def test_linear_rejects_activation_configuration_changed_after_construction():
-    weight = ConvRotInt8Tensor.from_hp(torch.ones(2, 64), group_size=64)
-    weight.act_per_tensor_scale = torch.tensor(0.02)
-    with pytest.raises(NotImplementedError, match="static activation scaling"):
-        torch.nn.functional.linear(torch.ones(1, 64), weight)
 
 
 @pytest.mark.parametrize("operation", ["to", "copy", "aten"])

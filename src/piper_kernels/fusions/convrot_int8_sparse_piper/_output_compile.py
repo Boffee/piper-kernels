@@ -19,6 +19,7 @@ from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import _backend, _layout, output
 
@@ -45,7 +46,6 @@ type _PreparedQueryProjectionNodes = tuple[
 
 def _attention_output_pattern(
     *,
-    explicit_activation: bool,
     with_block_lengths: bool,
     with_coarse: bool,
     with_sparse_query_blocks: bool,
@@ -55,18 +55,15 @@ def _attention_output_pattern(
         with_coarse=with_coarse,
         with_sparse_query_blocks=with_sparse_query_blocks,
     )
-    arguments: list[object] = [
+    return CallFunction(
+        torch.ops.piper_kernels.convrot_int8_linear.default,
         reshaped,
         KeywordArg("output_weight_qdata"),
         KeywordArg("output_weight_scale"),
         KeywordArg("output_bias"),
         KeywordArg("output_group_size"),
-    ]
-    if explicit_activation:
-        arguments.append(None)
-    return CallFunction(
-        torch.ops.piper_kernels.convrot_int8_linear.default,
-        *arguments,
+        None,
+        KeywordArg("output_input_scale"),
     )
 
 
@@ -241,6 +238,8 @@ def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
     group_size = _static_int(match.kwargs["output_group_size"])
     if group_size is None or group_size < 1 or input_features % group_size:
         return False
+    if not _compile_fx.valid_input_scale(match.kwargs["output_input_scale"], query.device):
+        return False
     bias_argument = match.kwargs["output_bias"]
     if bias_argument is None:
         return True
@@ -277,6 +276,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
     output_weight_scale: torch.fx.Node,
     output_bias: torch.fx.Node | None,
     output_group_size: int,
+    output_input_scale: torch.fx.Node | None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -304,7 +304,10 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
         output_routing_mode,
         block_lengths,
     )
-    output_kwargs: dict[str, Argument] = {"output_dtype": original.meta["val"].dtype}
+    output_kwargs: dict[str, Argument] = {
+        "output_dtype": original.meta["val"].dtype,
+        "output_input_scale": output_input_scale,
+    }
     with graph.inserting_before(original):
         attention_tail = (
             output_key,
@@ -356,25 +359,24 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
 
 
 _patterns = PatternMatcherPass("convrot_int8_sparse_piper_attention_output")
-for _explicit_activation in (False, True):
-    for _with_block_lengths in (False, True):
-        for _with_coarse in (False, True):
-            for _with_sparse_query_blocks in (False, True):
-                register_graph_pattern(
-                    _attention_output_pattern(
-                        explicit_activation=_explicit_activation,
-                        with_block_lengths=_with_block_lengths,
-                        with_coarse=_with_coarse,
-                        with_sparse_query_blocks=_with_sparse_query_blocks,
-                    ),
-                    extra_check=_valid_attention_output,
-                    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-                )(_replace_attention_output)
+for _with_block_lengths in (False, True):
+    for _with_coarse in (False, True):
+        for _with_sparse_query_blocks in (False, True):
+            register_graph_pattern(
+                _attention_output_pattern(
+                    with_block_lengths=_with_block_lengths,
+                    with_coarse=_with_coarse,
+                    with_sparse_query_blocks=_with_sparse_query_blocks,
+                ),
+                extra_check=_valid_attention_output,
+                pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_attention_output)
 
 
 def _fold_attention_output(graph: torch.fx.Graph) -> bool:
     """Replace one compatible materialized attention-to-output region."""
-    changed = _patterns.apply(graph) > 0
+    with _compile_fx.canonical_linear_calls(graph):
+        changed = _patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()

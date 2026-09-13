@@ -141,7 +141,8 @@ def test_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_compile_options_fold_gelu_tanh() -> None:
+@pytest.mark.parametrize("static", [False, True])
+def test_cuda_compile_options_fold_gelu_tanh(static) -> None:
     class CapturePass(CustomInferenceAwareGraphPass):
         def __init__(self) -> None:
             self.targets: list[object] = []
@@ -160,6 +161,7 @@ def test_cuda_compile_options_fold_gelu_tanh() -> None:
                 torch.randint(-127, 128, (96, 512), device="cuda", dtype=torch.int8),
                 torch.rand(96, 1, device="cuda", dtype=torch.float32) * 0.01,
                 group_size=256,
+                act_per_tensor_scale=torch.tensor(0.005, device="cuda") if static else None,
             )
             self.projection = torch.nn.Linear(
                 512,
@@ -257,3 +259,33 @@ def test_cuda_compile_options_match_unmodified_compiled_linears() -> None:
     assert all(
         torch.equal(value, reference) for value, reference in zip(actual, expected, strict=True)
     )
+
+
+@pytest.mark.parametrize("scales", ["shared", "distinct", "mixed"])
+def test_preparation_sharing_respects_static_scale_identity(scales):
+    graph = torch.fx.Graph()
+    value = _placeholder(graph, "value", torch.empty(7, 64, device="meta"))
+    weight = _placeholder(graph, "weight", torch.empty(11, 64, device="meta", dtype=torch.int8))
+    weight_scale = _placeholder(graph, "weight_scale", torch.empty(11, 1, device="meta"))
+    first_scale = _placeholder(graph, "first_scale", torch.empty((), device="meta"))
+    if scales == "shared":
+        second_scale = first_scale
+    elif scales == "distinct":
+        second_scale = _placeholder(graph, "second_scale", torch.empty((), device="meta"))
+    else:
+        second_scale = None
+    outputs = []
+    for scale in (first_scale, second_scale):
+        node = _linear(graph, value, weight, weight_scale, None, 16)
+        node.args = (*node.args, None, scale)
+        outputs.append(node)
+    graph.output(tuple(outputs))
+    _run_compile_pass(graph, is_inference=True)
+    prepared = [
+        node
+        for node in graph.nodes
+        if node.target == torch.ops.piper_kernels.convrot_int8_prepare_input.default
+    ]
+    assert len(prepared) == (1 if scales == "shared" else 0)
+    if prepared:
+        assert prepared[0].args[-1] is first_scale

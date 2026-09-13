@@ -10,7 +10,10 @@ from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
-from piper_kernels.weights.convrot.int8._quantization import validate_storage
+from piper_kernels.weights.convrot.int8._quantization import (
+    validate_activation_scale,
+    validate_storage,
+)
 
 from . import _backend as fusion_backend
 from . import query as query_projection
@@ -212,21 +215,25 @@ def _project_attention_chunk(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None,
     group_size: int,
     backend: LinearBackend,
+    output_input_scale: torch.Tensor | None = None,
 ) -> None:
     """Project one ready attention chunk into its final output rows."""
     batch = attention_chunk.shape[0]
     input_features = weight_qdata.shape[1]
+    prepared_input = prepared_input[:rows]
+    prepared_scale = prepared_scale[:rows]
     for batch_index in range(batch):
         chunk_input = attention_chunk[batch_index, :rows].reshape(rows, input_features)
         backend.prepare_input(
             chunk_input,
             group_size,
             activation_fn=None,
-            out=(prepared_input[:rows], prepared_scale[:rows]),
+            input_scale=output_input_scale,
+            out=(prepared_input, prepared_scale),
         )
         backend.linear_prepared(
-            prepared_input[:rows],
-            prepared_scale[:rows],
+            prepared_input,
+            prepared_scale,
             weight_qdata,
             weight_scale,
             bias,
@@ -235,7 +242,7 @@ def _project_attention_chunk(  # noqa: PLR0913, PLR0917
         )
 
 
-def _prepare_output_chunk_projector(
+def _prepare_output_chunk_projector(  # noqa: PLR0913
     attention_storage: torch.Tensor,
     sequence_length: int,
     weight_qdata: torch.Tensor,
@@ -247,8 +254,10 @@ def _prepare_output_chunk_projector(
     *,
     backend: LinearBackend,
     output_dtype: torch.dtype = torch.bfloat16,
+    output_input_scale: torch.Tensor | None = None,
 ) -> tuple[int, output_common.ChunkProjector, tuple[torch.Tensor, torch.Tensor]]:
     """Prepare output-chunk buffers using the fusion's already-selected backend."""
+    validate_activation_scale(output_input_scale, attention_storage.device)
     input_features, output_features = _validate_output_projection(
         attention_storage,
         weight_qdata,
@@ -289,6 +298,7 @@ def _prepare_output_chunk_projector(
             bias,
             group_size,
             backend,
+            output_input_scale,
         )
 
     return output_features, project_chunk, (prepared_input, prepared_scale)
@@ -323,6 +333,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     gate_projection: _PreparedGateProjection | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    output_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into the final ConvRot INT8 output."""
     backend = fusion_backend.require_output_backend(query)
@@ -360,6 +371,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         backend=backend,
         output_dtype=output_dtype,
+        output_input_scale=output_input_scale,
     )
     return output_common.run_chunked_attention_output(
         prepared,
@@ -408,6 +420,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     *,
     output_dtype: torch.dtype = torch.bfloat16,
     query_bias: torch.Tensor | None = None,
+    output_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output."""
     projection_backend = fusion_backend.require_projection_backend(
@@ -447,6 +460,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         backend=backend,
         output_dtype=output_dtype,
+        output_input_scale=output_input_scale,
     )
 
     def project_query_chunk(
@@ -526,6 +540,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
     query_bias: torch.Tensor | None = None,
+    output_input_scale: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -573,6 +588,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         gate_projection,
         output_dtype=output_dtype,
+        output_input_scale=output_input_scale,
         query_bias=query_bias,
     )
 
@@ -616,6 +632,7 @@ def _projected_query_attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
     _query_bias: torch.Tensor | None = None,
+    _output_input_scale: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -663,6 +680,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_qdata: torch.Tensor | None = None,
     gate_weight_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    output_input_scale: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -704,6 +722,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         gate_projection,
         output_dtype=output_dtype,
+        output_input_scale=output_input_scale,
     )
 
 
@@ -739,6 +758,7 @@ def _attention_output_op_fake(
     _gate_weight_qdata: torch.Tensor | None = None,
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    _output_input_scale: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:

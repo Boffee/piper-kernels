@@ -8,8 +8,12 @@ import torch
 
 from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear import _bias
+from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.convrot.int8 import _backend
-from piper_kernels.weights.convrot.int8._quantization import validate_storage
+from piper_kernels.weights.convrot.int8._quantization import (
+    validate_activation_scale,
+    validate_storage,
+)
 
 _DEFAULT_CHUNK_ROWS = 4_096
 
@@ -51,6 +55,9 @@ def _validate_inputs(
     down_bias: torch.Tensor | None,
     down_group_size: int,
     chunk_rows: int,
+    gate_input_scale: torch.Tensor | None = None,
+    value_input_scale: torch.Tensor | None = None,
+    down_input_scale: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if input.ndim == 0 or input.layout is not torch.strided or not input.is_contiguous():
         raise ValueError("ConvRot INT8 FFN input must be a non-scalar contiguous strided tensor")
@@ -69,6 +76,9 @@ def _validate_inputs(
         validate_storage(weight_qdata, weight_scale, group_size, input.dtype)
         if weight_qdata.device != input.device or weight_scale.device != input.device:
             raise ValueError("ConvRot INT8 FFN operands must share a device")
+
+    for input_scale in (gate_input_scale, value_input_scale, down_input_scale):
+        validate_activation_scale(input_scale, input.device)
 
     input_features = gate_weight_qdata.shape[1]
     intermediate_features = gate_weight_qdata.shape[0]
@@ -111,6 +121,9 @@ def _run_chunked_swiglu_ffn(
     down_bias: torch.Tensor | None,
     down_group_size: int,
     chunk_rows: int,
+    gate_input_scale: torch.Tensor | None = None,
+    value_input_scale: torch.Tensor | None = None,
+    down_input_scale: torch.Tensor | None = None,
     *,
     gated_updates: gated_updates_backend.IndexedGatedUpdates | None = None,
 ) -> torch.Tensor:
@@ -130,6 +143,9 @@ def _run_chunked_swiglu_ffn(
         down_bias,
         down_group_size,
         chunk_rows,
+        gate_input_scale,
+        value_input_scale,
+        down_input_scale,
     )
     backend = _backend.require_linear_backend(input)
     leading_shape = input.shape[:-1]
@@ -177,6 +193,8 @@ def _run_chunked_swiglu_ffn(
         dtype=torch.int8,
     )
     scale_storage = torch.empty(capacity, device=input.device, dtype=torch.float32)
+    shared_source = same_tensor_storage(gate_input_scale, value_input_scale)
+    second_projection = (gate_weight_qdata, gate_weight_scale, gate_bias) if shared_source else None
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         chunk_row_count = stop - start
@@ -185,13 +203,13 @@ def _run_chunked_swiglu_ffn(
             input_features,
         )
         prepared_scale = scale_storage[:chunk_row_count]
+        projections = projection_workspace[:chunk_row_count]
         backend.prepare_input(
             input_2d[start:stop],
-            gate_group_size,
-            activation_fn=None,
+            value_group_size,
+            input_scale=value_input_scale,
             out=(prepared_input, prepared_scale),
         )
-        projections = projection_workspace[:chunk_row_count]
         backend.linear_prepared(
             prepared_input,
             prepared_scale,
@@ -199,9 +217,26 @@ def _run_chunked_swiglu_ffn(
             value_weight_scale,
             value_bias,
             input.dtype,
-            out=projections,
-            second_projection=(gate_weight_qdata, gate_weight_scale, gate_bias),
+            out=projections if shared_source else projections[:, :intermediate_features],
+            second_projection=second_projection,
         )
+        if not shared_source:
+            # Reuse the same bounded preparation buffers after projecting the value.
+            backend.prepare_input(
+                input_2d[start:stop],
+                gate_group_size,
+                input_scale=gate_input_scale,
+                out=(prepared_input, prepared_scale),
+            )
+            backend.linear_prepared(
+                prepared_input,
+                prepared_scale,
+                gate_weight_qdata,
+                gate_weight_scale,
+                gate_bias,
+                input.dtype,
+                out=projections[:, intermediate_features:],
+            )
 
         prepared_swiglu = prepared_storage[: chunk_row_count * intermediate_features].view(
             chunk_row_count,
@@ -211,6 +246,7 @@ def _run_chunked_swiglu_ffn(
             projections,
             down_group_size,
             activation_fn="swiglu",
+            input_scale=down_input_scale,
             out=(prepared_swiglu, prepared_scale),
         )
         output_chunk = output_2d[start:stop] if projected is None else projected[:chunk_row_count]
@@ -253,6 +289,9 @@ def _chunked_swiglu_ffn_op(
     down_bias: torch.Tensor | None,
     down_group_size: int,
     chunk_rows: int,
+    gate_input_scale: torch.Tensor | None = None,
+    value_input_scale: torch.Tensor | None = None,
+    down_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _run_chunked_swiglu_ffn(
         input,
@@ -269,6 +308,9 @@ def _chunked_swiglu_ffn_op(
         down_bias,
         down_group_size,
         chunk_rows,
+        gate_input_scale,
+        value_input_scale,
+        down_input_scale,
     )
 
 
@@ -288,6 +330,9 @@ def _chunked_swiglu_ffn_op_fake(
     _down_bias: torch.Tensor | None,
     _down_group_size: int,
     _chunk_rows: int,
+    _gate_input_scale: torch.Tensor | None = None,
+    _value_input_scale: torch.Tensor | None = None,
+    _down_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return input.new_empty((*input.shape[:-1], down_weight_qdata.shape[0]))
 
@@ -317,6 +362,9 @@ def _chunked_swiglu_ffn_gated_updates_op(
     gate_indices: torch.Tensor,
     python_indexing: bool,
     chunk_rows: int,
+    gate_input_scale: torch.Tensor | None = None,
+    value_input_scale: torch.Tensor | None = None,
+    down_input_scale: torch.Tensor | None = None,
 ) -> None:
     _run_chunked_swiglu_ffn(
         input,
@@ -333,6 +381,9 @@ def _chunked_swiglu_ffn_gated_updates_op(
         down_bias,
         down_group_size,
         chunk_rows,
+        gate_input_scale,
+        value_input_scale,
+        down_input_scale,
         gated_updates=gated_updates_backend.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,
@@ -366,5 +417,8 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
     _gate_indices: torch.Tensor,
     _python_indexing: bool,
     _chunk_rows: int,
+    _gate_input_scale: torch.Tensor | None = None,
+    _value_input_scale: torch.Tensor | None = None,
+    _down_input_scale: torch.Tensor | None = None,
 ) -> None:
     return None

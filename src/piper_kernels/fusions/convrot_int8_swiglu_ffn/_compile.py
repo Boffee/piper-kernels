@@ -21,15 +21,15 @@ from torch._inductor.pattern_matcher import (
 from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
-from piper_kernels.linear import _bias
+from piper_kernels.linear import _bias, _storage
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
-from piper_kernels.linear.convrot.int8 import _backend
+from piper_kernels.linear.convrot.int8 import _backend, _compile_fx
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 
 from . import triton as ffn_backend
 
-_COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v8"
+_COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v9"
 
 
 def _semantic_linear_pattern(
@@ -43,6 +43,8 @@ def _semantic_linear_pattern(
         KeywordArg(f"{prefix}_weight_scale"),
         KeywordArg(f"{prefix}_bias"),
         KeywordArg(f"{prefix}_group_size"),
+        None,
+        KeywordArg(f"{prefix}_input_scale"),
     )
     if users is None:
         return CallFunction(torch.ops.piper_kernels.convrot_int8_linear.default, *arguments)
@@ -123,6 +125,11 @@ def _valid_semantic_ffn(  # noqa: PLR0911
     assert down_weight is not None
     assert down_scale is not None
     assert output_value is not None
+    if any(
+        not _compile_fx.valid_input_scale(match.kwargs[f"{prefix}_input_scale"], input_value.device)
+        for prefix in ("gate", "value", "down")
+    ):
+        return False
     weights = gate_weight, value_weight, down_weight
     scales = gate_scale, value_scale, down_scale
     if (
@@ -223,6 +230,9 @@ def _replace_semantic_ffn(  # noqa: PLR0913, PLR0917
     down_weight_scale: torch.fx.Node,
     down_bias: torch.fx.Node | None,
     down_group_size: int,
+    gate_input_scale: torch.fx.Node | None,
+    value_input_scale: torch.fx.Node | None,
+    down_input_scale: torch.fx.Node | None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -245,6 +255,9 @@ def _replace_semantic_ffn(  # noqa: PLR0913, PLR0917
                 down_bias,
                 down_group_size,
                 ffn_backend._DEFAULT_CHUNK_ROWS,
+                gate_input_scale,
+                value_input_scale,
+                down_input_scale,
             ),
         )
     replacement.meta = original.meta.copy()
@@ -273,6 +286,9 @@ def _replace_semantic_ffn_gated_updates(  # noqa: PLR0913, PLR0917
     update_gate: torch.fx.Node,
     gate_indices: torch.fx.Node,
     ffn_gate: torch.fx.Node,
+    gate_input_scale: torch.fx.Node | None,
+    value_input_scale: torch.fx.Node | None,
+    down_input_scale: torch.fx.Node | None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -302,6 +318,9 @@ def _replace_semantic_ffn_gated_updates(  # noqa: PLR0913, PLR0917
                 gate_indices,
                 python_indexing,
                 ffn_backend._DEFAULT_CHUNK_ROWS,
+                gate_input_scale,
+                value_input_scale,
+                down_input_scale,
             ),
         )
     mutation.meta["val"] = None
@@ -345,8 +364,9 @@ for _promote_gate in (None, False, True):
 
 
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
-    changes = _gated_updates_patterns.apply(graph)
-    changes += _patterns.apply(graph)
+    with _compile_fx.canonical_linear_calls(graph):
+        changes = _gated_updates_patterns.apply(graph)
+        changes += _patterns.apply(graph)
     changed = changes > 0
     if changed:
         graph.eliminate_dead_code()
@@ -369,6 +389,8 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                 for file_name in (
                     __file__,
                     _bias.__file__,
+                    _storage.__file__,
+                    _compile_fx.__file__,
                     projection_views.__file__,
                     ffn_backend.__file__,
                     swiglu_ffn_compile.__file__,

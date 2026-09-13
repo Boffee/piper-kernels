@@ -57,7 +57,7 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 from . import _backend, _kernels, _layout, _output_compile, key, output, query, value
 from . import triton as projection
 
-_COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v25"
+_COMPILE_PASS_VERSION = "convrot-int8-sparse-piper-compile-v26"
 _TILE_ROWS = _layout.TILE_ROWS
 _QUERY_SCALE_ROWS = _layout.QUERY_SCALE_ROWS
 
@@ -65,6 +65,7 @@ type _SemanticGateProjection = tuple[
     torch.fx.Node,
     torch.fx.Node,
     torch.fx.Node,
+    torch.fx.Node | None,
     torch.fx.Node | None,
 ]
 
@@ -116,6 +117,8 @@ def _linear_pattern(prefix: str) -> CallFunction:
         KeywordArg(f"{prefix}_weight_scale"),
         KeywordArg(f"{prefix}_bias"),
         KeywordArg("sparse_group_size"),
+        None,
+        KeywordArg(f"{prefix}_input_scale"),
         _users=1,
     )
 
@@ -132,11 +135,13 @@ def _semantic_gate_projection(
         or linear is gate
         or linear.target is not torch.ops.piper_kernels.convrot_int8_linear.default
         or linear.kwargs
-        or len(linear.args) not in (5, 6)
+        or len(linear.args) not in (5, 6, 7)
     ):
         return None
-    arguments = (*linear.args, None) if len(linear.args) == 5 else linear.args
-    input_node, weight_qdata, weight_scale, bias, linear_group_size, activation_fn = arguments
+    arguments = linear.args + (None,) * (7 - len(linear.args))
+    input_node, weight_qdata, weight_scale, bias, linear_group_size, activation_fn, input_scale = (
+        arguments
+    )
     if (
         input_node is not sparse_input
         or linear_group_size != group_size
@@ -158,9 +163,11 @@ def _semantic_gate_projection(
         or weight_value.ndim != 2
         or scale_value.dtype is not torch.float32
         or tuple(scale_value.shape) != (weight_value.shape[0], 1)
+        or not _compile_fx.valid_input_scale(input_scale, weight_value.device)
     ):
         return None
-    return linear, weight_qdata, weight_scale, bias
+    assert input_scale is None or isinstance(input_scale, torch.fx.Node)
+    return linear, weight_qdata, weight_scale, bias, input_scale
 
 
 def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912
@@ -192,6 +199,13 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
 
     input_value = metadata["sparse_input"]
     assert input_value is not None
+    if any(
+        not _compile_fx.valid_input_scale(
+            match.kwargs[f"sparse_{prefix}_input_scale"], input_value.device
+        )
+        for prefix in ("q", "k", "v")
+    ):
+        return False
     if input_value.ndim != 3:
         return False
     input_features = sparse_piper_compile.static_int(input_value.shape[-1])
@@ -273,7 +287,7 @@ def _valid_sparse_piper_coarse_residual_projection(
     return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
 
 
-def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
+def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
     match: Match,
     sparse_input: torch.fx.Node,
     sparse_q_weight_qdata: torch.fx.Node,
@@ -301,6 +315,9 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     coarse_gate: torch.fx.Node | None = None,
     coarse_key_blocks: Argument | None = None,
     coarse_scale: float | None = None,
+    sparse_q_input_scale: torch.fx.Node | None = None,
+    sparse_k_input_scale: torch.fx.Node | None = None,
+    sparse_v_input_scale: torch.fx.Node | None = None,
     **_unused: object,
 ) -> None:
     original = match.output_node()
@@ -322,13 +339,23 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             args=(sparse_input, 1),
         )
         logical_sequence_length.meta["val"] = sequence_length
-        input_qdata, input_scale, _logical_dtype = _compile_fx.emit_prepared_input(
-            graph,
-            sparse_input,
-            sparse_group_size,
-            None,
-            tuple(input_value.shape),
-        )
+        preparations: dict[torch.fx.Node | None, _compile_fx.PreparedInputNodes] = {}
+
+        def prepare(input_scale: torch.fx.Node | None) -> _compile_fx.PreparedInputNodes:
+            if input_scale not in preparations:
+                preparations[input_scale] = _compile_fx.emit_prepared_input(
+                    graph,
+                    sparse_input,
+                    sparse_group_size,
+                    None,
+                    tuple(input_value.shape),
+                    input_scale,
+                )
+            return preparations[input_scale]
+
+        q_input, q_scales, _ = prepare(sparse_q_input_scale)
+        k_input, k_scales, _ = prepare(sparse_k_input_scale)
+        v_input, v_scales, _ = prepare(sparse_v_input_scale)
         prepared_coarse_gate = coarse_gate
         if coarse_gate is not None:
             gate_projection = _semantic_gate_projection(
@@ -337,12 +364,15 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 sparse_group_size,
             )
             if gate_projection is not None:
-                gate_linear, gate_weight_qdata, gate_weight_scale, gate_bias = gate_projection
+                gate_linear, gate_weight_qdata, gate_weight_scale, gate_bias, gate_input_scale = (
+                    gate_projection
+                )
+                gate_input, gate_scales, _ = prepare(gate_input_scale)
                 prepared_gate_linear = graph.call_function(
                     torch.ops.piper_kernels.convrot_int8_linear_prepared.default,
                     args=(
-                        input_qdata,
-                        input_scale,
+                        gate_input,
+                        gate_scales,
                         gate_weight_qdata,
                         gate_weight_scale,
                         gate_bias,
@@ -350,6 +380,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                     ),
                 )
                 prepared_gate_linear.meta = gate_linear.meta.copy()
+                prepared_gate_linear.meta.pop("eager_input_vals", None)
                 prepared_coarse_gate = graph.call_function(
                     torch.ops.aten.reshape.default,
                     args=(prepared_gate_linear, coarse_gate.args[1]),
@@ -373,8 +404,8 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             graph,
             torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default,
             (
-                input_qdata,
-                input_scale,
+                q_input,
+                q_scales,
                 sparse_q_weight_qdata,
                 sparse_q_weight_scale,
                 sparse_q_norm_weight,
@@ -411,8 +442,8 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             ),
         )
         key_arguments = (
-            input_qdata,
-            input_scale,
+            k_input,
+            k_scales,
             sparse_k_weight_qdata,
             sparse_k_weight_scale,
             sparse_k_norm_weight,
@@ -429,7 +460,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
         )
         input_mean = graph.call_function(
             torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
-            args=(input_qdata, input_scale, *block_length_arguments),
+            args=(v_input, v_scales, *block_length_arguments),
         )
         input_mean.meta["val"] = input_value.new_empty(
             (batch, input_value.shape[-1]),
@@ -463,8 +494,8 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                 else torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value.default
             ),
             (
-                input_qdata,
-                input_scale,
+                v_input,
+                v_scales,
                 input_mean,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
@@ -538,7 +569,8 @@ for _activation_dtype in SUPPORTED_DTYPES:
 
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
     """Replace one compatible materialized sparse-attention projection region."""
-    changed = _patterns.apply(graph) > 0
+    with _compile_fx.canonical_linear_calls(graph):
+        changed = _patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()
         graph.lint()

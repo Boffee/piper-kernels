@@ -14,7 +14,7 @@ def _reciprocal_scale(value: torch.Tensor) -> bool:
     return value.device.type == "cuda" and torch.version.hip is not None
 
 
-def prepare_input(input, group_size, *, out):  # noqa: A002
+def prepare_input(input, group_size, input_scale=None, *, out):  # noqa: A002
     """Use separate rotation and row quantization to bound fused live storage."""
     width = input.shape[-1]
     value = input.reshape(-1, width)
@@ -29,6 +29,7 @@ def prepare_input(input, group_size, *, out):  # noqa: A002
             block_size=max(128, triton.next_power_of_2(width)),
             reciprocal_scale=_reciprocal_scale(value),
             accelerator_backend="hip" if _reciprocal_scale(value) else value.device.type,
+            static_scale_ptr=input_scale,
             num_warps=4,
         )
         return out

@@ -119,6 +119,12 @@ weight.add_(dense_update, alpha=adapter_strength, rounding_seed=seed)
 ```
 
 Use `from_quantized(..., logical_dtype=...)` to construct a weight from checkpoint storage.
+Pass `act_per_tensor_scale=input_scale` to either constructor to use a calibrated static input
+scale. It must be a finite positive FP32 scalar tensor on the weight device, calibrated after
+any input activation and ConvRot rotation. The scalar moves and serializes with the weight;
+conversion and dequantization of the weight do not depend on its value. Omitting it selects
+dynamic per-row input scaling. Static preparation skips the row maximum reduction and preserves
+the existing prepared-input and matrix-multiply contracts.
 
 For a weight with shape `[out_features, in_features]`, ordinary and GELU-tanh inputs have
 shape `[..., in_features]`; the SwiGLU input has shape `[..., 2 * in_features]`. The output
@@ -137,12 +143,22 @@ and retain the same semantics. Both
 reject autograd inputs.
 
 For compiled inference, `convrot_int8_compile_options()` installs deterministic post-AOT Inductor
-rewrites. An exclusive tanh-approximate GELU or `chunk(2, dim=-1)` `[up | gate]` SwiGLU chain
-feeding a ConvRot linear becomes an activated input-preparation node followed by a prepared
-linear. This avoids the materialized activated input and lets its source die before the linear
-output is allocated.
+rewrites. An exclusive tanh-approximate GELU feeding a ConvRot linear becomes an activated
+input-preparation node followed by a prepared linear. This avoids the materialized activated
+input and lets its source die before the linear output is allocated.
 Separately, two or more ordinary ConvRot linears fed by the same graph value become one explicit
 input preparation followed by independent prepared GEMMs at the original operation positions.
+Static inputs share preparation only when they use the same scale graph value; different
+static scales and dynamic scaling remain separate.
+GELU input fusion, SwiGLU FFNs, and sparse-attention region fusions support static, dynamic,
+and mixed input scaling. Each projection retains its own input scale. Compatible gate/value
+inputs share FFN preparation and a paired GEMM; distinct scales reuse the bounded preparation
+workspace for separate projections. Sparse attention shares preparation only across compatible
+Q/K/V and coarse-gate inputs, centers V using its own prepared input, and applies the output
+projection's scale inside each attention chunk.
+Static ConvRot INT8 weights bypass PyTorch's AOTAutograd disk cache because its wrapper
+cache key does not distinguish shared from independent input-scale tensors. Compilation,
+Inductor caching, and reuse of the compiled graph remain supported.
 Prepared tensors are ordinary graph values—there is no hidden runtime cache—and unmatched,
 eager, and training paths remain unchanged. Existing post-grad compiler passes in the supplied
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
@@ -598,11 +614,13 @@ These composable implementations define the operations and training behavior; co
 ConvRot INT8, NVFP4, and ConvRot NVFP4 graphs fuse the shared route scores, wider coarse attention,
 and gated residual, including valid-front padded storage. The fused residual combines both terms
 in FP32 and rounds once on output, avoiding intermediate activation rounding.
-When a compatible static ConvRot INT8, NVFP4, or ConvRot NVFP4 projection immediately consumes the
-quantized attention result, the bounded output rewrite also supports `block_lengths` and the coarse
-residual together with `sparse_query_blocks`. It passes the coarse result and coarse gate into
+When a compatible ConvRot INT8 projection or statically scaled NVFP4/ConvRot NVFP4 projection
+immediately consumes the quantized attention result, the bounded output rewrite supports
+`block_lengths` and the coarse residual together with `sparse_query_blocks`.
+It passes the coarse result and coarse gate into
 each ranged attention launch and projects that chunk directly, so the full attention output is
-not materialized. NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
+not materialized. ConvRot INT8 retains this bounded path with either static or dynamic per-row
+input scaling. NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
 they materialize attention, compute one global activation scale (after rotation for ConvRot),
 and pack/project successive chunks. When the output width does not exceed the attention width,
 the final contiguous output reuses the attention allocation; narrower outputs retain that larger

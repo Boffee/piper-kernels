@@ -21,15 +21,32 @@ class _RecordingBackend:
     def __init__(self):
         self.calls = []
 
-    def linear(self, value, weight_qdata, weight_scale, bias, group_size, activation_fn=None):
+    def linear(
+        self,
+        value,
+        weight_qdata,
+        weight_scale,
+        bias,
+        group_size,
+        activation_fn=None,
+        input_scale=None,
+    ):
         self.calls.append("linear")
         return reference.linear(
-            value, weight_qdata, weight_scale, group_size, bias, activation_fn=activation_fn
+            value,
+            weight_qdata,
+            weight_scale,
+            group_size,
+            bias,
+            activation_fn=activation_fn,
+            input_scale=input_scale,
         )
 
-    def prepare_input(self, value, group_size, activation_fn=None, *, out=None):
+    def prepare_input(self, value, group_size, activation_fn=None, input_scale=None, *, out=None):
         self.calls.append("prepare")
-        prepared = reference.prepare_input(apply_input_activation(value, activation_fn), group_size)
+        prepared = reference.prepare_input(
+            apply_input_activation(value, activation_fn), group_size, input_scale
+        )
         if out is None:
             return prepared
         for output, prepared_value in zip(out, prepared, strict=True):
@@ -145,7 +162,8 @@ def test_compiled_preparation_sharing_resolves_backend_at_execution(monkeypatch)
     assert capture.calls == compile_count
 
 
-def test_fake_schemas_need_no_implementation(monkeypatch):
+@pytest.mark.parametrize("static", [False, True])
+def test_fake_schemas_need_no_implementation(monkeypatch, static):
     def unexpected_selection(value):
         raise AssertionError("fake propagation selected an implementation")
 
@@ -157,8 +175,9 @@ def test_fake_schemas_need_no_implementation(monkeypatch):
     weight = torch.empty(7, 32, device="meta", dtype=torch.int8)
     scale = torch.empty(7, 1, device="meta")
 
-    result = _ops.linear(value, weight, scale, None, 16, "swiglu")
-    qdata, row_scale = _ops.prepare_input(value, 16, "swiglu")
+    input_scale = torch.empty((), device="meta") if static else None
+    result = _ops.linear(value, weight, scale, None, 16, "swiglu", input_scale)
+    qdata, row_scale = _ops.prepare_input(value, 16, "swiglu", input_scale)
     projected = _ops.linear_prepared(qdata, row_scale, weight, scale, None, value.dtype)
     int8_update_ops.add_(weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0)
     int8_update_ops.addmm_(
@@ -206,3 +225,41 @@ def test_explicit_optimized_ops_fail_if_no_implementation_exists(monkeypatch):
     value, weight, scale, bias = _operands()
     with pytest.raises(ValueError, match="optimized linear is unavailable"):
         _ops.linear(value, weight, scale, bias, 16)
+
+
+@pytest.mark.parametrize("scales", ["shared", "distinct", "mixed"])
+def test_compiled_static_sharing_and_scale_mutation(monkeypatch, scales):
+    implementation = _RecordingBackend()
+    monkeypatch.setattr(_backend, "select_linear_backend", lambda value: implementation)
+    monkeypatch.setattr(_backend, "select_preparation_backend", lambda value: implementation)
+    value, weight, weight_scale, bias = _operands()
+    first_scale = torch.tensor(0.005)
+    if scales == "shared":
+        second_scale = first_scale
+    elif scales == "distinct":
+        second_scale = torch.tensor(0.02)
+    else:
+        second_scale = None
+
+    def projections(value, first_scale, second_scale):
+        return (
+            _ops.linear(value, weight, weight_scale, bias, 16, None, first_scale),
+            _ops.linear(value, weight, weight_scale, bias, 16, None, second_scale),
+        )
+
+    compiled = torch.compile(projections, fullgraph=True, options=convrot_int8_compile_options())
+    with torch.inference_mode():
+        original = None
+        for scale in (0.005, 0.02):
+            first_scale.fill_(scale)
+            expected = projections(value, first_scale, second_scale)
+            implementation.calls.clear()
+            actual = compiled(value, first_scale, second_scale)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert implementation.calls == (
+                ["prepare", "project", "project"] if scales == "shared" else ["linear", "linear"]
+            )
+            if original is None:
+                original = actual[0]
+            else:
+                assert not torch.equal(original, actual[0])

@@ -33,6 +33,7 @@ def convrot_int8_linear(
         converted_weight.group_size,
         bias,
         activation_fn=activation_fn,
+        input_scale=converted_weight.act_per_tensor_scale,
     )
 
 

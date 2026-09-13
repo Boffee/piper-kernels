@@ -82,8 +82,9 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
         ),
     ],
 )
+@pytest.mark.parametrize("static", [False, True])
 def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
-    monkeypatch, backend, target
+    monkeypatch, backend, target, static
 ):
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     value = torch.empty(2, 64)
@@ -98,7 +99,9 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
     implementation = _backend.require_linear_backend(value)
     assert implementation is backend
 
-    assert implementation.prepare_input(value, 16, "swiglu", out=prepared) is prepared
+    input_scale = torch.tensor(0.02) if static else None
+    assert implementation.prepare_input(value, 16, "swiglu", input_scale, out=prepared) is prepared
+    assert prepare.call_args.kwargs["input_scale"] is input_scale
     assert prepare.call_args.args == (value, 32, 16)
     assert prepare.call_args.kwargs["out"] is prepared
     assert prepare.call_args.kwargs["activation_fn"] == "swiglu"
@@ -169,7 +172,7 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
             activation, qdata, scale, torch.float32, 16, bias, activation_fn="swiglu"
         )
         assert actual is expected_output
-        execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu")
+        execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu", None)
     elif operation == "add_":
         monkeypatch.setattr(int8_updates, "select_add", lambda value: execute)
         _update.add_(qdata, scale, torch.float32, 16, update, alpha=2, rounding_seed=2**64 - 1)

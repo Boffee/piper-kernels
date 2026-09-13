@@ -74,8 +74,9 @@ def test_rocm_uses_shared_triton_without_a_tuned_backend(monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 @pytest.mark.parametrize("activation", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("static", [False, True])
 def test_generic_preparation_matches_math_and_preserves_output_storage(
-    device, dtype, group_size, activation
+    device, dtype, group_size, activation, static
 ):
     torch.manual_seed(975)
     width = 3 * group_size
@@ -84,8 +85,11 @@ def test_generic_preparation_matches_math_and_preserves_output_storage(
     q_storage = torch.full((6 * width + 7,), 99, device=device, dtype=torch.int8)
     s_storage = torch.full((6 + 7,), -99.0, device=device)
     output = (q_storage[3:-4].reshape(2, 3, width), s_storage[3:-4].reshape(2, 3))
-    actual = _generic.prepare_input(value, group_size, activation, out=output)
-    expected = reference.prepare_input(apply_input_activation(value, activation), group_size)
+    input_scale = torch.tensor(0.025, device=device) if static else None
+    actual = _generic.prepare_input(value, group_size, activation, input_scale, out=output)
+    expected = reference.prepare_input(
+        apply_input_activation(value, activation), group_size, input_scale
+    )
     assert actual is output
     assert (actual[0].short() - expected[0].short()).abs().max().item() <= 1
     torch.testing.assert_close(
@@ -135,11 +139,13 @@ def test_wide_generic_preparation_uses_bounded_fallback(monkeypatch, device):
 
 
 @pytest.mark.parametrize("shape", [(0, 256), (2, 0)])
-def test_empty_preparation_does_not_launch(shape):
-    qdata, scale = _generic.prepare_input(torch.empty(shape), 256)
+@pytest.mark.parametrize("static", [False, True])
+def test_empty_preparation_does_not_launch(shape, static):
+    input_scale = torch.tensor(0.02) if static else None
+    qdata, scale = _generic.prepare_input(torch.empty(shape), 256, input_scale=input_scale)
     assert qdata.shape == shape
     assert scale.shape == shape[:-1]
-    assert (scale == 1e-30).all()
+    assert (scale == (0.02 if static else 1e-30)).all()
 
 
 def test_generic_preparation_rejects_incompatible_outputs():

@@ -95,12 +95,16 @@ def test_cpu_linear_supports_pytorch_keyword_and_mixed_argument_forms() -> None:
 
 
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_cpu_public_linear_matches_materialized_up_gate_swiglu(with_bias: bool) -> None:
+@pytest.mark.parametrize("static", [False, True])
+def test_cpu_public_linear_matches_materialized_up_gate_swiglu(
+    with_bias: bool, static: bool
+) -> None:
     torch.manual_seed(45)
     in_features, out_features = 32, 11
     weight = ConvRotInt8Tensor.from_hp(
         torch.randn(out_features, in_features),
         group_size=16,
+        act_per_tensor_scale=torch.tensor(0.005) if static else None,
     )
     up = torch.randn(2, 7, in_features)
     gate = torch.randn(2, 7, in_features)
@@ -114,12 +118,14 @@ def test_cpu_public_linear_matches_materialized_up_gate_swiglu(with_bias: bool) 
 
 
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_cpu_public_linear_matches_materialized_gelu_tanh(with_bias: bool) -> None:
+@pytest.mark.parametrize("static", [False, True])
+def test_cpu_public_linear_matches_materialized_gelu_tanh(with_bias: bool, static: bool) -> None:
     torch.manual_seed(47)
     in_features, out_features = 32, 11
     weight = ConvRotInt8Tensor.from_hp(
         torch.randn(out_features, in_features),
         group_size=16,
+        act_per_tensor_scale=torch.tensor(0.005) if static else None,
     )
     activation = torch.randn(2, 7, in_features)
     bias = torch.randn(out_features) if with_bias else None
