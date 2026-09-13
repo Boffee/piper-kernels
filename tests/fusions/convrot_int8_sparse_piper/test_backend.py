@@ -776,4 +776,4 @@ def test_output_input_reuse_requires_exclusive_fresh_matching_storage(source_kin
         device="meta",
         dtype=torch.bfloat16,
     )
-    assert _output_compile._can_reuse_input(source, original) == (source_kind == "fresh")
+    assert _output_compile._can_reuse_source_as_output(source, original) == (source_kind == "fresh")

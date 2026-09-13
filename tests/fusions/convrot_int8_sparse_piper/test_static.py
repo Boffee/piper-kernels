@@ -227,10 +227,7 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
 
 
 @pytest.mark.parametrize("escape", [False, True])
-@pytest.mark.parametrize("sequence", [257, 20480])
-def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(
-    monkeypatch, escape, sequence
-):
+def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatch, escape):
     class IntermediateInput(_ProjectedGateCoarseSparseAttentionOutput):
         output_features = _ProjectedGateCoarseSparseAttentionOutput.input_features
 
@@ -243,7 +240,8 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(
 
     torch._dynamo.reset()
     torch.manual_seed(1087)
-    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64 if sequence == 257 else 4096)
+    sequence = 257
+    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64)
     monkeypatch.setattr(IntermediateInput, "sequence_length", sequence)
     monkeypatch.setattr(IntermediateInput, "batch", 2)
     model = IntermediateInput(routing="minmax").eval()

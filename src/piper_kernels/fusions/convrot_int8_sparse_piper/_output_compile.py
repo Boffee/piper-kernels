@@ -144,15 +144,9 @@ def _prepared_query_projection(
     return projection, bias
 
 
-def _can_reuse_input(source: torch.fx.Node, original: torch.fx.Node) -> bool:
+def _can_reuse_source_as_output(source: torch.fx.Node, original: torch.fx.Node) -> bool:
     """Prove that preparing this fresh input exhausts every use of its storage."""
-    schema = getattr(source.target, "_schema", None)
-    if (
-        source.op != "call_function"
-        or schema is None
-        or len(schema.returns) != 1
-        or schema.returns[0].alias_info is not None
-    ):
+    if not preparation_sharing.operator_returns_fresh_tensor(source):
         return False
     source_value = preparation_sharing.tensor_metadata(source)
     output_value = preparation_sharing.tensor_metadata(original)
@@ -421,9 +415,11 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                         query_scale,
                         *projection_arguments[2:],
                     )
-                    gate_arguments = (source, gate_source[2], *gate_projection[2:])
+                    # Chunk-prepared Q and gate always share ``source``. Pass it
+                    # once so the custom-op mutation contract has one owner.
+                    gate_arguments = (None, gate_source[2], *gate_projection[2:])
                     output_kwargs["input_group_size"] = input_group_size
-                    if _can_reuse_input(source, original):
+                    if _can_reuse_source_as_output(source, original):
                         reusable_input = source
                         ops = torch.ops.piper_kernels
                         reuse = ops.convrot_int8_sparse_piper_projected_query_attention_output_

@@ -171,6 +171,20 @@ def _prepare_optional_gate_projection(
     )
 
 
+def _resolve_projected_gate_input(
+    query_input: torch.Tensor,
+    gate_input: torch.Tensor | None,
+    gate_weight_qdata: torch.Tensor | None,
+    input_group_size: int | None,
+) -> torch.Tensor | None:
+    """Use the Q source once when Q/gate preparation is chunked together."""
+    if input_group_size is None:
+        return gate_input
+    if gate_input is not None:
+        raise ValueError("chunk-prepared ConvRot INT8 Q and gate must share one input")
+    return query_input if gate_weight_qdata is not None else None
+
+
 def _validate_output_projection(
     attention_storage: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -609,7 +623,12 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         key,
         logical_sequence_length,
         block_lengths,
-        gate_input,
+        _resolve_projected_gate_input(
+            query_input,
+            gate_input,
+            gate_weight_qdata,
+            input_group_size,
+        ),
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
@@ -658,7 +677,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
 
 @torch.library.custom_op(
     "piper_kernels::convrot_int8_sparse_piper_projected_query_attention_output_",
-    mutates_args=("query_input", "gate_input"),
+    mutates_args=("query_input",),
 )
 def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
     query_input: torch.Tensor,
@@ -714,7 +733,12 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
         key,
         logical_sequence_length,
         block_lengths,
-        gate_input,
+        _resolve_projected_gate_input(
+            query_input,
+            gate_input,
+            gate_weight_qdata,
+            input_group_size,
+        ),
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
@@ -850,7 +874,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
-    gate_input: torch.Tensor | None = None,
+    gate_input_qdata: torch.Tensor | None = None,
     gate_input_scale: torch.Tensor | None = None,
     gate_weight_qdata: torch.Tensor | None = None,
     gate_weight_scale: torch.Tensor | None = None,
@@ -863,7 +887,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         query,
         logical_sequence_length,
         block_lengths,
-        gate_input,
+        gate_input_qdata,
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
@@ -928,7 +952,7 @@ def _attention_output_op_fake(
     _coarse_scale: float | None = None,
     _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,
-    _gate_input: torch.Tensor | None = None,
+    _gate_input_qdata: torch.Tensor | None = None,
     _gate_input_scale: torch.Tensor | None = None,
     _gate_weight_qdata: torch.Tensor | None = None,
     _gate_weight_scale: torch.Tensor | None = None,

@@ -44,6 +44,16 @@ def tensor_metadata(node: torch.fx.Node) -> torch.Tensor | None:
     return value if isinstance(value, torch.Tensor) else None
 
 
+def operator_returns_fresh_tensor(node: torch.fx.Node) -> bool:
+    """Whether an operator's schema guarantees storage independent of its inputs."""
+    if node.op != "call_function":
+        return False
+    schema = getattr(node.target, "_schema", None)
+    return bool(
+        schema is not None and len(schema.returns) == 1 and schema.returns[0].alias_info is None
+    )
+
+
 def dimension_key(dimension: int | torch.SymInt) -> tuple[str, int | str]:
     """Make static and symbolic metadata dimensions safe dictionary keys."""
     if isinstance(dimension, int):
@@ -163,6 +173,7 @@ __all__ = [
     "add_ordered_post_grad_passes",
     "add_post_grad_pass",
     "dimension_key",
+    "operator_returns_fresh_tensor",
     "share_preparation",
     "tensor_metadata",
 ]

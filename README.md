@@ -652,8 +652,7 @@ avoiding two full-sequence prepared inputs. When the floating-point source is a 
 exclusive intermediate with the same shape and dtype as the projected output, its consumed
 rows become output storage. Compiler ownership checks exclude caller inputs, aliases, and
 escaping values; other cases allocate a separate output. These bounds describe live tensors;
-CUDA allocator reservation also depends on cache history and lazy cuBLAS workspace
-initialization in routing.
+allocator-reserved memory can additionally depend on cache and library initialization history.
 NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
 they materialize attention, compute one global activation scale (after rotation for ConvRot),
 and pack/project successive chunks. When the output width does not exceed the attention width,
