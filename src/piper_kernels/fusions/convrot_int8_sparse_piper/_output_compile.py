@@ -144,6 +144,68 @@ def _prepared_query_projection(
     return projection, bias
 
 
+def _can_reuse_input(source: torch.fx.Node, original: torch.fx.Node) -> bool:
+    """Prove that preparing this fresh input exhausts every use of its storage."""
+    schema = getattr(source.target, "_schema", None)
+    if (
+        source.op != "call_function"
+        or schema is None
+        or len(schema.returns) != 1
+        or schema.returns[0].alias_info is not None
+    ):
+        return False
+    source_value = preparation_sharing.tensor_metadata(source)
+    output_value = preparation_sharing.tensor_metadata(original)
+    if source_value is None or output_value is None:
+        return False
+    if (
+        source_value.dtype is not output_value.dtype
+        or source_value.device != output_value.device
+        or not source_value.is_contiguous()
+        or tuple(map(preparation_sharing.dimension_key, source_value.shape))
+        != tuple(map(preparation_sharing.dimension_key, output_value.shape))
+    ):
+        return False
+    before_output = set()
+    for node in source.graph.nodes:
+        if node is original:
+            break
+        before_output.add(node)
+    return all(
+        user.op == "call_function"
+        and (
+            user.target is torch.ops.aten.sym_size.int
+            or (
+                user in before_output
+                and user.target is torch.ops.piper_kernels.convrot_int8_prepare_input.default
+            )
+        )
+        for user in source.users
+    )
+
+
+def _input_preparation(
+    qdata: torch.fx.Node,
+    scales: torch.fx.Node,
+) -> tuple[torch.fx.Node, int, torch.fx.Node | None] | None:
+    """Recover an ordinary input and its scale from a prepared tuple."""
+    producer = sparse_piper_compile.ordered_tuple_output_producer(
+        (qdata, scales), torch.ops.piper_kernels.convrot_int8_prepare_input.default
+    )
+    if producer is None or producer.kwargs or len(producer.args) not in (3, 4):
+        return None
+    source, group_size, activation = producer.args[:3]
+    scale = producer.args[3] if len(producer.args) == 4 else None
+    if (
+        not isinstance(source, torch.fx.Node)
+        or _static_int(group_size) is None
+        or activation is not None
+        or (scale is not None and not isinstance(scale, torch.fx.Node))
+    ):
+        return None
+    return source, cast(int, group_size), scale
+
+
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911, PLR0912
     tensor_names = (
         "output_query",
@@ -308,6 +370,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
         "output_dtype": original.meta["val"].dtype,
         "output_input_scale": output_input_scale,
     }
+    reusable_input = None
     with graph.inserting_before(original):
         attention_tail = (
             output_key,
@@ -339,7 +402,32 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
                 torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output
             )
             target = projected_query_output.default
-            projection_arguments, query_bias = query_projection
+            prepared_arguments, query_bias = query_projection
+            projection_arguments: tuple[Argument, ...] = prepared_arguments
+            if gate_projection is not None:
+                query_source = _input_preparation(*prepared_arguments[:2])
+                gate_source = _input_preparation(*gate_projection[:2])
+                if (
+                    query_source is not None
+                    and gate_source is not None
+                    and query_source[:2] == gate_source[:2]
+                    and query_source[2] is not gate_source[2]
+                ):
+                    # Prepare independent Q/gate scales inside the bounded chunk loop.
+                    # Keeping both full-sequence INT8 inputs defeats that memory bound.
+                    source, input_group_size, query_scale = query_source
+                    projection_arguments = (
+                        source,
+                        query_scale,
+                        *projection_arguments[2:],
+                    )
+                    gate_arguments = (source, gate_source[2], *gate_projection[2:])
+                    output_kwargs["input_group_size"] = input_group_size
+                    if _can_reuse_input(source, original):
+                        reusable_input = source
+                        ops = torch.ops.piper_kernels
+                        reuse = ops.convrot_int8_sparse_piper_projected_query_attention_output_
+                        target = reuse.default
             common_arguments = (*projection_arguments, *attention_tail)
             output_kwargs["query_bias"] = query_bias
         replacement = graph.call_function(
@@ -352,9 +440,13 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
             ),
             kwargs=output_kwargs,
         )
-    replacement.meta = original.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    original.replace_all_uses_with(replacement)
+    if reusable_input is None:
+        replacement.meta = original.meta.copy()
+        replacement.meta.pop("eager_input_vals", None)
+        original.replace_all_uses_with(replacement)
+    else:
+        replacement.meta["val"] = None
+        original.replace_all_uses_with(reusable_input)
     match.erase_nodes()
 
 

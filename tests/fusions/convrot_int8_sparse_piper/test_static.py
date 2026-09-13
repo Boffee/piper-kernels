@@ -32,10 +32,10 @@ def _set_scales(model, mode):
         preparations = 1
     elif mode == "distinct":
         scales = tuple(torch.tensor(value, device="cuda") for value in (0.02, 0.03, 0.04, 0.05))
-        preparations = 4
+        preparations = 2
     elif mode == "mixed":
         scales = (shared, None, torch.tensor(0.04, device="cuda"), None)
-        preparations = 3
+        preparations = 2
     elif mode == "static-output":
         scales = (None,) * 4
         preparations = 1
@@ -178,3 +178,102 @@ def test_static_coarse_gate_keeps_valid_metadata_when_attention_escapes():
         torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
         not in capture.targets
     )
+
+
+@pytest.mark.parametrize("mode", ["distinct", "mixed"])
+@pytest.mark.parametrize("sequence", [257, 320])
+def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
+    monkeypatch, mode, sequence
+):
+    torch._dynamo.reset()
+    torch.manual_seed(1086)
+    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64)
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", sequence)
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "batch", 2)
+    model = _ProjectedGateCoarseSparseAttentionOutput(routing="minmax").eval()
+    model.set_projection_bias(torch.float32)
+    _set_scales(model, mode)
+    hidden = torch.randn(2, sequence, model.input_features, device="cuda", dtype=torch.bfloat16)
+    lengths = (
+        torch.tensor([64, 17, 51, 64, 1], device="cuda", dtype=torch.int32)
+        if sequence == 320
+        else None
+    )
+    capture = _TargetCapturePass()
+    compiled = torch.compile(model, fullgraph=True, options=_options(capture))
+    with torch.inference_mode():
+        for iteration in range(2):
+            if iteration:
+                model.query.weight.act_per_tensor_scale.mul_(0.5)
+                if mode == "distinct":
+                    model.gate.weight.act_per_tensor_scale.mul_(0.5)
+            gate = model.gate(hidden).view(2, sequence, model.heads, model.head_dim)
+            expected, _ = _run_explicit_attention_output(
+                model,
+                hidden,
+                model.cos,
+                model.sin,
+                model.sparse_key_blocks,
+                coarse_gate=gate,
+                coarse_scale=model.coarse_scale,
+                coarse_key_blocks=model.coarse_key_blocks,
+                block_lengths=lengths,
+                sparse_query_blocks=2,
+            )
+            actual = compiled(hidden, lengths, 2)
+            assert_fusion_output_close(actual, expected)
+    assert capture.calls == 1
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 2
+
+
+@pytest.mark.parametrize("escape", [False, True])
+@pytest.mark.parametrize("sequence", [257, 20480])
+def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(
+    monkeypatch, escape, sequence
+):
+    class IntermediateInput(_ProjectedGateCoarseSparseAttentionOutput):
+        output_features = _ProjectedGateCoarseSparseAttentionOutput.input_features
+
+        def forward(self, hidden):
+            intermediate = torch.nn.functional.silu(hidden)
+            projected = super().forward(intermediate)
+            if escape:
+                return projected, intermediate.view_as(intermediate)
+            return projected
+
+    torch._dynamo.reset()
+    torch.manual_seed(1087)
+    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64 if sequence == 257 else 4096)
+    monkeypatch.setattr(IntermediateInput, "sequence_length", sequence)
+    monkeypatch.setattr(IntermediateInput, "batch", 2)
+    model = IntermediateInput(routing="minmax").eval()
+    _set_scales(model, "distinct")
+    hidden = torch.randn(2, sequence, model.input_features, device="cuda", dtype=torch.bfloat16)
+    before = hidden.clone()
+    capture = _TargetCapturePass()
+    with torch.inference_mode():
+        intermediate = torch.nn.functional.silu(hidden)
+        gate = model.gate(intermediate).view(2, sequence, model.heads, model.head_dim)
+        expected, _ = _run_explicit_attention_output(
+            model,
+            intermediate,
+            model.cos,
+            model.sin,
+            model.sparse_key_blocks,
+            coarse_gate=gate,
+            coarse_scale=model.coarse_scale,
+            coarse_key_blocks=model.coarse_key_blocks,
+        )
+        compiled = torch.compile(model, fullgraph=True, options=_options(capture))
+        for _ in range(3):
+            actual = compiled(hidden)
+            if escape:
+                actual, returned_intermediate = actual
+                torch.testing.assert_close(returned_intermediate, intermediate, rtol=0, atol=0)
+            assert_fusion_output_close(actual, expected)
+            torch.testing.assert_close(hidden, before, rtol=0, atol=0)
+    assert capture.calls == 1
+    inplace = (
+        torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output_.default
+    )
+    assert capture.targets.count(inplace) == (0 if escape else 1)

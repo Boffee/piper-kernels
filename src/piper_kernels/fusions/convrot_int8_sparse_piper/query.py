@@ -51,8 +51,6 @@ def _validate_inputs(  # noqa: PLR0913
         head_dim=head_dim,
         bias=bias,
     )
-    if result[1] < TILE_ROWS:
-        raise ValueError(f"Q projection requires at least {TILE_ROWS} sequence rows")
     if not math.isfinite(softmax_scale) or softmax_scale <= 0:
         raise ValueError("Q projection softmax scale must be finite and positive")
     return result
@@ -93,6 +91,8 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         bias=bias,
     )
     if chunk_rows is None:
+        if sequence_length < TILE_ROWS:
+            raise ValueError(f"Q projection requires at least {TILE_ROWS} sequence rows")
         chunk_rows = sequence_length
     if (
         isinstance(chunk_start, bool)

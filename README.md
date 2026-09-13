@@ -647,7 +647,14 @@ immediately consumes the quantized attention result, the bounded output rewrite 
 It passes the coarse result and coarse gate into
 each ranged attention launch and projects that chunk directly, so the full attention output is
 not materialized. ConvRot INT8 retains this bounded path with either static or dynamic per-row
-input scaling. NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
+input scaling. Independent Q/coarse-gate input scales are prepared within each query window,
+avoiding two full-sequence prepared inputs. When the floating-point source is a fresh,
+exclusive intermediate with the same shape and dtype as the projected output, its consumed
+rows become output storage. Compiler ownership checks exclude caller inputs, aliases, and
+escaping values; other cases allocate a separate output. These bounds describe live tensors;
+CUDA allocator reservation also depends on cache history and lazy cuBLAS workspace
+initialization in routing.
+NVFP4 and ConvRot NVFP4 also fuse dynamically scaled output projections:
 they materialize attention, compute one global activation scale (after rotation for ConvRot),
 and pack/project successive chunks. When the output width does not exceed the attention width,
 the final contiguous output reuses the attention allocation; narrower outputs retain that larger

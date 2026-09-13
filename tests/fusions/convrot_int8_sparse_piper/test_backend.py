@@ -292,7 +292,7 @@ def _run_output_fusion(projected_query, operands, storage):
         )
     qdata, scale, weight, weight_scale, norm, cos, sin = operands
     return output._run_projected_query_attention_output(
-        query_input_qdata=qdata,
+        query_input=qdata,
         query_input_scale=scale,
         query_weight_qdata=weight,
         query_weight_scale=weight_scale,
@@ -749,3 +749,31 @@ def test_output_folding_preserves_query_bias(bias_argument):
         assert recovered is None
     else:
         assert recovered == (projection, bias)
+
+
+@pytest.mark.parametrize("source_kind", ["fresh", "input", "alias", "escaped", "different-shape"])
+def test_output_input_reuse_requires_exclusive_fresh_matching_storage(source_kind):
+    graph = torch.fx.Graph()
+    input_node = graph.placeholder("input")
+    if source_kind == "input":
+        source = input_node
+    elif source_kind == "alias":
+        source = graph.call_function(torch.ops.aten.alias.default, args=(input_node,))
+    else:
+        source = graph.call_function(torch.ops.aten.silu.default, args=(input_node,))
+    source.meta["val"] = torch.empty(2, 257, 256, device="meta", dtype=torch.bfloat16)
+    graph.call_function(torch.ops.aten.sym_size.int, args=(source, 1))
+    graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_prepare_input.default, args=(source, 256, None)
+    )
+    if source_kind == "escaped":
+        graph.call_function(torch.ops.aten.alias.default, args=(source,))
+    original = graph.call_function(torch.ops.aten.clone.default, args=(input_node,))
+    original.meta["val"] = torch.empty(
+        2,
+        257,
+        320 if source_kind == "different-shape" else 256,
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    assert _output_compile._can_reuse_input(source, original) == (source_kind == "fresh")

@@ -19,10 +19,12 @@ from piper_kernels.linear.convrot.int8 import _backend, reference
 @pytest.fixture
 def operations(monkeypatch):
     # Deliberately exposes no target, execution plan, or vendor kernel utilities.
-    def prepare(input, group_size, activation_fn=None, input_scale=None, *, out):  # noqa: A002
+    def prepare(input, group_size, activation_fn=None, input_scale=None, *, out=None):  # noqa: A002
         prepared = reference.prepare_input(
             apply_input_activation(input, activation_fn), group_size, input_scale=input_scale
         )
+        if out is None:
+            return prepared
         for destination, source in zip(out, prepared, strict=True):
             destination.copy_(source)
         return out
@@ -237,3 +239,26 @@ def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module
             }
             if module in (ffn, ffn_compile):
                 assert node.attr not in {"from_device", "cuda_capability_at_least"}
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_sparse_gate_prepares_only_requested_rows(operations, static):
+    backend, select = operations
+    storage = torch.empty(2, 1, 5, 128, dtype=torch.int8)
+    value = torch.linspace(-1, 1, 2 * 5 * 16).reshape(2, 5, 16).to(torch.bfloat16)
+    input_scale = torch.tensor(0.02) if static else None
+    weight, weight_scale, bias = _weight(128, 16)
+    gate = sparse_output._prepare_gate_projection(
+        storage, 5, None, value, input_scale, weight, weight_scale, bias, 16
+    )
+    output = torch.full((2, 3, 1, 128), -999, dtype=torch.bfloat16)
+    gate.project(output, 2, 2)
+    prepared = reference.prepare_input(value[:, 2:4], 16, input_scale=input_scale)
+    expected = reference.linear_prepared(*prepared, weight, weight_scale, torch.bfloat16, bias)
+    torch.testing.assert_close(output[:, :2, 0], expected, rtol=0, atol=0)
+    assert torch.all(output[:, 2] == -999)
+    select.assert_called_once_with(value)
+    assert backend.prepare_input.call_count == backend.linear_prepared.call_count == 2
+    for call in backend.prepare_input.call_args_list:
+        assert call.args[0].shape == (2, 16)
+        assert call.kwargs["input_scale"] is input_scale
