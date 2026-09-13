@@ -5,6 +5,20 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0rc7] - 2026-09-13
+
+### Added
+
+- Added optional calibrated static input scales to 2-D ConvRot INT8 linears and their
+  SwiGLU FFN and sparse-Piper projection fusions. Static preparation uses the stored
+  scalar without dynamic row-maximum reductions and preserves scale storage through
+  tensor moves, serialization, updates, sharding, and compiler paths.
+
+### Changed
+
+- Documented the low-level validation contract: callers own tensor-content preconditions,
+  while kernels retain structural checks and guards required by their numerical algorithms.
+
 ## [0.7.0rc6] - 2026-09-11
 
 ### Added

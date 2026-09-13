@@ -1,4 +1,4 @@
-"""Versioned fixed activation scales for the H3 VAE INT8 encoder."""
+"""Versioned fixed input scales for the H3 VAE INT8 encoder."""
 
 from types import MappingProxyType
 
@@ -38,6 +38,6 @@ _P995_SCALES = {
     "conv_out": 0.004467581398785114,
 }
 
-P995_ACTIVATION_SCALES = MappingProxyType(_P995_SCALES)
+P995_INPUT_SCALES = MappingProxyType(_P995_SCALES)
 
-__all__ = ["P995_ACTIVATION_SCALES"]
+__all__ = ["P995_INPUT_SCALES"]

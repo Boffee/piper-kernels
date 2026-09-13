@@ -21,8 +21,8 @@ minimax_h3_vae_convrot_int8_compile_options()
 assert 'piper_kernels.specializations.minimax_h3_vae.conv3d' not in sys.modules
 assert 'piper_kernels.conv3d' not in sys.modules
 
-from piper_kernels.specializations.minimax_h3_vae.conv3d import P995_ACTIVATION_SCALES
-assert len(P995_ACTIVATION_SCALES) == 29
+from piper_kernels.specializations.minimax_h3_vae.conv3d import P995_INPUT_SCALES
+assert len(P995_INPUT_SCALES) == 29
 assert 'piper_kernels.conv3d' not in sys.modules
 """,
         ],
