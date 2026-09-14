@@ -44,23 +44,24 @@ def _sparse_piper_attention_kernel(
     value_ptr,
     query_scale_ptr,
     parameters_ptr,
-    mean_ptr,
-    coarse_ptr,
-    gate_ptr,
-    lengths_ptr,
+    value_mean_ptr,
+    coarse_output_ptr,
+    coarse_gate_ptr,
+    block_lengths_ptr,
     routes_ptr,
-    keep_ptr,
-    route_offsets_ptr,
+    head_keep_blocks_ptr,
+    route_head_offsets_ptr,
     output_ptr,
     query_block_offset,
-    global_block_offset,
-    query_storage_length: gl.constexpr,
-    storage_length: gl.constexpr,
-    logical_length: gl.constexpr,
-    sparse_blocks: gl.constexpr,
+    global_query_block_offset,
+    query_storage_sequence_length: gl.constexpr,
+    storage_sequence_length: gl.constexpr,
+    logical_sequence_length: gl.constexpr,
+    sparse_key_blocks: gl.constexpr,
     sparse_query_blocks: gl.constexpr,
     stride_rb: gl.constexpr,
     stride_rq: gl.constexpr,
+    stride_rr: gl.constexpr,
     stride_ob: gl.constexpr,
     stride_oh: gl.constexpr,
     stride_on: gl.constexpr,
@@ -72,9 +73,9 @@ def _sparse_piper_attention_kernel(
     stride_gn: gl.constexpr,
     heads: gl.constexpr,
     head_dim: gl.constexpr,
-    has_lengths: gl.constexpr,
-    has_dense_queries: gl.constexpr,
-    has_coarse: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
+    has_dense_query_suffix: gl.constexpr,
+    apply_coarse_residual: gl.constexpr,
 ):
     # Promote global tensor bases and caller strides before multiplication,
     # not after an i32 overflow. Fragment helpers derive local address width
@@ -84,7 +85,7 @@ def _sparse_piper_attention_kernel(
     bh = batch * heads + head
     local_block = gl.program_id(0)
     query_block = query_block_offset + local_block
-    global_block = global_block_offset + local_block
+    global_query_block = global_query_block_offset + local_block
     row_layout: gl.constexpr = gl.SliceLayout(2, MMA_LAYOUT)
     block_layout: gl.constexpr = gl.SliceLayout(1, row_layout)
     blocks = gl.full([1], query_block, gl.int32, block_layout)
@@ -96,45 +97,54 @@ def _sparse_piper_attention_kernel(
         routes_ptr
         + batch * stride_rb
         + blocks.to(gl.int64) * stride_rq
-        + gl.load(route_offsets_ptr + head)
+        + gl.load(route_head_offsets_ptr + head) * stride_rr
     )
-    routed_count = gl.load(keep_ptr + head)
-    use_routes = global_block < sparse_query_blocks if has_dense_queries else True
-    selected_count = gl.where(use_routes, routed_count, sparse_blocks)
-    tile_count = selected_count + storage_length // 64 - sparse_blocks
+    routed_count = gl.load(head_keep_blocks_ptr + head)
+    use_routes = global_query_block < sparse_query_blocks if has_dense_query_suffix else True
+    selected_count = gl.where(use_routes, routed_count, sparse_key_blocks)
+    tile_count = selected_count + storage_sequence_length // 64 - sparse_key_blocks
     query = query_fragments(
-        query_ptr + bh * query_storage_length * head_dim, blocks, query_storage_length, head_dim
+        query_ptr + bh * query_storage_sequence_length * head_dim,
+        blocks,
+        query_storage_sequence_length,
+        head_dim,
     )
     q_scale = gl.load(
         query_scale_ptr
-        + bh * (query_storage_length // 32)
+        + bh * (query_storage_sequence_length // 32)
         + blocks[:, None] * 2
         + rows[None, :] // 32
     )
     numerator = gl.zeros([1, 64, head_dim], gl.float32, MMA_LAYOUT)
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
-    parameters = parameters_ptr + bh * (storage_length // 64) * PARAMETER_COUNT
+    parameters = parameters_ptr + bh * (storage_sequence_length // 64) * PARAMETER_COUNT
 
     for pair in range(gl.cdiv(tile_count, 2)):
         tile_0 = tile_offset(
-            routes, pair * 2, routed_count, selected_count, sparse_blocks, 1, use_routes
+            routes,
+            pair * 2,
+            routed_count,
+            selected_count,
+            sparse_key_blocks,
+            stride_rr,
+            use_routes,
         )
         tile_1 = tile_offset(
             routes,
             gl.minimum(pair * 2 + 1, tile_count - 1),
             routed_count,
             selected_count,
-            sparse_blocks,
-            1,
+            sparse_key_blocks,
+            stride_rr,
             use_routes,
         )
         scores = qk_pair(
             query,
-            key_ptr + bh * storage_length * head_dim,
+            key_ptr + bh * storage_sequence_length * head_dim,
             tile_0,
             tile_1,
-            storage_length,
+            storage_sequence_length,
             head_dim,
         )
         parameters_0 = parameters + tile_0 * PARAMETER_COUNT
@@ -143,12 +153,12 @@ def _sparse_piper_attention_kernel(
         key_scale_1 = gl.load(parameters_1 + KEY_SCALE)
         scale_0 = q_scale * key_scale_0[:, None]
         scale_1 = q_scale * key_scale_1[:, None]
-        if has_lengths:
-            length_0 = gl.load(lengths_ptr + tile_0)
-            length_1 = gl.load(lengths_ptr + tile_1)
+        if mask_block_lengths:
+            length_0 = gl.load(block_lengths_ptr + tile_0)
+            length_1 = gl.load(block_lengths_ptr + tile_1)
         else:
-            length_0 = gl.minimum(64, logical_length - tile_0 * 64)
-            length_1 = gl.minimum(64, logical_length - tile_1 * 64)
+            length_0 = gl.minimum(64, logical_sequence_length - tile_0 * 64)
+            length_1 = gl.minimum(64, logical_sequence_length - tile_1 * 64)
         complete = (
             (gl.sum(length_0, 0) == 64) & (gl.sum(length_1, 0) == 64) & (pair * 2 + 1 < tile_count)
         )
@@ -219,30 +229,30 @@ def _sparse_piper_attention_kernel(
         )
         numerator = pv_pair(
             probabilities,
-            value_ptr + bh * storage_length * head_dim,
+            value_ptr + bh * storage_sequence_length * head_dim,
             tile_0,
             tile_1,
             numerator,
             current_weight,
-            storage_length,
+            storage_sequence_length,
         )
         running_max = next_max
 
     inverse_denominator = 1.0 / (gl.maximum(denominator, 1e-30) * 255.0)
     result = numerator * inverse_denominator[:, :, None]
-    result += gl.load(mean_ptr + bh * head_dim + features)[None, None, :]
+    result += gl.load(value_mean_ptr + bh * head_dim + features)[None, None, :]
     output_rows = (local_block * 64 + rows).to(gl.int64)
-    valid_rows = (global_block * 64 + rows < logical_length) | has_lengths
-    if has_coarse:
+    valid_rows = (global_query_block * 64 + rows < logical_sequence_length) | mask_block_lengths
+    if apply_coarse_residual:
         coarse = gl.load(
-            coarse_ptr
+            coarse_output_ptr
             + batch * stride_cb
             + head * stride_ch
             + query_block.to(gl.int64) * stride_cq
             + features
         )
         gate = gl.load(
-            gate_ptr
+            coarse_gate_ptr
             + batch * stride_gb
             + head * stride_gh
             + output_rows[None, :, None] * stride_gn
@@ -315,54 +325,43 @@ def _launch_sparse_piper_attention(
     if packed is not None and prepared.context is not packed.source:
         raise ValueError("bound sparse Piper launcher requires its original context")
     _validate_context(prepared.context)
-    blocks, global_offset = validate_attention_launch(
+    launch = validate_attention_launch(
         prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
     )
     if packed is None:
         packed = pack_context(prepared.context)
     query, context = prepared.query, prepared.context
-    batch, heads, query_length, head_dim = query.data.shape
-    storage_length = context.key.shape[2]
-    coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
-    gate_strides = (
-        (0, 0, 0)
-        if coarse_gate is None
-        else (coarse_gate.stride(0), coarse_gate.stride(2), coarse_gate.stride(1))
-    )
     with device_context(output.device):
-        _sparse_piper_attention_kernel[(blocks, heads, batch)](
+        _sparse_piper_attention_kernel[(launch.query_block_count, launch.heads, launch.batch)](
             query.data,
             context.key,
             packed.value,
             query.scale,
             packed.parameters,
             context.value_mean,
-            context.value_mean if coarse_output is None else coarse_output,
-            output if coarse_gate is None else coarse_gate,
-            context.head_keep_blocks if context.block_lengths is None else context.block_lengths,
+            launch.coarse_output,
+            launch.coarse_gate,
+            launch.block_lengths,
             query.routes,
             context.head_keep_blocks,
             context.route_head_offsets,
             output,
-            query_block_offset,
-            global_offset,
-            query_length,
-            storage_length,
-            context.logical_sequence_length,
-            context.sparse_key_blocks,
-            storage_length // 64
-            if context.sparse_query_blocks is None
-            else context.sparse_query_blocks,
-            query.routes.stride(0),
-            query.routes.stride(1),
-            *output.stride()[:3],
-            *coarse_strides,
-            *gate_strides,
-            heads,
-            head_dim,
-            context.block_lengths is not None,
-            context.sparse_query_blocks is not None,
-            coarse_output is not None,
+            launch.query_block_offset,
+            launch.global_query_block_offset,
+            launch.query_storage_sequence_length,
+            launch.storage_sequence_length,
+            launch.logical_sequence_length,
+            launch.sparse_key_blocks,
+            launch.sparse_query_blocks,
+            *launch.route_strides,
+            *launch.output_strides,
+            *launch.coarse_strides,
+            *launch.gate_strides,
+            launch.heads,
+            launch.head_dim,
+            launch.mask_block_lengths,
+            launch.has_dense_query_suffix,
+            launch.apply_coarse_residual,
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=(("target-features", "+cumode"),),
