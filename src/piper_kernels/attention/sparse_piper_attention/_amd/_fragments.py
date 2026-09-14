@@ -107,11 +107,16 @@ def _join_matrix(fragments):
 
 
 @gluon.jit
-def query_fragments(query_ptr, blocks, query_storage_length: gl.constexpr, head_dim: gl.constexpr):
+def query_fragments(
+    query_ptr,
+    blocks,
+    use_64bit_query_offsets: gl.constexpr,
+    head_dim: gl.constexpr,
+):
     threads = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT))
     lane = threads % 32
     blocks = gl.convert_layout(blocks, gl.SliceLayout(1, VECTOR_LAYOUT))
-    if query_storage_length * (head_dim // 8) > 2147483648:
+    if use_64bit_query_offsets:
         blocks = blocks.to(gl.int64)
     rows = blocks[:, None] * 64 + (threads // 32 * 16 + lane % 16)[None, :]
     words = query_ptr.to(gl.pointer_type(gl.uint64))
@@ -126,8 +131,15 @@ def query_fragments(query_ptr, blocks, query_storage_length: gl.constexpr, head_
 
 
 @gluon.jit
-def qk_pair(query, key_ptr, tile_0, tile_1, storage_length: gl.constexpr, head_dim: gl.constexpr):
-    offset_type: gl.constexpr = gl.uint32 if storage_length * head_dim <= 4294967296 else gl.int64
+def qk_pair(
+    query,
+    key_ptr,
+    tile_0,
+    tile_1,
+    use_64bit_context_offsets: gl.constexpr,
+    head_dim: gl.constexpr,
+):
+    offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
     tile_0 = gl.convert_layout(tile_0, gl.SliceLayout(1, VECTOR_LAYOUT))
     tile_1 = gl.convert_layout(tile_1, gl.SliceLayout(1, VECTOR_LAYOUT))
@@ -219,7 +231,13 @@ def rescale_numerator(numerator, old_weight):
 
 @gluon.jit
 def pv_pair(
-    probability, value_ptr, tile_0, tile_1, numerator, current_weight, storage_length: gl.constexpr
+    probability,
+    value_ptr,
+    tile_0,
+    tile_1,
+    numerator,
+    current_weight,
+    use_64bit_context_offsets: gl.constexpr,
 ):
     """Accumulate each D16 product directly into the already-rescaled numerator."""
     head_dim: gl.constexpr = numerator.shape[2]
@@ -234,7 +252,7 @@ def pv_pair(
             ),
         )
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
-    offset_type: gl.constexpr = gl.uint32 if storage_length * head_dim <= 4294967296 else gl.int64
+    offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     start_0 = gl.convert_layout(tile_0, gl.SliceLayout(1, VECTOR_LAYOUT)).to(offset_type) * 64
     start_1 = gl.convert_layout(tile_1, gl.SliceLayout(1, VECTOR_LAYOUT)).to(offset_type) * 64
     numerators = four_fragments(numerator) if head_dim == 64 else eight_fragments(numerator)

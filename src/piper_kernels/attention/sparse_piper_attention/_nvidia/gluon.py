@@ -19,7 +19,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
-from .._launch import validate_attention_launch
+from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
 from .._prepared import _PreparedSparsePiperAttention
 from . import policy
 
@@ -406,17 +406,7 @@ def _piper_pv_pair(
     return _rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
-@gluon.jit(
-    do_not_specialize=[
-        "logical_sequence_length",
-        "query_block_offset",
-        "global_query_block_offset",
-        "sparse_key_blocks",
-        "sparse_query_blocks",
-        "stride_rb",
-        "stride_rq",
-    ]
-)
+@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
 def _sparse_piper_attention_kernel(  # noqa: PLR0912
     query_desc,
     key_desc,

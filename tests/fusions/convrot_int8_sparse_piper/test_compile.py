@@ -40,13 +40,13 @@ _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 
 def _reset_attention_kernel_cache():
-    """Clear the active backend's device cache and return its kernel and target."""
+    """Clear and return the active backend's attention kernel."""
     target = AcceleratorTarget.from_device(torch.device("cuda"))
     module = attention_backend.amd_gluon if target.is_amd_hip else attention_backend.nvidia_gluon
     assert module is not None
     kernel = module._sparse_piper_attention_kernel
     kernel.device_caches.clear()
-    return kernel, target
+    return kernel
 
 
 def _compiled_specialization_count(kernel) -> int:
@@ -1480,7 +1480,7 @@ def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
 )
 def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> None:
     torch.manual_seed(709)
-    attention_kernel, target = _reset_attention_kernel_cache()
+    attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
@@ -1542,9 +1542,8 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
         capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
     )
-    # Characterize the device cache separately from Dynamo's single graph.
-    expected_specializations = len(cases) if target.is_amd_hip else 1
-    assert _compiled_specialization_count(attention_kernel) == expected_specializations
+    # The dynamic Dynamo graph must also reuse one compiled device specialization.
+    assert _compiled_specialization_count(attention_kernel) == 1
 
 
 @pytest.mark.gpu
@@ -1554,7 +1553,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
 )
 def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(711)
-    attention_kernel, target = _reset_attention_kernel_cache()
+    attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicCoarseSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
@@ -1620,9 +1619,8 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
         )
         == 1
     )
-    # Characterize the device cache separately from Dynamo's single graph.
-    expected_specializations = len(cases) if target.is_amd_hip else 1
-    assert _compiled_specialization_count(attention_kernel) == expected_specializations
+    # The dynamic Dynamo graph must also reuse one compiled device specialization.
+    assert _compiled_specialization_count(attention_kernel) == 1
 
 
 @pytest.mark.gpu

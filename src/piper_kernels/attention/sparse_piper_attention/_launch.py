@@ -11,6 +11,16 @@ from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_D
 from ._dtype import SUPPORTED_DTYPES
 from ._prepared import _PreparedSparsePiperAttention
 
+_DO_NOT_SPECIALIZE_ARGUMENTS = (
+    "query_block_offset",
+    "global_query_block_offset",
+    "logical_sequence_length",
+    "sparse_key_blocks",
+    "sparse_query_blocks",
+    "stride_rb",
+    "stride_rq",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _ValidatedAttentionLaunch:
@@ -182,9 +192,21 @@ def validate_attention_launch(
         logical_sequence_length=logical_sequence_length,
         sparse_key_blocks=context.sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
-        route_strides=tuple(query_state.routes.stride()),
-        output_strides=tuple(output.stride()[:3]),
-        coarse_strides=((0, 0, 0) if coarse_output is None else tuple(coarse_output.stride()[:3])),
+        route_strides=(
+            query_state.routes.stride(0),
+            query_state.routes.stride(1),
+            query_state.routes.stride(2),
+        ),
+        output_strides=(output.stride(0), output.stride(1), output.stride(2)),
+        coarse_strides=(
+            (0, 0, 0)
+            if coarse_output is None
+            else (
+                coarse_output.stride(0),
+                coarse_output.stride(1),
+                coarse_output.stride(2),
+            )
+        ),
         gate_strides=(
             (0, 0, 0)
             if coarse_gate is None
