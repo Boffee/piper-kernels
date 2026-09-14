@@ -8,42 +8,37 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
-from piper_kernels.attention.sparse_piper_attention._amd.gluon import _sparse_piper_attention_kernel
+from piper_kernels.attention.sparse_piper_attention._amd.gluon import (
+    _requires_64bit_context_offsets,
+    _requires_64bit_query_offsets,
+    _sparse_piper_attention_kernel,
+)
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
 
 def _compile_attention(
     architecture,
-    has_lengths,
-    has_dense_queries,
-    has_coarse,
-    storage_length=256,
+    mask_block_lengths,
+    has_dense_query_suffix,
+    apply_coarse_residual,
+    storage_sequence_length=256,
     head_dim=128,
     output_dtype="bf16",
 ):
     constants = {
-        "query_storage_length": storage_length,
-        "storage_length": storage_length,
-        "heads": 2,
         "head_dim": head_dim,
-        "logical_length": storage_length,
-        "sparse_blocks": 3,
-        "sparse_query_blocks": 2,
-        "stride_rb": 16,
-        "stride_rq": 4,
-        "stride_ob": 65536,
-        "stride_oh": 32768,
-        "stride_on": head_dim,
-        "stride_cb": 1024,
-        "stride_ch": 512,
-        "stride_cq": head_dim,
-        "stride_gb": 65536,
-        "stride_gh": head_dim,
-        "stride_gn": 2 * head_dim,
-        "has_lengths": has_lengths,
-        "has_dense_queries": has_dense_queries,
-        "has_coarse": has_coarse,
+        "use_64bit_query_offsets": _requires_64bit_query_offsets(
+            storage_sequence_length,
+            head_dim,
+        ),
+        "use_64bit_context_offsets": _requires_64bit_context_offsets(
+            storage_sequence_length,
+            head_dim,
+        ),
+        "mask_block_lengths": mask_block_lengths,
+        "has_dense_query_suffix": has_dense_query_suffix,
+        "apply_coarse_residual": apply_coarse_residual,
     }
     signature = {
         name: "i32" for name in _sparse_piper_attention_kernel.arg_names if name not in constants
@@ -55,13 +50,13 @@ def _compile_attention(
             "value_ptr": "*i8",
             "query_scale_ptr": "*fp32",
             "parameters_ptr": "*fp32",
-            "mean_ptr": "*fp32",
-            "coarse_ptr": "*fp32",
-            "gate_ptr": f"*{output_dtype}",
-            "lengths_ptr": "*i32",
+            "value_mean_ptr": "*fp32",
+            "coarse_output_ptr": "*fp32",
+            "coarse_gate_ptr": f"*{output_dtype}",
+            "block_lengths_ptr": "*i32",
             "routes_ptr": "*u16",
-            "keep_ptr": "*i32",
-            "route_offsets_ptr": "*i32",
+            "head_keep_blocks_ptr": "*i32",
+            "route_head_offsets_ptr": "*i32",
             "output_ptr": f"*{output_dtype}",
         }
     )
@@ -78,12 +73,22 @@ def _compile_attention(
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("has_lengths", [False, True])
-@pytest.mark.parametrize("has_dense_queries", [False, True])
-@pytest.mark.parametrize("has_coarse", [False, True])
-def test_fused_amd_compilation(architecture, has_lengths, has_dense_queries, has_coarse, head_dim):
+@pytest.mark.parametrize("mask_block_lengths", [False, True])
+@pytest.mark.parametrize("has_dense_query_suffix", [False, True])
+@pytest.mark.parametrize("apply_coarse_residual", [False, True])
+def test_fused_amd_compilation(
+    architecture,
+    mask_block_lengths,
+    has_dense_query_suffix,
+    apply_coarse_residual,
+    head_dim,
+):
     compiled = _compile_attention(
-        architecture, has_lengths, has_dense_queries, has_coarse, head_dim=head_dim
+        architecture,
+        mask_block_lengths,
+        has_dense_query_suffix,
+        apply_coarse_residual,
+        head_dim=head_dim,
     )
     assert compiled.asm["hsaco"]
     matrix_instructions = [
@@ -102,10 +107,15 @@ def test_fused_amd_compilation(architecture, has_lengths, has_dense_queries, has
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("dtype", ["fp16", "fp32"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("has_coarse", [False, True])
-def test_output_dtype_amd_compilation(architecture, dtype, head_dim, has_coarse):
+@pytest.mark.parametrize("apply_coarse_residual", [False, True])
+def test_output_dtype_amd_compilation(architecture, dtype, head_dim, apply_coarse_residual):
     compiled = _compile_attention(
-        architecture, True, True, has_coarse, head_dim=head_dim, output_dtype=dtype
+        architecture,
+        True,
+        True,
+        apply_coarse_residual,
+        head_dim=head_dim,
+        output_dtype=dtype,
     )
     assert compiled.asm["hsaco"]
     assert f'!tt.ptr<{dtype.replace("fp", "f")}> loc("output_ptr"' in compiled.asm["ttgir"]
@@ -115,11 +125,17 @@ def test_output_dtype_amd_compilation(architecture, dtype, head_dim, has_coarse)
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_dense_suffix_and_query_word_offsets_can_use_wide_addressing(architecture, head_dim):
+def test_runtime_lengths_support_wide_query_and_context_offsets(architecture, head_dim):
     # Compile only: a small UINT16 sparse prefix does not bound dense storage.
     # This also exceeds the signed-32-bit Q uint64-word-offset range.
+    storage_sequence_length = (1 << 31) // (head_dim // 8) + 64
     compiled = _compile_attention(
-        architecture, False, False, False, (1 << 31) // (head_dim // 8) + 64, head_dim
+        architecture,
+        False,
+        False,
+        False,
+        storage_sequence_length=storage_sequence_length,
+        head_dim=head_dim,
     )
     assert compiled.asm["hsaco"]
     assert re.search(r"arith\.(?:muli|shli) .*: tensor<1x128xi64", compiled.asm["ttgir"])

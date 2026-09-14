@@ -19,7 +19,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
-from .._launch import validate_attention_launch
+from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
 from .._prepared import _PreparedSparsePiperAttention
 from . import policy
 
@@ -406,17 +406,7 @@ def _piper_pv_pair(
     return _rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
-@gluon.jit(
-    do_not_specialize=[
-        "logical_sequence_length",
-        "query_block_offset",
-        "global_query_block_offset",
-        "sparse_key_blocks",
-        "sparse_query_blocks",
-        "stride_rb",
-        "stride_rq",
-    ]
-)
+@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
 def _sparse_piper_attention_kernel(  # noqa: PLR0912
     query_desc,
     key_desc,
@@ -864,61 +854,32 @@ def _launch_sparse_piper_attention(
     """
     query_state = prepared.query
     context = prepared.context
-    query = query_state.data
-    batch, heads, query_storage_sequence_length, head_dim = query.shape
-    logical_sequence_length = context.logical_sequence_length
-    storage_sequence_length = context.key.shape[2]
-    has_block_lengths = context.block_lengths is not None
-    # A compact ragged tile outside the sparse prefix is visited last by the
-    # dense suffix. Caller-supplied routes may put it anywhere within the
-    # sparse prefix, requiring masks in the ordinary loop as well.
-    ragged_tail_is_routed = (
-        not has_block_lengths and context.sparse_key_blocks * _BLOCK_N > logical_sequence_length
-    )
-    total_query_blocks = storage_sequence_length // TILE_ROWS
-    sparse_query_blocks = context.sparse_query_blocks
-    resolved_query_block_count, global_query_block_offset = validate_attention_launch(
+    launch = validate_attention_launch(
         prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
     )
-    has_coarse_residual = coarse_output is not None
-    skip_dense_routing = context.routes_per_query == 0
-    if skip_dense_routing and head_dim != 64:
+    if launch.skip_dense_routing and launch.head_dim != 64:
         raise ValueError("skip_dense_routing requires NVIDIA D64 attention")
-    query_rows = resolved_query_block_count * TILE_ROWS
     block_m, num_warps = policy.select_attention_schedule(
-        head_dim,
-        query_rows,
-        storage_sequence_length,
-        skip_dense_routing=skip_dense_routing,
-        has_coarse_residual=has_coarse_residual,
+        launch.head_dim,
+        launch.query_rows,
+        launch.storage_sequence_length,
+        skip_dense_routing=launch.skip_dense_routing,
+        has_coarse_residual=launch.apply_coarse_residual,
         selected_key_rows=(
-            context.routes_per_query // heads * _BLOCK_N
-            + storage_sequence_length
-            - context.sparse_key_blocks * _BLOCK_N
+            context.routes_per_query // launch.heads * _BLOCK_N
+            + launch.storage_sequence_length
+            - launch.sparse_key_blocks * _BLOCK_N
         ),
     )
     with device_context(output.device):
         install_uint8_int8_dot_hook()
 
         query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared, block_m)
-        routes = query_state.routes
-        route_head_offsets = context.route_head_offsets
-        stride_rb = routes.stride(0)
-        stride_rq = routes.stride(1)
-        stride_rr = routes.stride(2)
-        coarse_tensor = context.value_mean if coarse_output is None else coarse_output
-        gate_tensor = output if coarse_gate is None else coarse_gate
-        coarse_strides = (0, 0, 0) if coarse_output is None else coarse_output.stride()[:3]
-        gate_strides = (
-            (0, 0, 0)
-            if coarse_gate is None
-            else (
-                coarse_gate.stride(0),
-                coarse_gate.stride(2),
-                coarse_gate.stride(1),
-            )
+        grid = (
+            (launch.query_rows + block_m - 1) // block_m,
+            launch.heads,
+            launch.batch,
         )
-        grid = ((query_rows + block_m - 1) // block_m, heads, batch)
         _sparse_piper_attention_kernel[grid](
             query_desc,
             key_desc,
@@ -927,44 +888,36 @@ def _launch_sparse_piper_attention(
             context.key_scale,
             context.value_scale_multiplier,
             context.value_mean,
-            coarse_tensor,
-            gate_tensor,
-            (
-                context.block_lengths
-                if context.block_lengths is not None
-                else context.head_keep_blocks
-            ),
-            routes,
+            launch.coarse_output,
+            launch.coarse_gate,
+            launch.block_lengths,
+            query_state.routes,
             context.head_keep_blocks,
-            route_head_offsets,
+            context.route_head_offsets,
             output,
-            query_block_offset,
-            global_query_block_offset,
-            query_storage_sequence_length,
-            storage_sequence_length,
-            logical_sequence_length,
-            context.sparse_key_blocks,
-            total_query_blocks if sparse_query_blocks is None else sparse_query_blocks,
-            stride_rb,
-            stride_rq,
-            stride_rr,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            *coarse_strides,
-            *gate_strides,
-            heads,
-            head_dim,
-            has_block_lengths,
-            not has_block_lengths and logical_sequence_length != storage_sequence_length,
-            sparse_query_blocks is not None,
-            has_coarse_residual,
-            ragged_tail_is_routed,
+            launch.query_block_offset,
+            launch.global_query_block_offset,
+            launch.query_storage_sequence_length,
+            launch.storage_sequence_length,
+            launch.logical_sequence_length,
+            launch.sparse_key_blocks,
+            launch.sparse_query_blocks,
+            *launch.route_strides,
+            *launch.output_strides,
+            *launch.coarse_strides,
+            *launch.gate_strides,
+            launch.heads,
+            launch.head_dim,
+            launch.mask_block_lengths,
+            launch.mask_ragged_tail,
+            launch.has_dense_query_suffix,
+            launch.apply_coarse_residual,
+            launch.ragged_tail_is_routed,
             block_m,
             num_warps,
-            skip_dense_routing,
-            output.shape[2] % block_m != 0,
-            output.shape[2],
+            launch.skip_dense_routing,
+            launch.output_sequence_length % block_m != 0,
+            launch.output_sequence_length,
             num_warps=num_warps,
             num_stages=1,
         )

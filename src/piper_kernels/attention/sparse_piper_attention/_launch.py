@@ -2,12 +2,60 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 
 from ._dtype import SUPPORTED_DTYPES
 from ._prepared import _PreparedSparsePiperAttention
+
+_DO_NOT_SPECIALIZE_ARGUMENTS = (
+    "query_block_offset",
+    "global_query_block_offset",
+    "logical_sequence_length",
+    "sparse_key_blocks",
+    "sparse_query_blocks",
+    "stride_rb",
+    "stride_rq",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedAttentionLaunch:
+    """Backend-neutral kernel operands resolved by common launch validation."""
+
+    batch: int
+    heads: int
+    head_dim: int
+    query_block_offset: int
+    query_block_count: int
+    global_query_block_offset: int
+    query_storage_sequence_length: int
+    storage_sequence_length: int
+    output_sequence_length: int
+    logical_sequence_length: int
+    sparse_key_blocks: int
+    sparse_query_blocks: int
+    route_strides: tuple[int, int, int]
+    output_strides: tuple[int, int, int]
+    coarse_strides: tuple[int, int, int]
+    gate_strides: tuple[int, int, int]
+    coarse_output: torch.Tensor
+    coarse_gate: torch.Tensor
+    block_lengths: torch.Tensor
+    mask_block_lengths: bool
+    mask_ragged_tail: bool
+    has_dense_query_suffix: bool
+    apply_coarse_residual: bool
+    skip_dense_routing: bool
+    ragged_tail_is_routed: bool
+
+    @property
+    def query_rows(self) -> int:
+        """Return the number of output rows covered by this launch."""
+        return self.query_block_count * TILE_ROWS
 
 
 def _resolve_query_block_range(
@@ -48,8 +96,8 @@ def validate_attention_launch(
     query_block_count: int | None,
     coarse_output: torch.Tensor | None,
     coarse_gate: torch.Tensor | None,
-) -> tuple[int, int]:
-    """Validate output/coarse tensors; return block count and global offset."""
+) -> _ValidatedAttentionLaunch:
+    """Validate tensors and resolve the common metadata consumed by native kernels."""
     query_state = prepared.query
     context = prepared.context
     query = query_state.data
@@ -114,4 +162,63 @@ def validate_attention_launch(
             or coarse_gate.stride(-1) != 1
         ):
             raise ValueError("sparse Piper coarse gate must match the local attention output")
-    return resolved_query_block_count, global_query_block_offset
+    has_dense_query_suffix = context.sparse_query_blocks is not None
+    sparse_query_blocks = (
+        storage_sequence_length // TILE_ROWS
+        if context.sparse_query_blocks is None
+        else context.sparse_query_blocks
+    )
+    mask_ragged_tail = not has_block_lengths and logical_sequence_length != storage_sequence_length
+    resolved_coarse_output = context.value_mean if coarse_output is None else coarse_output
+    resolved_coarse_gate = output if coarse_gate is None else coarse_gate
+    block_lengths_operand = (
+        context.head_keep_blocks if context.block_lengths is None else context.block_lengths
+    )
+    # The dense suffix visits a compact ragged tile last. Caller-provided routes
+    # can also place that tile in the sparse prefix, which needs an ordinary-loop mask.
+    ragged_tail_is_routed = (
+        mask_ragged_tail and context.sparse_key_blocks * TILE_ROWS > logical_sequence_length
+    )
+    return _ValidatedAttentionLaunch(
+        batch=batch,
+        heads=heads,
+        head_dim=head_dim,
+        query_block_offset=query_block_offset,
+        query_block_count=resolved_query_block_count,
+        global_query_block_offset=global_query_block_offset,
+        query_storage_sequence_length=query_storage_sequence_length,
+        storage_sequence_length=storage_sequence_length,
+        output_sequence_length=output_sequence_length,
+        logical_sequence_length=logical_sequence_length,
+        sparse_key_blocks=context.sparse_key_blocks,
+        sparse_query_blocks=sparse_query_blocks,
+        route_strides=(
+            query_state.routes.stride(0),
+            query_state.routes.stride(1),
+            query_state.routes.stride(2),
+        ),
+        output_strides=(output.stride(0), output.stride(1), output.stride(2)),
+        coarse_strides=(
+            (0, 0, 0)
+            if coarse_output is None
+            else (
+                coarse_output.stride(0),
+                coarse_output.stride(1),
+                coarse_output.stride(2),
+            )
+        ),
+        gate_strides=(
+            (0, 0, 0)
+            if coarse_gate is None
+            else (coarse_gate.stride(0), coarse_gate.stride(2), coarse_gate.stride(1))
+        ),
+        coarse_output=resolved_coarse_output,
+        coarse_gate=resolved_coarse_gate,
+        block_lengths=block_lengths_operand,
+        mask_block_lengths=has_block_lengths,
+        mask_ragged_tail=mask_ragged_tail,
+        has_dense_query_suffix=has_dense_query_suffix,
+        apply_coarse_residual=has_coarse_residual,
+        skip_dense_routing=context.routes_per_query == 0,
+        ragged_tail_is_routed=ragged_tail_is_routed,
+    )

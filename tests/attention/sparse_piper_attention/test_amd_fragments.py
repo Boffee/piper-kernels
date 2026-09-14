@@ -118,7 +118,7 @@ def _paired_pv_kernel(
         gl.full([1], start_1 // 64, gl.int32, block_layout),
         gl.load(numerator_ptr + offsets),
         gl.load(weight_ptr + rows[None, :]),
-        256,
+        False,
     )
     gl.store(output_ptr + offsets, result)
 
@@ -188,13 +188,13 @@ def test_paired_pv_matches_exact_reference(starts, values, recurrence, head_dim)
 @gluon.jit
 def _qk_probe(query_ptr, key_ptr, output_ptr, tile_0, tile_1, head_dim: gl.constexpr):
     block_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, MMA_LAYOUT))
-    query = query_fragments(query_ptr, gl.full([1], 0, gl.int32, block_layout), 64, head_dim)
+    query = query_fragments(query_ptr, gl.full([1], 0, gl.int32, block_layout), False, head_dim)
     result = qk_pair(
         query,
         key_ptr,
         gl.full([1], tile_0, gl.int32, block_layout),
         gl.full([1], tile_1, gl.int32, block_layout),
-        256,
+        False,
         head_dim,
     )
     rows = gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, MMA_LAYOUT)))

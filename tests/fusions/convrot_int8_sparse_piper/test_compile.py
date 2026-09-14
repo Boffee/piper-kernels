@@ -11,6 +11,8 @@ from piper_kernels import (
     SparsePiperAttention,
     sparse_piper_coarse_residual,
 )
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
@@ -35,6 +37,21 @@ from .._accuracy import assert_fusion_output_close
 from ._helpers import output_available, projection_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
+
+
+def _reset_attention_kernel_cache():
+    """Clear and return the active backend's attention kernel."""
+    target = AcceleratorTarget.from_device(torch.device("cuda"))
+    module = attention_backend.amd_gluon if target.is_amd_hip else attention_backend.nvidia_gluon
+    assert module is not None
+    kernel = module._sparse_piper_attention_kernel
+    kernel.device_caches.clear()
+    return kernel
+
+
+def _compiled_specialization_count(kernel) -> int:
+    """Count compiled variants across accelerator devices."""
+    return sum(len(device_cache[0]) for device_cache in kernel.device_caches.values())
 
 
 class _SparseProjectionAttention(torch.nn.Module):
@@ -1463,6 +1480,7 @@ def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
 )
 def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> None:
     torch.manual_seed(709)
+    attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
@@ -1524,6 +1542,8 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
         capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
     )
+    # The dynamic Dynamo graph must also reuse one compiled device specialization.
+    assert _compiled_specialization_count(attention_kernel) == 1
 
 
 @pytest.mark.gpu
@@ -1533,6 +1553,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
 )
 def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(711)
+    attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicCoarseSparseProjectionAttention().eval()
     capture = _TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
@@ -1546,8 +1567,9 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
         options=options,
     )
 
+    cases = ((193, 2), (256, 3), (257, 3))
     with torch.no_grad():
-        for sequence, sparse_key_blocks in ((193, 2), (256, 3), (257, 3)):
+        for sequence, sparse_key_blocks in cases:
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -1597,6 +1619,8 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
         )
         == 1
     )
+    # The dynamic Dynamo graph must also reuse one compiled device specialization.
+    assert _compiled_specialization_count(attention_kernel) == 1
 
 
 @pytest.mark.gpu
