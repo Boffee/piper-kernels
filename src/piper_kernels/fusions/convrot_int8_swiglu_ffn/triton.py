@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
+from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.linear import _bias
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.convrot.int8 import _backend
@@ -125,7 +125,7 @@ def _run_chunked_swiglu_ffn(
     value_input_scale: torch.Tensor | None = None,
     down_input_scale: torch.Tensor | None = None,
     *,
-    gated_updates: gated_updates_backend.IndexedGatedUpdates | None = None,
+    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
 ) -> torch.Tensor:
     """Run a semantic gate/value SwiGLU FFN with bounded row workspaces."""
     input_features, intermediate_features, output_features = _validate_inputs(
@@ -155,7 +155,7 @@ def _run_chunked_swiglu_ffn(
     gate_layout = (
         None
         if gated_updates is None
-        else gated_updates_backend.validate_indexed_gated_updates(
+        else indexed_updates.validate_indexed_gated_updates(
             input,
             gated_updates,
             output_features,
@@ -262,7 +262,7 @@ def _run_chunked_swiglu_ffn(
         if gated_updates is not None:
             assert base_2d is not None
             assert gate_layout is not None
-            gated_updates_backend.apply_indexed_gated_updates(
+            indexed_updates.apply_indexed_gated_updates(
                 output_chunk,
                 base_2d[start:stop],
                 output_2d[start:stop],
@@ -384,7 +384,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
         gate_input_scale,
         value_input_scale,
         down_input_scale,
-        gated_updates=gated_updates_backend.IndexedGatedUpdates(
+        gated_updates=indexed_updates.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,
             update_gate=update_gate,

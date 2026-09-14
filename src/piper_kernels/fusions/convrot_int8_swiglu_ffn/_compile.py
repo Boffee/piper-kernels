@@ -18,16 +18,17 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
-from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
+from piper_kernels.fusions.ffn import _compile as ffn_compile
+from piper_kernels.fusions.ffn import _pattern as ffn_pattern
+from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
-from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
 from piper_kernels.linear import _bias, _storage
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.convrot.int8 import _backend, _compile_fx
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 
-from . import triton as ffn_backend
+from . import triton as swiglu_backend
 
 _COMPILE_PASS_VERSION = "convrot-int8-swiglu-ffn-compile-v9"
 
@@ -254,7 +255,7 @@ def _replace_semantic_ffn(  # noqa: PLR0913, PLR0917
                 down_weight_scale,
                 down_bias,
                 down_group_size,
-                ffn_backend._DEFAULT_CHUNK_ROWS,
+                swiglu_backend._DEFAULT_CHUNK_ROWS,
                 gate_input_scale,
                 value_input_scale,
                 down_input_scale,
@@ -293,7 +294,7 @@ def _replace_semantic_ffn_gated_updates(  # noqa: PLR0913, PLR0917
 ) -> None:
     original = match.output_node()
     graph = match.graph
-    python_indexing = swiglu_ffn_compile.uses_python_indexing(match)
+    python_indexing = ffn_compile.uses_python_indexing(match)
     with graph.inserting_before(original):
         mutation = graph.call_function(
             torch.ops.piper_kernels.convrot_int8_swiglu_ffn_gated_updates_.default,
@@ -317,7 +318,7 @@ def _replace_semantic_ffn_gated_updates(  # noqa: PLR0913, PLR0917
                 ffn_gate,
                 gate_indices,
                 python_indexing,
-                ffn_backend._DEFAULT_CHUNK_ROWS,
+                swiglu_backend._DEFAULT_CHUNK_ROWS,
                 gate_input_scale,
                 value_input_scale,
                 down_input_scale,
@@ -341,12 +342,12 @@ for _promote_gate in (None, False, True):
         )
         for _use_aten_index in (False, True):
             register_graph_pattern(
-                swiglu_ffn_pattern.gated_updates_pattern(
+                ffn_pattern.indexed_gated_updates_pattern(
                     _semantic_ffn_pattern,
                     use_aten_index=_use_aten_index,
                 ),
                 extra_check=lambda match, promote_gate=_promote_gate: (
-                    swiglu_ffn_compile.valid_gated_updates(
+                    ffn_compile.valid_indexed_gated_updates(
                         match,
                         partial(_valid_semantic_ffn, promote_gate=promote_gate),
                     )
@@ -392,9 +393,10 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _storage.__file__,
                     _compile_fx.__file__,
                     projection_views.__file__,
-                    ffn_backend.__file__,
-                    swiglu_ffn_compile.__file__,
-                    swiglu_ffn_triton.__file__,
+                    swiglu_backend.__file__,
+                    ffn_compile.__file__,
+                    ffn_pattern.__file__,
+                    indexed_updates.__file__,
                     swiglu_ffn_pattern.__file__,
                 )
                 if file_name is not None

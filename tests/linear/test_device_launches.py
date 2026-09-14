@@ -14,7 +14,7 @@ from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import _policy as sage_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage
-from piper_kernels.fusions.swiglu_ffn import triton as gated_updates
+from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import _generic
 from piper_kernels.linear.convrot.int8._amd import triton as amd
@@ -211,7 +211,7 @@ def test_nvfp4_scale_and_gguf_launchers_own_context(launches):
 
 def test_attention_and_fusion_epilogue_launchers_own_context(launches):
     launches.watch(sage, "_sage_attention_2pp_kernel")
-    launches.watch(gated_updates, "_gated_updates_kernel")
+    launches.watch(indexed_updates, "_indexed_gated_updates_kernel")
     with FakeTensorMode():
         value = torch.empty(1, 1, 64, 64, device="cuda:0")
         prepared = SimpleNamespace(
@@ -230,9 +230,12 @@ def test_attention_and_fusion_epilogue_launchers_own_context(launches):
         updates = SimpleNamespace(
             update_gate=value, ffn_gate=value, gate_indices=value, python_indexing=False
         )
-        layout = gated_updates.IndexedGatedUpdateLayout(64, 64, 1, 1)
-        gated_updates.apply_indexed_gated_updates(
+        layout = indexed_updates.IndexedGatedUpdateLayout(64, 64, 1, 1)
+        indexed_updates.apply_indexed_gated_updates(
             value, value, torch.empty_like(value), updates, layout, 0
         )
-    assert launches.calls == ["_sage_attention_2pp_kernel", "_gated_updates_kernel"]
+    assert launches.calls == [
+        "_sage_attention_2pp_kernel",
+        "_indexed_gated_updates_kernel",
+    ]
     assert launches.current == 1

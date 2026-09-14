@@ -20,9 +20,10 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
-from piper_kernels.fusions.swiglu_ffn import _compile as swiglu_ffn_compile
+from piper_kernels.fusions.ffn import _compile as ffn_compile
+from piper_kernels.fusions.ffn import _pattern as ffn_pattern
+from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
-from piper_kernels.fusions.swiglu_ffn import triton as swiglu_ffn_triton
 from piper_kernels.linear import _bias, _storage
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
@@ -31,7 +32,7 @@ from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 from . import _compile_validation, _core, _preparation
-from . import triton as ffn_backend
+from . import triton as swiglu_backend
 
 _COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v4"
 
@@ -142,7 +143,7 @@ def _valid_semantic_gated_updates(
     *,
     promote_gate: bool | None,
 ) -> bool:
-    return swiglu_ffn_compile.valid_gated_updates(
+    return ffn_compile.valid_indexed_gated_updates(
         match,
         partial(_valid_semantic_ffn, promote_gate=promote_gate),
     )
@@ -156,7 +157,7 @@ def _replace_semantic_ffn(match: Match, **_unused: object) -> None:
     with graph.inserting_before(original):
         replacement = graph.call_function(
             torch.ops.piper_kernels.nvfp4_swiglu_ffn.default,
-            args=(*operands.arguments(), ffn_backend._DEFAULT_CHUNK_ROWS),
+            args=(*operands.arguments(), swiglu_backend._DEFAULT_CHUNK_ROWS),
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -169,7 +170,7 @@ def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None
     graph = match.graph
     operands = _MatchedFfn.from_match(match)
     assert operands is not None
-    python_indexing = swiglu_ffn_compile.uses_python_indexing(match)
+    python_indexing = ffn_compile.uses_python_indexing(match)
     with graph.inserting_before(original):
         mutation = graph.call_function(
             torch.ops.piper_kernels.nvfp4_swiglu_ffn_gated_updates_.default,
@@ -181,7 +182,7 @@ def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None
                 match.kwargs["ffn_gate"],
                 match.kwargs["gate_indices"],
                 python_indexing,
-                ffn_backend._DEFAULT_CHUNK_ROWS,
+                swiglu_backend._DEFAULT_CHUNK_ROWS,
             ),
         )
     mutation.meta["val"] = None
@@ -221,7 +222,7 @@ for _with_source_high_first in (False, True):
                 )(_replace_semantic_ffn)
                 for _use_aten_index in (False, True):
                     register_graph_pattern(
-                        swiglu_ffn_pattern.gated_updates_pattern(
+                        ffn_pattern.indexed_gated_updates_pattern(
                             _semantic_ffn_pattern,
                             use_aten_index=_use_aten_index,
                         ),
@@ -265,12 +266,13 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _core.__file__,
                     _preparation.__file__,
                     _compile_validation.__file__,
-                    ffn_backend.__file__,
+                    swiglu_backend.__file__,
                     nvfp4_compile_fx.__file__,
                     nvfp4_validation.__file__,
-                    swiglu_ffn_compile.__file__,
+                    ffn_compile.__file__,
+                    ffn_pattern.__file__,
+                    indexed_updates.__file__,
                     swiglu_ffn_pattern.__file__,
-                    swiglu_ffn_triton.__file__,
                 )
                 if file_name is not None
             ),

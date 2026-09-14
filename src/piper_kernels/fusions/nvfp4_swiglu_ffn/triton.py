@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
+from piper_kernels.fusions.ffn import triton as indexed_updates
 
 from . import _core
 from ._preparation import StandardPreparation
@@ -165,7 +165,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
         down,
         chunk_rows,
         StandardPreparation(gate_high_first, down_high_first),
-        gated_updates=gated_updates_backend.IndexedGatedUpdates(
+        gated_updates=indexed_updates.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,
             update_gate=update_gate,

@@ -9,7 +9,7 @@ import torch
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
+from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -244,7 +244,7 @@ def run_chunked_swiglu_ffn(
     chunk_rows: int,
     preparation: PreparationBackend,
     *,
-    gated_updates: gated_updates_backend.IndexedGatedUpdates | None = None,
+    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
 ) -> torch.Tensor:
     """Run a semantic gate/value NVFP4 FFN with bounded row workspaces."""
     rows, intermediate_features, output_features = _validate_inputs(
@@ -286,7 +286,7 @@ def run_chunked_swiglu_ffn(
     gate_layout = (
         None
         if gated_updates is None
-        else gated_updates_backend.validate_indexed_gated_updates(
+        else indexed_updates.validate_indexed_gated_updates(
             input,
             gated_updates,
             output_features,
@@ -383,7 +383,7 @@ def run_chunked_swiglu_ffn(
             chunk_row_count,
             projected,
         )
-        gated_updates_backend.apply_indexed_gated_updates(
+        indexed_updates.apply_indexed_gated_updates(
             projected,
             base_2d[start:stop],
             output_2d[start:stop],

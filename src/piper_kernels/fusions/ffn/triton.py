@@ -1,4 +1,4 @@
-"""Shared indexed-gated-update Triton epilogue for chunked SwiGLU FFNs."""
+"""Shared indexed gated-update epilogue for bounded feed-forward networks."""
 
 # Triton's JIT launcher accepts compile-time options outside its Python signature.
 # pyright: reportCallIssue=false
@@ -40,8 +40,8 @@ class IndexedGatedUpdateLayout:
 
 
 @triton.jit
-def _gated_updates_kernel(
-    ffn_ptr,
+def _indexed_gated_updates_kernel(
+    ffn_output_ptr,
     base_ptr,
     reusable_update_ptr,
     update_gate_ptr,
@@ -62,7 +62,7 @@ def _gated_updates_kernel(
     valid = offsets < elements
     rows = offsets // features
     columns = offsets % features
-    ffn = tl.load(ffn_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    ffn_output = tl.load(ffn_output_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
     base = tl.load(base_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
     reusable_update = tl.load(
         reusable_update_ptr + offsets,
@@ -95,7 +95,7 @@ def _gated_updates_kernel(
         other=float("nan"),
     ).to(tl.float32)
     hidden = base + update_gate * reusable_update
-    result = hidden + ffn_gate * ffn
+    result = hidden + ffn_gate * ffn_output
     tl.store(reusable_update_ptr + offsets, result, mask=valid)
 
 
@@ -169,7 +169,7 @@ def validate_indexed_gated_updates(
 
 
 def apply_indexed_gated_updates(
-    ffn: torch.Tensor,
+    ffn_output: torch.Tensor,
     base: torch.Tensor,
     output: torch.Tensor,
     updates: IndexedGatedUpdates,
@@ -177,10 +177,10 @@ def apply_indexed_gated_updates(
     row_offset: int,
 ) -> None:
     """Apply one validated chunk of indexed gated updates into reusable output storage."""
-    elements = ffn.numel()
-    with device_context(ffn.device):
-        _gated_updates_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
-            ffn,
+    elements = ffn_output.numel()
+    with device_context(ffn_output.device):
+        _indexed_gated_updates_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
+            ffn_output,
             base,
             output,
             updates.update_gate,
@@ -188,7 +188,7 @@ def apply_indexed_gated_updates(
             updates.gate_indices,
             elements,
             row_offset,
-            features=ffn.shape[-1],
+            features=ffn_output.shape[-1],
             update_gate_row_stride=layout.update_gate_row_stride,
             ffn_gate_row_stride=layout.ffn_gate_row_stride,
             update_gate_rows=layout.update_gate_rows,

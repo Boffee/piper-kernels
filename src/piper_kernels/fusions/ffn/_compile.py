@@ -1,4 +1,4 @@
-"""Projection-independent compiler validation for SwiGLU FFN gated updates."""
+"""Projection-independent compiler validation for indexed FFN updates."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from torch._inductor.pattern_matcher import Match
 
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-type FfnValidator = Callable[[Match], bool]
+type FfnPatternValidator = Callable[[Match], bool]
 
 
 def _metadata(match: Match, name: str) -> torch.Tensor | None:
@@ -33,9 +33,12 @@ def _shape_matches(left: torch.Tensor, right: torch.Tensor) -> bool:
     )
 
 
-def valid_gated_updates(match: Match, valid_ffn: FfnValidator) -> bool:
+def valid_indexed_gated_updates(
+    match: Match,
+    valid_ffn_pattern: FfnPatternValidator,
+) -> bool:
     """Validate indexed gated updates and prove their intermediate safe to reuse."""
-    if not valid_ffn(match):
+    if not valid_ffn_pattern(match):
         return False
     input_value = _metadata(match, "ffn_input")
     base = _metadata(match, "base")
@@ -110,4 +113,8 @@ def uses_python_indexing(match: Match) -> bool:
     )
 
 
-__all__ = ["FfnValidator", "uses_python_indexing", "valid_gated_updates"]
+__all__ = [
+    "FfnPatternValidator",
+    "uses_python_indexing",
+    "valid_indexed_gated_updates",
+]

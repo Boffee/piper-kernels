@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
 from piper_kernels.fusions.nvfp4_swiglu_ffn._preparation import StandardPreparation
-from piper_kernels.fusions.swiglu_ffn import triton as gated_updates_backend
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 from piper_kernels.weights.convrot._rotation import validate_group_size
 
@@ -271,7 +271,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
             value_high_first,
             down_high_first,
         ),
-        gated_updates=gated_updates_backend.IndexedGatedUpdates(
+        gated_updates=indexed_updates.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,
             update_gate=update_gate,
