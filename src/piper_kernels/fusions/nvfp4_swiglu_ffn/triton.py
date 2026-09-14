@@ -5,9 +5,11 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.nvfp4_ffn import _core
+from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
 
-from . import _core
-from ._preparation import StandardPreparation
+from . import _operands
+from ._preparation import StandardSwiGLUPreparation
 
 _DEFAULT_CHUNK_ROWS = _core.DEFAULT_CHUNK_ROWS
 
@@ -38,7 +40,7 @@ def _chunked_swiglu_ffn_op(
     down_high_first: bool,
     chunk_rows: int,
 ) -> torch.Tensor:
-    gate, value, down = _core.linear_operands(
+    gate, value, down = _operands.linear_operands(
         gate_weight_qdata,
         gate_weight_scale,
         gate_weight_per_tensor_scale,
@@ -61,13 +63,13 @@ def _chunked_swiglu_ffn_op(
         down_dynamic_activation_scale,
         down_high_first,
     )
-    return _core.run_chunked_swiglu_ffn(
+    return _core.run_chunked_ffn(
         input,
-        gate,
-        value,
+        (value, gate),
         down,
         chunk_rows,
-        StandardPreparation(gate_high_first, down_high_first),
+        StandardSourcePreparation(gate_high_first),
+        StandardSwiGLUPreparation(down_high_first),
     )
 
 
@@ -135,7 +137,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
     python_indexing: bool,
     chunk_rows: int,
 ) -> None:
-    gate, value, down = _core.linear_operands(
+    gate, value, down = _operands.linear_operands(
         gate_weight_qdata,
         gate_weight_scale,
         gate_weight_per_tensor_scale,
@@ -158,13 +160,13 @@ def _chunked_swiglu_ffn_gated_updates_op(
         down_dynamic_activation_scale,
         down_high_first,
     )
-    _core.run_chunked_swiglu_ffn(
+    _core.run_chunked_ffn(
         input,
-        gate,
-        value,
+        (value, gate),
         down,
         chunk_rows,
-        StandardPreparation(gate_high_first, down_high_first),
+        StandardSourcePreparation(gate_high_first),
+        StandardSwiGLUPreparation(down_high_first),
         gated_updates=indexed_updates.IndexedGatedUpdates(
             base=base,
             reusable_update=reusable_update,

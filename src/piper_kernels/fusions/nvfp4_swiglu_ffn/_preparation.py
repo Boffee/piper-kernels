@@ -1,49 +1,39 @@
-"""Standard NVFP4 activation preparation shared by plain and mixed FFNs."""
+"""Standard NVFP4 SwiGLU preparation for a bounded FFN chunk."""
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
+from torch.nn import functional as F  # noqa: N812
+from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
-from . import _core
+
+def _dynamic_swiglu_scale(projections: torch.Tensor) -> torch.Tensor:
+    """Calculate the dynamic scale in FP32 without materializing SwiGLU."""
+    value, gate = projections.chunk(2, dim=-1)
+    return per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
+
+
+dynamic_swiglu_scale = torch.compile(_dynamic_swiglu_scale, fullgraph=True)
 
 
 @dataclass(frozen=True, slots=True)
-class StandardPreparation:
-    """Ordinary NVFP4 preparation used by the shared chunked runner."""
+class StandardSwiGLUPreparation:
+    """Apply SwiGLU and prepare ordinary NVFP4 down-projection inputs."""
 
-    source_high_first: bool
-    down_high_first: bool
+    source_projection_count: ClassVar[int] = 2
+    high_first: bool
 
-    def dynamic_source_scale(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-    ) -> torch.Tensor:
-        return nvfp4_dynamic_scale(input)
-
-    def prepare_source(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-        per_tensor_scale: torch.Tensor,
-        out: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_backend.prepare_static_out(
-            input,
-            per_tensor_scale,
-            out,
-            high_first=self.source_high_first,
-        )
-
-    def prepare_down(
+    def prepare(
         self,
         projections: torch.Tensor,
         activation_per_tensor_scale: torch.Tensor | None,
         dynamic_activation_scale: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         per_tensor_scale = (
-            _core.dynamic_swiglu_scale(projections)
+            dynamic_swiglu_scale(projections)
             if dynamic_activation_scale
             else activation_per_tensor_scale
         )
@@ -52,7 +42,10 @@ class StandardPreparation:
             projections,
             per_tensor_scale,
             swiglu=True,
-            high_first=self.down_high_first,
+            high_first=self.high_first,
         )
         # The scale stays internal to the FFN and is only read by the down GEMM.
         return qdata, scale, per_tensor_scale
+
+
+__all__ = ["StandardSwiGLUPreparation", "dynamic_swiglu_scale"]

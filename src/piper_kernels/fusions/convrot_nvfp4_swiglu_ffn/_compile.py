@@ -20,10 +20,17 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
+from piper_kernels.fusions.convrot_nvfp4_ffn import _preparation as convrot_source_preparation
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.ffn import triton as indexed_updates
-from piper_kernels.fusions.nvfp4_swiglu_ffn import _compile_validation, _core, _preparation
+from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
+from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
+from piper_kernels.fusions.nvfp4_swiglu_ffn import (
+    _compile_validation,
+    _operands,
+    _preparation,
+)
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.linear import _bias, _storage
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -301,7 +308,10 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _bias.__file__,
                     _storage.__file__,
                     projection_views.__file__,
-                    _core.__file__,
+                    ffn_core.__file__,
+                    source_preparation.__file__,
+                    convrot_source_preparation.__file__,
+                    _operands.__file__,
                     _preparation.__file__,
                     convrot_preparation.__file__,
                     _compile_validation.__file__,

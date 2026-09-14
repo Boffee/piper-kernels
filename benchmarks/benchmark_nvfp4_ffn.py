@@ -20,8 +20,9 @@ from lib.timing import ClockDomain, PhaseTimings, Timing, _linear_quantile
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation as rotated_preparation
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import triton as convrot_ffn
-from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
-from piper_kernels.fusions.nvfp4_swiglu_ffn._preparation import StandardPreparation
+from piper_kernels.fusions.nvfp4_ffn import _core
+from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
+from piper_kernels.fusions.nvfp4_swiglu_ffn._preparation import StandardSwiGLUPreparation
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
 from piper_kernels.linear.nvfp4 import triton as nvfp4
 
@@ -52,10 +53,15 @@ class GraphTiming:
     sample_ms: int = 80
 
 
-def _preparation(case: Case) -> _core.PreparationBackend:
+def _preparation_backends(
+    case: Case,
+) -> tuple[_core.SourcePreparationBackend, _core.ActivationPreparationBackend]:
     if case.group_size is None:
-        return StandardPreparation(case.high_first, case.high_first)
-    return convrot_ffn._preparation(
+        return (
+            StandardSourcePreparation(case.high_first),
+            StandardSwiGLUPreparation(case.high_first),
+        )
+    return convrot_ffn._preparation_backends(
         case.group_size,
         case.group_size,
         case.group_size,
@@ -86,7 +92,7 @@ def _workload(case: Case) -> tuple[torch.Tensor, tuple[_core.LinearOperands, ...
         )
         weights.append(packed)
         biases.append(torch.randn(height, device="cuda", dtype=case.dtype) * 0.1)
-    source_scale = _preparation(case).dynamic_source_scale(source)
+    source_scale = _preparation_backends(case)[0].dynamic_scale(source)
     down_scale = torch.tensor(0.01, device="cuda")
     linears = tuple(
         _core.LinearOperands(
@@ -190,11 +196,16 @@ def benchmark_case(
     """Measure the complete current FFN on a fixed synthetic workload."""
     _require_exclusive_gpu()
     source, linears = _workload(case)
-    preparation = _preparation(case)
+    source_preparation, activation_preparation = _preparation_backends(case)
 
     def run() -> torch.Tensor:
-        return _core.run_chunked_swiglu_ffn(
-            source, linears[0], linears[1], linears[2], case.chunk_rows, preparation
+        return _core.run_chunked_ffn(
+            source,
+            (linears[1], linears[0]),
+            linears[2],
+            case.chunk_rows,
+            source_preparation,
+            activation_preparation,
         )
 
     output = run()

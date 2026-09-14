@@ -18,6 +18,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels.fusions.convrot_int8_ffn import _core as ffn_core
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.ffn import triton as indexed_updates
@@ -393,6 +394,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _storage.__file__,
                     _compile_fx.__file__,
                     projection_views.__file__,
+                    ffn_core.__file__,
                     swiglu_backend.__file__,
                     ffn_compile.__file__,
                     ffn_pattern.__file__,

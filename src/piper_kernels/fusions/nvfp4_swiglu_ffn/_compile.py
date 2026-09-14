@@ -23,6 +23,8 @@ from torch.fx.node import Argument
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
+from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.linear import _bias, _storage
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -31,7 +33,7 @@ from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
-from . import _compile_validation, _core, _preparation
+from . import _compile_validation, _operands, _preparation
 from . import triton as swiglu_backend
 
 _COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v4"
@@ -263,7 +265,9 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _bias.__file__,
                     _storage.__file__,
                     projection_views.__file__,
-                    _core.__file__,
+                    ffn_core.__file__,
+                    source_preparation.__file__,
+                    _operands.__file__,
                     _preparation.__file__,
                     _compile_validation.__file__,
                     swiglu_backend.__file__,

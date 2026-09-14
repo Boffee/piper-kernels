@@ -1,109 +1,13 @@
-"""Bounded-workspace composition of a ConvRot INT8 SwiGLU feed-forward network."""
+"""Bounded-workspace ConvRot INT8 SwiGLU custom operations."""
 
 from __future__ import annotations
 
-import math
-
 import torch
 
+from piper_kernels.fusions.convrot_int8_ffn import _core
 from piper_kernels.fusions.ffn import triton as indexed_updates
-from piper_kernels.linear import _bias
-from piper_kernels.linear._storage import same_tensor_storage
-from piper_kernels.linear.convrot.int8 import _backend
-from piper_kernels.weights.convrot.int8._quantization import (
-    validate_activation_scale,
-    validate_storage,
-)
 
-_DEFAULT_CHUNK_ROWS = 4_096
-
-
-def _validate_bias(
-    bias: torch.Tensor | None,
-    *,
-    features: int,
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    name: str,
-) -> None:
-    if bias is None:
-        return
-    if (
-        bias.shape != (features,)
-        or bias.device != input.device
-        or bias.layout is not torch.strided
-        or not bias.is_contiguous()
-    ):
-        raise ValueError(
-            f"chunked ConvRot INT8 {name} bias must be a contiguous strided tensor "
-            f"with shape ({features},) on {input.device}"
-        )
-    _bias.validate_dtype(bias, f"chunked ConvRot INT8 {name}")
-
-
-def _validate_inputs(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    gate_weight_qdata: torch.Tensor,
-    gate_weight_scale: torch.Tensor,
-    gate_bias: torch.Tensor | None,
-    gate_group_size: int,
-    value_weight_qdata: torch.Tensor,
-    value_weight_scale: torch.Tensor,
-    value_bias: torch.Tensor | None,
-    value_group_size: int,
-    down_weight_qdata: torch.Tensor,
-    down_weight_scale: torch.Tensor,
-    down_bias: torch.Tensor | None,
-    down_group_size: int,
-    chunk_rows: int,
-    gate_input_scale: torch.Tensor | None = None,
-    value_input_scale: torch.Tensor | None = None,
-    down_input_scale: torch.Tensor | None = None,
-) -> tuple[int, int, int]:
-    if input.ndim == 0 or input.layout is not torch.strided or not input.is_contiguous():
-        raise ValueError("ConvRot INT8 FFN input must be a non-scalar contiguous strided tensor")
-    if math.prod(input.shape[:-1]) < 1:
-        raise ValueError("ConvRot INT8 FFN requires at least one input row")
-    if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, int) or chunk_rows < 1:
-        raise ValueError("ConvRot INT8 FFN chunk_rows must be a positive integer")
-    if gate_group_size != value_group_size:
-        raise ValueError("ConvRot INT8 gate and value projections must share one group size")
-
-    for weight_qdata, weight_scale, group_size in (
-        (gate_weight_qdata, gate_weight_scale, gate_group_size),
-        (value_weight_qdata, value_weight_scale, value_group_size),
-        (down_weight_qdata, down_weight_scale, down_group_size),
-    ):
-        validate_storage(weight_qdata, weight_scale, group_size, input.dtype)
-        if weight_qdata.device != input.device or weight_scale.device != input.device:
-            raise ValueError("ConvRot INT8 FFN operands must share a device")
-
-    for input_scale in (gate_input_scale, value_input_scale, down_input_scale):
-        validate_activation_scale(input_scale, input.device)
-
-    input_features = gate_weight_qdata.shape[1]
-    intermediate_features = gate_weight_qdata.shape[0]
-    output_features = down_weight_qdata.shape[0]
-    if input.shape[-1] != input_features:
-        raise ValueError(
-            f"ConvRot INT8 FFN input has {input.shape[-1]} features, expected {input_features}"
-        )
-    if value_weight_qdata.shape != (intermediate_features, input_features):
-        raise ValueError("ConvRot INT8 gate and value projections must have matching shapes")
-    if down_weight_qdata.shape[1] != intermediate_features:
-        raise ValueError("ConvRot INT8 down projection must consume the gate/value width")
-    _validate_bias(gate_bias, features=intermediate_features, input=input, name="gate")
-    _validate_bias(value_bias, features=intermediate_features, input=input, name="value")
-    _validate_bias(down_bias, features=output_features, input=input, name="down")
-    differentiable = (
-        input,
-        gate_weight_scale,
-        value_weight_scale,
-        down_weight_scale,
-        *(bias for bias in (gate_bias, value_bias, down_bias) if bias is not None),
-    )
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in differentiable):
-        raise RuntimeError("ConvRot INT8 FFN is inference-only and does not support autograd")
-    return input_features, intermediate_features, output_features
+_DEFAULT_CHUNK_ROWS = _core.DEFAULT_CHUNK_ROWS
 
 
 def _run_chunked_swiglu_ffn(
@@ -127,150 +31,36 @@ def _run_chunked_swiglu_ffn(
     *,
     gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
 ) -> torch.Tensor:
-    """Run a semantic gate/value SwiGLU FFN with bounded row workspaces."""
-    input_features, intermediate_features, output_features = _validate_inputs(
-        input,
+    """Run the public gate/value topology through the shared bounded runner."""
+    gate = _core.LinearOperands(
         gate_weight_qdata,
         gate_weight_scale,
         gate_bias,
         gate_group_size,
+        gate_input_scale,
+    )
+    value = _core.LinearOperands(
         value_weight_qdata,
         value_weight_scale,
         value_bias,
         value_group_size,
+        value_input_scale,
+    )
+    down = _core.LinearOperands(
         down_weight_qdata,
         down_weight_scale,
         down_bias,
         down_group_size,
-        chunk_rows,
-        gate_input_scale,
-        value_input_scale,
         down_input_scale,
     )
-    backend = _backend.require_linear_backend(input)
-    leading_shape = input.shape[:-1]
-    rows = math.prod(leading_shape)
-    capacity = min(rows, chunk_rows)
-    input_2d = input.reshape(rows, input_features)
-    gate_layout = (
-        None
-        if gated_updates is None
-        else indexed_updates.validate_indexed_gated_updates(
-            input,
-            gated_updates,
-            output_features,
-        )
+    return _core.run_chunked_ffn(
+        input,
+        (value, gate),
+        down,
+        "swiglu",
+        chunk_rows,
+        gated_updates=gated_updates,
     )
-    output = (
-        torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
-        if gated_updates is None
-        else gated_updates.reusable_update
-    )
-    output_2d = output.reshape(rows, output_features)
-    base_2d = None if gated_updates is None else gated_updates.base.reshape(rows, output_features)
-    projection_workspace = torch.empty(
-        (capacity, 2 * intermediate_features),
-        device=input.device,
-        dtype=input.dtype,
-    )
-    projected = None
-    if gated_updates is not None:
-        projected = (
-            projection_workspace.reshape(-1)[: capacity * output_features].view(
-                capacity,
-                output_features,
-            )
-            if output_features <= 2 * intermediate_features
-            else torch.empty(
-                (capacity, output_features),
-                device=input.device,
-                dtype=input.dtype,
-            )
-        )
-    prepared_storage = torch.empty(
-        capacity * max(input_features, intermediate_features),
-        device=input.device,
-        dtype=torch.int8,
-    )
-    scale_storage = torch.empty(capacity, device=input.device, dtype=torch.float32)
-    shared_source = same_tensor_storage(gate_input_scale, value_input_scale)
-    second_projection = (gate_weight_qdata, gate_weight_scale, gate_bias) if shared_source else None
-    for start in range(0, rows, chunk_rows):
-        stop = min(start + chunk_rows, rows)
-        chunk_row_count = stop - start
-        prepared_input = prepared_storage[: chunk_row_count * input_features].view(
-            chunk_row_count,
-            input_features,
-        )
-        prepared_scale = scale_storage[:chunk_row_count]
-        projections = projection_workspace[:chunk_row_count]
-        backend.prepare_input(
-            input_2d[start:stop],
-            value_group_size,
-            input_scale=value_input_scale,
-            out=(prepared_input, prepared_scale),
-        )
-        backend.linear_prepared(
-            prepared_input,
-            prepared_scale,
-            value_weight_qdata,
-            value_weight_scale,
-            value_bias,
-            input.dtype,
-            out=projections if shared_source else projections[:, :intermediate_features],
-            second_projection=second_projection,
-        )
-        if not shared_source:
-            # Reuse the same bounded preparation buffers after projecting the value.
-            backend.prepare_input(
-                input_2d[start:stop],
-                gate_group_size,
-                input_scale=gate_input_scale,
-                out=(prepared_input, prepared_scale),
-            )
-            backend.linear_prepared(
-                prepared_input,
-                prepared_scale,
-                gate_weight_qdata,
-                gate_weight_scale,
-                gate_bias,
-                input.dtype,
-                out=projections[:, intermediate_features:],
-            )
-
-        prepared_swiglu = prepared_storage[: chunk_row_count * intermediate_features].view(
-            chunk_row_count,
-            intermediate_features,
-        )
-        backend.prepare_input(
-            projections,
-            down_group_size,
-            activation_fn="swiglu",
-            input_scale=down_input_scale,
-            out=(prepared_swiglu, prepared_scale),
-        )
-        output_chunk = output_2d[start:stop] if projected is None else projected[:chunk_row_count]
-        backend.linear_prepared(
-            prepared_swiglu,
-            prepared_scale,
-            down_weight_qdata,
-            down_weight_scale,
-            down_bias,
-            input.dtype,
-            out=output_chunk,
-        )
-        if gated_updates is not None:
-            assert base_2d is not None
-            assert gate_layout is not None
-            indexed_updates.apply_indexed_gated_updates(
-                output_chunk,
-                base_2d[start:stop],
-                output_2d[start:stop],
-                gated_updates,
-                gate_layout,
-                start,
-            )
-    return output
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_swiglu_ffn", mutates_args=())

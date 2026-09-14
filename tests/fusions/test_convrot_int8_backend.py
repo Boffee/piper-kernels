@@ -10,6 +10,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._input_activations import apply_input_activation
+from piper_kernels.fusions.convrot_int8_ffn import _core as ffn_core
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import _compile as ffn_compile
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as ffn
@@ -98,6 +99,40 @@ def test_ffn_rejects_missing_backend_before_allocating_workspace(monkeypatch):
         ffn._run_chunked_swiglu_ffn(value, *gate, 16, *up, 16, *down, 16, 4)
     select.assert_called_once_with(value)
     allocate.assert_not_called()
+
+
+@pytest.mark.parametrize("chunk_rows", [1, 4, 16])
+def test_ffn_core_supports_one_source_gelu_topology(operations, chunk_rows):
+    backend, select = operations
+    value = torch.linspace(-1, 1, 160).reshape(2, 5, 16)
+    up, down = _weight(32, 16), _weight(20, 32)
+    actual = ffn_core.run_chunked_ffn(
+        value,
+        (ffn_core.LinearOperands(*up, 16, None),),
+        ffn_core.LinearOperands(*down, 16, None),
+        "gelu_tanh",
+        chunk_rows,
+    )
+    projected = reference.linear(value, *up[:2], 16, up[2])
+    expected = reference.linear(
+        projected,
+        *down[:2],
+        16,
+        down[2],
+        activation_fn="gelu_tanh",
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-8)
+    select.assert_called_once_with(value)
+    chunks = (10 + chunk_rows - 1) // chunk_rows
+    assert backend.prepare_input.call_count == backend.linear_prepared.call_count == 2 * chunks
+    preparations = backend.prepare_input.call_args_list
+    assert [call.kwargs.get("activation_fn") for call in preparations] == [
+        None,
+        "gelu_tanh",
+    ] * chunks
+    assert all(
+        call.kwargs["out"].shape[-1] == 32 for call in backend.linear_prepared.call_args_list[::2]
+    )
 
 
 def _semantic_ffn_graph(device, output_features=20):
@@ -217,7 +252,7 @@ def test_sparse_gate_uses_selected_projection_operation(operations):
     assert backend.linear_prepared.call_count == 2
 
 
-@pytest.mark.parametrize("module", [ffn, ffn_compile, sparse_output])
+@pytest.mark.parametrize("module", [ffn_core, ffn, ffn_compile, sparse_output])
 def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module):
     tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
     forbidden = tuple(
@@ -237,7 +272,7 @@ def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module
                 "prepare_input_with_plan",
                 "execute_prepared_linear",
             }
-            if module in (ffn, ffn_compile):
+            if module in (ffn_core, ffn, ffn_compile):
                 assert node.attr not in {"from_device", "cuda_capability_at_least"}
 
 
