@@ -148,6 +148,8 @@ def valid_semantic_ffn(
     return bool(
         all(source.input is sources[0].input for source in sources[1:])
         and input_value.dtype in (torch.float16, torch.bfloat16)
+        and input_value.layout is torch.strided
+        and input_value.is_contiguous()
         and all(value.dtype is input_value.dtype for value, _shape in source_values[1:])
         and down_input.dtype is input_value.dtype
         and all(

@@ -254,6 +254,28 @@ def test_compile_options_fail_closed_when_projection_escapes() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_compile_options_fail_closed_on_noncontiguous_input() -> None:
+    operands = make_operands(rows=258, up_dynamic=False, down_dynamic=False, seed=1015)
+    model = GeluFfn(operands).eval()
+    activation = operands.input.view(2, 129, -1).transpose(0, 1)
+    assert not activation.is_contiguous()
+    capture = TargetCapturePass()
+    with torch.inference_mode():
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(activation)
+        torch._dynamo.reset()
+        actual = torch.compile(model, fullgraph=True, options=capturing_options(capture))(
+            activation
+        )
+
+    assert isinstance(expected, torch.Tensor)
+    assert isinstance(actual, torch.Tensor)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.ops.piper_kernels.nvfp4_gelu_ffn.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     operands = make_operands(rows=257, up_dynamic=False, down_dynamic=False, seed=1019)
     model = GeluFfn(operands).eval()

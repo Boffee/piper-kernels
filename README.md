@@ -417,8 +417,8 @@ sum column-shard outputs, adding bias once. Column partitions preserve weight va
 can change dynamic activation scales and accumulation order, so comparisons with an
 unsharded quantized linear require numerical tolerances.
 
-With the corresponding `*_swiglu_ffn_compile_options()` or
-`*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,
+With the corresponding `*_swiglu_ffn_compile_options()`, `*_gelu_ffn_compile_options()`,
+or `*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,
 QKV-preparation, and attention/output-projection fusions. Shared compiler normalization
 removes redundant row flatten/restore pairs around semantic linears, including symbolic
 leading dimensions. Feature order, quantization metadata, and externally consumed values

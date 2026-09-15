@@ -53,13 +53,14 @@ def _validate_bias(
     _bias.validate_dtype(bias, f"chunked ConvRot INT8 {name}")
 
 
-def _validate_inputs(
+def validate_ffn(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     sources: tuple[LinearOperands, ...],
     down: LinearOperands,
     activation_fn: InputActivation,
     chunk_rows: int,
 ) -> tuple[int, int, int]:
+    """Validate bounded ConvRot INT8 FFN metadata and return its logical dimensions."""
     if input.ndim == 0 or input.layout is not torch.strided or not input.is_contiguous():
         raise ValueError("ConvRot INT8 FFN input must be a non-scalar contiguous strided tensor")
     if math.prod(input.shape[:-1]) < 1:
@@ -128,7 +129,7 @@ def run_chunked_ffn(
     gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
-    input_features, intermediate_features, output_features = _validate_inputs(
+    input_features, intermediate_features, output_features = validate_ffn(
         input,
         sources,
         down,
@@ -139,7 +140,7 @@ def run_chunked_ffn(
     leading_shape = input.shape[:-1]
     rows = math.prod(leading_shape)
     capacity = min(rows, chunk_rows)
-    input_2d = input.reshape(rows, input_features)
+    input_2d = input.view(rows, input_features)
     update_layout = (
         None
         if gated_updates is None
@@ -154,8 +155,8 @@ def run_chunked_ffn(
         if gated_updates is None
         else gated_updates.reusable_update
     )
-    output_2d = output.reshape(rows, output_features)
-    base_2d = None if gated_updates is None else gated_updates.base.reshape(rows, output_features)
+    output_2d = output.view(rows, output_features)
+    base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)
     projection_features = len(sources) * intermediate_features
     projection_workspace = torch.empty(
         (capacity, projection_features),
@@ -286,4 +287,4 @@ def run_chunked_ffn(
     return output
 
 
-__all__ = ["DEFAULT_CHUNK_ROWS", "LinearOperands", "run_chunked_ffn"]
+__all__ = ["DEFAULT_CHUNK_ROWS", "LinearOperands", "run_chunked_ffn", "validate_ffn"]

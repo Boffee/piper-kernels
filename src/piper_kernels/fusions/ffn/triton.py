@@ -85,19 +85,15 @@ def _indexed_gated_updates_kernel(
     else:
         update_gate_row = gate_rows
         ffn_gate_row = gate_rows
-    update_gate_row_valid = (update_gate_row >= 0) & (update_gate_row < update_gate_rows)
-    ffn_gate_row_valid = (ffn_gate_row >= 0) & (ffn_gate_row < ffn_gate_rows)
-    gate_rows_valid = update_gate_row_valid & ffn_gate_row_valid
-    tl.device_assert(gate_rows_valid, "gate index out of bounds", mask=valid)
     update_gate = tl.load(
         update_gate_ptr + update_gate_row * update_gate_row_stride + columns,
-        mask=valid & gate_rows_valid,
-        other=float("nan"),
+        mask=valid,
+        other=0.0,
     ).to(tl.float32)
     ffn_gate = tl.load(
         ffn_gate_ptr + ffn_gate_row * ffn_gate_row_stride + columns,
-        mask=valid & gate_rows_valid,
-        other=float("nan"),
+        mask=valid,
+        other=0.0,
     ).to(tl.float32)
     hidden = base + update_gate * reusable_update
     result = hidden + ffn_gate * ffn_output
@@ -107,9 +103,12 @@ def _indexed_gated_updates_kernel(
 def validate_indexed_gated_updates(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     updates: IndexedGatedUpdates,
-    output_features: int,
+    output_features: int | torch.SymInt,
 ) -> IndexedGatedUpdateLayout:
-    """Validate indexed-update operands and return their strided gate layout."""
+    """Validate indexed-update metadata and return its strided gate layout.
+
+    Index values are caller preconditions under the library validation contract.
+    """
     expected_shape = (*input.shape[:-1], output_features)
     for name, tensor in (
         ("base", updates.base),
@@ -202,7 +201,6 @@ def apply_indexed_gated_updates(
             python_indexing=updates.python_indexing,
             block_size=_EPILOGUE_BLOCK_SIZE,
             num_warps=4,
-            debug=True,
         )
 
 

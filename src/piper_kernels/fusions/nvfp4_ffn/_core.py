@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar, Protocol
+from typing import ClassVar, Protocol, cast
 
 import torch
 
@@ -65,13 +65,25 @@ class ActivationPreparationBackend(Protocol):
         ...
 
 
-def _validate_inputs(
+def _dimension_matches(
+    left: int | torch.SymInt,
+    right: int | torch.SymInt,
+) -> bool:
+    if isinstance(left, int) and isinstance(right, int):
+        return left == right
+    return str(left) == str(right)
+
+
+def validate_ffn(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     sources: tuple[LinearOperands, ...],
     down: LinearOperands,
     chunk_rows: int,
     activation_preparation: ActivationPreparationBackend,
-) -> tuple[int, int, int]:
+) -> tuple[int | torch.SymInt, int | torch.SymInt, int | torch.SymInt]:
+    """Validate bounded NVFP4 FFN metadata and return its logical dimensions."""
+    if input.ndim == 0 or input.layout is not torch.strided or not input.is_contiguous():
+        raise ValueError("NVFP4 FFN input must be a non-scalar contiguous strided tensor")
     if len(sources) != activation_preparation.source_projection_count:
         raise ValueError(
             "NVFP4 FFN source projection count does not match its activation preparation"
@@ -103,17 +115,13 @@ def _validate_inputs(
     if any(source.high_first != sources[0].high_first for source in sources[1:]):
         raise ValueError("NVFP4 FFN source projections must share nibble ordering")
     shape = source_shapes[0]
-    if (
-        any(
-            source_shape.rows != shape.rows
-            or source_shape.input_features != shape.input_features
-            or source_shape.output_features != shape.output_features
-            for source_shape in source_shapes[1:]
-        )
-        or not isinstance(shape.rows, int)
-        or not isinstance(shape.output_features, int)
+    if any(
+        not _dimension_matches(source_shape.rows, shape.rows)
+        or not _dimension_matches(source_shape.input_features, shape.input_features)
+        or not _dimension_matches(source_shape.output_features, shape.output_features)
+        for source_shape in source_shapes[1:]
     ):
-        raise ValueError("NVFP4 FFN source projections must have matching concrete shapes")
+        raise ValueError("NVFP4 FFN source projections must have matching shapes")
     intermediate_features = shape.output_features
     nvfp4_validation.validate_activation_scale(
         down.activation_per_tensor_scale,
@@ -130,8 +138,6 @@ def _validate_inputs(
         device=input.device,
         name="NVFP4 FFN down projection",
     )
-    if not isinstance(output_features, int):
-        raise ValueError("NVFP4 FFN requires concrete projection dimensions")
     linears = (*sources, down)
     differentiable_tensors = (
         input,
@@ -203,16 +209,19 @@ def run_chunked_ffn(
     gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
-    rows, intermediate_features, output_features = _validate_inputs(
+    dimensions = validate_ffn(
         input,
         sources,
         down,
         chunk_rows,
         activation_preparation,
     )
+    if any(not isinstance(dimension, int) for dimension in dimensions):
+        raise ValueError("NVFP4 FFN execution requires concrete dimensions")
+    rows, intermediate_features, output_features = cast(tuple[int, int, int], dimensions)
     leading_shape = input.shape[:-1]
     input_features = input.shape[-1]
-    input_2d = input.reshape(rows, input_features)
+    input_2d = input.view(rows, input_features)
     source_per_tensor_scales = _source_per_tensor_scales(input, sources, source_preparation)
     shared_input_preparation = all(source.dynamic_activation_scale for source in sources) or (
         all(not source.dynamic_activation_scale for source in sources)
@@ -235,8 +244,8 @@ def run_chunked_ffn(
         if gated_updates is None
         else gated_updates.reusable_update
     )
-    output_2d = output.reshape(rows, output_features)
-    base_2d = None if gated_updates is None else gated_updates.base.reshape(rows, output_features)
+    output_2d = output.view(rows, output_features)
+    base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
     source_storage = prepare_activation_storage(
         input,
@@ -340,4 +349,5 @@ __all__ = [
     "LinearOperands",
     "SourcePreparationBackend",
     "run_chunked_ffn",
+    "validate_ffn",
 ]

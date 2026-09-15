@@ -84,6 +84,38 @@ def _run_chunked_gelu_ffn(
     )
 
 
+def _validate_gelu_ffn(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    up_weight_qdata: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    up_bias: torch.Tensor | None,
+    up_group_size: int,
+    down_weight_qdata: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_bias: torch.Tensor | None,
+    down_group_size: int,
+    chunk_rows: int,
+    up_input_scale: torch.Tensor | None,
+    down_input_scale: torch.Tensor | None,
+) -> int:
+    """Validate fake/runtime metadata through the shared bounded-runner contract."""
+    up = _core.LinearOperands(
+        up_weight_qdata,
+        up_weight_scale,
+        up_bias,
+        up_group_size,
+        up_input_scale,
+    )
+    down = _core.LinearOperands(
+        down_weight_qdata,
+        down_weight_scale,
+        down_bias,
+        down_group_size,
+        down_input_scale,
+    )
+    return _core.validate_ffn(input, (up,), down, "gelu_tanh", chunk_rows)[2]
+
+
 @torch.library.custom_op("piper_kernels::convrot_int8_gelu_ffn", mutates_args=())
 def _chunked_gelu_ffn_op(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
@@ -118,19 +150,33 @@ def _chunked_gelu_ffn_op(
 @_chunked_gelu_ffn_op.register_fake
 def _chunked_gelu_ffn_op_fake(
     input: torch.Tensor,  # noqa: A002
-    _up_weight_qdata: torch.Tensor,
-    _up_weight_scale: torch.Tensor,
-    _up_bias: torch.Tensor | None,
-    _up_group_size: int,
+    up_weight_qdata: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    up_bias: torch.Tensor | None,
+    up_group_size: int,
     down_weight_qdata: torch.Tensor,
-    _down_weight_scale: torch.Tensor,
-    _down_bias: torch.Tensor | None,
-    _down_group_size: int,
-    _chunk_rows: int,
-    _up_input_scale: torch.Tensor | None = None,
-    _down_input_scale: torch.Tensor | None = None,
+    down_weight_scale: torch.Tensor,
+    down_bias: torch.Tensor | None,
+    down_group_size: int,
+    chunk_rows: int,
+    up_input_scale: torch.Tensor | None = None,
+    down_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return input.new_empty((*input.shape[:-1], down_weight_qdata.shape[0]))
+    output_features = _validate_gelu_ffn(
+        input,
+        up_weight_qdata,
+        up_weight_scale,
+        up_bias,
+        up_group_size,
+        down_weight_qdata,
+        down_weight_scale,
+        down_bias,
+        down_group_size,
+        chunk_rows,
+        up_input_scale,
+        down_input_scale,
+    )
+    return input.new_empty((*input.shape[:-1], output_features))
 
 
 @torch.library.custom_op(
@@ -183,26 +229,51 @@ def _chunked_gelu_ffn_gated_updates_op(
 
 @_chunked_gelu_ffn_gated_updates_op.register_fake
 def _chunked_gelu_ffn_gated_updates_op_fake(
-    _input: torch.Tensor,
-    _up_weight_qdata: torch.Tensor,
-    _up_weight_scale: torch.Tensor,
-    _up_bias: torch.Tensor | None,
-    _up_group_size: int,
-    _down_weight_qdata: torch.Tensor,
-    _down_weight_scale: torch.Tensor,
-    _down_bias: torch.Tensor | None,
-    _down_group_size: int,
-    _base: torch.Tensor,
-    _reusable_update: torch.Tensor,
-    _update_gate: torch.Tensor,
-    _ffn_gate: torch.Tensor,
-    _gate_indices: torch.Tensor,
-    _python_indexing: bool,
-    _chunk_rows: int,
-    _up_input_scale: torch.Tensor | None = None,
-    _down_input_scale: torch.Tensor | None = None,
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    up_weight_qdata: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    up_bias: torch.Tensor | None,
+    up_group_size: int,
+    down_weight_qdata: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_bias: torch.Tensor | None,
+    down_group_size: int,
+    base: torch.Tensor,
+    reusable_update: torch.Tensor,
+    update_gate: torch.Tensor,
+    ffn_gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    chunk_rows: int,
+    up_input_scale: torch.Tensor | None = None,
+    down_input_scale: torch.Tensor | None = None,
 ) -> None:
-    return None
+    output_features = _validate_gelu_ffn(
+        input,
+        up_weight_qdata,
+        up_weight_scale,
+        up_bias,
+        up_group_size,
+        down_weight_qdata,
+        down_weight_scale,
+        down_bias,
+        down_group_size,
+        chunk_rows,
+        up_input_scale,
+        down_input_scale,
+    )
+    indexed_updates.validate_indexed_gated_updates(
+        input,
+        indexed_updates.IndexedGatedUpdates(
+            base,
+            reusable_update,
+            update_gate,
+            ffn_gate,
+            gate_indices,
+            python_indexing,
+        ),
+        output_features,
+    )
 
 
 __all__ = [
