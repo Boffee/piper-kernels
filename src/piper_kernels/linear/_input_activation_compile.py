@@ -60,22 +60,21 @@ def swiglu_product_pattern(
     return CallFunction(torch.ops.aten.mul.Tensor, *multiply_args, _users=1)
 
 
-def gelu_tanh_pattern(
-    linear: LinearPattern,
+def gelu_tanh_activation_pattern(
+    input_pattern: object,
     *,
     promote_input: bool,
 ) -> CallFunction:
-    """Build PyTorch's normalized GELU-tanh decomposition feeding a linear."""
-    input_node = KeywordArg("input")
+    """Build PyTorch's normalized GELU-tanh decomposition around an input pattern."""
     value = (
         CallFunction(
             torch.ops.prims.convert_element_type.default,
-            input_node,
+            input_pattern,
             torch.float32,
             _users=4,
         )
         if promote_input
-        else input_node
+        else input_pattern
     )
     half = CallFunction(torch.ops.aten.mul.Tensor, value, 0.5, _users=1)
     square = CallFunction(torch.ops.aten.mul.Tensor, value, value, _users=1)
@@ -103,7 +102,21 @@ def gelu_tanh_pattern(
             KeywordArg("logical_dtype"),
             _users=1,
         )
-    return linear(activated)
+    return activated
+
+
+def gelu_tanh_pattern(
+    linear: LinearPattern,
+    *,
+    promote_input: bool,
+) -> CallFunction:
+    """Build PyTorch's normalized GELU-tanh decomposition feeding a linear."""
+    return linear(
+        gelu_tanh_activation_pattern(
+            KeywordArg("input"),
+            promote_input=promote_input,
+        )
+    )
 
 
 def valid_gelu_tanh(
@@ -131,6 +144,7 @@ def valid_gelu_tanh(
 
 __all__ = [
     "LinearPattern",
+    "gelu_tanh_activation_pattern",
     "gelu_tanh_pattern",
     "swiglu_product_pattern",
     "valid_gelu_tanh",

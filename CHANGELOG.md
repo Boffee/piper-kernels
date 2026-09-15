@@ -5,6 +5,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added bounded ConvRot INT8 tanh-GELU FFN execution and compiler folding for up/down
+  projections, including static and dynamic input scales and indexed gated updates.
+
 ## [0.7.0rc7] - 2026-09-13
 
 ### Added
