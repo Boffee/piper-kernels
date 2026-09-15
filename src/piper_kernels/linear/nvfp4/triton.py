@@ -8,8 +8,9 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
+from piper_kernels import _input_activations as input_activations
+from piper_kernels._triton import input_activations as triton_input_activations
 from piper_kernels._triton.nvfp4 import (
     _decode_fp4,
     _decode_fp4_code,
@@ -45,7 +46,7 @@ def _prepare_static_kernel(
     input_features: tl.constexpr,
     output_features: tl.constexpr,
     scale_column_blocks: tl.constexpr,
-    swiglu: tl.constexpr,
+    activation_fn: tl.constexpr,
     blocks_per_program: tl.constexpr,
     high_first: tl.constexpr,
 ):
@@ -65,16 +66,19 @@ def _prepare_static_kernel(
         mask=valid_blocks[:, None],
         other=0.0,
     ).to(tl.float32)
-    gate = values
-    if swiglu:
+    if activation_fn == "swiglu":
         gate = tl.load(
             input_ptr + input_offsets + output_features,
             mask=valid_blocks[:, None],
             other=0.0,
             eviction_policy="evict_first",
         ).to(tl.float32)
-    if swiglu:
-        values *= gate / (1.0 + libdevice.exp(-gate))  # pyright: ignore[reportOperatorIssue]
+        values = triton_input_activations.swiglu(values, gate)
+    elif activation_fn == "gelu_tanh":
+        values = triton_input_activations.gelu_tanh(
+            values,
+            "cuda",  # pyright: ignore[reportArgumentType]
+        )
 
     per_tensor_scale = tl.load(per_tensor_scale_ptr).to(tl.float32)
     packed, encoded_scale = encode_nvfp4_blocks(  # pyright: ignore[reportGeneralTypeIssues]
@@ -126,13 +130,13 @@ def _prepare_static_storage(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
     *,
-    swiglu: bool,
+    activation_fn: str | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     contiguous_input = input.contiguous()
     input_features = int(contiguous_input.shape[-1])
-    output_features = input_features // 2 if swiglu else input_features
+    output_features = input_features // input_activations.input_activation_width(activation_fn)
     rows = int(contiguous_input.numel() // input_features)
     qdata, scale = prepare_activation_storage(input, rows, output_features, out)
     block_count = rows * (output_features // _NVFP4_BLOCK_SIZE)
@@ -147,7 +151,7 @@ def _prepare_static_storage(
             output_features=output_features,
             scale_column_blocks=(output_features + _layout.SCALE_COLUMN_TILE - 1)
             // _layout.SCALE_COLUMN_TILE,
-            swiglu=swiglu,
+            activation_fn=activation_fn,
             blocks_per_program=_PREPARE_BLOCKS,
             high_first=high_first,
             num_warps=2,
@@ -158,14 +162,14 @@ def _prepare_static_storage(
 def prepare_static(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     per_tensor_scale: torch.Tensor,
-    swiglu: bool = False,
+    activation_fn: str | None = None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare a static-scale NVFP4 activation without intermediate tensors."""
     qdata, scale = _prepare_static_storage(
         input,
         per_tensor_scale,
-        swiglu=swiglu,
+        activation_fn=activation_fn,
         high_first=high_first,
     )
     return qdata, scale, per_tensor_scale.clone()
@@ -181,7 +185,7 @@ def prepare_static_out(
     return _prepare_static_storage(
         input,
         per_tensor_scale,
-        swiglu=False,
+        activation_fn=None,
         out=out,
         high_first=high_first,
     )

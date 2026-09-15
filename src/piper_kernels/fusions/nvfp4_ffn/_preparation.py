@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
+from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 
@@ -18,7 +18,7 @@ class StandardSourcePreparation:
         self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
     ) -> torch.Tensor:
-        return nvfp4_dynamic_scale(input)
+        return nvfp4_primitives.dynamic_scale(input)
 
     def prepare(
         self,

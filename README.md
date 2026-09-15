@@ -191,16 +191,17 @@ eager, and training paths remain unchanged. Existing post-grad compiler passes i
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
-The ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU FFN compiler integrations support
-FP16 and BF16 activations. Their `*_swiglu_ffn_compile_options()` helpers match separate
-gate, value, and down projections and install FFN fusion before ordinary linear rewriting.
-`convrot_int8_gelu_ffn_compile_options()` similarly folds an exclusive
-`down(gelu(up(input), approximate="tanh"))` region. It preserves each projection's static or
-dynamic input scale and selects a feature-width-aware row chunk that bounds reusable temporary
-storage near 1 GiB. Fused activation preparation retains FP32 arithmetic; outputs retain the
-input dtype.
+The ConvRot INT8, NVFP4, and ConvRot NVFP4 FFN compiler integrations support FP16 and BF16
+activations. Their `*_swiglu_ffn_compile_options()` helpers match separate gate, value, and down
+projections. Their `*_gelu_ffn_compile_options()` helpers fold an exclusive
+`down(gelu(up(input), approximate="tanh"))` region. Each helper installs FFN fusion before
+ordinary linear rewriting and preserves every projection's static or dynamic input scale.
+Feature-width-aware GELU row chunks bound reusable temporary storage near 1 GiB for INT8 and
+512 MiB for NVFP4 while amortizing long-sequence launches. Fused activation preparation retains
+FP32 arithmetic and quantizes directly into the down-projection input; outputs retain the input
+dtype.
 
-ConvRot NVFP4 FFN fusion includes SwiGLU, rotation, and NVFP4 preparation for the
+ConvRot NVFP4 FFN fusion includes SwiGLU or tanh-GELU, rotation, and NVFP4 preparation for the
 down projection. It reads the FFN's private projection workspace directly. Dynamic
 preparation reuses rotated FP32 values in a scratch buffer capped at 32 MiB per
 chunk and recomputes them in small tiles above that limit; static preparation

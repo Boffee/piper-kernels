@@ -9,6 +9,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.nvfp4 import _layout
 
@@ -38,14 +39,13 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 128, 129])
-@pytest.mark.parametrize("activation_fn", [None, "swiglu"])
+@pytest.mark.parametrize("activation_fn", ["gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("high_first", [False, True])
-def test_static_preparation_matches_compiled_decomposition(
+def test_static_activation_preparation_matches_portable_reference(
     rows: int,
     activation_fn: str | None,
     high_first: bool,
 ) -> None:
-    torch._dynamo.reset()
     torch.manual_seed(501)
     output_features = 80
     input_features = output_features * (2 if activation_fn == "swiglu" else 1)
@@ -57,16 +57,17 @@ def test_static_preparation_matches_compiled_decomposition(
     )
     per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
 
-    expected = nvfp4_ops._compiled_prepare_static(
+    expected = nvfp4_reference.prepare_input(
         input,
         per_tensor_scale,
-        activation_fn,
-        high_first,
+        False,
+        activation_fn=activation_fn,
+        high_first=high_first,
     )
     actual = nvfp4_triton.prepare_static(
         input,
         per_tensor_scale,
-        swiglu=activation_fn == "swiglu",
+        activation_fn=activation_fn,
         high_first=high_first,
     )
 
@@ -76,7 +77,7 @@ def test_static_preparation_matches_compiled_decomposition(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize("activation_fn", [None, "swiglu"])
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 def test_static_preparation_preserves_noncontiguous_logical_order(
     activation_fn: str | None,
 ) -> None:
@@ -96,12 +97,12 @@ def test_static_preparation_preserves_noncontiguous_logical_order(
     expected = nvfp4_triton.prepare_static(
         input.contiguous(),
         per_tensor_scale,
-        swiglu=activation_fn == "swiglu",
+        activation_fn=activation_fn,
     )
     actual = nvfp4_triton.prepare_static(
         input,
         per_tensor_scale,
-        swiglu=activation_fn == "swiglu",
+        activation_fn=activation_fn,
     )
 
     for expected_tensor, actual_tensor in zip(expected, actual, strict=True):

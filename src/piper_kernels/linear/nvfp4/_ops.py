@@ -11,19 +11,6 @@ from . import _projection, _validation, reference
 from . import triton as nvfp4_triton
 
 
-def _prepare_static_tensors(
-    input: torch.Tensor,  # noqa: A002
-    per_tensor_scale: torch.Tensor,
-    activation_fn: str | None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    qdata, scale, global_scale = reference.prepare_input(
-        input, per_tensor_scale, False, activation_fn, high_first
-    )
-    # Custom-op outputs must not alias their input scale.
-    return qdata, scale, global_scale.clone()
-
-
 def _prepare_dynamic_swiglu_tensors(
     input: torch.Tensor,  # noqa: A002
     high_first: bool = False,
@@ -38,7 +25,6 @@ def _prepare_dynamic_gelu_tanh_tensors(
     return reference.prepare_input(input, None, True, "gelu_tanh", high_first)
 
 
-_compiled_prepare_static = torch.compile(_prepare_static_tensors, fullgraph=True)
 _compiled_prepare_dynamic_swiglu = torch.compile(_prepare_dynamic_swiglu_tensors, fullgraph=True)
 _compiled_prepare_dynamic_gelu_tanh = torch.compile(
     _prepare_dynamic_gelu_tanh_tensors,
@@ -57,7 +43,7 @@ def _compiled_prepare_dynamic(
         qdata, scale = nvfp4_triton._prepare_static_storage(
             input,
             per_tensor_scale,
-            swiglu=False,
+            activation_fn=None,
             high_first=high_first,
         )
         return qdata, scale, per_tensor_scale
@@ -83,14 +69,7 @@ def _prepare_compiled(
         return _compiled_prepare_dynamic(input, activation_fn, high_first)
     if activation_per_tensor_scale is None:
         raise ValueError("static NVFP4 activation preparation requires a per-tensor scale")
-    if activation_fn in (None, "swiglu"):
-        return nvfp4_triton.prepare_static(
-            input,
-            activation_per_tensor_scale,
-            swiglu=activation_fn == "swiglu",
-            high_first=high_first,
-        )
-    return _compiled_prepare_static(
+    return nvfp4_triton.prepare_static(
         input,
         activation_per_tensor_scale,
         activation_fn,

@@ -1,4 +1,4 @@
-"""Compiler folding for a bounded-workspace NVFP4 SwiGLU FFN."""
+"""Compiler folding for a bounded-workspace standard NVFP4 GELU FFN."""
 
 from __future__ import annotations
 
@@ -11,63 +11,49 @@ from torch._inductor.custom_graph_pass import (
     CustomInferenceAwareGraphPass,
     get_hash_for_files,
 )
-from torch._inductor.pattern_matcher import (
-    Match,
-    PatternMatcherPass,
-    register_graph_pattern,
-)
+from torch._inductor.pattern_matcher import Match, PatternMatcherPass, register_graph_pattern
 from torch.fx.node import Argument
 
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.gelu_ffn import _pattern as gelu_ffn_pattern
 from piper_kernels.fusions.nvfp4_ffn import _compile as ffn_compile_common
 from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
 from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
-from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
+from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 
 from . import _operands, _preparation
-from . import triton as swiglu_backend
+from . import triton as gelu_backend
 
-_COMPILE_PASS_VERSION = "nvfp4-swiglu-ffn-compile-v4"
+_COMPILE_PASS_VERSION = "nvfp4-gelu-ffn-compile-v2"
 
 
 @dataclass(frozen=True, slots=True)
 class _MatchedFfn:
-    gate: nvfp4_compile_fx.SemanticLinearNodes
-    value: nvfp4_compile_fx.SemanticLinearNodes
+    up: nvfp4_compile_fx.SemanticLinearNodes
     down: nvfp4_compile_fx.SemanticLinearNodes
 
     @classmethod
     def from_match(cls, match: Match) -> _MatchedFfn | None:
-        projections = ffn_compile_common.matched_projections(
-            match,
-            ("gate", "value", "down"),
-        )
+        projections = ffn_compile_common.matched_projections(match, ("up", "down"))
         return None if projections is None else cls(*projections)
 
     def arguments(self) -> tuple[Argument, ...]:
-        """Return custom-op operands in semantic gate/value/down order."""
+        """Return custom-op operands in semantic up/down order."""
         return (
-            self.gate.input,
-            self.gate.weight_qdata,
-            self.gate.weight_scale,
-            self.gate.weight_per_tensor_scale,
-            self.gate.activation_per_tensor_scale,
-            self.gate.bias,
-            self.gate.dynamic_activation_scale,
-            self.gate.high_first,
-            self.value.weight_qdata,
-            self.value.weight_scale,
-            self.value.weight_per_tensor_scale,
-            self.value.activation_per_tensor_scale,
-            self.value.bias,
-            self.value.dynamic_activation_scale,
-            self.value.high_first,
+            self.up.input,
+            self.up.weight_qdata,
+            self.up.weight_scale,
+            self.up.weight_per_tensor_scale,
+            self.up.activation_per_tensor_scale,
+            self.up.bias,
+            self.up.dynamic_activation_scale,
+            self.up.high_first,
             self.down.weight_qdata,
             self.down.weight_scale,
             self.down.weight_per_tensor_scale,
@@ -78,30 +64,32 @@ class _MatchedFfn:
         )
 
 
-def _valid_semantic_ffn(match: Match, *, promote_gate: bool | None) -> bool:
+def _valid_semantic_ffn(match: Match) -> bool:
     operands = _MatchedFfn.from_match(match)
     if operands is None:
         return False
-    input_value = preparation_sharing.tensor_metadata(operands.gate.input)
+    input_value = preparation_sharing.tensor_metadata(operands.up.input)
     return bool(
         input_value is not None
-        and ffn_compile_common.valid_semantic_ffn(
-            match,
-            (operands.gate, operands.value),
-            operands.down,
-        )
-        and (promote_gate is not True or match.kwargs["logical_dtype"] is input_value.dtype)
+        and ffn_compile_common.valid_semantic_ffn(match, (operands.up,), operands.down)
+        and match.kwargs["logical_dtype"] is input_value.dtype
     )
 
 
-def _valid_semantic_gated_updates(
-    match: Match,
-    *,
-    promote_gate: bool | None,
-) -> bool:
-    return ffn_compile.valid_indexed_gated_updates(
-        match,
-        partial(_valid_semantic_ffn, promote_gate=promote_gate),
+def _chunk_rows(match: Match, *, gated_updates: bool) -> int:
+    operands = _MatchedFfn.from_match(match)
+    assert operands is not None
+    input_value = preparation_sharing.tensor_metadata(operands.up.input)
+    up_weight = preparation_sharing.tensor_metadata(operands.up.weight_qdata)
+    down_weight = preparation_sharing.tensor_metadata(operands.down.weight_qdata)
+    assert input_value is not None
+    assert up_weight is not None
+    assert down_weight is not None
+    return gelu_backend._default_chunk_rows(
+        input_value,
+        up_weight,
+        down_weight,
+        gated_updates=gated_updates,
     )
 
 
@@ -112,8 +100,8 @@ def _replace_semantic_ffn(match: Match, **_unused: object) -> None:
     assert operands is not None
     with graph.inserting_before(original):
         replacement = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_swiglu_ffn.default,
-            args=(*operands.arguments(), swiglu_backend._DEFAULT_CHUNK_ROWS),
+            torch.ops.piper_kernels.nvfp4_gelu_ffn.default,
+            args=(*operands.arguments(), _chunk_rows(match, gated_updates=False)),
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -129,7 +117,7 @@ def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None
     python_indexing = ffn_compile.uses_python_indexing(match)
     with graph.inserting_before(original):
         mutation = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_swiglu_ffn_gated_updates_.default,
+            torch.ops.piper_kernels.nvfp4_gelu_ffn_gated_updates_.default,
             args=(
                 *operands.arguments(),
                 match.kwargs["base"],
@@ -138,7 +126,7 @@ def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None
                 match.kwargs["ffn_gate"],
                 match.kwargs["gate_indices"],
                 python_indexing,
-                swiglu_backend._DEFAULT_CHUNK_ROWS,
+                _chunk_rows(match, gated_updates=True),
             ),
         )
     mutation.meta["val"] = None
@@ -148,8 +136,8 @@ def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None
     match.erase_nodes()
 
 
-_gated_updates_patterns = PatternMatcherPass("nvfp4_swiglu_ffn_gated_updates")
-_patterns = PatternMatcherPass("nvfp4_swiglu_ffn")
+_gated_updates_patterns = PatternMatcherPass("nvfp4_gelu_ffn_gated_updates")
+_patterns = PatternMatcherPass("nvfp4_gelu_ffn")
 for _with_source_high_first in (False, True):
     for _with_down_high_first in (False, True):
         _source_projection_pattern = partial(
@@ -164,36 +152,28 @@ for _with_source_high_first in (False, True):
             with_group_size=False,
             with_high_first=_with_down_high_first,
         )
-        for _promote_gate in (None, False, True):
-            for _reverse_multiply in (False, True):
-                _semantic_ffn_pattern = swiglu_ffn_pattern.semantic_ffn_pattern(
-                    _source_projection_pattern,
-                    _source_projection_pattern,
-                    _down_projection_pattern,
-                    promote_gate=_promote_gate,
-                    reverse_multiply=_reverse_multiply,
-                )
-                register_graph_pattern(
+        _semantic_ffn_pattern = gelu_ffn_pattern.semantic_ffn_pattern(
+            _source_projection_pattern,
+            _down_projection_pattern,
+            promote_input=True,
+        )
+        for _use_aten_index in (False, True):
+            register_graph_pattern(
+                ffn_pattern.indexed_gated_updates_pattern(
                     _semantic_ffn_pattern,
-                    extra_check=lambda match, promote_gate=_promote_gate: _valid_semantic_ffn(
-                        match, promote_gate=promote_gate
-                    ),
-                    pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-                )(_replace_semantic_ffn)
-                for _use_aten_index in (False, True):
-                    register_graph_pattern(
-                        ffn_pattern.indexed_gated_updates_pattern(
-                            _semantic_ffn_pattern,
-                            use_aten_index=_use_aten_index,
-                        ),
-                        extra_check=lambda match, promote_gate=_promote_gate: (
-                            _valid_semantic_gated_updates(
-                                match,
-                                promote_gate=promote_gate,
-                            )
-                        ),
-                        pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
-                    )(_replace_semantic_ffn_gated_updates)
+                    use_aten_index=_use_aten_index,
+                ),
+                extra_check=lambda match: ffn_compile.valid_indexed_gated_updates(
+                    match,
+                    _valid_semantic_ffn,
+                ),
+                pass_dict=_gated_updates_patterns,  # pyright: ignore[reportArgumentType]
+            )(_replace_semantic_ffn_gated_updates)
+        register_graph_pattern(
+            _semantic_ffn_pattern,
+            extra_check=_valid_semantic_ffn,
+            pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
+        )(_replace_semantic_ffn)
 
 
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
@@ -207,7 +187,7 @@ def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
 
 
 class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold semantic gate/value FFNs before ordinary NVFP4 normalization."""
+    """Fold semantic GELU FFNs before ordinary NVFP4 normalization."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
@@ -226,12 +206,12 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     source_preparation.__file__,
                     _operands.__file__,
                     _preparation.__file__,
-                    swiglu_backend.__file__,
-                    nvfp4_compile_fx.__file__,
+                    gelu_backend.__file__,
                     ffn_compile.__file__,
                     ffn_pattern.__file__,
                     indexed_updates.__file__,
-                    swiglu_ffn_pattern.__file__,
+                    gelu_ffn_pattern.__file__,
+                    input_activation_compile.__file__,
                 )
                 if file_name is not None
             ),
@@ -242,14 +222,14 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 compile_pass = _CompilePass()
 
 
-def nvfp4_swiglu_ffn_compile_options(
+def nvfp4_gelu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Install semantic FFN folding before ordinary NVFP4 folding."""
+    """Install semantic GELU FFN folding before ordinary NVFP4 folding."""
     return preparation_sharing.add_ordered_post_grad_passes(
         options,
         (compile_pass, nvfp4_compile.compile_pass),
     )
 
 
-__all__ = ["nvfp4_swiglu_ffn_compile_options"]
+__all__ = ["nvfp4_gelu_ffn_compile_options"]

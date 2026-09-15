@@ -1,4 +1,4 @@
-"""Standard NVFP4 SwiGLU preparation for a bounded FFN chunk."""
+"""FP32 GELU preparation for a bounded standard NVFP4 FFN chunk."""
 
 from dataclasses import dataclass
 from typing import ClassVar
@@ -10,20 +10,19 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 
 
-def _dynamic_swiglu_scale(projections: torch.Tensor) -> torch.Tensor:
-    """Calculate the dynamic scale in FP32 without materializing SwiGLU."""
-    value, gate = projections.chunk(2, dim=-1)
-    return per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
+def _dynamic_gelu_scale(projections: torch.Tensor) -> torch.Tensor:
+    """Calculate the dynamic scale in FP32 without materializing GELU."""
+    return per_tensor_amax_to_scale(F.gelu(projections.float(), approximate="tanh").abs().amax())
 
 
-dynamic_swiglu_scale = torch.compile(_dynamic_swiglu_scale, fullgraph=True)
+dynamic_gelu_scale = torch.compile(_dynamic_gelu_scale, fullgraph=True)
 
 
 @dataclass(frozen=True, slots=True)
-class StandardSwiGLUPreparation:
-    """Apply SwiGLU and prepare ordinary NVFP4 down-projection inputs."""
+class StandardGELUPreparation:
+    """Apply GELU and prepare ordinary NVFP4 down-projection inputs."""
 
-    source_projection_count: ClassVar[int] = 2
+    source_projection_count: ClassVar[int] = 1
     high_first: bool
 
     def prepare(
@@ -33,7 +32,7 @@ class StandardSwiGLUPreparation:
         dynamic_activation_scale: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         per_tensor_scale = (
-            dynamic_swiglu_scale(projections)
+            dynamic_gelu_scale(projections)
             if dynamic_activation_scale
             else activation_per_tensor_scale
         )
@@ -41,11 +40,10 @@ class StandardSwiGLUPreparation:
         qdata, scale = nvfp4_backend._prepare_static_storage(
             projections,
             per_tensor_scale,
-            activation_fn="swiglu",
+            activation_fn="gelu_tanh",
             high_first=self.high_first,
         )
-        # The scale stays internal to the FFN and is only read by the down GEMM.
         return qdata, scale, per_tensor_scale
 
 
-__all__ = ["StandardSwiGLUPreparation", "dynamic_swiglu_scale"]
+__all__ = ["StandardGELUPreparation", "dynamic_gelu_scale"]

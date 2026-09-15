@@ -50,6 +50,7 @@ def _indexed_gated_updates_kernel(
     elements,
     row_offset,
     features: tl.constexpr,
+    ffn_output_row_stride: tl.constexpr,
     update_gate_row_stride: tl.constexpr,
     ffn_gate_row_stride: tl.constexpr,
     update_gate_rows,
@@ -62,7 +63,11 @@ def _indexed_gated_updates_kernel(
     valid = offsets < elements
     rows = offsets // features
     columns = offsets % features
-    ffn_output = tl.load(ffn_output_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    ffn_output = tl.load(
+        ffn_output_ptr + rows * ffn_output_row_stride + columns,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
     base = tl.load(base_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
     reusable_update = tl.load(
         reusable_update_ptr + offsets,
@@ -189,6 +194,7 @@ def apply_indexed_gated_updates(
             elements,
             row_offset,
             features=ffn_output.shape[-1],
+            ffn_output_row_stride=ffn_output.stride(0),
             update_gate_row_stride=layout.update_gate_row_stride,
             ffn_gate_row_stride=layout.ffn_gate_row_stride,
             update_gate_rows=layout.update_gate_rows,

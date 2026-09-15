@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import benchmark_nvfp4_ffn as benchmark
 import pytest
+import torch
 
 
 @pytest.mark.parametrize(
@@ -67,3 +68,12 @@ def test_exclusivity_checks_only_the_selected_gpu(monkeypatch):
     query.stdout += f"{os.getpid() + 1}, GPU-selected\n"
     with pytest.raises(RuntimeError, match="GPU is shared"):
         benchmark._require_exclusive_gpu()
+
+
+def test_default_chunk_rows_are_topology_specific():
+    shape = (100_000, 5_120, 13_824)
+
+    assert benchmark._default_chunk_rows(shape, torch.bfloat16, "swiglu") == 1_536
+    gelu_rows = benchmark._default_chunk_rows(shape, torch.bfloat16, "gelu_tanh")
+    assert gelu_rows > 1_536
+    assert gelu_rows % 128 == 0

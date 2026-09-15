@@ -18,10 +18,13 @@ from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, 
 from lib.timing import ClockDomain, PhaseTimings, Timing, _linear_quantile
 
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
+from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import triton as convrot_gelu_ffn
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation as rotated_preparation
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import triton as convrot_ffn
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
+from piper_kernels.fusions.nvfp4_gelu_ffn import triton as gelu_ffn
+from piper_kernels.fusions.nvfp4_gelu_ffn._preparation import StandardGELUPreparation
 from piper_kernels.fusions.nvfp4_swiglu_ffn._preparation import StandardSwiGLUPreparation
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
 from piper_kernels.linear.nvfp4 import triton as nvfp4
@@ -32,13 +35,14 @@ _DEFAULT_SHAPES = [(1_024, 2_048, 8_192), (1_797, 2_048, 8_192), (4_096, 5_376, 
 
 @dataclass(frozen=True, slots=True)
 class Case:
-    """One complete FFN with independently supplied gate/value weights."""
+    """One complete FFN with separately prepared projection weights."""
 
     shape: tuple[int, int, int]
     dtype: torch.dtype
     dynamic: bool
     group_size: int | None
     chunk_rows: int
+    activation: str
     high_first: bool
     seed: int
 
@@ -59,7 +63,18 @@ def _preparation_backends(
     if case.group_size is None:
         return (
             StandardSourcePreparation(case.high_first),
-            StandardSwiGLUPreparation(case.high_first),
+            (
+                StandardGELUPreparation(case.high_first)
+                if case.activation == "gelu_tanh"
+                else StandardSwiGLUPreparation(case.high_first)
+            ),
+        )
+    if case.activation == "gelu_tanh":
+        return convrot_gelu_ffn._preparation_backends(
+            case.group_size,
+            case.group_size,
+            case.high_first,
+            case.high_first,
         )
     return convrot_ffn._preparation_backends(
         case.group_size,
@@ -77,11 +92,19 @@ def _workload(case: Case) -> tuple[torch.Tensor, tuple[_core.LinearOperands, ...
     source = torch.randn(rows, input_features, device="cuda", dtype=case.dtype)
     weights = []
     biases = []
-    for width, height in (
-        (input_features, intermediate_features),
-        (input_features, intermediate_features),
-        (intermediate_features, input_features),
-    ):
+    projection_shapes = (
+        (
+            (input_features, intermediate_features),
+            (intermediate_features, input_features),
+        )
+        if case.activation == "gelu_tanh"
+        else (
+            (input_features, intermediate_features),
+            (input_features, intermediate_features),
+            (intermediate_features, input_features),
+        )
+    )
+    for width, height in projection_shapes:
         dense = torch.randn(height, width, device="cuda", dtype=case.dtype) / math.sqrt(width)
         packed = (
             nvfp4.prepare_static(
@@ -100,7 +123,7 @@ def _workload(case: Case) -> tuple[torch.Tensor, tuple[_core.LinearOperands, ...
             weight_scale=weight[1],
             weight_per_tensor_scale=weight[2],
             activation_per_tensor_scale=(
-                None if case.dynamic else (source_scale if index < 2 else down_scale)
+                None if case.dynamic else (source_scale if index < len(weights) - 1 else down_scale)
             ),
             bias=bias,
             dynamic_activation_scale=case.dynamic,
@@ -199,10 +222,11 @@ def benchmark_case(
     source_preparation, activation_preparation = _preparation_backends(case)
 
     def run() -> torch.Tensor:
+        sources = (linears[0],) if case.activation == "gelu_tanh" else (linears[1], linears[0])
         return _core.run_chunked_ffn(
             source,
-            (linears[1], linears[0]),
-            linears[2],
+            sources,
+            linears[-1],
             case.chunk_rows,
             source_preparation,
             activation_preparation,
@@ -235,6 +259,7 @@ def benchmark_case(
             "dynamic_scale": case.dynamic,
             "group_size": case.group_size,
             "chunk_rows": case.chunk_rows,
+            "activation": case.activation,
             "high_first": case.high_first,
             "seed": case.seed,
             "static_down_scale": None if case.dynamic else 0.01,
@@ -261,7 +286,7 @@ def benchmark_case(
             "output_finite": True,
         },
     )
-    label = f"{case.shape} {case.dtype} {'dynamic' if case.dynamic else 'static'}"
+    label = f"{case.activation} {case.shape} {case.dtype} {'dynamic' if case.dynamic else 'static'}"
     print(f"{label}: {distribution.display(precision=6)} ms", flush=True)
     return record
 
@@ -275,7 +300,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--scaling", nargs="+", choices=["static", "dynamic"], default=["static", "dynamic"]
     )
     parser.add_argument("--group-size", type=int, choices=[16, 64, 256], default=256)
-    parser.add_argument("--chunk-rows", type=int, default=_core.DEFAULT_CHUNK_ROWS)
+    parser.add_argument("--chunk-rows", type=int)
+    parser.add_argument(
+        "--activation",
+        nargs="+",
+        choices=["swiglu", "gelu_tanh"],
+        default=["swiglu"],
+    )
     parser.add_argument("--high-first", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
@@ -300,7 +331,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         k % args.group_size or n % args.group_size for _, k, n in args.shape
     ):
         parser.error("K and N must be divisible by the rotation group size")
-    if args.chunk_rows < 128 or args.chunk_rows % 128:
+    if args.chunk_rows is not None and (args.chunk_rows < 128 or args.chunk_rows % 128):
         parser.error("--chunk-rows must be a positive multiple of 128")
     if min(args.calls_per_graph, args.samples, args.sample_ms) <= 0 or args.warmup_rounds < 0:
         parser.error("timing counts must be positive and warmup rounds non-negative")
@@ -309,6 +340,35 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ):
         parser.error("--rotated-workspace-mib must be non-negative and is only for ConvRot")
     return args
+
+
+def _default_chunk_rows(
+    shape: tuple[int, int, int],
+    dtype: torch.dtype,
+    activation: str,
+) -> int:
+    if activation == "swiglu":
+        return _core.DEFAULT_CHUNK_ROWS
+    _, input_features, intermediate_features = shape
+    input = torch.empty(1, input_features, dtype=dtype, device="meta")  # noqa: A001
+    up_qdata = torch.empty(
+        intermediate_features,
+        input_features // 2,
+        dtype=torch.uint8,
+        device="meta",
+    )
+    down_qdata = torch.empty(
+        input_features,
+        intermediate_features // 2,
+        dtype=torch.uint8,
+        device="meta",
+    )
+    return gelu_ffn._default_chunk_rows(
+        input,
+        up_qdata,
+        down_qdata,
+        gated_updates=False,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -325,21 +385,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     with torch.inference_mode(), _workspace_limit(args.rotated_workspace_mib):
         for shape in args.shape:
             for dtype in args.dtype:
-                for scaling in args.scaling:
-                    group_size = args.group_size if args.format == "convrot-nvfp4" else None
-                    case = Case(
-                        tuple(shape),
-                        _DTYPES[dtype],
-                        scaling == "dynamic",
-                        group_size,
-                        args.chunk_rows,
-                        args.high_first,
-                        args.seed + sum(shape) + (group_size or 0),
-                    )
-                    records.append(benchmark_case(case, timing, environment))
-                    write_records(records, output_target(args))
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                for activation in args.activation:
+                    for scaling in args.scaling:
+                        chunk_rows = args.chunk_rows or _default_chunk_rows(
+                            tuple(shape),
+                            _DTYPES[dtype],
+                            activation,
+                        )
+                        group_size = args.group_size if args.format == "convrot-nvfp4" else None
+                        case = Case(
+                            tuple(shape),
+                            _DTYPES[dtype],
+                            scaling == "dynamic",
+                            group_size,
+                            chunk_rows,
+                            activation,
+                            args.high_first,
+                            args.seed + sum(shape) + (group_size or 0),
+                        )
+                        records.append(benchmark_case(case, timing, environment))
+                        write_records(records, output_target(args))
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -248,15 +248,18 @@ def run_chunked_ffn(
         device=input.device,
         dtype=input.dtype,
     )
-    projected_workspace = (
-        None
-        if gated_updates is None
-        else torch.empty(
-            (workspace_rows, output_features),
-            device=input.device,
-            dtype=input.dtype,
+    projected_workspace = None
+    if gated_updates is not None:
+        projection_columns = projection_workspace.shape[1]
+        projected_workspace = (
+            projection_workspace[:, :output_features]
+            if output_features <= projection_columns
+            else torch.empty(
+                (workspace_rows, output_features),
+                device=input.device,
+                dtype=input.dtype,
+            )
         )
-    )
 
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)

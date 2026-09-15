@@ -7,6 +7,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Added bounded standard and ConvRot NVFP4 tanh-GELU FFN execution and compiler folding for
+  independently static or dynamic up/down input scales. GELU stays in FP32 through direct NVFP4
+  preparation, and a feature-width-aware row policy keeps long-sequence scratch near 512 MiB.
 - Added bounded ConvRot INT8 tanh-GELU FFN execution and compiler folding for up/down
   projections, including static and dynamic input scales and indexed gated updates.
 

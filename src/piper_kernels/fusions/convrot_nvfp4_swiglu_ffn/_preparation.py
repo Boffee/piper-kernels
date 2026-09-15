@@ -147,7 +147,7 @@ def prepare(
                 )
                 global_scale = nvfp4_dynamic_scale(row_amax)
                 qdata, scale = nvfp4_backend._prepare_static_storage(
-                    rotated, global_scale, swiglu=False, high_first=high_first
+                    rotated, global_scale, activation_fn=None, high_first=high_first
                 )
                 return qdata, scale, global_scale
             chunk_count = sum(chunk > 0 for chunk in chunks)
