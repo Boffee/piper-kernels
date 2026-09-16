@@ -125,7 +125,7 @@ def _validate_gelu_ffn(
         down_dynamic_activation_scale,
         down_high_first,
     )
-    _source_preparation, activation_preparation = _preparation_backends(
+    source_preparation, activation_preparation = _preparation_backends(
         up_group_size,
         down_group_size,
         up_high_first,
@@ -136,6 +136,7 @@ def _validate_gelu_ffn(
         (up,),
         down,
         chunk_rows,
+        source_preparation,
         activation_preparation,
     )[2]
 

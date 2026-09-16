@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import cast
 
 import torch
@@ -111,6 +112,7 @@ def valid_semantic_ffn(  # noqa: PLR0911
         return False
     concrete_weights = cast(tuple[torch.Tensor, ...], weights)
     concrete_scales = cast(tuple[torch.Tensor, ...], scales)
+    rows = math.prod(input_value.shape[:-1])
     if any(
         not _compile_fx.valid_input_scale(match.kwargs[f"{prefix}_input_scale"], input_value.device)
         for prefix in projection_prefixes
@@ -118,6 +120,7 @@ def valid_semantic_ffn(  # noqa: PLR0911
         return False
     if (
         input_value.ndim == 0
+        or (isinstance(rows, int) and rows < 1)
         or input_value.dtype not in (torch.float16, torch.bfloat16)
         or input_value.layout is not torch.strided
         or not input_value.is_contiguous()

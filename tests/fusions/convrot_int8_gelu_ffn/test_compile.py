@@ -221,7 +221,7 @@ def test_compile_options_fold_semantic_gelu_ffn(bias_dtype, dtype, scale_mode) -
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
-@pytest.mark.parametrize("failure", ["projection-escapes", "noncontiguous"])
+@pytest.mark.parametrize("failure", ["projection-escapes", "noncontiguous", "empty"])
 def test_compile_options_fail_closed(failure: str) -> None:
     torch.manual_seed(513)
     model = _GeluFfn(expose_up=failure == "projection-escapes").eval()
@@ -233,6 +233,8 @@ def test_compile_options_fail_closed(failure: str) -> None:
             device="cuda",
         )
         activation = storage[:, ::2]
+    elif failure == "empty":
+        activation = torch.empty(0, model.input_features, dtype=torch.bfloat16, device="cuda")
     else:
         activation = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
     capture = _TargetCapturePass()

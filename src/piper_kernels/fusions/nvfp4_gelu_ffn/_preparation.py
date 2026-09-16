@@ -25,6 +25,11 @@ class StandardGELUPreparation:
     source_projection_count: ClassVar[int] = 1
     high_first: bool
 
+    @property
+    def group_size(self) -> None:
+        """Standard NVFP4 does not rotate features."""
+        return None
+
     def prepare(
         self,
         projections: torch.Tensor,

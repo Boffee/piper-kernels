@@ -151,6 +151,7 @@ def _validate_gelu_ffn(
         (up,),
         down,
         chunk_rows,
+        StandardSourcePreparation(up_high_first),
         StandardGELUPreparation(down_high_first),
     )[2]
 

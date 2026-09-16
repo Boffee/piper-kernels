@@ -33,6 +33,11 @@ class LinearOperands:
 class SourcePreparationBackend(Protocol):
     """Format-specific preparation shared by the topology's source projections."""
 
+    @property
+    def group_size(self) -> int | None:
+        """Return the rotation group size, or None for standard NVFP4."""
+        ...
+
     def dynamic_scale(
         self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
@@ -55,6 +60,11 @@ class ActivationPreparationBackend(Protocol):
 
     source_projection_count: ClassVar[int]
 
+    @property
+    def group_size(self) -> int | None:
+        """Return the rotation group size, or None for standard NVFP4."""
+        ...
+
     def prepare(
         self,
         projections: torch.Tensor,
@@ -74,11 +84,24 @@ def _dimension_matches(
     return str(left) == str(right)
 
 
+def _validate_rotation_features(
+    features: int | torch.SymInt,
+    group_size: int | None,
+    name: str,
+) -> None:
+    if group_size is not None and isinstance(features, int) and features % group_size:
+        raise ValueError(
+            f"ConvRot NVFP4 FFN {name} features {features} must be divisible "
+            f"by group size {group_size}"
+        )
+
+
 def validate_ffn(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     sources: tuple[LinearOperands, ...],
     down: LinearOperands,
     chunk_rows: int,
+    source_preparation: SourcePreparationBackend,
     activation_preparation: ActivationPreparationBackend,
 ) -> tuple[int | torch.SymInt, int | torch.SymInt, int | torch.SymInt]:
     """Validate bounded NVFP4 FFN metadata and return its logical dimensions."""
@@ -122,7 +145,11 @@ def validate_ffn(
         for source_shape in source_shapes[1:]
     ):
         raise ValueError("NVFP4 FFN source projections must have matching shapes")
+    _validate_rotation_features(shape.input_features, source_preparation.group_size, "source")
     intermediate_features = shape.output_features
+    _validate_rotation_features(
+        intermediate_features, activation_preparation.group_size, "activated"
+    )
     nvfp4_validation.validate_activation_scale(
         down.activation_per_tensor_scale,
         down.dynamic_activation_scale,
@@ -214,6 +241,7 @@ def run_chunked_ffn(
         sources,
         down,
         chunk_rows,
+        source_preparation,
         activation_preparation,
     )
     if any(not isinstance(dimension, int) for dimension in dimensions):

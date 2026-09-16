@@ -199,6 +199,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _preparation.__file__,
                     convrot_preparation.__file__,
                     gelu_backend.__file__,
+                    standard_gelu_backend.__file__,
                     ffn_compile.__file__,
                     ffn_pattern.__file__,
                     indexed_updates.__file__,

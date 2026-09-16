@@ -14,6 +14,11 @@ class StandardSourcePreparation:
 
     high_first: bool
 
+    @property
+    def group_size(self) -> None:
+        """Standard NVFP4 does not rotate features."""
+        return None
+
     def dynamic_scale(
         self,
         input: torch.Tensor,  # noqa: A002 - match linear terminology
