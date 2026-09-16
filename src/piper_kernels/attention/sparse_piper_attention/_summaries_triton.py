@@ -100,7 +100,10 @@ def sequence_block_summaries(
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError("optimized sequence summaries require rank-four Q/K tensors")
     if (
-        query.shape[:2] != key.shape[:2]
+        query.shape[0] != key.shape[0]
+        or key.shape[1] < 1
+        or query.shape[1] < 1
+        or query.shape[1] % key.shape[1]
         or query.shape[-1] not in SUPPORTED_HEAD_DIMS
         or key.shape[-1] != query.shape[-1]
         or query.shape[2] < 1
@@ -136,13 +139,13 @@ def sequence_block_summaries(
         dtype=torch.float32,
     )
     key_primary = torch.empty(
-        (batch, heads, key_blocks, head_dim),
+        (batch, key.shape[1], key_blocks, head_dim),
         device=key.device,
         dtype=torch.float32,
     )
     mean_pool_summary = routing_mode == _MEAN_ROUTING
     key_aux = (
-        torch.empty((batch, heads, 0, head_dim), device=key.device, dtype=torch.float32)
+        torch.empty((batch, key.shape[1], 0, head_dim), device=key.device, dtype=torch.float32)
         if mean_pool_summary
         else torch.empty_like(key_primary)
     )
@@ -158,7 +161,7 @@ def sequence_block_summaries(
         ) -> None:
             logical_rows = sequence.shape[2]
             logical_blocks = (logical_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-            _block_summary_kernel[(batch * heads * logical_blocks,)](
+            _block_summary_kernel[(batch * sequence.shape[1] * logical_blocks,)](
                 sequence,
                 primary,
                 aux,
@@ -171,7 +174,7 @@ def sequence_block_summaries(
                 stride_ir=sequence.stride(2),
                 block_rows=_BLOCK_ROWS,
                 head_dim=head_dim,
-                heads=heads,
+                heads=sequence.shape[1],
                 query_summary=query,
                 mean_pool_summary=mean_pool_summary,
                 mask_block_lengths=block_lengths is not None,

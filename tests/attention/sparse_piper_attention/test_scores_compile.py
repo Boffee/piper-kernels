@@ -18,11 +18,15 @@ from piper_kernels.attention.sparse_piper_attention._scores_triton import (
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="requires AMD compiler tooling")
 
 
+@pytest.mark.parametrize("head_groups", [1, 3])
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("has_score_scale", [False, True])
 @pytest.mark.parametrize("specialization", ["generic", "h3_full_chunk", "h3_tail_chunk"])
-def test_minmax_scoring_stays_fp32_without_spills(architecture, has_score_scale, specialization):
+def test_minmax_scoring_stays_fp32_without_spills(
+    architecture, has_score_scale, specialization, head_groups
+):
     constants = {
+        "head_groups": head_groups,
         "block_m": _BLOCK_M,
         "block_n": _BLOCK_N,
         "block_k": _BLOCK_K,

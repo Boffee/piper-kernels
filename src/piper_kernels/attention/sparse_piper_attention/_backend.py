@@ -145,7 +145,9 @@ def select_minmax_scores(
         and 1 <= query_summary.shape[2] <= 64
         and key_primary.shape[2] > 0
         and key_primary.shape == key_aux.shape
-        and query_summary.shape[:2] == key_primary.shape[:2]
+        and query_summary.shape[0] == key_primary.shape[0]
+        and key_primary.shape[1] > 0
+        and query_summary.shape[1] % key_primary.shape[1] == 0
         and key_primary.shape[-1] == 128
     ):
         return None

@@ -144,6 +144,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
 
     for batch_index in range(batch):
         for head in range(heads):
+            kv_head = head // (heads // key.shape[2])
             for query_block in range(query_blocks):
                 key_indices, tile_indices, valid_keys = _active_indices(
                     routes,
@@ -158,10 +159,10 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                         sparse_query_blocks is None or query_block < sparse_query_blocks
                     ),
                 )
-                selected_key = key_int8[batch_index, head].index_select(0, key_indices)
-                selected_value = value_int8[batch_index, head].index_select(0, key_indices)
-                selected_key_scale = key_scale[batch_index, head].index_select(0, key_indices)
-                selected_value_scale = value_scale[batch_index, head].index_select(
+                selected_key = key_int8[batch_index, kv_head].index_select(0, key_indices)
+                selected_value = value_int8[batch_index, kv_head].index_select(0, key_indices)
+                selected_key_scale = key_scale[batch_index, kv_head].index_select(0, key_indices)
+                selected_value_scale = value_scale[batch_index, kv_head].index_select(
                     0,
                     tile_indices,
                 )
@@ -233,7 +234,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     running_max = next_max
 
                 block_output = numerator / (denominator.clamp_min(1e-30)[:, None] * _P_UINT8_RANGE)
-                block_output += value_mean[batch_index, head]
+                block_output += value_mean[batch_index, kv_head]
                 output[batch_index, head, query_start:query_stop] = block_output.to(query.dtype)
 
     return output.transpose(1, 2).contiguous()
@@ -258,6 +259,7 @@ def reference_exact_sparse_attention(
 
     for batch_index in range(batch):
         for head in range(heads):
+            kv_head = head // (heads // key.shape[2])
             for query_block in range(query_blocks):
                 key_indices, _tile_indices, valid_keys = _active_indices(
                     routes,
@@ -275,8 +277,8 @@ def reference_exact_sparse_attention(
                 query_start = query_block * _BLOCK_ROWS
                 query_stop = min(query_start + _BLOCK_ROWS, sequence)
                 block_query = query[batch_index, query_start:query_stop, head].float()
-                selected_key = key[batch_index, key_indices, head].float()
-                selected_value = value[batch_index, key_indices, head].float()
+                selected_key = key[batch_index, key_indices, kv_head].float()
+                selected_value = value[batch_index, key_indices, kv_head].float()
                 scores = block_query @ selected_key.mT * scale
                 if valid_keys is not None:
                     scores = scores.masked_fill(~valid_keys[None, :], -float("inf"))

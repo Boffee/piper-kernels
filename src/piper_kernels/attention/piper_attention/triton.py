@@ -382,6 +382,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     unmasked_query_tiles: tl.constexpr,
     unmasked_key_tiles: tl.constexpr,
     heads: tl.constexpr,
+    kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -405,6 +406,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
+    kv_batch_head = batch * kv_heads + head // (heads // kv_heads)
     offsets_m = query_block * block_m + tl.arange(0, block_m)
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
@@ -474,7 +476,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 numerator,
                 denominator,
                 running_max,
-                batch_head,
+                kv_batch_head,
                 start_n,
                 offsets_m,
                 offsets_n,
@@ -510,7 +512,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 numerator,
                 denominator,
                 running_max,
-                batch_head,
+                kv_batch_head,
                 start_n,
                 offsets_m,
                 offsets_n,
@@ -552,7 +554,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
                 numerator,
                 denominator,
                 running_max,
-                batch_head,
+                kv_batch_head,
                 start_n,
                 offsets_m,
                 offsets_n,
@@ -580,7 +582,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         output_low = accumulator_low / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         output_high = accumulator_high / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         if not is_causal:
-            value_mean_base = value_mean_ptr + batch_head * head_dim
+            value_mean_base = value_mean_ptr + kv_batch_head * head_dim
             output_low += tl.load(value_mean_base + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
             output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
         output_base = output_ptr + (batch_head * query_length + offsets_m[:, None]) * head_dim
@@ -597,7 +599,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     else:
         output = accumulator / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         if not is_causal:
-            output += tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)[None, :]
+            output += tl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d)[None, :]
         tl.store(
             output_ptr
             + (batch_head * query_length + offsets_m[:, None]) * head_dim
@@ -692,8 +694,7 @@ def _prepare_piper_attention(
     execution_plan: _policy.PiperAttentionExecutionPlan,
 ) -> _PreparedPiperAttention:
     """Quantize Q/K/V and construct the selected launch specialization."""
-    batch, heads, _query_length, head_dim = query.shape
-    key_length = key.shape[2]
+    batch, kv_heads, key_length, head_dim = key.shape
     plan = execution_plan
     if plan.split_pv_head_dim and head_dim != 128:
         raise ValueError("split-PV Piper Attention requires head_dim=128")
@@ -720,23 +721,23 @@ def _prepare_piper_attention(
             storage_key_length=storage_key_length,
         )
 
-        value_shape = (batch, heads, head_dim, storage_key_length)
+        value_shape = (batch, kv_heads, head_dim, storage_key_length)
         value_int8 = (
             torch.zeros(value_shape, device=value.device, dtype=torch.int8)
             if storage_key_length != key_length
             else torch.empty(value_shape, device=value.device, dtype=torch.int8)
         )
         value_scale_multiplier = torch.empty(
-            (batch, heads, key_length),
+            (batch, kv_heads, key_length),
             device=value.device,
             dtype=torch.float32,
         )
         value_log_scale = torch.empty(
-            (1,) if plan.derive_value_log_bound else (batch, heads, key_length),
+            (1,) if plan.derive_value_log_bound else (batch, kv_heads, key_length),
             device=value.device,
             dtype=torch.float16,
         )
-        _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), heads, batch)](
+        _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), kv_heads, batch)](
             value,
             value_mean,
             value_scale_multiplier,
@@ -752,7 +753,7 @@ def _prepare_piper_attention(
             value_int8.stride(3),
             is_causal=is_causal,
             store_log_scale=not plan.derive_value_log_bound,
-            heads=heads,
+            heads=kv_heads,
             head_dim=head_dim,
             block_n=_BLOCK_N,
             num_warps=4,
@@ -827,6 +828,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
                 unmasked_query_tiles=unmasked_queries,
                 unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
                 heads=heads,
+                kv_heads=prepared.key_scale.shape[1],
                 head_dim=head_dim,
                 block_m=plan.block_m,
                 block_n=_BLOCK_N,

@@ -30,6 +30,7 @@ def _validate_tensor_relationships(
     value: torch.Tensor,
     *,
     is_causal: bool,
+    allow_gqa: bool = False,
 ) -> None:
     if query.device != key.device or query.device != value.device:
         raise ValueError(
@@ -41,9 +42,21 @@ def _validate_tensor_relationships(
             f"{operator} query, key, and value must share a dtype, "
             f"got {query.dtype}/{key.dtype}/{value.dtype}"
         )
-    if query.shape[:2] != key.shape[:2] or key.shape[:2] != value.shape[:2]:
+    if (
+        query.shape[0] != key.shape[0]
+        or key.shape[:2] != value.shape[:2]
+        or query.shape[1] < 1
+        or key.shape[1] < 1
+        or query.shape[1] % key.shape[1]
+        or (not allow_gqa and query.shape[1] != key.shape[1])
+    ):
+        relationship = (
+            "equal batches, matching K/V heads, and query heads divisible by KV heads"
+            if allow_gqa
+            else "equal batch and head dimensions"
+        )
         raise ValueError(
-            f"{operator} currently requires equal batch and head dimensions, got "
+            f"{operator} requires {relationship}, got "
             f"{query.shape[:2]}/{key.shape[:2]}/{value.shape[:2]}"
         )
     if key.shape[2] != value.shape[2]:
@@ -75,6 +88,8 @@ def validate_attention_inputs(
     value: torch.Tensor,
     scale: float | None,
     is_causal: bool,
+    *,
+    allow_gqa: bool = False,
 ) -> float:
     """Validate a common attention contract and return the effective scale."""
     tensors: Mapping[str, torch.Tensor] = {
@@ -90,6 +105,7 @@ def validate_attention_inputs(
         key,
         value,
         is_causal=is_causal,
+        allow_gqa=allow_gqa,
     )
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors.values()):
         raise RuntimeError(

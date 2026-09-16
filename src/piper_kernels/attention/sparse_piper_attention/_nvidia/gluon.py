@@ -442,6 +442,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     stride_gh,
     stride_gn,
     heads,
+    head_groups: gl.constexpr,
     head_dim: gl.constexpr,
     mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
@@ -464,6 +465,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
+    kv_batch_head = batch * (heads // head_groups) + head // head_groups
     start_m = query_block * _GL_BLOCK_N
     output_start_m = local_query_block * _GL_BLOCK_N
     if skip_dense_routing:  # noqa: SIM108
@@ -560,16 +562,16 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     )
     _issue_tma_pair(
         key_desc,
-        [batch_head * storage_sequence_length + initial_n_0, 0],
-        [batch_head * storage_sequence_length + initial_n_1, 0],
+        [kv_batch_head * storage_sequence_length + initial_n_0, 0],
+        [kv_batch_head * storage_sequence_length + initial_n_1, 0],
         key_shared_0,
         key_shared_1,
         key_barrier,
     )
     _issue_tma_pair(
         value_desc,
-        [batch_head * head_dim, initial_n_0],
-        [batch_head * head_dim, initial_n_1],
+        [kv_batch_head * head_dim, initial_n_0],
+        [kv_batch_head * head_dim, initial_n_1],
         value_shared_0,
         value_shared_1,
         value_barrier,
@@ -618,7 +620,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
             block_lengths_ptr,
             denominator,
             running_max,
-            batch_head,
+            kv_batch_head,
             start_n_0,
             start_n_1,
             True,
@@ -659,8 +661,8 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         gl.barrier()
         _issue_tma_pair(
             key_desc,
-            [batch_head * storage_sequence_length + next_n_0, 0],
-            [batch_head * storage_sequence_length + next_n_1, 0],
+            [kv_batch_head * storage_sequence_length + next_n_0, 0],
+            [kv_batch_head * storage_sequence_length + next_n_1, 0],
             key_shared_0,
             key_shared_1,
             key_barrier,
@@ -678,8 +680,8 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         gl.barrier()
         _issue_tma_pair(
             value_desc,
-            [batch_head * head_dim, next_n_0],
-            [batch_head * head_dim, next_n_1],
+            [kv_batch_head * head_dim, next_n_0],
+            [kv_batch_head * head_dim, next_n_1],
             value_shared_0,
             value_shared_1,
             value_barrier,
@@ -707,7 +709,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         block_lengths_ptr,
         denominator,
         running_max,
-        batch_head,
+        kv_batch_head,
         start_n_0,
         start_n_1,
         has_second,
@@ -733,7 +735,7 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
 
     offsets_d = gl.arange(0, head_dim, column_layout)
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
-    value_mean = gl.load(value_mean_ptr + batch_head * head_dim + offsets_d).to(gl.float32)
+    value_mean = gl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d).to(gl.float32)
     output += value_mean[None, :]
     valid_queries = global_query_block * _GL_BLOCK_N + offsets_m < logical_sequence_length
     if block_m == 128:
@@ -797,15 +799,18 @@ def _make_gluon_descriptors(
     key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, head_dim], gl.int8)
     value_layout = gl.NVMMASharedLayout.get_default_for([head_dim, _BLOCK_N], gl.int8)
     batch_heads = int(query.shape[0] * query.shape[1])
+    kv_batch_heads = int(key.shape[0] * key.shape[1])
     query_storage_sequence_length = int(query.shape[2])
     storage_sequence_length = int(key.shape[2])
     if (
-        key.shape[:2] != query.shape[:2]
+        key.shape[0] != query.shape[0]
+        or key.shape[1] < 1
+        or query.shape[1] % key.shape[1]
         or key.shape[3] != query.shape[3]
         or value.shape
         != (
             query.shape[0],
-            query.shape[1],
+            key.shape[1],
             query.shape[3],
             storage_sequence_length,
         )
@@ -822,14 +827,14 @@ def _make_gluon_descriptors(
             ),
             TensorDescriptor(
                 key,
-                [batch_heads * storage_sequence_length, head_dim],
+                [kv_batch_heads * storage_sequence_length, head_dim],
                 [head_dim, 1],
                 [_BLOCK_N, head_dim],
                 key_layout,
             ),
             TensorDescriptor(
                 value,
-                [batch_heads * head_dim, storage_sequence_length],
+                [kv_batch_heads * head_dim, storage_sequence_length],
                 [storage_sequence_length, 1],
                 [head_dim, _BLOCK_N],
                 value_layout,
@@ -907,6 +912,7 @@ def _launch_sparse_piper_attention(
             *launch.coarse_strides,
             *launch.gate_strides,
             launch.heads,
+            launch.heads // context.key.shape[1],
             launch.head_dim,
             launch.mask_block_lengths,
             launch.mask_ragged_tail,

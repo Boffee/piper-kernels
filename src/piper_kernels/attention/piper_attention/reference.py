@@ -56,7 +56,12 @@ def reference_piper_attention(
     )
     value_int8, value_scale = _quantize_value_per_key(value_centered)
 
-    batch, heads, query_length, width = query.shape
+    batch, query_heads, query_length, width = query.shape
+    heads = key.shape[1]
+    groups = query_heads // heads
+    query_int8 = query_int8.reshape(batch, heads, groups * query_length, width)
+    query_scale = query_scale.reshape(batch, heads, groups * query_length)
+    query_length *= groups
     key_length = key.shape[2]
     numerator = torch.zeros(
         (batch, heads, query_length, width),
@@ -69,7 +74,7 @@ def reference_piper_attention(
         dtype=torch.float32,
     )
     running_max = torch.full_like(denominator, -float("inf"))
-    query_positions = torch.arange(query_length, device=query.device)
+    query_positions = torch.arange(query_length, device=query.device) % query.shape[2]
 
     for start in range(0, key_length, _PV_BLOCK):
         stop = min(start + _PV_BLOCK, key_length)
@@ -113,4 +118,4 @@ def reference_piper_attention(
 
     output = numerator / (denominator.clamp_min(1e-30)[..., None] * _P_UINT8_RANGE)
     output += value_mean
-    return output.to(output_dtype)
+    return output.reshape(query.shape).to(output_dtype)

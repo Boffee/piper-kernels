@@ -23,6 +23,7 @@ def _minmax_scores_kernel(  # noqa: PLR0913, PLR0917
     query_blocks: int,
     key_blocks: int,
     heads: int,
+    head_groups: tl.constexpr,
     query_batch_stride: int,
     query_head_stride: int,
     query_block_stride: int,
@@ -58,7 +59,7 @@ def _minmax_scores_kernel(  # noqa: PLR0913, PLR0917
         primary = tl.load(
             primary_ptr
             + batch * primary_batch_stride
-            + head * primary_head_stride
+            + (head // head_groups) * primary_head_stride
             + columns[None, :] * primary_block_stride
             + offsets[:, None],
             mask=columns[None, :] < key_blocks,
@@ -67,7 +68,7 @@ def _minmax_scores_kernel(  # noqa: PLR0913, PLR0917
         auxiliary = tl.load(
             auxiliary_ptr
             + batch * auxiliary_batch_stride
-            + head * auxiliary_head_stride
+            + (head // head_groups) * auxiliary_head_stride
             + columns[None, :] * auxiliary_block_stride
             + offsets[:, None],
             mask=columns[None, :] < key_blocks,
@@ -113,6 +114,7 @@ def minmax_scores(
             query_blocks,
             key_blocks,
             heads,
+            heads // key_primary.shape[1],
             *query_summary.stride()[:3],
             *key_primary.stride()[:3],
             *key_aux.stride()[:3],
