@@ -567,6 +567,23 @@ Piper Attention is an independently developed Sage-derived design. The per-key
 quantizer, centering identity, and online-softmax lineage are not claimed as novel in
 isolation; the name identifies this package's selected combination and fused recurrence.
 
+### Grouped-query attention
+
+`piper_attention` and `SparsePiperAttention` accept `Hq = groups * Hkv` query
+heads with matching K/V head counts, including multi-query attention (`Hkv = 1`).
+Head `h` reads K/V head `h // groups`; the output retains `Hq` heads. This is
+inferred from tensor shapes, without a separate enable flag. Dense attention uses
+`[B, H, S, D]`; sparse attention uses `[B, S, H, D]` and still requires matching
+Q/K/V sequence lengths. Existing D64/D128, dtype, device, and layout restrictions apply.
+
+K/V means, quantization, and storage are computed once per KV head. Sparse keep
+ratios and routing decisions remain per query head, including mean/minmax routing,
+dense suffixes, ragged tails, and valid-front padded blocks. No K/V repetition is
+needed. Dense causal attention retains its existing equal-sequence-length contract.
+
+This core support does not extend the projection-fusion graph patterns, the
+separate coarse-residual API, or SageAttention2++ to GQA.
+
 ## Sparse Piper Attention
 
 Sparse Piper is a separate non-causal SM120 operator for pre-tiled H3-style self-attention:

@@ -69,7 +69,9 @@ class SparsePiperAttention(torch.nn.Module):
         length per physical K64 block selects internally padded storage and
         returns that same physical layout; padded query outputs are unspecified.
         ``sparse_query_blocks`` optionally limits routing to the leading query
-        blocks; all later query blocks attend every key block densely.
+        blocks; all later query blocks attend every key block densely. Query heads
+        may be an integer multiple of the shared K/V head count. Keep ratios and
+        routes belong to query heads; K/V preparation and storage remain shared.
         """
         converted_scale = _validate_inputs(
             query,
@@ -131,8 +133,18 @@ def _validate_inputs(
     tensors = (query, key, value)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError("sparse Piper Q/K/V must use [batch,sequence,heads,features]")
-    if query.shape != key.shape or key.shape != value.shape:
-        raise ValueError("sparse Piper requires equal Q/K/V shapes")
+    if (
+        query.shape[:2] != key.shape[:2]
+        or query.shape[3] != key.shape[3]
+        or key.shape != value.shape
+        or query.shape[2] < 1
+        or key.shape[2] < 1
+        or query.shape[2] % key.shape[2]
+    ):
+        raise ValueError(
+            "sparse Piper requires matching batch/sequence/features "
+            "and query heads divisible by KV heads"
+        )
     if query.dtype not in SUPPORTED_DTYPES or any(
         tensor.dtype is not query.dtype for tensor in tensors
     ):

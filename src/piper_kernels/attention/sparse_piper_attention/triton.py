@@ -109,7 +109,10 @@ def _prepare_sparse_piper_attention(
 ) -> _PreparedSparsePiperAttention:
     """Prepare grouped Q/K and one folded V scale per logical K64 tile."""
     if (
-        combined_key.shape != query.shape
+        combined_key.shape[0] != query.shape[0]
+        or combined_key.shape[2:] != query.shape[2:]
+        or combined_key.shape[1] < 1
+        or query.shape[1] % combined_key.shape[1]
         or combined_value.shape != combined_key.shape
         or not 1 <= sparse_key_blocks <= query.shape[2] // _BLOCK_N
     ):
@@ -117,7 +120,7 @@ def _prepare_sparse_piper_attention(
     if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
-    batch, heads, logical_sequence_length, head_dim = query.shape
+    batch, kv_heads, logical_sequence_length, head_dim = combined_key.shape
     if block_lengths is not None and (
         logical_sequence_length % _BLOCK_N
         or block_lengths.shape != (logical_sequence_length // _BLOCK_N,)
@@ -155,18 +158,18 @@ def _prepare_sparse_piper_attention(
         storage_query_length=storage_sequence_length,
     )
     value_int8 = torch.empty(
-        (batch, heads, head_dim, storage_sequence_length),
+        (batch, kv_heads, head_dim, storage_sequence_length),
         device=combined_value.device,
         dtype=torch.int8,
     )
     value_scale_multiplier = torch.empty(
-        (batch, heads, tile_count, 1),
+        (batch, kv_heads, tile_count, 1),
         device=combined_value.device,
         dtype=torch.float32,
     )
 
     with device_context(query.device):
-        _quantize_value_per_tile_kernel[(tile_count, batch * heads)](
+        _quantize_value_per_tile_kernel[(tile_count, batch * kv_heads)](
             combined_value,
             value_mean,
             value_scale_multiplier,
@@ -180,7 +183,7 @@ def _prepare_sparse_piper_attention(
             value_int8.stride(1),
             value_int8.stride(2),
             value_int8.stride(3),
-            heads=heads,
+            heads=kv_heads,
             head_dim=head_dim,
             block_n=_BLOCK_N,
             mask_block_lengths=block_lengths is not None,

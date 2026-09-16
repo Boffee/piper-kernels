@@ -78,10 +78,10 @@ def test_full_keep_preserves_coarse_scores_and_output(monkeypatch, head_dim):
 
 
 def test_full_keep_keeps_input_validation():
-    query = torch.randn(1, 2, 64, 128)
-    layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 2), 1, query.device)
+    query = torch.randn(1, 3, 64, 128)
+    layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 3), 1, query.device)
     with pytest.raises(ValueError, match="batch/head/feature"):
-        _routing.packed_routes_from_sequences(query, query[:, :1], layout, _MEAN_ROUTING)
+        _routing.packed_routes_from_sequences(query, query[:, :2], layout, _MEAN_ROUTING)
 
 
 @pytest.mark.parametrize("blocks", [3, 513, 65536])

@@ -72,7 +72,13 @@ def _validate_sequences(
 ) -> None:
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError("routing query and key sequences must be rank-four tensors")
-    if query.shape[:2] != key.shape[:2] or query.shape[-1] != key.shape[-1]:
+    if (
+        query.shape[0] != key.shape[0]
+        or key.shape[1] < 1
+        or query.shape[1] < 1
+        or query.shape[1] % key.shape[1]
+        or query.shape[-1] != key.shape[-1]
+    ):
         raise ValueError("routing query and key batch/head/feature dimensions must match")
     if query.shape[2] < 1 or key.shape[2] < 1:
         raise ValueError("routing summaries require nonempty Q/K sequences")

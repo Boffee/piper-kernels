@@ -249,8 +249,11 @@ def routing_scores(
             return score(query_summary, key_primary, key_aux, score_scale=score_scale)
     batch, heads, query_blocks, head_dim = query_summary.shape
     key_blocks = key_primary.shape[2]
-    flat_query = query_summary.reshape(batch * heads, query_blocks, head_dim)
-    flat_key_primary = key_primary.reshape(batch * heads, key_blocks, head_dim)
+    kv_heads = key_primary.shape[1]
+    flat_query = query_summary.reshape(
+        batch * kv_heads, (heads // kv_heads) * query_blocks, head_dim
+    )
+    flat_key_primary = key_primary.reshape(batch * kv_heads, key_blocks, head_dim)
     if score_scale is None:
         scores = torch.bmm(flat_query, flat_key_primary.transpose(1, 2))
     else:
@@ -262,7 +265,7 @@ def routing_scores(
             alpha=score_scale,
         )
     if routing_mode != _MEAN_ROUTING:
-        flat_key_aux = key_aux.reshape(batch * heads, key_blocks, head_dim)
+        flat_key_aux = key_aux.reshape(batch * kv_heads, key_blocks, head_dim)
         if score_scale is None:
             auxiliary_scores = torch.bmm(flat_query, flat_key_aux.transpose(1, 2))
         else:
@@ -313,7 +316,10 @@ def _validate_summaries(
     if query_summary.ndim != 4 or key_primary.ndim != 4:
         raise ValueError("routing summaries must use rank-four Q/K tensors")
     if (
-        query_summary.shape[:2] != key_primary.shape[:2]
+        query_summary.shape[0] != key_primary.shape[0]
+        or key_primary.shape[1] < 1
+        or query_summary.shape[1] < 1
+        or query_summary.shape[1] % key_primary.shape[1]
         or query_summary.shape[-1] != key_primary.shape[-1]
     ):
         raise ValueError("routing summary batch/head/feature dimensions must match")

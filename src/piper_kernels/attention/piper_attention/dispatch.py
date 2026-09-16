@@ -29,6 +29,7 @@ def _validate_inputs(
         value,
         scale,
         is_causal,
+        allow_gqa=True,
     )
 
 
@@ -47,7 +48,8 @@ def piper_attention(
     """Run Piper Attention's key-scaled UINT8-P/INT8-V forward attention.
 
     Query, key, and value use ``[batch, heads, sequence, head_dim]`` layout
-    with FP16 or BF16 elements and contiguous head dimensions. Query and key
+    with FP16 or BF16 elements and contiguous head dimensions. The query head
+    count may be an integer multiple of the shared key/value head count. Query and key
     sequence lengths may differ for non-causal attention. ``scale`` defaults
     to ``head_dim**-0.5``.
 

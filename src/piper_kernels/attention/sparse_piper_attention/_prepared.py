@@ -25,7 +25,8 @@ class _PreparedSparsePiperContext:
 
     Zero routes per query denotes canonical full keep without a route list.
     Each backend validates whether it implements that execution mode.
-    Caller-supplied route lists retain their ordering and semantics.
+    Caller-supplied route lists retain their ordering and semantics. K/V tensors
+    carry KV heads; keep budgets and route offsets carry query heads.
     """
 
     key: torch.Tensor
@@ -155,9 +156,18 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         query_blocks=total_query_blocks,
         context="quantized sparse Piper",
     )
-    if head_keep_blocks.shape != (heads,) or head_keep_blocks.dtype is not torch.int32:
+    if (
+        head_keep_blocks.ndim != 1
+        or head_keep_blocks.numel() < 1
+        or heads < 1
+        or head_keep_blocks.numel() % heads
+        or head_keep_blocks.dtype is not torch.int32
+    ):
         raise ValueError("quantized sparse Piper head keep blocks must be one INT32 value per head")
-    if route_head_offsets.shape != (heads + 1,) or route_head_offsets.dtype is not torch.int32:
+    if (
+        route_head_offsets.shape != (head_keep_blocks.numel() + 1,)
+        or route_head_offsets.dtype is not torch.int32
+    ):
         raise ValueError("quantized sparse Piper route offsets must be an INT32 head vector")
     if routes_per_query < 0:
         raise ValueError("route count must be nonnegative")
@@ -193,7 +203,11 @@ def _prepare_sparse_piper_query_from_quantized(
         )
     batch, heads, storage_sequence_length, head_dim = query.shape
     if (
-        query.shape[:2] != context.key.shape[:2]
+        batch != context.key.shape[0]
+        or heads < 1
+        or heads != context.head_keep_blocks.numel()
+        or context.key.shape[1] < 1
+        or heads % context.key.shape[1]
         or head_dim != context.key.shape[-1]
         or storage_sequence_length < TILE_ROWS
         or storage_sequence_length % TILE_ROWS

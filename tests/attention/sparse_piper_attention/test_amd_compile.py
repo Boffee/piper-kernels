@@ -25,9 +25,11 @@ def _compile_attention(
     storage_sequence_length=256,
     head_dim=128,
     output_dtype="bf16",
+    head_groups=1,
 ):
     constants = {
         "head_dim": head_dim,
+        "head_groups": head_groups,
         "use_64bit_query_offsets": _requires_64bit_query_offsets(
             storage_sequence_length,
             head_dim,
@@ -139,3 +141,9 @@ def test_runtime_lengths_support_wide_query_and_context_offsets(architecture, he
     )
     assert compiled.asm["hsaco"]
     assert re.search(r"arith\.(?:muli|shli) .*: tensor<1x128xi64", compiled.asm["ttgir"])
+
+
+@pytest.mark.parametrize("head_groups", [3, 4])
+def test_gqa_amd_compilation(head_groups):
+    compiled = _compile_attention("gfx1201", False, True, False, head_groups=head_groups)
+    assert compiled.asm["hsaco"]

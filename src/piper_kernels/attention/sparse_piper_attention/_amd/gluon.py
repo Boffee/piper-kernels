@@ -88,6 +88,7 @@ def _sparse_piper_attention_kernel(
     stride_gh,
     stride_gn,
     heads,
+    head_groups: gl.constexpr,
     head_dim: gl.constexpr,
     use_64bit_query_offsets: gl.constexpr,
     use_64bit_context_offsets: gl.constexpr,
@@ -100,6 +101,7 @@ def _sparse_piper_attention_kernel(
     head = gl.program_id(1).to(gl.int64)
     batch = gl.program_id(2).to(gl.int64)
     batch_head = batch * heads + head
+    kv_batch_head = batch * (heads // head_groups) + head // head_groups
     local_query_block = gl.program_id(0)
     query_block = query_block_offset + local_query_block
     global_query_block = global_query_block_offset + local_query_block
@@ -143,7 +145,7 @@ def _sparse_piper_attention_kernel(
     numerator = gl.zeros([1, 64, head_dim], gl.float32, MMA_LAYOUT)
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
-    parameters = parameters_ptr + batch_head * sequence_tiles * PARAMETER_COUNT
+    parameters = parameters_ptr + kv_batch_head * sequence_tiles * PARAMETER_COUNT
 
     for pair in range(pair_count):
         tile_0 = tile_offset(
@@ -166,7 +168,7 @@ def _sparse_piper_attention_kernel(
         )
         scores = qk_pair(
             query,
-            key_ptr + batch_head * storage_sequence_length * head_dim,
+            key_ptr + kv_batch_head * storage_sequence_length * head_dim,
             tile_0,
             tile_1,
             use_64bit_context_offsets,
@@ -254,7 +256,7 @@ def _sparse_piper_attention_kernel(
         )
         numerator = pv_pair(
             probabilities,
-            value_ptr + batch_head * storage_sequence_length * head_dim,
+            value_ptr + kv_batch_head * storage_sequence_length * head_dim,
             tile_0,
             tile_1,
             numerator,
@@ -265,7 +267,7 @@ def _sparse_piper_attention_kernel(
 
     inverse_denominator = 1.0 / (gl.maximum(denominator, 1e-30) * 255.0)
     result = numerator * inverse_denominator[:, :, None]
-    result += gl.load(value_mean_ptr + batch_head * head_dim + features)[None, None, :]
+    result += gl.load(value_mean_ptr + kv_batch_head * head_dim + features)[None, None, :]
     output_rows = (local_query_block * 64 + rows).to(gl.int64)
     valid_rows = (global_query_block * 64 + rows < logical_sequence_length) | mask_block_lengths
     if apply_coarse_residual:
@@ -392,6 +394,7 @@ def _launch_sparse_piper_attention(
             *launch.coarse_strides,
             *launch.gate_strides,
             launch.heads,
+            launch.heads // context.key.shape[1],
             launch.head_dim,
             use_64bit_query_offsets,
             use_64bit_context_offsets,
