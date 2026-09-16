@@ -8,6 +8,7 @@ from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
@@ -246,7 +247,11 @@ def test_swiglu_preparation_matches_materialized_activation(
         actual = convrot_nvfp4.prepare_dynamic(input, group_size, "swiglu")
     else:
         per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
-        expected = nvfp4_ops._compiled_prepare_static(rotated, per_tensor_scale, None)
+        expected = nvfp4_reference.prepare_input(
+            rotated,
+            per_tensor_scale,
+            False,
+        )
         actual = convrot_nvfp4.prepare_static(
             input,
             per_tensor_scale,

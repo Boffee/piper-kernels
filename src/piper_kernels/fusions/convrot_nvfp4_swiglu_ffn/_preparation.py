@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import ClassVar
+
 import torch
 import triton
 import triton.language as tl
@@ -22,6 +25,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
+from piper_kernels.weights.convrot._rotation import validate_group_size
 
 # RTX 5090 measurements favored reuse up to 32 MiB; larger buffers added enough
 # memory traffic to favor recomputation. Reproduce with benchmark_nvfp4_ffn.py
@@ -143,7 +147,7 @@ def prepare(
                 )
                 global_scale = nvfp4_dynamic_scale(row_amax)
                 qdata, scale = nvfp4_backend._prepare_static_storage(
-                    rotated, global_scale, swiglu=False, high_first=high_first
+                    rotated, global_scale, activation_fn=None, high_first=high_first
                 )
                 return qdata, scale, global_scale
             chunk_count = sum(chunk > 0 for chunk in chunks)
@@ -180,3 +184,32 @@ def prepare(
             num_warps=2,
         )
     return qdata, scale, per_tensor_scale
+
+
+@dataclass(frozen=True, slots=True)
+class ConvRotSwiGLUPreparation:
+    """Apply SwiGLU, rotate, and prepare ConvRot NVFP4 down inputs."""
+
+    source_projection_count: ClassVar[int] = 2
+    group_size: int
+    high_first: bool
+
+    def __post_init__(self) -> None:
+        validate_group_size(self.group_size)
+
+    def prepare(
+        self,
+        projections: torch.Tensor,
+        activation_per_tensor_scale: torch.Tensor | None,
+        dynamic_activation_scale: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return prepare(
+            projections,
+            activation_per_tensor_scale,
+            dynamic_activation_scale,
+            self.group_size,
+            self.high_first,
+        )
+
+
+__all__ = ["ConvRotSwiGLUPreparation", "prepare"]

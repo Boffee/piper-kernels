@@ -409,19 +409,25 @@ uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
 uv run python benchmarks/benchmark_nvfp4_ffn.py --format nvfp4 \
   --shape 127 256 512 --shape 1024 2048 8192 --shape 1797 2048 8192 \
   --shape 4096 2048 8192 --json artifacts/nvfp4-ffn.json
+uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
+  --activation gelu_tanh --shape 127 2048 8192 --shape 100000 2048 8192 \
+  --json artifacts/convrot-nvfp4-gelu-ffn.json
 ```
 
 Each shape is `M K N`: input rows, input/output width, and intermediate FFN width.
 Both FP16/BF16 and static/dynamic scales run by default; select a subset with `--dtype`
-and `--scaling`. `--group-size` selects ConvRot groups 16, 64, or 256; `--high-first`
-checks the other nibble order. The recorded seed deterministically generates the input,
-independent gate/value weights, and biases. Static source scales are measured from the input;
-the synthetic static down scale is fixed at 0.01 and recorded in the output.
+and `--scaling`. `--activation` selects `swiglu` or `gelu_tanh`. `--group-size` selects
+ConvRot groups 16, 64, or 256; `--high-first` checks the other nibble order. The recorded seed
+deterministically generates the input, projection weights, and biases. Static source scales are
+measured from the input; the synthetic static down scale is fixed at 0.01 and recorded in the
+output.
 
-The benchmark uses the production FFN runner and the selected format's current preparation,
-with 1,536-row chunks by default. It writes one record per configuration. To evaluate future
-changes, run the same command on each Git revision using the same GPU and compare the saved
-results. Match shapes, dtype, scales, chunking, seeds, and timing settings between runs.
+The benchmark uses the production FFN runner and the selected format's current preparation.
+SwiGLU uses 1,536-row chunks by default; GELU uses its feature-width-aware production policy.
+`--chunk-rows` overrides either policy. The benchmark writes one record per configuration. To
+evaluate future changes, run the same command on each Git revision using the same GPU and compare
+the saved results. Match shapes, dtype, activation, scales, chunking, seeds, and timing settings
+between runs.
 
 The reported `prepared_execution` is CUDA graph replay of the **complete FFN**, measured
 with device events. Each graph contains 16 FFN calls; six unmeasured warmup rounds

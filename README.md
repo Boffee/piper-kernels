@@ -191,12 +191,17 @@ eager, and training paths remain unchanged. Existing post-grad compiler passes i
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
-The ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU FFN compiler integrations support
-FP16 and BF16 activations. Their `*_swiglu_ffn_compile_options()` helpers match separate
-gate, value, and down projections and install FFN fusion before ordinary linear rewriting.
-Fused activation preparation retains FP32 arithmetic; outputs retain the input dtype.
+The ConvRot INT8, NVFP4, and ConvRot NVFP4 FFN compiler integrations support FP16 and BF16
+activations. Their `*_swiglu_ffn_compile_options()` helpers match separate gate, value, and down
+projections. Their `*_gelu_ffn_compile_options()` helpers fold an exclusive
+`down(gelu(up(input), approximate="tanh"))` region. Each helper installs FFN fusion before
+ordinary linear rewriting and preserves every projection's static or dynamic input scale.
+Feature-width-aware GELU row chunks bound reusable temporary storage near 1 GiB for INT8 and
+512 MiB for NVFP4 while amortizing long-sequence launches. Fused activation preparation retains
+FP32 arithmetic and quantizes directly into the down-projection input; outputs retain the input
+dtype.
 
-ConvRot NVFP4 FFN fusion includes SwiGLU, rotation, and NVFP4 preparation for the
+ConvRot NVFP4 FFN fusion includes SwiGLU or tanh-GELU, rotation, and NVFP4 preparation for the
 down projection. It reads the FFN's private projection workspace directly. Dynamic
 preparation reuses rotated FP32 values in a scratch buffer capped at 32 MiB per
 chunk and recomputes them in small tiles above that limit; static preparation
@@ -261,8 +266,8 @@ Both implement the same preparation/projection interface; reusable INT8 arithmet
 ROCm coverage includes ordinary, GELU-tanh, and SwiGLU input preparation; INT8 linear and
 prepared/paired projections; caller-owned output buffers; dense and low-rank weight updates;
 and base `torch.compile` preparation sharing. FP16, BF16, and FP32 are supported.
-The shared chunked INT8 SwiGLU FFN also runs on ROCm, including indexed gated updates
-and automatic fusion of compatible FP16/BF16 graphs via `convrot_int8_swiglu_ffn_compile_options`.
+The shared chunked INT8 SwiGLU and GELU FFNs also run on ROCm, including indexed gated updates
+and automatic fusion of compatible FP16/BF16 graphs via their compile-option helpers.
 The RX 9070 XT (`gfx1201`) has on-device validation. `gfx942`, `gfx1100`, `gfx1151`,
 and `gfx1200` have compiler coverage only, not hardware correctness or performance validation.
 Unknown AMD architectures retain the portable reference for linear execution.
@@ -412,8 +417,8 @@ sum column-shard outputs, adding bias once. Column partitions preserve weight va
 can change dynamic activation scales and accumulation order, so comparisons with an
 unsharded quantized linear require numerical tolerances.
 
-With the corresponding `*_swiglu_ffn_compile_options()` or
-`*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,
+With the corresponding `*_swiglu_ffn_compile_options()`, `*_gelu_ffn_compile_options()`,
+or `*_sparse_piper_compile_options()`, batched DTensor projections retain the existing FFN,
 QKV-preparation, and attention/output-projection fusions. Shared compiler normalization
 removes redundant row flatten/restore pairs around semantic linears, including symbolic
 leading dimensions. Feature order, quantization metadata, and externally consumed values

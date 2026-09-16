@@ -14,14 +14,17 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
+from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
+from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import convrot_nvfp4_gelu_ffn_compile_options
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
     convrot_nvfp4_sparse_piper_compile_options,
 )
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import convrot_nvfp4_swiglu_ffn_compile_options
+from piper_kernels.fusions.nvfp4_gelu_ffn import nvfp4_gelu_ffn_compile_options
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
 from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -46,12 +49,18 @@ _FFN_OPTIONS = {
     "nvfp4": nvfp4_swiglu_ffn_compile_options,
     "convrot_nvfp4": convrot_nvfp4_swiglu_ffn_compile_options,
 }
+_GELU_FFN_OPTIONS = {
+    "convrot_int8": convrot_int8_gelu_ffn_compile_options,
+    "nvfp4": nvfp4_gelu_ffn_compile_options,
+    "convrot_nvfp4": convrot_nvfp4_gelu_ffn_compile_options,
+}
 _ATTENTION_OPTIONS = {
     "convrot_int8": convrot_int8_sparse_piper_compile_options,
     "nvfp4": nvfp4_sparse_piper_compile_options,
     "convrot_nvfp4": convrot_nvfp4_sparse_piper_compile_options,
 }
 _FFN_PROJECTIONS = ("gate", "value", "down")
+_GELU_FFN_PROJECTIONS = ("up", "down")
 _ATTENTION_PROJECTIONS = ("query", "key", "value", "output")
 
 
@@ -130,6 +139,14 @@ def _distributed_ffn(model, mesh, *, sharded=False):
     return distributed
 
 
+def _distributed_gelu_ffn(model, mesh, *, sharded=False):
+    distributed = copy.deepcopy(model)
+    for name in _GELU_FFN_PROJECTIONS:
+        placement = Shard(1 if name == "down" else 0) if sharded else Replicate()
+        _distribute_parameters(getattr(distributed, name), mesh, placement)
+    return distributed
+
+
 def _distributed_attention(model, mesh, *, projections=_ATTENTION_PROJECTIONS, sharded=False):
     distributed = copy.deepcopy(model)
     for name in projections:
@@ -177,6 +194,33 @@ class _FFN(torch.nn.Module):
         return (result, gate) if self.expose_gate else result
 
 
+class _GeluFFN(torch.nn.Module):
+    def __init__(self, format_name, *, bias=False, intermediate_features=512):
+        super().__init__()
+        for name, output_features, input_features in (
+            ("up", intermediate_features, 256),
+            ("down", 256, intermediate_features),
+        ):
+            source = (
+                torch.randn(output_features, input_features, device="cuda", dtype=torch.bfloat16)
+                * 0.02
+            )
+            layer = torch.nn.Linear(input_features, output_features, bias=False, device="meta")
+            layer.weight = torch.nn.Parameter(
+                _weight(format_name, source, high_first=format_name != "convrot_int8"),
+                requires_grad=False,
+            )
+            if bias:
+                layer.bias = torch.nn.Parameter(
+                    torch.randn(output_features, device="cuda", dtype=torch.float32) * 0.01,
+                    requires_grad=False,
+                )
+            setattr(self, name, layer)
+
+    def forward(self, value):
+        return self.down(F.gelu(self.up(value), approximate="tanh"))
+
+
 def _weight(format_name, source, *, high_first=False):
     if format_name == "convrot_int8":
         return ConvRotInt8Tensor.from_hp(source, group_size=64)
@@ -208,6 +252,11 @@ def _assert_ffn_fused(capture, format_name):
     _assert_no_separate_linears(capture)
 
 
+def _assert_gelu_ffn_fused(capture, format_name):
+    assert capture.targets.count(f"piper_kernels.{format_name}_gelu_ffn.default") == 1
+    _assert_no_separate_linears(capture)
+
+
 def _assert_no_separate_linears(capture):
     assert not any(
         target.endswith(("_linear.default", "_linear_prepared.default"))
@@ -229,6 +278,25 @@ def test_dtensor_ffn_selects_local_fused_operator(mesh, format_name, shape):
         compiled, capture = _compile_with_capture(distributed, _FFN_OPTIONS[format_name])
         actual = compiled(_replicate(value, mesh)).to_local()
     _assert_ffn_fused(capture, format_name)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("format_name", tuple(_GELU_FFN_OPTIONS))
+def test_dtensor_gelu_ffn_selects_local_fused_operator(mesh, format_name):
+    torch.manual_seed(117)
+    model = _GeluFFN(format_name, bias=True).eval()
+    distributed = _distributed_gelu_ffn(model, mesh)
+    value = torch.randn(2, 3, 64, 256, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        local, local_capture = _compile_with_capture(model, _GELU_FFN_OPTIONS[format_name])
+        expected = local(value)
+        _assert_gelu_ffn_fused(local_capture, format_name)
+        compiled, capture = _compile_with_capture(
+            distributed,
+            _GELU_FFN_OPTIONS[format_name],
+        )
+        actual = compiled(_replicate(value, mesh)).to_local()
+    _assert_gelu_ffn_fused(capture, format_name)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -417,6 +485,26 @@ def _check_sharded_ffn(format_name, mesh, cpu_mesh):
     assert capture.calls == 1
 
 
+def _check_sharded_gelu_ffn(format_name, mesh, cpu_mesh):
+    model = _GeluFFN(format_name, intermediate_features=256).eval()
+    distributed = _distributed_gelu_ffn(model, mesh, sharded=True)
+    torch.manual_seed(118)
+    value = torch.randn(1, 192, 256, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        local, local_capture = _compile_with_capture(model, _GELU_FFN_OPTIONS[format_name])
+        expected = local(value)
+        _assert_gelu_ffn_fused(local_capture, format_name)
+        compiled, capture = _compile_with_capture(
+            distributed,
+            _GELU_FFN_OPTIONS[format_name],
+        )
+        result = compiled(_replicate(value, mesh))
+    assert result.placements == (Partial(),)
+    _check_partial_output(result.to_local(), expected, cpu_mesh)
+    _assert_gelu_ffn_fused(capture, format_name)
+    assert capture.calls == 1
+
+
 def _check_sharded_attention(format_name, mesh, cpu_mesh):
     model = _attention(format_name)
     # Each rank owns complete local heads; output projection consumes only
@@ -450,7 +538,11 @@ def _two_rank_fusions(rank, store_path):
         mesh = DeviceMesh("cuda", [0, 1])
         cpu_mesh = DeviceMesh("cpu", [0, 1])
         for format_name in _FFN_OPTIONS:
-            for check in (_check_sharded_ffn, _check_sharded_attention):
+            for check in (
+                _check_sharded_ffn,
+                _check_sharded_gelu_ffn,
+                _check_sharded_attention,
+            ):
                 torch.manual_seed(116 + rank)
                 try:
                     check(format_name, mesh, cpu_mesh)

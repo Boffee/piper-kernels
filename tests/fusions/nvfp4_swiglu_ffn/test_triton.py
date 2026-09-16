@@ -6,7 +6,8 @@ from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
-from piper_kernels.fusions.nvfp4_swiglu_ffn import _core
+from piper_kernels.fusions.nvfp4_ffn import _core
+from piper_kernels.fusions.nvfp4_swiglu_ffn import _preparation
 from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
@@ -71,7 +72,9 @@ def test_compiled_swiglu_scale_matches_fp32_reference(rows: int, dtype: torch.dt
     value, gate = projections.chunk(2, dim=-1)
     expected = per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
 
-    torch.testing.assert_close(_core.dynamic_swiglu_scale(projections), expected, rtol=1e-6, atol=0)
+    torch.testing.assert_close(
+        _preparation.dynamic_swiglu_scale(projections), expected, rtol=1e-6, atol=0
+    )
 
 
 @pytest.mark.gpu

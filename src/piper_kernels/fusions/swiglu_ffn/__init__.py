@@ -1,1 +1,1 @@
-"""Projection-independent support for fused SwiGLU feed-forward networks."""
+"""Projection-independent graph grammar for fused SwiGLU feed-forward networks."""

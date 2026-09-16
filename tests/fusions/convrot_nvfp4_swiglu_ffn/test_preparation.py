@@ -5,7 +5,6 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation
-from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import triton as ffn_backend
 from piper_kernels.linear.convrot.nvfp4 import _ops
 
 _GPU = pytest.mark.skipif(
@@ -22,8 +21,8 @@ def _assert_storage_equal(actual, expected):
 
 
 def _prepare(projections, group, high_first=False, per_tensor_scale=None):
-    backend = ffn_backend._preparation(group, group, group, high_first, high_first, high_first)
-    return backend.prepare_down(projections, per_tensor_scale, per_tensor_scale is None)
+    preparation = _preparation.ConvRotSwiGLUPreparation(group, high_first)
+    return preparation.prepare(projections, per_tensor_scale, per_tensor_scale is None)
 
 
 @pytest.mark.gpu

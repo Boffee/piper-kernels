@@ -137,7 +137,7 @@ import sys
 from types import SimpleNamespace
 import torch
 from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
-from piper_kernels.fusions.nvfp4_swiglu_ffn._compile_validation import projection_call_matches
+from piper_kernels.fusions.nvfp4_ffn._compile import projection_call_matches
 
 nvfp4_swiglu_ffn_compile_options()
 assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
