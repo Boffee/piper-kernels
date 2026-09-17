@@ -12,6 +12,7 @@ from piper_kernels import (
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -52,6 +53,19 @@ def _reset_attention_kernel_cache():
 def _compiled_specialization_count(kernel) -> int:
     """Count compiled variants across accelerator devices."""
     return sum(len(device_cache[0]) for device_cache in kernel.device_caches.values())
+
+
+def _expected_specialization_count(cases) -> int:
+    """Device kernels the active backend compiles for these sequence lengths.
+
+    Neither backend specializes on an exact sequence length. NVIDIA keeps an
+    aligned fast path beside a masked-tail variant, so it compiles one kernel
+    per alignment class; masking unconditionally instead costs roughly 3% of
+    dense attention throughput. AMD masks unconditionally and compiles one.
+    """
+    if AcceleratorTarget.from_device(torch.device("cuda")).is_amd_hip:
+        return 1
+    return len({sequence % TILE_ROWS == 0 for sequence, _ in cases})
 
 
 class _SparseProjectionAttention(torch.nn.Module):
@@ -1542,8 +1556,8 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
         capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
     )
-    # The dynamic Dynamo graph must also reuse one compiled device specialization.
-    assert _compiled_specialization_count(attention_kernel) == 1
+    # The dynamic Dynamo graph must not add a device kernel per sequence length.
+    assert _compiled_specialization_count(attention_kernel) == _expected_specialization_count(cases)
 
 
 @pytest.mark.gpu
@@ -1619,8 +1633,8 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
         )
         == 1
     )
-    # The dynamic Dynamo graph must also reuse one compiled device specialization.
-    assert _compiled_specialization_count(attention_kernel) == 1
+    # The dynamic Dynamo graph must not add a device kernel per sequence length.
+    assert _compiled_specialization_count(attention_kernel) == _expected_specialization_count(cases)
 
 
 @pytest.mark.gpu
