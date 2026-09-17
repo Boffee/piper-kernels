@@ -67,6 +67,9 @@ def test_prepared_mean_custom_op_and_compilation():
         "SUCCESS"
     }
     compiled = torch.compile(_ops.dequantized_input_mean, fullgraph=True)
+    # The compiled reduction accumulates 272 terms, so its last bit depends on
+    # Inductor's split strategy. Match the eager test's tolerance instead of
+    # demanding bit equality that float32 does not promise.
     torch.testing.assert_close(
-        compiled(qdata, scale), torch.full((2, 272), 0.125, device="cuda"), rtol=0, atol=0
+        compiled(qdata, scale), torch.full((2, 272), 0.125, device="cuda"), rtol=2e-6, atol=2e-6
     )
