@@ -123,7 +123,6 @@ def _piper_probability_pair(
     key_layout: gl.constexpr,
     probability_layout: gl.constexpr,
     mask_block_lengths: gl.constexpr,
-    mask_ragged_tail: gl.constexpr,
     mask_duplicate: gl.constexpr,
 ):
     """Advance one shared Piper coordinate over two independently scaled K64 tiles."""
@@ -155,14 +154,13 @@ def _piper_probability_pair(
         block_length_1 = gl.load(block_lengths_ptr + start_n_1 // _GL_BLOCK_N)
         valid_keys_0 = offsets_n < block_length_0
         valid_keys_1 = offsets_n < block_length_1
-    elif mask_ragged_tail:
+    else:
         valid_keys_0 = start_n_0 + offsets_n < logical_sequence_length
         valid_keys_1 = start_n_1 + offsets_n < logical_sequence_length
-    if mask_block_lengths or mask_ragged_tail:
-        if mask_duplicate:
-            valid_keys_1 &= has_second
-        integer_scores_0 = gl.where(valid_keys_0[None, :], integer_scores_0, -2147483648)
-        integer_scores_1 = gl.where(valid_keys_1[None, :], integer_scores_1, -2147483648)
+    if mask_duplicate:
+        valid_keys_1 &= has_second
+    integer_scores_0 = gl.where(valid_keys_0[None, :], integer_scores_0, -2147483648)
+    integer_scores_1 = gl.where(valid_keys_1[None, :], integer_scores_1, -2147483648)
     # A duplicate second tile is entirely invalid, so its maximum is
     # replaced by -inf below without masking all of its integer scores.
 
@@ -214,15 +212,11 @@ def _piper_probability_pair(
     )
     # Mask the final exponent argument, permitting FMA for valid score shifts.
     shifted_scores = scores - block_max[:, None]
-    if mask_block_lengths or mask_ragged_tail:
-        valid_keys = gl.reshape(
-            gl.permute(gl.join(valid_keys_0, valid_keys_1), [1, 0]), [2 * _GL_BLOCK_N]
-        )
-        valid_keys = gl.convert_layout(valid_keys, column_layout)
-        shifted_scores = gl.where(valid_keys[None, :], shifted_scores, -float("inf"))
-    elif mask_duplicate:
-        valid_keys = (paired_columns < _GL_BLOCK_N) | has_second
-        shifted_scores = gl.where(valid_keys[None, :], shifted_scores, -float("inf"))
+    valid_keys = gl.reshape(
+        gl.permute(gl.join(valid_keys_0, valid_keys_1), [1, 0]), [2 * _GL_BLOCK_N]
+    )
+    valid_keys = gl.convert_layout(valid_keys, column_layout)
+    shifted_scores = gl.where(valid_keys[None, :], shifted_scores, -float("inf"))
     probabilities = gl.exp2(shifted_scores)
     probability_uint8 = _packed_float32_to_uint8(
         probabilities * value_scale_multiplier[None, :] + 0.5
@@ -407,7 +401,7 @@ def _piper_pv_pair(
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
-def _sparse_piper_attention_kernel(  # noqa: PLR0912
+def _sparse_piper_attention_kernel(
     query_desc,
     key_desc,
     value_desc,
@@ -445,14 +439,11 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     head_groups: gl.constexpr,
     head_dim: gl.constexpr,
     mask_block_lengths: gl.constexpr,
-    mask_ragged_tail: gl.constexpr,
     has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
-    ragged_tail_is_routed: gl.constexpr,
     block_m: gl.constexpr,
     mma_warps: gl.constexpr,
     skip_dense_routing: gl.constexpr,
-    mask_output_tail: gl.constexpr,
     output_sequence_length,
 ):
     """Pair native logical K64 tiles in one shared Piper probability coordinate."""
@@ -630,7 +621,6 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
             key_layout,
             probability_layout,
             mask_block_lengths,
-            mask_ragged_tail and ragged_tail_is_routed,
             False,
         )
 
@@ -719,7 +709,6 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         key_layout,
         probability_layout,
         mask_block_lengths,
-        mask_ragged_tail,
         True,
     )
     mbarrier.wait(value_barrier, phase=final_phase)
@@ -737,9 +726,10 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
     value_mean = gl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d).to(gl.float32)
     output += value_mean[None, :]
-    valid_queries = global_query_block * _GL_BLOCK_N + offsets_m < logical_sequence_length
-    if block_m == 128:
-        valid_queries = output_start_m + offsets_m < output_sequence_length
+    # Output rows are the only correct bound for the gate load and the store:
+    # block lengths pad internally, so `output_sequence_length` covers every
+    # written row while `logical_sequence_length` can fall inside the tile.
+    valid_queries = output_start_m + offsets_m < output_sequence_length
     if apply_coarse_residual:
         coarse = gl.load(
             coarse_output_ptr
@@ -754,14 +744,11 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
             + (output_start_m + offsets_m[:, None]) * stride_gn
             + offsets_d[None, :]
         )
-        if mask_ragged_tail:
-            gate = gl.load(
-                coarse_gate_ptr + gate_offsets,
-                mask=valid_queries[:, None],
-                other=0.0,
-            ).to(gl.float32)
-        else:
-            gate = gl.load(coarse_gate_ptr + gate_offsets).to(gl.float32)
+        gate = gl.load(
+            coarse_gate_ptr + gate_offsets,
+            mask=valid_queries[:, None],
+            other=0.0,
+        ).to(gl.float32)
         # Round once at the output store, after combining both FP32 terms.
         output = _fma_fp32(gate, coarse[None, :], output)
     output_offsets = (
@@ -770,14 +757,11 @@ def _sparse_piper_attention_kernel(  # noqa: PLR0912
         + (output_start_m + offsets_m[:, None]) * stride_on
         + offsets_d[None, :]
     )
-    if mask_output_tail:
-        gl.store(
-            output_ptr + output_offsets,
-            output.to(output_ptr.dtype.element_ty),
-            mask=valid_queries[:, None],
-        )
-    else:
-        gl.store(output_ptr + output_offsets, output.to(output_ptr.dtype.element_ty))
+    gl.store(
+        output_ptr + output_offsets,
+        output.to(output_ptr.dtype.element_ty),
+        mask=valid_queries[:, None],
+    )
 
     # Every warp must finish its final waits before any warp invalidates the
     # shared barriers.
@@ -915,14 +899,11 @@ def _launch_sparse_piper_attention(
             launch.heads // context.key.shape[1],
             launch.head_dim,
             launch.mask_block_lengths,
-            launch.mask_ragged_tail,
             launch.has_dense_query_suffix,
             launch.apply_coarse_residual,
-            launch.ragged_tail_is_routed,
             block_m,
             num_warps,
             launch.skip_dense_routing,
-            launch.output_sequence_length % block_m != 0,
             launch.output_sequence_length,
             num_warps=num_warps,
             num_stages=1,

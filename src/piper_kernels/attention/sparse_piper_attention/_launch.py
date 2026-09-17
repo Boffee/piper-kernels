@@ -19,6 +19,7 @@ _DO_NOT_SPECIALIZE_ARGUMENTS = (
     "sparse_query_blocks",
     "stride_rb",
     "stride_rq",
+    "output_sequence_length",
 )
 
 
@@ -46,11 +47,9 @@ class _ValidatedAttentionLaunch:
     coarse_gate: torch.Tensor
     block_lengths: torch.Tensor
     mask_block_lengths: bool
-    mask_ragged_tail: bool
     has_dense_query_suffix: bool
     apply_coarse_residual: bool
     skip_dense_routing: bool
-    ragged_tail_is_routed: bool
 
     @property
     def query_rows(self) -> int:
@@ -168,16 +167,10 @@ def validate_attention_launch(
         if context.sparse_query_blocks is None
         else context.sparse_query_blocks
     )
-    mask_ragged_tail = not has_block_lengths and logical_sequence_length != storage_sequence_length
     resolved_coarse_output = context.value_mean if coarse_output is None else coarse_output
     resolved_coarse_gate = output if coarse_gate is None else coarse_gate
     block_lengths_operand = (
         context.head_keep_blocks if context.block_lengths is None else context.block_lengths
-    )
-    # The dense suffix visits a compact ragged tile last. Caller-provided routes
-    # can also place that tile in the sparse prefix, which needs an ordinary-loop mask.
-    ragged_tail_is_routed = (
-        mask_ragged_tail and context.sparse_key_blocks * TILE_ROWS > logical_sequence_length
     )
     return _ValidatedAttentionLaunch(
         batch=batch,
@@ -216,9 +209,7 @@ def validate_attention_launch(
         coarse_gate=resolved_coarse_gate,
         block_lengths=block_lengths_operand,
         mask_block_lengths=has_block_lengths,
-        mask_ragged_tail=mask_ragged_tail,
         has_dense_query_suffix=has_dense_query_suffix,
         apply_coarse_residual=has_coarse_residual,
         skip_dense_routing=context.routes_per_query == 0,
-        ragged_tail_is_routed=ragged_tail_is_routed,
     )
