@@ -12,6 +12,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   preparation, and a feature-width-aware row policy keeps long-sequence scratch near 512 MiB.
 - Added bounded ConvRot INT8 tanh-GELU FFN execution and compiler folding for up/down
   projections, including static and dynamic input scales and indexed gated updates.
+- Added a PEP 561 `py.typed` marker so downstream type checkers use the package's inline
+  annotations instead of resolving every `piper_kernels` import to `Any`.
 
 ## [0.7.0rc7] - 2026-09-13
 
