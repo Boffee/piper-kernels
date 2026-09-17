@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-17
+
 ### Added
 
 - Added shared-KV grouped-query and multi-query attention to the dense and sparse Piper
@@ -576,7 +578,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...v0.7.0
 [0.7.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...v0.7.0rc1
 [0.6.1]: https://github.com/Boffee/piper-kernels/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...v0.6.0
