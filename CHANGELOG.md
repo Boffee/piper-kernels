@@ -5,13 +5,30 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-17
+
 ### Added
 
+- Added shared-KV grouped-query and multi-query attention to the dense and sparse Piper
+  attention cores. Both infer `Hq = groups * Hkv` from tensor shapes without an enable flag, and
+  each query head reads its shared K/V head directly. K/V means, quantization, routing summaries,
+  and prepared storage keep the KV-head count, while sparse budgets and routes stay per query
+  head across mean/minmax routing, dense suffixes, padded blocks, and ragged tails. Projection
+  fusions, the coarse-residual API, and SageAttention2++ are outside this change.
 - Added bounded standard and ConvRot NVFP4 tanh-GELU FFN execution and compiler folding for
   independently static or dynamic up/down input scales. GELU stays in FP32 through direct NVFP4
   preparation, and a feature-width-aware row policy keeps long-sequence scratch near 512 MiB.
 - Added bounded ConvRot INT8 tanh-GELU FFN execution and compiler folding for up/down
   projections, including static and dynamic input scales and indexed gated updates.
+- Added a PEP 561 `py.typed` marker so downstream type checkers use the package's inline
+  annotations instead of resolving every `piper_kernels` import to `Any`.
+
+### Fixed
+
+- Stopped AMD sparse Piper attention from compiling a separate device kernel for every sequence
+  length and sparse route capacity under `torch.compile(dynamic=True)`. Numerical launch metadata
+  resolves once and shares the NVIDIA `do_not_specialize` policy; head width, feature modes, and
+  query/context address width remain structural specializations.
 
 ## [0.7.0rc7] - 2026-09-13
 
@@ -561,7 +578,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...v0.7.0
 [0.7.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...v0.7.0rc1
 [0.6.1]: https://github.com/Boffee/piper-kernels/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...v0.6.0

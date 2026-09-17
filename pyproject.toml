@@ -1,6 +1,6 @@
 [project]
 name = "piper-kernels"
-version = "0.7.0rc7"
+version = "0.7.0"
 description = "Reusable PyTorch inference operators and Triton kernels."
 readme = "README.md"
 license = "Apache-2.0"
@@ -107,6 +107,10 @@ reportMissingImports = "none"
 reportPrivateImportUsage = "none"
 
 [tool.uv]
+# Older uv rewrites lockfile marker normalization, so every environment that
+# writes uv.lock must be new enough to agree with it. setup-uv reads this pin
+# instead of repeating a version in each workflow.
+required-version = ">=0.12.15"
 # The benchmark-only canonical CUDA extension imports the active PyTorch
 # installation from setup.py while compiling.
 no-build-isolation-package = ["sageattention"]
