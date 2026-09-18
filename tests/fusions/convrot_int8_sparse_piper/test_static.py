@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
@@ -16,7 +17,6 @@ from .test_compile import (
     _ProjectedGateCoarseSparseAttentionOutput,
     _run_explicit_attention_output,
     _SparseProjectionAttentionOutput,
-    _TargetCapturePass,
 )
 
 pytestmark = [
@@ -70,7 +70,7 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
     preparations = _set_scales(model, mode)
     hidden_states = torch.randn(1, 320, model.input_features, device="cuda", dtype=torch.bfloat16)
     block_lengths = torch.tensor([64, 17, 51, 64, 1], device="cuda", dtype=torch.int32)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         coarse_gate = model.gate(hidden_states).view(1, 320, model.heads, model.head_dim)
         expected, _ = _run_explicit_attention_output(
@@ -129,7 +129,7 @@ def test_static_sparse_scales_can_change_without_recompilation(monkeypatch, proj
     hidden_states = torch.randn(
         1, model.sequence_length, model.input_features, device="cuda", dtype=torch.bfloat16
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     compiled = torch.compile(model, fullgraph=True, options=_options(capture))
     with torch.inference_mode():
         first = compiled(hidden_states)
@@ -157,7 +157,7 @@ def test_static_coarse_gate_keeps_valid_metadata_when_attention_escapes():
     hidden = torch.randn(
         1, model.sequence_length, model.input_features, device="cuda", dtype=torch.bfloat16
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         gate = model.gate(hidden).view(1, model.sequence_length, model.heads, model.head_dim)
         expected = _run_explicit_attention_output(
@@ -199,7 +199,7 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
         if sequence == 320
         else None
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     compiled = torch.compile(model, fullgraph=True, options=_options(capture))
     with torch.inference_mode():
         for iteration in range(2):
@@ -248,7 +248,7 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
     _set_scales(model, "distinct")
     hidden = torch.randn(2, sequence, model.input_features, device="cuda", dtype=torch.bfloat16)
     before = hidden.clone()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         intermediate = torch.nn.functional.silu(hidden)
         gate = model.gate(intermediate).view(2, sequence, model.heads, model.head_dim)

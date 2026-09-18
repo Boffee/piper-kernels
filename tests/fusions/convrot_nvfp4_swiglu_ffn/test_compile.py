@@ -1,11 +1,10 @@
 """Tests for automatic semantic ConvRot NVFP4 SwiGLU FFN folding."""
 
-import uuid
 from dataclasses import replace
 
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import (
@@ -111,20 +110,7 @@ class _GatedUpdates(torch.nn.Module):
         return hidden + ffn_gate.index_select(0, gate_indices) * ffn
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
-def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
+def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
     options = convrot_nvfp4_swiglu_ffn_compile_options(nvfp4_swiglu_ffn_compile_options())
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
@@ -149,7 +135,7 @@ def test_shared_projection_weights_preserve_distinct_biases(
     model = _SwiGluFfn(operands).eval()
     # Explicitly tie the module parameter too, so tracing sees one shared weight.
     model.value.weight = model.gate.weight
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
         torch._dynamo.reset()
@@ -233,7 +219,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
         promote_gate=promote_gate,
         reverse_multiply=reverse_multiply,
     ).eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(
@@ -268,7 +254,7 @@ def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(
     down = standard.down if source_convrot else convrot.down
     operands = Operands(source.input, source.gate, source.value, down)  # type: ignore[arg-type]
     model = _SwiGluFfn(operands).eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     ordinary_options = convrot_nvfp4_compile_options(nvfp4_compile_options())
     with torch.no_grad():
         torch._dynamo.reset()
@@ -299,7 +285,7 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
         if failure == "different-input"
         else (operands.input,)
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(
@@ -342,7 +328,7 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) ->
     ffn_gate = gate_storage[:, 5 * output_features :]
     gate_indices = torch.randint(0, 7, (rows,), device="cuda", dtype=torch.int64)
     arguments = base, update_source, update_gate, ffn_gate, gate_indices
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(

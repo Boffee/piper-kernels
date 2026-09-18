@@ -1,14 +1,13 @@
 """Ordinary DTensor boundaries retain the same local FFN and attention fusions."""
 
 import copy
-import uuid
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn import functional as F  # noqa: N812
@@ -77,23 +76,8 @@ def mesh():
         dist.destroy_process_group()
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self):
-        self.targets = []
-        self.calls = 0
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph, is_inference):
-        assert is_inference
-        self.calls += 1
-        self.targets = [str(node.target) for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self):
-        return self._uuid
-
-
 def _compile_with_capture(model, options_fn):
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = options_fn({"triton.cudagraphs": False, "compile_threads": 1})
     options["post_grad_custom_pre_pass"] = (*options["post_grad_custom_pre_pass"], capture)
     torch.compiler.reset()
@@ -248,19 +232,19 @@ def _ffn_target(format_name):
 
 
 def _assert_ffn_fused(capture, format_name):
-    assert capture.targets.count(_ffn_target(format_name)) == 1
+    assert capture.target_names.count(_ffn_target(format_name)) == 1
     _assert_no_separate_linears(capture)
 
 
 def _assert_gelu_ffn_fused(capture, format_name):
-    assert capture.targets.count(f"piper_kernels.{format_name}_gelu_ffn.default") == 1
+    assert capture.target_names.count(f"piper_kernels.{format_name}_gelu_ffn.default") == 1
     _assert_no_separate_linears(capture)
 
 
 def _assert_no_separate_linears(capture):
     assert not any(
         target.endswith(("_linear.default", "_linear_prepared.default"))
-        for target in capture.targets
+        for target in capture.target_names
     )
 
 
@@ -331,8 +315,8 @@ def test_dtensor_ffn_preserves_externally_used_gate(mesh, format_name):
         expected = local(value)
         compiled, capture = _compile_with_capture(distributed, _FFN_OPTIONS[format_name])
         actual = compiled(_replicate(value, mesh))
-    assert _ffn_target(format_name) not in local_capture.targets
-    assert _ffn_target(format_name) not in capture.targets
+    assert _ffn_target(format_name) not in local_capture.target_names
+    assert _ffn_target(format_name) not in capture.target_names
     for output, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(output.to_local(), reference, rtol=0, atol=0)
 
@@ -347,7 +331,7 @@ def _attention(format_name):
 
 def _assert_attention_fused(capture, format_name):
     assert (
-        capture.targets.count(
+        capture.target_names.count(
             f"piper_kernels.{format_name}_sparse_piper_projected_query_attention_output.default"
         )
         == 1
@@ -355,7 +339,7 @@ def _assert_attention_fused(capture, format_name):
     projection_prefix = "convrot_int8" if format_name == "convrot_int8" else "nvfp4"
     for operation in ("project_key", "project_value"):
         assert (
-            capture.targets.count(
+            capture.target_names.count(
                 f"piper_kernels.{projection_prefix}_sparse_piper_{operation}.default"
             )
             == 1

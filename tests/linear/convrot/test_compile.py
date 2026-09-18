@@ -1,11 +1,10 @@
 """Tests for automatic ConvRot preparation sharing during compilation."""
 
 import operator
-import uuid
 
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 
 from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.int8._compile import (
@@ -143,17 +142,6 @@ def test_compiler_pass_uuid_is_versioned_and_stable() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("static", [False, True])
 def test_cuda_compile_options_fold_gelu_tanh(static) -> None:
-    class CapturePass(CustomInferenceAwareGraphPass):
-        def __init__(self) -> None:
-            self.targets: list[object] = []
-            self._uuid = uuid.uuid4().bytes
-
-        def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-            self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-        def uuid(self) -> bytes:
-            return self._uuid
-
     class GeluProjection(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -180,7 +168,7 @@ def test_cuda_compile_options_fold_gelu_tanh(static) -> None:
     torch.manual_seed(382)
     model = GeluProjection().eval()
     value = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
-    capture = CapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_compile_options()
     options["post_grad_custom_pre_pass"] = (
         options["post_grad_custom_pre_pass"],

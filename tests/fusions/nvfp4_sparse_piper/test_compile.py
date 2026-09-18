@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import operator
-import uuid
 
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -857,20 +856,7 @@ def _run_explicit_attention_output(
     return result.view(model.batch, model.sequence_length, model.output_features)
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
-def _options_with_capture(capture: _TargetCapturePass) -> dict[str, object]:
+def _options_with_capture(capture: TargetCapturePass) -> dict[str, object]:
     options = nvfp4_sparse_piper_compile_options()
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
@@ -1150,7 +1136,7 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True)(hidden_states)
@@ -1216,7 +1202,7 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
         device="cuda",
         dtype=dtype,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         expected = _run_explicit_attention_output(model, hidden_states)
         torch._dynamo.reset()
@@ -1286,7 +1272,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         expected = _run_explicit_attention_output(
             model,
@@ -1358,7 +1344,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         gate_input = _prepare_nvfp4_input(hidden_states, model.gate.weight)
         coarse_gate = nvfp4_ops.linear_prepared(
@@ -1411,7 +1397,7 @@ def test_cuda_compile_fails_closed_for_batch_two() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
 
     with torch.no_grad():
         torch.compile(

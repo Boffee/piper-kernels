@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import uuid
-
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.nvfp4_gelu_ffn import nvfp4_gelu_ffn_compile_options
@@ -108,21 +106,6 @@ class GatedUpdates(torch.nn.Module):
         ffn = self.ffn(hidden[..., : self.input_features].contiguous())
         assert isinstance(ffn, torch.Tensor)
         return hidden + selected_ffn_gate * ffn
-
-
-class TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self.calls = 0
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.calls += 1
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
 
 
 def capturing_options(capture: TargetCapturePass) -> dict[str, object]:
