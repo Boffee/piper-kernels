@@ -676,6 +676,7 @@ benchmark = [
     { name = "setuptools" },
 ]
 dev = [
+    { name = "filelock" },
     { name = "gguf" },
     { name = "piper-kernels", extra = ["convrot", "nvfp4", "triton"] },
     { name = "pre-commit" },
@@ -685,6 +686,7 @@ dev = [
     { name = "ruff" },
 ]
 test = [
+    { name = "filelock" },
     { name = "gguf" },
     { name = "pytest" },
     { name = "pytest-xdist" },
@@ -711,6 +713,7 @@ benchmark = [
     { name = "setuptools", specifier = ">=81.0" },
 ]
 dev = [
+    { name = "filelock", specifier = ">=3.12" },
     { name = "gguf", specifier = ">=0.18,<0.20" },
     { name = "piper-kernels", extras = ["convrot", "nvfp4", "triton"] },
     { name = "pre-commit", specifier = ">=4.0" },
@@ -720,6 +723,7 @@ dev = [
     { name = "ruff", specifier = ">=0.14.3" },
 ]
 test = [
+    { name = "filelock", specifier = ">=3.12" },
     { name = "gguf", specifier = ">=0.18,<0.20" },
     { name = "pytest", specifier = "~=9.0" },
     { name = "pytest-xdist", specifier = "~=3.8" },

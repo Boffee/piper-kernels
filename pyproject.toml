@@ -45,6 +45,7 @@ benchmark = [
 ]
 test = [
     "gguf>=0.18,<0.20",
+    "filelock>=3.12",
     "pytest~=9.0",
     "pytest-xdist~=3.8",
 ]

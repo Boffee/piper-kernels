@@ -1,8 +1,10 @@
 """Repository-wide pytest configuration."""
 
 import os
+from collections.abc import Iterator
 
 import pytest
+from filelock import FileLock
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)
@@ -16,7 +18,8 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
     accelerator default to 8. Set ``PYTEST_XDIST_AUTO_NUM_WORKERS`` to override,
     for example for a larger or smaller device.
     """
-    del config
+    if config.option.collectonly:
+        return 0  # Collection gains nothing from workers that each import PyTorch.
     if os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
         return None  # xdist's own hook honors the explicit override.
     cores = os.process_cpu_count() or 1
@@ -31,3 +34,16 @@ def _accelerator_visible() -> bool:
     import torch  # noqa: PLC0415 - deferred so the hidden-CUDA path stays light.
 
     return torch.cuda.is_available()
+
+
+@pytest.fixture
+def large_device_memory(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Run tests that need gigabytes of device memory one at a time.
+
+    Such tests check free device memory and then allocate. On different xdist
+    workers, two of them could both pass the check and then run out of memory
+    together. Every worker's base temporary directory shares one parent, which
+    scopes the lock to the test session.
+    """
+    with FileLock(tmp_path_factory.getbasetemp().parent / "large_device_memory.lock"):
+        yield

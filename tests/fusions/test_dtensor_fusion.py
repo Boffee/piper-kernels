@@ -538,6 +538,7 @@ def _two_rank_fusions(rank, store_path):
         dist.destroy_process_group()
 
 
+@pytest.mark.usefixtures("large_device_memory")
 def test_two_rank_local_fusions_and_partial_output_sums(tmp_path):
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("requires distributed Gloo support")

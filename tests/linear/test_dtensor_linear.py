@@ -248,6 +248,7 @@ def _two_rank_linear(rank, store_path, device_type):
         dist.destroy_process_group()
 
 
+@pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 def test_two_rank_replicated_and_sharded_linear(tmp_path, device_type):
     if not dist.is_available() or not dist.is_gloo_available():

@@ -356,6 +356,7 @@ def test_zero_scales_with_a_routed_partial_tile_are_finite(operand, mixed, head_
     torch.testing.assert_close(output, constants.expand_as(output).to(output.dtype), rtol=0, atol=0)
 
 
+@pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.parametrize(("batch", "head_dim"), [(8, 64), (4, 128)])
 def test_large_batch_local_query_uses_offsets_beyond_signed_int32(batch, head_dim):
     heads, sequence = 56, 100000

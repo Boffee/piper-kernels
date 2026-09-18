@@ -759,7 +759,8 @@ Tests run in parallel through `pytest-xdist`. CPU-only runs use up to 16 workers
 which start-up and memory outweigh the gain. GPU runs default to 8 workers because every
 worker allocates on the same device; set `PYTEST_XDIST_AUTO_NUM_WORKERS` to use more on a
 larger GPU or fewer on a smaller one. Pass `-n0` to run serially when debugging; `--pdb`
-does so automatically.
+does so automatically. Mark tests that allocate gigabytes of device memory or spawn extra GPU
+processes with `@pytest.mark.usefixtures("large_device_memory")` so they run one at a time.
 
 ## Releases
 
