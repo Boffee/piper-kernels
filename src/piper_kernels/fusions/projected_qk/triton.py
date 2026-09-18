@@ -21,14 +21,19 @@ def rmsnorm_rope_tile(
     norm_epsilon: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     block_m: tl.constexpr,
-    rsqrt_fn: tl.constexpr = None,  # pyright: ignore[reportArgumentType]
+    round_rsqrt_to_nearest: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
-    """Apply FP32 RMSNorm and RoPE; execution may supply a rounding-specific rsqrt."""
+    """Apply FP32 RMSNorm and RoPE, optionally with correctly rounded rsqrt."""
     feature_offsets = tl.arange(0, head_dim)
     variance = tl.sum(projection * projection, axis=2) / head_dim + norm_epsilon
-    # Resolve generic libdevice through the compiling target, not a Python
-    # default that captures its non-executable declaration before JIT.
-    inverse_rms = libdevice.rsqrt(variance) if rsqrt_fn is None else rsqrt_fn(variance)
+    # Resolve generic libdevice through the compiling target. Only some targets
+    # implement the correctly rounded variant, so a compile-time flag selects it.
+    # A function passed as a constexpr would enter Triton's cache key through its
+    # repr, whose per-process address prevents reuse of the on-disk kernel cache.
+    if round_rsqrt_to_nearest:
+        inverse_rms = libdevice.rsqrt_rn(variance)
+    else:
+        inverse_rms = libdevice.rsqrt(variance)
     normalized = projection * inverse_rms[:, :, None]  # pyright: ignore[reportOptionalSubscript]
     if norm_weight_ptr is not None:
         norm_weight = tl.load(norm_weight_ptr + feature_offsets).to(tl.float32)

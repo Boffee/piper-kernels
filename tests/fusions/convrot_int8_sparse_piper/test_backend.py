@@ -16,7 +16,6 @@ import triton
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
-from triton.language.extra.cuda import libdevice
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
@@ -620,7 +619,7 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
         assert call.kwargs["aligned_projection"] is False
         assert call.kwargs["mask_block_lengths"] is False
         if operation != "value":
-            assert call.kwargs["rsqrt_fn"] is (None if is_amd else libdevice.rsqrt_rn)
+            assert call.kwargs["round_rsqrt_to_nearest"] is (not is_amd)
             assert call.kwargs["mask_ragged_tail"] is (index == 1)
         if operation != "query":
             assert call.args[-1] == (0 if index == 0 else rows // block_m)
@@ -664,7 +663,7 @@ def test_production_launches_compile_without_intermediate_bf16(
         arguments.update(
             {name: item for name, item in call.kwargs.items() if name in function.arg_names}
         )
-        arguments.setdefault("rsqrt_fn", None)
+        arguments.setdefault("round_rsqrt_to_nearest", False)
         arguments.setdefault("group_m", 0)
         if not affine and operation != "value":
             arguments["norm_weight_ptr"] = None

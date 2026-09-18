@@ -34,7 +34,7 @@ def project_rmsnorm_rope_tile(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
-    rsqrt_fn: tl.constexpr = None,  # pyright: ignore[reportArgumentType]
+    round_rsqrt_to_nearest: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
     bias_ptr=None,
 ):
     """Return one FP32 normalized and rotated projection tile."""
@@ -72,5 +72,5 @@ def project_rmsnorm_rope_tile(
         norm_epsilon,
         mask_ragged_tail,
         block_m,
-        rsqrt_fn,
+        round_rsqrt_to_nearest,
     )

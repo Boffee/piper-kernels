@@ -5,6 +5,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the fused sparse-Piper Q/K projection kernels recompiling in every new process. Their
+  rsqrt rounding mode was passed as a function-valued compile-time constant, which Triton keys
+  by a repr that includes a per-process memory address, so no process could reuse another's
+  on-disk cache entries and each wrote new ones. A boolean compile-time flag now selects
+  correctly rounded rsqrt, making the cache key stable across processes.
+
 ## [0.7.0] - 2026-09-17
 
 ### Added
