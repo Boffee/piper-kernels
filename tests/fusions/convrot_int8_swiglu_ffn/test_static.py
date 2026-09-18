@@ -177,9 +177,10 @@ def test_static_ffn_can_feed_an_unfused_projection():
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_compiler_cache_does_not_confuse_shared_and_independent_scales(fused):
-    # Reuse identical compiler options across models: a fresh capture UUID for each
-    # model would hide AOT cache collisions involving aliases inside weight wrappers.
-    capture = TargetCapturePass()
+    # Reuse identical compiler options across models with the FX graph cache active.
+    # A cache-bypassing or per-model capture UUID would hide AOT cache collisions
+    # involving aliases inside weight wrappers.
+    capture = TargetCapturePass(cache_key=b"convrot-int8-swiglu-scale-cache-collisions")
     options = _capturing_options(capture) if fused else convrot_int8_compile_options()
     for mode in ("shared", "distinct", "mixed", "shared"):
         torch._dynamo.reset()
