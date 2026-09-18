@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-18
+
 ### Fixed
 
 - Fixed the fused sparse-Piper Q/K projection kernels recompiling in every new process. Their
@@ -586,7 +588,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/Boffee/piper-kernels/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...v0.7.0
 [0.7.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...v0.7.0rc1
 [0.6.1]: https://github.com/Boffee/piper-kernels/compare/v0.6.0...v0.6.1
