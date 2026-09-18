@@ -1,10 +1,8 @@
 """Tests for automatic ConvRot INT8-to-sparse-Piper graph fusion."""
 
-import uuid
-
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import (
@@ -248,21 +246,6 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             block_lengths=block_lengths,
         )
         return fine_output + coarse_output
-
-
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self.calls = 0
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.calls += 1
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
 
 
 class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
@@ -759,7 +742,7 @@ def test_compile_options_fuse_sparse_piper_projection_region(monkeypatch, head_d
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -823,7 +806,7 @@ def test_projection_fusion_respects_internal_block_lengths(routing: str) -> None
         dtype=torch.bfloat16,
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -877,7 +860,7 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -955,7 +938,7 @@ def test_coarse_projection_fusion_respects_internal_block_lengths(routing: str) 
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1019,7 +1002,7 @@ def test_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1072,7 +1055,7 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1137,7 +1120,7 @@ def test_compile_options_fuse_attention_output_boundary(
         device="cuda",
         dtype=dtype,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1188,7 +1171,7 @@ def test_compile_fuses_padded_mixed_query_attention_output() -> None:
         dtype=torch.bfloat16,
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1239,7 +1222,7 @@ def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1321,7 +1304,7 @@ def test_compile_fuses_every_bounded_attention_feature(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1409,7 +1392,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
         coarse_scale=model.coarse_scale,
         coarse_key_blocks=model.coarse_key_blocks,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1454,7 +1437,7 @@ def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1496,7 +1479,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
     torch.manual_seed(709)
     attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicSparseProjectionAttention().eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1569,7 +1552,7 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(711)
     attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicCoarseSparseProjectionAttention().eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1669,7 +1652,7 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
     ).mul_(2 * torch.pi)
     cos = angles.cos().contiguous()
     sin = angles.sin().contiguous()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1720,7 +1703,7 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
 def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(733)
     model = _DynamicSparseProjectionAttentionOutput().eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -1784,7 +1767,7 @@ def test_sparse_piper_projection_fails_closed_for_strided_rope() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)

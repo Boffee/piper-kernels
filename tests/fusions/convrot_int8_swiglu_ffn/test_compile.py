@@ -1,11 +1,10 @@
 """Tests for automatic semantic ConvRot INT8 SwiGLU FFN folding."""
 
-import uuid
 from typing import Literal
 
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
@@ -167,22 +166,7 @@ def _gated_update_arguments(
     return base, update_source, update_gate, ffn_gate, gate_indices
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self.calls = 0
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.calls += 1
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
-def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
+def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
     options = convrot_int8_swiglu_ffn_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -278,7 +262,7 @@ def test_compile_options_fold_semantic_swiglu_ffn(
         dtype=dtype,
         device="cuda",
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -316,7 +300,7 @@ def test_compile_options_fail_closed(failure: str) -> None:
         arguments = (storage[:, ::2],)
     else:
         arguments = (activation,)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -344,7 +328,7 @@ def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     second = torch.randn(385, model.input_features, dtype=torch.bfloat16, device="cuda")
     torch._dynamo.mark_dynamic(first, 0)
     torch._dynamo.mark_dynamic(second, 0)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     torch._dynamo.reset()
     compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
 
@@ -368,7 +352,7 @@ def test_compile_options_fold_h3_style_gated_updates(
     torch.manual_seed(224)
     model = _GatedUpdates(python_indexing=python_indexing, dtype=dtype).eval()
     arguments = _gated_update_arguments(model, 257)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -399,7 +383,7 @@ def test_gated_updates_fail_closed_when_intermediate_escapes(
     torch.manual_seed(216)
     model = _GatedUpdates(expose=expose).eval()
     arguments = _gated_update_arguments(model, 257)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -431,7 +415,7 @@ def test_gated_updates_do_not_mutate_caller_input(
     torch.manual_seed(217)
     model = _GatedUpdates(update_mode=update_mode).eval()
     arguments = _gated_update_arguments(model, 257)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(

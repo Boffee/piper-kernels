@@ -1,10 +1,8 @@
 """Shared custom ops dispatch eagerly and after real Inductor rewrites."""
 
-import uuid
-
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import convrot_int8_compile_options
@@ -109,19 +107,6 @@ def test_eager_validated_linear_uses_shared_op(monkeypatch, activation_fn):
 
 
 def test_compiled_preparation_sharing_resolves_backend_at_execution(monkeypatch):
-    class Capture(CustomInferenceAwareGraphPass):
-        def __init__(self):
-            self.calls = 0
-            self.targets = []
-            self.key = uuid.uuid4().bytes
-
-        def __call__(self, graph, is_inference):
-            self.calls += 1
-            self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-        def uuid(self):
-            return self.key
-
     selected = [_RecordingBackend()]
     monkeypatch.setattr(_backend, "select_linear_backend", lambda value: selected[0])
     value, weight, scale, bias = _operands()
@@ -132,7 +117,7 @@ def test_compiled_preparation_sharing_resolves_backend_at_execution(monkeypatch)
             _ops.linear(value, weight[:5], scale[:5], None, 16),
         )
 
-    capture = Capture()
+    capture = TargetCapturePass()
     options = convrot_int8_compile_options()
     options["post_grad_custom_pre_pass"] = (options["post_grad_custom_pre_pass"], capture)
     compiled = torch.compile(two_projections, fullgraph=True, options=options)

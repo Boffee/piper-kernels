@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 
 from piper_kernels.fusions.convrot_int8_swiglu_ffn.triton import _chunked_swiglu_ffn_op
 from piper_kernels.linear.convrot import convrot_int8_compile_options
@@ -15,7 +16,6 @@ from .test_compile import (
     _GatedUpdates,
     _relative_l2,
     _SwiGluFfn,
-    _TargetCapturePass,
 )
 from .test_triton import _operands
 
@@ -90,7 +90,7 @@ def test_compiled_static_ffn_observes_scale_changes_without_recompilation(mode):
     for projection, scale in zip((model.gate, model.value, model.down), scales, strict=True):
         projection.weight.act_per_tensor_scale = scale
     activation = torch.randn(129, model.input_features, device="cuda", dtype=torch.bfloat16)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
     ordinary = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())
     with torch.inference_mode():
@@ -115,7 +115,7 @@ def test_static_ffn_gated_updates_remain_fused():
     ):
         projection.weight.act_per_tensor_scale = scale
     arguments = _gated_update_arguments(model, 129)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
             *arguments
@@ -151,7 +151,7 @@ def test_static_ffn_can_feed_an_unfused_projection():
     ):
         projection.weight.act_per_tensor_scale = scale
     activation = torch.randn(129, model.input_features, device="cuda", dtype=torch.bfloat16)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         # Keep the fused FP32 SwiGLU boundary while preparing each projection
         # independently; an eager BF16 activation chain adds a lossy round trip.
@@ -177,9 +177,10 @@ def test_static_ffn_can_feed_an_unfused_projection():
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_compiler_cache_does_not_confuse_shared_and_independent_scales(fused):
-    # Reuse identical compiler options across models: a fresh capture UUID for each
-    # model would hide AOT cache collisions involving aliases inside weight wrappers.
-    capture = _TargetCapturePass()
+    # Reuse identical compiler options across models with the FX graph cache active.
+    # A cache-bypassing or per-model capture UUID would hide AOT cache collisions
+    # involving aliases inside weight wrappers.
+    capture = TargetCapturePass(cache_key=b"convrot-int8-swiglu-scale-cache-collisions")
     options = _capturing_options(capture) if fused else convrot_int8_compile_options()
     for mode in ("shared", "distinct", "mixed", "shared"):
         torch._dynamo.reset()

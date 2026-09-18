@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import uuid
-
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -691,19 +689,6 @@ def test_constructor_rejects_non_matrix_weight() -> None:
         )
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
 def _cuda_case(
     dynamic: bool,
     group_size: int,
@@ -830,7 +815,7 @@ def test_cuda_compile_preserves_semantic_linear(dynamic: bool) -> None:
         return F.linear(value, weight, bias)
 
     expected = projection(activation)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     actual = torch.compile(
         projection,
         fullgraph=True,

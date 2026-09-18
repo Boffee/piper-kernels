@@ -45,7 +45,9 @@ benchmark = [
 ]
 test = [
     "gguf>=0.18,<0.20",
+    "filelock>=3.12",
     "pytest~=9.0",
+    "pytest-xdist~=3.8",
 ]
 dev = [
     { include-group = "test" },
@@ -56,6 +58,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+# Parallel by default; tests/conftest.py bounds GPU runs. Debug serially with -n0.
+addopts = ["-n", "auto"]
 markers = [
     "gpu: requires a compatible accelerator (CUDA or ROCm, depending on the test)",
 ]

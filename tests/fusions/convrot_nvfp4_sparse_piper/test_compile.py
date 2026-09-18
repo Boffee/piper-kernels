@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import uuid
-
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -549,19 +547,6 @@ def _run_explicit_projected_gate_output(
     return _project_materialized_attention(attention, model.output)
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
@@ -598,7 +583,7 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
         device="cuda",
         dtype=dtype,
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_nvfp4_sparse_piper_compile_options()
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
@@ -662,7 +647,7 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     options = convrot_nvfp4_sparse_piper_compile_options()
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)

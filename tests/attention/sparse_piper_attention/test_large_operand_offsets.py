@@ -84,6 +84,7 @@ def _store_last_head(data, scales, summary, means, length: tl.constexpr, kind: t
         )
 
 
+@pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("kind", ["query", "key", "value"])

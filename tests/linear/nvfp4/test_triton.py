@@ -255,6 +255,7 @@ def test_prepared_linear_bounds_workspace(
     assert (actual == expected_value).all()
 
 
+@pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_inplace_bias_addition_crosses_int32_element_boundary() -> None:

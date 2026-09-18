@@ -755,6 +755,13 @@ uv build
 GPU tests use the `gpu` pytest marker. The pre-commit test hook hides CUDA so commits run
 the portable suite; run `uv run pytest` directly to exercise installed GPU backends.
 
+Tests run in parallel through `pytest-xdist`. CPU-only runs use up to 16 workers, beyond
+which start-up and memory outweigh the gain. GPU runs default to 8 workers because every
+worker allocates on the same device; set `PYTEST_XDIST_AUTO_NUM_WORKERS` to use more on a
+larger GPU or fewer on a smaller one. Pass `-n0` to run serially when debugging; `--pdb`
+does so automatically. Mark tests that allocate gigabytes of device memory or spawn extra GPU
+processes with `@pytest.mark.usefixtures("large_device_memory")` so they run one at a time.
+
 ## Releases
 
 Releases follow the compatibility and release policy in [VERSIONING.md](VERSIONING.md).

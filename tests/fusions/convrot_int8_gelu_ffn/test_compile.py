@@ -1,10 +1,8 @@
 """Tests for automatic semantic ConvRot INT8 GELU FFN folding."""
 
-import uuid
-
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
@@ -121,22 +119,7 @@ class _GatedUpdates(torch.nn.Module):
         return (output, ffn) if self.expose_ffn else output
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self.calls = 0
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.calls += 1
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
-def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
+def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
     options = convrot_int8_gelu_ffn_compile_options()
     compiler_passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(compiler_passes, tuple)
@@ -200,7 +183,7 @@ def test_compile_options_fold_semantic_gelu_ffn(bias_dtype, dtype, scale_mode) -
     if scale_mode in ("down-static", "static"):
         model.down.weight.act_per_tensor_scale = torch.tensor(0.04, device="cuda")
     activation = torch.randn(2, 257, model.input_features, dtype=dtype, device="cuda")
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -237,7 +220,7 @@ def test_compile_options_fail_closed(failure: str) -> None:
         activation = torch.empty(0, model.input_features, dtype=torch.bfloat16, device="cuda")
     else:
         activation = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -265,7 +248,7 @@ def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     second = torch.randn(385, model.input_features, dtype=torch.bfloat16, device="cuda")
     torch._dynamo.mark_dynamic(first, 0)
     torch._dynamo.mark_dynamic(second, 0)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     torch._dynamo.reset()
     compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
 
@@ -284,7 +267,7 @@ def test_compile_options_fold_indexed_gated_updates(python_indexing: bool) -> No
     torch.manual_seed(517)
     model = _GatedUpdates(python_indexing=python_indexing).eval()
     arguments = _gated_update_arguments(257)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -309,7 +292,7 @@ def test_gated_updates_fail_closed_when_ffn_escapes() -> None:
     torch.manual_seed(519)
     model = _GatedUpdates(expose_ffn=True).eval()
     arguments = _gated_update_arguments(257)
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
@@ -339,7 +322,7 @@ def test_compiled_static_scales_are_runtime_values() -> None:
     model.up.weight.act_per_tensor_scale = torch.tensor(0.02, device="cuda")
     model.down.weight.act_per_tensor_scale = torch.tensor(0.04, device="cuda")
     activation = torch.randn(129, model.input_features, dtype=torch.bfloat16, device="cuda")
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
     ordinary = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())
 

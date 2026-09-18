@@ -3,12 +3,12 @@
 import os
 import subprocess
 import sys
-import uuid
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
@@ -107,22 +107,7 @@ class _GatedUpdates(torch.nn.Module):
         return hidden + ffn_gate.index_select(0, gate_indices) * ffn
 
 
-class _TargetCapturePass(CustomInferenceAwareGraphPass):
-    def __init__(self) -> None:
-        self.targets: list[object] = []
-        self.calls = 0
-        self._uuid = uuid.uuid4().bytes
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        assert is_inference
-        self.calls += 1
-        self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
-
-    def uuid(self) -> bytes:
-        return self._uuid
-
-
-def _capturing_options(capture: _TargetCapturePass) -> dict[str, object]:
+def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
     options = nvfp4_swiglu_ffn_compile_options()
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
@@ -169,9 +154,11 @@ assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear") == register_conv
 def test_cuda_compile_in_fresh_process(register_convrot: bool) -> None:
     script = """
 import sys
+# Pytest puts tests/ on sys.path for shared test helpers; a fresh interpreter does not.
+sys.path.insert(0, sys.argv[2])
 import torch
 from tests.fusions.nvfp4_swiglu_ffn.test_compile import (
-    _SwiGluFfn, _TargetCapturePass, _capturing_options, _chunked_swiglu_ffn_op, make_operands,
+    _SwiGluFfn, TargetCapturePass, _capturing_options, _chunked_swiglu_ffn_op, make_operands,
 )
 
 assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
@@ -183,7 +170,7 @@ if register_convrot:
 torch.set_num_threads(1)
 operands = make_operands(rows=256, output_features=256, dynamic=True)
 model = _SwiGluFfn(operands).eval()
-capture = _TargetCapturePass()
+capture = TargetCapturePass()
 options = _capturing_options(capture)
 options.update({"triton.cudagraphs": False, "compile_threads": 1})
 with torch.no_grad():
@@ -197,7 +184,7 @@ assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in capture.targ
 assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear") == register_convrot
 """
     subprocess.run(
-        [sys.executable, "-c", script, str(register_convrot)],
+        [sys.executable, "-c", script, str(register_convrot), str(Path(__file__).parents[2])],
         env={**os.environ, "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1"},
         check=True,
         timeout=180,
@@ -221,7 +208,7 @@ def test_shared_projection_weights_preserve_distinct_biases(
     model = _SwiGluFfn(operands).eval()
     # Explicitly tie the module parameter too, so tracing sees one shared weight.
     model.value.weight = model.gate.weight
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
         torch._dynamo.reset()
@@ -303,7 +290,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
         promote_gate=promote_gate,
         reverse_multiply=reverse_multiply,
     ).eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(activation)
@@ -330,7 +317,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
 def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     operands = make_operands(rows=257, dynamic=False, seed=915)
     model = _SwiGluFfn(operands).eval()
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     first = operands.input
     second = torch.randn(385, first.shape[-1], device="cuda", dtype=torch.bfloat16)
     torch._dynamo.mark_dynamic(first, 0)
@@ -359,7 +346,7 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
         if failure == "different-input"
         else (operands.input,)
     )
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(*arguments)
@@ -400,7 +387,7 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) ->
     ffn_gate = gate_storage[:, 5 * output_features :]
     gate_indices = torch.randint(0, 7, (rows,), device="cuda", dtype=torch.int64)
     arguments = base, update_source, update_gate, ffn_gate, gate_indices
-    capture = _TargetCapturePass()
+    capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(*arguments)
