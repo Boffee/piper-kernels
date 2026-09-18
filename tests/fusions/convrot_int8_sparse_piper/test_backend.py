@@ -55,7 +55,9 @@ def _operands(sequence=193, heads=3, head_dim=128):
     )
 
 
-def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False, *, bias=None):
+def _call(
+    operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False, *, bias=None, mean=None
+):
     head_dim = operands[4].shape[0]
     if operation == "query":
         return query._launch_query_projection_range(
@@ -64,7 +66,8 @@ def _call(operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False, *
     if operation == "key":
         return key._launch_key_projection(*operands, 1e-6, routing, bias=bias)
     qdata, scale, weight, weight_scale, *_ = operands
-    mean = qdata.new_empty((2, 272), dtype=torch.float32)
+    if mean is None:
+        mean = qdata.new_empty((2, 272), dtype=torch.float32)
     return value._launch_value_projection(
         qdata,
         scale,
@@ -202,9 +205,13 @@ def test_unvalidated_projection_rejects_before_output_allocation(
     )
     with FakeTensorMode():
         operands = _operands(head_dim=head_dim)
+        # Allocate the test's own inputs before guarding: a cold FakeTensorMode
+        # dispatch routes new_empty through torch.empty, so allocating after the
+        # guard fails on test setup instead of on library allocations.
+        mean = operands[0].new_empty((2, 272), dtype=torch.float32)
         monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated outputs")))
         with pytest.raises(ValueError, match="sparse projections are unavailable"):
-            _call(operation, operands)
+            _call(operation, operands, mean=mean)
 
 
 @pytest.mark.parametrize("missing", [None, "attention", "linear"])
