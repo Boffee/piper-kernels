@@ -3,7 +3,6 @@
 # Triton's launch options and constexpr function arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -26,7 +25,7 @@ class ProjectionConfig:
     num_warps: int
     num_stages: int
     group_m: int = 0
-    rsqrt_fn: Callable | None = None
+    round_rsqrt_to_nearest: bool = False
 
 
 def project_query(
@@ -84,7 +83,7 @@ def project_query(
                 heads_per_program=config.heads_per_program,
                 head_dim=head_dim,
                 rotary_dim=rotary_dim,
-                rsqrt_fn=config.rsqrt_fn,
+                round_rsqrt_to_nearest=config.round_rsqrt_to_nearest,
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
@@ -166,7 +165,7 @@ def project_key(
                 heads_per_program=config.heads_per_program,
                 head_dim=head_dim,
                 rotary_dim=rotary_dim,
-                rsqrt_fn=config.rsqrt_fn,
+                round_rsqrt_to_nearest=config.round_rsqrt_to_nearest,
                 norm_epsilon=norm_epsilon,
                 mean_pool_summary=mean_pool_summary,
                 mask_block_lengths=has_block_lengths,

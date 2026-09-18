@@ -67,7 +67,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
-    rsqrt_fn: tl.constexpr = None,
+    round_rsqrt_to_nearest: tl.constexpr = False,
     group_m: tl.constexpr = 0,
     bias_ptr=None,
 ):
@@ -114,7 +114,7 @@ def _convrot_project_rmsnorm_rope_quantize_query_kernel(  # noqa: PLR0913, PLR09
         block_m,
         block_n,
         block_k,
-        rsqrt_fn,
+        round_rsqrt_to_nearest,
         bias_ptr=bias_ptr,
     )
 
@@ -175,7 +175,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
-    rsqrt_fn: tl.constexpr = None,
+    round_rsqrt_to_nearest: tl.constexpr = False,
     group_m: tl.constexpr = 0,
     bias_ptr=None,
 ):
@@ -212,7 +212,7 @@ def _convrot_project_quantize_key_kernel(  # noqa: PLR0913, PLR0917
         block_m,
         block_n,
         block_k,
-        rsqrt_fn,
+        round_rsqrt_to_nearest,
         bias_ptr=bias_ptr,
     )
     sparse_piper_kernels.store_key_tile(

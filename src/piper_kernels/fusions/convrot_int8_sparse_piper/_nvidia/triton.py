@@ -3,8 +3,6 @@
 from dataclasses import replace
 from functools import partial
 
-from triton.language.extra.cuda import libdevice
-
 from .. import triton as projection
 from .._layout import TILE_ROWS
 
@@ -14,7 +12,7 @@ _QUERY_CONFIG = projection.ProjectionConfig(
     heads_per_program=2,
     num_warps=8,
     num_stages=3,
-    rsqrt_fn=libdevice.rsqrt_rn,
+    round_rsqrt_to_nearest=True,
 )
 _CONTEXT_CONFIG = replace(_QUERY_CONFIG, block_m=2 * TILE_ROWS)
 

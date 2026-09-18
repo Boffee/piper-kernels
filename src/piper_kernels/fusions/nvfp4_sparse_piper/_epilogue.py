@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper import (
@@ -141,7 +140,7 @@ def _query_epilogue_kernel(  # noqa: PLR0913, PLR0917
         norm_epsilon,
         mask_ragged_tail,
         block_m,
-        rsqrt_fn=tl.constexpr(libdevice.rsqrt_rn),
+        round_rsqrt_to_nearest=tl.constexpr(True),
     )
     sparse_piper_kernels.store_query_tile(
         transformed,
@@ -237,7 +236,7 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
         norm_epsilon,
         mask_ragged_tail,
         block_m,
-        rsqrt_fn=tl.constexpr(libdevice.rsqrt_rn),
+        round_rsqrt_to_nearest=tl.constexpr(True),
     )
     sparse_piper_kernels.store_key_tile(
         transformed,
