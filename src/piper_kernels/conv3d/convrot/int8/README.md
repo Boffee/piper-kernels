@@ -50,10 +50,24 @@ and graph capture with live activation-scale changes. Offline tests check intege
 matrix instructions on SM120 and both RDNA4 targets.
 
 The benchmark reports plain and fused convolution timings against the portable
-reference, with cache-flushed and graph-replay measurements. Repeat `--shape N,C,T,H,W,O`
-to select synthetic cases; `--dtype float32` selects FP32 input, and `--tune` sweeps
-prepared convolution tiles without changing production policy. These measurements
-do not establish performance or quality for an entire encoder or a real checkpoint.
+reference and standard PyTorch ROCm FP16 convolution, with cache-flushed and
+graph-replay measurements. The FP16 baselines use both contiguous and
+`channels_last_3d` inputs/weights. They include matching causal/reflection padding
+and, for the fused comparison, eager framewise GroupNorm and SiLU. Logical FP16
+weight reconstruction and initial layout conversions happen outside timing;
+normalization, activation, padding, and any internal layout copies remain timed.
+FP16 omits activation quantization and retains FP16 intermediate rounding, so it
+is a performance baseline rather than the INT8 correctness oracle.
+
+Repeat `--shape N,C,T,H,W,O` to select synthetic cases; `--dtype float32` selects
+FP32 input for INT8/reference (the FP16 baseline still uses FP16), and `--tune`
+sweeps prepared convolution tiles without changing production policy.
+`--miopen-benchmark` enables vendor algorithm search before timing. The report
+records that setting and `PYTORCH_MIOPEN_SUGGEST_NHWC`, which gates native
+channels-last MIOpen execution in the tested PyTorch build.
+`--skip-reference-timing` skips only the portable reference's timings, retaining
+the correctness comparison. These measurements do not establish performance or
+quality for an entire encoder or a real checkpoint.
 
 Initial RX 9070 XT measurements (2026-09-19, FP16 inputs, graph replay, milliseconds):
 
@@ -69,6 +83,41 @@ reflection padding, stride, and scales. Environment: Python 3.13.13,
 PyTorch `2.14.0+rocm10.1.0a20260908`, HIP `7.16.26354`, Triton 3.8.0;
 command: `PYTHONPATH=src /path/to/rocm-env/bin/python
 benchmarks/benchmark_convrot_int8_conv3d_rocm.py --rep-ms 100`.
+
+Standard FP16 comparison on the same RX 9070 XT/software stack (2026-09-19):
+median of three separate process runs, graph replay, milliseconds, with
+`--rep-ms 100 --miopen-benchmark` and `PYTORCH_MIOPEN_SUGGEST_NHWC=1`. The table
+selects the faster FP16 layout per operation/shape: contiguous for C=128 and
+plain C=256; native channels-last for fused C=256 and both C=512 operations.
+
+To reproduce the FP16 comparison, run the following command in three separate
+processes and take the median for each reported timing:
+
+```shell
+PYTORCH_MIOPEN_SUGGEST_NHWC=1 PYTHONPATH=src \
+  /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d_rocm.py \
+  --rep-ms 100 --miopen-benchmark --skip-reference-timing
+```
+
+| N,C,T,H,W,O | INT8 plain | FP16 plain | Plain speedup | INT8 fused | FP16 GN/SiLU/conv | Fused speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,128,5,64,64,128 | 0.107 | 0.317 | 2.97x | 0.122 | 0.405 | 3.31x |
+| 1,256,3,32,32,256 | 0.065 | 0.190 | 2.90x | 0.071 | 0.237 | 3.34x |
+| 1,512,3,16,16,512 | 0.079 | 0.191 | 2.43x | 0.085 | 0.219 | 2.57x |
+
+Ratios use unrounded timings. Both paths include padding; the INT8 path includes
+rotation/quantization. FP16 uses the dequantized logical filter, with no runtime
+weight conversion. Three additional runs with the default MIOpen layout setting
+favored contiguous FP16 for every case (plain: 0.317/0.190/0.209 ms;
+GN/SiLU/conv: 0.404/0.238/0.234 ms).
+
+MIOpen's first algorithm search logged unavailable candidate kernels in this
+nightly build, but execution and correctness checks completed;
+the repeat runs had no MIOpen search errors. With native channels-last enabled,
+the portable FP32 reference became very slow (about 700 ms); the two repeat runs
+therefore used `--skip-reference-timing`, while still checking correctness against
+it. Results characterize this installed stack, not an exhaustive search over
+ROCm versions or convolution implementations.
 
 ## Quantize and dequantize weights
 
