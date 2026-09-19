@@ -1,4 +1,4 @@
-"""Offline matrix-instruction coverage for the shared convolution kernel."""
+"""Offline matrix-instruction and preparation coverage for ConvRot INT8 Conv3D."""
 
 import sys
 
