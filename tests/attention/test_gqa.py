@@ -4,9 +4,11 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import SparsePiperAttention, piper_attention
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention.triton import (
     _default_piper_attention_execution_plan,
     _prepare_piper_attention,
@@ -15,8 +17,18 @@ from piper_kernels.attention.piper_attention.triton import (
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._budget import _resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
+)
 from piper_kernels.attention.sparse_piper_attention._scores_triton import minmax_scores
+
+
+def _sm120_available():
+    # ROCm can also report capability (12, 0); include the accelerator backend.
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).is_cuda_capability(12, 0)
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -99,17 +111,11 @@ def test_gqa_invalid_heads_rejected_without_tensor_contents(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="requires SM120",
-)
-def test_gqa_compile_and_prepared_storage():
+@pytest.mark.skipif(not _sm120_available(), reason="requires NVIDIA SM120")
+def test_dense_gqa_compile_and_prepared_storage():
     # Keep semantic scalars inside the graph, as in an architecture processor.
     def dense_attention(query, key, value):
         return piper_attention(query, key, value, scale=128**-0.5)
-
-    def sparse_attention(query, key, value):
-        return attention(query, key, value, sparse_key_blocks=4, scale=128**-0.5)
 
     query = torch.randn(2, 8, 256, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(2, 2, 256, 128, device="cuda", dtype=query.dtype)
@@ -131,22 +137,40 @@ def test_gqa_compile_and_prepared_storage():
         rtol=0,
         atol=0,
     )
-    attention = SparsePiperAttention([0.5] * 8, routing="mean")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(("kv_heads", "groups"), [(1, 4), (2, 3)])
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, routing):
+    torch.manual_seed(816)
+    torch._dynamo.reset()
+    heads = kv_heads * groups
+    query = torch.randn(2, heads, 256, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(2, kv_heads, 256, head_dim, device="cuda", dtype=query.dtype)
+    value = torch.randn_like(key)
+    backend = _backend.select_attention_backend(query)
+    if backend is None:
+        pytest.skip("requires a native sparse-attention backend")
+    scale = head_dim**-0.5
+    attention = SparsePiperAttention([0.5] * heads, routing=routing)
     layout = _resolve_route_layout(attention._head_keep_ratio_units, 4, query.device)
-    routes = packed_routes_from_sequences(query, key, layout, _MEAN_ROUTING)
-    backend = _backend.require_attention_backend(query)
+    routing_mode = _MEAN_ROUTING if routing == "mean" else _MINMAX_ROUTING
+    routes = packed_routes_from_sequences(query, key, layout, routing_mode)
     prepared = backend.prepare(
         query,
         routes.indices,
         routes.head_keep_blocks,
-        128**-0.5,
+        scale,
         sparse_key_blocks=4,
         route_head_offsets=routes.route_head_offsets,
         combined_key=key,
         combined_value=value,
     )
-    assert prepared.query.data.shape[1] == 8
-    assert prepared.context.head_keep_blocks.numel() == 8
+    assert prepared.query.data.shape[1] == heads
+    assert prepared.context.head_keep_blocks.numel() == heads
     for tensor in (
         prepared.context.key,
         prepared.context.value,
@@ -154,27 +178,47 @@ def test_gqa_compile_and_prepared_storage():
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
     ):
-        assert tensor.shape[1] == 2
-    local_output = torch.empty((2, 8, 64, 128), device="cuda", dtype=query.dtype)
+        assert tensor.shape[1] == kv_heads
+    local_output = torch.empty((2, heads, 64, head_dim), device="cuda", dtype=query.dtype)
     backend.launch(prepared, local_output, query_block_offset=1, query_block_count=1)
     expected = attention(
         query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), sparse_key_blocks=4
     )
     torch.testing.assert_close(local_output, expected[:, 64:128].transpose(1, 2), rtol=0, atol=0)
-    inputs = tuple(x.transpose(1, 2) for x in (query, key, value))
-    torch.testing.assert_close(
-        torch.compile(sparse_attention, fullgraph=True, dynamic=True)(*inputs),
-        attention(*inputs, sparse_key_blocks=4),
-        rtol=0,
-        atol=0,
+
+    def sparse_attention(query, key, value, sparse_key_blocks):
+        # Keep the structural scale constant inside the graph, as in the dense test.
+        return attention(
+            query,
+            key,
+            value,
+            sparse_key_blocks=sparse_key_blocks,
+            scale=64**-0.5 if head_dim == 64 else 128**-0.5,
+        )
+
+    capture = TargetCapturePass()
+    compiled = torch.compile(
+        sparse_attention,
+        fullgraph=True,
+        dynamic=True,
+        options={"post_grad_custom_pre_pass": capture},
     )
+    with torch.inference_mode():
+        for sequence, sparse_key_blocks in ((193, 2), (257, 3), (320, 4)):
+            query = torch.randn(2, sequence, heads, head_dim, device="cuda", dtype=query.dtype)
+            key = torch.randn(2, sequence, kv_heads, head_dim, device="cuda", dtype=query.dtype)
+            value = torch.randn_like(key)
+            torch.testing.assert_close(
+                compiled(query, key, value, sparse_key_blocks),
+                attention(query, key, value, sparse_key_blocks=sparse_key_blocks),
+                rtol=0,
+                atol=0,
+            )
+    assert capture.calls == 1
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="requires SM120",
-)
+@pytest.mark.skipif(not _sm120_available(), reason="requires NVIDIA SM120")
 @pytest.mark.parametrize("causal", [False, True])
 def test_dense_gqa_per_thread_preparation(causal):
     query = torch.randn(2, 6, 67, 128, device="cuda", dtype=torch.bfloat16)

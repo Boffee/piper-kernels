@@ -1,0 +1,42 @@
+name: ROCm regressions
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 8 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-regressions
+  cancel-in-progress: false
+
+jobs:
+  rdna4:
+    if: vars.ENABLE_ROCM_CI == 'true'
+    runs-on: [self-hosted, linux, x64, rocm, rdna4]
+    timeout-minutes: 60
+    env:
+      ROCM_PYTHON: ${{ vars.ROCM_PYTHON }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test native ROCm backends
+        shell: bash
+        run: |
+          : "${ROCM_PYTHON:?Set ROCM_PYTHON to the provisioned ROCm environment's Python}"
+          "$ROCM_PYTHON" scripts/run_rocm_regressions.py --junitxml=artifacts/rocm-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-results
+          path: artifacts/rocm-results.xml
+          if-no-files-found: warn
+          retention-days: 14

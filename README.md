@@ -762,6 +762,33 @@ larger GPU or fewer on a smaller one. Pass `-n0` to run serially when debugging;
 does so automatically. Mark tests that allocate gigabytes of device memory or spawn extra GPU
 processes with `@pytest.mark.usefixtures("large_device_memory")` so they run one at a time.
 
+### ROCm hardware regressions
+
+Run the focused RDNA4 suite with the Python from an existing Linux ROCm environment:
+
+```shell
+/path/to/rocm-env/bin/python scripts/run_rocm_regressions.py --junitxml=artifacts/rocm-results.xml
+```
+
+The environment needs Python 3.13+, ROCm PyTorch 2.14+ with its matching Triton,
+TorchAO 0.17+, and the dependencies in the `test` group. Do not use the repository's
+CUDA-default `uv sync` to provision it. The script imports this checkout's source,
+prints environment/device versions, and requires native RDNA4 D64/D128 attention,
+INT8 linear, and sparse projection/output backends before collecting tests.
+An absent GPU or backend fails the run instead of silently skipping the suite.
+
+Coverage includes GQA/MQA prepared KV storage and dynamic compilation, both sparse routing
+policies, GELU FFNs, static/dynamic/mixed scales and scale mutation, and reuse of dynamic
+attention, coarse-residual, and output-fusion graphs. Execution is serial to bound VRAM
+and isolate kernel-cache assertions. Additional pytest arguments can select a subset,
+for example `-k sparse_gqa`.
+
+The `ROCm regressions` workflow runs nightly at 08:23 UTC and supports manual dispatch
+once a self-hosted Linux x64 runner has the `rocm` and `rdna4` labels. Provision its ROCm
+environment, set repository variable `ROCM_PYTHON` to that environment's absolute Python
+path, and set `ENABLE_ROCM_CI=true`. It uses the same script and uploads JUnit results.
+The workflow is opt-in and does not run pull-request code automatically on the host.
+
 ## Releases
 
 Releases follow the compatibility and release policy in [VERSIONING.md](VERSIONING.md).
