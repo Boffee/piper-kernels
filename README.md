@@ -297,10 +297,10 @@ ROCm environment rather than `uv sync` in that environment.
 `from_hp()`, `from_quantized()`, and `dequantize()` API. It carries packed INT8
 weights, FP32 weight scales, and an optional FP32 `act_per_tensor_scale` tensor.
 `piper_kernels.conv3d.convrot.int8.ConvRotInt8Conv3d` consumes that weight with a
-fixed activation scale. The optimized backend targets SM120, with a portable
-reference elsewhere. Loading contiguous checkpoint tensors preserves mmap
-storage. H3 encoder compile options fuse framewise GroupNorm, SiLU, padding,
-and residuals around explicitly installed quantized convolutions.
+fixed activation scale. Optimized backends target SM120 and Linux ROCm RDNA4
+(`gfx1200`/`gfx1201`), with a portable reference elsewhere. Loading contiguous
+checkpoint tensors preserves mmap storage. H3 encoder compile options fuse framewise
+GroupNorm, SiLU, padding, and residuals around explicitly installed quantized convolutions.
 
 See [ConvRot INT8 Conv3D](src/piper_kernels/conv3d/convrot/int8/README.md) for
 checkpoint conversion, loading, supported shapes, and engine integration.
@@ -774,14 +774,15 @@ The environment needs Python 3.13+, ROCm PyTorch 2.14+ with its matching Triton,
 TorchAO 0.17+, and the dependencies in the `test` group. Do not use the repository's
 CUDA-default `uv sync` to provision it. The script imports this checkout's source,
 prints environment/device versions, and requires native RDNA4 D64/D128 attention,
-INT8 linear, and sparse projection/output backends before collecting tests.
+INT8 linear/Conv3D, and sparse projection/output backends before collecting tests.
 An absent GPU or backend fails the run instead of silently skipping the suite.
 
 Coverage includes GQA/MQA prepared KV storage and dynamic compilation, both sparse routing
 policies, GELU FFNs, static/dynamic/mixed scales and scale mutation, and reuse of dynamic
-attention, coarse-residual, and output-fusion graphs. Execution is serial to bound VRAM
-and isolate kernel-cache assertions. Additional pytest arguments can select a subset,
-for example `-k sparse_gqa`.
+attention, coarse-residual, and output-fusion graphs. Conv3D coverage includes plain
+and GroupNorm–SiLU paths, exact integer accumulation, graph capture, and H3 compilation.
+Execution is serial to bound VRAM and isolate kernel-cache assertions.
+Additional pytest arguments can select a subset, for example `-k sparse_gqa`.
 
 The `ROCm regressions` workflow runs nightly at 08:23 UTC and supports manual dispatch
 once a self-hosted Linux x64 runner has the `rocm` and `rdna4` labels. Provision its ROCm

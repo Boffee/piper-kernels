@@ -6,29 +6,16 @@ from typing import Literal, cast
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
-from . import reference
+from . import _backend, reference
 from ._validation import (
     _validate_common,
     _validate_inference,
     _validate_norm,
 )
 
-try:
-    from . import triton as triton_backend
-except ModuleNotFoundError as error:
-    if error.name != "triton":
-        raise
-    triton_backend = None
-
 type SpatialPadding = Literal["none", "reflect", "reflect_right"]
-
-
-def _supports_triton(input: torch.Tensor) -> bool:  # noqa: A002
-    target = AcceleratorTarget.from_device(input.device)
-    return target.is_cuda_capability(12, 0)
 
 
 @torch.library.custom_op(
@@ -59,9 +46,7 @@ def _conv3d_op(
         right_spatial_padding,
         residual,
     )
-    backend = (
-        triton_backend if triton_backend is not None and _supports_triton(input) else reference
-    )
+    backend = _backend.select_backend(input) or reference
     return backend.conv3d(
         input,
         weight_qdata,
@@ -138,9 +123,7 @@ def _group_norm_silu_conv3d_op(  # noqa: PLR0913, PLR0917
     )
     _validate_norm(input, norm_weight, norm_bias, norm_groups, norm_epsilon)
 
-    backend = (
-        triton_backend if triton_backend is not None and _supports_triton(input) else reference
-    )
+    backend = _backend.select_backend(input) or reference
     return backend.group_norm_silu_conv3d(
         input,
         norm_weight,
