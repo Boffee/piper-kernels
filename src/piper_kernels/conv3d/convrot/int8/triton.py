@@ -1,4 +1,4 @@
-"""Triton kernels for static-scale ConvRot INT8 causal convolutions."""
+"""Shared ConvRot INT8 convolution kernels and policy-driven launch mechanics."""
 
 # pyright: reportCallIssue=false
 
@@ -12,9 +12,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from piper_kernels._triton import convrot as rotation_backend
 from piper_kernels._triton import convrot_int8 as int8_kernels
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
 
-from . import _policy
+from ._interfaces import ConvolutionPolicy
 from ._validation import _output_shape
 
 
@@ -368,7 +367,14 @@ def _conv3d_kernel(  # noqa: PLR0915
     )
 
 
-def _prepare_input(input, group_size, input_scale):  # noqa: A002
+def _prepare_input(
+    input,  # noqa: A002
+    group_size,
+    input_scale,
+    *,
+    policy: ConvolutionPolicy,
+    accelerator_backend: str,
+):
     batch, channels, frames, height, width = input.shape
     token_volume = frames * height * width
     token_count = batch * token_volume
@@ -377,7 +383,7 @@ def _prepare_input(input, group_size, input_scale):  # noqa: A002
         device=input.device,
         dtype=torch.int8,
     )
-    block_m, num_warps = _policy.preparation_plan(channels, token_count, group_norm=False)
+    block_m, num_warps = policy.preparation_plan(channels, token_count, group_norm=False)
     with device_context(input.device):
         _prepare_channelwise_kernel[(triton.cdiv(token_count, block_m),)](
             input,
@@ -394,7 +400,7 @@ def _prepare_input(input, group_size, input_scale):  # noqa: A002
             channels=channels,
             group_size=group_size,
             input_scale=input_scale,
-            accelerator_backend="cuda",
+            accelerator_backend=accelerator_backend,
             block_m=block_m,
             num_warps=num_warps,
         )
@@ -409,6 +415,9 @@ def _prepare_group_norm_silu_input(
     norm_epsilon,
     group_size,
     input_scale,
+    *,
+    policy: ConvolutionPolicy,
+    accelerator_backend: str,
 ):
     batch, channels, frames, height, width = input.shape
     channels_per_group = channels // norm_groups
@@ -462,7 +471,7 @@ def _prepare_group_norm_silu_input(
             device=input.device,
             dtype=torch.int8,
         )
-        block_m, num_warps = _policy.preparation_plan(channels, token_count, group_norm=True)
+        block_m, num_warps = policy.preparation_plan(channels, token_count, group_norm=True)
         _prepare_group_norm_silu_kernel[(triton.cdiv(token_count, block_m),)](
             input,
             norm_weight,
@@ -487,7 +496,7 @@ def _prepare_group_norm_silu_input(
             channels_per_group=channels_per_group,
             group_size=group_size,
             input_scale=input_scale,
-            accelerator_backend="cuda",
+            accelerator_backend=accelerator_backend,
             block_m=block_m,
             num_warps=num_warps,
         )
@@ -502,6 +511,7 @@ def _conv3d_prepared(
     input_scale,
     stride,
     *,
+    policy: ConvolutionPolicy,
     symmetric_spatial_padding,
     right_spatial_padding,
     residual,
@@ -521,14 +531,13 @@ def _conv3d_prepared(
     residual_pointer = residual if residual is not None else output
     residual_strides = residual.stride() if residual is not None else output.stride()
     rows = batch * output_frames * output_height * output_width
-    plan = _policy.convolution_plan(input_channels, output_channels, rows)
-    target = AcceleratorTarget.from_device(input_qdata.device)
-    use_weight_descriptor = (
-        target.is_cuda_capability(12, 0)
-        and weight_qdata.data_ptr() % 16 == 0
-        and input_channels == 128
-        and output_channels % plan.block_n == 0
-        and (output_height >= 256 or output_channels > 128)
+    plan = policy.convolution_plan(input_channels, output_channels, rows)
+    use_weight_descriptor = policy.use_weight_descriptor(
+        input_channels,
+        output_channels,
+        output_height,
+        plan.block_n,
+        aligned=weight_qdata.data_ptr() % 16 == 0,
     )
     with device_context(input_qdata.device):
         weight_argument = (
@@ -593,11 +602,15 @@ def conv3d(
     input_scale,
     stride,
     *,
+    policy: ConvolutionPolicy,
+    accelerator_backend: str,
     symmetric_spatial_padding,
     right_spatial_padding,
     residual,
 ):
-    prepared = _prepare_input(input, group_size, input_scale)
+    prepared = _prepare_input(
+        input, group_size, input_scale, policy=policy, accelerator_backend=accelerator_backend
+    )
     return _conv3d_prepared(
         prepared,
         weight_qdata,
@@ -605,6 +618,7 @@ def conv3d(
         bias,
         input_scale,
         stride,
+        policy=policy,
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
@@ -624,6 +638,8 @@ def group_norm_silu_conv3d(
     input_scale,
     stride,
     *,
+    policy: ConvolutionPolicy,
+    accelerator_backend: str,
     symmetric_spatial_padding,
     right_spatial_padding,
     residual,
@@ -636,6 +652,8 @@ def group_norm_silu_conv3d(
         norm_epsilon,
         group_size,
         input_scale,
+        policy=policy,
+        accelerator_backend=accelerator_backend,
     )
     return _conv3d_prepared(
         prepared,
@@ -644,6 +662,7 @@ def group_norm_silu_conv3d(
         bias,
         input_scale,
         stride,
+        policy=policy,
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,

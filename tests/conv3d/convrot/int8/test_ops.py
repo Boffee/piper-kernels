@@ -301,13 +301,22 @@ def test_triton_group_norm_silu_conv3d_matches_reference(channels, height, width
 @pytest.mark.skipif(not _nvidia_cuda_available(), reason="requires NVIDIA CUDA")
 def test_group_norm_preserves_small_variance_at_large_frame_offsets():
     from piper_kernels.conv3d.convrot.int8 import triton as backend  # noqa: PLC0415
+    from piper_kernels.conv3d.convrot.int8._nvidia import policy  # noqa: PLC0415
 
     torch.manual_seed(31415)
     offsets = torch.tensor([1000.0, -1000.0], device="cuda").view(1, 1, 2, 1, 1)
     activation = (offsets + 0.5 * torch.randn(1, 128, 2, 33, 35, device="cuda")).half()
     weight, bias = torch.ones(128, device="cuda"), torch.zeros(128, device="cuda")
     actual = backend._prepare_group_norm_silu_input(
-        activation, weight, bias, 32, 1e-6, 64, torch.tensor(0.02, device="cuda")
+        activation,
+        weight,
+        bias,
+        32,
+        1e-6,
+        64,
+        torch.tensor(0.02, device="cuda"),
+        policy=policy,
+        accelerator_backend="cuda",
     )
     expected = reference._prepare_group_norm_silu_input(
         activation, weight, bias, 32, 1e-6, 64, torch.tensor(0.02, device="cuda")

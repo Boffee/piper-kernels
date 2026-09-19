@@ -8,7 +8,7 @@ from torch._C._nn import pad as torch_pad
 from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
 from torch.nn import functional
 
-from piper_kernels.conv3d.convrot.int8 import _ops, _policy, _validation, reference
+from piper_kernels.conv3d.convrot.int8 import _backend, _ops, _validation, reference
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
 _FUSED = torch.ops.piper_kernels.convrot_int8_group_norm_silu_conv3d.default
@@ -201,12 +201,10 @@ class _CompilePass(CustomGraphPass):
         files = [
             __file__,
             _ops.__file__,
-            _policy.__file__,
             _validation.__file__,
             reference.__file__,
+            *_backend.source_files(),
         ]
-        if _ops.triton_backend is not None:
-            files.append(_ops.triton_backend.__file__)
         return get_hash_for_files(
             tuple(files),
             extra="minimax-h3-convrot-int8-conv3d-v1",

@@ -1,19 +1,20 @@
 """SM120 launch policy for static-scale ConvRot INT8 causal convolutions."""
 
-from typing import NamedTuple
+from piper_kernels._triton.targets import AcceleratorTarget
+
+from .._plan import ConvolutionPlan, PreparationPlan
 
 
-class ConvolutionPlan(NamedTuple):
-    block_m: int
-    block_n: int
-    block_k: int
-    num_warps: int
-    num_stages: int
+def supports_target(target: AcceleratorTarget) -> bool:
+    return target.is_cuda_capability(12, 0)
 
 
-class PreparationPlan(NamedTuple):
-    block_m: int
-    num_warps: int
+def use_weight_descriptor(
+    channels: int, outputs: int, height: int, block_n: int, *, aligned: bool
+) -> bool:
+    return (
+        aligned and channels == 128 and outputs % block_n == 0 and (height >= 256 or outputs > 128)
+    )
 
 
 def convolution_plan(channels: int, outputs: int, rows: int) -> ConvolutionPlan:
