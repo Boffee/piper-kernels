@@ -1,5 +1,6 @@
 """Convolution dispatch and vendor-owned launch policy contracts."""
 
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -8,28 +9,35 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import _backend, _ops, reference
+from piper_kernels.conv3d.convrot.int8._amd import policy as amd
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia
 from piper_kernels.specializations.minimax_h3_vae.conv3d import _compile
 
 
 @pytest.mark.parametrize(
-    ("target", "supported"),
+    ("target", "vendor"),
     [
-        (AcceleratorTarget("cuda", "sm120"), True),
-        (AcceleratorTarget("cuda", "sm100"), False),
-        (AcceleratorTarget("hip", "gfx1201"), False),
-        (AcceleratorTarget("cpu", "cpu"), False),
+        (AcceleratorTarget("cuda", "sm120"), "nvidia"),
+        (AcceleratorTarget("cuda", "sm100"), None),
+        (AcceleratorTarget("hip", "gfx1200"), "amd" if sys.platform == "linux" else None),
+        (AcceleratorTarget("hip", "gfx1201"), "amd" if sys.platform == "linux" else None),
+        (AcceleratorTarget("hip", "gfx1100"), None),
+        (AcceleratorTarget("hip", "gfx942"), None),
+        (AcceleratorTarget("hip", "gfx9999"), None),
+        (AcceleratorTarget("cpu", "cpu"), None),
     ],
 )
-def test_select_backend_uses_target_policy(monkeypatch, target, supported):
-    implementation = object()
-    monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
+def test_select_backend_uses_target_policy(monkeypatch, target, vendor):
+    implementations = {"nvidia": object(), "amd": object(), None: None}
+    monkeypatch.setattr(_backend, "_nvidia_backend", implementations["nvidia"])
+    monkeypatch.setattr(_backend, "_amd_backend", implementations["amd"])
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    assert _backend.select_backend(torch.empty(0)) is (implementation if supported else None)
+    assert _backend.select_backend(torch.empty(0)) is implementations[vendor]
 
 
 def test_missing_triton_uses_reference(monkeypatch):
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
+    monkeypatch.setattr(_backend, "_amd_backend", None)
     assert _backend.select_backend(torch.empty(0)) is None
 
 
@@ -130,11 +138,42 @@ def test_compiler_cache_tracks_backend_sources(monkeypatch):
             "_interfaces.py",
             "_plan.py",
             "_nvidia/policy.py",
+            "_amd/policy.py",
         )
     } <= set(files)
     if _backend._shared is not None:
-        assert {str(root / path) for path in ("triton.py", "_nvidia/triton.py")} <= set(files)
+        assert {
+            str(root / path) for path in ("triton.py", "_nvidia/triton.py", "_amd/triton.py")
+        } <= set(files)
     capture = Mock(return_value=b"cache-key")
     monkeypatch.setattr(_compile, "get_hash_for_files", capture)
     assert _compile.compile_pass.uuid() == b"cache-key"
     assert set(files) <= set(capture.call_args.args[0])
+
+
+def test_amd_policy_requires_linux(monkeypatch):
+    monkeypatch.setattr(amd.sys, "platform", "win32")
+    assert not amd.supports_target(AcceleratorTarget("hip", "gfx1201"))
+
+
+@pytest.mark.parametrize("channels", [64, 128, 256, 512, 1024, 2048, 4096])
+def test_amd_preparation_bounds_rotation_tile_and_never_uses_descriptors(channels):
+    for fused in (False, True):
+        plan = amd.preparation_plan(channels, 32768, group_norm=fused)
+        assert plan.block_m * channels <= 4096
+        assert plan.block_m > 0
+        assert plan == amd.preparation_plan(channels, 16, group_norm=fused)
+    assert not amd.use_weight_descriptor(channels, 256, 256, 128, aligned=True)
+
+
+@pytest.mark.parametrize(
+    ("channels", "outputs", "rows", "expected"),
+    [
+        (128, 128, 8192, (128, 128, 128, 8, 2)),
+        (256, 256, 3072, (64, 128, 128, 4, 2)),
+        (512, 512, 768, (64, 64, 64, 4, 2)),
+        (64, 7, 18, (32, 64, 64, 4, 2)),
+    ],
+)
+def test_amd_convolution_uses_measured_tiles(channels, outputs, rows, expected):
+    assert amd.convolution_plan(channels, outputs, rows) == expected

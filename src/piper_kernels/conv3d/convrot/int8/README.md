@@ -20,10 +20,55 @@ plus bias, stride, and spatial padding. Quantization state belongs to the weight
   height and width greater than one. Strides are three positive integers;
   dilation and convolution groups are not supported.
 
-The optimized backend targets SM120; other devices use the portable reference.
+Optimized backends target NVIDIA SM120 and Linux ROCm RDNA4 (`gfx1200`/`gfx1201`);
+other devices use the portable reference. RX 9070 XT (`gfx1201`) has hardware
+correctness/performance coverage; `gfx1200` also has offline compilation coverage.
 GroupNorm statistics, affine transforms, SiLU, rotation, rescaling, bias, and
 residual addition use FP32 intermediates. The convolution accumulates INT8
 products in INT32. Eliminated FP16 intermediate rounding is not reproduced.
+
+The public operations and weight format are shared. `_backend.py` selects a
+vendor implementation; `_nvidia/` and `_amd/` own target support and launch policy.
+Both use the common Triton kernels and launch mechanics in `triton.py`. AMD uses
+HIP quantization rounding and pointer-based weight loads; NVIDIA retains its
+SM120 tile policy and optional weight descriptors. No activation-scale conversion
+or checkpoint migration is needed when moving between supported devices.
+
+## ROCm validation and benchmarks
+
+Use an existing ROCm environment; the repository's default `uv` sources select CUDA:
+
+```shell
+PYTHONPATH=src /path/to/rocm-env/bin/python -m pytest -o addopts='' tests/conv3d/convrot/int8
+PYTHONPATH=src /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d_rocm.py
+```
+
+The hardware regressions also run through `scripts/run_rocm_regressions.py`.
+They cover FP16/FP32 and noncontiguous inputs, all padding modes, channel counts
+through 4096, exact INT32 accumulation, fused normalization, dynamic compilation,
+and graph capture with live activation-scale changes. Offline tests check integer
+matrix instructions on SM120 and both RDNA4 targets.
+
+The benchmark reports plain and fused convolution timings against the portable
+reference, with cache-flushed and graph-replay measurements. Repeat `--shape N,C,T,H,W,O`
+to select synthetic cases; `--dtype float32` selects FP32 input, and `--tune` sweeps
+prepared convolution tiles without changing production policy. These measurements
+do not establish performance or quality for an entire encoder or a real checkpoint.
+
+Initial RX 9070 XT measurements (2026-09-19, FP16 inputs, graph replay, milliseconds):
+
+| N,C,T,H,W,O | Native plain | Reference plain | Native fused | Reference fused |
+| --- | ---: | ---: | ---: | ---: |
+| 1,128,5,64,64,128 | 0.106 | 3.399 | 0.121 | 4.544 |
+| 1,256,3,32,32,256 | 0.064 | 1.606 | 0.070 | 1.667 |
+| 1,512,3,16,16,512 | 0.078 | 1.450 | 0.084 | 1.947 |
+
+These compare with the portable quantized reference, not a vendor-tuned FP16
+convolution. They use the benchmark's seeded synthetic weights and default
+reflection padding, stride, and scales. Environment: Python 3.13.13,
+PyTorch `2.14.0+rocm10.1.0a20260908`, HIP `7.16.26354`, Triton 3.8.0;
+command: `PYTHONPATH=src /path/to/rocm-env/bin/python
+benchmarks/benchmark_convrot_int8_conv3d_rocm.py --rep-ms 100`.
 
 ## Quantize and dequantize weights
 

@@ -4,14 +4,15 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.conv3d.convrot.int8 import conv3d, group_norm_silu_conv3d, reference
+from piper_kernels.conv3d.convrot.int8 import _backend, conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
-def _nvidia_cuda_available() -> bool:
-    return torch.cuda.is_available() and AcceleratorTarget.from_device(
-        torch.device("cuda")
-    ).is_cuda_capability(12, 0)
+def _native_available() -> bool:
+    return (
+        torch.cuda.is_available()
+        and _backend.select_backend(torch.empty(0, device="cuda")) is not None
+    )
 
 
 def _packed(qdata, scale, group_size=64, input_scale=0.02):
@@ -174,7 +175,7 @@ def test_public_fusion_rejects_trainable_normalization(gradient):
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _nvidia_cuda_available(), reason="requires NVIDIA CUDA")
+@pytest.mark.skipif(not _native_available(), reason="requires a native Conv3D backend")
 @pytest.mark.parametrize(
     ("shape", "outputs", "padding", "stride", "residual_enabled"),
     [
@@ -250,7 +251,7 @@ def test_triton_conv3d_matches_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _nvidia_cuda_available(), reason="requires NVIDIA CUDA")
+@pytest.mark.skipif(not _native_available(), reason="requires a native Conv3D backend")
 @pytest.mark.parametrize(
     ("channels", "height", "width"), [(128, 16, 16), (256, 33, 35), (512, 5, 7), (1024, 3, 3)]
 )
@@ -298,15 +299,17 @@ def test_triton_group_norm_silu_conv3d_matches_reference(channels, height, width
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _nvidia_cuda_available(), reason="requires NVIDIA CUDA")
+@pytest.mark.skipif(not _native_available(), reason="requires a native Conv3D backend")
 def test_group_norm_preserves_small_variance_at_large_frame_offsets():
     from piper_kernels.conv3d.convrot.int8 import triton as backend  # noqa: PLC0415
-    from piper_kernels.conv3d.convrot.int8._nvidia import policy  # noqa: PLC0415
+    from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy  # noqa: PLC0415
+    from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy  # noqa: PLC0415
 
     torch.manual_seed(31415)
     offsets = torch.tensor([1000.0, -1000.0], device="cuda").view(1, 1, 2, 1, 1)
     activation = (offsets + 0.5 * torch.randn(1, 128, 2, 33, 35, device="cuda")).half()
     weight, bias = torch.ones(128, device="cuda"), torch.zeros(128, device="cuda")
+    target = AcceleratorTarget.from_device(activation.device)
     actual = backend._prepare_group_norm_silu_input(
         activation,
         weight,
@@ -315,8 +318,8 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
         1e-6,
         64,
         torch.tensor(0.02, device="cuda"),
-        policy=policy,
-        accelerator_backend="cuda",
+        policy=amd_policy if target.is_amd_hip else nvidia_policy,
+        accelerator_backend=target.backend,
     )
     expected = reference._prepare_group_norm_silu_input(
         activation, weight, bias, 32, 1e-6, 64, torch.tensor(0.02, device="cuda")
@@ -327,7 +330,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _nvidia_cuda_available(), reason="requires SM120")
+@pytest.mark.skipif(not _native_available(), reason="requires a native Conv3D backend")
 def test_unaligned_contiguous_weight_uses_pointer_loads():
     activation = torch.randn(1, 128, 2, 3, 3, device="cuda", dtype=torch.float16)
     weight = _weight(256, 128, device="cuda")

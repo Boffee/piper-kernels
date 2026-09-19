@@ -13,6 +13,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 _SUITE = (
+    "tests/conv3d/convrot/int8",
+    "tests/specializations/minimax_h3_vae/test_conv3d_compile.py",
     "tests/linear/convrot/int8/test_amd.py",
     "tests/linear/convrot/int8/test_static_input.py",
     "tests/fusions/convrot_int8_gelu_ffn",
@@ -39,6 +41,7 @@ def _check_environment() -> None:
     from piper_kernels.attention.sparse_piper_attention import (  # noqa: PLC0415
         _backend as attention,
     )
+    from piper_kernels.conv3d.convrot.int8 import _backend as convolution  # noqa: PLC0415
     from piper_kernels.fusions.convrot_int8_sparse_piper import _backend as fusion  # noqa: PLC0415
     from piper_kernels.linear.convrot.int8 import _backend as linear  # noqa: PLC0415
 
@@ -48,6 +51,8 @@ def _check_environment() -> None:
     if not target.is_amd_hip or not target.is_architecture("gfx1200", "gfx1201"):
         raise SystemExit(f"ROCm regressions require RDNA4 (gfx1200/gfx1201), got {target}.")
     probe = torch.empty(0, device="cuda")
+    if convolution.select_backend(probe) is None:
+        raise SystemExit("ROCm regressions require a native ConvRot INT8 Conv3D backend.")
     if linear.select_linear_backend(probe) is None or fusion.select_output_backend(probe) is None:
         raise SystemExit("ROCm regressions require native INT8 linear and sparse output backends.")
     for head_dim in (64, 128):
