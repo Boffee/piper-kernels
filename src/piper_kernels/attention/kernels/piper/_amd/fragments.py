@@ -1,4 +1,4 @@
-"""Four-wave Q64 fragments for the RDNA4 D64/D128 attention schedule."""
+"""Shared four-wave Q64 fragments for RDNA4 dense and sparse Piper."""
 
 # Gluon device parameters, layouts and static tuples are not Python values.
 # ruff: noqa: ANN001, ANN202
@@ -131,20 +131,26 @@ def query_fragments(
 
 
 @gluon.jit
-def qk_pair(
+def qk_tiles(
     query,
     key_ptr,
     tile_0,
     tile_1,
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
+    two_tiles: gl.constexpr = True,
 ):
+    """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
+
+    Paired mode preserves sparse Piper's K128 layout. Single-tile mode ignores
+    ``tile_1`` and returns K64 scores for dense Piper's per-tile recurrence.
+    """
     offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
     tile_0 = gl.convert_layout(tile_0, gl.SliceLayout(1, VECTOR_LAYOUT))
     tile_1 = gl.convert_layout(tile_1, gl.SliceLayout(1, VECTOR_LAYOUT))
     results = ()
-    for group in gl.static_range(4):
+    for group in gl.static_range(4 if two_tiles else 2):
         for column in gl.static_range(group * 2, group * 2 + 2):
             tile = tile_0 if column < 4 else tile_1
             row = tile[:, None] * 64 + (column % 4) * 16 + lane[None, :] % 16
@@ -169,6 +175,7 @@ def qk_pair(
 
 @gluon.jit
 def softmax_fragment(scores, maximum, scale, inverse_multiplier, log_multiplier):
+    """Pack a sparse fragment with a tile-wide V scale and unrounded denominator."""
     row_layout: gl.constexpr = maximum.type.layout
     maximum = gl.convert_layout(maximum, gl.SliceLayout(2, scores.type.layout))
     scale = gl.convert_layout(scale, maximum.type.layout)
@@ -230,7 +237,7 @@ def rescale_numerator(numerator, old_weight):
 
 
 @gluon.jit
-def pv_pair(
+def pv_tiles(
     probability,
     value_ptr,
     tile_0,
@@ -238,12 +245,17 @@ def pv_pair(
     numerator,
     current_weight,
     use_64bit_context_offsets: gl.constexpr,
+    two_tiles: gl.constexpr = True,
 ):
-    """Accumulate each D16 product directly into the already-rescaled numerator."""
+    """Accumulate D16 products into the already-rescaled numerator.
+
+    Probability words follow the single-K64 or paired-K128 order from ``qk_tiles``;
+    V uses the packed WMMA layout. Single-tile mode ignores ``tile_1``.
+    """
     head_dim: gl.constexpr = numerator.shape[2]
-    packed = eight_fragments(probability)
+    packed = eight_fragments(probability) if two_tiles else four_fragments(probability)
     fragments = ()
-    for k in gl.static_range(8):
+    for k in gl.static_range(8 if two_tiles else 4):
         fragment: gl.tensor = packed[k]
         fragments += (
             gl.convert_layout(
@@ -262,7 +274,7 @@ def pv_pair(
             column = column_tile * 16 + lane % 16
             zero = gl.full([1, 128], 0, gl.int32, VECTOR_LAYOUT)
             acc = (zero, zero, zero, zero, zero, zero, zero, zero)
-            for k in gl.static_range(8):
+            for k in gl.static_range(8 if two_tiles else 4):
                 start = start_0 if k < 4 else start_1
                 token = (k % 4 // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8
                 offset = (start[:, None] * head_dim + column[None, :] * 64 + token).to(offset_type)

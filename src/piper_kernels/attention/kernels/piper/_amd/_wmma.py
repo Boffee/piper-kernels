@@ -1,4 +1,4 @@
-"""Native RDNA4 WMMA for the fixed transposed QK/PV fragment layout."""
+"""Shared dense/sparse RDNA4 WMMA for transposed QK/PV fragments."""
 
 # Gluon device function types are not represented by Python annotations.
 # ruff: noqa: ANN001, ANN202

@@ -1,4 +1,4 @@
-"""Exact RDNA4 fragment arithmetic and explicit packed-context lifetime."""
+"""Exact dense/sparse RDNA4 fragments and sparse packed-context lifetime."""
 
 from dataclasses import replace
 from unittest.mock import Mock
@@ -9,15 +9,15 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._amd import gluon as backend
-from piper_kernels.attention.sparse_piper_attention._amd._fragments import (
+from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
     pack_probabilities,
-    pv_pair,
-    qk_pair,
+    pv_tiles,
+    qk_tiles,
     query_fragments,
     rescale_numerator,
 )
+from piper_kernels.attention.sparse_piper_attention._amd import gluon as backend
 from piper_kernels.attention.sparse_piper_attention._amd._packing import _pack_values
 from piper_kernels.attention.sparse_piper_attention._amd.gluon import bind_context
 from piper_kernels.attention.sparse_piper_attention._prepared import (
@@ -54,7 +54,7 @@ def _pack_probability_kernel(probability_ptr, output_ptr, columns: gl.constexpr)
     )
 
 
-@pytest.mark.parametrize("columns", [32, 64, 128])
+@pytest.mark.parametrize("columns", [16, 32, 64, 128])
 def test_probability_packing_preserves_every_byte(columns):
     codes = torch.arange(64 * columns, device="cuda").reshape(64, columns).to(torch.uint8)
     output = torch.empty((64, columns // 8), dtype=torch.uint64, device="cuda")
@@ -62,7 +62,8 @@ def test_probability_packing_preserves_every_byte(columns):
     torch.testing.assert_close(output.view(torch.uint8), codes, rtol=0, atol=0)
 
 
-def test_probability_packing_rounds_fp32_ties_to_even_and_saturates():
+@pytest.mark.parametrize("columns", [16, 32, 64, 128])
+def test_probability_packing_rounds_fp32_ties_to_even_and_saturates(columns):
     boundaries = torch.arange(255, dtype=torch.float32) + 0.5
     below = torch.nextafter(boundaries, torch.full_like(boundaries, -torch.inf))
     above = torch.nextafter(boundaries, torch.full_like(boundaries, torch.inf))
@@ -87,13 +88,17 @@ def test_probability_packing_rounds_fp32_ties_to_even_and_saturates():
     codes = values.repeat((64 * 128 + values.numel() - 1) // values.numel())[: 64 * 128]
     codes = codes.reshape(64, 128)
     expected = codes.double().round().clamp(0, 255).to(torch.uint8)
-    output = torch.empty((64, 16), dtype=torch.uint64, device="cuda")
-    _pack_probability_kernel[(1,)](codes.cuda(), output, 128, num_warps=4)
-    torch.testing.assert_close(output.view(torch.uint8).cpu(), expected, rtol=0, atol=0)
+    output = torch.empty((64, columns // 8), dtype=torch.uint64, device="cuda")
+    for start in range(0, 128, columns):
+        chunk = codes[:, start : start + columns].contiguous().cuda()
+        _pack_probability_kernel[(1,)](chunk, output, columns, num_warps=4)
+        torch.testing.assert_close(
+            output.view(torch.uint8).cpu(), expected[:, start : start + columns], rtol=0, atol=0
+        )
 
 
 @gluon.jit
-def _paired_pv_kernel(
+def _pv_tiles_probe(
     probability_ptr,
     value_ptr,
     numerator_ptr,
@@ -102,16 +107,19 @@ def _paired_pv_kernel(
     start_0,
     start_1,
     head_dim: gl.constexpr,
+    two_tiles: gl.constexpr,
 ):
     block_m: gl.constexpr = 64
     rows = gl.arange(0, block_m, gl.SliceLayout(0, gl.SliceLayout(2, MMA_LAYOUT)))
-    columns = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
+    columns = gl.arange(
+        0, 128 if two_tiles else 64, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT))
+    )
     offsets = rows[None, :, None] * 128 + columns[None, None, :]
     probability = pack_probabilities(gl.load(probability_ptr + offsets).to(gl.float32))
     features = gl.arange(0, head_dim, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
     offsets = rows[None, :, None] * head_dim + features[None, None, :]
     block_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, MMA_LAYOUT))
-    result = pv_pair(
+    result = pv_tiles(
         probability,
         value_ptr,
         gl.full([1], start_0 // 64, gl.int32, block_layout),
@@ -119,6 +127,7 @@ def _paired_pv_kernel(
         gl.load(numerator_ptr + offsets),
         gl.load(weight_ptr + rows[None, :]),
         False,
+        two_tiles=two_tiles,
     )
     gl.store(output_ptr + offsets, result)
 
@@ -126,6 +135,7 @@ def _paired_pv_kernel(
 @pytest.mark.parametrize("starts", [(0, 64), (192, 64), (128, 128)])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("recurrence", [False, True])
+@pytest.mark.parametrize("two_tiles", [False, True])
 @pytest.mark.parametrize(
     "values",
     [
@@ -137,7 +147,7 @@ def _paired_pv_kernel(
         "all_bytes",
     ],
 )
-def test_paired_pv_matches_exact_reference(starts, values, recurrence, head_dim):
+def test_pv_tiles_match_exact_reference(starts, values, recurrence, head_dim, two_tiles):
     generator = torch.Generator().manual_seed(952)
     block_m = 64
     probability = torch.randint(0, 256, (block_m, 128), dtype=torch.uint8, generator=generator)
@@ -155,10 +165,9 @@ def test_paired_pv_matches_exact_reference(starts, values, recurrence, head_dim)
         value.zero_()
         value[starts[0] + torch.arange(64), torch.arange(64)] = 1
         value[starts[1] + torch.arange(64), (64 + torch.arange(64)) % head_dim] = 1
-    expected = (
-        probability[:, :64].long() @ value[starts[0] : starts[0] + 64].long()
-        + probability[:, 64:].long() @ value[starts[1] : starts[1] + 64].long()
-    )
+    expected = probability[:, :64].long() @ value[starts[0] : starts[0] + 64].long()
+    if two_tiles:
+        expected += probability[:, 64:].long() @ value[starts[1] : starts[1] + 64].long()
     numerator = torch.zeros((block_m, head_dim), dtype=torch.float32)
     weight = torch.ones(block_m)
     if recurrence:
@@ -170,7 +179,7 @@ def test_paired_pv_matches_exact_reference(starts, values, recurrence, head_dim)
     output = storage[8:-8].view(block_m, head_dim)
     packed_value = torch.empty((1, 1, 4, head_dim, 64), dtype=torch.int8, device="cuda")
     _pack_values[(4, 1)](value.T.contiguous().cuda(), packed_value, 256, head_dim, num_warps=4)
-    _paired_pv_kernel[(1,)](
+    _pv_tiles_probe[(1,)](
         probability.cuda(),
         packed_value,
         numerator.cuda(),
@@ -178,6 +187,7 @@ def test_paired_pv_matches_exact_reference(starts, values, recurrence, head_dim)
         output,
         *starts,
         head_dim,
+        two_tiles,
         num_warps=4,
     )
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
@@ -186,26 +196,31 @@ def test_paired_pv_matches_exact_reference(starts, values, recurrence, head_dim)
 
 
 @gluon.jit
-def _qk_probe(query_ptr, key_ptr, output_ptr, tile_0, tile_1, head_dim: gl.constexpr):
+def _qk_probe(
+    query_ptr, key_ptr, output_ptr, tile_0, tile_1, head_dim: gl.constexpr, two_tiles: gl.constexpr
+):
     block_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, MMA_LAYOUT))
     query = query_fragments(query_ptr, gl.full([1], 0, gl.int32, block_layout), False, head_dim)
-    result = qk_pair(
+    result = qk_tiles(
         query,
         key_ptr,
         gl.full([1], tile_0, gl.int32, block_layout),
         gl.full([1], tile_1, gl.int32, block_layout),
         False,
         head_dim,
+        two_tiles=two_tiles,
     )
     rows = gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, MMA_LAYOUT)))
-    cols = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
-    gl.store(output_ptr + rows[None, :, None] * 128 + cols[None, None, :], result)
+    width: gl.constexpr = 128 if two_tiles else 64
+    cols = gl.arange(0, width, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
+    gl.store(output_ptr + rows[None, :, None] * width + cols[None, None, :], result)
 
 
 @pytest.mark.parametrize("tiles", [(0, 1), (3, 1), (2, 2)])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("values", ["random", "minimum", "maximum", "opposing", "all_bytes"])
-def test_qk_bias_recovers_exact_full_range_int8_products(tiles, values, head_dim):
+@pytest.mark.parametrize("two_tiles", [False, True])
+def test_qk_bias_recovers_exact_full_range_int8_products(tiles, values, head_dim, two_tiles):
     generator = torch.Generator().manual_seed(751)
     query = torch.randint(-128, 128, (64, head_dim), dtype=torch.int8, generator=generator)
     key = torch.randint(-128, 128, (256, head_dim), dtype=torch.int8, generator=generator)
@@ -215,10 +230,12 @@ def test_qk_bias_recovers_exact_full_range_int8_products(tiles, values, head_dim
         if values == "all_bytes":
             query.copy_(torch.arange(query.numel()).view_as(query).to(torch.int8))
             key.copy_(torch.eye(head_dim, dtype=torch.int8).repeat(256 // head_dim, 1))
-    selected = torch.cat([key[tile * 64 : (tile + 1) * 64] for tile in tiles])
+    selected = torch.cat(
+        [key[tile * 64 : (tile + 1) * 64] for tile in (tiles if two_tiles else tiles[:1])]
+    )
     expected = query.long() @ selected.long().T
-    actual = torch.empty((64, 128), dtype=torch.float32, device="cuda")
-    _qk_probe[(1,)](query.cuda(), key.cuda(), actual, *tiles, head_dim, num_warps=4)
+    actual = torch.empty((64, 128 if two_tiles else 64), dtype=torch.float32, device="cuda")
+    _qk_probe[(1,)](query.cuda(), key.cuda(), actual, *tiles, head_dim, two_tiles, num_warps=4)
     torch.testing.assert_close(actual.cpu().double(), expected.double(), rtol=0, atol=0)
 
 

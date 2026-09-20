@@ -6,11 +6,11 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention._policy import (
+from piper_kernels.attention.piper_attention._nvidia.policy import (
     PiperAttentionExecutionPlan,
     select_execution_plan,
 )
-from piper_kernels.attention.piper_attention.triton import (
+from piper_kernels.attention.piper_attention._nvidia.triton import (
     _default_piper_attention_execution_plan,
     _prepare_piper_attention,
 )

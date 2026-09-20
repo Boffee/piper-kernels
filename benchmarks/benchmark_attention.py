@@ -42,6 +42,7 @@ from lib.triton_inspection import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.piper_attention import _backend as piper_backend
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -292,7 +293,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     provider_names = resolve_provider_names(
         args.providers,
         include_canonical=args.canonical,
-        piper_attention_supported=target.supports_uint8_int8_mma,
+        piper_attention_supported=piper_backend.select_backend(target) is not None,
         sage_attention_2pp_supported=target.supports_fp8_fp16_mma,
     )
     _validate_args(args, provider_names)

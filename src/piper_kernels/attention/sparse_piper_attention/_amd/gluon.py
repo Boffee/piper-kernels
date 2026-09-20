@@ -12,20 +12,20 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
-
-from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
-from .._prepared import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
-from ._fragments import (
+from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
     concat_columns,
-    pv_pair,
-    qk_pair,
+    pv_tiles,
+    qk_tiles,
     query_fragments,
     rescale_numerator,
     softmax_fragment,
     split_columns,
 )
+from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
+
+from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
+from .._prepared import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
 from ._packing import (
     INVERSE_MULTIPLIER,
     KEY_SCALE,
@@ -166,7 +166,7 @@ def _sparse_piper_attention_kernel(
             stride_rr,
             use_sparse_routes,
         )
-        scores = qk_pair(
+        scores = qk_tiles(
             query,
             key_ptr + kv_batch_head * storage_sequence_length * head_dim,
             tile_0,
@@ -254,7 +254,7 @@ def _sparse_piper_attention_kernel(
         probabilities = concat_columns(
             concat_columns(packed[0], packed[1]), concat_columns(packed[2], packed[3])
         )
-        numerator = pv_pair(
+        numerator = pv_tiles(
             probabilities,
             value_ptr + kv_batch_head * storage_sequence_length * head_dim,
             tile_0,

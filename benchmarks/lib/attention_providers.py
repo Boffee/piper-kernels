@@ -14,7 +14,7 @@ from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_backend
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
-from piper_kernels.attention.piper_attention import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
 from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 
