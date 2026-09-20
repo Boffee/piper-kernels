@@ -5,12 +5,13 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention._validation import validate_attention_inputs
 
+from . import _backend
 from .reference import reference_piper_attention
 
 try:
     from .triton import triton_piper_attention as _triton_piper_attention
-except ModuleNotFoundError as exc:
-    if exc.name != "triton":
+except ModuleNotFoundError as error:
+    if error.name != "triton":
         raise
     _triton_piper_attention = None
 
@@ -34,7 +35,7 @@ def _validate_inputs(
 
 
 def _supports_triton(target: AcceleratorTarget) -> bool:
-    return _triton_piper_attention is not None and target.supports_uint8_int8_mma
+    return _triton_piper_attention is not None and _backend.select_backend(target) is not None
 
 
 def piper_attention(
@@ -61,8 +62,9 @@ def piper_attention(
     outputs through quantization.
 
     The optimized backend supports NVIDIA SM8x and consumer Blackwell SM12x,
-    where the packaged compiler extension can select mixed-sign MMAv2. Other
-    devices use the portable quantized reference. This is an inference-only
+    where the packaged compiler extension can select mixed-sign MMAv2, and
+    Linux RDNA4 (gfx1200/gfx1201) using native mixed-sign WMMA. Other devices
+    use the portable quantized reference. This is an inference-only
     operator.
     """
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)

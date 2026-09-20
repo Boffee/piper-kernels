@@ -21,7 +21,7 @@ _MEAN_BLOCK_N = 64
 _MEAN_BLOCK_D = 64
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "num_chunks", "heads"])
 def _kv_mean_partial_kernel(
     key_ptr,
     value_ptr,
@@ -36,7 +36,7 @@ def _kv_mean_partial_kernel(
     stride_vh,
     stride_vn,
     is_causal: tl.constexpr,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
     chunk_n: tl.constexpr,
     block_n: tl.constexpr,
@@ -87,7 +87,7 @@ def _kv_mean_partial_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "num_chunks"])
 def _kv_mean_finalize_kernel(
     key_partial_ptr,
     value_partial_ptr,
@@ -195,6 +195,13 @@ def compute_kv_means(
 
 
 @triton.jit
+def quantize_value_rows(value):
+    """Return dense Piper's per-token signed INT8 values and FP32 scales."""
+    value_scale = tl.max(tl.abs(value), axis=1) / _V_INT8_RANGE + _SCALE_EPSILON
+    return qk_quantization.round_to_int8(value / value_scale[:, None]), value_scale
+
+
+@triton.jit
 def quantize_value_per_key_block(
     value_ptr,
     value_mean_ptr,
@@ -214,7 +221,7 @@ def quantize_value_per_key_block(
     stride_vok,
     is_causal: tl.constexpr,
     store_log_scale: tl.constexpr,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
@@ -236,8 +243,7 @@ def quantize_value_per_key_block(
         value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
         value = value - value_mean[None, :]
     value = tl.where(valid_value[:, None], value, 0.0)
-    value_scale = tl.max(tl.abs(value), axis=1) / _V_INT8_RANGE + _SCALE_EPSILON
-    value_quantized = qk_quantization.round_to_int8(value / value_scale[:, None])
+    value_quantized, value_scale = quantize_value_rows(value)
     tl.store(
         value_scale_multiplier_ptr + batch_head * key_length + value_offsets_n,
         value_scale * _P_UINT8_RANGE,

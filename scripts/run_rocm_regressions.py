@@ -13,6 +13,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 _SUITE = (
+    "tests/attention/piper_attention/test_amd.py",
+    "tests/attention/test_gqa.py::test_dense_gqa_matches_repeated_kv",
+    "tests/attention/sparse_piper_attention/test_amd_fragments.py",
     "tests/conv3d/convrot/int8",
     "tests/specializations/minimax_h3_vae/test_conv3d_compile.py",
     "tests/linear/convrot/int8/test_amd.py",
@@ -38,6 +41,7 @@ def _check_environment() -> None:
     import triton  # noqa: PLC0415
 
     from piper_kernels._triton.targets import AcceleratorTarget  # noqa: PLC0415
+    from piper_kernels.attention.piper_attention import _backend as dense  # noqa: PLC0415
     from piper_kernels.attention.sparse_piper_attention import (  # noqa: PLC0415
         _backend as attention,
     )
@@ -51,6 +55,8 @@ def _check_environment() -> None:
     if not target.is_amd_hip or not target.is_architecture("gfx1200", "gfx1201"):
         raise SystemExit(f"ROCm regressions require RDNA4 (gfx1200/gfx1201), got {target}.")
     probe = torch.empty(0, device="cuda")
+    if dense.select_backend(target) is None:
+        raise SystemExit("ROCm regressions require a native dense Piper backend.")
     if convolution.select_backend(probe) is None:
         raise SystemExit("ROCm regressions require a native ConvRot INT8 Conv3D backend.")
     if linear.select_linear_backend(probe) is None or fusion.select_output_backend(probe) is None:

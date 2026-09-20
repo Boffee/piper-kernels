@@ -9,7 +9,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import SparsePiperAttention, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention.triton import (
+from piper_kernels.attention.piper_attention._nvidia.triton import (
     _default_piper_attention_execution_plan,
     _prepare_piper_attention,
     _run_piper_attention,

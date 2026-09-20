@@ -6,7 +6,7 @@ import torch
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention import triton as piper_attention
+from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import _backend, _generic

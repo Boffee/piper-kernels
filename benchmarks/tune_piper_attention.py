@@ -38,8 +38,8 @@ from lib.tuning import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention import _policy as piper_attention_policy
-from piper_kernels.attention.piper_attention import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention._nvidia import policy as piper_attention_policy
+from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
 
 
 def _validate_args(arguments: argparse.Namespace) -> None:

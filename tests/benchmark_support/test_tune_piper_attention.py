@@ -10,7 +10,7 @@ from tune_piper_attention import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention._policy import select_execution_plan
+from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 
 _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 _SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")

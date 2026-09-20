@@ -13,9 +13,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention import _policy
-from piper_kernels.attention.piper_attention.reference import reference_piper_attention
-from piper_kernels.attention.piper_attention.triton import (
+from piper_kernels.attention.piper_attention._nvidia import policy as _policy
+from piper_kernels.attention.piper_attention._nvidia.triton import (
     _conservative_value_log_scale_bound,
     _default_piper_attention_execution_plan,
     _launch_piper_attention,
@@ -23,6 +22,7 @@ from piper_kernels.attention.piper_attention.triton import (
     _ptx_float32_to_uint8x4,
     _run_piper_attention,
 )
+from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
 
 def _piper_gpu_available() -> bool:

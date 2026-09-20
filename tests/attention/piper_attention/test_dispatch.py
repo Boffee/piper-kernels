@@ -6,7 +6,7 @@ import torch
 import piper_kernels
 from piper_kernels import piper_attention
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
-from piper_kernels.attention.piper_attention import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
 
 
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

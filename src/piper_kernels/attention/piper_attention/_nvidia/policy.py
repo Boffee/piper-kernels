@@ -1,4 +1,4 @@
-"""Backend-independent execution planning for Piper Attention."""
+"""NVIDIA execution planning for Piper Attention."""
 
 from dataclasses import asdict, dataclass
 
@@ -9,6 +9,11 @@ from piper_kernels.attention.scheduling import (
     NUM_STAGES_VALUES,
     NUM_WARPS_VALUES,
 )
+
+
+def supports_target(target: AcceleratorTarget) -> bool:
+    """Require the NVIDIA MMAv2 lowering handled by the mixed-sign extension."""
+    return target.supports_uint8_int8_mma
 
 
 @dataclass(frozen=True, slots=True)
