@@ -560,8 +560,15 @@ four-code probability conversion for D64 and non-causal D128, while causal D128 
 the faster stock conversion. SM89 and exact SM120 have measured schedules; other
 supported targets use the generic schedule. Production plan selection depends on target, head
 dimension, and causal mode, not sequence length. Hopper lowers the operation through
-unsupported WGMMA and therefore uses the slow portable quantized reference. Native ROCm
-mixed-sign lowering remains future work.
+unsupported WGMMA and therefore uses the slow portable quantized reference.
+
+Linux ROCm RDNA4 (`gfx1200`/`gfx1201`) also has a native dense backend for D64/D128,
+FP16/BF16, causal and non-causal attention, and GQA/MQA. It shares the AMD signed-QK
+and mixed-sign-PV WMMA fragments with sparse Piper, but retains dense Piper's per-token
+V scales and K64 recurrence. Q/K use Q32/K64 scale groups; V is quantized directly into
+the packed WMMA layout. NVIDIA and AMD execution live under separate `_nvidia/` and
+`_amd/` packages, with the public compiler boundary and quantization arithmetic shared.
+See the [dense ROCm implementation and benchmarks](src/piper_kernels/attention/piper_attention/README.md).
 
 Piper Attention is an independently developed Sage-derived design. The per-key
 quantizer, centering identity, and online-softmax lineage are not claimed as novel in
@@ -773,7 +780,7 @@ Run the focused RDNA4 suite with the Python from an existing Linux ROCm environm
 The environment needs Python 3.13+, ROCm PyTorch 2.14+ with its matching Triton,
 TorchAO 0.17+, and the dependencies in the `test` group. Do not use the repository's
 CUDA-default `uv sync` to provision it. The script imports this checkout's source,
-prints environment/device versions, and requires native RDNA4 D64/D128 attention,
+prints environment/device versions, and requires native RDNA4 D64/D128 dense/sparse attention,
 INT8 linear/Conv3D, and sparse projection/output backends before collecting tests.
 An absent GPU or backend fails the run instead of silently skipping the suite.
 
@@ -781,7 +788,10 @@ Coverage includes GQA/MQA prepared KV storage and dynamic compilation, both spar
 policies, GELU FFNs, static/dynamic/mixed scales and scale mutation, and reuse of dynamic
 attention, coarse-residual, and output-fusion graphs. Conv3D coverage includes plain
 and GroupNorm–SiLU paths, exact integer accumulation, graph capture, and H3 compilation.
-Execution is serial to bound VRAM and isolate kernel-cache assertions.
+Dense attention coverage includes per-token V scaling, causal masking, rectangular inputs,
+ragged tails, FP16/BF16 quality, fullgraph compilation, and live-input graph capture.
+Shared AMD fragment tests check exact signed and mixed-sign accumulation for single and
+paired K64 tiles. Execution is serial to bound VRAM and isolate kernel-cache assertions.
 Additional pytest arguments can select a subset, for example `-k sparse_gqa`.
 
 The `ROCm regressions` workflow runs nightly at 08:23 UTC and supports manual dispatch

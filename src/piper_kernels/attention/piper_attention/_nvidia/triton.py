@@ -73,7 +73,7 @@ def _conservative_value_log_scale_bound(value_scale_multiplier):
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "heads"])
 def _quantize_value_per_key_kernel(
     value_ptr,
     value_mean_ptr,
@@ -90,7 +90,7 @@ def _quantize_value_per_key_kernel(
     stride_ok,
     is_causal: tl.constexpr,
     store_log_scale: tl.constexpr,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
@@ -364,7 +364,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     return numerator, denominator, next_max
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["query_length", "key_length", "heads"])
 def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     query_ptr,
     key_ptr,
@@ -382,8 +382,8 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     split_pv_head_dim: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     unmasked_key_tiles: tl.constexpr,
-    heads: tl.constexpr,
-    kv_heads: tl.constexpr,
+    heads,
+    head_groups: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -407,7 +407,7 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
-    kv_batch_head = batch * kv_heads + head // (heads // kv_heads)
+    kv_batch_head = batch * (heads // head_groups) + head // head_groups
     offsets_m = query_block * block_m + tl.arange(0, block_m)
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
@@ -829,7 +829,7 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
                 unmasked_query_tiles=unmasked_queries,
                 unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
                 heads=heads,
-                kv_heads=prepared.key_scale.shape[1],
+                head_groups=heads // prepared.key_scale.shape[1],
                 head_dim=head_dim,
                 block_m=plan.block_m,
                 block_n=_BLOCK_N,

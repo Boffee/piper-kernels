@@ -221,7 +221,7 @@ def quantize_query_per_thread_group(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["query_length"])
 def quantize_query_per_thread_kernel(
     query_ptr,
     output_ptr,
@@ -260,7 +260,7 @@ def quantize_query_per_thread_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["query_length"])
 def quantize_query_per_warp_kernel(
     query_ptr,
     output_ptr,
@@ -329,7 +329,7 @@ def quantize_key_per_thread_group(
     stride_on,
     stride_sb,
     stride_sh,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
 ):
     """Quantize one per-thread K scale group for standalone or fused launchers."""
@@ -370,7 +370,7 @@ def quantize_key_per_thread_group(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "heads"])
 def quantize_key_per_thread_kernel(
     key_ptr,
     mean_ptr,
@@ -385,7 +385,7 @@ def quantize_key_per_thread_kernel(
     stride_on,
     stride_sb,
     stride_sh,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
 ):
     """Standalone launcher for the shared per-thread K component."""
@@ -411,7 +411,7 @@ def quantize_key_per_thread_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "heads"])
 def quantize_key_per_block_kernel(
     key_ptr,
     mean_ptr,
@@ -426,7 +426,7 @@ def quantize_key_per_block_kernel(
     stride_on,
     stride_sb,
     stride_sh,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):

@@ -1,6 +1,7 @@
 """Tests for the unified full-attention benchmark."""
 
 import json
+import sys
 import tomllib
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -122,6 +123,40 @@ def test_sm89_piper_provider_registers_separate_quantization_kernels() -> None:
         "quantize-value-per-key",
         "attention",
     }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+def test_rdna4_provider_uses_dense_preparation_and_shared_benchmark_phases(architecture):
+    target = AcceleratorTarget("hip", architecture)
+    validate_provider_support((PIPER_ATTENTION, PYTORCH_SDPA), target)
+    assert qk_quantization_granularity(target) == "per_warp"
+    query = torch.empty((1, 6, 65, 128), device="meta", dtype=torch.bfloat16)
+    key = torch.empty((1, 2, 131, 128), device="meta", dtype=query.dtype)
+    providers = make_attention_providers(
+        (query, key, key),
+        provider_names=(PIPER_ATTENTION,),
+        config=AttentionConfig(dtype=query.dtype),
+        target=target,
+    )
+    provider = providers[PIPER_ATTENTION]
+    assert provider.configuration["implementation"] == "rdna4_gluon"
+    assert provider.configuration["value_scale"] == "per_key"
+    assert provider.configuration["block_n"] == 64
+    assert set(provider.triton_jit_functions) == {
+        "kv-mean-partial",
+        "kv-mean-finish",
+        "quantize-query-per-warp",
+        "quantize-key-per-block",
+        "quantize-pack-value-per-key",
+        "attention",
+    }
+
+
+@pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151"])
+def test_untuned_amd_dense_provider_is_not_benchmarked_as_native(architecture):
+    with pytest.raises(SystemExit, match="RDNA4"):
+        validate_provider_support((PIPER_ATTENTION,), AcceleratorTarget("hip", architecture))
 
 
 @pytest.mark.parametrize("sequence_length", [2 * 1024, 32 * 1024])

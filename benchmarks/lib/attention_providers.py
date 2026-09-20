@@ -14,6 +14,9 @@ from piper_kernels import sage_attention_2pp
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_backend
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
+from piper_kernels.attention.piper_attention._amd import gluon as amd_piper
+from piper_kernels.attention.piper_attention._amd import policy as amd_policy
+from piper_kernels.attention.piper_attention._amd import triton as amd_preparation
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
 from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
@@ -49,8 +52,12 @@ type CanonicalSageAttention = Callable[..., torch.Tensor]
 
 
 def qk_quantization_granularity(target: AcceleratorTarget) -> str:
-    """Return the SageAttention Q/K granularity used on an NVIDIA architecture."""
-    return "per_warp" if target.is_cuda_capability(12) else "per_thread"
+    """Return the Q/K granularity used by the selected attention backend."""
+    return (
+        "per_warp"
+        if target.is_cuda_capability(12) or amd_policy.supports_target(target)
+        else "per_thread"
+    )
 
 
 def default_provider_names(
@@ -97,9 +104,12 @@ def validate_provider_support(
     """Reject selected providers that cannot run on the active accelerator."""
     needs_piper_attention = PIPER_ATTENTION in provider_names
     needs_sage_attention_fp8 = any(name in SAGE_ATTENTION_FP8_PROVIDERS for name in provider_names)
-    if needs_piper_attention and not target.supports_uint8_int8_mma:
+    if needs_piper_attention and not (
+        target.supports_uint8_int8_mma or amd_policy.supports_target(target)
+    ):
         raise SystemExit(
-            "Piper Attention providers require NVIDIA SM8x or consumer Blackwell SM12x"
+            "Piper Attention providers require NVIDIA SM8x or consumer Blackwell SM12x, "
+            "or Linux RDNA4 gfx1200/gfx1201"
         )
     if needs_sage_attention_fp8 and not target.supports_fp8_fp16_mma:
         raise SystemExit(
@@ -152,7 +162,7 @@ def _load_canonical_sage_attention(capability: tuple[int, int]) -> CanonicalSage
 
 
 def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
-    if target.is_cuda_capability(12):
+    if qk_quantization_granularity(target) == "per_warp":
         return {
             "quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel,
             "quantize-key-per-block": qk_backend.quantize_key_per_block_kernel,
@@ -206,6 +216,8 @@ def _make_piper_attention_provider(
     config: AttentionConfig,
     target: AcceleratorTarget,
 ) -> AttentionProvider:
+    if amd_policy.supports_target(target):
+        return _make_amd_piper_attention_provider(inputs, config=config, target=target)
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
     plan = piper_attention_backend._default_piper_attention_execution_plan(
@@ -245,6 +257,49 @@ def _make_piper_attention_provider(
             "value_scale": "per_key",
         },
         triton_jit_functions=_piper_attention_jit_functions(target),
+    )
+
+
+def _make_amd_piper_attention_provider(
+    inputs: AttentionInputs,
+    *,
+    config: AttentionConfig,
+    target: AcceleratorTarget,
+) -> AttentionProvider:
+    query, key, value = inputs
+    scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
+
+    def prepare() -> object:
+        return amd_piper.prepare_attention(query, key, value, scale, config.is_causal)
+
+    def run(prepared: object) -> torch.Tensor:
+        return amd_piper.launch_attention(cast(amd_piper.PreparedAttention, prepared))
+
+    return BenchmarkProvider(
+        name=PIPER_ATTENTION,
+        prepare=prepare,
+        run=run,
+        synchronize=torch.cuda.synchronize,
+        configuration={
+            **config.as_dict(),
+            "implementation": "rdna4_gluon",
+            "algorithm": "piper_attention",
+            "block_m": 64,
+            "block_n": 64,
+            "num_warps": 4,
+            "num_stages": 1,
+            "qk_quantization": "per_warp",
+            "probability_dtype": "uint8",
+            "value_dtype": "int8",
+            "value_scale": "per_key",
+        },
+        triton_jit_functions={
+            "kv-mean-partial": piper_quantization._kv_mean_partial_kernel,
+            "kv-mean-finish": piper_quantization._kv_mean_finalize_kernel,
+            **_qk_jit_functions(target),
+            "quantize-pack-value-per-key": amd_preparation._prepare_value_kernel,
+            "attention": amd_piper._dense_piper_kernel,
+        },
     )
 
 

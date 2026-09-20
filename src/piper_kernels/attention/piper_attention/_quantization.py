@@ -21,7 +21,7 @@ _MEAN_BLOCK_N = 64
 _MEAN_BLOCK_D = 64
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "num_chunks", "heads"])
 def _kv_mean_partial_kernel(
     key_ptr,
     value_ptr,
@@ -36,7 +36,7 @@ def _kv_mean_partial_kernel(
     stride_vh,
     stride_vn,
     is_causal: tl.constexpr,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
     chunk_n: tl.constexpr,
     block_n: tl.constexpr,
@@ -87,7 +87,7 @@ def _kv_mean_partial_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["key_length", "num_chunks"])
 def _kv_mean_finalize_kernel(
     key_partial_ptr,
     value_partial_ptr,
@@ -221,7 +221,7 @@ def quantize_value_per_key_block(
     stride_vok,
     is_causal: tl.constexpr,
     store_log_scale: tl.constexpr,
-    heads: tl.constexpr,
+    heads,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):

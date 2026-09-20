@@ -9,7 +9,18 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend
+from piper_kernels.attention.piper_attention._amd import policy
 from piper_kernels.attention.piper_attention.triton import triton_piper_attention
+
+
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx942", "gfx1100", "sm120", None])
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_amd_target_gate(monkeypatch, architecture, platform):
+    monkeypatch.setattr(policy.sys, "platform", platform)
+    target = AcceleratorTarget("hip", architecture)
+    expected = platform == "linux" and architecture in ("gfx1200", "gfx1201")
+    assert policy.supports_target(target) is expected
+    assert _backend.select_backend(target) is (_backend.amd_attention if expected else None)
 
 
 @pytest.mark.parametrize("architecture", ["sm80", "sm89", "sm90", "sm100", "sm120", "sm121"])
@@ -25,7 +36,9 @@ def test_non_gpu_targets_retain_fallback(backend):
 
 
 def test_missing_implementation_retains_fallback(monkeypatch):
+    monkeypatch.setattr(_backend, "amd_attention", None)
     monkeypatch.setattr(_backend, "nvidia_attention", None)
+    assert _backend.select_backend(AcceleratorTarget("hip", "gfx1201")) is None
     assert _backend.select_backend(AcceleratorTarget("cuda", "sm120")) is None
 
 
