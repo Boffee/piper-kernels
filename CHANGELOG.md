@@ -9,6 +9,27 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Native Linux RDNA4 (`gfx1200`/`gfx1201`) dense Piper attention, for FP16 and BF16, D64 and
+  D128, causal and non-causal attention, ragged and rectangular inputs, and GQA/MQA. ROCm
+  previously lowered dense Piper through the slow portable quantized reference, which the
+  README recorded as future work. The backend shares the AMD signed-QK and mixed-sign-PV
+  WMMA fragments with sparse Piper while keeping dense Piper's per-token V scales and K64
+  recurrence. On an RX 9070 XT at the documented MiniMax-H3-shaped B1/H56/D128/BF16
+  non-causal workload, 16,384 tokens take 58.5 ms against 111.3 ms for ROCm Flash SDPA, and
+  53.6 ms for sparse Piper at full keep.
+- Native Linux RDNA4 (`gfx1200`/`gfx1201`) ConvRot INT8 Conv3D, for both plain convolution
+  and the fused framewise GroupNorm/SiLU path, using HIP quantization and measured AMD launch
+  settings. Against standard ROCm FP16 on an RX 9070 XT, plain Conv3D runs 2.4x to 3.0x
+  faster and the GroupNorm/SiLU path 2.6x to 3.3x, across the shapes in the Conv3D README.
+  Packed weights, the static activation-scale contract, and the portable fallback are
+  unchanged, and the new backend sources are included in the H3 compiler cache keys.
+- A ROCm hardware regression suite, `scripts/run_rocm_regressions.py`, plus an opt-in
+  `rocm.yml` workflow. The script runs against an existing Linux ROCm environment rather than
+  the repository's CUDA-default `uv sync`, and requires the native RDNA4 backends to be
+  present before collecting, so a missing GPU or backend fails the run instead of quietly
+  reducing it to a skip.
+- A repeatable standard-FP16 Conv3D benchmark with correctness and timing measured
+  separately, and RDNA4 dense attention benchmarking.
 - `piper_kernels.stochastic_quantization` is public. It holds the unbiased rounding that
   quantized weight updates apply, `stochastic_round_to_int` and
   `stochastic_codebook_indices`, plus a `triton` submodule carrying the same rounding for
@@ -19,6 +40,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Dense Piper attention and ConvRot INT8 Conv3D each split into shared dispatch plus separate
+  `_nvidia` and `_amd` backend packages. NVIDIA kernel math and the SM120 launch policy carry
+  over unchanged; Conv3D dispatch no longer hardcodes an SM120 capability test and asks the
+  backend for a native implementation instead. No public export or signature changed.
+- Dense Piper attention treats sequence lengths and exact head counts as runtime metadata and
+  specializes only on structural choices: GQA ratio, head dimension, causal mode, launch
+  policy, and address width. Head count was a `tl.constexpr`, so each distinct one compiled
+  its own kernel.
 - Moved `_stochastic_quantization` and `_triton.stochastic_quantization` into that package
   and renamed the Triton draw `_random` to `random_uniform`. Both modules were internal, so
   no supported import path changed.
