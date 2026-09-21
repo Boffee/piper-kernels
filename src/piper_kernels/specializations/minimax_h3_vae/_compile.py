@@ -15,11 +15,12 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx as convrot_int8_compile_fx
-from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._amd import triton as amd_convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia_convrot_int8_backend
 
 from . import _ops
 
-_COMPILE_PASS_VERSION = "minimax-h3-vae-convrot-int8-compile-v3"
+_COMPILE_PASS_VERSION = "minimax-h3-vae-convrot-int8-compile-v4"
 
 type _LinearShape = tuple[int, int, int]
 type _MatmulSchedule = tuple[int, int, int, int, int]
@@ -37,6 +38,15 @@ _SM120_MATMUL_SCHEDULES: dict[_LinearShape, _MatmulSchedule] = {
     (7_188, 2_048, 2_048): (128, 128, 128, 4, 2),
     (7_188, 16_384, 2_048): (128, 128, 64, 8, 3),
     (7_188, 2_048, 8_192): (128, 128, 128, 4, 2),
+}
+
+# RX 9070 XT measurements retain the generic RDNA4 plan for H3's wider FFN
+# expansion and larger projection batches. Only these exact small-output shapes
+# benefit from halving the output tile width.
+_RDNA4_MATMUL_SCHEDULES: dict[_LinearShape, _MatmulSchedule] = {
+    (1_797, 2_048, 2_048): (128, 128, 64, 8, 2),
+    (1_797, 2_048, 8_192): (128, 128, 64, 8, 2),
+    (3_594, 2_048, 8_192): (128, 128, 64, 8, 2),
 }
 
 _LINEAR_TARGET = torch.ops.piper_kernels.convrot_int8_linear.default
@@ -81,9 +91,11 @@ def _schedule_for(
     *,
     target: AcceleratorTarget,
 ) -> _MatmulSchedule | None:
-    if not target.is_cuda_capability(12, 0):
-        return None
-    return _SM120_MATMUL_SCHEDULES.get(shape)
+    if target.is_cuda_capability(12, 0):
+        return _SM120_MATMUL_SCHEDULES.get(shape)
+    if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
+        return _RDNA4_MATMUL_SCHEDULES.get(shape)
+    return None
 
 
 def _specialize_linears(
@@ -178,7 +190,8 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             (
                 __file__,
                 _ops.__file__,
-                convrot_int8_backend.__file__,
+                amd_convrot_int8_backend.__file__,
+                nvidia_convrot_int8_backend.__file__,
                 convrot_int8_compile_fx.__file__,
             ),
             extra=_COMPILE_PASS_VERSION,

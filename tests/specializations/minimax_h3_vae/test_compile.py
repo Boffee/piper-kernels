@@ -20,6 +20,7 @@ from piper_kernels.specializations.minimax_h3_vae._compile import (
 from piper_kernels.specializations.minimax_h3_vae._ops import _execution_plan
 
 _SM120 = AcceleratorTarget("cuda", "sm120")
+_GFX1201 = AcceleratorTarget("hip", "gfx1201")
 
 
 @pytest.mark.parametrize(
@@ -41,6 +42,27 @@ def test_sm120_schedule_covers_supported_batch_shapes(
     expected: tuple[int, int, int, int, int],
 ) -> None:
     assert _schedule_for(shape, target=_SM120) == expected
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ((1_797, 2_048, 2_048), (128, 128, 64, 8, 2)),
+        ((1_797, 16_384, 2_048), None),
+        ((1_797, 2_048, 8_192), (128, 128, 64, 8, 2)),
+        ((3_594, 2_048, 2_048), None),
+        ((3_594, 16_384, 2_048), None),
+        ((3_594, 2_048, 8_192), (128, 128, 64, 8, 2)),
+        ((7_188, 2_048, 2_048), None),
+        ((7_188, 16_384, 2_048), None),
+        ((7_188, 2_048, 8_192), None),
+    ],
+)
+def test_rdna4_schedule_specializes_only_measured_wins(
+    shape: tuple[int, int, int],
+    expected: tuple[int, int, int, int, int] | None,
+) -> None:
+    assert _schedule_for(shape, target=_GFX1201) == expected
 
 
 def _placeholder(graph: torch.fx.Graph, name: str, value: torch.Tensor) -> torch.fx.Node:
@@ -188,7 +210,7 @@ def test_pass_leaves_unrecognized_shapes_and_training_graphs_unchanged() -> None
     assert str(training_graph) == original
 
 
-def test_pass_leaves_exact_h3_shape_unchanged_off_sm120() -> None:
+def test_pass_leaves_exact_h3_shape_unchanged_on_unsupported_target() -> None:
     graph = torch.fx.Graph()
     activation = _placeholder(graph, "activation", torch.empty(1_797, 2_048, device="meta"))
     qdata = _placeholder(
@@ -206,6 +228,31 @@ def test_pass_leaves_exact_h3_shape_unchanged_off_sm120() -> None:
     assert str(graph) == original
 
 
+def test_pass_emits_measured_rdna4_schedule() -> None:
+    graph = torch.fx.Graph()
+    activation = _placeholder(graph, "activation", torch.empty(1_797, 8_192, device="meta"))
+    qdata = _placeholder(
+        graph,
+        "qdata",
+        torch.empty(2_048, 8_192, dtype=torch.int8, device="meta"),
+    )
+    scale = _placeholder(graph, "scale", torch.empty(2_048, 1, device="meta"))
+    output = _linear(graph, activation, qdata, scale)
+    graph.output(output)
+
+    _run_passes(graph, target=_GFX1201)
+
+    specialized = [
+        node
+        for node in graph.nodes
+        if node.target
+        == torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default
+    ]
+    assert len(specialized) == 1
+    assert specialized[0].args[-1] == [128, 128, 64, 8, 2]
+    graph.lint()
+
+
 def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch) -> None:
     weight = torch.empty(16_384, 2_048, dtype=torch.int8, device="meta")
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: _SM120)
@@ -217,6 +264,20 @@ def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch) 
     assert plan.matmul_block_k == 64
     assert plan.matmul_num_warps == 8
     assert plan.matmul_num_stages == 3
+    assert plan.fuse_rotation_quantization
+
+
+def test_operator_builds_the_emitted_schedule_over_the_amd_plan(monkeypatch) -> None:
+    weight = torch.empty(2_048, 8_192, dtype=torch.int8, device="meta")
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: _GFX1201)
+
+    plan = _execution_plan(weight, [128, 128, 64, 8, 2])
+
+    assert plan.matmul_block_m == 128
+    assert plan.matmul_block_n == 128
+    assert plan.matmul_block_k == 64
+    assert plan.matmul_num_warps == 8
+    assert plan.matmul_num_stages == 2
     assert plan.fuse_rotation_quantization
 
 
