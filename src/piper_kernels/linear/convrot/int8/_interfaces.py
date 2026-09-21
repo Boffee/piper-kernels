@@ -5,6 +5,8 @@ from typing import Protocol
 
 import torch
 
+from ._plan import LinearExecutionPlan
+
 type PreparedInput = tuple[torch.Tensor, torch.Tensor]
 type SecondProjection = tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
 
@@ -60,6 +62,25 @@ class LinearBackend(PreparationBackend, Protocol):
         weight_scale: torch.Tensor,
         bias: torch.Tensor | None,
         logical_dtype: torch.dtype,
+        *,
+        out: torch.Tensor | None = None,
+        second_projection: SecondProjection | None = None,
+    ) -> torch.Tensor: ...
+
+    def default_execution_plan(
+        self,
+        weight_qdata: torch.Tensor,
+    ) -> LinearExecutionPlan: ...
+
+    def execute_prepared_linear(
+        self,
+        input_qdata: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_qdata: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+        logical_dtype: torch.dtype,
+        execution_plan: LinearExecutionPlan,
         *,
         out: torch.Tensor | None = None,
         second_projection: SecondProjection | None = None,

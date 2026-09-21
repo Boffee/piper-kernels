@@ -17,6 +17,7 @@ _SUITE = (
     "tests/attention/test_gqa.py::test_dense_gqa_matches_repeated_kv",
     "tests/attention/sparse_piper_attention/test_amd_fragments.py",
     "tests/conv3d/convrot/int8",
+    "tests/specializations/minimax_h3_vae/test_amd_linear.py",
     "tests/specializations/minimax_h3_vae/test_conv3d_compile.py",
     "tests/linear/convrot/int8/test_amd.py",
     "tests/linear/convrot/int8/test_static_input.py",

@@ -191,6 +191,13 @@ eager, and training paths remain unchanged. Existing post-grad compiler passes i
 options mapping are preserved. Pass the result through `torch.compile(options=...)`; PyTorch
 treats `mode` and `options` as mutually exclusive, so do not also supply `mode`.
 
+MiniMax-H3 VAE decoder graphs can instead use
+`minimax_h3_vae_convrot_int8_compile_options()` from
+`piper_kernels.specializations.minimax_h3_vae`. It installs the ordinary ConvRot pass first,
+then applies exact-shape matrix schedules measured on SM120 and RDNA4. Unrecognized shapes and
+targets keep the ordinary backend policy; the specialization does not replace the attention
+operator or inspect tensor contents.
+
 The ConvRot INT8, NVFP4, and ConvRot NVFP4 FFN compiler integrations support FP16 and BF16
 activations. Their `*_swiglu_ffn_compile_options()` helpers match separate gate, value, and down
 projections. Their `*_gelu_ffn_compile_options()` helpers fold an exclusive
@@ -285,8 +292,9 @@ FP32 reduction ordering and fused activations can differ from the reference at I
 boundaries. GGUF-to-INT8 conversion uses a shared fused decoding/rotation kernel, using
 fused rows through 8,192 columns on ROCm and bounded tiled conversion for wider rows,
 including on AMD targets without a tuned GEMM policy. This integration does
-not enable ROCm dequantized-input means, specialized attention fusions, attention kernels,
-or NVFP4 kernels.
+not enable ROCm dequantized-input means or NVFP4 kernels. Dense and sparse
+attention, including the supported ConvRot INT8 sparse-attention fusions, have
+their own RDNA4 backends described below.
 
 The repository's default `uv` development sources still select CUDA; use a separate
 ROCm environment rather than `uv sync` in that environment.
@@ -593,7 +601,8 @@ separate coarse-residual API, or SageAttention2++ to GQA.
 
 ## Sparse Piper Attention
 
-Sparse Piper is a separate non-causal SM120 operator for pre-tiled H3-style self-attention:
+Sparse Piper is a separate non-causal operator for pre-tiled H3-style self-attention,
+with optimized SM120 and RDNA4 backends:
 
 ```python
 from piper_kernels import SparsePiperAttention
