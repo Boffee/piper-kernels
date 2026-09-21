@@ -1,4 +1,9 @@
-"""Shared Triton primitives for stochastic terminal-code selection."""
+"""Triton primitives for stochastic terminal-code selection.
+
+The kernel-side counterpart of :mod:`piper_kernels.stochastic_quantization`.
+A caller draws with :func:`random_uniform` by logical element offset, so a
+kernel's launch geometry cannot change which values it samples.
+"""
 
 # Triton JIT helper signatures intentionally use untyped tensor parameters
 # and upper-case constexpr names.
@@ -16,7 +21,7 @@ def seed_argument(seed: int | None) -> int:
 
 
 @triton.jit
-def _random(seed, offsets):
+def random_uniform(seed, offsets):
     """Draw by logical element offset so launch geometry cannot affect samples."""
     return tl.rand(seed, offsets.to(tl.uint64))
 
@@ -35,8 +40,8 @@ def stochastic_round_to_int(
     safe = tl.where(interior, values, 0.0)
     lower = tl.floor(safe)
     probability = safe - lower
-    rounded = lower + (_random(seed, offsets) < probability)
+    rounded = lower + (random_uniform(seed, offsets) < probability)
     return tl.where(interior & (probability > 0.0), rounded, deterministic)
 
 
-__all__ = ["seed_argument", "stochastic_round_to_int"]
+__all__ = ["random_uniform", "seed_argument", "stochastic_round_to_int"]

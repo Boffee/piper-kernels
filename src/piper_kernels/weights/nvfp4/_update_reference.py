@@ -7,7 +7,7 @@ from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, pack_uint4,
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels._stochastic_quantization import stochastic_codebook_indices
+from piper_kernels.stochastic_quantization import stochastic_codebook_indices
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout
 from piper_kernels.weights.nvfp4.tensor import _MIN_PER_TENSOR_SCALE, PiperNVFP4Tensor

@@ -12,8 +12,8 @@ from piper_kernels._triton.convrot_int8 import (
     rotate_quantize_rows_kernel,
 )
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.stochastic_quantization import seed_argument
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.stochastic_quantization.triton import seed_argument
 
 from ._gguf_policy import select_conversion_chunks
 

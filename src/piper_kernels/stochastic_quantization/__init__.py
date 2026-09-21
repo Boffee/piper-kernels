@@ -1,4 +1,15 @@
-"""Stochastic terminal-code selection for quantized updates."""
+"""Stochastic terminal-code selection for quantized updates.
+
+Rounding a quantized weight update to its nearest representable code biases the
+result toward that code. These primitives instead pick one of the two adjacent
+codes with probability proportional to the distance, so repeated updates stay
+unbiased. A `seed` makes the draw reproducible without consuming the
+process-global RNG, and every caller applying one update must pass the same
+seed to reproduce that update.
+
+Import `piper_kernels.stochastic_quantization.triton` for the Triton
+primitives that express the same rounding inside a kernel.
+"""
 
 import torch
 

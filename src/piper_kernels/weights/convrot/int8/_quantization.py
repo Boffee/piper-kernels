@@ -2,7 +2,7 @@
 
 import torch
 
-from piper_kernels._stochastic_quantization import stochastic_round_to_int
+from piper_kernels.stochastic_quantization import stochastic_round_to_int
 from piper_kernels.weights.convrot._rotation import rotate_groups, validate_group_size
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
