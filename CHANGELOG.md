@@ -5,6 +5,24 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-20
+
+### Added
+
+- `piper_kernels.stochastic_quantization` is public. It holds the unbiased rounding that
+  quantized weight updates apply, `stochastic_round_to_int` and
+  `stochastic_codebook_indices`, plus a `triton` submodule carrying the same rounding for
+  callers writing their own kernels: `stochastic_round_to_int`, `random_uniform`, and
+  `seed_argument`. These were internal, which left `piper-offload` maintaining its own copy
+  of the same primitives; two implementations of one seeded draw cannot be kept in
+  agreement by review alone.
+
+### Changed
+
+- Moved `_stochastic_quantization` and `_triton.stochastic_quantization` into that package
+  and renamed the Triton draw `_random` to `random_uniform`. Both modules were internal, so
+  no supported import path changed.
+
 ## [0.7.1] - 2026-09-18
 
 ### Fixed
