@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from piper_kernels.weights._update import (
+    narrow_rounding_seed,
     validate_real_scalar,
-    validate_rounding_seed,
     validate_update_operands,
 )
 from piper_kernels.weights.nvfp4 import _layout
@@ -137,7 +137,7 @@ def addmm_(
     operation = _operation(weight, "addmm_")
     beta_float = validate_real_scalar(beta, "beta", operation=operation)
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
-    validate_rounding_seed(rounding_seed, operation=operation)
+    seed = narrow_rounding_seed(rounding_seed, operation=operation)
     if beta_float == 1 and alpha_float == 0:
         return
 
@@ -154,7 +154,7 @@ def addmm_(
             alpha_float,
             weight.is_swizzled_scales,
             weight.high_first,
-            _seed_argument(rounding_seed),
+            seed,
         )
         return
 
@@ -181,7 +181,7 @@ def add_(
     _validate_add(weight, update)
     operation = _operation(weight, "add_")
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
-    validate_rounding_seed(rounding_seed, operation=operation)
+    seed = narrow_rounding_seed(rounding_seed, operation=operation)
     if alpha_float == 0:
         return
 
@@ -196,7 +196,7 @@ def add_(
             alpha_float,
             weight.is_swizzled_scales,
             weight.high_first,
-            _seed_argument(rounding_seed),
+            seed,
         )
         return
 
@@ -207,10 +207,6 @@ def add_(
         alpha=alpha_float,
         rounding_seed=rounding_seed,
     )
-
-
-def _seed_argument(seed: int | None) -> int | None:
-    return seed if seed is None or seed < (1 << 63) else seed - (1 << 64)
 
 
 __all__ = ["add_", "addmm_"]

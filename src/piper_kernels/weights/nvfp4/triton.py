@@ -18,7 +18,7 @@ from piper_kernels._triton.nvfp4 import (
     swizzled_scale_offsets,
 )
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.stochastic_quantization import _random, seed_argument
+from piper_kernels.stochastic_quantization.triton import random_uniform
 from piper_kernels.weights.nvfp4 import _layout
 
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
@@ -36,7 +36,7 @@ def _stochastic_e2m1(values, seed, offsets):
     )
     width = tl.where(magnitude < 2.0, 0.5, tl.where(magnitude < 4.0, 1.0, 2.0))
     probability = (magnitude - lower) / width
-    sampled = lower + tl.where(_random(seed, offsets) < probability, width, 0.0)
+    sampled = lower + tl.where(random_uniform(seed, offsets) < probability, width, 0.0)
     sampled = tl.where(values < 0.0, -sampled, sampled)
     return tl.where((magnitude > 0.0) & (magnitude < 6.0), sampled, values)
 
@@ -234,7 +234,7 @@ def _update_(
         *(mat2.stride() if mat2 is not None else (0, 0)),
         beta,
         alpha,
-        seed_argument(rounding_seed),
+        0 if rounding_seed is None else rounding_seed,
     )
     options = {
         "group_size": group_size,

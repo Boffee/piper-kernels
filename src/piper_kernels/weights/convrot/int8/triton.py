@@ -12,7 +12,6 @@ from piper_kernels._triton.convrot_int8 import (
     rotate_quantize_rows_kernel,
 )
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.stochastic_quantization import seed_argument
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._gguf_policy import select_conversion_chunks
@@ -119,7 +118,7 @@ def _requantize_update_(qdata, scale, update, beta, alpha, rounding_seed, *, has
             update.stride(1),
             beta,
             alpha,
-            seed_argument(rounding_seed),
+            0 if rounding_seed is None else rounding_seed,
             block_size=max(128, triton.next_power_of_2(in_features)),
             has_base=beta != 0,
             has_update=has_update,

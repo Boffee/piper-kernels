@@ -52,6 +52,41 @@ to inference. Callers can rely on this boundary when composing and capturing ker
 | `piper_kernels.weights` | Quantized weight formats, conversion, updates, and sharding |
 | `piper_kernels.linear` | Linear operators and optimized backends |
 | `piper_kernels.linear.convrot` | ConvRot linear operators and compiler integrations |
+| `piper_kernels.stochastic_quantization` | Unbiased stochastic rounding for quantized updates, in eager torch and Triton |
+
+## Stochastic quantization
+
+Rounding a quantized weight update to its nearest representable code biases the result
+toward that code, and the bias compounds when updates are applied repeatedly. The
+`piper_kernels.stochastic_quantization` package rounds to one of the two adjacent codes
+with probability proportional to the distance between them, so the expected value is the
+unrounded one.
+
+```python
+from piper_kernels.stochastic_quantization import stochastic_round_to_int
+
+qdata = stochastic_round_to_int(
+    scaled_values,
+    seed=seed,
+    quant_min=-128,
+    quant_max=127,
+    deterministic=scaled_values.round().to(torch.int64),
+)
+```
+
+`stochastic_round_to_int` rounds to adjacent integers and `stochastic_codebook_indices`
+selects adjacent entries of an arbitrary sorted codebook, which is how 4- and 8-bit float
+formats are handled. Both take the `deterministic` result to fall back to wherever the
+value is not interior to the representable range, and both draw from a seeded generator
+rather than the process-global RNG, so a caller reproduces an update by passing the same
+seed. Values outside the representable range, and exact hits on a code, are never
+perturbed.
+
+`piper_kernels.stochastic_quantization.triton` carries the same rounding for callers
+writing their own kernels: `stochastic_round_to_int`, the `random_uniform` draw it is
+built on, and `seed_argument`, which converts a Python seed into a launch-safe scalar.
+`random_uniform` draws by logical element offset, so a kernel's launch geometry cannot
+change which values it samples. Importing it requires Triton; the package itself does not.
 
 ## Triton setup
 
@@ -744,9 +779,9 @@ the reproducible provider comparison.
 
 ## Dependency direction
 
-Applications such as Piper consume this package. Integrations such as torch-offload may
-optionally recognize its tensor types, but `piper-kernels` does not depend on either
-project.
+Applications such as Piper consume this package, and `piper-offload` requires it for the
+ConvRot weight formats and the stochastic rounding above. `piper-kernels` does not depend
+on either project.
 
 ## Development
 

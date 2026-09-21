@@ -6,8 +6,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from piper_kernels._triton import convrot as convrot_backend
-from piper_kernels._triton.stochastic_quantization import stochastic_round_to_int
 from piper_kernels.gguf import triton as gguf_backend
+from piper_kernels.stochastic_quantization.triton import stochastic_round_to_int
 
 
 @triton.jit

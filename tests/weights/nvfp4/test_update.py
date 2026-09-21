@@ -388,3 +388,23 @@ def test_aten_dispatch_and_invalid_inputs(operation, group_size):
         _apply(weight, operands, operation, seed=-1)
     with pytest.raises(RuntimeError, match="does not support autograd"):
         _apply(weight, tuple(value.requires_grad_() for value in operands), operation)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
+@pytest.mark.parametrize("seed", [(1 << 64) - 1, 1 << 63, (1 << 63) + 12345])
+def test_updates_replay_for_seeds_above_the_signed_range(device, seed):
+    # These cross the operator schema's int64 as a narrowed scalar. Nothing
+    # below the entry point may narrow them a second time.
+    def updated():
+        weight = _weight(device=device)
+        update = torch.randn(
+            weight.shape,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=torch.Generator(device=device).manual_seed(21),
+        )
+        weight.add_(update, alpha=0.5, rounding_seed=seed)
+        return weight.qdata.clone()
+
+    first = updated()
+    assert torch.equal(first, updated())
