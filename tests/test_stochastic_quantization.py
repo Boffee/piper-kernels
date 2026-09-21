@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from piper_kernels.stochastic_quantization import (
+    signed_seed,
     stochastic_codebook_indices,
     stochastic_round_to_int,
 )
@@ -160,3 +161,21 @@ def test_codebook_selection_rejects_a_mismatched_device() -> None:
             seed=1,
             deterministic=deterministic,
         )
+
+
+def test_signed_seed_carries_the_unsigned_bit_pattern() -> None:
+    assert signed_seed(0) == 0
+    assert signed_seed((1 << 63) - 1) == (1 << 63) - 1
+    assert signed_seed(1 << 63) == -(1 << 63)
+    assert signed_seed((1 << 64) - 1) == -1
+
+
+def test_signed_seed_rejects_values_outside_the_unsigned_range() -> None:
+    # Narrowing twice would land here, and wrapping would alias onto a
+    # different, valid seed.
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        signed_seed(-1)
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        signed_seed(1 << 64)
+    with pytest.raises(TypeError, match="unsigned 64-bit"):
+        signed_seed(True)

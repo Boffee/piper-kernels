@@ -374,3 +374,24 @@ def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
         int8_updates.add_(qdata, scale, torch.ones(2, 32), 16, 1.0)
     assert (qdata == 3).all()
     fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("seed", [(1 << 64) - 1, 1 << 63, (1 << 63) + 12345])
+def test_updates_replay_for_seeds_above_the_signed_range(device, seed):
+    # These cross the operator schema's int64 as a narrowed scalar. Nothing
+    # below the entry point may narrow them a second time.
+    def updated():
+        weight = torch.randn(8, 64, device=device, generator=_seeded(device))
+        mat1 = torch.randn(8, 5, device=device, generator=_seeded(device))
+        mat2 = torch.randn(5, 64, device=device, generator=_seeded(device))
+        wrapped = ConvRotInt8Tensor.from_hp(weight, group_size=16)
+        wrapped.addmm_(mat1, mat2, alpha=0.5, rounding_seed=seed)
+        return wrapped.qdata.clone()
+
+    first = updated()
+    assert torch.equal(first, updated())
+
+
+def _seeded(device):
+    return torch.Generator(device=device).manual_seed(21)

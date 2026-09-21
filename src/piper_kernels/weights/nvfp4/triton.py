@@ -18,7 +18,7 @@ from piper_kernels._triton.nvfp4 import (
     swizzled_scale_offsets,
 )
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.stochastic_quantization.triton import random_uniform, seed_argument
+from piper_kernels.stochastic_quantization.triton import random_uniform
 from piper_kernels.weights.nvfp4 import _layout
 
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
@@ -234,7 +234,7 @@ def _update_(
         *(mat2.stride() if mat2 is not None else (0, 0)),
         beta,
         alpha,
-        seed_argument(rounding_seed),
+        0 if rounding_seed is None else rounding_seed,
     )
     options = {
         "group_size": group_size,

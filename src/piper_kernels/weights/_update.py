@@ -4,6 +4,8 @@ import math
 
 import torch
 
+from piper_kernels.stochastic_quantization import signed_seed
+
 
 def validate_real_scalar(
     value: int | float | complex,
@@ -32,6 +34,18 @@ def validate_rounding_seed(
         raise TypeError(f"{operation} rounding_seed must be an unsigned 64-bit integer")
     if not 0 <= rounding_seed < (1 << 64):
         raise ValueError(f"{operation} rounding_seed must be an unsigned 64-bit integer")
+
+
+def narrow_rounding_seed(
+    rounding_seed: int | None,
+    *,
+    operation: str,
+) -> int | None:
+    """Validate a seed and narrow it to the int64 an operator schema carries."""
+    validate_rounding_seed(rounding_seed, operation=operation)
+    if rounding_seed is None:
+        return None
+    return signed_seed(rounding_seed)
 
 
 def validate_update_operands(
@@ -63,6 +77,7 @@ def validate_update_operands(
 
 
 __all__ = [
+    "narrow_rounding_seed",
     "validate_real_scalar",
     "validate_rounding_seed",
     "validate_update_operands",

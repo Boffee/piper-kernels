@@ -3,8 +3,8 @@
 import torch
 
 from piper_kernels.weights._update import (
+    narrow_rounding_seed,
     validate_real_scalar,
-    validate_rounding_seed,
     validate_update_operands,
 )
 from piper_kernels.weights.convrot.int8._quantization import validate_storage
@@ -83,14 +83,6 @@ def _validate_add(
     )
 
 
-def _seed_argument(rounding_seed: int | None) -> int | None:
-    return (
-        rounding_seed
-        if rounding_seed is None or rounding_seed < (1 << 63)
-        else rounding_seed - (1 << 64)
-    )
-
-
 def add_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -105,10 +97,9 @@ def add_(
     _validate_add(qdata, scale, dtype, group_size, update)
     operation = "ConvRot INT8 add_"
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
-    validate_rounding_seed(rounding_seed, operation=operation)
+    seed = narrow_rounding_seed(rounding_seed, operation=operation)
     if alpha_float == 0:
         return
-    seed = _seed_argument(rounding_seed)
     if _backend.select_add(qdata) is not None:
         _ops.add_(
             qdata,
@@ -146,10 +137,9 @@ def addmm_(
     operation = "ConvRot INT8 addmm_"
     beta_float = validate_real_scalar(beta, "beta", operation=operation)
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
-    validate_rounding_seed(rounding_seed, operation=operation)
+    seed = narrow_rounding_seed(rounding_seed, operation=operation)
     if beta_float == 1 and alpha_float == 0:
         return
-    seed = _seed_argument(rounding_seed)
     if _backend.select_addmm(qdata) is not None:
         _ops.addmm_(
             qdata,

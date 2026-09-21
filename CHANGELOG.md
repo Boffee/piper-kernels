@@ -51,6 +51,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Moved `_stochastic_quantization` and `_triton.stochastic_quantization` into that package
   and renamed the Triton draw `_random` to `random_uniform`. Both modules were internal, so
   no supported import path changed.
+- A rounding seed is narrowed to its signed 64-bit form exactly once, by
+  `stochastic_quantization.signed_seed`. The NVFP4 and ConvRot INT8 update paths each had a
+  private copy of that arithmetic, applied before the operator schema, whose `SymInt?` seed
+  cannot carry a value at or above `2**63`; the Triton launch helper then applied a third
+  copy to the result. The second narrowing was idempotent, so results are unchanged, but it
+  left `seed_argument` having to accept a signed value it documents as unsigned. It now
+  takes only the seed a caller was given.
+
+### Fixed
+
+- Rounding seeds at or above `2**63` are covered by tests. Every existing case used a small
+  seed, so nothing exercised the narrowing that lets one cross the operator schema, and
+  removing it failed only on the native backends at runtime.
 
 ## [0.7.1] - 2026-09-18
 

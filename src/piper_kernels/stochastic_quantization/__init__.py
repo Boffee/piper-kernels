@@ -13,7 +13,22 @@ primitives that express the same rounding inside a kernel.
 
 import torch
 
-__all__ = ["stochastic_codebook_indices", "stochastic_round_to_int"]
+__all__ = ["signed_seed", "stochastic_codebook_indices", "stochastic_round_to_int"]
+
+
+def signed_seed(seed: int) -> int:
+    """Return the signed int64 carrying an unsigned 64-bit seed's bit pattern.
+
+    Operator schemas and kernel launch arguments are int64, so a seed at or
+    above 2**63 cannot cross them unchanged. This is the only place that
+    conversion happens: narrowing a seed twice is harmless but leaves a signed
+    value where callers expect the seed they supplied.
+    """
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(f"rounding seed must be an unsigned 64-bit integer, got {seed!r}")
+    if not 0 <= seed < (1 << 64):
+        raise ValueError(f"rounding seed must be an unsigned 64-bit integer, got {seed}")
+    return seed if seed < (1 << 63) else seed - (1 << 64)
 
 
 def _uniform(

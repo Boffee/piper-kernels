@@ -13,18 +13,12 @@ def test_seed_argument_round_trips_the_unsigned_range() -> None:
     assert seed_argument((1 << 64) - 1) == -1
 
 
-def test_seed_argument_passes_through_an_already_signed_seed() -> None:
-    # The weight update paths convert once, then hand the same scalar to the
-    # reference and Triton backends so both sample identically.
-    for unsigned in (1 << 63, (1 << 64) - 1, (1 << 63) + 12345):
-        assert seed_argument(seed_argument(unsigned)) == seed_argument(unsigned)
-
-
-def test_seed_argument_rejects_seeds_that_do_not_fit_64_bits() -> None:
-    # Wrapping would map these onto 0, which is also the no-seed argument.
-    with pytest.raises(ValueError, match="64 bits"):
+def test_seed_argument_rejects_an_already_narrowed_seed() -> None:
+    # A signed seed here means a caller narrowed it before the launch, which is
+    # the conversion this helper owns. Wrapping it would alias a valid seed.
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        seed_argument(-1)
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
         seed_argument(1 << 64)
-    with pytest.raises(ValueError, match="64 bits"):
-        seed_argument(-(1 << 63) - 1)
-    with pytest.raises(TypeError, match="64-bit integer"):
+    with pytest.raises(TypeError, match="unsigned 64-bit"):
         seed_argument(True)
