@@ -14,9 +14,22 @@ import triton.language as tl
 
 
 def seed_argument(seed: int | None) -> int:
-    """Return a launch-safe signed scalar with the seed's uint64 bit pattern."""
+    """Return a launch-safe signed scalar with the seed's uint64 bit pattern.
+
+    Accepts a seed already in that signed form, because the weight update paths
+    convert once before choosing a backend and hand the same scalar to both the
+    reference and Triton implementations. The range check is only wide enough to
+    admit that: a seed outside 64 bits either way is rejected rather than
+    wrapped, since wrapping would alias it onto 0, which means no seed at all.
+    Callers validate their own seeds; `piper_kernels.weights` does so with
+    `validate_rounding_seed`.
+    """
     if seed is None:
         return 0
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(f"rounding seed must be a 64-bit integer, got {seed!r}")
+    if not -(1 << 63) <= seed < (1 << 64):
+        raise ValueError(f"rounding seed must fit 64 bits, got {seed}")
     return seed if seed < (1 << 63) else seed - (1 << 64)
 
 

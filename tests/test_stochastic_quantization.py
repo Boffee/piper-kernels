@@ -144,3 +144,19 @@ def test_integer_rounding_preserves_deterministic_terminal_codes() -> None:
     )
 
     assert torch.equal(rounded, deterministic)
+
+
+def test_codebook_selection_rejects_a_mismatched_device() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    values = torch.full((4,), 0.5, device="cuda")
+    codebook = torch.tensor((0.0, 1.0))
+    deterministic = torch.zeros((4,), device="cuda", dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="not the values'"):
+        stochastic_codebook_indices(
+            values,
+            codebook,
+            seed=1,
+            deterministic=deterministic,
+        )

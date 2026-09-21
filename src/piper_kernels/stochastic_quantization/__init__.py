@@ -41,7 +41,11 @@ def stochastic_round_to_int(
     quant_max: int,
     deterministic: torch.Tensor,
 ) -> torch.Tensor:
-    """Round scaled values to adjacent integers with unbiased probability."""
+    """Round scaled values to adjacent integers with unbiased probability.
+
+    Rounding is computed in FP32, so a float64 `values` is reduced to that
+    precision before its adjacent integers are chosen.
+    """
     if deterministic.shape != values.shape:
         raise ValueError("Deterministic integer qdata does not match the values.")
     finite = torch.nan_to_num(
@@ -75,16 +79,27 @@ def stochastic_codebook_indices(
     seed: int,
     deterministic: torch.Tensor,
 ) -> torch.Tensor:
-    """Select adjacent finite codebook entries with unbiased probability."""
+    """Select adjacent finite codebook entries with unbiased probability.
+
+    `codebook` must hold at least one finite entry. That is a caller
+    precondition and is not rejected at runtime, because reading the entries to
+    check them would synchronize the device on every call; the device and shape
+    are host metadata, so those are checked. Selection is computed in FP32, so a
+    float64 `values` or `codebook` is reduced to that precision before the
+    adjacent entries are chosen.
+    """
     if deterministic.shape != values.shape:
         raise ValueError("Deterministic codebook qdata does not match the values.")
     if codebook.ndim != 1 or codebook.numel() < 2:
         raise ValueError(
             "Stochastic rounding requires a one-dimensional codebook with at least two entries."
         )
+    if codebook.device != values.device:
+        raise ValueError(
+            f"Stochastic-rounding codebook is on {codebook.device}, not the values' "
+            f"{values.device}."
+        )
     finite_mask = torch.isfinite(codebook)
-    if not bool(finite_mask.any()):
-        raise ValueError("Stochastic-rounding codebook has no finite entries.")
 
     storage_indices = torch.arange(
         codebook.numel(),
