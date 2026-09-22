@@ -5,6 +5,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Restore the minimum supported PyTorch version to 2.14.
+
 ## [0.7.3] - 2026-09-22
 
 ### Changed
