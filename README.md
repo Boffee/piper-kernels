@@ -3,7 +3,9 @@
 Reusable PyTorch inference operators and optimized kernels for the Piper ecosystem and
 other consumers.
 
-Piper Kernels requires Python 3.13 or newer and PyTorch 2.14 or newer.
+Piper Kernels requires Python 3.13 or newer and PyTorch 2.13 or newer.
+The experimental native NVIDIA NVFP4 affine path requires PyTorch 2.14 or
+newer for its upstream concurrent-scaling fix.
 
 The package owns operator semantics, portable PyTorch references, tensor subclasses,
 and optimized backends. It deliberately does not know about model repositories,
@@ -482,7 +484,8 @@ its dtype until FP32 addition and uses a reusable FP32 workspace bounded by 32 M
 although small mixed-bias projections can be slower. FP32 outputs reuse their output buffer
 for bias addition. Autocast converts eligible operands at the public linear boundary.
 
-PyTorch 2.14's native two-level NVFP4 GEMM keeps each call's scaling tensor independent
+The experimental native NVIDIA NVFP4 affine path requires PyTorch 2.14 or newer.
+Its two-level NVFP4 GEMM keeps each call's scaling tensor independent
 through the [upstream concurrency fix](https://github.com/pytorch/pytorch/commit/7add580915ff1a547f3c8bfd25afaca4207ac832).
 Affine projections retain their fused GEMM epilogue across concurrent threads and CUDA
 streams. Sparse-attention fusions can overlap gate and output projections on separate streams.
@@ -821,7 +824,7 @@ Run the focused RDNA4 suite with the Python from an existing Linux ROCm environm
 /path/to/rocm-env/bin/python scripts/run_rocm_regressions.py --junitxml=artifacts/rocm-results.xml
 ```
 
-The environment needs Python 3.13+, ROCm PyTorch 2.14+ with its matching Triton,
+The environment needs Python 3.13+, ROCm PyTorch 2.13+ with its matching Triton,
 TorchAO 0.17+, and the dependencies in the `test` group. Do not use the repository's
 CUDA-default `uv sync` to provision it. The script imports this checkout's source,
 prints environment/device versions, and requires native RDNA4 D64/D128 dense/sparse attention,
