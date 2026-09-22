@@ -695,8 +695,8 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", marker = "extra == 'nvfp4'", specifier = ">=2" },
-    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13" },
-    { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.14" },
+    { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.14", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'convrot') or (sys_platform == 'win32' and extra == 'convrot')", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'nvfp4') or (sys_platform == 'win32' and extra == 'nvfp4')", specifier = ">=0.18", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'convrot'", specifier = ">=0.17" },
