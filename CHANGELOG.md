@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-22
+
 ### Changed
 
 - Lower the base PyTorch requirement to 2.13 for the production kernels and ROCm
