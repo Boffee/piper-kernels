@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Lower the base PyTorch requirement to 2.13 for the production kernels and ROCm
+  backends. The experimental native NVIDIA NVFP4 affine path still requires
+  PyTorch 2.14 for its upstream concurrent-scaling fix.
+
 ## [0.7.2] - 2026-09-20
 
 ### Added
