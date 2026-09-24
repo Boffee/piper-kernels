@@ -14,6 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_sequences,
@@ -391,10 +392,10 @@ def test_route_and_coarse_path_reuses_chunked_minmax_pool_scores() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+    reason="requires native NVIDIA SM89 or SM120 routing",
 )
-def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
+def test_nvidia_packed_routes_match_the_portable_exact_policy() -> None:
     generator = torch.Generator().manual_seed(54)
     query = torch.randn((1, 3, 5 * 64, 128), dtype=torch.bfloat16, generator=generator)
     key = torch.randn((1, 3, 7 * 64, 128), dtype=torch.bfloat16, generator=generator)
@@ -415,11 +416,11 @@ def test_sm120_packed_routes_match_the_portable_exact_policy() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+    reason="requires native NVIDIA SM89 or SM120 routing",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_sm120_padded_summaries_match_portable_valid_prefix_extrema(dtype: torch.dtype) -> None:
+def test_nvidia_padded_summaries_match_portable_valid_prefix_extrema(dtype: torch.dtype) -> None:
     generator = torch.Generator().manual_seed(545)
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
     query = torch.randn((1, 2, 3 * 64, 128), dtype=dtype, generator=generator)
@@ -450,10 +451,10 @@ def test_sm120_padded_summaries_match_portable_valid_prefix_extrema(dtype: torch
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+    reason="requires native NVIDIA SM89 or SM120 routing",
 )
-def test_sm120_ragged_key_summaries_match_portable_extrema() -> None:
+def test_nvidia_ragged_key_summaries_match_portable_extrema() -> None:
     generator = torch.Generator().manual_seed(546)
     query = torch.randn((1, 2, 129, 128), dtype=torch.bfloat16, generator=generator)
     key = torch.randn((1, 2, 193, 128), dtype=torch.bfloat16, generator=generator)
@@ -468,10 +469,10 @@ def test_sm120_ragged_key_summaries_match_portable_extrema() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+    reason="requires native NVIDIA SM89 or SM120 routing",
 )
-def test_sm120_ragged_routes_ignore_invalid_query_storage() -> None:
+def test_nvidia_ragged_routes_ignore_invalid_query_storage() -> None:
     generator = torch.Generator(device="cuda").manual_seed(65)
     query_storage = torch.randn(
         (1, 2, 128, 128),

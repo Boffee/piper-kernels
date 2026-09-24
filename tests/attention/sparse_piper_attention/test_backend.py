@@ -26,7 +26,6 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._interfaces import AttentionBackend
-from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
@@ -36,35 +35,56 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
-    ("target", "supported"),
+    ("target", "kernel"),
     [
-        (AcceleratorTarget("cuda", "sm120"), True),
-        (AcceleratorTarget("cuda", "sm121"), False),
-        (AcceleratorTarget("cuda", "sm89"), False),
-        (AcceleratorTarget("hip", "gfx1201"), False),
-        (AcceleratorTarget("hip", "gfx942"), False),
-        (AcceleratorTarget("cpu"), False),
-        (AcceleratorTarget("xpu"), False),
+        (AcceleratorTarget("cuda", "sm120"), "tma"),
+        (AcceleratorTarget("cuda", "sm89"), "async_copy"),
+        (AcceleratorTarget("cuda", "sm121"), None),
+        (AcceleratorTarget("cuda", "sm100"), None),
+        (AcceleratorTarget("cuda", "sm90"), None),
+        (AcceleratorTarget("cuda", "sm86"), None),
+        (AcceleratorTarget("cuda", "sm80"), None),
+        (AcceleratorTarget("hip", "gfx1201"), None),
+        (AcceleratorTarget("hip", "gfx942"), None),
+        (AcceleratorTarget("cpu"), None),
+        (AcceleratorTarget("xpu"), None),
     ],
 )
-def test_attention_selection_uses_operand_target(monkeypatch, target, supported, head_dim):
+def test_attention_selection_uses_operand_target(monkeypatch, target, kernel, head_dim):
     query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
-    backend = AttentionBackend(prepare=Mock(), launch=Mock())
-    d64_backend = replace(backend, skip_dense_routing=True)
-    monkeypatch.setattr(_backend, "_nvidia_attention", backend)
-    monkeypatch.setattr(_backend, "_nvidia_attention_skip_dense_routing", d64_backend)
+    backends = {}
+    for name in ("tma", "async_copy"):
+        backend = AttentionBackend(prepare=Mock(), launch=Mock())
+        backends[name] = (backend, replace(backend, skip_dense_routing=True))
+    monkeypatch.setattr(_backend, "_nvidia_attention", backends["tma"][0])
+    monkeypatch.setattr(_backend, "_nvidia_attention_skip_dense_routing", backends["tma"][1])
+    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", backends["async_copy"][0])
+    monkeypatch.setattr(
+        _backend, "_nvidia_sm89_attention_skip_dense_routing", backends["async_copy"][1]
+    )
     monkeypatch.setattr(_backend, "_amd_attention", None)
-    assert policy.supports_target(target) is supported
-    expected = d64_backend if head_dim == 64 else backend
-    assert _backend.select_attention_backend(query) is (expected if supported else None)
+    expected = None if kernel is None else backends[kernel][1 if head_dim == 64 else 0]
+    assert _backend.select_attention_backend(query) is expected
     probe.assert_called_once_with(query.device)
+
+
+@pytest.mark.skipif(_backend.nvidia_sm89_gluon is None, reason="requires Triton import")
+def test_sm89_attention_uses_its_own_launcher_and_shared_preparation():
+    sm89 = _backend._nvidia_sm89_attention
+    sm120 = _backend._nvidia_attention
+    assert sm89 is not None
+    assert sm120 is not None
+    assert sm89.launch is _backend.nvidia_sm89_gluon._launch_sparse_piper_attention
+    assert sm89.launch is not sm120.launch
+    assert sm89.prepare is sm120.prepare
 
 
 def test_missing_attention_implementation_does_not_probe_device(monkeypatch):
     monkeypatch.setattr(_backend, "_nvidia_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", None)
     monkeypatch.setattr(_backend, "_amd_attention", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
     query = torch.empty(1)
@@ -83,6 +103,7 @@ def test_amd_attention_selection_is_independent_and_uses_tensor_device(
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     monkeypatch.setattr(_backend, "_nvidia_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", None)
     backend = AttentionBackend(prepare=Mock(), launch=Mock())
     monkeypatch.setattr(_backend, "_amd_attention", backend)
     query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
@@ -267,9 +288,12 @@ def test_score_fallback_keeps_autograd(monkeypatch):
     ("target", "routes_supported", "summaries_supported"),
     [
         (AcceleratorTarget("cuda", "sm120"), True, True),
+        (AcceleratorTarget("cuda", "sm89"), True, True),
         (AcceleratorTarget("hip", "gfx1200"), True, False),
         (AcceleratorTarget("hip", "gfx1201"), True, False),
         (AcceleratorTarget("cuda", "sm121"), False, False),
+        (AcceleratorTarget("cuda", "sm90"), False, False),
+        (AcceleratorTarget("cuda", "sm86"), False, False),
         (AcceleratorTarget("hip", "gfx1100"), False, False),
         (AcceleratorTarget("hip", "gfx942"), False, False),
         (AcceleratorTarget("cpu"), False, False),
@@ -284,6 +308,7 @@ def test_auxiliary_selection_is_independent_of_attention(
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     monkeypatch.setattr(_backend, "_nvidia_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", None)
     monkeypatch.setattr(_backend, "_amd_attention", None)
     route_selector, summarize = Mock(), Mock()
     monkeypatch.setattr(
@@ -305,6 +330,50 @@ def test_auxiliary_selection_is_independent_of_attention(
     )
     assert probe.call_count == 2
     assert all(call.args == (query.device,) for call in probe.call_args_list)
+
+
+def test_fused_operand_preparation_follows_summary_support(monkeypatch):
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm89")
+    )
+    query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+    selected = _backend.select_fused_operand_preparation(
+        query, query, _routing_modes._MINMAX_ROUTING
+    )
+    assert (selected is not None) is (_backend.select_sequence_summaries(query, query) is not None)
+    unsupported = torch.empty(1, 1, 128, 32, dtype=torch.bfloat16)
+    assert (
+        _backend.select_fused_operand_preparation(
+            unsupported, unsupported, _routing_modes._MINMAX_ROUTING
+        )
+        is None
+    )
+
+
+def test_mean_pool_routing_keeps_the_separate_summary_pass(monkeypatch):
+    """Only min/max summaries reduce order-independently, so only they may fuse."""
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm89")
+    )
+    query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+    assert (
+        _backend.select_fused_operand_preparation(query, query, _routing_modes._MEAN_ROUTING)
+        is None
+    )
+    assert (
+        _backend.select_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
+        is not None
+    )
+
+
+def test_fused_operand_preparation_requires_native_preparation(monkeypatch):
+    monkeypatch.setattr(_backend, "preparation", None)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
+    query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+    assert (
+        _backend.select_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
+        is None
+    )
 
 
 @pytest.mark.parametrize("invalid", ["dtype", "width", "stride", "key_dtype", "device"])
@@ -580,12 +649,41 @@ def test_shared_preparation_accepts_empty_routes_and_rejects_negative_counts(hea
 
 
 @pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
-def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch):
-    native = _backend.nvidia_gluon
+@pytest.mark.parametrize("module", ["nvidia_gluon", "nvidia_sm89_gluon"])
+def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, module):
+    native = getattr(_backend, module)
     prepared = _prepared_attention(128, 0)
     enter_device = Mock(side_effect=AssertionError("unsupported mode reached device execution"))
     monkeypatch.setattr(native, "device_context", enter_device)
     with pytest.raises(ValueError, match="skip_dense_routing requires NVIDIA D64"):
+        native._launch_sparse_piper_attention(
+            prepared, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+        )
+    enter_device.assert_not_called()
+
+
+@pytest.mark.skipif(_backend.nvidia_sm89_gluon is None, reason="requires Triton import")
+@pytest.mark.parametrize("operand", ["query", "key", "value"])
+@pytest.mark.parametrize("defect", ["noncontiguous", "misaligned"])
+def test_sm89_rejects_uncopyable_storage_before_device_execution(monkeypatch, operand, defect):
+    native = _backend.nvidia_sm89_gluon
+    prepared = _prepared_attention(128, 2)
+    tensor = {
+        "query": prepared.query.data,
+        "key": prepared.context.key,
+        "value": prepared.context.value,
+    }[operand]
+    if defect == "noncontiguous":
+        replacement = torch.empty_like(tensor).transpose(-1, -2).contiguous().transpose(-1, -2)
+    else:
+        replacement = torch.empty(tensor.numel() + 1, dtype=tensor.dtype)[1:].view(tensor.shape)
+    if operand == "query":
+        prepared = replace(prepared, query=replace(prepared.query, data=replacement))
+    else:
+        prepared = replace(prepared, context=replace(prepared.context, **{operand: replacement}))
+    enter_device = Mock(side_effect=AssertionError("unsupported storage reached device execution"))
+    monkeypatch.setattr(native, "device_context", enter_device)
+    with pytest.raises(ValueError, match="16-byte-aligned"):
         native._launch_sparse_piper_attention(
             prepared, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
         )

@@ -8,6 +8,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteAndCoarseBuilder,
 )
@@ -203,11 +204,11 @@ def test_route_and_coarse_builder_places_out_of_order_query_chunks_by_offset() -
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+    reason="requires native NVIDIA SM89 or SM120 routing",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_sm120_padded_summaries_match_portable_valid_prefix_means(dtype: torch.dtype) -> None:
+def test_nvidia_padded_summaries_match_portable_valid_prefix_means(dtype: torch.dtype) -> None:
     generator = torch.Generator().manual_seed(73)
     block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
     query = torch.randn((1, 2, 3 * 64, 128), dtype=dtype, generator=generator)

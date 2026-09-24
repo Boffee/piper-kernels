@@ -34,6 +34,13 @@ except ModuleNotFoundError as error:
     nvidia_gluon = None
 
 try:
+    from ._nvidia import gluon_sm89 as nvidia_sm89_gluon
+except ModuleNotFoundError as error:
+    if error.name is None or not error.name.startswith("triton"):
+        raise
+    nvidia_sm89_gluon = None
+
+try:
     from ._amd import gluon as amd_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
@@ -50,6 +57,19 @@ _nvidia_attention = (
 )
 _nvidia_attention_skip_dense_routing = (
     replace(_nvidia_attention, skip_dense_routing=True) if _nvidia_attention is not None else None
+)
+_nvidia_sm89_attention = (
+    AttentionBackend(
+        prepare=preparation._prepare_sparse_piper_operands,
+        launch=nvidia_sm89_gluon._launch_sparse_piper_attention,
+    )
+    if preparation is not None and nvidia_sm89_gluon is not None
+    else None
+)
+_nvidia_sm89_attention_skip_dense_routing = (
+    replace(_nvidia_sm89_attention, skip_dense_routing=True)
+    if _nvidia_sm89_attention is not None
+    else None
 )
 _amd_attention = (
     AttentionBackend(
@@ -87,20 +107,27 @@ except ModuleNotFoundError as error:
 
 def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
     """Return native execution or let the caller use the quantized reference."""
-    if _nvidia_attention is None and _amd_attention is None:
+    if _nvidia_attention is None and _nvidia_sm89_attention is None and _amd_attention is None:
         return None
     target = AcceleratorTarget.from_device(query.device)
     # Device probes and pre-projection activations do not have an attention head axis.
     head_dim = query.shape[-1] if query.ndim == 4 else 128
-    if nvidia_policy.supports_target(target):
-        if _nvidia_attention is not None and nvidia_policy.skip_dense_routing(head_dim):
-            return _nvidia_attention_skip_dense_routing
-        return _nvidia_attention
-    return (
-        _amd_attention
-        if amd_policy.supports_target(target) and head_dim in SUPPORTED_HEAD_DIMS
-        else None
-    )
+    if nvidia_policy.uses_tensor_descriptors(target):
+        backend, full_keep_backend = _nvidia_attention, _nvidia_attention_skip_dense_routing
+    elif nvidia_policy.uses_async_copies(target):
+        backend, full_keep_backend = (
+            _nvidia_sm89_attention,
+            _nvidia_sm89_attention_skip_dense_routing,
+        )
+    else:
+        return (
+            _amd_attention
+            if amd_policy.supports_target(target) and head_dim in SUPPORTED_HEAD_DIMS
+            else None
+        )
+    if backend is not None and nvidia_policy.skip_dense_routing(head_dim):
+        return full_keep_backend
+    return backend
 
 
 def source_files() -> tuple[str, ...]:
@@ -196,10 +223,10 @@ def select_fused_operand_preparation(
     ):
         return None
     target = AcceleratorTarget.from_device(query.device)
-    if nvidia_policy.supports_target(target):
+    if nvidia_policy.uses_tensor_descriptors(target):
         if not nvidia_policy.use_fused_preparation(query.shape[-1], query.shape[2]):
             return None
-    elif not amd_policy.supports_target(target):
+    elif not (nvidia_policy.uses_async_copies(target) or amd_policy.supports_target(target)):
         return None
     return preparation._prepare_sparse_piper_operands
 

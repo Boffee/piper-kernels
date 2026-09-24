@@ -85,6 +85,7 @@ def _call(
     [
         AcceleratorTarget("cuda", "sm120"),
         AcceleratorTarget("cuda", "sm121"),
+        AcceleratorTarget("cuda", "sm89"),
         AcceleratorTarget("hip", "gfx1201"),
         AcceleratorTarget("hip", "gfx1200"),
         AcceleratorTarget("hip", "gfx1100"),
@@ -257,6 +258,8 @@ def test_output_support_is_independent_of_qkv_projection_support(
     [
         ("linux", AcceleratorTarget("hip", "gfx1100")),
         ("linux", AcceleratorTarget("cuda", "sm121")),
+        ("linux", AcceleratorTarget("cuda", "sm89")),
+        ("win32", AcceleratorTarget("cuda", "sm89")),
         ("linux", AcceleratorTarget("cpu")),
         ("win32", AcceleratorTarget("hip", "gfx1100")),
         ("win32", AcceleratorTarget("cpu")),

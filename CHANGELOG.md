@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
+  the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
+  suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
+
 ## [0.7.6rc1] - 2026-09-25
 
 ### Changed

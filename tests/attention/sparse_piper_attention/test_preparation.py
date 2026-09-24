@@ -18,6 +18,8 @@ from piper_kernels.attention.sparse_piper_attention import _backend, _routing_mo
         (AcceleratorTarget("cuda", "sm120"), 128, 512, False),
         (AcceleratorTarget("cuda", "sm120"), 128, 1024, True),
         (AcceleratorTarget("cuda", "sm120"), 128, 100000, True),
+        (AcceleratorTarget("cuda", "sm89"), 64, 256, True),
+        (AcceleratorTarget("cuda", "sm89"), 128, 256, True),
         (AcceleratorTarget("hip", "gfx1200"), 64, 256, True),
         (AcceleratorTarget("hip", "gfx1201"), 128, 256, True),
         (AcceleratorTarget("hip", "gfx942"), 128, 4096, False),
