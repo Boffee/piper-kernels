@@ -221,7 +221,9 @@ def quantize_query_per_thread_group(
     )
 
 
-@triton.jit(do_not_specialize=["query_length"])
+# Per-row scale strides follow the sequence length; specializing on their
+# divisibility would compile a new variant per length class for no benefit.
+@triton.jit(do_not_specialize=["query_length", "stride_sb", "stride_sh"])
 def quantize_query_per_thread_kernel(
     query_ptr,
     output_ptr,
@@ -370,7 +372,7 @@ def quantize_key_per_thread_group(
     )
 
 
-@triton.jit(do_not_specialize=["key_length", "heads"])
+@triton.jit(do_not_specialize=["key_length", "heads", "stride_sb", "stride_sh"])
 def quantize_key_per_thread_kernel(
     key_ptr,
     mean_ptr,
