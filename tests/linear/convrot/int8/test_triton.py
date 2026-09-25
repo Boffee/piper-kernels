@@ -365,6 +365,56 @@ def test_default_linear_execution_plan_accepts_explicit_target_for_meta_weight()
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only launch policy")
+@pytest.mark.parametrize(
+    ("rows", "k", "n"),
+    [(m, 272, 73) for m in (1, 127, 128, 129, 384, 511, 512, 513, 1025, 2177)]
+    + [(128, 256, 1024), (512, 256, 1024), (1280, 256, 1024), (1281, 256, 1024)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_shape_aware_paired_projection_matches_previous_schedule_with_tails(rows, k, n, dtype):
+    torch.manual_seed(512)
+    # Tail K/N, leading dimensions, mixed bias types, and row-strided outputs
+    # exercise all three schedules with two independent projections.
+    value = torch.randint(-127, 128, (1, rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(1, rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    second_weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    second_scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.float32)
+    second_bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    second_projection = (second_weight, second_scale, second_bias)
+    previous = int8_nvidia.default_execution_plan(weight)
+    expected = int8_nvidia.execute_prepared_linear(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        dtype,
+        previous,
+        second_projection=second_projection,
+    )
+    storage = torch.full((1, rows, 2 * n + 13), 42, device="cuda", dtype=dtype)
+    out = storage[..., : 2 * n]
+    actual = int8_nvidia.linear_prepared(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        dtype,
+        out=out,
+        second_projection=second_projection,
+    )
+    assert actual is out
+    assert torch.equal(actual, expected)
+    assert torch.all(storage[..., 2 * n :] == 42)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_injected_linear_execution_plan_matches_reference(activation_fn: str | None) -> None:

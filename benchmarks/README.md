@@ -277,15 +277,13 @@ Validate the selected plan at `M=131073` on `(N, K)=(16384, 6144)` for expansion
 indexing, and `(N, K)=(4096, 14336)` for contraction. Expand to the full N/K matrix only if those
 results are unexpected.
 
-The production schedule uses `128x256x128` GEMM tiles, eight warps, three stages, and fixed
-`GROUP_M=16` ordering (groups of up to 16 M tiles) for every target and shape. On exact SM120 at
-the H3 AdaLN guard `M=1, N=96768, K=2688`, this schedule measured 0.219 ms versus 0.526 ms for the
-former generic plan. The execution plan therefore has no target-, M-, N-, or K-specific GEMM
-schedule branch.
+The large-M schedule uses `128x256x128` GEMM tiles, eight warps, three stages, and fixed
+`GROUP_M=16` ordering (groups of up to 16 M tiles). SM120 chooses among three configurations
+from the output tile count, as documented below; other targets keep their existing schedules.
 NVIDIA and AMD use one GEMM launch, including all M/N/K tails. With aligned N/K, complete
-M tiles take an unmasked branch and boundary tiles use masks. Unaligned N or K uses the
-existing masked loop in the same launch. Tail handling requires no padding or temporary
-buffers and does not change tile selection. M, N, and K remain runtime values.
+large M tiles take an unmasked branch and boundary tiles use masks. Unaligned N or K uses
+the existing masked loop in the same launch. Tail handling requires no padding or temporary
+buffers and is independent of tile selection. M, N, and K remain runtime values.
 
 On an RTX 5090 (SM120) with Torch 2.13.0+cu130 and Triton 3.7.1, three fresh processes per variant
 confirmed median per-cell end-to-end speedups of 2.20-2.61x at M=8192 and 4.55-5.56x at M=32768
@@ -465,6 +463,84 @@ before changing the production policy.
 
 ### ConvRot INT8
 
+SM120 uses three GEMM configurations, selected from host shape metadata:
+
+| Configuration | BLOCK_M | BLOCK_N | BLOCK_K | Warps | Stages |
+|---|---:|---:|---:|---:|---:|
+| Small | 32 | 64 | 128 | 8 | 4 |
+| Medium | 64 | 64 | 128 | 4 | 3 |
+| Large | 128 | 256 | 128 | 8 | 3 |
+
+For input `[M,K]` and weight `[N,K]`, M is the flattened row count and N is the output
+width of each projection. P is 1 for a single projection and 2 for paired projections.
+Apply these rules in order:
+
+1. Use small tiles when `M <= 32` or `ceil(M/32) * ceil(N/64) * P <= 128`.
+2. Otherwise use medium tiles when `N <= 64` or `M * ceil(N/256) * P < 128 * 72`.
+3. Otherwise use large tiles.
+
+The thresholds count 128 small output tiles and 72 useful large output tiles. The large
+count uses actual M so a one-row tail does not count as a full 128-row tile. Narrow outputs
+stay within the existing small/medium configurations because wider tiles add no input reuse.
+Selection is monotonic in M for fixed N/P. K affects preparation but not GEMM tile selection;
+preparation remains independent of N so inputs can be shared across projections.
+
+These fixed heuristics were measured on an RTX 5090. Performance on other SM120 devices
+has not been established. Other architectures retain their existing schedules. Selection uses
+no device-property query, runtime autotuning, or model-specific table. M/N/K remain runtime
+values; alignment, dtype, bias, and paired operation can still create compiled variants of
+each configuration.
+
+Compare the full ConvRot operator with fixed large tiles and BF16 cuBLAS using CUDA graphs:
+
+```shell
+uv run python benchmarks/benchmark_convrot_int8_small_m.py > convrot-small-m.jsonl
+```
+
+The default uses the original reported seven-projection mix at
+`M=128,256,384,512,1024,3072`: `(K,N)=(1024,2048), (1024,1024), (2048,1024),
+(1024,3072), (3072,1024)`, counting the second and fourth shapes twice. These are benchmark
+inputs, not policy keys. Checks require bitwise agreement with the fixed large-tile schedule
+and an independent INT32 matmul reference. Full-linear timing includes rotation/quantization;
+preparation and prepared GEMM are also reported separately. JSONL records the environment,
+shapes, selected plans, timestamps, and timing samples. Acquire the shared GPU gate as
+outlined below before benchmarking.
+
+Repeated `--shape K N` arguments select other dimensions. For example, compare all three
+configurations and production dispatch across narrow outputs and wider transformer layers:
+
+```shell
+uv run python benchmarks/benchmark_convrot_int8_small_m.py --compare-schedules --skip-bf16 \
+  --rows 128 512 1024 3072 \
+  --shape 2048 16 --shape 4096 1024 --shape 4096 12288 \
+  --shape 12288 4096 --shape 5120 25600 --shape 5376 14336 --rep-ms 30
+```
+
+In this mode, `linear` forces small tiles, `medium_linear` medium tiles,
+`previous_linear` large tiles, and `policy_linear` measures production. All include
+preparation. `--paired` compares two projections sharing one preparation. Timing order
+alternates between repeats; `--order-offset 0/1` also alternates order between processes.
+
+RTX 5090, Torch 2.14.0+cu130, Triton 3.8.0, driver 615.71.09, 2026-09-24: median of three
+30 ms CUDA-graph measurements for the default seven-projection mix, including preparation:
+
+| M | Fixed large-tile INT8 (us) | M/N policy (us) | BF16 cuBLAS (us) |
+|---:|---:|---:|---:|
+| 128 | 165.4 | 37.1 | 54.5 |
+| 256 | 167.2 | 48.5 | 74.8 |
+| 384 | 170.4 | 58.9 | 88.5 |
+| 512 | 173.0 | 70.0 | 117.6 |
+| 1024 | 182.8 | 117.2 | 218.6 |
+| 3072 | 274.6 | 274.0 | 541.1 |
+
+Each default shape at M<=512 beat BF16 in this run. These are isolated synthetic operator
+measurements, not complete-model speedups. Additional measurements cover wider projection
+mixes, paired projections, irregular M/N/K, and narrow outputs through M=100000. The local
+records are in `artifacts/convrot-mn-policy-commit-20260924/`,
+`artifacts/convrot-simple-policy-20260924/`, and `artifacts/convrot-m-only-20260924/`.
+The latter compares fixed M-only cutoffs with the M/N
+policy across projection mixes derived from 0.6B-, 2B-, 8B-, and 32B-scale models.
+
 Compare the original split-tail GEMM with a fully masked single launch and the production
 single launch, all using the fixed `128x256x128` tile configuration:
 
@@ -493,7 +569,7 @@ benchmark/correctness helper `lib/convrot_int8_legacy.py`.
 For aligned N/K, production branches around the entire projection: full M tiles use unmasked
 loads/stores and tail tiles use masks. Scaling and bias stay inside the branch to preserve
 floating-point rounding. Unaligned N/K uses the original masked loop in one launch. Neither
-NVIDIA nor AMD retains a separate tail launch, and the production tile policy is unchanged.
+NVIDIA nor AMD retains a separate tail launch; tail handling is independent of tile selection.
 
 On the shared local GPU, first POST `{"id":"<unique-lease-id>"}` to
 `http://127.0.0.1:8080/piper/engine/register`, then `/piper/engine/acquire`; wait for acquire

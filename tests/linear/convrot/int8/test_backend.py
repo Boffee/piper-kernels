@@ -111,6 +111,18 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
         assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
 
 
+@pytest.mark.parametrize(("rows", "block_m"), [(None, 128), (1280, 64)])
+def test_nvidia_planner_needs_no_device_properties_with_explicit_target(monkeypatch, rows, block_m):
+    weight = SimpleNamespace(shape=(1024, 1024), device=torch.device("cuda"))
+    properties = Mock(side_effect=AssertionError("planner queried device properties"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    plan = nvidia.default_execution_plan(
+        weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
+    )
+    assert plan.matmul_block_m == block_m
+    properties.assert_not_called()
+
+
 @pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])
 def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architecture):
     target = AcceleratorTarget("cuda", architecture)
@@ -166,6 +178,10 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
         *prepared, weight, scale, None, torch.float32, out=output, second_projection=second
     )
     assert result is output
+    if backend is nvidia:
+        expected_plan = backend.default_execution_plan(
+            weight, target=target, rows=value.shape[0], projection_count=2
+        )
     assert project.call_args.args[-1] == expected_plan
     assert project.call_args.kwargs == {"out": output, "second_projection": second}
 

@@ -147,6 +147,88 @@ def test_execution_plan_selects_uniform_matmul_schedule() -> None:
     assert plan.matmul_num_stages == 3
 
 
+@pytest.mark.parametrize(
+    ("rows", "k", "n", "block_m"),
+    [
+        (1, 5376, 14336, 32),
+        (32, 5376, 14336, 32),
+        (33, 5376, 14336, 64),
+        (128, 1024, 2048, 32),
+        (128, 1024, 3072, 64),
+        (256, 1024, 1024, 32),
+        (257, 1024, 1024, 64),
+        (512, 1024, 1024, 64),
+        (512, 5376, 14336, 128),
+        (2048, 3072, 1024, 64),
+        (2049, 3072, 1024, 64),
+        (2303, 3072, 1024, 64),
+        (2304, 3072, 1024, 128),
+        (1025, 1024, 2048, 64),
+        (2560, 3072, 1024, 128),
+        (2048, 1024, 3072, 128),
+        (3072, 1024, 3072, 128),
+        (128, 96, 5376, 64),
+        (512, 96, 5376, 128),
+        (16384, 5376, 96, 128),
+        (32768, 5376, 96, 128),
+        (100000, 96, 5376, 128),
+        (4096, 2048, 16, 32),
+        (4097, 2048, 16, 64),
+        (100000, 2048, 16, 64),
+        (100000, 5376, 64, 64),
+        (100000, 5376, 65, 128),
+    ],
+)
+def test_shape_aware_schedule_preserves_preparation(rows, k, n, block_m):
+    previous = select_execution_plan(_SM120, in_features=k)
+    actual = select_execution_plan(_SM120, in_features=k, rows=rows, out_features=n)
+    assert actual.matmul_block_m == block_m
+    assert (
+        replace(
+            actual,
+            matmul_block_m=previous.matmul_block_m,
+            matmul_block_n=previous.matmul_block_n,
+            matmul_num_warps=previous.matmul_num_warps,
+            matmul_num_stages=previous.matmul_num_stages,
+        )
+        == previous
+    )
+
+
+def test_shape_aware_schedule_accounts_for_paired_tiles():
+    args = {"in_features": 1024, "out_features": 1024, "rows": 1280}
+    assert select_execution_plan(_SM120, **args).matmul_block_m == 64
+    assert select_execution_plan(_SM120, **args, projection_count=2).matmul_block_m == 128
+    thin = {"in_features": 2048, "out_features": 16, "rows": 4096}
+    assert select_execution_plan(_SM120, **thin).matmul_block_m == 32
+    assert select_execution_plan(_SM120, **thin, projection_count=2).matmul_block_m == 64
+
+
+@pytest.mark.parametrize("out_features", [16, 64, 65, 257, 1024, 3072, 5376, 14336])
+@pytest.mark.parametrize("projection_count", [1, 2])
+def test_shape_aware_schedule_is_monotonic_in_rows(out_features, projection_count):
+    blocks = [
+        select_execution_plan(
+            _SM120,
+            in_features=2048,
+            out_features=out_features,
+            projection_count=projection_count,
+            rows=rows,
+        ).matmul_block_m
+        for rows in (*range(1, 4097), 8192, 16384, 32768, 100000)
+    ]
+    assert blocks == sorted(blocks)
+    assert set(blocks) <= {32, 64, 128}
+
+
+@pytest.mark.parametrize("architecture", ["sm75", "sm80", "sm89", "sm90", "sm100", "sm121"])
+def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
+    target = AcceleratorTarget("cuda", architecture)
+    assert select_execution_plan(
+        target, in_features=3072, rows=128, out_features=2048
+    ) == select_execution_plan(target, in_features=3072)
+
+
 def test_execution_plan_serializes_flat_tuning_fields() -> None:
     plan = select_execution_plan(_SM120, in_features=512)
 
