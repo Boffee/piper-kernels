@@ -132,14 +132,16 @@ def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
         (
             _SM89,
             PiperAttentionExecutionPlan(
-                block_m=128,
+                block_m=64,
                 grouped_qk=False,
-                split_pv_head_dim=True,
+                split_pv_head_dim=False,
                 use_tensor_descriptors=False,
+                derive_value_log_bound=True,
                 num_stages=1,
-                loop_num_stages=3,
-                loop_licm=True,
                 use_packed_probability_conversion=True,
+                unspecialized_value_stride=True,
+                use_gluon_kernel=True,
+                max_registers=232,
             ),
         ),
         (
@@ -174,18 +176,12 @@ def test_execution_plan_separates_architecture_facts_from_exact_target_tuning(
     assert plan == expected
 
 
-@pytest.mark.parametrize(
-    ("head_dim", "is_causal", "selected"),
-    [
-        (128, False, True),
-        (64, False, False),
-        (128, True, False),
-    ],
-)
-def test_sm89_noncausal_d128_policy_is_dimension_and_mode_specific(
+@pytest.mark.parametrize(("head_dim", "max_registers"), [(64, 168), (128, 232)])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_sm89_runs_the_gluon_kernel_in_every_mode(
     head_dim: int,
+    max_registers: int,
     is_causal: bool,
-    selected: bool,
 ) -> None:
     plan = _select(
         _SM89,
@@ -193,13 +189,57 @@ def test_sm89_noncausal_d128_policy_is_dimension_and_mode_specific(
         is_causal=is_causal,
     )
 
-    assert plan.split_pv_head_dim is selected
-    assert plan.use_packed_probability_conversion is selected
-    assert plan.loop_licm is selected
-    assert plan.loop_num_stages == (3 if selected else None)
-    assert plan.num_stages == (1 if selected else 3)
-    assert plan.block_m == (64 if is_causal else 128)
+    assert plan.use_gluon_kernel
+    assert plan.max_registers == max_registers
+    assert plan.block_m == 64
+    assert plan.derive_value_log_bound
+    assert plan.use_packed_probability_conversion
+    assert plan.unspecialized_value_stride
+    assert not plan.grouped_qk
+    assert not plan.split_pv_head_dim
     assert not plan.use_tensor_descriptors
+    assert not plan.optimize_causal_traversal
+
+
+def test_register_cap_requires_the_gluon_kernel() -> None:
+    query = torch.empty((1, 1, 64, 64), device="meta")
+    plan = replace(_select(_SM89, head_dim=64), use_gluon_kernel=False)
+
+    with pytest.raises(ValueError, match="register cap requires the Gluon kernel"):
+        _prepare_piper_attention(
+            query,
+            query,
+            query,
+            0.125,
+            False,
+            execution_plan=plan,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"block_m": 128},
+        {"grouped_qk": True},
+        {"split_pv_head_dim": True},
+        {"derive_value_log_bound": False},
+    ],
+)
+def test_gluon_plan_rejects_unsupported_recurrence_choices(
+    changes: dict[str, object],
+) -> None:
+    query = torch.empty((1, 1, 64, 128), device="meta")
+    plan = replace(_select(_SM89), **changes)
+
+    with pytest.raises(ValueError, match="Gluon kernel requires"):
+        _prepare_piper_attention(
+            query,
+            query,
+            query,
+            0.125,
+            False,
+            execution_plan=plan,
+        )
 
 
 @pytest.mark.parametrize(
@@ -300,15 +340,6 @@ def test_sm120_optimized_causal_traversal_policy_is_mode_specific(
     assert plan.optimize_causal_traversal is expected
 
 
-def test_sm89_does_not_inherit_sage_attention_schedule() -> None:
-    plan = _select(_SM89, is_causal=True)
-
-    assert plan.block_m == 64
-    assert not plan.optimize_causal_traversal
-    assert plan.loop_num_stages is None
-    assert not plan.loop_licm
-
-
 def test_unmeasured_sm12x_target_does_not_inherit_sm120_causal_policy() -> None:
     plan = _select(_SM121, is_causal=True)
 
@@ -349,6 +380,9 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "loop_num_stages": 2,
         "loop_licm": True,
         "use_packed_probability_conversion": False,
+        "unspecialized_value_stride": False,
+        "use_gluon_kernel": False,
+        "max_registers": None,
     }
 
 

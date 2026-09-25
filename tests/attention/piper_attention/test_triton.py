@@ -13,6 +13,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.piper_attention._nvidia import gluon_async_copy as _gluon_async_copy
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
 from piper_kernels.attention.piper_attention._nvidia.triton import (
@@ -47,6 +48,16 @@ def _sqnr_db(actual: torch.Tensor, reference: torch.Tensor) -> float:
     signal_energy = torch.sum(reference_float.square())
     error_energy = torch.sum(error_float.square())
     return float(10 * torch.log10(signal_energy / error_energy))
+
+
+def _on_triton(plan: _policy.PiperAttentionExecutionPlan) -> _policy.PiperAttentionExecutionPlan:
+    """Return the same recurrence on the Triton kernel, dropping Gluon-only choices."""
+    return replace(plan, use_gluon_kernel=False, max_registers=None)
+
+
+def _triton_plan(query: torch.Tensor, is_causal: bool) -> _policy.PiperAttentionExecutionPlan:
+    """Return the production plan for Triton-kernel controls, even where Gluon is default."""
+    return _on_triton(_default_piper_attention_execution_plan(query, is_causal))
 
 
 pytestmark = [
@@ -230,7 +241,7 @@ def test_noncausal_ragged_key_tail_matches_quantized_reference(
     key = torch.randn(1, 1, key_length, head_dim, device="cuda", dtype=torch.bfloat16)
     value = torch.randn_like(key)
     plan = replace(
-        _default_piper_attention_execution_plan(query, False),
+        _triton_plan(query, False),
         derive_value_log_bound=derive_value_log_bound,
     )
 
@@ -267,7 +278,7 @@ def test_packed_probability_conversion_matches_stock_attention(
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     plan = replace(
-        _default_piper_attention_execution_plan(query, is_causal),
+        _triton_plan(query, is_causal),
         use_tensor_descriptors=False,
         num_stages=3,
     )
@@ -305,7 +316,7 @@ def test_optimized_causal_traversal_matches_fully_masked_loop(
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     base_plan = replace(
-        _default_piper_attention_execution_plan(query, True),
+        _triton_plan(query, True),
         block_m=block_m,
     )
     arguments = (query, key, value, head_dim**-0.5, True)
@@ -324,48 +335,194 @@ def test_optimized_causal_traversal_matches_fully_masked_loop(
     torch.testing.assert_close(partitioned, masked, atol=2**-9, rtol=0.0)
 
 
+def _sm89_plans(
+    query: torch.Tensor,
+    is_causal: bool,
+) -> tuple[_policy.PiperAttentionExecutionPlan, _policy.PiperAttentionExecutionPlan]:
+    """Return the SM89 Gluon plan and the Triton plan with the same recurrence."""
+    gluon_plan = _default_piper_attention_execution_plan(
+        query,
+        is_causal,
+        target=AcceleratorTarget(backend="cuda", architecture="sm89"),
+    )
+    return gluon_plan, _on_triton(gluon_plan)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize(
+    ("batch", "heads", "kv_heads", "query_length", "key_length"),
+    [
+        (1, 2, 2, 1, 1),
+        (1, 2, 2, 63, 63),
+        (1, 2, 2, 64, 64),
+        (1, 2, 2, 193, 193),
+        (2, 4, 1, 320, 320),
+        (1, 2, 2, 129, 65),
+        (1, 2, 2, 300, 1100),
+    ],
+)
+def test_gluon_kernel_matches_triton_recurrence(
+    dtype: torch.dtype,
+    head_dim: int,
+    is_causal: bool,
+    batch: int,
+    heads: int,
+    kv_heads: int,
+    query_length: int,
+    key_length: int,
+) -> None:
+    if is_causal and query_length != key_length:
+        pytest.skip("causal attention is square")
+    torch.manual_seed(101 + query_length + key_length + head_dim)
+    query = torch.randn(batch, heads, query_length, head_dim, device="cuda", dtype=dtype)
+    key = torch.randn(batch, kv_heads, key_length, head_dim, device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
+    gluon_plan, triton_plan = _sm89_plans(query, is_causal)
+    arguments = (query, key, value, head_dim**-0.5, is_causal)
+
+    with torch.no_grad():
+        gluon = _run_piper_attention(*arguments, execution_plan=gluon_plan)
+        stock = _run_piper_attention(*arguments, execution_plan=triton_plan)
+
+    assert gluon.shape == query.shape
+    assert gluon.dtype is dtype
+    assert torch.isfinite(gluon).all()
+    # Both kernels share the recurrence; FP32 operation order can move a value
+    # across one final output rounding boundary.
+    torch.testing.assert_close(gluon, stock, atol=2**-8, rtol=0.0)
+
+
+def test_gluon_ragged_lengths_reuse_one_specialization() -> None:
+    compiles: list[str] = []
+    previous = triton.knobs.compilation.listener
+
+    def listener(*, src, metadata, metadata_group, times, cache_hit) -> None:
+        if src.fn.__name__ == "_dense_piper_attention_kernel":
+            compiles.append(metadata["hash"])
+
+    triton.knobs.compilation.listener = listener
+    try:
+        with torch.no_grad():
+            for query_length, key_length in ((1, 1), (63, 63), (64, 64), (193, 193), (320, 320)):
+                query = torch.randn(1, 2, query_length, 64, device="cuda", dtype=torch.bfloat16)
+                key = torch.randn(1, 2, key_length, 64, device="cuda", dtype=torch.bfloat16)
+                gluon_plan, _ = _sm89_plans(query, True)
+                _run_piper_attention(query, key, key, 0.125, True, execution_plan=gluon_plan)
+    finally:
+        triton.knobs.compilation.listener = previous
+
+    assert len(set(compiles)) <= 1
+
+
+def test_gluon_storage_holds_whole_query_and_key_tiles() -> None:
+    query = torch.randn(1, 2, 193, 64, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 2, 65, 64, device="cuda", dtype=torch.bfloat16)
+    gluon_plan, _ = _sm89_plans(query, False)
+
+    with torch.no_grad():
+        prepared = _prepare_piper_attention(
+            query,
+            key,
+            key,
+            0.125,
+            False,
+            execution_plan=gluon_plan,
+        )
+
+    assert isinstance(prepared.key, torch.Tensor)
+    assert isinstance(prepared.value, torch.Tensor)
+    assert prepared.query.shape[2] == 256
+    assert prepared.key.shape[2] == 128
+    assert prepared.value.shape[3] == 128
+    assert not prepared.query[:, :, 193:].any()
+    assert not prepared.query_scale[:, :, 193:].any()
+
+
+@pytest.mark.parametrize("key_length", [1, 63, 64, 193])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_unspecialized_value_stride_matches_specialized_preparation(
+    key_length: int,
+    is_causal: bool,
+) -> None:
+    torch.manual_seed(97 + key_length)
+    query_length = key_length if is_causal else 129
+    query = torch.randn(1, 2, query_length, 128, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 2, key_length, 128, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    plan = replace(
+        _triton_plan(query, is_causal),
+        use_tensor_descriptors=False,
+        num_stages=3,
+    )
+    arguments = (query, key, value, 128**-0.5, is_causal)
+
+    with torch.no_grad():
+        specialized = _prepare_piper_attention(
+            *arguments,
+            execution_plan=replace(plan, unspecialized_value_stride=False),
+        )
+        unspecialized = _prepare_piper_attention(
+            *arguments,
+            execution_plan=replace(plan, unspecialized_value_stride=True),
+        )
+
+    assert torch.equal(unspecialized.value, specialized.value)
+    assert torch.equal(unspecialized.value_scale_multiplier, specialized.value_scale_multiplier)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sequence", [193, 8192, 32768])
-def test_sm89_d128_measured_schedule_clears_relative_quality_gate(
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_sm89_measured_schedule_clears_relative_quality_gate(
     sequence: int,
+    head_dim: int,
+    is_causal: bool,
     dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(68)
-    query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=dtype)
+    query = torch.randn(1, 1, sequence, head_dim, device="cuda", dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     target = AcceleratorTarget(backend="cuda", architecture="sm89")
     specialized_plan = _default_piper_attention_execution_plan(
         query,
-        False,
+        is_causal,
         target=target,
     )
     generic_plan = _policy._generic_execution_plan(
         target,
-        head_dim=128,
-        is_causal=False,
+        head_dim=head_dim,
+        is_causal=is_causal,
     )
 
-    assert specialized_plan.split_pv_head_dim
+    assert specialized_plan.derive_value_log_bound
     assert specialized_plan.use_packed_probability_conversion
     with torch.no_grad():
         specialized = _run_piper_attention(
             query,
             key,
             value,
-            128**-0.5,
-            False,
+            head_dim**-0.5,
+            is_causal,
             execution_plan=specialized_plan,
         )
         generic = _run_piper_attention(
             query,
             key,
             value,
-            128**-0.5,
-            False,
+            head_dim**-0.5,
+            is_causal,
             execution_plan=generic_plan,
         )
-        reference = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=is_causal,
+        )
 
     assert torch.isfinite(specialized).all()
     assert _sqnr_db(specialized, reference) >= _sqnr_db(generic, reference) - 0.5
@@ -413,7 +570,7 @@ def test_derived_value_log_bound_runs_all_common_modes(
     query = torch.randn(1, 1, query_length, head_dim, device="cuda", dtype=dtype)
     key = torch.randn(1, 1, key_length, head_dim, device="cuda", dtype=dtype)
     value = torch.randn_like(key)
-    base_plan = _default_piper_attention_execution_plan(query, is_causal)
+    base_plan = _triton_plan(query, is_causal)
     stored_plan = replace(base_plan, derive_value_log_bound=False)
     derived_plan = replace(base_plan, derive_value_log_bound=True)
 
@@ -476,7 +633,7 @@ def test_causal_triton_is_independent_of_future_value_rows(
     changed_value = value.clone()
     changed_value[:, :, 32:] = torch.randn_like(changed_value[:, :, 32:]) * 32
     plan = replace(
-        _default_piper_attention_execution_plan(query, True),
+        _triton_plan(query, True),
         optimize_causal_traversal=optimize_causal_traversal,
     )
 
@@ -616,7 +773,10 @@ def test_ragged_query_tail_falls_back_to_masked_pointer_load() -> None:
 @pytest.mark.parametrize("query_length", [1, 63, 64, 65, 127, 128, 129, 193])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_one_launch_covers_all_query_rows(monkeypatch, query_length, head_dim, is_causal) -> None:
+@pytest.mark.parametrize("kernel_name", ["triton", "gluon"])
+def test_one_launch_covers_all_query_rows(
+    monkeypatch, query_length, head_dim, is_causal, kernel_name
+) -> None:
     torch.manual_seed(419)
     # Projection-style strides, two batches, and grouped K/V catch tail offsets
     # that would otherwise alias the next head or batch.
@@ -632,7 +792,13 @@ def test_one_launch_covers_all_query_rows(monkeypatch, query_length, head_dim, i
         dtype=query.dtype,
     ).transpose(1, 2)
     value = torch.randn_like(key)
-    plan = _default_piper_attention_execution_plan(query, is_causal)
+    # Each kernel family is checked on every GPU; SM89 selects the Gluon kernel.
+    if kernel_name == "gluon":
+        plan, _ = _sm89_plans(query, is_causal)
+        module, attribute = _gluon_async_copy, "_dense_piper_attention_kernel"
+    else:
+        plan = _triton_plan(query, is_causal)
+        module, attribute = _backend, "_piper_attention_kernel"
     prepared = _prepare_piper_attention(
         query, key, value, head_dim**-0.5, is_causal, execution_plan=plan
     )
@@ -641,14 +807,14 @@ def test_one_launch_covers_all_query_rows(monkeypatch, query_length, head_dim, i
     output.fill_(float("nan"))
     prepared = replace(prepared, output=output)
     launches = []
-    kernel = _backend._piper_attention_kernel
+    kernel = getattr(module, attribute)
 
     class CountedKernel:
         def __getitem__(self, grid):
             launches.append(grid)
             return kernel[grid]
 
-    monkeypatch.setattr(_backend, "_piper_attention_kernel", CountedKernel())
+    monkeypatch.setattr(module, attribute, CountedKernel())
     with torch.no_grad():
         actual = _launch_piper_attention(prepared)
         expected = reference_piper_attention(
@@ -701,7 +867,7 @@ def test_explicit_execution_plan_runs_native_loop_controls() -> None:
     query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    production_plan = _default_piper_attention_execution_plan(query, True)
+    production_plan = _triton_plan(query, True)
     alternate_plan = replace(
         production_plan,
         block_m=64,

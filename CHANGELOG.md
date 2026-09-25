@@ -11,6 +11,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
 
+### Changed
+
+- Dense Piper attention on SM89 runs a new Gluon kernel that stages Q64/K64 tiles through
+  `cp.async` and keeps dense Piper's per-token scales and K64 recurrence. On an RTX 4070 Ti
+  SUPER at 16K tokens and 16 heads, whole calls take 7.6/11.8/3.9/6.4 ms instead of
+  10.4/26.3/8.7/19.0 ms (D64/D128 non-causal, D64/D128 causal). Error against exact FP64
+  attention changes by at most 1.4% of its previous value.
+- SM89 dense Piper compiles fewer kernel specializations than SM120 for the same workload
+  (54 vs 82 on a mixed workload, previously 86): ragged query and key lengths reuse one
+  kernel, and Q/K/V quantization no longer specializes on length-dependent strides. SM120
+  kernels are unchanged.
+
 ## [0.7.6rc1] - 2026-09-25
 
 ### Changed

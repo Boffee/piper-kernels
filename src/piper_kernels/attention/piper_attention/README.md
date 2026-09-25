@@ -5,7 +5,8 @@ are shared by NVIDIA and AMD. Dispatch inspects operand-device metadata only.
 Unsupported targets retain the portable quantized reference. Numerical reductions
 here are part of preparation or attention, not implicit input validation.
 
-- `_nvidia/`: the existing SM8x/SM12x Triton kernels and measured launch policies.
+- `_nvidia/`: the existing SM8x/SM12x Triton kernels, the `cp.async` Gluon kernel
+  (`gluon_async_copy.py`), and measured launch policies.
 - `_amd/`: ROCm RDNA4 (`gfx1200`/`gfx1201`) Gluon attention and packed V preparation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
@@ -28,6 +29,12 @@ probability-code units until the output epilogue.
   that boundary to avoid descriptor setup overhead in short eager calls. Both use
   three pipeline stages.
 - Non-causal D128 uses K/V descriptors and two pipeline stages at every length.
+
+Exact SM89 runs the Gluon kernel instead, staging Q, K, and V tiles through
+`cp.async` commit groups with Q64/K64 tiles and four warps. It keeps per-thread Q/K
+scales and derives the V log-scale bound. Register caps of 168 (D64) and 232 (D128)
+let three and two CTAs share an SM. Only the final K64 tile carries masks, so ragged
+lengths reuse one compiled kernel. Causal grids start with the longest query rows.
 
 Selection uses host metadata only. See [_nvidia/policy.py](_nvidia/policy.py) for
 launch choices and the [benchmark guide](../../../../benchmarks/README.md#attention-tuning-workload-anchors)
