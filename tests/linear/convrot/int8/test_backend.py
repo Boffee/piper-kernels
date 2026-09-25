@@ -148,15 +148,17 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
     ],
 )
 @pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize(("rows", "columns"), [(2, 7), (64, 25600)])
 def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
-    monkeypatch, backend, target, static
+    monkeypatch, backend, target, static, rows, columns
 ):
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    value = torch.empty(2, 64)
-    prepared = (torch.empty(2, 32, dtype=torch.int8), torch.empty(2))
-    weight, scale = torch.empty(7, 32, dtype=torch.int8), torch.empty(7, 1)
-    second = (torch.empty_like(weight), torch.empty_like(scale), torch.empty(7))
-    output = torch.empty(2, 18)[:, 2:-2]
+    value = torch.empty(rows, 64)
+    prepared = (torch.empty(rows, 32, dtype=torch.int8), torch.empty(rows))
+    weight = torch.empty(columns, 32, dtype=torch.int8)
+    scale = torch.empty(columns, 1)
+    second = (torch.empty_like(weight), torch.empty_like(scale), torch.empty(columns))
+    output = torch.empty(rows, 2 * columns + 4)[:, 2:-2]
     prepare = Mock(return_value=prepared)
     project = Mock(return_value=output)
     monkeypatch.setattr(backend, "prepare_input_with_plan", prepare)
@@ -179,9 +181,7 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
     )
     assert result is output
     if backend is nvidia:
-        expected_plan = backend.default_execution_plan(
-            weight, target=target, rows=value.shape[0], projection_count=2
-        )
+        expected_plan = backend.default_execution_plan(weight, target=target, rows=rows)
     assert project.call_args.args[-1] == expected_plan
     assert project.call_args.kwargs == {"out": output, "second_projection": second}
 

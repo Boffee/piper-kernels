@@ -1,10 +1,12 @@
 """Host-side execution-plan policy tests for INT8 ConvRot."""
 
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
 from piper_kernels.linear.convrot.int8._nvidia.policy import (
     NvidiaExecutionPlan,
     select_execution_plan,
@@ -195,24 +197,13 @@ def test_shape_aware_schedule_preserves_preparation(rows, k, n, block_m):
     )
 
 
-def test_shape_aware_schedule_accounts_for_paired_tiles():
-    args = {"in_features": 1024, "out_features": 1024, "rows": 1280}
-    assert select_execution_plan(_SM120, **args).matmul_block_m == 64
-    assert select_execution_plan(_SM120, **args, projection_count=2).matmul_block_m == 128
-    thin = {"in_features": 2048, "out_features": 16, "rows": 4096}
-    assert select_execution_plan(_SM120, **thin).matmul_block_m == 32
-    assert select_execution_plan(_SM120, **thin, projection_count=2).matmul_block_m == 64
-
-
 @pytest.mark.parametrize("out_features", [16, 64, 65, 257, 1024, 3072, 5376, 14336])
-@pytest.mark.parametrize("projection_count", [1, 2])
-def test_shape_aware_schedule_is_monotonic_in_rows(out_features, projection_count):
+def test_shape_aware_schedule_is_monotonic_in_rows(out_features):
     blocks = [
         select_execution_plan(
             _SM120,
             in_features=2048,
             out_features=out_features,
-            projection_count=projection_count,
             rows=rows,
         ).matmul_block_m
         for rows in (*range(1, 4097), 8192, 16384, 32768, 100000)
@@ -227,6 +218,32 @@ def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
     assert select_execution_plan(
         target, in_features=3072, rows=128, out_features=2048
     ) == select_execution_plan(target, in_features=3072)
+
+
+@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
+def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_features):
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=5376)
+    expected = replace(
+        base,
+        fuse_rotation_quantization=False,
+        fused_num_warps=16,
+        rotation_num_warps=8,
+        quantization_num_warps=2,
+        matmul_block_m=16,
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        matmul_num_stages=2,
+    )
+    architecture_policy = Mock(return_value=expected)
+    monkeypatch.setattr(nvidia_policy, "_sm120_execution_plan", architecture_policy)
+
+    actual = select_execution_plan(_SM120, in_features=5376, rows=rows, out_features=out_features)
+
+    assert actual is expected
+    architecture_policy.assert_called_once_with(
+        in_features=5376, rows=rows, out_features=out_features
+    )
 
 
 def test_execution_plan_serializes_flat_tuning_fields() -> None:

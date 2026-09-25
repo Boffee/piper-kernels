@@ -121,9 +121,7 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
     second_dense_weight = -dense_weight if args.paired else None
     prepared = nvidia.prepare_input(value, group_size)
     output = torch.empty(m, n * (2 if args.paired else 1), device=value.device, dtype=value.dtype)
-    selected = nvidia.default_execution_plan(
-        qdata, rows=m, projection_count=2 if args.paired else 1
-    )
+    selected = nvidia.default_execution_plan(qdata, rows=m)
     production = selected
     if args.compare_schedules:
         production = replace(

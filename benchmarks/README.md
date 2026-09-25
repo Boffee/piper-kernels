@@ -472,18 +472,20 @@ SM120 uses three GEMM configurations, selected from host shape metadata:
 | Large | 128 | 256 | 128 | 8 | 3 |
 
 For input `[M,K]` and weight `[N,K]`, M is the flattened row count and N is the output
-width of each projection. P is 1 for a single projection and 2 for paired projections.
+width of each projection. Single and paired projections use the same selection rules.
 Apply these rules in order:
 
-1. Use small tiles when `M <= 32` or `ceil(M/32) * ceil(N/64) * P <= 128`.
-2. Otherwise use medium tiles when `N <= 64` or `M * ceil(N/256) * P < 128 * 72`.
+1. Use small tiles when `M <= 32` or `ceil(M/32) * ceil(N/64) <= 128`.
+2. Otherwise use medium tiles when `N <= 64` or `M * ceil(N/256) < 128 * 72`.
 3. Otherwise use large tiles.
 
 The thresholds count 128 small output tiles and 72 useful large output tiles. The large
 count uses actual M so a one-row tail does not count as a full 128-row tile. Narrow outputs
 stay within the existing small/medium configurations because wider tiles add no input reuse.
-Selection is monotonic in M for fixed N/P. K affects preparation but not GEMM tile selection;
+Selection is monotonic in M for fixed N. K affects preparation but not GEMM tile selection;
 preparation remains independent of N so inputs can be shared across projections.
+Paired gate/up projections still share one GEMM launch; their combined width does not
+change the tile choice.
 
 These fixed heuristics were measured on an RTX 5090. Performance on other SM120 devices
 has not been established. Other architectures retain their existing schedules. Selection uses
@@ -540,6 +542,10 @@ records are in `artifacts/convrot-mn-policy-commit-20260924/`,
 `artifacts/convrot-simple-policy-20260924/`, and `artifacts/convrot-m-only-20260924/`.
 The latter compares fixed M-only cutoffs with the M/N
 policy across projection mixes derived from 0.6B-, 2B-, 8B-, and 32B-scale models.
+Earlier paired measurements used projection count in selection. The full-FFN ablation in
+`artifacts/convrot-ffn-projection-count-20260924/` records the tradeoff behind removing that
+factor: it improved some short FFNs but regressed the tested K5120/N25600 FFN at M64 by
+about 15%. Ordinary single-projection selection is unchanged.
 
 Compare the original split-tail GEMM with a fully masked single launch and the production
 single launch, all using the fixed `128x256x128` tile configuration:

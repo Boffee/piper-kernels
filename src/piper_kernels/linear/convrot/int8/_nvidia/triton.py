@@ -107,7 +107,6 @@ def default_execution_plan(
     *,
     target: AcceleratorTarget | None = None,
     rows: int | None = None,
-    projection_count: int = 1,
 ) -> LinearExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
@@ -116,7 +115,6 @@ def default_execution_plan(
         in_features=weight_qdata.shape[1],
         rows=rows,
         out_features=weight_qdata.shape[0],
-        projection_count=projection_count,
     )
 
 
@@ -393,11 +391,7 @@ def linear_prepared(
     second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
-    plan = default_execution_plan(
-        weight_qdata,
-        rows=math.prod(input_qdata.shape[:-1]),
-        projection_count=2 if second_projection is not None else 1,
-    )
+    plan = default_execution_plan(weight_qdata, rows=math.prod(input_qdata.shape[:-1]))
     return execute_prepared_linear(
         input_qdata,
         input_scale,

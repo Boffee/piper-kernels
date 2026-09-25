@@ -369,7 +369,7 @@ def test_default_linear_execution_plan_accepts_explicit_target_for_meta_weight()
 @pytest.mark.parametrize(
     ("rows", "k", "n"),
     [(m, 272, 73) for m in (1, 127, 128, 129, 384, 511, 512, 513, 1025, 2177)]
-    + [(128, 256, 1024), (512, 256, 1024), (1280, 256, 1024), (1281, 256, 1024)],
+    + [(128, 256, 1024), (512, 256, 1024), (2304, 256, 1024), (2305, 256, 1024)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_shape_aware_paired_projection_matches_previous_schedule_with_tails(rows, k, n, dtype):
