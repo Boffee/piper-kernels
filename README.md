@@ -140,6 +140,10 @@ Update imports under `piper_kernels.fusions`, compile-option helper names, and a
 Shared weight rotation lives under `weights.convrot`, with reusable accelerator
 primitives under `_triton`. Linear operators and compile options live under `linear.convrot`.
 
+CPU linear execution uses PyTorch's INT8 matrix multiplication with INT32 accumulation,
+including in eager mode. PyTorch selects the available CPU implementation; performance depends
+on its build and the CPU's instruction support. Weight storage remains INT8.
+
 Quantize a dense weight, or wrap existing checkpoint storage without dequantizing it,
 then use the resulting tensor as a normal linear weight:
 
