@@ -67,7 +67,9 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
         pytest.param(
             amd,
             AcceleratorTarget("hip", "gfx1201"),
-            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm is Linux-only"),
+            marks=pytest.mark.skipif(
+                sys.platform not in ("linux", "win32"), reason="requires Linux or Windows ROCm"
+            ),
         ),
     ],
 )
@@ -143,7 +145,9 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
         pytest.param(
             amd,
             AcceleratorTarget("hip", "gfx1201"),
-            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only"),
+            marks=pytest.mark.skipif(
+                sys.platform not in ("linux", "win32"), reason="requires Linux or Windows ROCm"
+            ),
         ),
     ],
 )

@@ -96,11 +96,15 @@ distribution with its matching Triton; Piper does not pin a competing Linux Trit
 The extra selects Triton 3.8 via
 [`triton-windows`](https://github.com/triton-lang/triton-windows) on 64-bit Windows.
 
-Optimized Windows execution requires Windows 10 or 11, a supported NVIDIA GPU with a
-current driver, and the Visual C++ Redistributable for Visual Studio 2015-2022. The
-Windows wheel bundles its CUDA toolchain and TinyCC, so a separate CUDA toolkit or Visual
-Studio install is not required for Piper's Triton kernels. The base package remains
-portable and does not require either Triton distribution.
+Optimized Windows execution requires Windows 10 or 11, a supported GPU with a current
+driver, and the Visual C++ Redistributable for Visual Studio 2015-2022. For NVIDIA,
+the Windows wheel bundles its CUDA toolchain and TinyCC, so a separate CUDA toolkit or
+Visual Studio install is not required for Piper's Triton kernels. For AMD, install
+[TheRock's ROCm PyTorch build](https://github.com/ROCm/TheRock/blob/main/RELEASES.md)
+and its matching GPU device packages. AMD dispatch accepts Linux and Windows with the
+same architecture limits; on-device correctness and performance validation is currently
+Linux-only. Run the ROCm hardware regressions below before relying on Windows execution.
+The base package remains portable and does not require either Triton distribution.
 
 ## Shared weight formats
 
@@ -344,7 +348,7 @@ ROCm environment rather than `uv sync` in that environment.
 `from_hp()`, `from_quantized()`, and `dequantize()` API. It carries packed INT8
 weights, FP32 weight scales, and an optional FP32 `act_per_tensor_scale` tensor.
 `piper_kernels.conv3d.convrot.int8.ConvRotInt8Conv3d` consumes that weight with a
-fixed activation scale. Optimized backends target SM120 and Linux ROCm RDNA4
+fixed activation scale. Optimized backends target SM120 and ROCm RDNA4
 (`gfx1200`/`gfx1201`), with a portable reference elsewhere. Loading contiguous
 checkpoint tensors preserves mmap storage. H3 encoder compile options fuse framewise
 GroupNorm, SiLU, padding, and residuals around explicitly installed quantized convolutions.
@@ -610,7 +614,7 @@ supported targets use the generic schedule. Production plan selection depends on
 dimension, and causal mode, not sequence length. Hopper lowers the operation through
 unsupported WGMMA and therefore uses the slow portable quantized reference.
 
-Linux ROCm RDNA4 (`gfx1200`/`gfx1201`) also has a native dense backend for D64/D128,
+ROCm RDNA4 (`gfx1200`/`gfx1201`) also has a native dense backend for D64/D128,
 FP16/BF16, causal and non-causal attention, and GQA/MQA. It shares the AMD signed-QK
 and mixed-sign-PV WMMA fragments with sparse Piper, but retains dense Piper's per-token
 V scales and K64 recurrence. Q/K use Q32/K64 scale groups; V is quantized directly into
@@ -833,11 +837,14 @@ processes with `@pytest.mark.usefixtures("large_device_memory")` so they run one
 
 ### ROCm hardware regressions
 
-Run the focused RDNA4 suite with the Python from an existing Linux ROCm environment:
+Run the focused RDNA4 suite with the Python from an existing ROCm environment:
 
 ```shell
 /path/to/rocm-env/bin/python scripts/run_rocm_regressions.py --junitxml=artifacts/rocm-results.xml
 ```
+
+On native Windows, use the environment's `Scripts/python.exe` instead. The runner accepts
+both Linux and Windows and requires the native backends on either platform.
 
 The environment needs Python 3.13+, ROCm PyTorch 2.14+ with its matching Triton,
 TorchAO 0.17+, and the dependencies in the `test` group. Do not use the repository's

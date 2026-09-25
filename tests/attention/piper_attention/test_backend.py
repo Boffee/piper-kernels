@@ -14,11 +14,11 @@ from piper_kernels.attention.piper_attention.triton import triton_piper_attentio
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx942", "gfx1100", "sm120", None])
-@pytest.mark.parametrize("platform", ["linux", "win32"])
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
 def test_amd_target_gate(monkeypatch, architecture, platform):
     monkeypatch.setattr(policy.sys, "platform", platform)
     target = AcceleratorTarget("hip", architecture)
-    expected = platform == "linux" and architecture in ("gfx1200", "gfx1201")
+    expected = platform in ("linux", "win32") and architecture in ("gfx1200", "gfx1201")
     assert policy.supports_target(target) is expected
     assert _backend.select_backend(target) is (_backend.amd_attention if expected else None)
 

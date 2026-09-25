@@ -6,7 +6,7 @@ Unsupported targets retain the portable quantized reference. Numerical reduction
 here are part of preparation or attention, not implicit input validation.
 
 - `_nvidia/`: the existing SM8x/SM12x Triton kernels and measured launch policies.
-- `_amd/`: Linux RDNA4 (`gfx1200`/`gfx1201`) Gluon attention and packed V preparation.
+- `_amd/`: ROCm RDNA4 (`gfx1200`/`gfx1201`) Gluon attention and packed V preparation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
 

@@ -31,9 +31,9 @@ class AmdExecutionPlan(LinearExecutionPlan):
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
-    """Select only Linux HIP architectures covered by the AMD compile tests."""
+    """Select HIP architectures covered by the AMD compile tests on Linux and Windows."""
     return (
-        sys.platform == "linux"
+        sys.platform in ("linux", "win32")
         and target.is_amd_hip
         and target.is_architecture(*_SUPPORTED_ARCHITECTURES)
     )

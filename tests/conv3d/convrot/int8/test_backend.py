@@ -19,15 +19,19 @@ from piper_kernels.specializations.minimax_h3_vae.conv3d import _compile
     [
         (AcceleratorTarget("cuda", "sm120"), "nvidia"),
         (AcceleratorTarget("cuda", "sm100"), None),
-        (AcceleratorTarget("hip", "gfx1200"), "amd" if sys.platform == "linux" else None),
-        (AcceleratorTarget("hip", "gfx1201"), "amd" if sys.platform == "linux" else None),
+        (AcceleratorTarget("hip", "gfx1200"), "amd"),
+        (AcceleratorTarget("hip", "gfx1201"), "amd"),
         (AcceleratorTarget("hip", "gfx1100"), None),
         (AcceleratorTarget("hip", "gfx942"), None),
         (AcceleratorTarget("hip", "gfx9999"), None),
         (AcceleratorTarget("cpu", "cpu"), None),
     ],
 )
-def test_select_backend_uses_target_policy(monkeypatch, target, vendor):
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
+def test_select_backend_uses_target_policy(monkeypatch, target, vendor, platform):
+    monkeypatch.setattr(sys, "platform", platform)
+    if vendor == "amd" and platform not in ("linux", "win32"):
+        vendor = None
     implementations = {"nvidia": object(), "amd": object(), None: None}
     monkeypatch.setattr(_backend, "_nvidia_backend", implementations["nvidia"])
     monkeypatch.setattr(_backend, "_amd_backend", implementations["amd"])
@@ -151,8 +155,8 @@ def test_compiler_cache_tracks_backend_sources(monkeypatch):
     assert set(files) <= set(capture.call_args.args[0])
 
 
-def test_amd_policy_requires_linux(monkeypatch):
-    monkeypatch.setattr(amd.sys, "platform", "win32")
+def test_amd_policy_rejects_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(amd.sys, "platform", "darwin")
     assert not amd.supports_target(AcceleratorTarget("hip", "gfx1201"))
 
 

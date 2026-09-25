@@ -24,12 +24,12 @@ def _available():
     )
 
 
-@pytest.mark.parametrize("platform", ["linux", "win32"])
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
 @pytest.mark.parametrize("arch", ["gfx1200", "gfx1201", "gfx1100", "gfx942", "gfx9999"])
-def test_amd_projection_support_is_limited_to_linux_rdna4(monkeypatch, platform, arch):
+def test_amd_projection_support_is_limited_to_linux_and_windows_rdna4(monkeypatch, platform, arch):
     monkeypatch.setattr(sys, "platform", platform)
     assert policy.supports_target(AcceleratorTarget("hip", arch)) is (
-        platform == "linux" and arch in ("gfx1200", "gfx1201")
+        platform in ("linux", "win32") and arch in ("gfx1200", "gfx1201")
     )
 
 

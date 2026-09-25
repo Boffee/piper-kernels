@@ -50,8 +50,14 @@ def _check_environment() -> None:
     from piper_kernels.fusions.convrot_int8_sparse_piper import _backend as fusion  # noqa: PLC0415
     from piper_kernels.linear.convrot.int8 import _backend as linear  # noqa: PLC0415
 
-    if sys.platform != "linux" or torch.version.hip is None or not torch.cuda.is_available():
-        raise SystemExit("ROCm regressions require Linux ROCm PyTorch and a visible RDNA4 GPU.")
+    if (
+        sys.platform not in ("linux", "win32")
+        or torch.version.hip is None
+        or not torch.cuda.is_available()
+    ):
+        raise SystemExit(
+            "ROCm regressions require Linux or Windows ROCm PyTorch and a visible RDNA4 GPU."
+        )
     target = AcceleratorTarget.from_device(torch.device("cuda"))
     if not target.is_amd_hip or not target.is_architecture("gfx1200", "gfx1201"):
         raise SystemExit(f"ROCm regressions require RDNA4 (gfx1200/gfx1201), got {target}.")
@@ -72,6 +78,7 @@ def _check_environment() -> None:
     environment = {
         "checkout": str(_ROOT),
         "python": platform.python_version(),
+        "platform": sys.platform,
         "executable": sys.executable,
         "torch": torch.__version__,
         "hip": torch.version.hip,
