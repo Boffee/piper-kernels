@@ -1,7 +1,10 @@
+from dataclasses import replace
+
 import pytest
 import torch
 from lib.attention import AttentionConfig
 from lib.providers import ProviderPhase
+from lib.tuning import UnsupportedTuningCandidateError
 from tune_piper_attention import (
     _candidate_plans,
     _make_candidate,
@@ -61,6 +64,31 @@ def test_sm89_tuner_defaults_to_production_preparation() -> None:
     production_plan = _sm89_production_plan()
 
     assert _candidate_plans(_parse_args([]), production_plan) == (production_plan,)
+
+
+def test_sm89_tuner_can_measure_the_triton_recurrence() -> None:
+    production_plan = _sm89_production_plan()
+
+    plans = _candidate_plans(_parse_args(["--no-use-gluon-kernel"]), production_plan)
+
+    assert production_plan.use_gluon_kernel
+    assert [plan.use_gluon_kernel for plan in plans] == [False]
+    assert plans[0].max_registers is None
+
+
+def test_gluon_candidate_with_triton_tiling_is_unsupported() -> None:
+    plan = replace(_sm89_production_plan(), block_m=128)
+    tensor = torch.empty((1, 1, 8, 128), device="meta")
+    candidate = _make_candidate(
+        plan,
+        (tensor, tensor, tensor),
+        config=AttentionConfig(dtype=torch.float16, scale=128**-0.5, seed=7),
+        target=_SM89,
+    )
+
+    assert candidate.name.startswith("gluon-regs232-")
+    with pytest.raises(UnsupportedTuningCandidateError, match="Gluon kernel requires"):
+        candidate.make_provider()
 
 
 def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
