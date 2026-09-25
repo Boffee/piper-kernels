@@ -5,10 +5,24 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-09-25
+
 ### Changed
 
+- Dense NVIDIA Piper attention handles full query tiles and ragged tails in one launch.
+  On SM120, causal D128 attention uses K/V tensor descriptors from 1,024 query tokens.
+- Sparse Piper attention on SM120 and RDNA4 shares Q/K quantization with min/max routing
+  summaries, limits key summaries to the sparse prefix, and reduces padded preparation
+  copies and peak memory.
+- ConvRot INT8 combines full and tail matrix tiles in one NVIDIA/AMD launch. SM120 selects
+  smaller tiles for short inputs using the output dimensions.
 - ConvRot INT8 CPU linears use PyTorch's INT8 matrix multiplication with INT32 accumulation,
   avoiding full INT32 copies of the input and weight before each multiplication.
+
+### Fixed
+
+- Register the NVIDIA mixed-sign INT8 compiler hook before Piper kernels compile, avoiding
+  redundant compilation of preparation kernels on the second attention call.
 
 ## [0.7.4] - 2026-09-22
 
@@ -667,7 +681,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.5...HEAD
+[0.7.5]: https://github.com/Boffee/piper-kernels/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/Boffee/piper-kernels/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/Boffee/piper-kernels/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/Boffee/piper-kernels/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/Boffee/piper-kernels/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...v0.7.0
 [0.7.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...v0.7.0rc1
