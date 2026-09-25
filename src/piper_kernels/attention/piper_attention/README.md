@@ -10,23 +10,28 @@ here are part of preparation or attention, not implicit input validation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
 
-## NVIDIA query tails
+## NVIDIA scheduling
 
-The prepared attention recurrence uses one launch for both full query tiles and
-a ragged final tile. A branch shared by every thread in a CTA preserves unmasked
-loads and stores for full tiles, including the Q tensor-descriptor path when
-selected. The tail uses masked Q pointer loads and output stores in the same
-grid. Aligned query lengths compile without the branch. Optimized causal
-traversal visits query tiles in reverse order, including the tail first.
+The attention recurrence handles full query tiles and a ragged final tile in one
+launch. Full tiles retain unmasked access, including Q descriptor loads when selected;
+the tail uses masked Q pointer loads and output stores. Aligned grids compile without
+the tail branch. Optimized causal traversal visits query tiles in reverse order.
+Quantization and statistics preparation use separate launches.
 
-This changes scheduling only: tile sizes, Q/K/V quantization, key traversal,
-FP32 accumulation, and value-mean restoration retain their existing behavior.
-Quantization and statistics preparation still use separate launches.
+Exact SM120 uses Q64 tiles for causal attention and Q128 for non-causal attention,
+with K64 tiles and four warps. D128 splits PV into two FP32 D64 accumulators.
+Non-causal attention derives its V log-scale bound. FP32 numerators remain in
+probability-code units until the output epilogue.
 
-On exact SM120, causal D64 enables loop-invariant code motion for ragged query
-grids to avoid a long-context regression in the combined kernel. Aligned grids
-retain the original loop schedule. This follows tile alignment, with no
-sequence-length crossover or change to query tile size.
+- Causal D64 enables loop-invariant code motion only for ragged query grids.
+- Causal D128 uses K/V descriptors from 1,024 query tokens and pointer loads below
+  that boundary to avoid descriptor setup overhead in short eager calls. Both use
+  three pipeline stages.
+- Non-causal D128 uses K/V descriptors and two pipeline stages at every length.
+
+Selection uses host metadata only. See [_nvidia/policy.py](_nvidia/policy.py) for
+launch choices and the [benchmark guide](../../../../benchmarks/README.md#attention-tuning-workload-anchors)
+for performance measurements.
 
 ## RDNA4 behavior
 

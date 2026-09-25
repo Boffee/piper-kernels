@@ -10,6 +10,8 @@ from piper_kernels.attention.scheduling import (
     NUM_WARPS_VALUES,
 )
 
+_SM120_CAUSAL_DESCRIPTOR_MIN_QUERY_LENGTH = 1024
+
 
 def supports_target(target: AcceleratorTarget) -> bool:
     """Require the NVIDIA MMAv2 lowering handled by the mixed-sign extension."""
@@ -94,7 +96,10 @@ def _sm120_execution_plan(
 ) -> PiperAttentionExecutionPlan:
     """Build the loop, probability, and value-metadata plan measured on exact SM120."""
     split_pv_head_dim = head_dim == 128
-    use_tensor_descriptors = head_dim == 128 and not is_causal
+    # Short causal calls keep pointer loads to avoid descriptor setup overhead.
+    use_tensor_descriptors = head_dim == 128 and (
+        not is_causal or query_length >= _SM120_CAUSAL_DESCRIPTOR_MIN_QUERY_LENGTH
+    )
     block_m = 64 if is_causal else 128
     # Packed conversion wins for D64 and non-causal D128. The D128 causal
     # specialization is neutral to slightly slower and retains stock lowering.
@@ -103,7 +108,7 @@ def _sm120_execution_plan(
         grouped_qk=True,
         split_pv_head_dim=split_pv_head_dim,
         use_tensor_descriptors=use_tensor_descriptors,
-        num_stages=2 if use_tensor_descriptors else 3,
+        num_stages=2 if use_tensor_descriptors and not is_causal else 3,
         derive_value_log_bound=not is_causal,
         optimize_causal_traversal=is_causal,
         # The combined full/tail kernel benefits from loop-invariant motion

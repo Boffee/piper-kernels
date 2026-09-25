@@ -52,6 +52,52 @@ def test_noncausal_d128_execution_plan_is_sequence_length_invariant(sequence: in
     assert plan.use_packed_probability_conversion
 
 
+@pytest.mark.parametrize(("batch", "heads"), [(1, 1), (1, 16), (4, 48)])
+@pytest.mark.parametrize(
+    ("sequence", "descriptors"),
+    [
+        (128, False),
+        (512, False),
+        (768, False),
+        (1023, False),
+        (1024, True),
+        (1025, True),
+        (1536, True),
+        (4096, True),
+        (131072, True),
+        (131073, True),
+    ],
+)
+def test_sm120_causal_d128_load_schedule_uses_query_metadata(
+    batch: int,
+    heads: int,
+    sequence: int,
+    descriptors: bool,
+) -> None:
+    query = torch.empty((batch, heads, sequence, 128), device="meta")
+
+    plan = _default_piper_attention_execution_plan(query, True, target=_SM120)
+
+    # The short plan supplies all numerical choices and the three-stage launch.
+    assert plan == replace(
+        _select(_SM120, is_causal=True),
+        use_tensor_descriptors=descriptors,
+    )
+
+
+@pytest.mark.parametrize("target", [_SM80, _SM89, _SM121])
+@pytest.mark.parametrize("sequence", [1024, 1025, 131073])
+def test_other_targets_retain_causal_d128_load_schedule(
+    target: AcceleratorTarget,
+    sequence: int,
+) -> None:
+    query = torch.empty((1, 16, sequence, 128), device="meta")
+
+    plan = _default_piper_attention_execution_plan(query, True, target=target)
+
+    assert plan == _select(target, is_causal=True)
+
+
 @pytest.mark.parametrize("target", [_SM120, _SM121])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])

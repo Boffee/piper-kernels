@@ -103,59 +103,38 @@ rejected uniform tensor descriptors: D64 descriptors were 2–14% slower than po
 through 128K, with identical quality, so the D64-pointer/D128-descriptor distinction remains
 explicit.
 
-Exact-SM120 Piper policy likewise avoids short-context tuning thresholds: D128 always uses split
-PV, all non-causal attention derives its V log-scale bound, and non-causal D64 uses 128-row query
-tiles. Causal and non-causal D128 keep two FP32 D64 accumulators at every length;
-across H16/H48 and the three performance anchors, splitting causal D128 was 14.8–17.2% faster end
-to end than one FP32 D128 accumulator, with no measurable quality change. Earlier synthetic
-measurements found scaled FP16 10–14% faster than FP32 at 8K/32K/64K for only
-0.04/0.15/0.29 dB lower SQNR, and 8–9% faster at 128K with a 0.55 dB loss. Real MiniMax-H3
-activations at H56/D128 and 104K exposed a less stable quality tradeoff: FP16 lost 3.21 dB and
-3.90 dB versus FP32 in early and middle sampled layers, and changed the complete transformer
-output by 27.26 dB SQNR / 4.33% relative L2. Quality therefore takes precedence over those
-synthetic latency wins, and the scaled-FP16 recurrence and its 128K policy boundary have been
-removed. Non-causal D128 uniformly uses M128 tensor descriptors; above 128K, that schedule was
-6–9% faster on aligned square inputs and 55–59% faster on the long ragged and rectangular guards
-than M64 pointer loads. The shared FP32 numerator recurrence keeps numerators in UINT8
-probability-code units for D64 and D128 in both causal and non-causal attention, and removes the
-common factor of 255 once in the output epilogue, before non-causal value-mean restoration. On
-SM120 across H16/H48, D64/D128, and all three performance anchors, that scaling change reduced
-end-to-end latency by a per-cell median 0.47–2.00% over three fresh processes without a measurable
-quality change.
+Dense Piper's [NVIDIA scheduling policy](../src/piper_kernels/attention/piper_attention/README.md#nvidia-scheduling)
+uses FP32 accumulators; scaled FP16 was rejected after quality regressions on captured H3
+activations. Query tile size depends on target, head dimension, and causal mode, without a
+separate CTA-count heuristic. Alternate schedules remain available to the offline tuners.
 
-An H16/H48 fixed-plan screen retained M64 for causal attention. D128 M128 was roughly 1.9–2.1x
-slower at 8K–128K and compiled with 112 spills versus 16 for M64. D64 M128 was 4.8–6.4% slower at
-8K and ranged from 3.6% slower to effectively tied at 32K; although it became 5.8–7.2% faster at
-128K, adding a D64-only length crossover was rejected in favor of one causal M64 policy. Portable
-targets retain conservative explicit fallbacks.
+On RTX 5090, Torch 2.14.0+cu130, and Triton 3.8.0, the causal D128 descriptor schedule
+reduced complete attention latency at Harrier 0.6B dimensions (`B1/Hq16/Hkv8/D128`, BF16).
+These are medians across three fresh processes against the single-launch pointer baseline:
 
-Production attention planning starts from a 128-row query tile. Target policies explicitly select
-smaller tiles where kernel resource use requires them; head count and sequence length do not feed a
-separate CTA-count heuristic. Tile selection depends on accelerator target, head dimension, and
-causal mode. Dense Piper now handles full query tiles and their ragged tail in one launch;
-exact-SM120 causal D64 enables loop-invariant code motion only for ragged query grids to retain
-long-context performance in that combined kernel. Aligned grids keep the original schedule.
-This uses query-tile alignment, not a length crossover. Smaller tiles and alternate metadata paths
-remain available to the offline tuners.
+| Query tokens | CUDA-graph latency reduction | Eager wall latency reduction |
+|---:|---:|---:|
+| 1,024 | 24% | 4% |
+| 2,048 | 33% | 18% |
+| 4,096 | 36% | 31% |
 
-The single-launch change was checked against the split launcher at `e086641` on an RTX 5090,
-PyTorch 2.14.0+cu130, and Triton 3.8.0. For batch-one BF16 square attention, H16/H48,
-D64/D128, and both causal modes, complete operator latency fell by 13.8–22.0% at 1,025
-tokens, 6.2–22.4% at 8,193, and 1.9–15.3% at 32,769. Aligned 8,192-token cases stayed
-within 1.1% of the split baseline. These are medians across three fresh processes, each
-alternating providers over three repetitions with 20 ms synchronized-wall warmup and
-measurement windows. Prepared execution was measured separately with CUDA graphs.
-All 96 confirmation cases were bitwise equal. H16 checks also covered aligned 128K,
-131,073-token tails, and rectangular Q/KV inputs; the retained ragged causal D64 setting
-reduced complete 131,073-token latency from 167.37 ms to 151.74 ms in that long guard.
-These synthetic operator measurements do not establish model throughput or other-GPU speedups.
+Graph timings include preparation kernels and exclude per-call host setup. The loading
+boundary was checked at 1,023/1,024/1,025 tokens, with GQA/MQA, batch, dtype, and long-context
+guards. This evaluation measured scheduling only. Full-model speedup was not measured.
+
+The earlier single-launch change reduced complete eager latency by 13.8–22.0% at 1,025
+tokens, 6.2–22.4% at 8,193, and 1.9–15.3% at 32,769 versus split launcher `e086641`.
+Aligned 8,192-token cases stayed within 1.1%. These three-process medians used the same
+hardware/software stack, BF16 B1/H16 or H48, D64/D128, and both causal modes.
+The descriptor results above already include this change; the gains are not additive.
 
 Treat 8K, 32K, and 128K as evidence for one continuous plan rather than dispatch keys. Prefer a
 length-invariant policy whenever the algorithm is valid across the range; sampled anchors alone do
 not justify a threshold or a square-only specialization. If a future implementation has an
 unavoidable applicability or material performance boundary, probe immediately below and above it
-plus an irregular interior length. Performance selection starts at 8K; use the 2K guard only to
-reject pathological short-context behavior, not to create another crossover.
+plus an irregular interior length. For long-context work, performance selection starts at 8K;
+use the 2K guard to reject pathological short-context behavior. The causal D128 text-workload
+schedule above separately measures short contexts and its loading boundary.
 
 Tail correctness and long-context performance need different coverage. Exercise tile boundaries
 cheaply with small square lengths such as `63`, `64`, `65`, `127`, `128`, `129`, and `193`.
@@ -168,7 +147,7 @@ Small ragged tests establish the tile-local masking contract, but they do not re
 D64 and D128; it need not repeat the full H16/H48 matrix unless its result is unexpected. Test both
 `131072` and `131073` explicitly even though current production plans have no 128K transition:
 numerator precision, tile size, loading strategy, and score-reduction choices remain uniform across
-sequence lengths.
+that 128K boundary.
 
 Screen against the current production plan, then confirm a proposed winner in at least three fresh
 processes with alternating candidate/baseline order and an otherwise idle accelerator. Record
