@@ -70,6 +70,7 @@ class _PreparedSparsePiperOperands:
 
     ``query_summary``/``key_summary``/``key_aux`` are the min/max routing
     summaries, present only when preparation was asked to emit them.
+    Key summaries cover only the sparse prefix; query summaries cover all blocks.
     """
 
     key: torch.Tensor

@@ -261,8 +261,8 @@ def _run_sparse_piper_attention(
         assert operands.key_aux is not None
         routes = packed_routes_from_summaries(
             operands.query_summary,
-            operands.key_summary[:, :, :sparse_key_blocks],
-            operands.key_aux[:, :, :sparse_key_blocks],
+            operands.key_summary,
+            operands.key_aux,
             layout,
             routing_mode,
             skip_dense_routing=backend.skip_dense_routing,

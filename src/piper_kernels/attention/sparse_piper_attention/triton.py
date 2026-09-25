@@ -29,6 +29,7 @@ _BLOCK_N = 64
 _FUSED_DO_NOT_SPECIALIZE = (
     "logical_sequence_length",
     "storage_sequence_length",
+    "sparse_key_blocks",
     "stride_qb",
     "stride_qh",
     "stride_qn",
@@ -233,6 +234,7 @@ def _quantize_key_with_summary_kernel(
     block_lengths_ptr,
     logical_sequence_length,
     storage_sequence_length,
+    sparse_key_blocks,
     stride_kb,
     stride_kh,
     stride_kn,
@@ -261,18 +263,18 @@ def _quantize_key_with_summary_kernel(
     )
     head_block = (batch * heads + head).to(tl.int64)
 
-    # Routing summarizes raw K; quantization encodes K centered by its mean.
-    summary, auxiliary = sparse_piper_kernels.summarize_block_tiles(
-        tl.reshape(values, (1, 1, block_n, head_dim)),
-        tl.reshape(valid_rows, (1, block_n)),
-        tl.constexpr(False),
-        tl.constexpr(False),
-    )
-    summary_offsets = (
-        head_block * (storage_sequence_length // block_n) + key_block
-    ) * head_dim + features
-    tl.store(key_summary_ptr + summary_offsets, tl.reshape(summary, (head_dim,)))
-    tl.store(key_aux_ptr + summary_offsets, tl.reshape(auxiliary, (head_dim,)))
+    # Only the sparse prefix needs routing summaries; the dense suffix still
+    # needs quantization, but every query attends to it without routing.
+    if key_block < sparse_key_blocks:
+        summary, auxiliary = sparse_piper_kernels.summarize_block_tiles(
+            tl.reshape(values, (1, 1, block_n, head_dim)),
+            tl.reshape(valid_rows, (1, block_n)),
+            tl.constexpr(False),
+            tl.constexpr(False),
+        )
+        summary_offsets = (head_block * sparse_key_blocks + key_block) * head_dim + features
+        tl.store(key_summary_ptr + summary_offsets, tl.reshape(summary, (head_dim,)))
+        tl.store(key_aux_ptr + summary_offsets, tl.reshape(auxiliary, (head_dim,)))
 
     # Centering sees only the logical length, as the separate quantizer did, so a
     # zeroed padded row still centers to -mean and shares its tile's scale.
@@ -306,6 +308,7 @@ def _prepare_query_key_with_summaries(
     scale: float,
     *,
     storage_sequence_length: int,
+    sparse_key_blocks: int,
     block_lengths: torch.Tensor | None,
 ) -> tuple[qk_quantization.PreparedInt8QueryKey, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize Q/K and emit their min/max K64 summaries in one pass over each operand.
@@ -333,7 +336,7 @@ def _prepare_query_key_with_summaries(
         (batch, heads, blocks, head_dim), device=query.device, dtype=torch.float32
     )
     key_primary = torch.empty(
-        (batch, kv_heads, blocks, head_dim), device=key.device, dtype=torch.float32
+        (batch, kv_heads, sparse_key_blocks, head_dim), device=key.device, dtype=torch.float32
     )
     key_aux = torch.empty_like(key_primary)
     lengths_or_placeholder = block_lengths if block_lengths is not None else key_mean
@@ -367,6 +370,7 @@ def _prepare_query_key_with_summaries(
             lengths_or_placeholder,
             sequence_length,
             storage_sequence_length,
+            sparse_key_blocks,
             key.stride(0),
             key.stride(1),
             key.stride(2),
@@ -449,6 +453,7 @@ def _prepare_sparse_piper_operands(
             key_mean,
             scale,
             storage_sequence_length=storage_sequence_length,
+            sparse_key_blocks=sparse_key_blocks,
             block_lengths=block_lengths,
         )
     else:
