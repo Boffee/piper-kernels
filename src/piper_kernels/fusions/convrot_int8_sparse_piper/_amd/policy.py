@@ -12,7 +12,7 @@ def supports_head_dim(head_dim: int) -> bool:
 
 def supports_target(target: AcceleratorTarget) -> bool:
     return (
-        sys.platform == "linux"
+        sys.platform in ("linux", "win32")
         and target.is_amd_hip
         and target.is_architecture("gfx1200", "gfx1201")
     )

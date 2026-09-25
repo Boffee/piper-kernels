@@ -63,7 +63,7 @@ def piper_attention(
 
     The optimized backend supports NVIDIA SM8x and consumer Blackwell SM12x,
     where the packaged compiler extension can select mixed-sign MMAv2, and
-    Linux RDNA4 (gfx1200/gfx1201) using native mixed-sign WMMA. Other devices
+    ROCm RDNA4 (gfx1200/gfx1201) using native mixed-sign WMMA. Other devices
     use the portable quantized reference. This is an inference-only
     operator.
     """

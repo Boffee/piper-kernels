@@ -92,9 +92,11 @@ def _call(
     ],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
 def test_projection_selection_uses_operand_target_and_keeps_support_closed(
-    monkeypatch, target, head_dim
+    monkeypatch, target, head_dim, platform
 ):
+    monkeypatch.setattr(sys, "platform", platform)
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(
@@ -105,7 +107,7 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
     if target.is_cuda_capability(12, 0):
         expected = nvidia
     elif (
-        sys.platform == "linux"
+        platform in ("linux", "win32")
         and target.is_amd_hip
         and target.is_architecture("gfx1200", "gfx1201")
     ):
@@ -222,8 +224,11 @@ def test_unvalidated_projection_rejects_before_output_allocation(
         AcceleratorTarget("hip", "gfx1201"),
     ],
 )
-def test_output_support_is_independent_of_qkv_projection_support(monkeypatch, missing, target):
-    monkeypatch.setattr(sys, "platform", "linux")
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_output_support_is_independent_of_qkv_projection_support(
+    monkeypatch, missing, target, platform
+):
+    monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setattr(_backend, "_nvidia_projection", None)
     monkeypatch.setattr(_backend, "_amd_projection", None)
     probe = Mock(return_value=target)
@@ -253,8 +258,10 @@ def test_output_support_is_independent_of_qkv_projection_support(monkeypatch, mi
         ("linux", AcceleratorTarget("hip", "gfx1100")),
         ("linux", AcceleratorTarget("cuda", "sm121")),
         ("linux", AcceleratorTarget("cpu")),
-        ("win32", AcceleratorTarget("hip", "gfx1200")),
-        ("win32", AcceleratorTarget("hip", "gfx1201")),
+        ("win32", AcceleratorTarget("hip", "gfx1100")),
+        ("win32", AcceleratorTarget("cpu")),
+        ("darwin", AcceleratorTarget("hip", "gfx1200")),
+        ("darwin", AcceleratorTarget("hip", "gfx1201")),
     ],
 )
 def test_unvalidated_output_integration_rejects_before_resolving_operations(

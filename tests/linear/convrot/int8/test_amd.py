@@ -22,7 +22,9 @@ from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import _quantization as int8_quantization
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
+pytestmark = pytest.mark.skipif(
+    sys.platform not in ("linux", "win32"), reason="requires Linux or Windows ROCm"
+)
 
 _gpu = pytest.mark.skipif(
     torch.version.hip is None or not torch.cuda.is_available(),
@@ -31,12 +33,15 @@ _gpu = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
-def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architecture):
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
+def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architecture, platform):
+    monkeypatch.setattr(policy.sys, "platform", platform)
     target = AcceleratorTarget("hip", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"))
-    assert _backend.select_linear_backend(value) is amd
+    expected = amd if platform in ("linux", "win32") else None
+    assert _backend.select_linear_backend(value) is expected
     assert int8_updates.select_add(value) is int8_updates.add_
     assert int8_updates.select_addmm(value) is int8_updates.addmm_
     assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out

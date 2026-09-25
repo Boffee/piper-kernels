@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.6rc1] - 2026-09-25
+
+### Changed
+
+- Allow native Windows HIP dispatch for AMD dense Piper attention, ConvRot INT8 linear
+  and Conv3D, and ConvRot INT8 sparse-attention fusions using `triton-windows`. Existing
+  architecture limits remain unchanged. The ROCm hardware regression runner now accepts
+  Windows; on-device correctness and performance coverage is still Linux-only.
+
 ## [0.7.5] - 2026-09-25
 
 ### Changed

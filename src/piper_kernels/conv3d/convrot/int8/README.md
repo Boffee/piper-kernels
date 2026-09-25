@@ -20,7 +20,7 @@ plus bias, stride, and spatial padding. Quantization state belongs to the weight
   height and width greater than one. Strides are three positive integers;
   dilation and convolution groups are not supported.
 
-Optimized backends target NVIDIA SM120 and Linux ROCm RDNA4 (`gfx1200`/`gfx1201`);
+Optimized backends target NVIDIA SM120 and ROCm RDNA4 (`gfx1200`/`gfx1201`);
 other devices use the portable reference. RX 9070 XT (`gfx1201`) has hardware
 correctness/performance coverage; `gfx1200` also has offline compilation coverage.
 GroupNorm statistics, affine transforms, SiLU, rotation, rescaling, bias, and

@@ -13,7 +13,7 @@ from .._plan import ConvolutionPlan, PreparationPlan
 def supports_target(target: AcceleratorTarget) -> bool:
     """gfx1201 has runtime coverage; gfx1200 also has offline compilation coverage."""
     return (
-        sys.platform == "linux"
+        sys.platform in ("linux", "win32")
         and target.is_amd_hip
         and target.is_architecture("gfx1200", "gfx1201")
     )
