@@ -6,6 +6,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from lib.convrot_int8_legacy import legacy_matmul
 from torch import nn
 
 from piper_kernels._triton import convrot as convrot_backend
@@ -364,6 +365,56 @@ def test_default_linear_execution_plan_accepts_explicit_target_for_meta_weight()
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only launch policy")
+@pytest.mark.parametrize(
+    ("rows", "k", "n"),
+    [(m, 272, 73) for m in (1, 127, 128, 129, 384, 511, 512, 513, 1025, 2177)]
+    + [(128, 256, 1024), (512, 256, 1024), (2304, 256, 1024), (2305, 256, 1024)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_shape_aware_paired_projection_matches_previous_schedule_with_tails(rows, k, n, dtype):
+    torch.manual_seed(512)
+    # Tail K/N, leading dimensions, mixed bias types, and row-strided outputs
+    # exercise all three schedules with two independent projections.
+    value = torch.randint(-127, 128, (1, rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(1, rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    second_weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    second_scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.float32)
+    second_bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    second_projection = (second_weight, second_scale, second_bias)
+    previous = int8_nvidia.default_execution_plan(weight)
+    expected = int8_nvidia.execute_prepared_linear(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        dtype,
+        previous,
+        second_projection=second_projection,
+    )
+    storage = torch.full((1, rows, 2 * n + 13), 42, device="cuda", dtype=dtype)
+    out = storage[..., : 2 * n]
+    actual = int8_nvidia.linear_prepared(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        dtype,
+        out=out,
+        second_projection=second_projection,
+    )
+    assert actual is out
+    assert torch.equal(actual, expected)
+    assert torch.all(storage[..., 2 * n :] == 42)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA-only low-level utility")
 def test_injected_linear_execution_plan_matches_reference(activation_fn: str | None) -> None:
@@ -666,6 +717,54 @@ def test_sm120_large_matmul_matches_reference(
             torch.testing.assert_close(actual, expected)
     else:
         torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.04)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(
+    ("rows", "k", "n"),
+    [
+        (1, 64, 96),
+        (512, 512, 256),
+        (513, 512, 256),
+        (2177, 512, 256),
+        (512, 512, 257),
+        (513, 512, 257),
+        (512, 272, 256),
+        (513, 272, 257),
+        (2177, 272, 257),
+        (513, 64, 96),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("paired", [False, True])
+def test_per_tile_tail_matches_split_with_bias_and_strided_output(rows, k, n, dtype, paired):
+    torch.manual_seed(927)
+    value = torch.randint(-127, 128, (1, rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(1, rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.float32)
+    second = None
+    if paired:
+        second = (
+            torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8),
+            torch.rand(n, 1, device="cuda") * 0.01,
+            torch.randn(n, device="cuda", dtype=torch.float16),
+        )
+    plan = int8_nvidia.default_execution_plan(weight)
+    args = (value, row_scale, weight, scale, bias, dtype, plan)
+    width = n * (2 if paired else 1)
+    expected = torch.empty((1, rows, width), device="cuda", dtype=dtype)
+    legacy_matmul(
+        (value, row_scale), weight, scale, expected, plan, bias=bias, second_projection=second
+    )
+    storage = torch.full((1, rows, width + 13), 42, device="cuda", dtype=dtype)
+    out = storage[..., :width]
+    actual = int8_nvidia.execute_prepared_linear(*args, second_projection=second, out=out)
+    assert actual is out
+    assert torch.equal(actual, expected)
+    assert torch.all(storage[..., width:] == 42)
 
 
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])

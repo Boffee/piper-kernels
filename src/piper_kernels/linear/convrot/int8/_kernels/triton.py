@@ -77,21 +77,19 @@ def scaled_int8_matmul(
 
 
 @triton.jit
-def int8_matmul_kernel(
+def _int8_matmul_with_bias(
     input_ptr,
     weight_ptr,
-    output_ptr,
     input_scale_ptr,
     weight_scale_ptr,
     bias_ptr,
-    second_weight_ptr,
-    second_scale_ptr,
     second_bias_ptr,
+    offsets_m,
+    offsets_n,
+    second,
     m,
     n,
     k,
-    output_row_stride,
-    row_block_offset,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -99,31 +97,8 @@ def int8_matmul_kernel(
     paired: tl.constexpr,
     second_has_bias: tl.constexpr,
     aligned_tiles: tl.constexpr,
-    group_m: tl.constexpr,
 ):
-    if group_m:
-        pid = tl.program_id(0)
-        num_pid_n = tl.cdiv(n, block_n) * (2 if paired else 1)
-        row_block_count = tl.num_programs(0) // num_pid_n
-        num_pid_in_group = group_m * num_pid_n
-        group_id = pid // num_pid_in_group
-        pid_in_group = pid % num_pid_in_group
-        first_pid_m = group_id * group_m
-        actual_group_m = tl.minimum(row_block_count - first_pid_m, group_m)
-        pid_m = first_pid_m + pid_in_group % actual_group_m + row_block_offset
-        pid_n = pid_in_group // actual_group_m
-    else:
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-    second = pid_n >= tl.cdiv(n, block_n)
-    if paired:
-        pid_n %= tl.cdiv(n, block_n)
-        weight_ptr = tl.where(second, second_weight_ptr, weight_ptr)
-        weight_scale_ptr = tl.where(second, second_scale_ptr, weight_scale_ptr)
-    offsets_m = pid_m * block_m + tl.arange(0, block_m)
-    offsets_n = pid_n * block_n + tl.arange(0, block_n)
-    offsets_m_i64 = offsets_m.to(tl.int64)
-    offsets_n_i64 = offsets_n.to(tl.int64)
+    # Keep scaling and bias together in each branch to preserve FMA rounding.
     result = scaled_int8_matmul(
         input_ptr,
         weight_ptr,
@@ -159,12 +134,106 @@ def int8_matmul_kernel(
             bias = tl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0)
         result += bias[None, :]
 
+    return result
+
+
+@triton.jit
+def int8_matmul_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    second_weight_ptr,
+    second_scale_ptr,
+    second_bias_ptr,
+    m,
+    n,
+    k,
+    output_row_stride,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    has_bias: tl.constexpr,
+    paired: tl.constexpr,
+    second_has_bias: tl.constexpr,
+    aligned_m: tl.constexpr,
+    aligned_nk: tl.constexpr,
+    group_m: tl.constexpr,
+):
+    if group_m:
+        pid = tl.program_id(0)
+        num_pid_n = tl.cdiv(n, block_n) * (2 if paired else 1)
+        row_block_count = tl.num_programs(0) // num_pid_n
+        num_pid_in_group = group_m * num_pid_n
+        group_id = pid // num_pid_in_group
+        pid_in_group = pid % num_pid_in_group
+        first_pid_m = group_id * group_m
+        actual_group_m = tl.minimum(row_block_count - first_pid_m, group_m)
+        pid_m = first_pid_m + pid_in_group % actual_group_m
+        pid_n = pid_in_group // actual_group_m
+    else:
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+    second = pid_n >= tl.cdiv(n, block_n)
+    if paired:
+        pid_n %= tl.cdiv(n, block_n)
+        weight_ptr = tl.where(second, second_weight_ptr, weight_ptr)
+        weight_scale_ptr = tl.where(second, second_scale_ptr, weight_scale_ptr)
+    offsets_m = pid_m * block_m + tl.arange(0, block_m)
+    offsets_n = pid_n * block_n + tl.arange(0, block_n)
+    tile_args = (
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        second_bias_ptr,
+        offsets_m,
+        offsets_n,
+        second,
+        m,
+        n,
+        k,
+    )
+    # Large tiles share one launch. With aligned N/K, complete M tiles take an
+    # unmasked branch around the entire projection. Other widths use the masked
+    # loop in the same launch; branching for those widths can regress performance.
+    if group_m and aligned_nk:
+        tile_aligned = aligned_m or (pid_m + 1) * block_m <= m
+    else:
+        tile_aligned = aligned_m and aligned_nk
+    if tile_aligned:
+        result = _int8_matmul_with_bias(
+            *tile_args,
+            block_m,
+            block_n,
+            block_k,
+            has_bias,
+            paired,
+            second_has_bias,
+            True,
+        )
+    else:
+        result = _int8_matmul_with_bias(
+            *tile_args,
+            block_m,
+            block_n,
+            block_k,
+            has_bias,
+            paired,
+            second_has_bias,
+            False,
+        )
     output_pointers = (
-        output_ptr + offsets_m_i64[:, None] * output_row_stride + offsets_n_i64[None, :]
+        output_ptr
+        + offsets_m.to(tl.int64)[:, None] * output_row_stride
+        + offsets_n.to(tl.int64)[None, :]
     )
     if paired:
         output_pointers += second * n
-    if aligned_tiles:
+    if tile_aligned:
         tl.store(output_pointers, result)
     else:
         tl.store(

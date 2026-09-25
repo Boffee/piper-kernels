@@ -4,7 +4,7 @@ These schedules are measured on SM120 and retain the existing defaults on other
 supported NVIDIA targets. Hardware support does not imply per-target tuning.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
@@ -49,6 +49,8 @@ _FUSED_MAX_CHUNK_SIZE = 16_384
 _TWO_WARP_MAX_CHUNK_SIZE = 2_048
 _DEFAULT_ROTATION_NUM_WARPS = 4
 _DEFAULT_QUANTIZATION_NUM_WARPS = 8
+_SM120_SMALL_TILE_LIMIT = 128
+_SM120_LARGE_TILE_THRESHOLD = 72
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -61,14 +63,8 @@ def supports_preparation_target(target: AcceleratorTarget) -> bool:
     return target.is_nvidia_cuda
 
 
-def select_execution_plan(
-    target: AcceleratorTarget,
-    *,
-    in_features: int,
-) -> NvidiaExecutionPlan:
-    """Select the production preparation and GEMM schedule for one linear."""
-    if not supports_target(target):
-        raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
+def _base_execution_plan(*, in_features: int) -> NvidiaExecutionPlan:
+    """Build shared NVIDIA preparation and fixed GEMM defaults."""
     fused_chunks = fused_preparation_chunks(in_features)
     fused_num_warps = 4
     if fused_chunks is not None:
@@ -88,4 +84,41 @@ def select_execution_plan(
         matmul_block_n=256,
         matmul_block_k=128,
         matmul_num_warps=8,
+        matmul_num_stages=3,
     )
+
+
+def _sm120_execution_plan(
+    *,
+    in_features: int,
+    rows: int | None,
+    out_features: int | None,
+) -> NvidiaExecutionPlan:
+    """Apply measured SM120 policy to the full base plan."""
+    plan = _base_execution_plan(in_features=in_features)
+    if not rows or not out_features:
+        return plan
+    small_tiles = ((rows + 31) // 32) * ((out_features + 63) // 64)
+    if rows <= 32 or small_tiles <= _SM120_SMALL_TILE_LIMIT:
+        return replace(plan, matmul_block_m=32, matmul_block_n=64, matmul_num_stages=4)
+    large_columns = (out_features + 255) // 256
+    # Count useful 128-row tiles so a one-row tail is not a full tile.
+    # When N fits one 64-column tile, wider tiles add no input reuse.
+    if out_features <= 64 or rows * large_columns < 128 * _SM120_LARGE_TILE_THRESHOLD:
+        return replace(plan, matmul_block_m=64, matmul_block_n=64, matmul_num_warps=4)
+    return plan
+
+
+def select_execution_plan(
+    target: AcceleratorTarget,
+    *,
+    in_features: int,
+    rows: int | None = None,
+    out_features: int | None = None,
+) -> NvidiaExecutionPlan:
+    """Dispatch full architecture policies, retaining the base plan for other targets."""
+    if not supports_target(target):
+        raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
+    if target.is_architecture("sm120"):
+        return _sm120_execution_plan(in_features=in_features, rows=rows, out_features=out_features)
+    return _base_execution_plan(in_features=in_features)

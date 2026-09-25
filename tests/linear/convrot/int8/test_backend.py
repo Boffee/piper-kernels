@@ -1,8 +1,9 @@
 """Implementation selection preserves ConvRot INT8 dispatch and fallback contracts."""
 
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
@@ -58,6 +59,70 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
     resolve_target.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("backend", "target"),
+    [
+        (nvidia, AcceleratorTarget("cuda", "sm120")),
+        (nvidia, AcceleratorTarget("cuda", "sm89")),
+        pytest.param(
+            amd,
+            AcceleratorTarget("hip", "gfx1201"),
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm is Linux-only"),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [
+        (0, 1024, 1024),
+        (1024, 0, 1024),
+        (1025, 1024, 1024),
+        (100000, 1024, 1024),
+        (1024, 1024, 1024),
+        (512, 257, 256),
+        (513, 257, 256),
+        (513, 256, 272),
+        (513, 257, 64),
+    ],
+)
+def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, m, n, k):
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
+    kernel = MagicMock()
+    monkeypatch.setattr(backend, "int8_matmul_kernel", kernel)
+    value = torch.empty(m, k, device="meta", dtype=torch.int8)
+    weight = torch.empty(n, k, device="meta", dtype=torch.int8)
+    row_scale = torch.empty(m, device="meta")
+    scale = torch.empty(n, 1, device="meta")
+    plan = backend.default_execution_plan(weight, target=target)
+    result = backend.execute_prepared_linear(
+        value, row_scale, weight, scale, None, torch.bfloat16, plan
+    )
+    assert result.shape == (m, n)
+    if not m or not n:
+        kernel.__getitem__.assert_not_called()
+    else:
+        row_tiles = (m + plan.matmul_block_m - 1) // plan.matmul_block_m
+        column_tiles = (n + plan.matmul_block_n - 1) // plan.matmul_block_n
+        assert kernel.__getitem__.call_args_list == [call((row_tiles * column_tiles,))]
+        kernel.__getitem__.return_value.assert_called_once()
+        flags = kernel.__getitem__.return_value.call_args.kwargs
+        assert flags["aligned_m"] == (m % plan.matmul_block_m == 0)
+        assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
+
+
+@pytest.mark.parametrize(("rows", "block_m"), [(None, 128), (1280, 64)])
+def test_nvidia_planner_needs_no_device_properties_with_explicit_target(monkeypatch, rows, block_m):
+    weight = SimpleNamespace(shape=(1024, 1024), device=torch.device("cuda"))
+    properties = Mock(side_effect=AssertionError("planner queried device properties"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    plan = nvidia.default_execution_plan(
+        weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
+    )
+    assert plan.matmul_block_m == block_m
+    properties.assert_not_called()
+
+
 @pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])
 def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architecture):
     target = AcceleratorTarget("cuda", architecture)
@@ -83,15 +148,17 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
     ],
 )
 @pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize(("rows", "columns"), [(2, 7), (64, 25600)])
 def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
-    monkeypatch, backend, target, static
+    monkeypatch, backend, target, static, rows, columns
 ):
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    value = torch.empty(2, 64)
-    prepared = (torch.empty(2, 32, dtype=torch.int8), torch.empty(2))
-    weight, scale = torch.empty(7, 32, dtype=torch.int8), torch.empty(7, 1)
-    second = (torch.empty_like(weight), torch.empty_like(scale), torch.empty(7))
-    output = torch.empty(2, 18)[:, 2:-2]
+    value = torch.empty(rows, 64)
+    prepared = (torch.empty(rows, 32, dtype=torch.int8), torch.empty(rows))
+    weight = torch.empty(columns, 32, dtype=torch.int8)
+    scale = torch.empty(columns, 1)
+    second = (torch.empty_like(weight), torch.empty_like(scale), torch.empty(columns))
+    output = torch.empty(rows, 2 * columns + 4)[:, 2:-2]
     prepare = Mock(return_value=prepared)
     project = Mock(return_value=output)
     monkeypatch.setattr(backend, "prepare_input_with_plan", prepare)
@@ -113,6 +180,8 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
         *prepared, weight, scale, None, torch.float32, out=output, second_projection=second
     )
     assert result is output
+    if backend is nvidia:
+        expected_plan = backend.default_execution_plan(weight, target=target, rows=rows)
     assert project.call_args.args[-1] == expected_plan
     assert project.call_args.kwargs == {"out": output, "second_projection": second}
 

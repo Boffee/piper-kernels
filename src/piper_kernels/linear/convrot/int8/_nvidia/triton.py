@@ -106,12 +106,15 @@ def default_execution_plan(
     weight_qdata: torch.Tensor,
     *,
     target: AcceleratorTarget | None = None,
+    rows: int | None = None,
 ) -> LinearExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
     return policy.select_execution_plan(
         target,
         in_features=weight_qdata.shape[1],
+        rows=rows,
+        out_features=weight_qdata.shape[0],
     )
 
 
@@ -245,8 +248,7 @@ def execute_prepared_linear(
         raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
-    # Cache grouping and the M-tail split are intrinsic to the selected large-tile family,
-    # rather than additional execution-plan axes.
+    # Cache grouping is intrinsic to the large-tile family.
     group_m = (
         _LARGE_MATMUL_GROUP_M_TILES
         if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
@@ -254,52 +256,38 @@ def execute_prepared_linear(
     )
     bias_pointer = bias if bias is not None else output
 
-    with device_context(input_qdata.device):
-
-        def launch_tiles(row_block_count: int, row_block_offset: int, *, aligned_m: bool) -> None:
-            grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
-            int8_matmul_kernel[grid](
-                input_qdata_2d,
-                weight_qdata,
-                output,
-                input_scale_1d,
-                weight_scale,
-                bias_pointer,
-                second_weight,
-                second_scale,
-                second_bias if second_bias is not None else output,
-                m,
-                n,
-                k,
-                output.stride(0),
-                row_block_offset,
-                block_m=plan.matmul_block_m,
-                block_n=plan.matmul_block_n,
-                block_k=plan.matmul_block_k,
-                has_bias=bias is not None,
-                paired=paired,
-                second_has_bias=second_bias is not None,
-                aligned_tiles=aligned_m
-                and (n % plan.matmul_block_n == 0)
-                and (k % plan.matmul_block_k == 0),
-                group_m=group_m,
-                num_stages=plan.matmul_num_stages,
-                num_warps=plan.matmul_num_warps,
-            )
-
-        full_row_blocks = m // plan.matmul_block_m
-        if group_m:
-            if full_row_blocks:
-                launch_tiles(full_row_blocks, 0, aligned_m=True)
-            if m % plan.matmul_block_m:
-                launch_tiles(1, full_row_blocks, aligned_m=False)
-        else:
-            launch_tiles(
-                (m + plan.matmul_block_m - 1) // plan.matmul_block_m,
-                0,
-                aligned_m=False,
-            )
+    if not m or not n:
         return result
+    row_block_count = triton.cdiv(m, plan.matmul_block_m)
+    grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+    with device_context(input_qdata.device):
+        int8_matmul_kernel[grid](
+            input_qdata_2d,
+            weight_qdata,
+            output,
+            input_scale_1d,
+            weight_scale,
+            bias_pointer,
+            second_weight,
+            second_scale,
+            second_bias if second_bias is not None else output,
+            m,
+            n,
+            k,
+            output.stride(0),
+            block_m=plan.matmul_block_m,
+            block_n=plan.matmul_block_n,
+            block_k=plan.matmul_block_k,
+            has_bias=bias is not None,
+            paired=paired,
+            second_has_bias=second_bias is not None,
+            aligned_m=m % plan.matmul_block_m == 0,
+            aligned_nk=n % plan.matmul_block_n == 0 and k % plan.matmul_block_k == 0,
+            group_m=group_m,
+            num_stages=plan.matmul_num_stages,
+            num_warps=plan.matmul_num_warps,
+        )
+    return result
 
 
 def run_linear(
@@ -326,7 +314,11 @@ def run_linear(
     plan = (
         execution_plan
         if execution_plan is not None
-        else default_execution_plan(weight_qdata, target=target)
+        else default_execution_plan(
+            weight_qdata,
+            target=target,
+            rows=math.prod(original_shape[:-1]),
+        )
     )
     input_qdata, row_scales = prepare_input_with_plan(
         input,
@@ -399,7 +391,7 @@ def linear_prepared(
     second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
-    plan = default_execution_plan(weight_qdata)
+    plan = default_execution_plan(weight_qdata, rows=math.prod(input_qdata.shape[:-1]))
     return execute_prepared_linear(
         input_qdata,
         input_scale,

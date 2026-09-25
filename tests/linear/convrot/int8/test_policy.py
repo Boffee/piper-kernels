@@ -1,10 +1,12 @@
 """Host-side execution-plan policy tests for INT8 ConvRot."""
 
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
 from piper_kernels.linear.convrot.int8._nvidia.policy import (
     NvidiaExecutionPlan,
     select_execution_plan,
@@ -145,6 +147,103 @@ def test_execution_plan_selects_uniform_matmul_schedule() -> None:
     assert plan.matmul_block_k == 128
     assert plan.matmul_num_warps == 8
     assert plan.matmul_num_stages == 3
+
+
+@pytest.mark.parametrize(
+    ("rows", "k", "n", "block_m"),
+    [
+        (1, 5376, 14336, 32),
+        (32, 5376, 14336, 32),
+        (33, 5376, 14336, 64),
+        (128, 1024, 2048, 32),
+        (128, 1024, 3072, 64),
+        (256, 1024, 1024, 32),
+        (257, 1024, 1024, 64),
+        (512, 1024, 1024, 64),
+        (512, 5376, 14336, 128),
+        (2048, 3072, 1024, 64),
+        (2049, 3072, 1024, 64),
+        (2303, 3072, 1024, 64),
+        (2304, 3072, 1024, 128),
+        (1025, 1024, 2048, 64),
+        (2560, 3072, 1024, 128),
+        (2048, 1024, 3072, 128),
+        (3072, 1024, 3072, 128),
+        (128, 96, 5376, 64),
+        (512, 96, 5376, 128),
+        (16384, 5376, 96, 128),
+        (32768, 5376, 96, 128),
+        (100000, 96, 5376, 128),
+        (4096, 2048, 16, 32),
+        (4097, 2048, 16, 64),
+        (100000, 2048, 16, 64),
+        (100000, 5376, 64, 64),
+        (100000, 5376, 65, 128),
+    ],
+)
+def test_shape_aware_schedule_preserves_preparation(rows, k, n, block_m):
+    previous = select_execution_plan(_SM120, in_features=k)
+    actual = select_execution_plan(_SM120, in_features=k, rows=rows, out_features=n)
+    assert actual.matmul_block_m == block_m
+    assert (
+        replace(
+            actual,
+            matmul_block_m=previous.matmul_block_m,
+            matmul_block_n=previous.matmul_block_n,
+            matmul_num_warps=previous.matmul_num_warps,
+            matmul_num_stages=previous.matmul_num_stages,
+        )
+        == previous
+    )
+
+
+@pytest.mark.parametrize("out_features", [16, 64, 65, 257, 1024, 3072, 5376, 14336])
+def test_shape_aware_schedule_is_monotonic_in_rows(out_features):
+    blocks = [
+        select_execution_plan(
+            _SM120,
+            in_features=2048,
+            out_features=out_features,
+            rows=rows,
+        ).matmul_block_m
+        for rows in (*range(1, 4097), 8192, 16384, 32768, 100000)
+    ]
+    assert blocks == sorted(blocks)
+    assert set(blocks) <= {32, 64, 128}
+
+
+@pytest.mark.parametrize("architecture", ["sm75", "sm80", "sm89", "sm90", "sm100", "sm121"])
+def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
+    target = AcceleratorTarget("cuda", architecture)
+    assert select_execution_plan(
+        target, in_features=3072, rows=128, out_features=2048
+    ) == select_execution_plan(target, in_features=3072)
+
+
+@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
+def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_features):
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=5376)
+    expected = replace(
+        base,
+        fuse_rotation_quantization=False,
+        fused_num_warps=16,
+        rotation_num_warps=8,
+        quantization_num_warps=2,
+        matmul_block_m=16,
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        matmul_num_stages=2,
+    )
+    architecture_policy = Mock(return_value=expected)
+    monkeypatch.setattr(nvidia_policy, "_sm120_execution_plan", architecture_policy)
+
+    actual = select_execution_plan(_SM120, in_features=5376, rows=rows, out_features=out_features)
+
+    assert actual is expected
+    architecture_policy.assert_called_once_with(
+        in_features=5376, rows=rows, out_features=out_features
+    )
 
 
 def test_execution_plan_serializes_flat_tuning_fields() -> None:
