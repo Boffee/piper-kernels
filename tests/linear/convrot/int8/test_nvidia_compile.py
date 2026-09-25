@@ -65,7 +65,8 @@ def test_nvidia_preparation_compiles_without_a_device(architecture, static):
         120,
     ],
 )
-def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture):
+@pytest.mark.parametrize("aligned_nk", [False, True])
+def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture, aligned_nk):
     plan = policy.select_execution_plan(
         AcceleratorTarget("cuda", f"sm{architecture}"), in_features=512
     )
@@ -85,7 +86,6 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture):
             "n": "i32",
             "k": "i32",
             "output_row_stride": "i32",
-            "row_block_offset": "i32",
         },
         constexprs={
             "block_m": plan.matmul_block_m,
@@ -94,7 +94,8 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture):
             "has_bias": True,
             "paired": True,
             "second_has_bias": True,
-            "aligned_tiles": False,
+            "aligned_m": False,
+            "aligned_nk": aligned_nk,
             "group_m": 16,
         },
     )

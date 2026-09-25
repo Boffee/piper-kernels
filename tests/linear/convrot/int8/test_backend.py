@@ -1,8 +1,9 @@
 """Implementation selection preserves ConvRot INT8 dispatch and fallback contracts."""
 
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
@@ -56,6 +57,58 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
 
     assert _backend.select_linear_backend(torch.empty(1)) is None
     resolve_target.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("backend", "target"),
+    [
+        (nvidia, AcceleratorTarget("cuda", "sm120")),
+        (nvidia, AcceleratorTarget("cuda", "sm89")),
+        pytest.param(
+            amd,
+            AcceleratorTarget("hip", "gfx1201"),
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm is Linux-only"),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [
+        (0, 1024, 1024),
+        (1024, 0, 1024),
+        (1025, 1024, 1024),
+        (100000, 1024, 1024),
+        (1024, 1024, 1024),
+        (512, 257, 256),
+        (513, 257, 256),
+        (513, 256, 272),
+        (513, 257, 64),
+    ],
+)
+def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, m, n, k):
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
+    kernel = MagicMock()
+    monkeypatch.setattr(backend, "int8_matmul_kernel", kernel)
+    value = torch.empty(m, k, device="meta", dtype=torch.int8)
+    weight = torch.empty(n, k, device="meta", dtype=torch.int8)
+    row_scale = torch.empty(m, device="meta")
+    scale = torch.empty(n, 1, device="meta")
+    plan = backend.default_execution_plan(weight, target=target)
+    result = backend.execute_prepared_linear(
+        value, row_scale, weight, scale, None, torch.bfloat16, plan
+    )
+    assert result.shape == (m, n)
+    if not m or not n:
+        kernel.__getitem__.assert_not_called()
+    else:
+        row_tiles = (m + plan.matmul_block_m - 1) // plan.matmul_block_m
+        column_tiles = (n + plan.matmul_block_n - 1) // plan.matmul_block_n
+        assert kernel.__getitem__.call_args_list == [call((row_tiles * column_tiles,))]
+        kernel.__getitem__.return_value.assert_called_once()
+        flags = kernel.__getitem__.return_value.call_args.kwargs
+        assert flags["aligned_m"] == (m % plan.matmul_block_m == 0)
+        assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
 
 
 @pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])
