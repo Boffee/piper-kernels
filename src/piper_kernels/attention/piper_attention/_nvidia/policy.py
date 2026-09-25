@@ -90,20 +90,25 @@ def _sm120_execution_plan(
     *,
     head_dim: int,
     is_causal: bool,
+    query_length: int,
 ) -> PiperAttentionExecutionPlan:
     """Build the loop, probability, and value-metadata plan measured on exact SM120."""
     split_pv_head_dim = head_dim == 128
     use_tensor_descriptors = head_dim == 128 and not is_causal
+    block_m = 64 if is_causal else 128
     # Packed conversion wins for D64 and non-causal D128. The D128 causal
     # specialization is neutral to slightly slower and retains stock lowering.
     return PiperAttentionExecutionPlan(
-        block_m=64 if is_causal else 128,
+        block_m=block_m,
         grouped_qk=True,
         split_pv_head_dim=split_pv_head_dim,
         use_tensor_descriptors=use_tensor_descriptors,
         num_stages=2 if use_tensor_descriptors else 3,
         derive_value_log_bound=not is_causal,
         optimize_causal_traversal=is_causal,
+        # The combined full/tail kernel benefits from loop-invariant motion
+        # for causal D64. Aligned grids retain their measured original loop.
+        loop_licm=is_causal and head_dim == 64 and query_length % block_m != 0,
         use_packed_probability_conversion=not (is_causal and head_dim == 128),
     )
 
@@ -113,6 +118,7 @@ def select_execution_plan(
     *,
     head_dim: int,
     is_causal: bool,
+    query_length: int,
 ) -> PiperAttentionExecutionPlan:
     """Combine portable capability defaults with exact-target measured policy."""
     if target.is_cuda_capability(8, 9):
@@ -124,6 +130,7 @@ def select_execution_plan(
         return _sm120_execution_plan(
             head_dim=head_dim,
             is_causal=is_causal,
+            query_length=query_length,
         )
     return _generic_execution_plan(
         target,

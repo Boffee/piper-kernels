@@ -24,12 +24,16 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("architecture", [89, 120])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("aligned_queries", [False, True])
 def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
-    monkeypatch, architecture, head_dim, causal
+    monkeypatch, architecture, head_dim, causal, aligned_queries
 ):
     plan = replace(
         select_execution_plan(
-            AcceleratorTarget("cuda", f"sm{architecture}"), head_dim=head_dim, is_causal=causal
+            AcceleratorTarget("cuda", f"sm{architecture}"),
+            head_dim=head_dim,
+            is_causal=causal,
+            query_length=128 if aligned_queries else 129,
         ),
         use_tensor_descriptors=False,
     )
@@ -41,13 +45,14 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         head_dim=head_dim,
         is_causal=causal,
         block_n=64,
-        unmasked_query_tiles=True,
+        aligned_queries=aligned_queries,
         unmasked_key_tiles=not causal,
         use_query_tensor_descriptor=False,
     )
     signature = {name: "i32" for name in _piper_attention_kernel.arg_names if name not in constants}
     signature.update(
         query_ptr="*i8",
+        query_descriptor="*i8",
         key_ptr="*i8",
         value_ptr="*i8",
         query_scale_ptr="*fp32",

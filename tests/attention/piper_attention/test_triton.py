@@ -14,6 +14,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
+from piper_kernels.attention.piper_attention._nvidia import triton as _backend
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _conservative_value_log_scale_bound,
     _default_piper_attention_execution_plan,
@@ -610,6 +611,89 @@ def test_ragged_query_tail_falls_back_to_masked_pointer_load() -> None:
     assert prepared.query_descriptor.shape == [1, sequence, 128]
     assert torch.isfinite(descriptor).all()
     torch.testing.assert_close(descriptor, pointer, atol=2**-9, rtol=0.0)
+
+
+@pytest.mark.parametrize("query_length", [1, 63, 64, 65, 127, 128, 129, 193])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_one_launch_covers_all_query_rows(monkeypatch, query_length, head_dim, is_causal) -> None:
+    torch.manual_seed(419)
+    # Projection-style strides, two batches, and grouped K/V catch tail offsets
+    # that would otherwise alias the next head or batch.
+    query = torch.randn(
+        2, query_length, 6, head_dim, device="cuda", dtype=torch.bfloat16
+    ).transpose(1, 2)
+    key = torch.randn(
+        2,
+        query_length if is_causal else 131,
+        2,
+        head_dim,
+        device="cuda",
+        dtype=query.dtype,
+    ).transpose(1, 2)
+    value = torch.randn_like(key)
+    plan = _default_piper_attention_execution_plan(query, is_causal)
+    prepared = _prepare_piper_attention(
+        query, key, value, head_dim**-0.5, is_causal, execution_plan=plan
+    )
+    guarded = torch.full((query.numel() + 32,), 7.0, device=query.device, dtype=query.dtype)
+    output = guarded[16:-16].view(query.shape)
+    output.fill_(float("nan"))
+    prepared = replace(prepared, output=output)
+    launches = []
+    kernel = _backend._piper_attention_kernel
+
+    class CountedKernel:
+        def __getitem__(self, grid):
+            launches.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(_backend, "_piper_attention_kernel", CountedKernel())
+    with torch.no_grad():
+        actual = _launch_piper_attention(prepared)
+        expected = reference_piper_attention(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            is_causal,
+            qk_quantization=_qk_quantization(),
+        )
+    assert len(launches) == 1
+    assert torch.isfinite(actual).all()
+    assert torch.all(guarded[:16] == 7.0)
+    assert torch.all(guarded[-16:] == 7.0)
+    error = (actual.float() - expected.float()).abs()
+    assert error.mean().item() < 0.003
+    assert error.max().item() < 0.12
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_ragged_single_launch_replays_with_updated_queries(head_dim, is_causal) -> None:
+    torch.manual_seed(420)
+    query = torch.randn(2, 4, 193, head_dim, device="cuda", dtype=torch.float16)
+    key = torch.randn(2, 2, 193, head_dim, device="cuda", dtype=query.dtype)
+    value = torch.randn_like(key)
+    prepared = _prepare_piper_attention(
+        query,
+        key,
+        value,
+        head_dim**-0.5,
+        is_causal,
+        execution_plan=_default_piper_attention_execution_plan(query, is_causal),
+    )
+    _launch_piper_attention(prepared)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch_piper_attention(prepared)
+
+    prepared.query.zero_()
+    expected = _launch_piper_attention(prepared).clone()
+    prepared.output.fill_(float("nan"))
+    graph.replay()
+    torch.testing.assert_close(prepared.output, expected, atol=0, rtol=0)
 
 
 def test_explicit_execution_plan_runs_native_loop_controls() -> None:

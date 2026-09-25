@@ -131,9 +131,24 @@ targets retain conservative explicit fallbacks.
 
 Production attention planning starts from a 128-row query tile. Target policies explicitly select
 smaller tiles where kernel resource use requires them; head count and sequence length do not feed a
-separate CTA-count heuristic. Default production plan selection depends only on accelerator target,
-head dimension, and causal mode—not query or key length. Smaller tiles and alternate metadata paths
+separate CTA-count heuristic. Tile selection depends on accelerator target, head dimension, and
+causal mode. Dense Piper now handles full query tiles and their ragged tail in one launch;
+exact-SM120 causal D64 enables loop-invariant code motion only for ragged query grids to retain
+long-context performance in that combined kernel. Aligned grids keep the original schedule.
+This uses query-tile alignment, not a length crossover. Smaller tiles and alternate metadata paths
 remain available to the offline tuners.
+
+The single-launch change was checked against the split launcher at `e086641` on an RTX 5090,
+PyTorch 2.14.0+cu130, and Triton 3.8.0. For batch-one BF16 square attention, H16/H48,
+D64/D128, and both causal modes, complete operator latency fell by 13.8–22.0% at 1,025
+tokens, 6.2–22.4% at 8,193, and 1.9–15.3% at 32,769. Aligned 8,192-token cases stayed
+within 1.1% of the split baseline. These are medians across three fresh processes, each
+alternating providers over three repetitions with 20 ms synchronized-wall warmup and
+measurement windows. Prepared execution was measured separately with CUDA graphs.
+All 96 confirmation cases were bitwise equal. H16 checks also covered aligned 128K,
+131,073-token tails, and rectangular Q/KV inputs; the retained ragged causal D64 setting
+reduced complete 131,073-token latency from 167.37 ms to 151.74 ms in that long guard.
+These synthetic operator measurements do not establish model throughput or other-GPU speedups.
 
 Treat 8K, 32K, and 128K as evidence for one continuous plan rather than dispatch keys. Prefer a
 length-invariant policy whenever the algorithm is valid across the range; sampled anchors alone do

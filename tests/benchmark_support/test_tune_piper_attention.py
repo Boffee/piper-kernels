@@ -21,6 +21,7 @@ def _production_plan(*, is_causal: bool = False):
         _SM120,
         head_dim=128,
         is_causal=is_causal,
+        query_length=8192,
     )
 
 
@@ -29,6 +30,7 @@ def _sm89_production_plan():
         _SM89,
         head_dim=128,
         is_causal=False,
+        query_length=8192,
     )
 
 

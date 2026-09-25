@@ -364,8 +364,8 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     return numerator, denominator, next_max
 
 
-@triton.jit(do_not_specialize=["query_length", "key_length", "heads"])
-def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
+@triton.jit
+def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     query_ptr,
     key_ptr,
     value_ptr,
@@ -375,35 +375,28 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
     value_log_scale_ptr,
     value_mean_ptr,
     output_ptr,
+    query_block,
     query_length,
     key_length,
+    heads,
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
-    unmasked_query_tiles: tl.constexpr,
     unmasked_key_tiles: tl.constexpr,
-    heads,
     head_groups: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
-    use_query_tensor_descriptor: tl.constexpr,
     optimize_causal_traversal: tl.constexpr,
     loop_num_stages: tl.constexpr,
     loop_licm: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    unmasked_query_tiles: tl.constexpr,
+    use_query_tensor_descriptor: tl.constexpr,
 ):
-    """Fused UINT8-P/INT8-V online attention."""
-    if unmasked_query_tiles:
-        query_block = tl.program_id(0)
-        if is_causal and optimize_causal_traversal:
-            query_block = tl.num_programs(0) - 1 - query_block
-    else:
-        # A masked launch contains only the single ragged query tail. Derive
-        # its block at runtime so the exact query length is not a JIT key.
-        query_block = query_length // block_m
+    """Evaluate one complete or masked query tile with the same FP32 recurrence."""
     head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
@@ -610,6 +603,94 @@ def _piper_attention_kernel(  # noqa: PLR0912, PLR0915
         )
 
 
+@triton.jit(do_not_specialize=["query_length", "key_length", "heads"])
+def _piper_attention_kernel(
+    query_ptr,
+    query_descriptor,
+    key_ptr,
+    value_ptr,
+    query_scale_ptr,
+    key_scale_ptr,
+    value_scale_multiplier_ptr,
+    value_log_scale_ptr,
+    value_mean_ptr,
+    output_ptr,
+    query_length,
+    key_length,
+    is_causal: tl.constexpr,
+    grouped_qk: tl.constexpr,
+    split_pv_head_dim: tl.constexpr,
+    aligned_queries: tl.constexpr,
+    unmasked_key_tiles: tl.constexpr,
+    heads,
+    head_groups: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    use_tensor_descriptors: tl.constexpr,
+    use_query_tensor_descriptor: tl.constexpr,
+    optimize_causal_traversal: tl.constexpr,
+    loop_num_stages: tl.constexpr,
+    loop_licm: tl.constexpr,
+    use_packed_probability_conversion: tl.constexpr,
+    derive_value_log_bound: tl.constexpr,
+):
+    """Cover full query tiles and their ragged tail in one grid."""
+    query_block = tl.program_id(0)
+    if is_causal and optimize_causal_traversal:
+        query_block = tl.num_programs(0) - 1 - query_block
+    tile_args = (
+        key_ptr,
+        value_ptr,
+        query_scale_ptr,
+        key_scale_ptr,
+        value_scale_multiplier_ptr,
+        value_log_scale_ptr,
+        value_mean_ptr,
+        output_ptr,
+        query_block,
+        query_length,
+        key_length,
+        heads,
+    )
+    tile_options = tl.constexpr(
+        (
+            is_causal,
+            grouped_qk,
+            split_pv_head_dim,
+            unmasked_key_tiles,
+            head_groups,
+            head_dim,
+            block_m,
+            block_n,
+            use_tensor_descriptors,
+            optimize_causal_traversal,
+            loop_num_stages,
+            loop_licm,
+            use_packed_probability_conversion,
+            derive_value_log_bound,
+        )
+    )
+    # This CTA-uniform branch folds away for aligned queries. Only the tail
+    # needs masked pointer loads; full tiles retain the Q descriptor if present.
+    if aligned_queries or query_block < query_length // block_m:
+        _piper_attention_query_tile(
+            query_descriptor if use_query_tensor_descriptor else query_ptr,
+            *tile_args,
+            *tile_options,
+            unmasked_query_tiles=tl.constexpr(True),
+            use_query_tensor_descriptor=use_query_tensor_descriptor,
+        )
+    else:
+        _piper_attention_query_tile(
+            query_ptr,
+            *tile_args,
+            *tile_options,
+            unmasked_query_tiles=tl.constexpr(False),
+            use_query_tensor_descriptor=tl.constexpr(False),
+        )
+
+
 def _make_key_value_descriptors(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -665,6 +746,7 @@ def _default_piper_attention_execution_plan(
         target,
         head_dim=head_dim,
         is_causal=is_causal,
+        query_length=query.shape[2],
     )
 
 
@@ -799,59 +881,42 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
     batch, heads, query_length, head_dim = prepared.output.shape
     plan = prepared.plan
     attention_kernel = cast(Any, _piper_attention_kernel)
-    launch_options = {
-        "num_warps": plan.num_warps,
-        "num_stages": plan.num_stages,
-    }
-
+    use_query_tensor_descriptor = prepared.query_descriptor is not None
     with device_context(prepared.output.device):
-
-        def launch(query_blocks: int, unmasked_queries: bool) -> None:
-            use_query_tensor_descriptor = unmasked_queries and prepared.query_descriptor is not None
-            query_argument = (
-                prepared.query_descriptor if use_query_tensor_descriptor else prepared.query
-            )
-            attention_kernel[(query_blocks, heads, batch)](
-                query_argument,
-                prepared.key,
-                prepared.value,
-                prepared.query_scale,
-                prepared.key_scale,
-                prepared.value_scale_multiplier,
-                prepared.value_log_scale,
-                prepared.value_mean,
-                prepared.output,
-                query_length,
-                prepared.key_length,
-                is_causal=prepared.is_causal,
-                grouped_qk=plan.grouped_qk,
-                split_pv_head_dim=plan.split_pv_head_dim,
-                unmasked_query_tiles=unmasked_queries,
-                unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
-                heads=heads,
-                head_groups=heads // prepared.key_scale.shape[1],
-                head_dim=head_dim,
-                block_m=plan.block_m,
-                block_n=_BLOCK_N,
-                use_tensor_descriptors=plan.use_tensor_descriptors,
-                use_query_tensor_descriptor=use_query_tensor_descriptor,
-                optimize_causal_traversal=plan.optimize_causal_traversal,
-                loop_num_stages=plan.loop_num_stages,
-                loop_licm=plan.loop_licm,
-                use_packed_probability_conversion=plan.use_packed_probability_conversion,
-                derive_value_log_bound=plan.derive_value_log_bound,
-                **launch_options,
-            )
-
-        full_query_blocks = query_length // plan.block_m
-        has_partial_query_block = query_length % plan.block_m != 0
-        if plan.optimize_causal_traversal and has_partial_query_block:
-            launch(1, False)
-        if full_query_blocks:
-            launch(full_query_blocks, True)
-        if not plan.optimize_causal_traversal and has_partial_query_block:
-            launch(1, False)
-        return prepared.output
+        attention_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
+            prepared.query,
+            prepared.query_descriptor if use_query_tensor_descriptor else prepared.query,
+            prepared.key,
+            prepared.value,
+            prepared.query_scale,
+            prepared.key_scale,
+            prepared.value_scale_multiplier,
+            prepared.value_log_scale,
+            prepared.value_mean,
+            prepared.output,
+            query_length,
+            prepared.key_length,
+            is_causal=prepared.is_causal,
+            grouped_qk=plan.grouped_qk,
+            split_pv_head_dim=plan.split_pv_head_dim,
+            aligned_queries=query_length % plan.block_m == 0,
+            unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
+            heads=heads,
+            head_groups=heads // prepared.key_scale.shape[1],
+            head_dim=head_dim,
+            block_m=plan.block_m,
+            block_n=_BLOCK_N,
+            use_tensor_descriptors=plan.use_tensor_descriptors,
+            use_query_tensor_descriptor=use_query_tensor_descriptor,
+            optimize_causal_traversal=plan.optimize_causal_traversal,
+            loop_num_stages=plan.loop_num_stages,
+            loop_licm=plan.loop_licm,
+            use_packed_probability_conversion=plan.use_packed_probability_conversion,
+            derive_value_log_bound=plan.derive_value_log_bound,
+            num_warps=plan.num_warps,
+            num_stages=plan.num_stages,
+        )
+    return prepared.output
 
 
 def _run_piper_attention(

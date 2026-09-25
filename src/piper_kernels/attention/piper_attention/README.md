@@ -10,6 +10,24 @@ here are part of preparation or attention, not implicit input validation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
 
+## NVIDIA query tails
+
+The prepared attention recurrence uses one launch for both full query tiles and
+a ragged final tile. A branch shared by every thread in a CTA preserves unmasked
+loads and stores for full tiles, including the Q tensor-descriptor path when
+selected. The tail uses masked Q pointer loads and output stores in the same
+grid. Aligned query lengths compile without the branch. Optimized causal
+traversal visits query tiles in reverse order, including the tail first.
+
+This changes scheduling only: tile sizes, Q/K/V quantization, key traversal,
+FP32 accumulation, and value-mean restoration retain their existing behavior.
+Quantization and statistics preparation still use separate launches.
+
+On exact SM120, causal D64 enables loop-invariant code motion for ragged query
+grids to avoid a long-context regression in the combined kernel. Aligned grids
+retain the original loop schedule. This follows tile alignment, with no
+sequence-length crossover or change to query tile size.
+
 ## RDNA4 behavior
 
 The schedule is four wave32 warps, Q64/K64, with native signed INT8 QK
