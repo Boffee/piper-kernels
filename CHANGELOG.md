@@ -5,6 +5,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- ConvRot INT8 CPU linears use PyTorch's INT8 matrix multiplication with INT32 accumulation,
+  avoiding full INT32 copies of the input and weight before each multiplication.
+
 ## [0.7.4] - 2026-09-22
 
 ### Changed

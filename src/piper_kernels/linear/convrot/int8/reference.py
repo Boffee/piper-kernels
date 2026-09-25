@@ -39,7 +39,8 @@ def linear_prepared(
     rows = math.prod(leading_shape)
     input_2d = input_qdata.reshape(rows, in_features)
     if input_qdata.device.type == "cpu":
-        accumulated = input_2d.to(torch.int32) @ weight_qdata.T.to(torch.int32)
+        # Keep operands in INT8 while accumulating in INT32; ordinary INT8 @ overflows.
+        accumulated = torch._int_mm(input_2d, weight_qdata.T)
     else:
         # Float32 represents each INT8 product exactly. Only very long reductions
         # can round the integer sum, which is preferable to rejecting the shape.
