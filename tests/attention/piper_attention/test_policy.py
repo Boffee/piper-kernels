@@ -31,11 +31,12 @@ def _select(
         target,
         head_dim=head_dim,
         is_causal=is_causal,
+        query_length=128,
     )
 
 
 @pytest.mark.parametrize("sequence", [1, 8192, 131073])
-def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> None:
+def test_noncausal_d128_execution_plan_is_sequence_length_invariant(sequence: int) -> None:
     query = torch.empty((1, 8, sequence, 128), device="meta")
 
     plan = _default_piper_attention_execution_plan(
@@ -49,6 +50,25 @@ def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> N
     assert plan.split_pv_head_dim
     assert plan.derive_value_log_bound
     assert plan.use_packed_probability_conversion
+
+
+@pytest.mark.parametrize("target", [_SM120, _SM121])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize(
+    ("sequence", "ragged"),
+    [(64, False), (65, True), (8192, False), (8193, True)],
+)
+def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
+    target: AcceleratorTarget,
+    head_dim: int,
+    is_causal: bool,
+    sequence: int,
+    ragged: bool,
+) -> None:
+    query = torch.empty((1, 8, sequence, head_dim), device="meta")
+    plan = _default_piper_attention_execution_plan(query, is_causal, target=target)
+    assert plan.loop_licm is (target == _SM120 and head_dim == 64 and is_causal and ragged)
 
 
 @pytest.mark.parametrize(

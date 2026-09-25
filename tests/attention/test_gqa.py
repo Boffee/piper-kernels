@@ -112,12 +112,13 @@ def test_gqa_invalid_heads_rejected_without_tensor_contents(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _sm120_available(), reason="requires NVIDIA SM120")
-def test_dense_gqa_compile_and_prepared_storage():
+@pytest.mark.parametrize("query_length", [256, 257])
+def test_dense_gqa_compile_and_prepared_storage(query_length):
     # Keep semantic scalars inside the graph, as in an architecture processor.
     def dense_attention(query, key, value):
         return piper_attention(query, key, value, scale=128**-0.5)
 
-    query = torch.randn(2, 8, 256, 128, device="cuda", dtype=torch.bfloat16)
+    query = torch.randn(2, 8, query_length, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(2, 2, 256, 128, device="cuda", dtype=query.dtype)
     value = torch.randn_like(key)
     dense = _prepare_piper_attention(
