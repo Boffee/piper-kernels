@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
@@ -24,12 +25,14 @@ def test_reference_is_close_to_exact_attention(
         head_dim**-0.5,
         is_causal,
     )
-    expected = torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        is_causal=is_causal,
-    )
+    # The math oracle avoids native BF16 CPU SDPA crashes on Windows runners.
+    with sdpa_kernel(SDPBackend.MATH):
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=is_causal,
+        )
     error = (actual.float() - expected.float()).abs()
 
     assert actual.shape == query.shape
