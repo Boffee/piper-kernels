@@ -5,24 +5,26 @@ from typing import Protocol
 
 import torch
 
-from ._prepared import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
+from ._prepared import (
+    _PreparedSparsePiperAttention,
+    _PreparedSparsePiperContext,
+    _PreparedSparsePiperOperands,
+)
 
 
-class PrepareAttention(Protocol):
+class PrepareOperands(Protocol):
     def __call__(
         self,
         query: torch.Tensor,
-        routes: torch.Tensor,
-        head_keep_blocks: torch.Tensor,
         scale: float,
         *,
         sparse_key_blocks: int,
-        route_head_offsets: torch.Tensor,
         combined_key: torch.Tensor,
         combined_value: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
-    ) -> _PreparedSparsePiperAttention: ...
+        emit_summaries: bool = False,
+    ) -> _PreparedSparsePiperOperands: ...
 
 
 class LaunchAttention(Protocol):
@@ -50,7 +52,7 @@ class AttentionBackend:
     callers only provide quantized tensors, routes, and logical query ranges.
     """
 
-    prepare: PrepareAttention
+    prepare: PrepareOperands
     launch: LaunchAttention
     bind: BindAttention | None = None
     # Selected for this backend and head width; applies only to full-keep calls.

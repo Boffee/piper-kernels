@@ -18,7 +18,7 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
 )
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
+from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_operands
 
 requires_sm120 = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -39,18 +39,15 @@ def _prepared(sequence, ratios, *, block_lengths=None, sparse_query_blocks=None)
     routes = packed_routes_from_sequences(
         query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING, block_lengths
     )
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         query,
-        routes.indices,
-        routes.head_keep_blocks,
         64**-0.5,
         sparse_key_blocks=blocks,
-        route_head_offsets=routes.route_head_offsets,
         combined_key=key,
         combined_value=value,
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
-    )
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
     return operands, prepared
 
 

@@ -38,3 +38,8 @@ def select_attention_schedule(
     if min(query_rows, key_rows) >= 8192 and selected_key_rows >= 1024:
         return 64, 2
     return 64, 4
+
+
+def use_fused_preparation(head_dim: int, sequence_length: int) -> bool:
+    """Use fused Q/K summaries above the measured SM120 short-row crossover."""
+    return sequence_length >= (2048 if head_dim == 64 else 1024)

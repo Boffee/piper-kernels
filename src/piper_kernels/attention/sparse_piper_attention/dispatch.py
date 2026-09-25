@@ -19,7 +19,7 @@ from ._budget import (
     _ResolvedRouteLayout,
 )
 from ._dtype import SUPPORTED_DTYPES
-from ._routing import packed_routes_from_sequences
+from ._routing import packed_routes_from_sequences, packed_routes_from_summaries
 from ._routing_modes import (
     _ROUTING_NAME_BY_MODE,
     routing_mode_from_name,
@@ -200,47 +200,82 @@ def _run_sparse_piper_attention(
     block_lengths: torch.Tensor | None,
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
+    backend = _backend.select_attention_backend(query)
     sparse_key_rows = sparse_key_blocks * _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
     validate_routing_mode(routing_mode)
-    backend = _backend.select_attention_backend(query)
-    routes = packed_routes_from_sequences(
-        query_head_major,
-        sparse_key,
-        layout,
-        routing_mode,
-        block_lengths,
-        skip_dense_routing=backend is not None and backend.skip_dense_routing,
+    # Take min/max routing summaries from the Q/K quantization pass
+    # unless this call keeps every block, which needs no summaries at all.
+    prepare_operands = (
+        _backend.select_fused_operand_preparation(query_head_major, key_head_major, routing_mode)
+        if backend is not None and not layout.keeps_all_blocks(sparse_key_blocks)
+        else None
     )
-
-    if backend is None:
-        return reference_sparse_piper_attention(
-            query,
-            key,
-            value,
-            routes,
+    if prepare_operands is None:
+        routes = packed_routes_from_sequences(
+            query_head_major,
+            sparse_key,
+            layout,
+            routing_mode,
+            block_lengths,
+            skip_dense_routing=backend is not None and backend.skip_dense_routing,
+        )
+        if backend is None:
+            return reference_sparse_piper_attention(
+                query,
+                key,
+                value,
+                routes,
+                sparse_key_blocks=sparse_key_blocks,
+                scale=scale,
+                block_lengths=block_lengths,
+                sparse_query_blocks=sparse_query_blocks,
+            )
+        value_head_major = value.transpose(1, 2)
+        output = torch.empty_like(query, memory_format=torch.contiguous_format)
+        prepared = backend.prepare(
+            query_head_major,
+            scale,
             sparse_key_blocks=sparse_key_blocks,
-            scale=scale,
+            combined_key=key_head_major,
+            combined_value=value_head_major,
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
+        ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    else:
+        assert backend is not None
+        operands = prepare_operands(
+            query_head_major,
+            scale,
+            sparse_key_blocks=sparse_key_blocks,
+            combined_key=key_head_major,
+            combined_value=value.transpose(1, 2),
+            block_lengths=block_lengths,
+            sparse_query_blocks=sparse_query_blocks,
+            emit_summaries=True,
         )
-
-    value_head_major = value.transpose(1, 2)
-    output = torch.empty_like(query, memory_format=torch.contiguous_format)
-    prepared = backend.prepare(
-        query_head_major,
-        routes.indices,
-        routes.head_keep_blocks,
-        scale,
-        sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.route_head_offsets,
-        combined_key=key_head_major,
-        combined_value=value_head_major,
-        block_lengths=block_lengths,
-        sparse_query_blocks=sparse_query_blocks,
-    )
+        assert operands.query_summary is not None
+        assert operands.key_summary is not None
+        assert operands.key_aux is not None
+        routes = packed_routes_from_summaries(
+            operands.query_summary,
+            operands.key_summary[:, :, :sparse_key_blocks],
+            operands.key_aux[:, :, :sparse_key_blocks],
+            layout,
+            routing_mode,
+            skip_dense_routing=backend.skip_dense_routing,
+        )
+        prepared = operands.with_routes(
+            routes.indices,
+            routes.head_keep_blocks,
+            routes.route_head_offsets,
+        )
+        # Release the routing summaries, then allocate the output, so neither
+        # coexists with the other or with routing's scratch storage.
+        del operands
+        output = torch.empty_like(query, memory_format=torch.contiguous_format)
     backend.launch(prepared, output.transpose(1, 2))
     return output
 

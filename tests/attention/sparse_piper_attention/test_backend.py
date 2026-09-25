@@ -333,7 +333,8 @@ def test_dense_orchestration_uses_selected_operations(monkeypatch, head_dim, kee
     query = torch.zeros(1, 128, 1, head_dim, dtype=torch.bfloat16)
     key, value = torch.zeros_like(query), torch.zeros_like(query)
     state = object()
-    prepare = Mock(return_value=state)
+    operands = Mock(with_routes=Mock(return_value=state))
+    prepare = Mock(return_value=operands)
     launch = Mock(side_effect=lambda prepared, output: output.fill_(3))
     backend = AttentionBackend(prepare=prepare, launch=launch, skip_dense_routing=head_dim == 64)
     select = Mock(return_value=backend)
@@ -348,7 +349,9 @@ def test_dense_orchestration_uses_selected_operations(monkeypatch, head_dim, kee
     assert select.call_args.args[0].data_ptr() == query.data_ptr()
     assert prepare.call_args.args[0].data_ptr() == query.data_ptr()
     route_count = 0 if head_dim == 64 and keep_ratio == 1.0 else int(2 * keep_ratio)
-    assert prepare.call_args.args[1].shape[-1] == route_count
+    assert prepare.call_args.args[1] == head_dim**-0.5
+    operands.with_routes.assert_called_once()
+    assert operands.with_routes.call_args.args[0].shape[-1] == route_count
     assert prepare.call_args.kwargs["combined_key"].data_ptr() == key.data_ptr()
     assert prepare.call_args.kwargs["combined_value"].data_ptr() == value.data_ptr()
     assert prepare.call_args.kwargs["sparse_key_blocks"] == 2

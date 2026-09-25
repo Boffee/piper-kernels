@@ -39,7 +39,7 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     coarse_attention,
     mean_pool_block_values,
 )
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
+from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_operands
 
 
 @pytest.mark.gpu
@@ -156,16 +156,9 @@ def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_
     blocks = sequence_length // 64
     layout = _resolve_route_layout(_normalize_head_keep_ratios((1.0,)), blocks, query.device)
     routes = packed_routes_from_sequences(query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING)
-    prepared = _prepare_sparse_piper_attention(
-        query,
-        routes.indices,
-        routes.head_keep_blocks,
-        128**-0.5,
-        sparse_key_blocks=blocks,
-        route_head_offsets=routes.route_head_offsets,
-        combined_key=key,
-        combined_value=value,
-    )
+    prepared = _prepare_sparse_piper_operands(
+        query, 128**-0.5, sparse_key_blocks=blocks, combined_key=key, combined_value=value
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
     coarse = torch.full(
         (1, 1, (sequence_length + 63) // 64, 128),
         1.0 / 256,
@@ -207,16 +200,13 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
         query_head_major,
         sparse_key,
     )
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         query_head_major,
-        routes.indices,
-        routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
-    )
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
 
     quantized_arguments = (
         prepared.query.data,
@@ -311,15 +301,16 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         sparse_key,
         layout,
     )
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         query_head_major,
-        placeholder_routes.indices,
-        placeholder_routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=placeholder_routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
+    ).with_routes(
+        placeholder_routes.indices,
+        placeholder_routes.head_keep_blocks,
+        placeholder_routes.route_head_offsets,
     )
     if routing_mode == _MEAN_ROUTING:
         query_summary = _sequence_block_means(query_head_major)
@@ -417,17 +408,14 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     )
     query_block_count = (sequence_length + 63) // 64
     sparse_query_blocks = query_block_count - 1 if mixed_query_scope else None
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         query_head_major,
-        routes.indices,
-        routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
         sparse_query_blocks=sparse_query_blocks,
-    )
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
 
     coarse_output = torch.randn(
         (shape[0], shape[2], query_block_count, shape[3]),
@@ -535,16 +523,13 @@ def _block_length_case(routing_mode: int, head_dim: int):
             query_head_major,
             key_head_major,
         )
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         query_head_major,
-        routes.indices,
-        routes.head_keep_blocks,
         head_dim**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
-    )
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
     arguments = (
         prepared.query.data,
         prepared.query.scale,
@@ -751,15 +736,16 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
         key_head_major[:, :, : sparse_key_blocks * 64],
         layout,
     )
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         query_head_major,
-        placeholder_routes.indices,
-        placeholder_routes.head_keep_blocks,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
-        route_head_offsets=placeholder_routes.route_head_offsets,
         combined_key=key_head_major,
         combined_value=value_head_major,
+    ).with_routes(
+        placeholder_routes.indices,
+        placeholder_routes.head_keep_blocks,
+        placeholder_routes.route_head_offsets,
     )
     query_mean = _sequence_block_means(query_head_major)
     key_mean = _sequence_block_means(key_head_major)

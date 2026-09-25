@@ -1,6 +1,8 @@
 """Tests for stock-Triton mixed-sign integer-dot lowering."""
 
 import inspect
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -187,6 +189,49 @@ def test_compiler_hook_composes_cache_identity_and_stage_order() -> None:
     assert len(calls) == 1
     assert callable(stages["llir"])
     assert stages["llir"](None, {}) == "unmarked"
+
+
+@pytest.mark.parametrize("cuda_build", [False, True])
+def test_import_registers_cuda_hook_without_initializing_a_device(cuda_build):
+    script = f"""
+import importlib
+
+import torch
+from triton import knobs
+
+torch.version.cuda = '13.0' if {cuda_build!r} else None
+
+def forbidden(*args, **kwargs):
+    raise AssertionError('import must not initialize or probe a device')
+
+torch.cuda._lazy_init = forbidden
+torch.cuda.is_available = forbidden
+torch.cuda.get_device_capability = forbidden
+importlib.import_module('triton.runtime.driver')._create_driver = forbidden
+
+def previous(*args):
+    return 'previous', 'previous-hash'
+
+knobs.runtime.add_stages_inspection_hook = previous
+import piper_kernels
+from piper_kernels._triton import mixed_int8
+
+hook = knobs.runtime.add_stages_inspection_hook
+if {cuda_build!r}:
+    assert isinstance(hook, mixed_int8._MixedInt8StageHook)
+    assert hook.previous is previous
+    identity = hook()
+    mixed_int8._register_uint8_int8_dot_hook()
+    assert knobs.runtime.add_stages_inspection_hook is hook
+    assert hook() == identity
+else:
+    assert hook is previous
+assert not torch.cuda.is_initialized()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.gpu

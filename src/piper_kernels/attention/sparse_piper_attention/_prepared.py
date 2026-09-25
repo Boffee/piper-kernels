@@ -64,6 +64,61 @@ class _PreparedSparsePiperAttention:
     launch: LaunchAttention | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedSparsePiperOperands:
+    """Quantized sequence-global operands before routes are known.
+
+    ``query_summary``/``key_summary``/``key_aux`` are the min/max routing
+    summaries, present only when preparation was asked to emit them.
+    """
+
+    key: torch.Tensor
+    value: torch.Tensor
+    key_scale: torch.Tensor
+    value_scale_multiplier: torch.Tensor
+    value_mean: torch.Tensor
+    query: torch.Tensor
+    query_scale: torch.Tensor
+    block_lengths: torch.Tensor | None
+    sparse_key_blocks: int
+    sparse_query_blocks: int | None
+    logical_sequence_length: int
+    query_summary: torch.Tensor | None = None
+    key_summary: torch.Tensor | None = None
+    key_aux: torch.Tensor | None = None
+
+    def with_routes(
+        self,
+        routes: torch.Tensor,
+        head_keep_blocks: torch.Tensor,
+        route_head_offsets: torch.Tensor,
+    ) -> _PreparedSparsePiperAttention:
+        """Bind selected routes to these quantized operands."""
+        context = _PreparedSparsePiperContext(
+            key=self.key,
+            value=self.value,
+            key_scale=self.key_scale,
+            value_scale_multiplier=self.value_scale_multiplier,
+            value_mean=self.value_mean,
+            route_head_offsets=route_head_offsets,
+            head_keep_blocks=head_keep_blocks,
+            routes_per_query=routes.shape[2],
+            block_lengths=self.block_lengths,
+            sparse_key_blocks=self.sparse_key_blocks,
+            sparse_query_blocks=self.sparse_query_blocks,
+            logical_sequence_length=self.logical_sequence_length,
+        )
+        return _PreparedSparsePiperAttention(
+            context=context,
+            query=_prepare_sparse_piper_query_from_quantized(
+                self.query,
+                self.query_scale,
+                routes,
+                context,
+            ),
+        )
+
+
 def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     key: torch.Tensor,
     key_scale: torch.Tensor,
