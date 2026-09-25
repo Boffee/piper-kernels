@@ -31,7 +31,7 @@ def skip_dense_routing(head_dim: int) -> bool:
     return head_dim == 64
 
 
-def select_attention_schedule(
+def select_sm120_attention_schedule(
     head_dim: int,
     query_rows: int,
     key_rows: int,
@@ -58,7 +58,7 @@ def select_attention_schedule(
     return 64, 4
 
 
-def use_fused_preparation(head_dim: int, sequence_length: int) -> bool:
+def use_sm120_fused_preparation(head_dim: int, sequence_length: int) -> bool:
     """Use fused Q/K summaries above the measured SM120 short-row crossover."""
     return sequence_length >= (2048 if head_dim == 64 else 1024)
 

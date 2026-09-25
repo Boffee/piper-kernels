@@ -22,7 +22,7 @@ def test_schedule_respects_width_ranges_and_coarse(
     width, queries, keys, skip_dense_routing, coarse, expected
 ):
     assert (
-        policy.select_attention_schedule(
+        policy.select_sm120_attention_schedule(
             width,
             queries,
             keys,
@@ -35,7 +35,7 @@ def test_schedule_respects_width_ranges_and_coarse(
 
 
 def test_very_sparse_long_sequences_keep_four_warps():
-    assert policy.select_attention_schedule(
+    assert policy.select_sm120_attention_schedule(
         64,
         8192,
         8192,

@@ -30,3 +30,44 @@ def tile_offset(
         sparse_start = sparse_tile * tile_stride
         dense_start = sparse_blocks * tile_stride + (position - selected_count) * tile_stride
         return gl.where(position < selected_count, sparse_start, dense_start)
+
+
+@gluon.jit
+def pair_tile_offsets(
+    routes,
+    pair_index,
+    tile_count,
+    routed_count,
+    selected_count,
+    sparse_blocks,
+    route_stride,
+    use_routes,
+    skip_dense_routing: gl.constexpr = False,
+    tile_stride: gl.constexpr = 1,
+):
+    """Return two tile offsets, duplicating the last tile for an incomplete pair."""
+    position_0 = pair_index * 2
+    position_1 = gl.minimum(position_0 + 1, tile_count - 1)
+    offset_0 = tile_offset(
+        routes,
+        position_0,
+        routed_count,
+        selected_count,
+        sparse_blocks,
+        route_stride,
+        use_routes,
+        skip_dense_routing,
+        tile_stride,
+    )
+    offset_1 = tile_offset(
+        routes,
+        position_1,
+        routed_count,
+        selected_count,
+        sparse_blocks,
+        route_stride,
+        use_routes,
+        skip_dense_routing,
+        tile_stride,
+    )
+    return offset_0, offset_1

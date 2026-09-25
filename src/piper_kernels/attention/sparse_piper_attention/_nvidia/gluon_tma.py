@@ -1,4 +1,4 @@
-"""Paired-K128 Gluon kernel for sparse Piper Attention on SM120."""
+"""Paired-K128 Gluon kernel for sparse Piper Attention with NVIDIA TMA loads."""
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
 # ruff: noqa: ANN001, ANN202, PLR0913, PLR0915, PLR0917
@@ -15,7 +15,7 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
+from piper_kernels.attention.kernels.sparse_piper.gluon import pair_tile_offsets
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
@@ -172,21 +172,10 @@ def _sparse_piper_attention_kernel(
     dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
-    initial_position_1 = gl.minimum(1, tile_count - 1)
-    initial_n_0 = tile_offset(
+    initial_n_0, initial_n_1 = pair_tile_offsets(
         route_base,
         0,
-        routed_sparse_tile_count,
-        selected_sparse_tile_count,
-        sparse_key_blocks,
-        stride_rr,
-        use_sparse_routes,
-        skip_dense_routing,
-        _GL_BLOCK_N,
-    )
-    initial_n_1 = tile_offset(
-        route_base,
-        initial_position_1,
+        tile_count,
         routed_sparse_tile_count,
         selected_sparse_tile_count,
         sparse_key_blocks,
@@ -245,7 +234,6 @@ def _sparse_piper_attention_kernel(
 
     for pair_index in range(pair_count - 1):
         phase = pair_index & 1
-        tile_position_0 = pair_index * 2
         mbarrier.wait(key_barrier, phase=phase)
         (
             probability,
@@ -276,22 +264,10 @@ def _sparse_piper_attention_kernel(
             False,
         )
 
-        next_position_0 = tile_position_0 + 2
-        next_position_1 = gl.minimum(next_position_0 + 1, tile_count - 1)
-        next_n_0 = tile_offset(
+        next_n_0, next_n_1 = pair_tile_offsets(
             route_base,
-            next_position_0,
-            routed_sparse_tile_count,
-            selected_sparse_tile_count,
-            sparse_key_blocks,
-            stride_rr,
-            use_sparse_routes,
-            skip_dense_routing,
-            _GL_BLOCK_N,
-        )
-        next_n_1 = tile_offset(
-            route_base,
-            next_position_1,
+            pair_index + 1,
+            tile_count,
             routed_sparse_tile_count,
             selected_sparse_tile_count,
             sparse_key_blocks,
@@ -491,7 +467,7 @@ def _launch_sparse_piper_attention(
     )
     if launch.skip_dense_routing and launch.head_dim != 64:
         raise ValueError("skip_dense_routing requires NVIDIA D64 attention")
-    block_m, num_warps = policy.select_attention_schedule(
+    block_m, num_warps = policy.select_sm120_attention_schedule(
         launch.head_dim,
         launch.query_rows,
         launch.storage_sequence_length,

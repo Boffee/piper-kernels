@@ -33,9 +33,9 @@ pytestmark = [
     ),
 ]
 
-if _backend.nvidia_sm89_gluon is not None:
-    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon as sm120
-    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_sm89 as native
+if _backend.nvidia_async_copy_gluon is not None:
+    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_async_copy as native
+    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_tma as sm120
     from piper_kernels.attention.sparse_piper_attention.triton import (
         _prepare_sparse_piper_operands,
     )

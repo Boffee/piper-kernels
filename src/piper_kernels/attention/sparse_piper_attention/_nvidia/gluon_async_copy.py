@@ -1,11 +1,9 @@
-"""Paired-K128 Gluon kernel for sparse Piper Attention on SM89.
+"""Paired-K128 Gluon kernel for sparse Piper Attention with NVIDIA async copies.
 
-Ada has no Tensor Memory Accelerator. Q, the two routed K64 tiles of each
-pair, and their V tiles therefore reach shared memory through Ampere-style
-``cp.async`` copies tracked by commit groups, instead of TMA descriptors and
-mbarriers. The routed traversal, shared-memory layouts, paired-K128 recurrence,
-and epilogue are the SM120 kernel's, so both targets share one numerical
-contract.
+Q and each pair's K/V tiles reach shared memory through ``cp.async`` copies
+tracked by commit groups. The TMA implementation shares the routed traversal,
+paired-K128 recurrence, and epilogue. Dispatch currently selects this load
+pipeline on SM89 and retains its measured launch policy.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -22,7 +20,7 @@ from triton.experimental.gluon.language.nvidia.ampere import async_copy
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
+from piper_kernels.attention.kernels.sparse_piper.gluon import pair_tile_offsets
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
@@ -95,46 +93,6 @@ def _copy_value_pair(
     offsets = features[:, None] * storage_sequence_length + keys[None, :]
     async_copy.async_load(value_shared_pair.index(0), value_ptr + start_n_0 + offsets)
     async_copy.async_load(value_shared_pair.index(1), value_ptr + start_n_1 + offsets)
-
-
-@gluon.jit
-def _pair_offsets(
-    pair_index,
-    tile_count,
-    route_base,
-    routed_sparse_tile_count,
-    selected_sparse_tile_count,
-    sparse_key_blocks,
-    stride_rr,
-    use_sparse_routes,
-    skip_dense_routing: gl.constexpr,
-):
-    """Return both K/V tile offsets of a pair, duplicating a missing second tile."""
-    position_0 = pair_index * 2
-    position_1 = gl.minimum(position_0 + 1, tile_count - 1)
-    start_n_0 = tile_offset(
-        route_base,
-        position_0,
-        routed_sparse_tile_count,
-        selected_sparse_tile_count,
-        sparse_key_blocks,
-        stride_rr,
-        use_sparse_routes,
-        skip_dense_routing,
-        _GL_BLOCK_N,
-    )
-    start_n_1 = tile_offset(
-        route_base,
-        position_1,
-        routed_sparse_tile_count,
-        selected_sparse_tile_count,
-        sparse_key_blocks,
-        stride_rr,
-        use_sparse_routes,
-        skip_dense_routing,
-        _GL_BLOCK_N,
-    )
-    return start_n_0, start_n_1
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
@@ -237,7 +195,7 @@ def _sparse_piper_attention_kernel(
         [_GL_NUM_WARPS, 1],
         [1, 0],
     )
-    # The SM120 kernel's TMA-compatible swizzles also serve ldmatrix here; Q and K
+    # The TMA kernel's shared-memory swizzles also serve ldmatrix here; Q and K
     # rows share one layout.
     row_shared_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for(
         [_GL_BLOCK_N, head_dim], gl.int8
@@ -278,16 +236,17 @@ def _sparse_piper_attention_kernel(
     query_rows = start_m + gl.arange(0, _GL_BLOCK_N, gl.SliceLayout(1, row_copy_layout))
     _copy_rows(query_base_ptr, query_rows, query_shared, row_copy_layout)
     async_copy.commit_group()
-    start_n_0, start_n_1 = _pair_offsets(
+    start_n_0, start_n_1 = pair_tile_offsets(
+        route_base,
         0,
         tile_count,
-        route_base,
         routed_sparse_tile_count,
         selected_sparse_tile_count,
         sparse_key_blocks,
         stride_rr,
         use_sparse_routes,
         skip_dense_routing,
+        _GL_BLOCK_N,
     )
     _copy_key_pair(key_base_ptr, start_n_0, start_n_1, key_shared_pair, row_copy_layout)
     async_copy.commit_group()
@@ -349,16 +308,17 @@ def _sparse_piper_attention_kernel(
             mask_ragged_tail and ragged_tail_is_routed,
             False,
         )
-        next_n_0, next_n_1 = _pair_offsets(
+        next_n_0, next_n_1 = pair_tile_offsets(
+            route_base,
             pair_index + 1,
             tile_count,
-            route_base,
             routed_sparse_tile_count,
             selected_sparse_tile_count,
             sparse_key_blocks,
             stride_rr,
             use_sparse_routes,
             skip_dense_routing,
+            _GL_BLOCK_N,
         )
         gl.barrier()
         _copy_key_pair(key_base_ptr, next_n_0, next_n_1, key_shared_pair, row_copy_layout)
@@ -482,7 +442,7 @@ def _validate_copy_storage(prepared: _PreparedSparsePiperAttention) -> None:
         not tensor.is_contiguous() or tensor.data_ptr() % _COPY_ALIGNMENT
         for tensor in (query, key, value)
     ):
-        raise ValueError("SM89 sparse Piper requires contiguous 16-byte-aligned Q/K/V storage")
+        raise ValueError("cp.async sparse Piper requires contiguous 16-byte-aligned Q/K/V storage")
 
 
 def _launch_sparse_piper_attention(

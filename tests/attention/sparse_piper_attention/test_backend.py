@@ -59,11 +59,11 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, kernel, he
     for name in ("tma", "async_copy"):
         backend = AttentionBackend(prepare=Mock(), launch=Mock())
         backends[name] = (backend, replace(backend, skip_dense_routing=True))
-    monkeypatch.setattr(_backend, "_nvidia_attention", backends["tma"][0])
-    monkeypatch.setattr(_backend, "_nvidia_attention_skip_dense_routing", backends["tma"][1])
-    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", backends["async_copy"][0])
+    monkeypatch.setattr(_backend, "_nvidia_tma_attention", backends["tma"][0])
+    monkeypatch.setattr(_backend, "_nvidia_tma_attention_skip_dense_routing", backends["tma"][1])
+    monkeypatch.setattr(_backend, "_nvidia_async_copy_attention", backends["async_copy"][0])
     monkeypatch.setattr(
-        _backend, "_nvidia_sm89_attention_skip_dense_routing", backends["async_copy"][1]
+        _backend, "_nvidia_async_copy_attention_skip_dense_routing", backends["async_copy"][1]
     )
     monkeypatch.setattr(_backend, "_amd_attention", None)
     expected = None if kernel is None else backends[kernel][1 if head_dim == 64 else 0]
@@ -71,20 +71,20 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, kernel, he
     probe.assert_called_once_with(query.device)
 
 
-@pytest.mark.skipif(_backend.nvidia_sm89_gluon is None, reason="requires Triton import")
+@pytest.mark.skipif(_backend.nvidia_async_copy_gluon is None, reason="requires Triton import")
 def test_sm89_attention_uses_its_own_launcher_and_shared_preparation():
-    sm89 = _backend._nvidia_sm89_attention
-    sm120 = _backend._nvidia_attention
+    sm89 = _backend._nvidia_async_copy_attention
+    sm120 = _backend._nvidia_tma_attention
     assert sm89 is not None
     assert sm120 is not None
-    assert sm89.launch is _backend.nvidia_sm89_gluon._launch_sparse_piper_attention
+    assert sm89.launch is _backend.nvidia_async_copy_gluon._launch_sparse_piper_attention
     assert sm89.launch is not sm120.launch
     assert sm89.prepare is sm120.prepare
 
 
 def test_missing_attention_implementation_does_not_probe_device(monkeypatch):
-    monkeypatch.setattr(_backend, "_nvidia_attention", None)
-    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_tma_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_async_copy_attention", None)
     monkeypatch.setattr(_backend, "_amd_attention", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
     query = torch.empty(1)
@@ -102,8 +102,8 @@ def test_amd_attention_selection_is_independent_and_uses_tensor_device(
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
-    monkeypatch.setattr(_backend, "_nvidia_attention", None)
-    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_tma_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_async_copy_attention", None)
     backend = AttentionBackend(prepare=Mock(), launch=Mock())
     monkeypatch.setattr(_backend, "_amd_attention", backend)
     query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
@@ -307,8 +307,8 @@ def test_auxiliary_selection_is_independent_of_attention(
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
-    monkeypatch.setattr(_backend, "_nvidia_attention", None)
-    monkeypatch.setattr(_backend, "_nvidia_sm89_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_tma_attention", None)
+    monkeypatch.setattr(_backend, "_nvidia_async_copy_attention", None)
     monkeypatch.setattr(_backend, "_amd_attention", None)
     route_selector, summarize = Mock(), Mock()
     monkeypatch.setattr(
@@ -648,8 +648,8 @@ def test_shared_preparation_accepts_empty_routes_and_rejects_negative_counts(hea
         _prepared_attention(head_dim, -1)
 
 
-@pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
-@pytest.mark.parametrize("module", ["nvidia_gluon", "nvidia_sm89_gluon"])
+@pytest.mark.skipif(_backend.nvidia_tma_gluon is None, reason="requires Triton import")
+@pytest.mark.parametrize("module", ["nvidia_tma_gluon", "nvidia_async_copy_gluon"])
 def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, module):
     native = getattr(_backend, module)
     prepared = _prepared_attention(128, 0)
@@ -662,11 +662,11 @@ def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, m
     enter_device.assert_not_called()
 
 
-@pytest.mark.skipif(_backend.nvidia_sm89_gluon is None, reason="requires Triton import")
+@pytest.mark.skipif(_backend.nvidia_async_copy_gluon is None, reason="requires Triton import")
 @pytest.mark.parametrize("operand", ["query", "key", "value"])
 @pytest.mark.parametrize("defect", ["noncontiguous", "misaligned"])
 def test_sm89_rejects_uncopyable_storage_before_device_execution(monkeypatch, operand, defect):
-    native = _backend.nvidia_sm89_gluon
+    native = _backend.nvidia_async_copy_gluon
     prepared = _prepared_attention(128, 2)
     tensor = {
         "query": prepared.query.data,
@@ -757,7 +757,7 @@ query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
 assert _backend.select_attention_backend(query) is None
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 assert policy.skip_dense_routing(64)
-assert policy.select_attention_schedule(
+assert policy.select_sm120_attention_schedule(
     64, 32768, 32768, skip_dense_routing=True,
     has_coarse_residual=False, selected_key_rows=32768,
 ) == (128, 4)

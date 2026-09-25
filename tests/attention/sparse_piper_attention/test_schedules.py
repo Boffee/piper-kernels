@@ -11,7 +11,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._nvidia import gluon as native
+from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_tma as native
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_query_from_quantized,
@@ -58,7 +58,7 @@ def test_skip_dense_routing_matches_materialized_routes(monkeypatch, sequence):
     operands, prepared = _prepared(sequence, [1.0, 1.0])
     expected = torch.empty_like(operands[0])
     with monkeypatch.context() as patch:
-        patch.setattr(policy, "select_attention_schedule", lambda *args, **kwargs: (64, 4))
+        patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
         native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2))
     actual = SparsePiperAttention([1.0, 1.0])(*operands, sparse_key_blocks=sequence // 64)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -89,7 +89,7 @@ def test_two_warps_preserve_mixed_routes_dense_suffix_and_coarse(monkeypatch, co
             "coarse_gate": torch.randn_like(operands[0]),
         }
     with monkeypatch.context() as patch:
-        patch.setattr(policy, "select_attention_schedule", lambda *args, **kwargs: (64, 4))
+        patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
         native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2), **kwargs)
     native._launch_sparse_piper_attention(prepared, actual.transpose(1, 2), **kwargs)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -102,7 +102,7 @@ def test_large_tile_preserves_odd_query_ranges_and_output_guards(monkeypatch):
     operands, prepared = _prepared(sequence, [1.0, 1.0])
     expected = torch.empty_like(operands[0])
     with monkeypatch.context() as patch:
-        patch.setattr(policy, "select_attention_schedule", lambda *args, **kwargs: (64, 4))
+        patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
         native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2))
     context = replace(prepared.context, routes_per_query=0)
     routes = prepared.query.routes[:, :, :0].contiguous()
@@ -140,7 +140,7 @@ def test_large_tile_preserves_internally_padded_blocks(monkeypatch):
     operands, prepared = _prepared(sequence, [1.0, 1.0], block_lengths=lengths)
     expected = torch.empty_like(operands[0])
     with monkeypatch.context() as patch:
-        patch.setattr(policy, "select_attention_schedule", lambda *args, **kwargs: (64, 4))
+        patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
         native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2))
     actual = SparsePiperAttention([1.0, 1.0])(
         *operands, sparse_key_blocks=sequence // 64, block_lengths=lengths

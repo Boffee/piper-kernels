@@ -27,18 +27,18 @@ except ModuleNotFoundError as error:
     preparation = None
 
 try:
-    from ._nvidia import gluon as nvidia_gluon
+    from ._nvidia import gluon_tma as nvidia_tma_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
-    nvidia_gluon = None
+    nvidia_tma_gluon = None
 
 try:
-    from ._nvidia import gluon_sm89 as nvidia_sm89_gluon
+    from ._nvidia import gluon_async_copy as nvidia_async_copy_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
-    nvidia_sm89_gluon = None
+    nvidia_async_copy_gluon = None
 
 try:
     from ._amd import gluon as amd_gluon
@@ -47,28 +47,30 @@ except ModuleNotFoundError as error:
         raise
     amd_gluon = None
 
-_nvidia_attention = (
+_nvidia_tma_attention = (
     AttentionBackend(
         prepare=preparation._prepare_sparse_piper_operands,
-        launch=nvidia_gluon._launch_sparse_piper_attention,
+        launch=nvidia_tma_gluon._launch_sparse_piper_attention,
     )
-    if preparation is not None and nvidia_gluon is not None
+    if preparation is not None and nvidia_tma_gluon is not None
     else None
 )
-_nvidia_attention_skip_dense_routing = (
-    replace(_nvidia_attention, skip_dense_routing=True) if _nvidia_attention is not None else None
+_nvidia_tma_attention_skip_dense_routing = (
+    replace(_nvidia_tma_attention, skip_dense_routing=True)
+    if _nvidia_tma_attention is not None
+    else None
 )
-_nvidia_sm89_attention = (
+_nvidia_async_copy_attention = (
     AttentionBackend(
         prepare=preparation._prepare_sparse_piper_operands,
-        launch=nvidia_sm89_gluon._launch_sparse_piper_attention,
+        launch=nvidia_async_copy_gluon._launch_sparse_piper_attention,
     )
-    if preparation is not None and nvidia_sm89_gluon is not None
+    if preparation is not None and nvidia_async_copy_gluon is not None
     else None
 )
-_nvidia_sm89_attention_skip_dense_routing = (
-    replace(_nvidia_sm89_attention, skip_dense_routing=True)
-    if _nvidia_sm89_attention is not None
+_nvidia_async_copy_attention_skip_dense_routing = (
+    replace(_nvidia_async_copy_attention, skip_dense_routing=True)
+    if _nvidia_async_copy_attention is not None
     else None
 )
 _amd_attention = (
@@ -107,17 +109,21 @@ except ModuleNotFoundError as error:
 
 def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
     """Return native execution or let the caller use the quantized reference."""
-    if _nvidia_attention is None and _nvidia_sm89_attention is None and _amd_attention is None:
+    if (
+        _nvidia_tma_attention is None
+        and _nvidia_async_copy_attention is None
+        and _amd_attention is None
+    ):
         return None
     target = AcceleratorTarget.from_device(query.device)
     # Device probes and pre-projection activations do not have an attention head axis.
     head_dim = query.shape[-1] if query.ndim == 4 else 128
     if nvidia_policy.uses_tensor_descriptors(target):
-        backend, full_keep_backend = _nvidia_attention, _nvidia_attention_skip_dense_routing
+        backend, full_keep_backend = _nvidia_tma_attention, _nvidia_tma_attention_skip_dense_routing
     elif nvidia_policy.uses_async_copies(target):
         backend, full_keep_backend = (
-            _nvidia_sm89_attention,
-            _nvidia_sm89_attention_skip_dense_routing,
+            _nvidia_async_copy_attention,
+            _nvidia_async_copy_attention_skip_dense_routing,
         )
     else:
         return (
@@ -224,7 +230,7 @@ def select_fused_operand_preparation(
         return None
     target = AcceleratorTarget.from_device(query.device)
     if nvidia_policy.uses_tensor_descriptors(target):
-        if not nvidia_policy.use_fused_preparation(query.shape[-1], query.shape[2]):
+        if not nvidia_policy.use_sm120_fused_preparation(query.shape[-1], query.shape[2]):
             return None
     elif not (nvidia_policy.uses_async_copies(target) or amd_policy.supports_target(target)):
         return None
