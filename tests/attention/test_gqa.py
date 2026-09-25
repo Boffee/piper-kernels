@@ -162,14 +162,11 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
     routes = packed_routes_from_sequences(query, key, layout, routing_mode)
     prepared = backend.prepare(
         query,
-        routes.indices,
-        routes.head_keep_blocks,
         scale,
         sparse_key_blocks=4,
-        route_head_offsets=routes.route_head_offsets,
         combined_key=key,
         combined_value=value,
-    )
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
     assert prepared.query.data.shape[1] == heads
     assert prepared.context.head_keep_blocks.numel() == heads
     for tensor in (

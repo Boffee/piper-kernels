@@ -23,7 +23,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_sparse_piper_attention,
 )
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_attention
+from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_operands
 
 pytestmark = [
     pytest.mark.gpu,
@@ -53,16 +53,13 @@ def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
     routes = packed_routes_from_sequences(
         q.transpose(1, 2), k.transpose(1, 2)[:, :, : blocks * 64], layout, routing_mode
     )
-    prepared = _prepare_sparse_piper_attention(
+    prepared = _prepare_sparse_piper_operands(
         q.transpose(1, 2),
-        routes.indices,
-        routes.head_keep_blocks,
         head_dim**-0.5,
         sparse_key_blocks=blocks,
-        route_head_offsets=routes.route_head_offsets,
         combined_key=k.transpose(1, 2),
         combined_value=v.transpose(1, 2),
-    )
+    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
     expected = reference_sparse_piper_attention(
         q, k, v, routes, sparse_key_blocks=blocks, scale=head_dim**-0.5
     )

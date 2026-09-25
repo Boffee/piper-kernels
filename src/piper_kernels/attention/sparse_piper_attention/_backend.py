@@ -9,8 +9,15 @@ from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_D
 
 from ._amd import policy as amd_policy
 from ._dtype import SUPPORTED_DTYPES
-from ._interfaces import AttentionBackend, MinmaxScores, SelectRoutes, SequenceSummaries
+from ._interfaces import (
+    AttentionBackend,
+    MinmaxScores,
+    PrepareOperands,
+    SelectRoutes,
+    SequenceSummaries,
+)
 from ._nvidia import policy as nvidia_policy
+from ._routing_modes import _MEAN_ROUTING
 
 try:
     from . import triton as preparation
@@ -35,7 +42,7 @@ except ModuleNotFoundError as error:
 
 _nvidia_attention = (
     AttentionBackend(
-        prepare=preparation._prepare_sparse_piper_attention,
+        prepare=preparation._prepare_sparse_piper_operands,
         launch=nvidia_gluon._launch_sparse_piper_attention,
     )
     if preparation is not None and nvidia_gluon is not None
@@ -46,7 +53,7 @@ _nvidia_attention_skip_dense_routing = (
 )
 _amd_attention = (
     AttentionBackend(
-        prepare=preparation._prepare_sparse_piper_attention,
+        prepare=preparation._prepare_sparse_piper_operands,
         launch=amd_gluon._launch_sparse_piper_attention,
         bind=amd_gluon.bind_context,
     )
@@ -164,6 +171,37 @@ def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
     else:
         blocks = torch.arange(sparse_key_blocks, device=routes.device, dtype=torch.int32)
         routes.unflatten(-1, (-1, sparse_key_blocks)).copy_(blocks.to(torch.uint16))
+
+
+def select_fused_operand_preparation(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    routing_mode: int,
+) -> PrepareOperands | None:
+    """Fuse min/max summaries into Q/K quantization on native attention backends.
+
+    Mean routing keeps its existing reduction order: a different FP32 sum can
+    change routes tied within a ULP. SM120 also keeps its faster short-row path.
+    """
+    if preparation is None or routing_mode == _MEAN_ROUTING:
+        return None
+    if not (
+        query.device == key.device
+        and query.shape[-1] in SUPPORTED_HEAD_DIMS
+        and key.shape[-1] == query.shape[-1]
+        and query.stride(-1) == 1
+        and key.stride(-1) == 1
+        and query.dtype in SUPPORTED_DTYPES
+        and key.dtype == query.dtype
+    ):
+        return None
+    target = AcceleratorTarget.from_device(query.device)
+    if nvidia_policy.supports_target(target):
+        if not nvidia_policy.use_fused_preparation(query.shape[-1], query.shape[2]):
+            return None
+    elif not amd_policy.supports_target(target):
+        return None
+    return preparation._prepare_sparse_piper_operands
 
 
 def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> SequenceSummaries | None:

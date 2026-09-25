@@ -19,6 +19,7 @@ import threading
 from collections.abc import Callable
 from typing import Any, cast
 
+import torch
 import triton
 import triton.language as tl
 from triton import knobs
@@ -240,11 +241,16 @@ def _validate_target(target: object | None) -> None:
 def install_uint8_int8_dot_hook() -> None:
     """Install the idempotent compiler-stage hook used by :func:`uint8_int8_dot`.
 
-    Call this before launching a kernel that uses :func:`uint8_int8_dot`. Installing
-    the hook changes Triton's explicit cache identity and does not alter kernels with
-    no marked mixed-sign dot.
+    Call this inside the operand's device context before launching a mixed dot.
+    CUDA builds register the hook at import, before any Piper kernels compile;
+    this call validates the active target and restores a replaced hook if needed.
     """
     _validate_target(driver.active.get_current_target())
+    _register_uint8_int8_dot_hook()
+
+
+def _register_uint8_int8_dot_hook() -> None:
+    """Register compiler state without probing or initializing an accelerator."""
     runtime_knobs = cast(Any, knobs.runtime)
     if not hasattr(runtime_knobs, "add_stages_inspection_hook"):
         raise MixedInt8DotCompatibilityError(
@@ -261,3 +267,11 @@ def install_uint8_int8_dot_hook() -> None:
             )
         previous = cast(Callable[..., tuple[str, str]] | None, current)
         runtime_knobs.add_stages_inspection_hook = _MixedInt8StageHook(previous)
+
+
+# Late installation changes every Triton kernel's cache identity, recompiling
+# preparation/projection kernels on the second attention call. Build metadata
+# lets CUDA imports establish that identity without initializing a driver, and
+# leaves CPU/ROCm builds alone. Unmarked kernels pass through unchanged.
+if torch.version.cuda is not None:
+    _register_uint8_int8_dot_hook()

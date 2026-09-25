@@ -27,6 +27,7 @@ def _kv_mean_partial_kernel(
     value_ptr,
     key_partial_ptr,
     value_partial_ptr,
+    block_lengths_ptr,
     key_length,
     num_chunks,
     stride_kb,
@@ -41,6 +42,7 @@ def _kv_mean_partial_kernel(
     chunk_n: tl.constexpr,
     block_n: tl.constexpr,
     block_d: tl.constexpr,
+    mask_block_lengths: tl.constexpr,
 ):
     """Reduce one raw K chunk and, when non-causal, its V chunk."""
     chunk = tl.program_id(0)
@@ -56,6 +58,11 @@ def _kv_mean_partial_kernel(
     for offset in tl.range(0, chunk_n, block_n, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
         current_n = chunk_start + offset + offsets_n
         mask = (current_n[:, None] < key_length) & (offsets_d[None, :] < head_dim)
+        if mask_block_lengths:
+            lengths = tl.load(
+                block_lengths_ptr + current_n // block_n, mask=current_n < key_length, other=0
+            )
+            mask &= ((current_n % block_n) < lengths)[:, None]
         key = tl.load(
             key_ptr
             + batch * stride_kb
@@ -133,8 +140,13 @@ def compute_kv_means(
     value: torch.Tensor,
     *,
     is_causal: bool,
+    block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the shared Piper K mean and optional non-causal V mean."""
+    """Compute K/V means, optionally treating padded K64 rows as zero.
+
+    Divide by the physical sequence length, including padding, to preserve the
+    reduction over zeroed copies. Callers validate block-length metadata.
+    """
     batch, heads, key_length, head_dim = key.shape
     num_chunks = int(triton.cdiv(key_length, _MEAN_CHUNK_N))
     partial_shape = (batch, heads, num_chunks, head_dim)
@@ -162,6 +174,7 @@ def compute_kv_means(
             value,
             key_partial,
             value_partial,
+            block_lengths if block_lengths is not None else key,
             key_length,
             num_chunks,
             key.stride(0),
@@ -176,6 +189,7 @@ def compute_kv_means(
             chunk_n=_MEAN_CHUNK_N,
             block_n=_MEAN_BLOCK_N,
             block_d=_MEAN_BLOCK_D,
+            mask_block_lengths=block_lengths is not None,
             num_warps=4,
         )
         _kv_mean_finalize_kernel[(batch * heads, int(triton.cdiv(head_dim, _MEAN_BLOCK_D)))](

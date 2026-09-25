@@ -689,6 +689,19 @@ scores and top-k selection. Standalone attention also skips routing summaries in
 This includes ratios that round to a full physical budget. Coarse-attention scores still run
 because they contribute to the coarse output.
 
+Standalone min/max routing shares Q/K loads with quantization on SM120 and RDNA4.
+SM120 keeps separate passes below 2,048 rows for D64 and 1,024 rows for D128, where
+they measured faster. Mean routing preserves its existing FP32 reduction order.
+Padded preparation masks rows inside the K/V mean and V quantization kernels; the
+fused Q/K pass also avoids padded Q/K copies. ConvRot projection fusions already
+produce quantized operands and summaries and bypass this standalone preparation.
+
+On CUDA builds, importing Piper registers its mixed-sign INT8 compiler extension
+without initializing a GPU. This keeps Triton's cache identity stable across the
+first and subsequent dense, sparse, and fused attention calls. Target validation
+still runs on the operand's device at launch; CPU and ROCm builds do not register
+the extension.
+
 Sparse Piper also exposes a routing-selectable Q/K/V-derived coarse-attention residual:
 
 ```python

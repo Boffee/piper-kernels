@@ -12,7 +12,7 @@ Inputs are seeded synthetic BF16 tensors, not captured model activations.
 import argparse
 import json
 import statistics
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 from typing import cast
@@ -32,6 +32,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 )
 from piper_kernels.attention.sparse_piper_attention._interfaces import LaunchAttention
 from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperAttention
+from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
 from piper_kernels.attention.sparse_piper_attention.reference import (
@@ -91,22 +92,21 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     )
     routes = route_call()
     skip_dense_routing = routes.indices.shape[-1] == 0
-    prepare_call = partial(
-        backend.prepare,
-        query.transpose(1, 2),
-        routes.indices,
-        routes.head_keep_blocks,
-        args.head_dim**-0.5,
-        sparse_key_blocks=blocks,
-        route_head_offsets=routes.route_head_offsets,
-        combined_key=key.transpose(1, 2),
-        combined_value=value.transpose(1, 2),
-    )
 
     def prepare_execution(
-        prepare_inputs: Callable[[], _PreparedSparsePiperAttention] = prepare_call,
+        selected_routes: PackedRoutes = routes,
     ) -> tuple[_PreparedSparsePiperAttention, LaunchAttention]:
-        state = prepare_inputs()
+        state = backend.prepare(
+            query.transpose(1, 2),
+            args.head_dim**-0.5,
+            sparse_key_blocks=blocks,
+            combined_key=key.transpose(1, 2),
+            combined_value=value.transpose(1, 2),
+        ).with_routes(
+            selected_routes.indices,
+            selected_routes.head_keep_blocks,
+            selected_routes.route_head_offsets,
+        )
         return state, backend.bind_context(state.context)
 
     prepared, bound_launch = prepare_execution()
@@ -158,7 +158,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     operations = useful_integer_operations(sequence, selected_blocks, args.batch, args.head_dim)
     # Measure real public-call memory with no extra prepared benchmark state or
     # output retained. This matters at 100k tokens on a 16-GB accelerator.
-    del launch, bound_launch, prepared, output, routes, route_call, prepare_execution, prepare_call
+    del launch, bound_launch, prepared, output, routes, route_call, prepare_execution
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     public = synchronized_wall_benchmark(
