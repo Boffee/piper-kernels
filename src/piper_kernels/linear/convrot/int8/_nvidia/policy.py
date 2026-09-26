@@ -47,22 +47,32 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
     def __post_init__(self) -> None:
         LinearExecutionPlan.__post_init__(self)
         if self.fused_num_warps not in _FUSED_NUM_WARPS_VALUES:
-            choices = _choices(_FUSED_NUM_WARPS_VALUES)
-            raise ValueError(f"ConvRot fused preparation num_warps must be {choices}")
+            raise ValueError(
+                f"ConvRot fused preparation num_warps must be {_choices(_FUSED_NUM_WARPS_VALUES)}"
+            )
         if self.rotation_num_warps not in _ROTATION_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot split rotation num_warps must be 1, 2, 4, or 8")
+            raise ValueError(
+                f"ConvRot split rotation num_warps must be {_choices(_ROTATION_NUM_WARPS_VALUES)}"
+            )
         if self.quantization_num_warps not in _QUANTIZATION_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot split quantization num_warps must be 1, 2, 4, or 8")
+            raise ValueError(
+                "ConvRot split quantization num_warps must be "
+                f"{_choices(_QUANTIZATION_NUM_WARPS_VALUES)}"
+            )
         if self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
             raise ValueError(f"ConvRot matmul block_m must be {_choices(_MATMUL_BLOCK_M_VALUES)}")
         if self.matmul_block_n not in _MATMUL_BLOCK_N_VALUES:
-            raise ValueError("ConvRot matmul block_n must be 16, 32, 64, 128, or 256")
+            raise ValueError(f"ConvRot matmul block_n must be {_choices(_MATMUL_BLOCK_N_VALUES)}")
         if self.matmul_block_k not in _MATMUL_BLOCK_K_VALUES:
-            raise ValueError("ConvRot matmul block_k must be 32, 64, or 128")
+            raise ValueError(f"ConvRot matmul block_k must be {_choices(_MATMUL_BLOCK_K_VALUES)}")
         if self.matmul_num_warps not in _MATMUL_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot matmul num_warps must be 2, 4, or 8")
+            raise ValueError(
+                f"ConvRot matmul num_warps must be {_choices(_MATMUL_NUM_WARPS_VALUES)}"
+            )
         if self.matmul_num_stages not in _MATMUL_NUM_STAGES_VALUES:
-            raise ValueError("ConvRot matmul num_stages must be 1, 2, 3, or 4")
+            raise ValueError(
+                f"ConvRot matmul num_stages must be {_choices(_MATMUL_NUM_STAGES_VALUES)}"
+            )
         self._validate_matmul()
 
     def _validate_matmul(self) -> None:
@@ -74,7 +84,7 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
                 raise ValueError(f"ConvRot {name} must be boolean")
         group_m = self.matmul_group_m
         if type(group_m) is not int or group_m not in _MATMUL_GROUP_M_VALUES:
-            raise ValueError("ConvRot matmul group_m must be 0, 8, or 16")
+            raise ValueError(f"ConvRot matmul group_m must be {_choices(_MATMUL_GROUP_M_VALUES)}")
         if self.matmul_kernel == "gluon_async_copy":
             # Two 64-column warp tiles and two/four 64-row warp tiles per CTA.
             if (

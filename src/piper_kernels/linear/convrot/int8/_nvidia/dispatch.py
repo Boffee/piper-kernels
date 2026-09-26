@@ -88,33 +88,6 @@ def prepare_input_with_plan(
     return result
 
 
-def _prepare_input_with_production_plan(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    group_size: int,
-    *,
-    activation_fn: str | None,
-    input_scale: torch.Tensor | None = None,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepare an ordinary or activated input under production policy."""
-    in_features = input.shape[-1] // input_activation_width(activation_fn)
-    target = AcceleratorTarget.from_device(input.device)
-    plan = policy.select_execution_plan(
-        target,
-        in_features=in_features,
-    )
-    return prepare_input_with_plan(
-        input,
-        in_features,
-        group_size,
-        activation_fn=activation_fn,
-        input_scale=input_scale,
-        execution_plan=plan,
-        target=target,
-        out=out,
-    )
-
-
 def execute_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -264,11 +237,20 @@ def prepare_input(
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply an optional activation, then rotate and quantize a linear input."""
-    return _prepare_input_with_production_plan(
+    in_features = input.shape[-1] // input_activation_width(activation_fn)
+    target = AcceleratorTarget.from_device(input.device)
+    plan = policy.select_execution_plan(
+        target,
+        in_features=in_features,
+    )
+    return prepare_input_with_plan(
         input,
+        in_features,
         group_size,
         activation_fn=activation_fn,
         input_scale=input_scale,
+        execution_plan=plan,
+        target=target,
         out=out,
     )
 
