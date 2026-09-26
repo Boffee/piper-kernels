@@ -235,7 +235,6 @@ def _sparse_piper_attention_kernel(
 
     query_rows = start_m + gl.arange(0, _GL_BLOCK_N, gl.SliceLayout(1, row_copy_layout))
     _copy_rows(query_base_ptr, query_rows, query_shared, row_copy_layout)
-    async_copy.commit_group()
     start_n_0, start_n_1 = pair_tile_offsets(
         route_base,
         0,
@@ -260,8 +259,8 @@ def _sparse_piper_attention_kernel(
     )
     async_copy.commit_group()
 
-    # Q is the oldest group; the first pair's K and V may remain in flight.
-    async_copy.wait_group(2)
+    # Q shares the first pair's K group; only its V group may remain in flight.
+    async_copy.wait_group(1)
     gl.barrier()
     query = query_shared.load(query_layout)
 
