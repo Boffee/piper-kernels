@@ -30,11 +30,13 @@ probability-code units until the output epilogue.
   three pipeline stages.
 - Non-causal D128 uses K/V descriptors and two pipeline stages at every length.
 
-Exact SM89 runs the Gluon kernel instead, staging Q, K, and V tiles through
-`cp.async` commit groups with Q64/K64 tiles and four warps. It keeps per-thread Q/K
-scales and derives the V log-scale bound. Register caps of 168 (D64) and 232 (D128)
-let three and two CTAs share an SM. Only the final K64 tile carries masks, so ragged
-lengths reuse one compiled kernel. Causal grids start with the longest query rows.
+Exact SM89 runs the Gluon kernel instead, staging Q, K, V, and per-key V multipliers
+through `cp.async` commit groups with K64 tiles and four warps. It keeps per-thread
+Q/K scales and derives the V log-scale bound. D64 uses Q128 tiles, 32 rows per warp,
+and quantizes Q in the kernel prologue; D128 uses Q64 tiles under a 232-register cap so
+two CTAs share an SM. Only the final K64 tile carries masks, plus the diagonal tile
+before it for causal Q128 tiles, so ragged lengths reuse one compiled kernel. Causal
+grids start with the longest query rows.
 
 Selection uses host metadata only. See [_nvidia/policy.py](_nvidia/policy.py) for
 launch choices and the [benchmark guide](../../../../benchmarks/README.md#attention-tuning-workload-anchors)

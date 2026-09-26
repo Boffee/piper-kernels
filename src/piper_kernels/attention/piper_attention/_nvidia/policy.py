@@ -23,8 +23,9 @@ class PiperAttentionExecutionPlan:
     """Host-side specialization and launch choices for one Piper invocation.
 
     ``use_gluon_kernel`` replaces the Triton recurrence with the ``cp.async`` Gluon
-    kernel; ``max_registers`` applies only to it. ``unspecialized_value_stride``
-    quantizes V without specializing on its key-length-dependent row stride.
+    kernel; ``max_registers`` and ``fuse_query_quantization`` apply only to it.
+    ``unspecialized_value_stride`` quantizes V without specializing on its
+    key-length-dependent row stride.
     """
 
     block_m: int
@@ -41,6 +42,7 @@ class PiperAttentionExecutionPlan:
     unspecialized_value_stride: bool = False
     use_gluon_kernel: bool = False
     max_registers: int | None = None
+    fuse_query_quantization: bool = False
 
     def __post_init__(self) -> None:
         if self.block_m not in BLOCK_M_VALUES:
@@ -80,14 +82,17 @@ def _generic_execution_plan(
 def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
     """Build the exact-SM89 plan measured on an RTX 4070 Ti SUPER.
 
-    Every mode runs the ``cp.async`` Gluon kernel on Q64 tiles with per-thread Q/K
-    scales: SM120's grouped scales raise the error against exact attention by
-    7-12% here. Register caps give three CTAs per SM at D64 and two at D128. V
+    Every mode runs the ``cp.async`` Gluon kernel with per-thread Q/K scales:
+    SM120's grouped scales raise the error against exact attention by 7-12% here.
+    D64 gives each warp 32 query rows and quantizes Q in the kernel prologue. D128
+    gives each warp 16 rows under a register cap that fits two CTAs per SM; there
+    the prologue would cost more than the Q preparation pass it replaces. V
     quantization leaves the V row stride unspecialized, which keeps SM89 within
     SM120's compile count and is also 3-5x faster here.
     """
+    wide = head_dim == 128
     return PiperAttentionExecutionPlan(
-        block_m=64,
+        block_m=64 if wide else 128,
         grouped_qk=False,
         split_pv_head_dim=False,
         use_tensor_descriptors=False,
@@ -96,7 +101,8 @@ def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
         use_packed_probability_conversion=True,
         unspecialized_value_stride=True,
         use_gluon_kernel=True,
-        max_registers=232 if head_dim == 128 else 168,
+        max_registers=232 if wide else None,
+        fuse_query_quantization=not wide,
     )
 
 

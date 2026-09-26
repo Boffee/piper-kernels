@@ -9,10 +9,15 @@ import torch
 import triton
 import triton.language as tl
 from lib.triton_inspection import compiled_artifact
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
+    triton as qk_quantization,
+)
 from piper_kernels.attention.piper_attention._nvidia import gluon_async_copy as _gluon_async_copy
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
@@ -52,7 +57,7 @@ def _sqnr_db(actual: torch.Tensor, reference: torch.Tensor) -> float:
 
 def _on_triton(plan: _policy.PiperAttentionExecutionPlan) -> _policy.PiperAttentionExecutionPlan:
     """Return the same recurrence on the Triton kernel, dropping Gluon-only choices."""
-    return replace(plan, use_gluon_kernel=False, max_registers=None)
+    return replace(plan, use_gluon_kernel=False, max_registers=None, fuse_query_quantization=False)
 
 
 def _triton_plan(query: torch.Tensor, is_causal: bool) -> _policy.PiperAttentionExecutionPlan:
@@ -416,6 +421,95 @@ def test_gluon_ragged_lengths_reuse_one_specialization() -> None:
     assert len(set(compiles)) <= 1
 
 
+@gluon.jit
+def _gluon_query_quantization_kernel(
+    query_ptr,
+    output_ptr,
+    scale_ptr,
+    softmax_scale,
+    query_length,
+    head_dim: gl.constexpr,
+    block_q: gl.constexpr,
+):
+    # The same row layouts as the Gluon attention prologue.
+    row_threads: gl.constexpr = 128 // block_q
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, head_dim // row_threads], [32 // row_threads, row_threads], [4, 1], [1, 0]
+    )
+    final_layout: gl.constexpr = gl.BlockedLayout(
+        [1, head_dim // (2 * row_threads)], [32 // row_threads, row_threads], [4, 1], [1, 0]
+    )
+    start = gl.program_id(0) * block_q
+    head = gl.program_id(1)
+    rows = start + gl.arange(0, block_q, gl.SliceLayout(1, layout))
+    features = gl.arange(0, head_dim, gl.SliceLayout(0, layout))
+    offsets = (head * query_length + rows[:, None]) * head_dim + features[None, :]
+    valid = (rows < query_length)[:, None]
+    values = gl.load(query_ptr + offsets, mask=valid, other=0.0).to(gl.float32)
+    quantized, row_scale = _gluon_async_copy._quantize_query_rows(
+        values, softmax_scale, head_dim, final_layout
+    )
+    quantized = gl.convert_layout(quantized, layout)
+    gl.store(output_ptr + offsets, quantized, mask=valid)
+    scale_rows = start + gl.arange(0, block_q, row_scale.type.layout)
+    gl.store(
+        scale_ptr + head * query_length + scale_rows, row_scale, mask=scale_rows < query_length
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("block_q", [64, 128])
+@pytest.mark.parametrize("query_length", [193, 4096])
+def test_gluon_query_quantization_matches_sage_per_thread_kernel(
+    head_dim: int,
+    block_q: int,
+    query_length: int,
+) -> None:
+    torch.manual_seed(107 + head_dim + query_length)
+    query = torch.randn(1, 4, query_length, head_dim, device="cuda", dtype=torch.bfloat16) * 3
+    query[..., 5] += 20
+    expected_query, expected_scale = qk_quantization.prepare_query(query, 0.1, grouped=False)
+    actual_query = torch.empty_like(expected_query)
+    actual_scale = torch.empty_like(expected_scale)
+
+    _gluon_query_quantization_kernel[(triton.cdiv(query_length, block_q), 4)](
+        query,
+        actual_query,
+        actual_scale,
+        0.1,
+        query_length,
+        head_dim,
+        block_q,
+        num_warps=4,
+    )
+
+    assert torch.equal(actual_query, expected_query)
+    assert torch.equal(actual_scale, expected_scale)
+
+
+def test_per_thread_key_scales_match_gluon_mma_columns() -> None:
+    # The Gluon kernel reads one K scale per MMA thread and tile: keys 8j + 2t
+    # and 8j + 2t + 1 of every K64 tile must share one scale for each t.
+    torch.manual_seed(103)
+    query = torch.randn(1, 2, 64, 64, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(1, 2, 256, 64, device="cuda", dtype=torch.bfloat16)
+    gluon_plan, _ = _sm89_plans(query, False)
+
+    with torch.no_grad():
+        prepared = _prepare_piper_attention(
+            query,
+            key,
+            key,
+            0.125,
+            False,
+            execution_plan=gluon_plan,
+        )
+
+    groups = prepared.key_scale.reshape(1, 2, 4, 8, 4, 2)
+    assert torch.equal(groups, groups[:, :, :, :1, :, :1].expand_as(groups))
+    assert groups[:, :, :, 0, :, 0].unique().numel() > 1
+
+
 def test_gluon_storage_holds_whole_query_and_key_tiles() -> None:
     query = torch.randn(1, 2, 193, 64, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(1, 2, 65, 64, device="cuda", dtype=torch.bfloat16)
@@ -433,11 +527,8 @@ def test_gluon_storage_holds_whole_query_and_key_tiles() -> None:
 
     assert isinstance(prepared.key, torch.Tensor)
     assert isinstance(prepared.value, torch.Tensor)
-    assert prepared.query.shape[2] == 256
     assert prepared.key.shape[2] == 128
     assert prepared.value.shape[3] == 128
-    assert not prepared.query[:, :, 193:].any()
-    assert not prepared.query_scale[:, :, 193:].any()
 
 
 @pytest.mark.parametrize("key_length", [1, 63, 64, 193])

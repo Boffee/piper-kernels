@@ -176,11 +176,16 @@ def test_execution_plan_separates_architecture_facts_from_exact_target_tuning(
     assert plan == expected
 
 
-@pytest.mark.parametrize(("head_dim", "max_registers"), [(64, 168), (128, 232)])
+@pytest.mark.parametrize(
+    ("head_dim", "block_m", "max_registers", "fuse_query_quantization"),
+    [(64, 128, None, True), (128, 64, 232, False)],
+)
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_sm89_runs_the_gluon_kernel_in_every_mode(
     head_dim: int,
-    max_registers: int,
+    block_m: int,
+    max_registers: int | None,
+    fuse_query_quantization: bool,
     is_causal: bool,
 ) -> None:
     plan = _select(
@@ -191,7 +196,8 @@ def test_sm89_runs_the_gluon_kernel_in_every_mode(
 
     assert plan.use_gluon_kernel
     assert plan.max_registers == max_registers
-    assert plan.block_m == 64
+    assert plan.block_m == block_m
+    assert plan.fuse_query_quantization is fuse_query_quantization
     assert plan.derive_value_log_bound
     assert plan.use_packed_probability_conversion
     assert plan.unspecialized_value_stride
@@ -201,11 +207,27 @@ def test_sm89_runs_the_gluon_kernel_in_every_mode(
     assert not plan.optimize_causal_traversal
 
 
-def test_register_cap_requires_the_gluon_kernel() -> None:
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"fuse_query_quantization": True}, "fused query quantization"),
+        ({"max_registers": 232}, "register cap"),
+    ],
+)
+def test_gluon_only_choices_require_the_gluon_kernel(
+    changes: dict[str, object],
+    message: str,
+) -> None:
     query = torch.empty((1, 1, 64, 64), device="meta")
-    plan = replace(_select(_SM89, head_dim=64), use_gluon_kernel=False)
+    triton_plan = replace(
+        _select(_SM89, head_dim=64),
+        use_gluon_kernel=False,
+        max_registers=None,
+        fuse_query_quantization=False,
+    )
+    plan = replace(triton_plan, **changes)
 
-    with pytest.raises(ValueError, match="register cap requires the Gluon kernel"):
+    with pytest.raises(ValueError, match=f"{message} requires the Gluon kernel"):
         _prepare_piper_attention(
             query,
             query,
@@ -219,7 +241,7 @@ def test_register_cap_requires_the_gluon_kernel() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"block_m": 128},
+        {"num_warps": 8},
         {"grouped_qk": True},
         {"split_pv_head_dim": True},
         {"derive_value_log_bound": False},
@@ -383,6 +405,7 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "unspecialized_value_stride": False,
         "use_gluon_kernel": False,
         "max_registers": None,
+        "fuse_query_quantization": False,
     }
 
 

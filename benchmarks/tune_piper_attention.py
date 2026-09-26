@@ -116,8 +116,9 @@ def _candidate_plans(
             derive_value_log_bound=derive_value_log_bound,
             optimize_causal_traversal=optimize_causal_traversal,
             use_gluon_kernel=use_gluon_kernel,
-            # The register cap exists only in the Gluon kernel.
+            # The register cap and in-kernel Q quantization exist only in the Gluon kernel.
             max_registers=production_plan.max_registers if use_gluon_kernel else None,
+            fuse_query_quantization=production_plan.fuse_query_quantization and use_gluon_kernel,
         )
         for (
             block_m,

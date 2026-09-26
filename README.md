@@ -609,12 +609,14 @@ production targets use the portable quantized reference instead. The public opti
 dispatch supports NVIDIA SM8x and consumer Blackwell SM12x, whose Triton lowering uses
 the MMAv2 instruction rewritten by the packaged extension. Exact SM120 uses packed
 four-code probability conversion for D64 and non-causal D128, while causal D128 retains
-the faster stock conversion. Exact SM120 has a measured Triton schedule. SM89 runs a Gluon
-kernel that stages Q64/K64 tiles through `cp.async` and keeps the same per-token scales and
-K64 recurrence; only its final key tile carries masks, so ragged lengths reuse one compiled
-kernel. Other supported targets use the generic schedule. Production plan selection depends on
-target, head dimension, and causal mode, not sequence length. Hopper lowers the operation through
-unsupported WGMMA and therefore uses the slow portable quantized reference.
+the faster stock conversion. Exact SM120 has a measured Triton schedule. SM89 runs a
+Gluon kernel that stages Q/K/V tiles through `cp.async` and keeps the same per-token
+scales and K64 recurrence; only its final key tile carries masks, so ragged lengths reuse
+one compiled kernel. At D64 it covers 128 query rows per CTA and quantizes Q in its
+prologue instead of a separate preparation pass. Other supported targets use the generic
+schedule. Production plan selection depends on target, head dimension, and causal mode,
+not sequence length. Hopper lowers the operation through unsupported WGMMA and therefore
+uses the slow portable quantized reference.
 
 ROCm RDNA4 (`gfx1200`/`gfx1201`) also has a native dense backend for D64/D128,
 FP16/BF16, causal and non-causal attention, and GQA/MQA. It shares the AMD signed-QK

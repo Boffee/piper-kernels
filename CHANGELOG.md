@@ -13,13 +13,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- Dense Piper attention on SM89 runs a new Gluon kernel that stages Q64/K64 tiles through
+- Dense Piper attention on SM89 runs a new Gluon kernel that stages Q/K/V tiles through
   `cp.async` and keeps dense Piper's per-token scales and K64 recurrence. On an RTX 4070 Ti
-  SUPER at 16K tokens and 16 heads, whole calls take 7.6/11.8/3.9/6.4 ms instead of
-  10.4/26.3/8.7/19.0 ms (D64/D128 non-causal, D64/D128 causal). Error against exact FP64
-  attention changes by at most 1.4% of its previous value.
+  SUPER at 16K tokens and 16 heads, whole calls take 5.9/11.0/3.2/6.0 ms instead of
+  10.4/26.3/8.7/19.0 ms (D64/D128 non-causal, D64/D128 causal), within 6% of full-keep sparse
+  Piper. Error against exact FP64 attention changes by at most 1.4% of its previous value.
 - SM89 dense Piper compiles fewer kernel specializations than SM120 for the same workload
-  (54 vs 82 on a mixed workload, previously 86): ragged query and key lengths reuse one
+  (52 vs 82 on a mixed workload, previously 86): ragged query and key lengths reuse one
   kernel, and Q/K/V quantization no longer specializes on length-dependent strides. SM120
   kernels are unchanged.
 - `benchmarks/tune_piper_attention.py` gains `--use-gluon-kernel`.
