@@ -13,7 +13,7 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
-from piper_kernels.fusions.convrot_int8_piper import _backend, query
+from piper_kernels.fusions.convrot_int8_piper import _backend, _kernels, query
 from piper_kernels.fusions.convrot_int8_piper import triton as projection
 
 
@@ -255,6 +255,13 @@ def test_projection_selector_uses_validated_targets(monkeypatch, target, support
     value = torch.empty(0)
     assert (_backend.select_projection_backend(value, head_dim=64) is not None) is supported
     assert _backend.select_projection_backend(value, head_dim=32) is None
+    if supported:
+        assert _backend.require_projection_backend(value, head_dim=64) is not None
+    else:
+        with pytest.raises(ValueError, match="projections are unavailable"):
+            _backend.require_projection_backend(value, head_dim=64)
+    with pytest.raises(ValueError, match="projections are unavailable"):
+        _backend.require_projection_backend(value, head_dim=32)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="offline ROCm compilation requires Linux")
@@ -262,9 +269,9 @@ def test_projection_selector_uses_validated_targets(monkeypatch, target, support
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("affine", [False, True])
 def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim, affine):
-    function = projection._project_qk_kernel
+    function = _kernels._project_qk_kernel
     kernel = MagicMock()
-    monkeypatch.setattr(projection, "_project_qk_kernel", kernel)
+    monkeypatch.setattr(_kernels, "_project_qk_kernel", kernel)
     monkeypatch.setattr(projection, "device_context", lambda _: nullcontext())
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", arch))
     operands = _operands("meta", sequence=193, head_dim=head_dim, affine=affine)

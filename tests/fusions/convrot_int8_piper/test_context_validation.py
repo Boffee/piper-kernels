@@ -162,8 +162,8 @@ def test_fake_outputs_only_and_empty_execution_skips_target(monkeypatch, batch):
     cos = torch.empty(65, 48)
     norm = torch.empty(64, requires_grad=True)
     with torch.no_grad(), _OutputOnly():
-        prepared_key = key._project_key_fake(*operands, norm, cos, cos, 1e-5, head_dim=64)
-        prepared_value = value._project_value_fake(*operands, head_dim=64, is_causal=False)
+        prepared_key = key._project_key_op_fake(*operands, norm, cos, cos, 1e-5, head_dim=64)
+        prepared_value = value._project_value_op_fake(*operands, head_dim=64, is_causal=False)
         assert prepared_key[0].shape == (batch, 2, 128, 64)
         assert prepared_value[0].shape == (batch, 2, 64, 128)
     native = _native_inputs(batch=batch)

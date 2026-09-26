@@ -6,6 +6,7 @@ from piper_kernels.fusions.convrot_int8_projection._validation import validate_p
 from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 
 from . import _backend
+from ._interfaces import ValueOutput
 
 
 def _validate_inputs(
@@ -39,9 +40,7 @@ def _validate_inputs(
     return batch, sequence, heads, head_dim
 
 
-def _outputs(
-    input_qdata: torch.Tensor, shape: tuple[int, int, int, int]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _new_outputs(input_qdata: torch.Tensor, shape: tuple[int, int, int, int]) -> ValueOutput:
     batch, sequence, heads, head_dim = shape
     storage = (sequence + 63) // 64 * 64
     return (
@@ -73,11 +72,9 @@ def _project_value_op(
         input_qdata, input_scale, weight_qdata, weight_scale, bias, head_dim, is_causal
     )
     if shape[0] == 0:
-        return _outputs(input_qdata, shape)
-    backend = _backend.select_projection_backend(input_qdata, head_dim=head_dim)
-    if backend is None:
-        raise ValueError(f"dense Piper V projection is unavailable on {input_qdata.device}")
-    output = _outputs(input_qdata, shape)
+        return _new_outputs(input_qdata, shape)
+    backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
+    output = _new_outputs(input_qdata, shape)
     backend.project_value(
         input_qdata, input_scale, weight_qdata, weight_scale, bias, is_causal=is_causal, out=output
     )
@@ -85,7 +82,7 @@ def _project_value_op(
 
 
 @_project_value_op.register_fake
-def _project_value_fake(
+def _project_value_op_fake(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -98,4 +95,4 @@ def _project_value_fake(
     shape = _validate_inputs(
         input_qdata, input_scale, weight_qdata, weight_scale, bias, head_dim, is_causal
     )
-    return _outputs(input_qdata, shape)
+    return _new_outputs(input_qdata, shape)

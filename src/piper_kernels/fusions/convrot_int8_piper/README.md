@@ -66,7 +66,10 @@ projected-mean kernel, output validation and chunk projector, compiler tuple
 matching, and the attention-to-output stream pipeline. Dense centering and
 per-token V quantization remain separate from sparse summaries and tile scales.
 Both producers use typed backend methods with caller-owned buffers; target
-configurations live in separate NVIDIA and RDNA4 modules.
+configurations live in separate NVIDIA and RDNA4 modules. As in sparse Piper,
+`_kernels.py` contains device kernels and `triton.py` owns their launchers.
+Compiler matching uses optional backend selection; validated execution requires
+a supported backend through `_backend.py`.
 
 K/V stay global. Q uses one reusable buffer with global RoPE positions and causal
 row coordinates. When the output width is at least the merged attention width,

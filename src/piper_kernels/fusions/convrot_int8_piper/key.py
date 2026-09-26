@@ -3,12 +3,11 @@
 import torch
 
 from . import _backend
+from ._interfaces import KeyOutput
 from ._validation import validate_qk_inputs
 
 
-def _outputs(
-    input_qdata: torch.Tensor, shape: tuple[int, int, int, int]
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _new_outputs(input_qdata: torch.Tensor, shape: tuple[int, int, int, int]) -> KeyOutput:
     batch, sequence, heads, head_dim = shape
     storage = (sequence + 63) // 64 * 64
     return (
@@ -46,11 +45,9 @@ def _project_key_op(
         head_dim=head_dim,
     )
     if shape[0] == 0:
-        return _outputs(input_qdata, shape)
-    backend = _backend.select_projection_backend(input_qdata, head_dim=shape[-1])
-    if backend is None:
-        raise ValueError(f"dense Piper K projection is unavailable on {input_qdata.device}")
-    output = _outputs(input_qdata, shape)
+        return _new_outputs(input_qdata, shape)
+    backend = _backend.require_projection_backend(input_qdata, head_dim=shape[-1])
+    output = _new_outputs(input_qdata, shape)
     backend.project_key(
         input_qdata,
         input_scale,
@@ -68,7 +65,7 @@ def _project_key_op(
 
 
 @_project_key_op.register_fake
-def _project_key_fake(
+def _project_key_op_fake(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -94,4 +91,4 @@ def _project_key_fake(
         bias=bias,
         head_dim=head_dim,
     )
-    return _outputs(input_qdata, shape)
+    return _new_outputs(input_qdata, shape)

@@ -163,9 +163,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         query_chunk_rows,
         is_causal=is_causal,
     )
-    backend = _backend.select_projection_backend(input_qdata, head_dim=head_dim)
-    if backend is None:
-        raise ValueError(f"dense Piper projection is unavailable on {input_qdata.device}")
+    backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     output_backend = linear_backend.require_linear_backend(input_qdata)
     context = attention.prepare_quantized_context(
         key,
@@ -230,7 +228,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
 
 
 @_projected_query_attention_output_op.register_fake
-def _projected_query_attention_output_fake(  # noqa: PLR0913, PLR0917
+def _projected_query_attention_output_op_fake(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     query_weight: torch.Tensor,

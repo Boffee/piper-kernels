@@ -37,6 +37,18 @@ def select_projection_backend(
     return _amd_projection if amd_policy.supports_target(target) else None
 
 
+def require_projection_backend(
+    input: torch.Tensor,  # noqa: A002
+    *,
+    head_dim: int = 128,
+) -> ProjectionBackend:
+    """Require a native projection backend after validating execution inputs."""
+    backend = select_projection_backend(input, head_dim=head_dim)
+    if backend is None:
+        raise ValueError(f"ConvRot INT8 dense projections are unavailable on {input.device}")
+    return backend
+
+
 def source_files() -> tuple[str, ...]:
     """Track target policy and all shared projection/quantization arithmetic."""
     paths: list[str | None] = [
@@ -65,9 +77,12 @@ def source_files() -> tuple[str, ...]:
         from piper_kernels.linear.convrot.int8._generic import mean  # noqa: PLC0415
         from piper_kernels.linear.convrot.int8._kernels import triton as matmul  # noqa: PLC0415
 
+        from . import _kernels  # noqa: PLC0415
+
         paths.extend(
             (
                 _projection.__file__,
+                _kernels.__file__,
                 _amd_projection.__file__ if _amd_projection is not None else None,
                 _nvidia_projection.__file__ if _nvidia_projection is not None else None,
                 shared_projection.__file__,

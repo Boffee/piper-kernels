@@ -51,7 +51,7 @@ def test_output_fake_allocates_only_final_output_and_empty_batch_skips_hardware(
     monkeypatch.setattr(AcceleratorTarget, "from_device", forbidden)
     monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
     with _OutputOnly():
-        result = output._projected_query_attention_output_fake(*args, head_dim=64)
+        result = output._projected_query_attention_output_op_fake(*args, head_dim=64)
     assert result.shape == (batch, 65, 80)
     assert result.dtype is torch.bfloat16
     if batch == 0:

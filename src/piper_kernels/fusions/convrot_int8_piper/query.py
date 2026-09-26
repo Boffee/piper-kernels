@@ -5,6 +5,7 @@ import math
 import torch
 
 from . import _backend
+from ._interfaces import QueryOutput
 from ._validation import validate_qk_inputs
 
 
@@ -42,7 +43,7 @@ def _validate_inputs(  # noqa: PLR0913, PLR0917
 def _new_outputs(
     input_qdata: torch.Tensor,
     shape: tuple[int, int, int, int],
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> QueryOutput:
     batch, sequence_length, heads, head_dim = shape
     storage_length = (sequence_length + 63) // 64 * 64
     return (
@@ -64,7 +65,7 @@ def _launch_query_projection(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> QueryOutput:
     """Project the complete Q sequence into padded Q32 data and base-2 scales."""
     shape = _validate_inputs(
         input_qdata,
@@ -81,9 +82,7 @@ def _launch_query_projection(  # noqa: PLR0913
     )
     if shape[0] == 0:
         return _new_outputs(input_qdata, shape)
-    backend = _backend.select_projection_backend(input_qdata, head_dim=shape[-1])
-    if backend is None:
-        raise ValueError(f"dense Piper Q projection is unavailable on {input_qdata.device}")
+    backend = _backend.require_projection_backend(input_qdata, head_dim=shape[-1])
     output = _new_outputs(input_qdata, shape)
     backend.project_query(
         input_qdata,
