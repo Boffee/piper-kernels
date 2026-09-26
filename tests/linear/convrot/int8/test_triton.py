@@ -937,19 +937,25 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
-def test_explicit_async_copy_plan_preserves_paired_fma_on_unaligned_input():
+@pytest.mark.parametrize("unaligned_operand", ["input", "second_weight"])
+def test_explicit_async_copy_plan_preserves_paired_fma_on_unaligned_operand(unaligned_operand):
     # Start with SM120's implicit-FMA defaults, then explicitly select Gluon. Its
     # fallback must retain Gluon's rounding even though this is not an SM8x policy plan.
     torch.manual_seed(889)
     rows, k, n = 513, 512, 1024
-    storage = torch.randint(-127, 128, (rows * k + 8,), device="cuda", dtype=torch.int8)
-    value = storage[8:].view(rows, k)
+    input_offset = 8 if unaligned_operand == "input" else 0
+    storage = torch.randint(-127, 128, (rows * k + input_offset,), device="cuda", dtype=torch.int8)
+    value = storage[input_offset:].view(rows, k)
     row_scale = torch.rand(rows, device="cuda") * 0.01
     weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
     scale = torch.rand(n, 1, device="cuda") * 0.01
     bias = torch.randn(n, device="cuda", dtype=torch.float32)
+    weight_offset = 8 if unaligned_operand == "second_weight" else 0
+    second_storage = torch.randint(
+        -127, 128, (n * k + weight_offset,), device="cuda", dtype=torch.int8
+    )
     second = (
-        torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8),
+        second_storage[weight_offset:].view(n, k),
         torch.rand(n, 1, device="cuda") * 0.01,
         torch.randn(n, device="cuda", dtype=torch.float16),
     )

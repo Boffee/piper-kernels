@@ -49,7 +49,7 @@ def test_shared_plan_does_not_impose_nvidia_warp_limits():
         NvidiaExecutionPlan(**shared.as_dict())
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, 4.0])
 def test_shared_plan_rejects_invalid_launch_dimensions(value):
     with pytest.raises(ValueError, match="positive integer"):
         LinearExecutionPlan(
@@ -435,9 +435,12 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
     "changes",
     [
         {"matmul_block_m": 8},
+        {"matmul_block_m": 256},
         {"matmul_block_n": 512},
+        {"matmul_block_n": 128.0},
         {"matmul_block_k": 16},
         {"matmul_num_warps": 16},
+        {"matmul_num_warps": True},
         {"matmul_num_stages": 5},
     ],
 )

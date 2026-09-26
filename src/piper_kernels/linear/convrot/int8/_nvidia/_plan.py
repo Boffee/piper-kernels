@@ -8,7 +8,7 @@ from .._plan import LinearExecutionPlan
 _FUSED_NUM_WARPS_VALUES = (1, 2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
 _QUANTIZATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
-_MATMUL_BLOCK_M_VALUES = (16, 32, 64, 128, 256)
+_MATMUL_BLOCK_M_VALUES = (16, 32, 64, 128)
 _MATMUL_BLOCK_N_VALUES = (16, 32, 64, 128, 256)
 _MATMUL_BLOCK_K_VALUES = (32, 64, 128)
 _MATMUL_NUM_WARPS_VALUES = (2, 4, 8)
@@ -71,20 +71,6 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
                 "ConvRot split quantization num_warps must be "
                 f"{_choices(_QUANTIZATION_NUM_WARPS_VALUES)}"
             )
-        if self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
-            raise ValueError(f"ConvRot matmul block_m must be {_choices(_MATMUL_BLOCK_M_VALUES)}")
-        if self.matmul_block_n not in _MATMUL_BLOCK_N_VALUES:
-            raise ValueError(f"ConvRot matmul block_n must be {_choices(_MATMUL_BLOCK_N_VALUES)}")
-        if self.matmul_block_k not in _MATMUL_BLOCK_K_VALUES:
-            raise ValueError(f"ConvRot matmul block_k must be {_choices(_MATMUL_BLOCK_K_VALUES)}")
-        if self.matmul_num_warps not in _MATMUL_NUM_WARPS_VALUES:
-            raise ValueError(
-                f"ConvRot matmul num_warps must be {_choices(_MATMUL_NUM_WARPS_VALUES)}"
-            )
-        if self.matmul_num_stages not in _MATMUL_NUM_STAGES_VALUES:
-            raise ValueError(
-                f"ConvRot matmul num_stages must be {_choices(_MATMUL_NUM_STAGES_VALUES)}"
-            )
         self._validate_matmul()
 
     def _validate_matmul(self) -> None:
@@ -110,8 +96,24 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
                     "ConvRot async-copy GEMM requires 128x128x64/4-warps or "
                     "256x128x64/8-warps, with 3 or 4 stages"
                 )
-        elif self.matmul_block_m == 256:
-            raise ValueError("ConvRot Triton matmul block_m must be 16, 32, 64, or 128")
+            return
+
+        if self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
+            raise ValueError(
+                f"ConvRot Triton matmul block_m must be {_choices(_MATMUL_BLOCK_M_VALUES)}"
+            )
+        if self.matmul_block_n not in _MATMUL_BLOCK_N_VALUES:
+            raise ValueError(f"ConvRot matmul block_n must be {_choices(_MATMUL_BLOCK_N_VALUES)}")
+        if self.matmul_block_k not in _MATMUL_BLOCK_K_VALUES:
+            raise ValueError(f"ConvRot matmul block_k must be {_choices(_MATMUL_BLOCK_K_VALUES)}")
+        if self.matmul_num_warps not in _MATMUL_NUM_WARPS_VALUES:
+            raise ValueError(
+                f"ConvRot matmul num_warps must be {_choices(_MATMUL_NUM_WARPS_VALUES)}"
+            )
+        if self.matmul_num_stages not in _MATMUL_NUM_STAGES_VALUES:
+            raise ValueError(
+                f"ConvRot matmul num_stages must be {_choices(_MATMUL_NUM_STAGES_VALUES)}"
+            )
 
 
 class MatmulSchedule(NamedTuple):

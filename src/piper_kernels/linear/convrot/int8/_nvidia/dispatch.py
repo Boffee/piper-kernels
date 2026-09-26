@@ -111,11 +111,12 @@ def execute_prepared_linear(
     k = input_qdata.shape[-1]
     n = weight_qdata.shape[0]
     paired = second_projection is not None
-    second_weight, second_scale, second_bias = (
-        (weight_qdata, weight_scale, None) if second_projection is None else second_projection
-    )
-    if second_weight.shape != weight_qdata.shape:
-        raise ValueError("paired INT8 projections must have matching weight shapes")
+    if second_projection is None:
+        second_weight, second_scale, second_bias = weight_qdata, weight_scale, None
+    else:
+        second_weight, second_scale, second_bias = second_projection
+        if second_weight.shape != weight_qdata.shape:
+            raise ValueError("paired INT8 projections must have matching weight shapes")
     output_features = n * (2 if paired else 1)
     if out is None:
         output = torch.empty(
@@ -138,7 +139,10 @@ def execute_prepared_linear(
     plan = execution_plan
     launcher = triton_kernels.launch_int8_matmul
     if plan.matmul_kernel == "gluon_async_copy":
-        if gluon_async_copy.operands_aligned(input_qdata_2d, weight_qdata, second_weight):
+        aligned = gluon_async_copy.operands_aligned(input_qdata_2d, weight_qdata)
+        if paired:
+            aligned = aligned and gluon_async_copy.operands_aligned(second_weight)
+        if aligned:
             launcher = gluon_async_copy.launch_int8_matmul
         else:
             plan = policy.grouped_triton_plan(plan)
