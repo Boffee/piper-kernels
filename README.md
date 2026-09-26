@@ -273,8 +273,8 @@ in one GPU launch.
 The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
 `convrot_int8_sparse_piper_compile_options` from
 `piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary
-ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
-ConvRot Q/K/V projections with optional FP16/BF16/FP32 bias, D64/D128 RMSNorm and split-half
+ConvRot pass. On exact SM120 and SM89, it recognizes a compatible H3-style region containing
+three ConvRot Q/K/V projections with optional FP16/BF16/FP32 bias, D64/D128 RMSNorm and split-half
 RoPE for Q/K, followed by `sparse_piper_attention`. The rewrite shares input preparation and
 emits quantized Q/K/V plus routing summaries directly, avoiding the three materialized projection
 outputs. Arbitrary logical sequence lengths are written directly into internally K64-padded

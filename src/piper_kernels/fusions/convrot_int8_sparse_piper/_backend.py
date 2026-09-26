@@ -14,11 +14,13 @@ from ._interfaces import ProjectionBackend
 from ._nvidia import policy as nvidia_policy
 
 try:
+    from ._nvidia import sm89 as _nvidia_sm89_projection
     from ._nvidia import triton as _nvidia_projection
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _nvidia_projection = None
+    _nvidia_sm89_projection = None
 
 
 try:
@@ -54,6 +56,7 @@ def source_files() -> tuple[str, ...]:
             nvidia_policy.__file__,
             amd_policy.__file__,
             None if _nvidia_projection is None else _nvidia_projection.__file__,
+            None if _nvidia_sm89_projection is None else _nvidia_sm89_projection.__file__,
             None if _amd_projection is None else _amd_projection.__file__,
             linear_backend.__file__,
             attention_backend.__file__,
@@ -72,7 +75,7 @@ def select_projection_backend(
         return None
     target = AcceleratorTarget.from_device(input.device)
     if nvidia_policy.supports_target(target):
-        return _nvidia_projection
+        return _nvidia_sm89_projection if nvidia_policy.is_sm89(target) else _nvidia_projection
     return (
         _amd_projection
         if amd_policy.supports_target(target) and amd_policy.supports_head_dim(head_dim)
@@ -89,6 +92,12 @@ def require_projection_backend(
     if backend is None:
         raise ValueError(f"ConvRot INT8 sparse projections are unavailable on {input.device}")
     return backend
+
+
+def query_chunk_rows(output: torch.Tensor, default: int) -> int:
+    """Query rows per fused attention-output chunk on the output's device."""
+    target = AcceleratorTarget.from_device(output.device)
+    return nvidia_policy.SM89_QUERY_CHUNK_ROWS if nvidia_policy.is_sm89(target) else default
 
 
 def select_output_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
