@@ -140,7 +140,7 @@ def execute_prepared_linear(
         if gluon_async_copy.operands_aligned(input_qdata_2d, weight_qdata, second_weight):
             launcher = gluon_async_copy.launch_int8_matmul
         else:
-            plan = policy.async_copy_fallback_plan(plan)
+            plan = policy.grouped_triton_plan(plan)
     launcher(
         input_qdata_2d,
         weight_qdata,

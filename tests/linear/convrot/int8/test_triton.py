@@ -854,7 +854,7 @@ def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
     # Clear in-memory caches so earlier tests cannot hide a per-row-count compile.
     kernels = (
         int8_nvidia.triton_kernels.dynamic_m_int8_matmul_kernel,
-        int8_nvidia.gluon_async_copy.int8_matmul_gluon_kernel,
+        int8_nvidia.gluon_async_copy._int8_matmul_kernel,
     )
     for kernel in kernels:
         kernel.device_caches.clear()

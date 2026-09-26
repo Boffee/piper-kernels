@@ -147,7 +147,7 @@ def _compile_int8_matmul(
     if plan.matmul_kernel == "gluon_async_copy":
         # Runtime specialization marks 16-byte-aligned INT8 operands and K, which the
         # launcher requires before selecting the Gluon GEMM.
-        kernel = gluon.int8_matmul_gluon_kernel
+        kernel = gluon._int8_matmul_kernel
         aligned = ("input_ptr", "weight_ptr", "second_weight_ptr", "k")
         source = GluonASTSource(
             kernel,
@@ -159,7 +159,7 @@ def _compile_int8_matmul(
                 "block_k": plan.matmul_block_k,
                 "stages": plan.matmul_num_stages,
                 "group_m": plan.matmul_group_m,
-                "warps_m": plan.matmul_num_warps // gluon.WARPS_N,
+                "warps_m": plan.matmul_num_warps // gluon._WARPS_N,
                 "whole_k_tiles": aligned_nk,
                 **flags,
             },

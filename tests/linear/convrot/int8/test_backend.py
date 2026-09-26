@@ -98,7 +98,7 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
     monkeypatch.setattr(kernel_backend, "int8_matmul_kernel", kernel)
     if backend is nvidia:
         monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
-        monkeypatch.setattr(nvidia.gluon_async_copy, "int8_matmul_gluon_kernel", gluon_kernel)
+        monkeypatch.setattr(nvidia.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
     value = torch.empty(m, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
     row_scale = torch.empty(m, device="meta")
@@ -156,8 +156,8 @@ def test_triton_tail_scheduling_is_independent_of_bias_rounding(
     weight = torch.empty(64, 256, device="meta", dtype=torch.int8)
     plan = replace(
         nvidia.default_execution_plan(weight, target=AcceleratorTarget("cuda", "sm120"), rows=33),
-        matmul_specialize_m=specialize_m,
-        matmul_explicit_bias_fma=explicit_bias_fma,
+        triton_specialize_m=specialize_m,
+        triton_explicit_bias_fma=explicit_bias_fma,
     )
     nvidia.execute_prepared_linear(
         value,
@@ -242,7 +242,7 @@ def test_sm8x_wide_projections_launch_the_gluon_kernel(
     gluon_kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
     monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
-    monkeypatch.setattr(nvidia.gluon_async_copy, "int8_matmul_gluon_kernel", gluon_kernel)
+    monkeypatch.setattr(nvidia.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
     k = 1024
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)

@@ -505,9 +505,38 @@ def test_kernel_selection_is_independent_of_tile_replacement() -> None:
         replace(gluon, matmul_block_n=64)
 
 
+@pytest.mark.parametrize("specialize_m", [False, True])
+@pytest.mark.parametrize("explicit_bias_fma", [False, True])
+def test_gluon_reports_effective_behavior_and_preserves_triton_options(
+    specialize_m, explicit_bias_fma
+) -> None:
+    triton = replace(
+        select_execution_plan(_SM120, in_features=512),
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        triton_specialize_m=specialize_m,
+        triton_explicit_bias_fma=explicit_bias_fma,
+    )
+    gluon = replace(triton, matmul_kernel="gluon_async_copy")
+
+    assert gluon.matmul_specialize_m is False
+    assert gluon.matmul_explicit_bias_fma is True
+    assert gluon.as_dict() == triton.as_dict() | {
+        "matmul_kernel": "gluon_async_copy",
+        "matmul_specialize_m": False,
+        "matmul_explicit_bias_fma": True,
+    }
+    assert replace(gluon, matmul_kernel="triton") == triton
+    fallback = nvidia_policy.grouped_triton_plan(gluon)
+    assert fallback.matmul_kernel == "triton"
+    assert fallback.matmul_specialize_m is False
+    assert fallback.matmul_explicit_bias_fma is True
+
+
 @pytest.mark.parametrize(
     "changes",
-    [{"matmul_kernel": "unknown"}, {"matmul_specialize_m": 1}, {"matmul_explicit_bias_fma": 0}],
+    [{"matmul_kernel": "unknown"}, {"triton_specialize_m": 1}, {"triton_explicit_bias_fma": 0}],
 )
 def test_execution_plan_rejects_invalid_implementation_options(changes) -> None:
     plan = select_execution_plan(_SM120, in_features=512)

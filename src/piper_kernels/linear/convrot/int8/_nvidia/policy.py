@@ -34,15 +34,35 @@ def _choices(values: tuple[int, ...]) -> str:
 class NvidiaExecutionPlan(LinearExecutionPlan):
     """Explicit implementation and schedule, independent of the selecting architecture.
 
-    Triton may specialize on M and contract bias implicitly, or branch per tile and
-    use explicit bias FMAs. Gluon's async-copy implementation always uses dynamic M
-    and explicit FMAs, including in its unaligned-operand fallback.
+    The ``triton_*`` options apply only to Triton. The read-only ``matmul_*``
+    properties report the selected implementation's effective behavior. Gluon's
+    async-copy implementation always uses dynamic M and explicit bias FMAs,
+    including in its unaligned-operand fallback.
     """
 
     matmul_kernel: Literal["triton", "gluon_async_copy"] = "triton"
     matmul_group_m: int = 0
-    matmul_specialize_m: bool = True
-    matmul_explicit_bias_fma: bool = False
+    triton_specialize_m: bool = True
+    triton_explicit_bias_fma: bool = False
+
+    @property
+    def matmul_specialize_m(self) -> bool:
+        """Return whether the selected implementation specializes on the row count."""
+        return self.matmul_kernel == "triton" and self.triton_specialize_m
+
+    @property
+    def matmul_explicit_bias_fma(self) -> bool:
+        """Return whether the selected implementation uses explicit bias FMAs."""
+        return self.matmul_kernel == "gluon_async_copy" or self.triton_explicit_bias_fma
+
+    def as_dict(self) -> dict[str, int | bool | str]:
+        """Report effective execution choices, omitting inactive Triton options."""
+        choices = LinearExecutionPlan.as_dict(self)
+        del choices["triton_specialize_m"], choices["triton_explicit_bias_fma"]
+        return choices | {
+            "matmul_specialize_m": self.matmul_specialize_m,
+            "matmul_explicit_bias_fma": self.matmul_explicit_bias_fma,
+        }
 
     def __post_init__(self) -> None:
         LinearExecutionPlan.__post_init__(self)
@@ -79,7 +99,7 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
         """Validate implementation capabilities independently of measured target defaults."""
         if self.matmul_kernel not in _MATMUL_KERNEL_VALUES:
             raise ValueError("ConvRot matmul kernel must be triton or gluon_async_copy")
-        for name in ("matmul_specialize_m", "matmul_explicit_bias_fma"):
+        for name in ("triton_specialize_m", "triton_explicit_bias_fma"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"ConvRot {name} must be boolean")
         group_m = self.matmul_group_m
@@ -212,8 +232,8 @@ def _sm8x_execution_plan(
         matmul_num_warps=8,
         matmul_num_stages=4,
         matmul_group_m=8,
-        matmul_specialize_m=False,
-        matmul_explicit_bias_fma=True,
+        triton_specialize_m=False,
+        triton_explicit_bias_fma=True,
     )
     if not rows or not out_features:
         return plan
@@ -232,12 +252,12 @@ def _sm8x_execution_plan(
         if rows >= _SM8X_GLUON_MIN_ROWS and rows * wide_columns >= gluon_tiles:
             return gluon
     elif rows * column_tiles >= 128 * _SM8X_LARGE_TILE_THRESHOLD:
-        return async_copy_fallback_plan(plan)
+        return grouped_triton_plan(plan)
     return _narrow_triton_plan(plan, block_m=64, num_stages=4, group_m=0)
 
 
-def async_copy_fallback_plan(plan: NvidiaExecutionPlan) -> NvidiaExecutionPlan:
-    """Return the grouped 128x64 Triton tile, also used when Gluon operands are unaligned."""
+def grouped_triton_plan(plan: NvidiaExecutionPlan) -> NvidiaExecutionPlan:
+    """Select the 128x64 Triton tile for large narrow GEMMs or unaligned Gluon operands."""
     return _narrow_triton_plan(plan, block_m=128, num_stages=3, group_m=16)
 
 
@@ -254,8 +274,8 @@ def _narrow_triton_plan(
         matmul_num_warps=4,
         matmul_num_stages=num_stages,
         matmul_group_m=group_m,
-        matmul_specialize_m=False,
-        matmul_explicit_bias_fma=True,
+        triton_specialize_m=False,
+        triton_explicit_bias_fma=True,
     )
 
 

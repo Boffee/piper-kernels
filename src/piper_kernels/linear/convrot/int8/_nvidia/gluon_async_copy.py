@@ -30,11 +30,11 @@ from piper_kernels._triton.runtime import device_context
 from .policy import NvidiaExecutionPlan
 
 # Warp tiles are 64 columns wide, so every supported tile uses two warp columns.
-WARPS_N = 2
+_WARPS_N = 2
 # ``cp.async`` moves at most 16 bytes per thread and instruction.
 _COPY_BYTES = 16
 
-_GL_WARPS_N = gl.constexpr(WARPS_N)
+_GL_WARPS_N = gl.constexpr(_WARPS_N)
 _GL_COPY_BYTES = gl.constexpr(_COPY_BYTES)
 
 
@@ -150,7 +150,7 @@ def _accumulate(
 
 
 @gluon.jit(do_not_specialize=["m"])
-def int8_matmul_gluon_kernel(
+def _int8_matmul_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
@@ -319,7 +319,7 @@ def launch_int8_matmul(
     num_warps = plan.matmul_num_warps
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n) * (2 if paired else 1),)
     with device_context(input_qdata.device):
-        int8_matmul_gluon_kernel[grid](
+        _int8_matmul_kernel[grid](
             input_qdata,
             weight_qdata,
             output,
@@ -338,7 +338,7 @@ def launch_int8_matmul(
             block_k,
             plan.matmul_num_stages,
             plan.matmul_group_m,
-            num_warps // WARPS_N,
+            num_warps // _WARPS_N,
             bias is not None,
             paired,
             second_bias is not None,
