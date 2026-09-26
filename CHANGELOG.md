@@ -29,16 +29,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   128x128 and 256x128 tiles, which follows the CUTLASS SM80 INT8 schedule: `cp.async` pipelines,
   `ldmatrix` operands, and 64x64 warp tiles with one barrier per K tile. On an RTX 4070 Ti
   SUPER, whole linears including preparation run MiniMax H3 transformer blocks at 8K-131K rows
-  at 277-284 effective TOPS. That is 5.4-5.5x faster than before and 3.1x faster than BF16
+  at 278-283 effective TOPS. That is 5.4-5.5x faster than before and 3.1x faster than BF16
   cuBLAS. The H3 VAE linears run 4.9-5.0x faster, and short-M projections 5-22x faster. GEMM
   outputs are bitwise identical to the previous schedule. SM8x prepares rows of at most 1,024
   columns with one warp (2-6% of the small-M mix time). Plain inputs keep identical bits, and
-  GELU/SwiGLU codes may differ from other NVIDIA targets by one INT8 code. Rows split into two
-  8,192-column chunks (K 12289-16384) use eight warps, 0.4-2.6% faster per call with identical
-  bits. SM8x launches write bias adds as explicit FMAs, so grouped tiles with a per-tile tail
-  branch keep the same rounding for paired biased projections. SM120 and AMD schedules and
-  compiled code are unchanged. The new `benchmark_convrot_int8_realistic.py` measures H3, VAE,
-  short-M, and anchor linears against the original plan and BF16 in about three minutes.
+  GELU/SwiGLU codes may differ from other NVIDIA targets by one INT8 code. SM8x launches write
+  bias adds as explicit FMAs, so grouped tiles with a per-tile tail branch keep the same
+  rounding for paired biased projections. SM120 and AMD schedules and compiled code are
+  unchanged. The new `benchmark_convrot_int8_realistic.py` measures H3, VAE, short-M, and anchor
+  linears against the original plan and BF16 in about three minutes.
   `benchmark_convrot_int8_small_m.py` measures the original plan as `previous_linear` on every
   target, and `--compare-schedules` forces the SM8x configurations on SM8x.
 

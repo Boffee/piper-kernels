@@ -876,42 +876,6 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset):
 @pytest.mark.gpu
 @pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
 @pytest.mark.parametrize(
-    ("rows", "in_features", "group_size"), [(1, 14336, 256), (129, 12352, 64), (1000, 16384, 16)]
-)
-@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("static", [False, True])
-def test_sm8x_preparation_matches_base_preparation(
-    rows, in_features, group_size, activation_fn, dtype, static
-):
-    torch.manual_seed(rows)
-    width = in_features * (2 if activation_fn == "swiglu" else 1)
-    value = (torch.randn(rows, width, device="cuda") * 4).to(dtype)
-    input_scale = torch.tensor(0.05, device="cuda") if static else None
-    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=in_features)
-    expected = int8_nvidia.prepare_input_with_plan(
-        value,
-        in_features,
-        group_size,
-        activation_fn=activation_fn,
-        input_scale=input_scale,
-        execution_plan=base,
-        target=AcceleratorTarget.from_device(value.device),
-    )
-    actual = int8_nvidia.prepare_input(value, group_size, activation_fn, input_scale)
-    assert (
-        int8_nvidia.default_execution_plan(
-            torch.empty(1, in_features, device="cuda", dtype=torch.int8)
-        ).fused_num_warps
-        != base.fused_num_warps
-    )
-    assert torch.equal(actual[0], expected[0])
-    assert torch.equal(actual[1], expected[1])
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
-@pytest.mark.parametrize(
     ("rows", "in_features", "group_size"),
     [(1, 16, 16), (7, 96, 16), (129, 256, 256), (1000, 768, 64), (1000, 1024, 256)],
 )

@@ -607,16 +607,15 @@ Sustained GEMM-only throughput at H3 shapes was 297-310 TOPS, against 222-230 fo
 Triton tile and 304-319 for cuBLAS `torch._int_mm`, which writes INT32 without the ConvRot
 epilogue.
 
-Preparation follows the shared NVIDIA plan with two SM8x exceptions. Rows of at most 1,024
-columns use one warp, which avoids cross-warp reductions. Plain inputs keep identical bits,
-but GELU and SwiGLU codes may differ from wider launches by one INT8 code, with scales within
-a few FP32 ulps. This is the same bound the optimized path already allows against the portable
-path. One warp cut 2-6% from the default seven-projection mix. Rows split into two
-8,192-column chunks (K 12289-16384) use eight warps; their bits are unchanged, and whole calls
-were 0.4-2.6% faster. The Triton large tile groups sixteen row blocks and the Gluon tiles
-eight. Without grouping, the 128x64 tile was up to 1.5x slower at `M=8192, K>=12288`, where the
-input does not fit in L2. SM8x plans carry their grouping as a plan field, so SM120 launches,
-including the H3 VAE's ungrouped 128x128 schedules, are unchanged.
+Preparation follows the shared NVIDIA plan with one SM8x exception. Rows of at most 1,024
+columns use one warp, which avoids cross-warp reductions. Plain inputs keep identical bits, but
+GELU and SwiGLU codes may differ from wider launches by one INT8 code, with scales within a few
+FP32 ulps. This is the same bound the optimized path already allows against the portable path.
+One warp cut 2-6% from the default seven-projection mix. The Triton large tile groups sixteen
+row blocks and the Gluon tiles eight. Without grouping, the 128x64 tile was up to 1.5x slower
+at `M=8192, K>=12288`, where the input does not fit in L2. SM8x plans carry their grouping as a
+plan field, so SM120 launches, including the H3 VAE's ungrouped 128x128 schedules, are
+unchanged.
 
 The Triton tiles were chosen from a 210-shape GEMM sweep on SM89 with 13 tiles, with and
 without grouping. The Gluon thresholds come from a second, 247-shape sweep. It crossed 13 row
@@ -663,26 +662,26 @@ output agreed bitwise with the original plan:
 
 | Group | Rows | SM8x policy (TOPS) | Original plan (TOPS) | BF16 cuBLAS (TFLOPS) | vs original | vs BF16 |
 |---|---:|---:|---:|---:|---:|---:|
-| H3 block | 8192 | 18.21 ms (277) | 100.02 ms (50) | 56.72 ms (89) | 5.49x | 3.11x |
-| H3 block | 32768 | 71.58 ms (282) | 394.27 ms (51) | 221.44 ms (91) | 5.51x | 3.09x |
-| H3 block | 131072 | 284.91 ms (284) | 1564.10 ms (52) | 881.85 ms (92) | 5.49x | 3.10x |
-| H3 block | 131073 | 285.27 ms (283) | 1541.24 ms (52) | 883.12 ms (92) | 5.40x | 3.10x |
-| H3 VAE | 1797 | 0.88 ms (222) | 4.39 ms (45) | 2.46 ms (80) | 4.96x | 2.78x |
-| H3 VAE | 7188 | 3.30 ms (238) | 16.27 ms (48) | 9.04 ms (87) | 4.94x | 2.74x |
-| Projection mix | 1 | 26.4 us | 577.8 us | 27.4 us | 21.89x | 1.04x |
-| Projection mix | 16 | 26.4 us (14) | 585.8 us (1) | 39.2 us (9) | 22.22x | 1.49x |
-| Projection mix | 128 | 43.3 us (68) | 603.3 us (5) | 68.8 us (43) | 13.94x | 1.59x |
-| Projection mix | 1024 | 133.7 us (177) | 774.8 us (30) | 281.7 us (84) | 5.80x | 2.11x |
-| H3 widths | 1 | 276.0 us | 1771.2 us | 600.2 us | 6.42x | 2.17x |
-| H3 widths | 64 | 308.3 us (80) | 1803.3 us (14) | 682.8 us (36) | 5.85x | 2.21x |
-| H3 widths | 512 | 923.1 us (214) | 4917.6 us (40) | 2455.9 us (80) | 5.33x | 2.66x |
-| Anchors | 8192 | 24.13 ms (285) | 133.91 ms (51) | 76.02 ms (90) | 5.55x | 3.15x |
-| Anchors | 32768 | 95.78 ms (287) | 532.03 ms (52) | 300.46 ms (91) | 5.55x | 3.14x |
+| H3 block | 8192 | 18.15 ms (278) | 100.00 ms (51) | 56.57 ms (89) | 5.51x | 3.12x |
+| H3 block | 32768 | 71.60 ms (282) | 394.63 ms (51) | 221.45 ms (91) | 5.51x | 3.09x |
+| H3 block | 131072 | 285.81 ms (283) | 1568.55 ms (52) | 882.72 ms (92) | 5.49x | 3.09x |
+| H3 block | 131073 | 286.19 ms (282) | 1545.76 ms (52) | 883.78 ms (91) | 5.40x | 3.09x |
+| H3 VAE | 1797 | 0.88 ms (222) | 4.39 ms (45) | 2.46 ms (80) | 4.98x | 2.79x |
+| H3 VAE | 7188 | 3.29 ms (238) | 16.29 ms (48) | 9.04 ms (87) | 4.95x | 2.75x |
+| Projection mix | 1 | 26.4 us | 577.7 us | 27.5 us | 21.86x | 1.04x |
+| Projection mix | 16 | 26.5 us (14) | 585.8 us (1) | 39.4 us (9) | 22.14x | 1.49x |
+| Projection mix | 128 | 43.2 us (68) | 603.4 us (5) | 67.3 us (44) | 13.96x | 1.56x |
+| Projection mix | 1024 | 133.9 us (176) | 773.9 us (31) | 282.0 us (84) | 5.78x | 2.11x |
+| H3 widths | 1 | 277.4 us | 1770.7 us | 600.3 us | 6.38x | 2.16x |
+| H3 widths | 64 | 309.5 us (80) | 1804.1 us (14) | 683.6 us (36) | 5.83x | 2.21x |
+| H3 widths | 512 | 925.1 us (213) | 4913.5 us (40) | 2455.9 us (80) | 5.31x | 2.65x |
+| Anchors | 8192 | 24.11 ms (285) | 134.27 ms (51) | 76.05 ms (90) | 5.57x | 3.15x |
+| Anchors | 32768 | 95.96 ms (286) | 532.79 ms (52) | 300.44 ms (91) | 5.55x | 3.13x |
 
 Single-row cases are bound by weight reads, so their throughput is omitted. At 131072 rows,
-the H3 stages ran at 294 TOPS for Q/K/V, 271 for the output projection, 291 for the FFN up
-projection, and 269 for the GELU-fused down projection. The original plan ran at 51-52 TOPS.
-The N=16384 anchors ran at 292-297 TOPS. The N=4096 anchors ran at 252-259 TOPS, because
+the H3 stages ran at 295 TOPS for Q/K/V, 271 for the output projection, 291 for the FFN up
+projection, and 265 for the GELU-fused down projection. The original plan ran at 51-52 TOPS.
+The N=16384 anchors ran at 292-296 TOPS. The N=4096 anchors ran at 252-260 TOPS, because
 preparation takes a larger share of those calls. Before the Gluon GEMM, the SM8x policy ran the
 H3 blocks at 220-221 TOPS, the VAE at 191-199, and the anchors at 223.
 `benchmark_convrot_int8.py` defaults went from 8.27/32.23 ms with the original plan to

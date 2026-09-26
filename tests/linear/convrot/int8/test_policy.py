@@ -342,9 +342,9 @@ def test_sm8x_schedule_without_shape_uses_grouped_large_tile(architecture, in_fe
         (2_048, 4),
         (5_376, 2),
         (12_288, 4),
-        (12_289, 8),
-        (14_336, 8),
-        (16_384, 8),
+        (12_289, 4),
+        (14_336, 4),
+        (16_384, 4),
         (16_385, 4),
         (28_672, 8),
         (49_408, 4),
@@ -358,7 +358,7 @@ def test_sm8x_preparation_depends_only_on_in_features(architecture, in_features,
         for rows, n in ((None, None), (1, 64), (256, 1024), (8192, 4096))
     ]
 
-    # Only one short chunk or two 8,192-column chunks change warps; the rest is shared.
+    # Only single chunks of at most 1,024 columns change warps; the rest is shared.
     for plan in plans:
         assert plan.fused_num_warps == fused_num_warps
         assert plan.fuse_rotation_quantization is previous.fuse_rotation_quantization

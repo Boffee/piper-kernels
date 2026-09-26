@@ -119,7 +119,6 @@ _SM8X_GLUON_MIN_COLUMNS = 129
 _SM8X_GLUON_MEDIUM_THRESHOLD = 48
 _SM8X_GLUON_LARGE_THRESHOLD = 128
 _SM8X_ONE_WARP_MAX_CHUNK_SIZE = 1_024
-_SM8X_EIGHT_WARP_PREPARATION_CHUNKS = (2, 8_192)
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -199,9 +198,6 @@ def _sm8x_execution_plan(
         # SwiGLU codes may differ from wider launches by one INT8 code; plain inputs do not.
         if chunk_count == 1 and chunk_size <= _SM8X_ONE_WARP_MAX_CHUNK_SIZE:
             fused_num_warps = 1
-        # Two 8,192-column chunks prepare faster with eight warps and identical bits.
-        elif fused_chunks == _SM8X_EIGHT_WARP_PREPARATION_CHUNKS:
-            fused_num_warps = 8
     plan = Sm8xExecutionPlan(
         fuse_rotation_quantization=base.fuse_rotation_quantization,
         fused_num_warps=fused_num_warps,
