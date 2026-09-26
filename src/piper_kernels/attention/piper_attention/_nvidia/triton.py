@@ -30,6 +30,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from .. import _quantization
+from . import gluon_async_copy as _gluon_async_copy
 from . import policy as _policy
 
 _BLOCK_N = 64
@@ -118,6 +119,14 @@ def _quantize_value_per_key_kernel(
         head_dim,
         block_n,
     )
+
+
+# The same launcher without specializing on the key-length-dependent V row
+# stride: one variant for every key length, and on SM89 3-5x faster than the
+# variant that vectorizes stores for a 16-byte-divisible stride.
+_quantize_value_per_key_unspecialized_kernel = triton.jit(
+    do_not_specialize=["key_length", "heads", "stride_od"],
+)(_quantize_value_per_key_kernel.fn)
 
 
 @triton.jit
@@ -750,6 +759,34 @@ def _default_piper_attention_execution_plan(
     )
 
 
+def _check_gluon_plan(plan: _policy.PiperAttentionExecutionPlan) -> None:
+    """Reject plans that mix Gluon-only and Triton-only launch choices."""
+    if not plan.use_gluon_kernel:
+        if plan.fuse_query_quantization:
+            raise ValueError("fused query quantization requires the Gluon kernel")
+        if plan.max_registers is not None:
+            raise ValueError("a register cap requires the Gluon kernel")
+        return
+    if (
+        plan.block_m not in _gluon_async_copy.BLOCK_Q_VALUES
+        or plan.num_warps != 4
+        or plan.num_stages != 1
+        or plan.grouped_qk
+        or plan.split_pv_head_dim
+        or plan.use_tensor_descriptors
+        or not plan.derive_value_log_bound
+        or not plan.use_packed_probability_conversion
+        or plan.optimize_causal_traversal
+        or plan.loop_num_stages is not None
+        or plan.loop_licm
+    ):
+        raise ValueError(
+            "the Gluon kernel requires Q64 or Q128 tiles on four warps, per-thread Q/K scales, "
+            "an unsplit PV product, pointer loads, a derived V log bound, and packed "
+            "probability codes, with no Triton loop controls"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedPiperAttention:
     query: torch.Tensor
@@ -765,6 +802,7 @@ class _PreparedPiperAttention:
     key_length: int
     is_causal: bool
     plan: _policy.PiperAttentionExecutionPlan
+    softmax_scale: float
 
 
 def _prepare_piper_attention(
@@ -783,10 +821,18 @@ def _prepare_piper_attention(
         raise ValueError("split-PV Piper Attention requires head_dim=128")
     if plan.optimize_causal_traversal and not is_causal:
         raise ValueError("optimized causal traversal requires causal attention")
+    _check_gluon_plan(plan)
     with device_context(query.device):
         install_uint8_int8_dot_hook()
         padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
-        storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
+        pad_storage = plan.use_tensor_descriptors or plan.use_gluon_kernel
+        storage_key_length = padded_key_length if pad_storage else key_length
+        # The Gluon kernel copies whole query tiles; padded rows are zero.
+        storage_query_length = (
+            int(triton.cdiv(query.shape[2], plan.block_m)) * plan.block_m
+            if plan.use_gluon_kernel
+            else None
+        )
 
         # A sequence-wide V mean is valid only for non-causal attention. Per-row
         # INT8 rounding would otherwise let future V rows perturb earlier outputs.
@@ -795,14 +841,27 @@ def _prepare_piper_attention(
             value,
             is_causal=is_causal,
         )
-        prepared_qk = qk_quantization.prepare_query_key(
-            query,
-            key,
-            key_mean,
-            scale,
-            grouped=plan.grouped_qk,
-            storage_key_length=storage_key_length,
-        )
+        if plan.fuse_query_quantization:
+            # The Gluon kernel reads raw Q and quantizes each tile in its prologue.
+            key_int8, key_scale = qk_quantization.prepare_key(
+                key,
+                key_mean,
+                grouped=plan.grouped_qk,
+                storage_key_length=storage_key_length,
+            )
+            query_operand, query_scale = query, key_scale.new_empty(0)
+        else:
+            prepared_qk = qk_quantization.prepare_query_key(
+                query,
+                key,
+                key_mean,
+                scale,
+                grouped=plan.grouped_qk,
+                storage_key_length=storage_key_length,
+                storage_query_length=storage_query_length,
+            )
+            query_operand, query_scale = prepared_qk.query, prepared_qk.query_scale
+            key_int8, key_scale = prepared_qk.key, prepared_qk.key_scale
 
         value_shape = (batch, kv_heads, head_dim, storage_key_length)
         value_int8 = (
@@ -820,7 +879,12 @@ def _prepare_piper_attention(
             device=value.device,
             dtype=torch.float16,
         )
-        _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), kv_heads, batch)](
+        value_kernel = (
+            _quantize_value_per_key_unspecialized_kernel
+            if plan.unspecialized_value_stride
+            else _quantize_value_per_key_kernel
+        )
+        value_kernel[(triton.cdiv(key_length, _BLOCK_N), kv_heads, batch)](
             value,
             value_mean,
             value_scale_multiplier,
@@ -842,17 +906,17 @@ def _prepare_piper_attention(
             num_warps=4,
         )
 
-        key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
+        key_argument: torch.Tensor | TensorDescriptor = key_int8
         value_argument: torch.Tensor | TensorDescriptor = value_int8
         if plan.use_tensor_descriptors:
             key_argument, value_argument = _make_key_value_descriptors(
-                prepared_qk.key,
+                key_int8,
                 value_int8,
                 split_pv_head_dim=plan.split_pv_head_dim,
             )
         query_descriptor = (
             _make_query_descriptor(
-                prepared_qk.query,
+                query_operand,
                 plan.block_m,
             )
             if plan.use_tensor_descriptors and plan.block_m == 128
@@ -860,12 +924,12 @@ def _prepare_piper_attention(
         )
         output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
         return _PreparedPiperAttention(
-            query=prepared_qk.query,
+            query=query_operand,
             query_descriptor=query_descriptor,
             key=key_argument,
             value=value_argument,
-            query_scale=prepared_qk.query_scale,
-            key_scale=prepared_qk.key_scale,
+            query_scale=query_scale,
+            key_scale=key_scale,
             value_scale_multiplier=value_scale_multiplier,
             value_log_scale=value_log_scale,
             value_mean=value_mean,
@@ -873,6 +937,7 @@ def _prepare_piper_attention(
             key_length=key_length,
             is_causal=is_causal,
             plan=plan,
+            softmax_scale=scale,
         )
 
 
@@ -880,6 +945,25 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
     """Launch only the fused attention recurrence on prepared integer inputs."""
     batch, heads, query_length, head_dim = prepared.output.shape
     plan = prepared.plan
+    if plan.use_gluon_kernel:
+        assert isinstance(prepared.key, torch.Tensor)
+        assert isinstance(prepared.value, torch.Tensor)
+        return _gluon_async_copy.launch_attention(
+            prepared.query,
+            prepared.key,
+            prepared.value,
+            prepared.query_scale,
+            prepared.key_scale,
+            prepared.value_scale_multiplier,
+            prepared.value_mean,
+            prepared.output,
+            softmax_scale=prepared.softmax_scale,
+            key_length=prepared.key_length,
+            is_causal=prepared.is_causal,
+            block_q=plan.block_m,
+            quantize_query=plan.fuse_query_quantization,
+            max_registers=plan.max_registers,
+        )
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = prepared.query_descriptor is not None
     with device_context(prepared.output.device):

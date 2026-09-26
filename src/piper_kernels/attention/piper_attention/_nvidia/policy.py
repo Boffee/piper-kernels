@@ -20,7 +20,13 @@ def supports_target(target: AcceleratorTarget) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class PiperAttentionExecutionPlan:
-    """Host-side specialization and launch choices for one Piper invocation."""
+    """Host-side specialization and launch choices for one Piper invocation.
+
+    ``use_gluon_kernel`` replaces the Triton recurrence with the ``cp.async`` Gluon
+    kernel; ``max_registers`` and ``fuse_query_quantization`` apply only to it.
+    ``unspecialized_value_stride`` quantizes V without specializing on its
+    key-length-dependent row stride.
+    """
 
     block_m: int
     grouped_qk: bool
@@ -33,6 +39,10 @@ class PiperAttentionExecutionPlan:
     loop_num_stages: int | None = None
     loop_licm: bool = False
     use_packed_probability_conversion: bool = False
+    unspecialized_value_stride: bool = False
+    use_gluon_kernel: bool = False
+    max_registers: int | None = None
+    fuse_query_quantization: bool = False
 
     def __post_init__(self) -> None:
         if self.block_m not in BLOCK_M_VALUES:
@@ -69,22 +79,30 @@ def _generic_execution_plan(
     )
 
 
-def _sm89_execution_plan(
-    *,
-    head_dim: int,
-    is_causal: bool,
-) -> PiperAttentionExecutionPlan:
-    """Build the exact-SM89 plan, including its measured D128 schedule."""
-    noncausal_d128 = not is_causal and head_dim == 128
+def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
+    """Build the exact-SM89 plan measured on an RTX 4070 Ti SUPER.
+
+    Every mode runs the ``cp.async`` Gluon kernel with per-thread Q/K scales:
+    SM120's grouped scales raise the error against exact attention by 7-12% here.
+    D64 gives each warp 32 query rows and quantizes Q in the kernel prologue. D128
+    gives each warp 16 rows under a register cap that fits two CTAs per SM; there
+    the prologue would cost more than the Q preparation pass it replaces. V
+    quantization leaves the V row stride unspecialized, which keeps SM89 within
+    SM120's compile count and is also 3-5x faster here.
+    """
+    wide = head_dim == 128
     return PiperAttentionExecutionPlan(
-        block_m=64 if is_causal else 128,
+        block_m=64 if wide else 128,
         grouped_qk=False,
-        split_pv_head_dim=noncausal_d128,
+        split_pv_head_dim=False,
         use_tensor_descriptors=False,
-        num_stages=1 if noncausal_d128 else 3,
-        loop_num_stages=3 if noncausal_d128 else None,
-        loop_licm=noncausal_d128,
-        use_packed_probability_conversion=noncausal_d128,
+        derive_value_log_bound=True,
+        num_stages=1,
+        use_packed_probability_conversion=True,
+        unspecialized_value_stride=True,
+        use_gluon_kernel=True,
+        max_registers=232 if wide else None,
+        fuse_query_quantization=not wide,
     )
 
 
@@ -127,10 +145,7 @@ def select_execution_plan(
 ) -> PiperAttentionExecutionPlan:
     """Combine portable capability defaults with exact-target measured policy."""
     if target.is_cuda_capability(8, 9):
-        return _sm89_execution_plan(
-            head_dim=head_dim,
-            is_causal=is_causal,
-        )
+        return _sm89_execution_plan(head_dim=head_dim)
     if target.is_cuda_capability(12, 0):
         return _sm120_execution_plan(
             head_dim=head_dim,
