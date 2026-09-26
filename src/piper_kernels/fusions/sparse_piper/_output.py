@@ -18,7 +18,7 @@ if TYPE_CHECKING:
         _PreparedSparsePiperAttention,
     )
 
-DEFAULT_QUERY_CHUNK_ROWS = 4_096
+DEFAULT_QUERY_CHUNK_ROWS = output_pipeline.DEFAULT_QUERY_CHUNK_ROWS
 _MIN_PROJECTED_GATE_PIPELINE_CHUNKS = 8
 
 AttentionProjector = output_pipeline.AttentionProjector
@@ -230,6 +230,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
     project_attention: AttentionProjector | None = None,
+    reuse_output_for_attention: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Validate sparse coarse gates and supply the shared pipeline's output shape."""
@@ -259,6 +260,7 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913
         auxiliary_pipeline_min_chunks=_MIN_PROJECTED_GATE_PIPELINE_CHUNKS,
         output_dtype=output_dtype,
         project_attention=project_attention,
+        reuse_output_for_attention=reuse_output_for_attention,
         out=out,
     )
 
@@ -273,6 +275,7 @@ def run_chunked_attention_output(
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
     project_attention: AttentionProjector | None = None,
+    reuse_output_for_attention: bool = False,
 ) -> torch.Tensor:
     """Pipeline a materialized Q boundary through bounded attention output."""
     prepared_attention = prepared.attention
@@ -305,10 +308,11 @@ def run_chunked_attention_output(
         project_coarse_gate_chunk=project_coarse_gate_chunk,
         output_dtype=output_dtype,
         project_attention=project_attention,
+        reuse_output_for_attention=reuse_output_for_attention,
     )
 
 
-def run_chunked_projected_query_attention_output(
+def run_chunked_projected_query_attention_output(  # noqa: PLR0913
     prepared: _PreparedAttentionContext,
     output_features: int,
     query_chunk_rows: int,
@@ -319,6 +323,7 @@ def run_chunked_projected_query_attention_output(
     project_coarse_gate_chunk: CoarseGateChunkProjector | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
     project_attention: AttentionProjector | None = None,
+    reuse_output_for_attention: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project, route, attend, and consume one bounded Q window at a time."""
@@ -357,6 +362,7 @@ def run_chunked_projected_query_attention_output(
         project_coarse_gate_chunk=project_coarse_gate_chunk,
         output_dtype=output_dtype,
         project_attention=project_attention,
+        reuse_output_for_attention=reuse_output_for_attention,
         out=out,
     )
 

@@ -4,10 +4,8 @@ import math
 
 import torch
 
-from piper_kernels.fusions.convrot_int8_sage_qk._validation import validate_qk_projection_inputs
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
-
 from . import _backend
+from ._validation import validate_qk_inputs
 
 
 def _validate_inputs(  # noqa: PLR0913, PLR0917
@@ -23,7 +21,7 @@ def _validate_inputs(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None,
     head_dim: int | None,
 ) -> tuple[int, int, int, int]:
-    batch, sequence_length, heads = validate_qk_projection_inputs(
+    shape = validate_qk_inputs(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -36,16 +34,9 @@ def _validate_inputs(  # noqa: PLR0913, PLR0917
         head_dim=head_dim,
         bias=bias,
     )
-    if heads < 1 or input_qdata.shape[2] < 1:
-        raise ValueError("dense Piper Q projection requires nonempty head and input dimensions")
     if not math.isfinite(softmax_scale) or softmax_scale <= 0:
         raise ValueError("dense Piper Q projection softmax scale must be finite and positive")
-    if torch.is_grad_enabled() and any(
-        operand is not None and operand.requires_grad
-        for operand in (input_scale, weight_scale, norm_weight, cos, sin, bias)
-    ):
-        raise RuntimeError("dense Piper Q projection is inference-only")
-    return batch, sequence_length, heads, resolve_head_dim(norm_weight, head_dim)
+    return shape
 
 
 def _new_outputs(
@@ -94,7 +85,7 @@ def _launch_query_projection(  # noqa: PLR0913
     if backend is None:
         raise ValueError(f"dense Piper Q projection is unavailable on {input_qdata.device}")
     output = _new_outputs(input_qdata, shape)
-    backend(
+    backend.project_query(
         input_qdata,
         input_scale,
         weight_qdata,

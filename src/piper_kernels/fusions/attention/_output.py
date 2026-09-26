@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+DEFAULT_QUERY_CHUNK_ROWS = 4096
+
 type AttentionProjector = Callable[[torch.Tensor], torch.Tensor]
 type ChunkProjector = Callable[[torch.Tensor, torch.Tensor, int, int], None]
 type AuxiliaryChunkProjector = Callable[[torch.Tensor, int, int], None]
@@ -82,6 +84,7 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
     output_dtype: torch.dtype = torch.bfloat16,
     project_attention: AttentionProjector | None = None,
     out: torch.Tensor | None = None,
+    reuse_output_for_attention: bool = False,
 ) -> torch.Tensor:
     """Run validated row windows through attention and its output projection.
 
@@ -95,6 +98,11 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
     Chunk projectors fill the final output rows. Multiple chunks overlap projection
     on a consumer stream; a single chunk uses the current stream. Include every
     tensor retained by the chunk projector in projector_tensors.
+
+    With reuse_output_for_attention, a sufficiently wide final output supplies
+    each attention window's temporary storage. For each batch element, the chunk
+    projector must read the entire window into separate storage before writing
+    its output rows. Narrow outputs retain the two bounded attention buffers.
 
     A whole-output projector materializes attention first, for example to derive a
     global activation scale. It owns its output allocation; out applies only to
@@ -146,11 +154,6 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
         return project_attention(attention)
 
     assert project_chunk is not None
-    attention_buffers = torch.empty(
-        (min(2, chunk_count), *chunk_shape),
-        device=device,
-        dtype=output_dtype,
-    )
     output_shape = (batch, sequence_length, output_features)
     if out is None:
         output = torch.empty(output_shape, device=device, dtype=output_dtype)
@@ -164,9 +167,23 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
             raise ValueError("attention output buffer must match the projected output")
         output = out
 
+    attention_buffers = (
+        None
+        if reuse_output_for_attention and output_features >= heads * head_dim
+        else torch.empty((min(2, chunk_count), *chunk_shape), device=device, dtype=output_dtype)
+    )
+
+    def attention_window(slot: int, start: int, rows: int) -> torch.Tensor:
+        if attention_buffers is not None:
+            return attention_buffers[slot, :, :rows]
+        # Pack attention contiguously within each batch's unwritten output
+        # rows, even when the output projection expands the feature width.
+        storage = output[:, start : start + rows].view(batch, rows * output_features)
+        return storage[:, : rows * heads * head_dim].view(batch, rows, heads, head_dim)
+
     if chunk_count == 1:
         start, rows = chunk_ranges[0]
-        attention_chunk = attention_buffers[0, :, :rows]
+        attention_chunk = attention_window(0, start, rows)
         launch_chunk(attention_chunk, start, rows, get_auxiliary_chunk(start, rows))
         project_chunk(attention_chunk, output, start, rows)
         return output
@@ -202,7 +219,7 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
 
         for chunk_index, (start, rows) in enumerate(chunk_ranges):
             attention_slot = attention_slots.acquire_for_write(producer, chunk_index)
-            attention_chunk = attention_buffers[attention_slot, :, :rows]
+            attention_chunk = attention_window(attention_slot, start, rows)
             if auxiliary_slots is None:
                 auxiliary_chunk = get_auxiliary_chunk(start, rows)
             else:
@@ -228,11 +245,12 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
                 )
             with torch.cuda.stream(consumer):
                 ready_slot = attention_slots.acquire_for_read(consumer, chunk_index)
-                ready_attention = attention_buffers[ready_slot, :, :rows]
+                ready_attention = attention_window(ready_slot, start, rows)
                 project_chunk(ready_attention, output, start, rows)
                 attention_slots.release(consumer, chunk_index)
         producer.wait_event(attention_slots.consumed[(chunk_count - 1) % 2])
-        attention_buffers.record_stream(consumer)
+        if attention_buffers is not None:
+            attention_buffers.record_stream(consumer)
         output.record_stream(consumer)
         for tensor in projector_tensors:
             tensor.record_stream(consumer)

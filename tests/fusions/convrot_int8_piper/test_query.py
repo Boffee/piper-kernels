@@ -262,9 +262,9 @@ def test_projection_selector_uses_validated_targets(monkeypatch, target, support
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("affine", [False, True])
 def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim, affine):
-    function = projection._project_query_kernel
+    function = projection._project_qk_kernel
     kernel = MagicMock()
-    monkeypatch.setattr(projection, "_project_query_kernel", kernel)
+    monkeypatch.setattr(projection, "_project_qk_kernel", kernel)
     monkeypatch.setattr(projection, "device_context", lambda _: nullcontext())
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", arch))
     operands = _operands("meta", sequence=193, head_dim=head_dim, affine=affine)
@@ -274,28 +274,33 @@ def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim
     assert len(calls) == 2
     assert [call.args[0] for call in kernel.__getitem__.call_args_list] == [(3, 3, 2), (1, 3, 2)]
     for call in calls:
-        arguments = dict(zip(function.arg_names, call.args, strict=False))
-        arguments.update(
-            {name: item for name, item in call.kwargs.items() if name in function.arg_names}
-        )
-        constants, signature = {}, {}
-        types = {torch.int8: "*i8", torch.float32: "*fp32", torch.bfloat16: "*bf16"}
-        for parameter in function.params:
-            argument = arguments[parameter.name]
-            if parameter.is_constexpr:
-                constants[parameter.name] = argument
-            elif argument is None:
-                constants[parameter.name] = None
-                signature[parameter.name] = "constexpr"
-            else:
-                signature[parameter.name] = (
-                    types[argument.dtype] if isinstance(argument, torch.Tensor) else "i32"
-                )
-        compiled = triton.compile(
-            ASTSource(function, signature, constexprs=constants),
-            target=GPUTarget("hip", arch, 32),
-            options={name: call.kwargs[name] for name in ("num_warps", "num_stages")},
-        )
+        compiled = _compile_rdna4_launch(function, call, arch)
         assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
         assert compiled.metadata.shared <= 65536
         assert "arith.truncf" not in compiled.asm["ttgir"]
+
+
+def _compile_rdna4_launch(function, call, arch):
+    arguments = dict(zip(function.arg_names, call.args, strict=False))
+    arguments.update(
+        {name: item for name, item in call.kwargs.items() if name in function.arg_names}
+    )
+    constants, signature = {}, {}
+    types = {torch.int8: "*i8", torch.float32: "*fp32", torch.bfloat16: "*bf16"}
+    for parameter in function.params:
+        argument = arguments[parameter.name]
+        if parameter.is_constexpr:
+            constants[parameter.name] = argument
+        elif argument is None:
+            constants[parameter.name] = None
+            signature[parameter.name] = "constexpr"
+        else:
+            signature[parameter.name] = (
+                types[argument.dtype] if isinstance(argument, torch.Tensor) else "i32"
+            )
+    compiled = triton.compile(
+        ASTSource(function, signature, constexprs=constants),
+        target=GPUTarget("hip", arch, 32),
+        options={name: call.kwargs[name] for name in ("num_warps", "num_stages")},
+    )
+    return compiled

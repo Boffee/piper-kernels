@@ -51,9 +51,15 @@ def test_global_scale_projection_uses_all_ragged_windows(project_auxiliary: bool
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
 @pytest.mark.parametrize("auxiliary_mode", ["none", "materialized", "projected"])
 @pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("output_features", [5, 12, 17])
+@pytest.mark.parametrize("chunk_rows", [7, 128])
+@pytest.mark.parametrize("reuse_output", [False, True])
 def test_chunk_output_on_nondefault_stream_preserves_caller_storage(
     auxiliary_mode: str,
     capture: bool,
+    output_features: int,
+    chunk_rows: int,
+    reuse_output: bool,
 ) -> None:
     shape = (2, 67, 3, 4)
     source = (
@@ -63,13 +69,16 @@ def test_chunk_output_on_nondefault_stream_preserves_caller_storage(
         .to(torch.bfloat16)
     )
     auxiliary = source.mul(0.25)
-    bias = torch.arange(5, device="cuda", dtype=torch.bfloat16)
+    bias = torch.arange(output_features, device="cuda", dtype=torch.bfloat16)
     backing = torch.full((4, shape[1], bias.numel()), -999, device="cuda", dtype=source.dtype)
     out = backing[1:3]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
     def launch_chunk(buffer, start, rows, auxiliary_chunk):
+        shares_output = buffer.untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+        assert shares_output == (reuse_output and output_features >= shape[2] * shape[3])
+        assert buffer[0].is_contiguous()
         current = source[:, start : start + rows]
         if auxiliary_chunk is None:
             buffer.copy_(current)
@@ -87,7 +96,7 @@ def test_chunk_output_on_nondefault_stream_preserves_caller_storage(
             shape,
             source.device,
             bias.numel(),
-            7,
+            chunk_rows,
             launch_chunk,
             project_chunk,
             (bias,),
@@ -96,6 +105,7 @@ def test_chunk_output_on_nondefault_stream_preserves_caller_storage(
                 project_auxiliary_chunk if auxiliary_mode == "projected" else None
             ),
             out=out,
+            reuse_output_for_attention=reuse_output,
         )
 
     with torch.cuda.stream(stream):

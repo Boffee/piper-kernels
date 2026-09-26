@@ -333,6 +333,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
         output_dtype=output_dtype,
+        reuse_output_for_attention=True,
     )
 
 
@@ -488,6 +489,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
         output_dtype=output_dtype,
         out=out,
+        reuse_output_for_attention=True,
     )
 
 
