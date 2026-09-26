@@ -636,9 +636,11 @@ The async-copy kernel and one-warp preparation also run on SM120. GPU correctnes
 the SM8x schedules on either architecture; production SM120 selection remains unchanged.
 The [NVIDIA implementation layout](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md)
 separates policy, dispatch, and implementation launchers as sparse Piper attention does.
-The tuner accepts `--matmul-kernel triton gluon_async_copy`, `--matmul-group-m 0 8 16`, and
-`--matmul-block-m 256`. It reports unsupported combinations to stderr, measures supported
-candidates, and errors clearly if none remain. For example, on SM80 or newer:
+For NVIDIA plans, the tuner accepts `--matmul-kernel triton gluon_async_copy` and
+`--matmul-group-m 0 8 16`; those two axes are rejected for AMD plans. Shared tile and warp
+axes retain CUDA/ROCm support, including 256-row tiles and AMD's 32-warp preparation.
+The tuner reports unsupported combinations to stderr, measures supported candidates, and
+errors clearly if none remain. For example, on SM80 or newer:
 
 ```shell
 uv run python benchmarks/tune_convrot_int8_linear.py \

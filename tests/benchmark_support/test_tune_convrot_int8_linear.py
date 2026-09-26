@@ -14,7 +14,6 @@ from tune_convrot_int8_linear import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as convrot_int8_backend
 from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 
 
@@ -25,12 +24,18 @@ def _production_plan():
     )
 
 
-def _workload(*, rows: int = 2, out_features: int = 96, in_features: int = 512):
+def _workload(
+    *,
+    rows: int = 2,
+    out_features: int = 96,
+    in_features: int = 512,
+    target: AcceleratorTarget | None = None,
+):
     return make_convrot_int8_workload(
         ConvRotShape("custom", rows, out_features, in_features),
         ConvRotConfig(torch.bfloat16, 256, 0),
         device=torch.device("cpu"),
-        target=AcceleratorTarget("cuda", "sm120"),
+        target=target if target is not None else AcceleratorTarget("cuda", "sm120"),
     )
 
 
@@ -93,6 +98,20 @@ def test_amd_tuning_accepts_its_preparation_warp_count_and_preserves_backend_con
         _candidate_plans(arguments, _production_plan())
     with pytest.raises(SystemExit, match="no supported execution plans"):
         _candidate_plans(_parse_args(["--matmul-num-warps", "2"]), workload.production_plan)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--matmul-kernel", "triton"],
+        ["--matmul-kernel", "gluon_async_copy"],
+        ["--matmul-group-m", "16"],
+    ],
+)
+def test_amd_tuning_rejects_nvidia_only_axes(arguments):
+    workload = _workload(target=AcceleratorTarget("hip", "gfx1201"))
+    with pytest.raises(SystemExit, match="require an NVIDIA execution plan"):
+        _candidate_plans(_parse_args(arguments), workload.production_plan)
 
 
 def _sm8x_plan():
@@ -261,18 +280,21 @@ def test_candidate_configuration_contains_flat_execution_plan_fields() -> None:
     assert candidate.configuration["dtype"] == "bfloat16"
 
 
+@pytest.mark.parametrize(
+    "target", [AcceleratorTarget("cuda", "sm120"), AcceleratorTarget("hip", "gfx1201")]
+)
 def test_candidate_provider_injects_plan_into_complete_operator(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, target: AcceleratorTarget
 ) -> None:
-    plan = _production_plan()
-    workload = _workload()
+    workload = _workload(target=target)
+    plan = workload.production_plan
     calls = []
 
     def fake_run(*args, **kwargs):
         calls.append((args, kwargs))
         return torch.empty((2, 96), device="meta")
 
-    monkeypatch.setattr(convrot_int8_backend, "run_linear", fake_run)
+    monkeypatch.setattr(workload.backend, "run_linear", fake_run)
     provider = _make_candidate(plan, workload).make_provider()
 
     prepared = provider.prepare()
