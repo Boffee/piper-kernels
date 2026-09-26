@@ -161,9 +161,9 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     group_m: tl.constexpr = 0,
     bias_ptr=None,
 ):
-    """Project two heads over two K64 tiles and emit sparse Piper's V format."""
-    tl.static_assert(block_m == 2 * _JIT_VALUE_TILE_ROWS)
-    tl.static_assert(heads_per_program == 2)
+    """Project one or two heads over whole K64 tiles and emit sparse Piper's V format."""
+    tl.static_assert(block_m % _JIT_VALUE_TILE_ROWS == 0)
+    tl.static_assert(heads_per_program == 1 or heads_per_program == 2)  # noqa: PLR1714
     tl.static_assert(block_n == heads_per_program * head_dim)
     tl.static_assert(head_dim == 64 or head_dim == 128)  # noqa: PLR1714
 
