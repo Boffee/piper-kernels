@@ -139,6 +139,7 @@ def qk_tiles(
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
+    pipeline_priority: gl.constexpr = None,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
 
@@ -168,8 +169,12 @@ def qk_tiles(
                 acc = int8_wmma(query[k], key, acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
             results += (gl.fma(result.to(gl.float32, bitcast=True), 67108864.0, -10680707.0),)
-        with gl.amd.warp_pipeline_stage("qk"):
-            pass
+        if pipeline_priority is None:
+            with gl.amd.warp_pipeline_stage("qk"):
+                pass
+        else:
+            with gl.amd.warp_pipeline_stage("qk", priority=pipeline_priority):
+                pass
     return _join_matrix(results)
 
 
@@ -246,6 +251,7 @@ def pv_tiles(
     current_weight,
     use_64bit_context_offsets: gl.constexpr,
     two_tiles: gl.constexpr = True,
+    pipeline_priority: gl.constexpr = None,
 ):
     """Accumulate D16 products into the already-rescaled numerator.
 
@@ -288,6 +294,10 @@ def pv_tiles(
                     gl.convert_layout(numerators[column_tile], MMA_LAYOUT),
                 ),
             )
-        with gl.amd.warp_pipeline_stage("pv"):
-            pass
+        if pipeline_priority is None:
+            with gl.amd.warp_pipeline_stage("pv"):
+                pass
+        else:
+            with gl.amd.warp_pipeline_stage("pv", priority=pipeline_priority):
+                pass
     return _join_matrix(results)

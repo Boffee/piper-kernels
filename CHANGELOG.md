@@ -15,6 +15,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- RDNA4 D128 sparse Piper uses WGP scheduling and prioritizes matrix stages in the
+  stock Gluon kernel, preserving dynamic-length reuse and numerical operations.
 - RDNA4 D128 min/max routing uses tiled FP32 scoring for standalone query chunks as well
   as fused projection windows, avoiding a second global score matrix for larger chunks.
 
