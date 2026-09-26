@@ -377,7 +377,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     value_mean_ptr,
     output_ptr,
     query_block,
-    query_length,
+    query_storage_length,
     key_length,
     query_start,
     query_rows,
@@ -426,7 +426,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     else:
         query = tl.load(
             query_ptr
-            + ((batch_head * query_length + offsets_m[:, None]) * head_dim)
+            + ((batch_head * query_storage_length + offsets_m[:, None]) * head_dim)
             + offsets_d[None, :],
             mask=valid_queries[:, None],
             other=0,
@@ -434,7 +434,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     if grouped_qk:
         query_scale = tl.load(
             query_scale_ptr
-            + batch_head * tl.cdiv(query_length, 32)
+            + batch_head * tl.cdiv(query_storage_length, 32)
             + query_start // 32
             + output_rows // 32,
             mask=valid_queries,
@@ -442,7 +442,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
         )
     else:
         query_scale = tl.load(
-            query_scale_ptr + batch_head * query_length + offsets_m,
+            query_scale_ptr + batch_head * query_storage_length + offsets_m,
             mask=valid_queries,
             other=0.0,
         )
@@ -628,7 +628,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
 
 @triton.jit(
     do_not_specialize=[
-        "query_length",
+        "query_storage_length",
         "key_length",
         "heads",
         "query_start",
@@ -650,7 +650,7 @@ def _piper_attention_kernel(
     value_log_scale_ptr,
     value_mean_ptr,
     output_ptr,
-    query_length,
+    query_storage_length,
     key_length,
     query_start,
     query_rows,
@@ -685,7 +685,7 @@ def _piper_attention_kernel(
     if full_query:
         query_start = 0
         global_query_start = 0
-        query_rows = query_length
+        query_rows = query_storage_length
     query_block = tl.program_id(0)
     if is_causal and optimize_causal_traversal:
         query_block = tl.num_programs(0) - 1 - query_block
@@ -699,7 +699,7 @@ def _piper_attention_kernel(
         value_mean_ptr,
         output_ptr,
         query_block,
-        query_length,
+        query_storage_length,
         key_length,
         query_start,
         query_rows,
@@ -1035,7 +1035,7 @@ def _launch_piper_attention_into(
             context.value_log_scale,
             context.value_mean,
             output,
-            query_length,
+            query.data.shape[2],
             context.key_length,
             query_start,
             rows,
@@ -1060,7 +1060,9 @@ def _launch_piper_attention_into(
             loop_licm=plan.loop_licm,
             use_packed_probability_conversion=plan.use_packed_probability_conversion,
             derive_value_log_bound=plan.derive_value_log_bound,
-            full_query=query_start == 0 and query.global_row_offset == 0 and rows == query_length,
+            full_query=(
+                query_start == 0 and query.global_row_offset == 0 and rows == query.data.shape[2]
+            ),
             contiguous_output=output.is_contiguous(),
             num_warps=plan.num_warps,
             num_stages=plan.num_stages,

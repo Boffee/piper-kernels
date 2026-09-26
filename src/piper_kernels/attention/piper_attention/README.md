@@ -10,6 +10,10 @@ here are part of preparation or attention, not implicit input validation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
 
+For an opt-in Q projection fusion, see
+[ConvRot INT8 query fusion](../../fusions/convrot_int8_piper/README.md).
+Its quantized-Q compiler boundary retains the ordinary dense K/V preparation.
+
 ## NVIDIA scheduling
 
 The attention recurrence handles full query tiles and a ragged final tile in one

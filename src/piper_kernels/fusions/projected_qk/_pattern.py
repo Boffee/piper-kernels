@@ -33,8 +33,14 @@ def normalized_rope_pattern(  # noqa: PLR0913
     output_users: int = 1,
     activation_dtype: torch.dtype = torch.bfloat16,
     affine: bool = True,
+    full_rotary: bool = False,
 ) -> CallFunction:
-    """Match projected RMSNorm/RoPE using caller-owned capture names."""
+    """Match projected RMSNorm/RoPE using caller-owned capture names.
+
+    Full-width RoPE drops the identity slice and empty passthrough in canonical
+    graphs. That form captures only the half width; callers validate that its
+    tables cover the complete head dimension.
+    """
     # FP32 graphs omit redundant casts around RMSNorm and RoPE.
     low_precision = activation_dtype is not torch.float32
     reshaped = CallFunction(
@@ -79,13 +85,17 @@ def normalized_rope_pattern(  # noqa: PLR0913
         if low_precision
         else scaled
     )
-    rotary = CallFunction(
-        torch.ops.aten.slice.Tensor,
-        rounded,
-        3,
-        0,
-        KeywordArg(rotary_dim_name),
-        _users=2,
+    rotary = (
+        rounded
+        if full_rotary
+        else CallFunction(
+            torch.ops.aten.slice.Tensor,
+            rounded,
+            3,
+            0,
+            KeywordArg(rotary_dim_name),
+            _users=2,
+        )
     )
     split = CallFunction(
         torch.ops.aten.split.Tensor,
@@ -106,7 +116,11 @@ def normalized_rope_pattern(  # noqa: PLR0913
     )
     sin = _rope_table_pattern(sin_name, activation_dtype)
     rotated = CallFunction(torch.ops.aten.mul.Tensor, rotated, sin, _users=1)
-    rotary_output = CallFunction(torch.ops.aten.add.Tensor, direct, rotated, _users=1)
+    rotary_output = CallFunction(
+        torch.ops.aten.add.Tensor, direct, rotated, _users=output_users if full_rotary else 1
+    )
+    if full_rotary:
+        return rotary_output
     passthrough = CallFunction(
         torch.ops.aten.slice.Tensor,
         rounded,

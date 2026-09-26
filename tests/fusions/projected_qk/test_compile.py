@@ -11,7 +11,7 @@ from piper_kernels.fusions.projected_qk import _compile, _pattern
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-def _transform_graph(dtype, affine):
+def _transform_graph(dtype, affine, *, full_rotary=False):
     def transform(features, weight, cos, sin):
         projected = torch.ops.aten.clone.default(features)
         shaped = torch.ops.aten.reshape.default(projected, (1, 192, 2, 128))
@@ -31,8 +31,8 @@ def _transform_graph(dtype, affine):
             if dtype is not torch.float32
             else scaled
         )
-        rotary = torch.ops.aten.slice.Tensor(rounded, 3, 0, 96)
-        first, second = torch.ops.aten.split.Tensor(rotary, 48, -1)
+        rotary = rounded if full_rotary else torch.ops.aten.slice.Tensor(rounded, 3, 0, 96)
+        first, second = torch.ops.aten.split.Tensor(rotary, 64 if full_rotary else 48, -1)
         cos_table = (
             torch.ops.prims.convert_element_type.default(cos, dtype)
             if dtype is not torch.float32
@@ -51,13 +51,15 @@ def _transform_graph(dtype, affine):
         sin_table = torch.ops.aten.unsqueeze.default(sin_table, 2)
         rotated = torch.ops.aten.mul.Tensor(rotated, sin_table)
         result = torch.ops.aten.add.Tensor(direct, rotated)
+        if full_rotary:
+            return result
         tail = torch.ops.aten.slice.Tensor(rounded, 3, 96, torch.iinfo(torch.int64).max)
         return torch.ops.aten.cat.default([result, tail], -1)
 
     return torch.fx.symbolic_trace(transform).graph
 
 
-def _transform_pattern(dtype, affine):
+def _transform_pattern(dtype, affine, *, full_rotary=False):
     return _pattern.normalized_rope_pattern(
         CallFunction(torch.ops.aten.clone.default, KeywordArg("features"), _users=1),
         shape_name="shape",
@@ -69,6 +71,7 @@ def _transform_pattern(dtype, affine):
         half_rotary_dim_name="half_width",
         activation_dtype=dtype,
         affine=affine,
+        full_rotary=full_rotary,
     )
 
 
@@ -99,6 +102,17 @@ def test_transform_pattern_rejects_an_escaping_normalized_intermediate():
     normalization = next(node for node in graph.nodes if node.target is torch.ops.aten.mul.Tensor)
     graph.call_function(torch.ops.aten.neg.default, (normalization,))
     assert not _transform_pattern(torch.bfloat16, True).match(output)
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("affine", [False, True])
+def test_transform_pattern_supports_canonical_full_rope(dtype, affine):
+    graph = _transform_graph(dtype, affine, full_rotary=True)
+    output = next(node for node in reversed(graph.nodes) if node.op == "call_function")
+    match = _transform_pattern(dtype, affine, full_rotary=True).match(output)
+    assert isinstance(match, Match)
+    assert "width" not in match.kwargs
+    assert match.kwargs["half_width"] == 64
 
 
 def _node(graph, name, value):
