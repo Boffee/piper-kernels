@@ -95,6 +95,7 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
     gluon_kernel = MagicMock()
     monkeypatch.setattr(backend, "int8_matmul_kernel", kernel)
     if backend is nvidia:
+        monkeypatch.setattr(nvidia, "sm8x_int8_matmul_kernel", kernel)
         monkeypatch.setattr(nvidia.gluon, "int8_matmul_gluon_kernel", gluon_kernel)
     value = torch.empty(m, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
@@ -117,7 +118,9 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
         launched.__getitem__.return_value.assert_called_once()
         if not uses_gluon:
             flags = kernel.__getitem__.return_value.call_args.kwargs
-            assert flags["aligned_m"] == (m % plan.matmul_block_m == 0)
+            # SM8x branches per tile instead of specializing on aligned M.
+            sm8x = target.is_cuda_capability(8)
+            assert flags["aligned_m"] == (not sm8x and m % plan.matmul_block_m == 0)
             assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
 
 
@@ -139,28 +142,29 @@ def test_nvidia_planner_needs_no_device_properties_with_explicit_target(
 
 
 @pytest.mark.parametrize(
-    ("architecture", "rows", "tile", "group_m"),
+    ("architecture", "rows", "n", "tile", "group_m"),
     [
         # SM120 derives grouping from the 128x256 tile, including explicit
         # 128x128 schedules such as the H3 VAE specialization.
-        ("sm120", 4096, None, 16),
-        ("sm120", 4096, (128, 128, 128, 4, 2), 0),
-        ("sm120", 64, None, 0),
-        ("sm89", 512, None, 16),
-        ("sm89", 256, None, 0),
-        ("sm89", 4, None, 0),
-        ("sm86", 512, (128, 256, 128, 8, 3), 16),
+        ("sm120", 4096, 1000, None, 16),
+        ("sm120", 4096, 1000, (128, 128, 128, 4, 2), 0),
+        ("sm120", 64, 1000, None, 0),
+        ("sm89", 8192, 96, None, 16),
+        ("sm89", 256, 1000, None, 0),
+        ("sm89", 4, 1000, None, 0),
+        ("sm86", 8192, 96, (128, 256, 128, 8, 3), 16),
     ],
 )
 @pytest.mark.parametrize("paired", [False, True])
 def test_nvidia_launch_grouping_follows_the_plan(
-    monkeypatch, architecture, rows, tile, group_m, paired
+    monkeypatch, architecture, rows, n, tile, group_m, paired
 ):
     target = AcceleratorTarget("cuda", architecture)
     monkeypatch.setattr(nvidia, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     monkeypatch.setattr(nvidia, "int8_matmul_kernel", kernel)
-    k, n = 1024, 1000
+    monkeypatch.setattr(nvidia, "sm8x_int8_matmul_kernel", kernel)
+    k = 1024
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
     plan = nvidia.default_execution_plan(weight, target=target, rows=rows)
@@ -192,18 +196,21 @@ def test_nvidia_launch_grouping_follows_the_plan(
     assert kernel.__getitem__.return_value.call_args.kwargs["group_m"] == group_m
 
 
-@pytest.mark.parametrize(("rows", "block_m", "num_warps"), [(4096, 256, 8), (2048, 128, 4)])
+@pytest.mark.parametrize(
+    ("rows", "n", "block_m", "num_warps"), [(4096, 1000, 128, 4), (4096, 2000, 256, 8)]
+)
 @pytest.mark.parametrize("paired", [False, True])
 def test_sm8x_wide_projections_launch_the_gluon_kernel(
-    monkeypatch, rows, block_m, num_warps, paired
+    monkeypatch, rows, n, block_m, num_warps, paired
 ):
     target = AcceleratorTarget("cuda", "sm89")
     monkeypatch.setattr(nvidia, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     gluon_kernel = MagicMock()
     monkeypatch.setattr(nvidia, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(nvidia, "sm8x_int8_matmul_kernel", kernel)
     monkeypatch.setattr(nvidia.gluon, "int8_matmul_gluon_kernel", gluon_kernel)
-    k, n = 1024, 1000
+    k = 1024
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
     plan = nvidia.default_execution_plan(weight, target=target, rows=rows)

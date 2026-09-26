@@ -801,7 +801,7 @@ def _sm8x_available() -> bool:
     ],
 )
 def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired, bias_dtypes):
-    # SM8x bias adds are explicit FMAs; grouped tiles branch per tile on ragged M.
+    # SM8x bias adds are explicit FMAs, so tiles can branch per tile on ragged M.
     torch.manual_seed(889)
     value = torch.randint(-127, 128, (1, rows, k), device="cuda", dtype=torch.int8)
     row_scale = torch.rand(1, rows, device="cuda") * 0.01
@@ -845,10 +845,32 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.parametrize(("k", "n"), [(256, 1024), (256, 2048), (512, 96)])
+def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
+    # Clear in-memory caches so earlier tests cannot hide a per-row-count compile.
+    kernels = (int8_nvidia.sm8x_int8_matmul_kernel, int8_nvidia.gluon.int8_matmul_gluon_kernel)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    torch.manual_seed(k + n)
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    tiles = set()
+    for rows in (1, 2, 15, 16, 17, 64, 97, 128, 255, 256, 769, 1535, 1536, 2048, 4097, 8192):
+        value = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+        row_scale = torch.rand(rows, device="cuda") * 0.01
+        int8_nvidia.linear_prepared(value, row_scale, weight, scale, None, torch.bfloat16)
+        plan = int8_nvidia.default_execution_plan(weight, rows=rows)
+        tiles.add((plan.matmul_block_m, plan.matmul_block_n))
+    compiled = sum(len(cache[0]) for kernel in kernels for cache in kernel.device_caches.values())
+    assert len(tiles) == compiled == 3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
 @pytest.mark.parametrize("offset", [0, 8])
 def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset):
     torch.manual_seed(417)
-    rows, k, n = 1030, 512, 1000
+    rows, k, n = 1600, 512, 1000
     storage = torch.randint(-127, 128, (rows * k + 16,), device="cuda", dtype=torch.int8)
     value = storage[offset : offset + rows * k].view(rows, k)
     row_scale = torch.rand(rows, device="cuda") * 0.01

@@ -24,6 +24,9 @@ from .._plan import LinearExecutionPlan
 from . import gluon, policy
 
 _LARGE_MATMUL_GROUP_M_TILES = 16
+# SM8x tiles branch per tile on ragged M instead of specializing on it, so one compiled
+# kernel per tile serves every row count.
+sm8x_int8_matmul_kernel = triton.jit(do_not_specialize=["m"])(int8_matmul_kernel.fn)
 
 
 def quantize_input(
@@ -263,7 +266,7 @@ def execute_prepared_linear(
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
     # Cache grouping is intrinsic to the large-tile family. SM8x plans name
     # their grouping because their large tile is narrower, and write bias adds
-    # as FMAs so per-tile branches round like every other SM8x tile.
+    # as FMAs so every SM8x tile can branch per tile with one rounding.
     if isinstance(plan, policy.Sm8xExecutionPlan):
         group_m = plan.matmul_group_m
     elif plan.matmul_block_m == 128 and plan.matmul_block_n == 256:
@@ -275,30 +278,30 @@ def execute_prepared_linear(
     if not m or not n:
         return result
     if isinstance(plan, policy.Sm8xExecutionPlan) and plan.matmul_kernel == "gluon":
-        with device_context(input_qdata.device):
-            gluon.launch_int8_matmul(
-                input_qdata_2d,
-                weight_qdata,
-                output,
-                input_scale_1d,
-                weight_scale,
-                bias,
-                second_weight,
-                second_scale,
-                second_bias,
-                paired=paired,
-                block_m=plan.matmul_block_m,
-                block_n=plan.matmul_block_n,
-                block_k=plan.matmul_block_k,
-                num_warps=plan.matmul_num_warps,
-                num_stages=plan.matmul_num_stages,
-                group_m=plan.matmul_group_m,
-            )
+        gluon.launch_int8_matmul(
+            input_qdata_2d,
+            weight_qdata,
+            output,
+            input_scale_1d,
+            weight_scale,
+            bias,
+            second_weight,
+            second_scale,
+            second_bias,
+            paired=paired,
+            block_m=plan.matmul_block_m,
+            block_n=plan.matmul_block_n,
+            block_k=plan.matmul_block_k,
+            num_warps=plan.matmul_num_warps,
+            num_stages=plan.matmul_num_stages,
+            group_m=plan.matmul_group_m,
+        )
         return result
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
     grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+    kernel = sm8x_int8_matmul_kernel if sm8x else int8_matmul_kernel
     with device_context(input_qdata.device):
-        int8_matmul_kernel[grid](
+        kernel[grid](
             input_qdata_2d,
             weight_qdata,
             output,
@@ -318,7 +321,7 @@ def execute_prepared_linear(
             has_bias=bias is not None,
             paired=paired,
             second_has_bias=second_bias is not None,
-            aligned_m=m % plan.matmul_block_m == 0,
+            aligned_m=not sm8x and m % plan.matmul_block_m == 0,
             aligned_nk=n % plan.matmul_block_n == 0 and k % plan.matmul_block_k == 0,
             group_m=group_m,
             explicit_bias_fma=sm8x,

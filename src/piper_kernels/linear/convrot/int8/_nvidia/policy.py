@@ -113,11 +113,12 @@ _SM120_LARGE_TILE_THRESHOLD = 72
 _SM8X_SMALL_ROWS = 16
 _SM8X_SMALL_TILE_LIMIT = 96
 _SM8X_LARGE_TILE_THRESHOLD = 64
-# Gluon tiles need at least two 128-row tiles and more than one 128-column tile.
+# Gluon tiles need at least 256 rows and more than one 128-column tile. Up to 1,024
+# columns, 256-row tiles leave too few CTAs, so those outputs use 128-row Gluon tiles.
 _SM8X_GLUON_MIN_ROWS = 256
 _SM8X_GLUON_MIN_COLUMNS = 129
-_SM8X_GLUON_MEDIUM_THRESHOLD = 48
-_SM8X_GLUON_LARGE_THRESHOLD = 128
+_SM8X_GLUON_MEDIUM_MAX_COLUMNS = 1_024
+_SM8X_GLUON_THRESHOLD = 48
 _SM8X_ONE_WARP_MAX_CHUNK_SIZE = 1_024
 
 
@@ -186,8 +187,10 @@ def _sm8x_execution_plan(
     """Apply measured SM8x policy to the shared preparation plan.
 
     Short and narrow projections use 64-column Triton tiles, where the base 128x256
-    tile would spill. Wider projections with enough rows use the Gluon GEMM, whose
-    128x128 and 256x128 tiles keep 64x64 warp tiles and a four-stage copy pipeline.
+    tile would spill. Wider projections with enough rows use the Gluon GEMM: 128x128
+    tiles up to 1,024 output columns and 256x128 tiles beyond. Each output width uses at
+    most three tiles as the row count changes, and SM8x launches do not specialize on M,
+    so a layer compiles at most three GEMMs.
     """
     base = _base_execution_plan(in_features=in_features)
     fused_num_warps = base.fused_num_warps
@@ -216,14 +219,17 @@ def _sm8x_execution_plan(
     small_tiles = ((rows + _SM8X_SMALL_ROWS - 1) // _SM8X_SMALL_ROWS) * column_tiles
     if rows <= _SM8X_SMALL_ROWS or small_tiles <= _SM8X_SMALL_TILE_LIMIT:
         return _sm8x_triton_plan(plan, block_m=16, num_stages=4, group_m=0)
-    # Count useful tiles so a one-row tail is not a full tile.
-    if out_features >= _SM8X_GLUON_MIN_COLUMNS and rows >= _SM8X_GLUON_MIN_ROWS:
+    # Count useful tiles so a one-row tail is not a full tile. Wide outputs step from the
+    # 64-row Triton tile to one Gluon tile; narrow outputs to the 128-row Triton tile.
+    if out_features >= _SM8X_GLUON_MIN_COLUMNS:
+        gluon = plan
+        if out_features <= _SM8X_GLUON_MEDIUM_MAX_COLUMNS:
+            gluon = replace(plan, matmul_block_m=128, matmul_num_warps=4, matmul_num_stages=3)
         wide_columns = (out_features + 127) // 128
-        if rows * wide_columns >= 256 * _SM8X_GLUON_LARGE_THRESHOLD:
-            return plan
-        if rows * wide_columns >= 128 * _SM8X_GLUON_MEDIUM_THRESHOLD:
-            return replace(plan, matmul_block_m=128, matmul_num_warps=4, matmul_num_stages=3)
-    if rows >= 128 and rows * column_tiles >= 128 * _SM8X_LARGE_TILE_THRESHOLD:
+        gluon_tiles = gluon.matmul_block_m * _SM8X_GLUON_THRESHOLD
+        if rows >= _SM8X_GLUON_MIN_ROWS and rows * wide_columns >= gluon_tiles:
+            return gluon
+    elif rows >= 128 and rows * column_tiles >= 128 * _SM8X_LARGE_TILE_THRESHOLD:
         return _sm8x_triton_plan(plan, block_m=128, num_stages=3, group_m=16)
     return _sm8x_triton_plan(plan, block_m=64, num_stages=4, group_m=0)
 

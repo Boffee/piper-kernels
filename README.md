@@ -213,7 +213,8 @@ measured on exact SM120 and optimistic on other targets. Larger rows materialize
 and retain the same semantics. NVIDIA GEMM tiles are chosen from the row count and output
 width by measured policies for exact SM120 and for SM8x (measured on SM89); other NVIDIA
 targets keep one fixed schedule. Wide SM8x projections use a Gluon GEMM with CUTLASS-style
-64x64 warp tiles. Tile and kernel selection do not change output bits; see the
+64x64 warp tiles, and an SM8x layer compiles at most three GEMMs as its row count changes.
+Tile and kernel selection do not change output bits; see the
 [ConvRot INT8 benchmark notes](benchmarks/README.md#convrot-int8). Both
 `F.linear` with a ConvRot INT8 weight and the explicit INT8 entry point are inference-only and
 reject autograd inputs.

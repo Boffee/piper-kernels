@@ -279,22 +279,25 @@ def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_
         (32, 3072, "small"),
         (33, 3072, "medium"),
         (127, 4096, "medium"),
-        (128, 4096, "large"),
-        (255, 16384, "large"),
+        (128, 4096, "medium"),
+        (255, 16384, "medium"),
         (256, 16384, "gluon_large"),
-        (256, 2048, "large"),
-        (511, 1024, "medium"),
-        (512, 1024, "large"),
-        (767, 1024, "large"),
+        (256, 2048, "medium"),
+        (767, 2048, "medium"),
+        (768, 2048, "gluon_large"),
+        (767, 1024, "medium"),
         (768, 1024, "gluon_medium"),
-        (4095, 1024, "gluon_medium"),
-        (4096, 1024, "gluon_large"),
+        (100000, 1024, "gluon_medium"),
+        (1365, 1025, "medium"),
+        (1366, 1025, "gluon_large"),
         (1536, 16, "small"),
         (1537, 16, "medium"),
         (8191, 64, "medium"),
         (8192, 64, "large"),
-        (8192, 128, "large"),
-        (8192, 129, "gluon_medium"),
+        (4095, 128, "medium"),
+        (4096, 128, "large"),
+        (3071, 129, "medium"),
+        (3072, 129, "gluon_medium"),
         (100000, 96, "large"),
         (32768, 16384, "gluon_large"),
     ],
@@ -310,6 +313,21 @@ def test_sm8x_schedule_uses_its_own_tiles_and_preserves_preparation(architecture
     preparation += ("rotation_num_warps", "quantization_num_warps")
     for field in preparation:
         assert getattr(actual, field) == getattr(previous, field)
+
+
+@pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
+@pytest.mark.parametrize("out_features", [16, 64, 96, 128, 129, 256, 1024, 5376, 16384, 65536])
+def test_sm8x_layer_uses_at_most_three_tiles_across_row_counts(architecture, out_features):
+    # Each tile is one compiled GEMM because SM8x launches do not specialize on M.
+    target = AcceleratorTarget("cuda", architecture)
+    rows = [*range(1, 4097), *(2**power + d for power in range(12, 21) for d in (-1, 0, 1))]
+    tiles = {
+        _sm8x_tile(
+            select_execution_plan(target, in_features=5376, rows=row, out_features=out_features)
+        )
+        for row in rows
+    }
+    assert len(tiles) <= 3
 
 
 @pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)

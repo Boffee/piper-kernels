@@ -5,7 +5,8 @@ swizzled shared memory, ``ldmatrix`` operands, and m16n8k32 INT8 MMAs with 64x64
 Each pipeline stage has its own shared-memory allocation and stage indices stay static, so
 the barrier analysis inserts one barrier per K tile instead of two. Interior tiles whose K
 tiles are whole skip every copy mask; edge tiles zero-fill rows and K columns outside the
-problem. Accumulation is exact INT32, and the epilogue computes
+problem. The kernel does not specialize on M, so one compiled kernel serves every row count.
+Accumulation is exact INT32, and the epilogue computes
 ``(acc * input_scale) * weight_scale`` with bias added through explicit FMAs, which matches
 the SM8x Triton schedules bitwise.
 """
@@ -22,6 +23,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
+
+from piper_kernels._triton.runtime import device_context
 
 # Warp tiles are 64 columns wide, so every supported tile uses two warp columns.
 WARPS_N = 2
@@ -143,7 +146,7 @@ def _accumulate(
     return accumulator
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["m"])
 def int8_matmul_gluon_kernel(
     input_ptr,
     weight_ptr,
@@ -307,29 +310,30 @@ def launch_int8_matmul(
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n) * (2 if paired else 1),)
-    int8_matmul_gluon_kernel[grid](
-        input_qdata,
-        weight_qdata,
-        output,
-        input_scale,
-        weight_scale,
-        bias if bias is not None else output,
-        second_weight,
-        second_scale,
-        second_bias if second_bias is not None else output,
-        m,
-        n,
-        k,
-        output.stride(0),
-        block_m,
-        block_n,
-        block_k,
-        num_stages,
-        group_m,
-        num_warps // WARPS_N,
-        bias is not None,
-        paired,
-        second_bias is not None,
-        k % block_k == 0,
-        num_warps=num_warps,
-    )
+    with device_context(input_qdata.device):
+        int8_matmul_gluon_kernel[grid](
+            input_qdata,
+            weight_qdata,
+            output,
+            input_scale,
+            weight_scale,
+            bias if bias is not None else output,
+            second_weight,
+            second_scale,
+            second_bias if second_bias is not None else output,
+            m,
+            n,
+            k,
+            output.stride(0),
+            block_m,
+            block_n,
+            block_k,
+            num_stages,
+            group_m,
+            num_warps // WARPS_N,
+            bias is not None,
+            paired,
+            second_bias is not None,
+            k % block_k == 0,
+            num_warps=num_warps,
+        )

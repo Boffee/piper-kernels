@@ -162,6 +162,8 @@ def test_prepared_paired_projection_owns_context_for_all_launches(launches, back
     launches.backend = "hip" if backend is amd else "cuda"
     launches.fail = fail
     launches.watch(backend, "int8_matmul_kernel")
+    if backend is nvidia:
+        launches.watch(backend, "sm8x_int8_matmul_kernel")
     with FakeTensorMode():
         value = torch.empty(129, 256, dtype=torch.int8, device="cuda:0")
         scale = torch.empty(129, device=value.device)
