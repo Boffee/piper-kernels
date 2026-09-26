@@ -837,6 +837,47 @@ projection windows already used native scoring and are unaffected. General FP32 
 differ from Torch in their rounding; exact-score ties retain lower-index selection. Mean
 routing and D64 retain their existing scoring paths.
 
+The complete ConvRot INT8 fusion benchmark can compare query windows at the H3
+B1/H56/D128 shape, with hidden/output width 5376, BF16 activations, min/max routing,
+and 25% keep:
+
+```shell
+python benchmarks/benchmark_sparse_piper_fusion.py \
+  --sequence 100000 150000 --query-chunk-rows 4096 8192 16384 --samples 7 \
+  --json artifacts/sparse_piper_fusion_windows.json
+```
+
+Each variant uses the same seeded inputs and weights. A benchmark-only graph pass
+sets and checks the actual fused operator's query-window argument, and each variant
+must reuse one dynamic graph across sequence lengths. Complete outputs are compared
+with the quantized materialized baseline using a CPU reference and bounded slices;
+compilation and these comparisons are outside the shuffled timing samples. Peak extra
+allocation includes the returned output and execution workspace. The benchmark defaults
+to a 4096-row window and sequences 8192, 32768, 100000, and 150000.
+
+On the same RX 9070 XT/software stack above, seven paired samples gave these
+synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`):
+
+| Tokens | Materialized | Fused 4096 | Fused 8192 | Fused 16384 |
+|---:|---:|---:|---:|---:|
+| 100,000 | 654.11 | 661.56 | 656.22 | 653.29 |
+| 150,000 | 1349.31 | 1369.85 | 1362.52 | 1367.09 |
+
+Every fused output matched the materialized result exactly, including an 8193-token
+tail control, and each window reused one graph across all three lengths. At 150K,
+peak extra allocation was 6882 MiB materialized versus 5722, 5928, and 6340 MiB for
+the three fused windows. The materialized baseline releases prepared input after V
+projection and Q/K/V after attention, before output projection.
+
+Two earlier independent window sweeps also found only 0.4-0.6% lower latency with
+8192 rows at 150K. A separate projected-coarse-gate control found a 0.6% gain while
+adding 354 MiB; 16384 rows added about 1060 MiB without beating 8192. At 100K,
+16384 rows also reduce the gate pipeline to seven chunks, below its eight-chunk
+overlap threshold. These synthetic measurements favor retaining the 4096-row
+production default: the modest latency benefit requires more workspace, and the
+fused pipeline's main benefit here is bounded memory. No production window policy
+changes are included in this benchmark extension.
+
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell

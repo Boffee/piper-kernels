@@ -7,6 +7,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- H3 ConvRot INT8 sparse-attention fusion benchmarks can sweep query-window sizes through
+  150,000 tokens, checking the emitted fusion, complete outputs, latency, and peak allocation.
 - Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
