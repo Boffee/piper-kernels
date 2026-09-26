@@ -507,10 +507,10 @@ Paired gate/up projections still share one GEMM launch; their combined width doe
 change the tile choice.
 
 These fixed heuristics were measured on an RTX 5090. Performance on other SM120 devices
-has not been established. Other architectures retain their existing schedules. Selection uses
-no device-property query, runtime autotuning, or model-specific table. M/N/K remain runtime
-values; alignment, dtype, bias, and paired operation can still create compiled variants of
-each configuration.
+has not been established. SM8x uses its own policy, described below; other architectures
+retain their existing schedules. Selection uses no device-property query, runtime autotuning,
+or model-specific table. M/N/K remain runtime values; alignment, dtype, bias, and paired
+operation can still create compiled variants of each configuration.
 
 Compare the full ConvRot operator with fixed large tiles and BF16 cuBLAS using CUDA graphs:
 
@@ -566,6 +566,112 @@ Earlier paired measurements used projection count in selection. The full-FFN abl
 factor: it improved some short FFNs but regressed the tested K5120/N25600 FFN at M64 by
 about 15%. Ordinary single-projection selection is unchanged.
 
+SM8x (SM80, SM86, SM87, SM89) uses its own three GEMM configurations. The fixed 128x256 tile
+needs 255 registers with 176 spilled values and 96 KiB of shared memory on SM89, and reaches
+about 50 TOPS. Every SM8x configuration is 64 columns wide:
+
+| Configuration | BLOCK_M | BLOCK_N | BLOCK_K | Warps | Stages | GROUP_M |
+|---|---:|---:|---:|---:|---:|---:|
+| Small | 16 | 64 | 128 | 4 | 4 | none |
+| Medium | 64 | 64 | 128 | 4 | 4 | none |
+| Large | 128 | 64 | 128 | 4 | 3 | 16 |
+
+Apply these rules in order:
+
+1. Use small tiles when `M <= 16` or `ceil(M/16) * ceil(N/64) <= 96`.
+2. Otherwise use medium tiles when `M * ceil(N/64) < 128 * 64`.
+3. Otherwise use large tiles, which also serve as the plan without shape metadata.
+
+The thresholds count 96 small tiles and 64 useful large tiles, about one wave on 66 SMs. As on
+SM120, the large count uses actual M, selection is monotonic in M for fixed N, and K affects
+preparation but not tile selection. Preparation follows the shared NVIDIA plan with two SM8x
+exceptions. Rows of at most 1,024 columns use one warp, which avoids cross-warp reductions.
+Plain inputs keep identical bits, but GELU and SwiGLU codes may differ from wider launches by
+one INT8 code, with scales within a few FP32 ulps. This is the same bound the optimized path
+already allows against the portable path. One warp cut 2-6% from the default seven-projection
+mix totals below. Rows split into two 8,192-column chunks (K 12289-16384) use eight warps;
+their bits are unchanged, and whole calls were 0.4-2.6% faster. The large tile groups sixteen
+row blocks. Without grouping it was up to 1.5x slower at `M=8192, K>=12288`, where the input
+does not fit in L2. Sixteen rather than eight row blocks reread the weight half as often. That
+was 3-5% faster at H3 widths, whose weights exceed the 48 MiB L2, and about 3% slower at
+`N=4096, K=6144`, whose weight fits. SM8x plans carry their grouping as a plan field, so SM120
+launches, including the H3 VAE's ungrouped 128x128 schedules, are unchanged.
+
+The policy was chosen from a 210-shape GEMM sweep on SM89. The sweep crossed 15 row counts
+from 1 to 8192 with 14 K/N pairs: the projection mix, square and wide layers up to
+K=N=14336, and narrow outputs down to N=16. It compared 13 tiles with and without grouping.
+The selected tile averaged 1.04x the per-shape best (geometric mean). The worst cases are
+narrow outputs at `M~1500`, where `32x64` tiles would be about 1.6x faster. A fourth
+configuration improved the average by only 1.5%, so SM8x keeps SM120's three configurations.
+Interleaved runs over 24 realistic GEMMs compared four grouped large tiles. The set covered H3
+transformer and VAE projections, the N=4096 anchors, and mid-sized layers. The 128x64 tile with
+GROUP_M 16 averaged 1.013x the fastest, against 1.024x with GROUP_M 8. Grouped 128x128x128
+tiles were up to 2% faster at the largest H3 shapes but up to 1.6x slower at mid-sized M. Only
+SM89 was measured. SM80, SM86 and SM87 share the INT8 MMA path, and each configuration
+compiles within the 99 KiB per-block shared-memory limit of SM86/SM89, but their best
+thresholds may differ.
+
+Measure representative workloads in about three minutes:
+
+```shell
+uv run python benchmarks/benchmark_convrot_int8_realistic.py > convrot-realistic.jsonl
+```
+
+The cases follow MiniMax H3. Transformer blocks use hidden width 5376, 56x128 attention, and
+a tanh-GELU FFN of width 14336 at 8K, 32K, 131072, and 131073 rows. Q/K/V share one
+preparation, and GELU is fused into the down-projection preparation. The H3 VAE linears run
+at 1797 and 7188 rows. The short-M cases use the projection mix at M=1-1024 and H3 widths
+at M=1-512. The eight primary anchors are also included. Each case captures one CUDA graph
+per variant over preallocated buffers:
+
+- the production plan;
+- the original plan, with shared preparation and fixed 128x256 tiles;
+- BF16 cuBLAS, multiplying the same inputs without a separate GELU pass. This favors BF16
+  in the down projection.
+
+The graphs are replayed interleaved for three rounds in one process. Each sample lasts at
+least 250 ms after a 10 s warmup. Shorter bursts ran up to 7% above sustained,
+power-limited clocks. With these settings, the H3 block and VAE totals were within 1-2% of
+three-process Triton `do_bench_cudagraph` measurements. Those took about an hour for the same
+coverage. The benchmark checks
+production outputs bitwise against the original plan in row chunks. JSON lines include
+per-sample times and TOPS, and stderr prints the group table. Select rows with `--h3-rows`,
+`--vae-rows`, `--mix-rows`, `--h3-short-rows`, and `--anchor-rows`.
+
+RTX 4070 Ti SUPER (SM89, 66 SMs), Torch 2.14.0+cu130, Triton 3.8.0, driver 596.49, Windows,
+2026-09-25, BF16, no bias. Totals sum each group's linears, including preparation. Every
+output agreed bitwise with the original plan:
+
+| Group | Rows | SM8x policy (TOPS) | Original plan (TOPS) | BF16 cuBLAS (TFLOPS) | vs original | vs BF16 |
+|---|---:|---:|---:|---:|---:|---:|
+| H3 block | 8192 | 22.93 ms (220) | 100.48 ms (50) | 56.56 ms (89) | 4.38x | 2.47x |
+| H3 block | 32768 | 91.38 ms (221) | 396.24 ms (51) | 221.40 ms (91) | 4.34x | 2.42x |
+| H3 block | 131072 | 365.88 ms (221) | 1571.86 ms (51) | 882.86 ms (92) | 4.30x | 2.41x |
+| H3 block | 131073 | 365.90 ms (221) | 1553.64 ms (52) | 884.09 ms (91) | 4.25x | 2.42x |
+| H3 VAE | 1797 | 1.03 ms (191) | 4.44 ms (44) | 2.46 ms (80) | 4.33x | 2.39x |
+| H3 VAE | 7188 | 3.93 ms (199) | 16.50 ms (48) | 9.03 ms (87) | 4.20x | 2.30x |
+| Projection mix | 1 | 26.4 us | 578.0 us | 30.4 us | 21.94x | 1.15x |
+| Projection mix | 16 | 26.3 us (14) | 585.5 us (1) | 39.3 us (9) | 22.28x | 1.49x |
+| Projection mix | 128 | 43.2 us (68) | 603.6 us (5) | 67.0 us (44) | 13.96x | 1.55x |
+| Projection mix | 1024 | 146.9 us (161) | 778.2 us (30) | 282.1 us (84) | 5.30x | 1.92x |
+| H3 widths | 1 | 275.9 us | 1770.8 us | 600.4 us | 6.42x | 2.18x |
+| H3 widths | 64 | 311.6 us (79) | 1809.2 us (14) | 683.5 us (36) | 5.81x | 2.19x |
+| H3 widths | 512 | 995.0 us (198) | 4977.0 us (40) | 2456.9 us (80) | 5.00x | 2.47x |
+| Anchors | 8192 | 30.86 ms (223) | 135.10 ms (51) | 76.04 ms (90) | 4.38x | 2.46x |
+| Anchors | 32768 | 123.21 ms (223) | 538.33 ms (51) | 300.57 ms (91) | 4.37x | 2.44x |
+
+Single-row cases are bound by weight reads, so their throughput is omitted. At 131072 rows
+the H3 stages ran at 227 TOPS for Q/K/V, 213 for the output projection, 224 for the FFN up
+projection, and 214 for the GELU-fused down projection, against 51-52 TOPS with the
+original plan. The anchors ran at 205-228 TOPS, 4.13-4.45x the original plan. For
+comparison, cuBLAS `torch._int_mm` peaks at about 330 TOPS on this GPU.
+`benchmark_convrot_int8.py` defaults went from 8.27/32.23 ms to 1.97/7.91 ms with unchanged
+SQNR. Bias and paired projections with ragged M agreed bitwise and ran at the same rate.
+
+On SM8x, `benchmark_convrot_int8_small_m.py --compare-schedules` forces the SM8x small and
+medium configurations, and `previous_linear` is the original plan on every target. The local
+records are in `artifacts/convrot-sm8x-policy-20260925/`.
+
 Compare the original split-tail GEMM with a fully masked single launch and the production
 single launch, all using the fixed `128x256x128` tile configuration:
 
@@ -593,8 +699,12 @@ benchmark/correctness helper `lib/convrot_int8_legacy.py`.
 
 For aligned N/K, production branches around the entire projection: full M tiles use unmasked
 loads/stores and tail tiles use masks. Scaling and bias stay inside the branch to preserve
-floating-point rounding. Unaligned N/K uses the original masked loop in one launch. Neither
-NVIDIA nor AMD retains a separate tail launch; tail handling is independent of tile selection.
+floating-point rounding. Some grouped tile shapes, including 128x64 and 64x64, still let the
+compiler move an identical paired bias add below the branch, where it rounds separately from
+the scale multiply. SM8x launches therefore write bias adds as explicit FMAs. That path is
+compiled only for SM8x plans; SM120 and AMD code is instruction-identical. Unaligned N/K uses
+the original masked loop in one launch. Neither NVIDIA nor AMD retains a separate tail launch;
+tail handling is independent of tile selection.
 
 On the shared local GPU, first POST `{"id":"<unique-lease-id>"}` to
 `http://127.0.0.1:8080/piper/engine/register`, then `/piper/engine/acquire`; wait for acquire
