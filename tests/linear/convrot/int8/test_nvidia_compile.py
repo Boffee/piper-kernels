@@ -90,7 +90,7 @@ _SM8X_SHARED_MEMORY_LIMIT = 99 * 1024
 
 @pytest.mark.parametrize("architecture", [80, 86, 89])
 @pytest.mark.parametrize(
-    ("rows", "out_features"), [(1, 4096), (256, 1024), (512, 1024), (2048, 1024), (8192, 4096)]
+    ("rows", "out_features"), [(1, 4096), (256, 1024), (8192, 128), (2048, 1024), (8192, 4096)]
 )
 @pytest.mark.parametrize("aligned", [False, True])
 def test_sm8x_schedules_compile_within_consumer_shared_memory(
@@ -109,7 +109,8 @@ def test_sm8x_schedules_compile_within_consumer_shared_memory(
         output="*bf16",
         biases=("*bf16", "*bf16"),
         paired=False,
-        aligned_m=aligned,
+        # SM8x launches branch on ragged M per tile instead of specializing on it.
+        aligned_m=False,
         aligned_nk=aligned,
         group_m=plan.matmul_group_m,
     )
@@ -120,7 +121,11 @@ def test_sm8x_schedules_compile_within_consumer_shared_memory(
 def _compile_int8_matmul(
     plan, architecture, *, output, biases, paired, aligned_m, aligned_nk, group_m
 ):
-    """Compile the kernel an NVIDIA plan launches: Gluon for SM8x Gluon plans, else Triton."""
+    """Compile the kernel an NVIDIA plan launches: Gluon for SM8x Gluon plans, else Triton.
+
+    ``aligned_m`` and ``group_m`` apply to Triton only; Gluon plans use their own grouping
+    and branch on ragged M at run time.
+    """
     signature = {
         "input_ptr": "*i8",
         "weight_ptr": "*i8",

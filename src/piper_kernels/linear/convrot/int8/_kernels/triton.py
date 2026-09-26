@@ -112,70 +112,12 @@ def scaled_int8_matmul(
 
 
 @triton.jit
-def _int8_matmul_with_explicit_bias_fma(
-    input_ptr,
-    weight_ptr,
-    input_scale_ptr,
-    weight_scale_ptr,
-    bias_ptr,
-    second_bias_ptr,
-    offsets_m,
-    offsets_n,
-    second,
-    m,
-    n,
-    k,
-    block_m: tl.constexpr,
-    block_n: tl.constexpr,
-    block_k: tl.constexpr,
-    has_bias: tl.constexpr,
-    paired: tl.constexpr,
-    second_has_bias: tl.constexpr,
-    aligned_tiles: tl.constexpr,
-):
-    """Add bias with the contracted epilogue's rounding, written as explicit FMAs.
-
-    Per-tile alignment branches let the compiler sink an identical paired bias add
-    below the branch, away from its weight-scale multiply, which rounds twice.
-    """
-    row_scaled, weight_scale = _row_scaled_int8_matmul(
-        input_ptr,
-        weight_ptr,
-        input_scale_ptr,
-        weight_scale_ptr,
-        offsets_m,
-        offsets_n,
-        m,
-        n,
-        k,
-        block_m,
-        block_n,
-        block_k,
-        aligned_tiles,
-    )
-    if paired and (has_bias or second_has_bias):
-        bias = tl.full((block_n,), 0, tl.float32)
-        second_bias = tl.full((block_n,), 0, tl.float32)
-        if has_bias:
-            bias = tl.load(bias_ptr + offsets_n, (offsets_n < n) & ~second, other=0.0).to(
-                tl.float32
-            )
-        if second_has_bias:
-            second_bias = tl.load(
-                second_bias_ptr + offsets_n, (offsets_n < n) & second, other=0.0
-            ).to(tl.float32)
-        result = tl.fma(
-            row_scaled, weight_scale[None, :], tl.where(second, second_bias, bias)[None, :]
-        )
-    elif has_bias:
-        if aligned_tiles:
-            bias = tl.load(bias_ptr + offsets_n)
-        else:
-            bias = tl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0)
-        result = tl.fma(row_scaled, weight_scale[None, :], bias.to(tl.float32)[None, :])
-    else:
-        result = row_scaled * weight_scale[None, :]
-    return result
+def _add_bias(result, row_scaled, weight_scale, bias, explicit_bias_fma: tl.constexpr):
+    if explicit_bias_fma:
+        # Per-tile branches can let the compiler sink an identical bias add below the
+        # branch, away from its scale multiply, which would round twice.
+        return tl.fma(row_scaled, weight_scale[None, :], bias.to(tl.float32)[None, :])
+    return result + bias[None, :]
 
 
 @triton.jit
@@ -201,30 +143,8 @@ def _int8_matmul_with_bias(
     aligned_tiles: tl.constexpr,
     explicit_bias_fma: tl.constexpr,
 ):
-    if explicit_bias_fma:
-        return _int8_matmul_with_explicit_bias_fma(
-            input_ptr,
-            weight_ptr,
-            input_scale_ptr,
-            weight_scale_ptr,
-            bias_ptr,
-            second_bias_ptr,
-            offsets_m,
-            offsets_n,
-            second,
-            m,
-            n,
-            k,
-            block_m,
-            block_n,
-            block_k,
-            has_bias,
-            paired,
-            second_has_bias,
-            aligned_tiles,
-        )
     # Keep scaling and bias together in each branch to preserve FMA rounding.
-    result = scaled_int8_matmul(
+    row_scaled, weight_scale = _row_scaled_int8_matmul(
         input_ptr,
         weight_ptr,
         input_scale_ptr,
@@ -239,6 +159,7 @@ def _int8_matmul_with_bias(
         block_k,
         aligned_tiles,
     )
+    result = row_scaled * weight_scale[None, :]
     if paired and (has_bias or second_has_bias):
         # Select FP32 values rather than pointers: biases may have different dtypes.
         bias = tl.full((block_n,), 0, tl.float32)
@@ -251,13 +172,14 @@ def _int8_matmul_with_bias(
             second_bias = tl.load(
                 second_bias_ptr + offsets_n, (offsets_n < n) & second, other=0.0
             ).to(tl.float32)
-        result += tl.where(second, second_bias, bias)[None, :]
+        bias = tl.where(second, second_bias, bias)
+        result = _add_bias(result, row_scaled, weight_scale, bias, explicit_bias_fma)
     elif has_bias:
         if aligned_tiles:
             bias = tl.load(bias_ptr + offsets_n)
         else:
             bias = tl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0)
-        result += bias[None, :]
+        result = _add_bias(result, row_scaled, weight_scale, bias, explicit_bias_fma)
 
     return result
 

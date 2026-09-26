@@ -4,7 +4,7 @@ The kernel follows the CUTLASS SM80 INT8 schedule: 16-byte ``cp.async`` copies i
 swizzled shared memory, ``ldmatrix`` operands, and m16n8k32 INT8 MMAs with 64x64 warp tiles.
 Each pipeline stage has its own shared-memory allocation and stage indices stay static, so
 the barrier analysis inserts one barrier per K tile instead of two. Interior tiles whose K
-tiles are whole skip every copy mask; edge tiles zero-fill rows and K columns outside the
+tiles are whole skip per-element copy masks; edge tiles zero-fill rows and K columns outside the
 problem. The kernel does not specialize on M, so one compiled kernel serves every row count.
 Accumulation is exact INT32, and the epilogue computes
 ``(acc * input_scale) * weight_scale`` with bias added through explicit FMAs, which matches
@@ -172,6 +172,7 @@ def int8_matmul_gluon_kernel(
     second_has_bias: gl.constexpr,
     whole_k_tiles: gl.constexpr,
 ):
+    # Gluon has no ``in`` operator for constexpr tuples.
     three_or_four: gl.constexpr = stages == 3 or stages == 4  # noqa: PLR1714
     gl.static_assert(three_or_four, "SM8x Gluon GEMM uses three or four stages")
     num_warps: gl.constexpr = warps_m * _GL_WARPS_N

@@ -96,7 +96,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--sample-ms",
         type=float,
         default=250.0,
-        help="minimum graph duration per sample; shorter bursts run above sustained clocks",
+        help="minimum graph duration per sample, up to 1,000 calls; shorter bursts run above "
+        "sustained clocks",
     )
     parser.add_argument("--bias", action="store_true", help="add BF16 biases")
     parser.add_argument("--skip-bf16", action="store_true")
@@ -130,7 +131,7 @@ def _cases(args: argparse.Namespace) -> list[Case]:
 
 
 def _capture(function: Callable[[], object], sample_ms: float) -> tuple[torch.cuda.CUDAGraph, int]:
-    """Capture enough unrolled calls to fill ``sample_ms``; large calls run once."""
+    """Capture enough calls, at most 1,000, to fill ``sample_ms``; large calls run once."""
     function()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)

@@ -241,8 +241,14 @@ def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
     ) == select_execution_plan(target, in_features=3072)
 
 
+@pytest.mark.parametrize(
+    ("architecture", "policy_name"),
+    [("sm120", "_sm120_execution_plan"), ("sm86", "_sm8x_execution_plan")],
+)
 @pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
-def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_features):
+def test_architecture_policy_owns_preparation_and_matmul(
+    monkeypatch, architecture, policy_name, rows, out_features
+):
     base = select_execution_plan(_SM120, in_features=5376)
     expected = replace(
         base,
@@ -257,9 +263,14 @@ def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_
         matmul_num_stages=2,
     )
     architecture_policy = Mock(return_value=expected)
-    monkeypatch.setattr(nvidia_policy, "_sm120_execution_plan", architecture_policy)
+    monkeypatch.setattr(nvidia_policy, policy_name, architecture_policy)
 
-    actual = select_execution_plan(_SM120, in_features=5376, rows=rows, out_features=out_features)
+    actual = select_execution_plan(
+        AcceleratorTarget("cuda", architecture),
+        in_features=5376,
+        rows=rows,
+        out_features=out_features,
+    )
 
     assert actual is expected
     architecture_policy.assert_called_once_with(
@@ -315,19 +326,22 @@ def test_sm8x_schedule_uses_its_own_tiles_and_preserves_preparation(architecture
         assert getattr(actual, field) == getattr(previous, field)
 
 
-@pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
-@pytest.mark.parametrize("out_features", [16, 64, 96, 128, 129, 256, 1024, 5376, 16384, 65536])
-def test_sm8x_layer_uses_at_most_three_tiles_across_row_counts(architecture, out_features):
+@pytest.mark.parametrize(
+    "out_features", [16, 64, 65, 96, 128, 129, 256, 1024, 1025, 3072, 5376, 16384, 65536]
+)
+def test_sm8x_layer_steps_through_at_most_three_tiles_as_rows_grow(out_features):
     # Each tile is one compiled GEMM because SM8x launches do not specialize on M.
-    target = AcceleratorTarget("cuda", architecture)
-    rows = [*range(1, 4097), *(2**power + d for power in range(12, 21) for d in (-1, 0, 1))]
-    tiles = {
+    target = AcceleratorTarget("cuda", "sm89")
+    rows = [*range(1, 9000), *(2**power + d for power in range(14, 21) for d in (-1, 0, 1))]
+    tiles = [
         _sm8x_tile(
-            select_execution_plan(target, in_features=5376, rows=row, out_features=out_features)
+            select_execution_plan(target, in_features=2048, rows=row, out_features=out_features)
         )
         for row in rows
-    }
-    assert len(tiles) <= 3
+    ]
+    block_m = [tile[0] for tile in tiles]
+    assert block_m == sorted(block_m)
+    assert len(set(tiles)) <= 3
 
 
 @pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
@@ -384,49 +398,6 @@ def test_sm8x_preparation_depends_only_on_in_features(architecture, in_features,
         assert plan.quantization_num_warps == previous.quantization_num_warps
 
 
-@pytest.mark.parametrize("out_features", [16, 64, 65, 96, 1024, 3072, 14336])
-def test_sm8x_schedule_is_monotonic_in_rows(out_features):
-    target = AcceleratorTarget("cuda", "sm89")
-    blocks = [
-        select_execution_plan(
-            target,
-            in_features=2048,
-            out_features=out_features,
-            rows=rows,
-        ).matmul_block_m
-        for rows in (*range(1, 9000), 16384, 32768, 100000)
-    ]
-    assert blocks == sorted(blocks)
-    assert set(blocks) <= {16, 64, 128, 256}
-
-
-@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
-def test_sm8x_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_features):
-    expected = Sm8xExecutionPlan(
-        fuse_rotation_quantization=False,
-        fused_num_warps=16,
-        rotation_num_warps=8,
-        quantization_num_warps=2,
-        matmul_block_m=16,
-        matmul_block_n=128,
-        matmul_block_k=64,
-        matmul_num_warps=4,
-        matmul_num_stages=2,
-        matmul_group_m=16,
-    )
-    architecture_policy = Mock(return_value=expected)
-    monkeypatch.setattr(nvidia_policy, "_sm8x_execution_plan", architecture_policy)
-
-    actual = select_execution_plan(
-        AcceleratorTarget("cuda", "sm86"), in_features=5376, rows=rows, out_features=out_features
-    )
-
-    assert actual is expected
-    architecture_policy.assert_called_once_with(
-        in_features=5376, rows=rows, out_features=out_features
-    )
-
-
 def test_only_sm8x_plans_accept_one_fused_preparation_warp():
     sm8x = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
     sm120 = select_execution_plan(_SM120, in_features=512)
@@ -445,6 +416,7 @@ def test_only_sm8x_plans_accept_one_fused_preparation_warp():
         {"matmul_block_n": 64},
         {"matmul_num_warps": 4},
         {"matmul_num_stages": 2},
+        {"matmul_group_m": 0},
     ],
 )
 def test_sm8x_plan_rejects_unsupported_kernel_tiles(changes):
@@ -455,7 +427,7 @@ def test_sm8x_plan_rejects_unsupported_kernel_tiles(changes):
         replace(plan, **changes)
 
 
-@pytest.mark.parametrize("group_m", [-1, 1, 4, 32, True])
+@pytest.mark.parametrize("group_m", [-1, 1, 4, 32, True, False])
 def test_sm8x_plan_rejects_invalid_group_m(group_m):
     plan = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
 

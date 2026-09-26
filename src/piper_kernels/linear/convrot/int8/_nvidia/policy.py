@@ -23,11 +23,11 @@ _MATMUL_BLOCK_N_VALUES = (16, 32, 64, 128, 256)
 _MATMUL_BLOCK_K_VALUES = (32, 64, 128)
 _MATMUL_NUM_WARPS_VALUES = (2, 4, 8)
 _MATMUL_NUM_STAGES_VALUES = (1, 2, 3, 4)
-_MATMUL_GROUP_M_VALUES = (0, 8, 16)
+_SM8X_MATMUL_GROUP_M_VALUES = (0, 8, 16)
 # SM8x runs exactly these tiles (block_m, block_n, block_k, warps) with the Gluon GEMM in
 # ``gluon.py``: 64x64 warp tiles over 64-column K tiles. Every other tile runs Triton.
-_GLUON_TILES = ((128, 128, 64, 4), (256, 128, 64, 8))
-_GLUON_NUM_STAGES_VALUES = (3, 4)
+_SM8X_GLUON_TILES = ((128, 128, 64, 4), (256, 128, 64, 8))
+_SM8X_GLUON_NUM_STAGES_VALUES = (3, 4)
 
 
 def _choices(values: tuple[int, ...]) -> str:
@@ -69,11 +69,12 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
 class Sm8xExecutionPlan(NvidiaExecutionPlan):
     """SM8x launch choices with explicit GEMM grouping.
 
-    The base 128x256 tile spills on SM8x. The 128x128x64 and 256x128x64 tiles run the
-    Gluon GEMM in ``gluon.py``; other tiles run the shared Triton kernel, so replacing a
-    plan's tile also selects its kernel. Other plans derive grouping from the 128x256 tile,
-    which SM120 schedules keep unchanged. SM8x launches also write bias adds as explicit
-    FMAs. One-warp fused preparation is measured only on SM8x.
+    The base 128x256 tile spills on SM8x. The 128x128x64 tile with four warps and the
+    256x128x64 tile with eight warps run the Gluon GEMM in ``gluon.py``; other tiles run the
+    shared Triton kernel, so replacing a plan's tile also selects its kernel. Other plans
+    derive grouping from the 128x256 tile, which SM120 schedules keep unchanged. SM8x
+    launches also write bias adds as explicit FMAs. One-warp fused preparation is measured
+    only on SM8x.
     """
 
     fused_num_warps_values: ClassVar[tuple[int, ...]] = _SM8X_FUSED_NUM_WARPS_VALUES
@@ -82,11 +83,14 @@ class Sm8xExecutionPlan(NvidiaExecutionPlan):
 
     def __post_init__(self) -> None:
         NvidiaExecutionPlan.__post_init__(self)
-        if self.matmul_group_m not in _MATMUL_GROUP_M_VALUES:
+        group_m = self.matmul_group_m
+        if isinstance(group_m, bool) or group_m not in _SM8X_MATMUL_GROUP_M_VALUES:
             raise ValueError("ConvRot matmul group_m must be 0, 8, or 16")
         if self.matmul_kernel == "gluon":
-            if self.matmul_num_stages not in _GLUON_NUM_STAGES_VALUES:
+            if self.matmul_num_stages not in _SM8X_GLUON_NUM_STAGES_VALUES:
                 raise ValueError("ConvRot SM8x Gluon tiles use 3 or 4 stages")
+            if not group_m:
+                raise ValueError("ConvRot SM8x Gluon tiles need group_m 8 or 16")
         elif self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
             raise ValueError(
                 "ConvRot SM8x 256-row tiles must be 256x128x64 Gluon tiles with 8 warps"
@@ -101,7 +105,7 @@ class Sm8xExecutionPlan(NvidiaExecutionPlan):
             self.matmul_block_k,
             self.matmul_num_warps,
         )
-        return "gluon" if tile in _GLUON_TILES else "triton"
+        return "gluon" if tile in _SM8X_GLUON_TILES else "triton"
 
 
 _FUSED_MAX_CHUNK_SIZE = 16_384
@@ -119,7 +123,7 @@ _SM8X_GLUON_MIN_ROWS = 256
 _SM8X_GLUON_MIN_COLUMNS = 129
 _SM8X_GLUON_MEDIUM_MAX_COLUMNS = 1_024
 _SM8X_GLUON_THRESHOLD = 48
-_SM8X_ONE_WARP_MAX_CHUNK_SIZE = 1_024
+_SM8X_ONE_WARP_MAX_COLUMNS = 1_024
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -194,13 +198,11 @@ def _sm8x_execution_plan(
     """
     base = _base_execution_plan(in_features=in_features)
     fused_num_warps = base.fused_num_warps
-    fused_chunks = fused_preparation_chunks(in_features)
-    if fused_chunks is not None:
-        chunk_count, chunk_size = fused_chunks
-        # One warp keeps a short row in registers without cross-warp reductions. GELU and
-        # SwiGLU codes may differ from wider launches by one INT8 code; plain inputs do not.
-        if chunk_count == 1 and chunk_size <= _SM8X_ONE_WARP_MAX_CHUNK_SIZE:
-            fused_num_warps = 1
+    # One warp keeps a short row, always one fused chunk, in registers without cross-warp
+    # reductions. GELU and SwiGLU codes may differ from wider launches by one INT8 code;
+    # plain inputs do not.
+    if in_features <= _SM8X_ONE_WARP_MAX_COLUMNS:
+        fused_num_warps = 1
     plan = Sm8xExecutionPlan(
         fuse_rotation_quantization=base.fuse_rotation_quantization,
         fused_num_warps=fused_num_warps,
@@ -229,13 +231,13 @@ def _sm8x_execution_plan(
         gluon_tiles = gluon.matmul_block_m * _SM8X_GLUON_THRESHOLD
         if rows >= _SM8X_GLUON_MIN_ROWS and rows * wide_columns >= gluon_tiles:
             return gluon
-    elif rows >= 128 and rows * column_tiles >= 128 * _SM8X_LARGE_TILE_THRESHOLD:
-        return _sm8x_triton_plan(plan, block_m=128, num_stages=3, group_m=16)
+    elif rows * column_tiles >= 128 * _SM8X_LARGE_TILE_THRESHOLD:
+        return sm8x_large_triton_plan(plan)
     return _sm8x_triton_plan(plan, block_m=64, num_stages=4, group_m=0)
 
 
-def sm8x_triton_fallback(plan: Sm8xExecutionPlan) -> Sm8xExecutionPlan:
-    """Return the grouped 128x64 Triton tile used when Gluon operands are unaligned."""
+def sm8x_large_triton_plan(plan: Sm8xExecutionPlan) -> Sm8xExecutionPlan:
+    """Return the grouped 128x64 Triton tile, also used when Gluon operands are unaligned."""
     return _sm8x_triton_plan(plan, block_m=128, num_stages=3, group_m=16)
 
 

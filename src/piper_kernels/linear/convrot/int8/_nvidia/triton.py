@@ -254,19 +254,36 @@ def execute_prepared_linear(
     output = result.reshape(m, output_features)
     if output.stride(1) != 1:
         raise ValueError("prepared INT8 GEMM output must be column-contiguous")
+    if not m or not n:
+        return result
     plan = execution_plan
     sm8x = isinstance(plan, policy.Sm8xExecutionPlan)
-    if (
-        isinstance(plan, policy.Sm8xExecutionPlan)
-        and plan.matmul_kernel == "gluon"
-        and not _gluon_operands_aligned(input_qdata_2d, weight_qdata, second_weight)
-    ):
+    if sm8x and plan.matmul_kernel == "gluon":
         # 16-byte cp.async copies need aligned INT8 rows; use the Triton tile otherwise.
-        plan = policy.sm8x_triton_fallback(plan)
+        if _gluon_operands_aligned(input_qdata_2d, weight_qdata, second_weight):
+            gluon.launch_int8_matmul(
+                input_qdata_2d,
+                weight_qdata,
+                output,
+                input_scale_1d,
+                weight_scale,
+                bias,
+                second_weight,
+                second_scale,
+                second_bias,
+                paired=paired,
+                block_m=plan.matmul_block_m,
+                block_n=plan.matmul_block_n,
+                block_k=plan.matmul_block_k,
+                num_warps=plan.matmul_num_warps,
+                num_stages=plan.matmul_num_stages,
+                group_m=plan.matmul_group_m,
+            )
+            return result
+        plan = policy.sm8x_large_triton_plan(plan)
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
-    # Cache grouping is intrinsic to the large-tile family. SM8x plans name
-    # their grouping because their large tile is narrower, and write bias adds
-    # as FMAs so every SM8x tile can branch per tile with one rounding.
+    # Cache grouping is intrinsic to the large-tile family. SM8x plans name their
+    # grouping because their large tile is narrower.
     if isinstance(plan, policy.Sm8xExecutionPlan):
         group_m = plan.matmul_group_m
     elif plan.matmul_block_m == 128 and plan.matmul_block_n == 256:
@@ -274,29 +291,6 @@ def execute_prepared_linear(
     else:
         group_m = 0
     bias_pointer = bias if bias is not None else output
-
-    if not m or not n:
-        return result
-    if isinstance(plan, policy.Sm8xExecutionPlan) and plan.matmul_kernel == "gluon":
-        gluon.launch_int8_matmul(
-            input_qdata_2d,
-            weight_qdata,
-            output,
-            input_scale_1d,
-            weight_scale,
-            bias,
-            second_weight,
-            second_scale,
-            second_bias,
-            paired=paired,
-            block_m=plan.matmul_block_m,
-            block_n=plan.matmul_block_n,
-            block_k=plan.matmul_block_k,
-            num_warps=plan.matmul_num_warps,
-            num_stages=plan.matmul_num_stages,
-            group_m=plan.matmul_group_m,
-        )
-        return result
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
     grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
     kernel = sm8x_int8_matmul_kernel if sm8x else int8_matmul_kernel

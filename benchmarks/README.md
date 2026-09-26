@@ -586,7 +586,7 @@ Apply these rules in order:
 2. When `128 < N <= 1024`, use Gluon medium tiles when `M >= 256` and
    `M * ceil(N/128) >= 128 * 48`.
 3. When `N > 1024`, use Gluon large tiles when `M >= 256` and `M * ceil(N/128) >= 256 * 48`.
-4. When `N <= 128`, use Triton large tiles when `M >= 128` and `M * ceil(N/64) >= 128 * 64`.
+4. When `N <= 128`, use Triton large tiles when `M * ceil(N/64) >= 128 * 64`.
 5. Otherwise use medium tiles.
 
 Without shape metadata the plan is the Gluon large tile. The counts use actual M, so a one-row
@@ -598,9 +598,10 @@ their JIT keys, and the Triton tiles branch per tile at run time instead of comp
 `aligned_m` variant. A layer therefore compiles at most three GEMMs, plus one preparation
 kernel, as its row count changes. Across 26 row counts from 1 to 131073, an H3 layer compiled
 three GEMMs on SM8x and nine with the SM120 plan. A plan's tile selects its kernel: on SM8x,
-exactly the 128x128x64 and 256x128x64 tiles run Gluon. The launcher falls back to the grouped
-Triton tile when an INT8 input or weight row is not 16-byte aligned, which the Gluon copies
-require; that tile then takes the Gluon tile's place among the three.
+exactly the 128x128x64 tile with four warps and the 256x128x64 tile with eight warps run Gluon.
+The launcher falls back to the grouped Triton tile when an INT8 input or weight row is not
+16-byte aligned, which the Gluon copies require; that tile then takes the Gluon tile's place
+among the three.
 
 The Gluon GEMM follows the CUTLASS SM80 INT8 schedule that cuBLAS selects on this GPU
 (`256x128_64x3`): 16-byte `cp.async` copies into swizzled shared memory, `ldmatrix` operands,
@@ -609,12 +610,12 @@ stage has its own shared-memory allocation and the K loop is unrolled by the sta
 static stage indices, Gluon's barrier analysis can see that the stage being refilled differs
 from the one being read, so each K tile needs one barrier instead of two. That raised the GEMM
 from about 290 to 303 TOPS on four large shapes. Interior tiles whose K tiles are whole skip
-every copy mask, which keeps the unrolled loop within 255 registers without spills. Edge tiles
-zero-fill rows and K columns. The epilogue matches the SM8x Triton tiles bitwise: exact INT32
-accumulation, then `(acc * input_scale) * weight_scale` with bias added through explicit FMAs.
-Sustained GEMM-only throughput at H3 shapes was 297-310 TOPS, against 222-230 for the grouped
-Triton tile and 304-319 for cuBLAS `torch._int_mm`, which writes INT32 without the ConvRot
-epilogue.
+per-element copy masks, which keeps the unrolled loop within 255 registers without spills. Edge
+tiles zero-fill rows and K columns. The epilogue matches the SM8x Triton tiles bitwise: exact
+INT32 accumulation, then `(acc * input_scale) * weight_scale` with bias added through explicit
+FMAs. Sustained GEMM-only throughput at H3 shapes was 297-310 TOPS, against 222-230 for the
+grouped Triton tile and 304-319 for cuBLAS `torch._int_mm`, which writes INT32 without the
+ConvRot epilogue.
 
 Preparation follows the shared NVIDIA plan with one SM8x exception. Rows of at most 1,024
 columns use one warp, which avoids cross-warp reductions. Plain inputs keep identical bits, but
@@ -662,14 +663,14 @@ per variant over preallocated buffers:
 - BF16 cuBLAS, multiplying the same inputs without a separate GELU pass. This favors BF16
   in the down projection.
 
-The graphs are replayed interleaved for three rounds in one process. Each sample lasts at
-least 250 ms after a 10 s warmup. Shorter bursts ran up to 7% above sustained,
-power-limited clocks. With these settings, the H3 block and VAE totals were within 1-2% of
-three-process Triton `do_bench_cudagraph` measurements. Those took about an hour for the same
-coverage. The benchmark checks
-production outputs bitwise against the original plan in row chunks. JSON lines include
-per-sample times and TOPS, and stderr prints the group table. Select rows with `--h3-rows`,
-`--vae-rows`, `--mix-rows`, `--h3-short-rows`, and `--anchor-rows`.
+The graphs are replayed interleaved for three rounds in one process. Each sample lasts at least
+250 ms, or 1,000 calls for the shortest cases, after a 10 s warmup. Shorter bursts ran up to 7%
+above sustained, power-limited clocks. With these settings, the H3 block and VAE totals were
+within 1-2% of three-process Triton `do_bench_cudagraph` measurements. Those took about an hour
+for the same coverage. The benchmark checks production outputs bitwise against the original
+plan in row chunks. JSON lines include per-sample times and TOPS, and stderr prints the group
+table. Select rows with `--h3-rows`, `--vae-rows`, `--mix-rows`, `--h3-short-rows`, and
+`--anchor-rows`.
 
 RTX 4070 Ti SUPER (SM89, 66 SMs), Torch 2.14.0+cu130, Triton 3.8.0, driver 596.49, Windows,
 2026-09-26, BF16, no bias. Totals sum each group's linears, including preparation. Every
@@ -700,13 +701,10 @@ The N=16384 anchors ran at 291-296 TOPS. The N=4096 anchors ran at 251-260 TOPS,
 preparation takes a larger share of those calls. The projection mix at 1024 rows is bound by
 its small grids and by preparation, which takes about a fifth of its time; its layers ran at
 149-197 TOPS, and cuBLAS INT8 alone, without preparation or the epilogue, reached 187 TOPS on
-the mix. Before the three-GEMM limit, a four-step ladder with both Gluon tiles at every width
-ran the mix at 176 TOPS, because 1024->3072 used the medium Gluon tile, and the whole benchmark
-within 0.1% of this policy. With only the large Gluon tile, the mix at 1024 rows ran at 146
-TOPS. Before the Gluon GEMM, the SM8x policy ran the H3 blocks at 220-221 TOPS, the VAE at
-191-199, and the anchors at 223. `benchmark_convrot_int8.py` defaults went from 8.27/32.23 ms
-with the original plan to 1.97/7.91 ms with the Triton tiles, with unchanged SQNR. Bias and
-paired projections with ragged M agreed bitwise.
+the mix. A four-step ladder with both Gluon tiles at every width, which compiles a fourth GEMM
+per layer, ran the whole benchmark within 0.1% of this policy. With Triton tiles only, the H3
+blocks ran at 220-221 TOPS, the VAE at 191-199, and the anchors at 223. Bias and paired
+projections with ragged M agreed bitwise.
 
 On SM8x, `benchmark_convrot_int8_small_m.py --compare-schedules` forces the SM8x small and
 medium configurations, and `previous_linear` is the original plan on every target. The local

@@ -821,7 +821,6 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
     base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
     args = (value, row_scale, weight, scale, bias, dtype)
     expected = int8_nvidia.execute_prepared_linear(*args, base, second_projection=second)
-    selected = int8_nvidia.default_execution_plan(weight, rows=rows)
     width = n * (2 if paired else 1)
     storage = torch.full((1, rows, width + 13), 42, device="cuda", dtype=dtype)
     out = storage[..., :width]
@@ -840,7 +839,7 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
             out_features=class_n,
         )
         forced = int8_nvidia.execute_prepared_linear(*args, plan, second_projection=second)
-        assert torch.equal(forced, expected), (plan, selected)
+        assert torch.equal(forced, expected), plan
 
 
 @pytest.mark.gpu
@@ -867,10 +866,11 @@ def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
-@pytest.mark.parametrize("offset", [0, 8])
-def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset):
+@pytest.mark.parametrize(("offset", "k"), [(0, 512), (8, 512), (0, 520)])
+def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, k):
+    # An unaligned input pointer or a K that is not a multiple of 16 bytes runs Triton.
     torch.manual_seed(417)
-    rows, k, n = 1600, 512, 1000
+    rows, n = 1600, 1000
     storage = torch.randint(-127, 128, (rows * k + 16,), device="cuda", dtype=torch.int8)
     value = storage[offset : offset + rows * k].view(rows, k)
     row_scale = torch.rand(rows, device="cuda") * 0.01
@@ -891,7 +891,7 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset):
     actual = int8_nvidia.execute_prepared_linear(*args, plan)
 
     assert plan.matmul_kernel == "gluon"
-    assert launches == ([plan.matmul_block_m] if offset == 0 else [])
+    assert launches == ([plan.matmul_block_m] if offset == 0 and k % 16 == 0 else [])
     assert torch.equal(actual, int8_nvidia.execute_prepared_linear(*args, base))
 
 

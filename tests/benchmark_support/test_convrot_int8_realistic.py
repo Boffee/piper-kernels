@@ -72,4 +72,6 @@ def test_small_run_agrees_with_original_plan_and_summarizes(bias: bool) -> None:
     assert block["total_us"]["production"] == pytest.approx(
         sum(record["median_us"]["production"] for record in records[:2])
     )
-    assert block["speedup_vs_original"] > 0
+    assert block["speedup_vs_original"] == pytest.approx(
+        block["total_us"]["original"] / block["total_us"]["production"]
+    )
