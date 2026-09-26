@@ -166,7 +166,7 @@ def select_minmax_scores(
     key_primary: torch.Tensor,
     key_aux: torch.Tensor,
 ) -> MinmaxScores | None:
-    """Use the measured small-query FP32 scoring kernel on RDNA4 only."""
+    """Use tiled FP32 scoring for D128 min/max summaries on RDNA4."""
     if _score_backend is None:
         return None
     tensors = query_summary, key_primary, key_aux
@@ -182,7 +182,7 @@ def select_minmax_scores(
         query_summary.shape[-1] == 128
         and query_summary.shape[0] > 0
         and query_summary.shape[1] > 0
-        and 1 <= query_summary.shape[2] <= 64
+        and query_summary.shape[2] > 0
         and key_primary.shape[2] > 0
         and key_primary.shape == key_aux.shape
         and query_summary.shape[0] == key_primary.shape[0]

@@ -799,6 +799,44 @@ the budget guard excludes the 1%-keep regression found in the broader sparse-bud
 These choices retain the same quantization and FP32 recurrence. Coarse attention still computes
 its own scores even when fine-route selection is unnecessary.
 
+RDNA4 D128 min/max routing uses the same tiled FP32 scorer for fused projection windows
+and standalone chunks of up to 384 query blocks. To compare it with two Torch GEMMs plus
+the maximum epilogue, run with the Python from a provisioned ROCm environment:
+
+```shell
+python benchmarks/benchmark_sparse_piper_scores.py \
+  --sequence 8192 32768 100000 150000 --query-blocks 64 128 384 --samples 5 --rep-ms 100
+```
+
+Omitting `--query-blocks` retains the full and final chunks of the 4096-token fused pipeline.
+The benchmark checks scores against FP64 and includes score allocation. On an RX 9070 XT,
+Torch `2.14.0+rocm10.1.0a20260908` and matching Triton `3.8.0+git675c5987`, synthetic
+B1/H56/D128 summaries gave these device-event medians across five paired panels:
+
+| Query blocks | Key blocks | Torch scoring (ms) | Tiled scoring (ms) |
+|---:|---:|---:|---:|
+| 128 | 128 | 0.174 | 0.062 |
+| 384 | 512 | 2.154 | 0.494 |
+| 384 | 1562 | 6.649 | 1.659 |
+| 384 | 2343 | 9.915 | 2.485 |
+
+These are cache-flushed scoring measurements, not complete attention speedups. H3-shaped
+BF16 public calls at B1/H56/D128 and 25% keep were compared with the old 64-query-block
+dispatch limit using seven shuffled pairs per process:
+
+| Tokens | Initial old / new (ms) | Confirmation old / new (ms) |
+|---:|---:|---:|
+| 100,000 | 538.18 / 519.26 | 522.21 / 521.13 |
+| 150,000 | 1203.05 / 1160.58 | 1161.15 / 1159.92 |
+
+The initial 3.5% complete-call gain did not reproduce; the confirmation gain was only
+0.1-0.2%. Routes and outputs matched exactly in both runs, and peak allocation was unchanged.
+At 150K, the tiled scorer removes one 192 MiB auxiliary score matrix per full standalone
+chunk, but other attention buffers dominate the full-call peak. Default fused 4096-row
+projection windows already used native scoring and are unaffected. General FP32 scores can
+differ from Torch in their rounding; exact-score ties retain lower-index selection. Mean
+routing and D64 retain their existing scoring paths.
+
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell
