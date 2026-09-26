@@ -30,6 +30,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from .. import _quantization
+from .._validation import validate_output_buffer
 from . import policy as _policy
 
 _BLOCK_N = 64
@@ -751,39 +752,55 @@ def _default_piper_attention_execution_plan(
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedPiperAttention:
-    query: torch.Tensor
-    query_descriptor: TensorDescriptor | None
+class _PreparedPiperContext:
+    """Reusable K/V operands and the plan defining their quantization and layout."""
+
     key: torch.Tensor | TensorDescriptor
     value: torch.Tensor | TensorDescriptor
-    query_scale: torch.Tensor
     key_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_log_scale: torch.Tensor
     value_mean: torch.Tensor
-    output: torch.Tensor
     key_length: int
     is_causal: bool
     plan: _policy.PiperAttentionExecutionPlan
 
 
-def _prepare_piper_attention(
-    query: torch.Tensor,
+@dataclass(frozen=True, slots=True)
+class _PreparedPiperQuery:
+    """Quantized Q with its unpadded logical shape and original floating dtype."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    descriptor: TensorDescriptor | None
+    shape: tuple[int, int, int, int]
+    dtype: torch.dtype
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPiperAttention:
+    """Prepared K/V and Q with one reusable output for full attention."""
+
+    context: _PreparedPiperContext
+    query: _PreparedPiperQuery
+    output: torch.Tensor
+
+
+def _prepare_piper_context(
     key: torch.Tensor,
     value: torch.Tensor,
-    scale: float,
-    is_causal: bool,
     *,
+    is_causal: bool,
     execution_plan: _policy.PiperAttentionExecutionPlan,
-) -> _PreparedPiperAttention:
-    """Quantize Q/K/V and construct the selected launch specialization."""
+) -> _PreparedPiperContext:
+    """Prepare validated K/V once, independently of Q and output storage."""
     batch, kv_heads, key_length, head_dim = key.shape
     plan = execution_plan
     if plan.split_pv_head_dim and head_dim != 128:
         raise ValueError("split-PV Piper Attention requires head_dim=128")
     if plan.optimize_causal_traversal and not is_causal:
         raise ValueError("optimized causal traversal requires causal attention")
-    with device_context(query.device):
+    with device_context(key.device):
         install_uint8_int8_dot_hook()
         padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
         storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
@@ -795,11 +812,9 @@ def _prepare_piper_attention(
             value,
             is_causal=is_causal,
         )
-        prepared_qk = qk_quantization.prepare_query_key(
-            query,
+        key_int8, key_scale = qk_quantization.prepare_key(
             key,
             key_mean,
-            scale,
             grouped=plan.grouped_qk,
             storage_key_length=storage_key_length,
         )
@@ -842,67 +857,109 @@ def _prepare_piper_attention(
             num_warps=4,
         )
 
-        key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
+        key_argument: torch.Tensor | TensorDescriptor = key_int8
         value_argument: torch.Tensor | TensorDescriptor = value_int8
         if plan.use_tensor_descriptors:
             key_argument, value_argument = _make_key_value_descriptors(
-                prepared_qk.key,
+                key_int8,
                 value_int8,
                 split_pv_head_dim=plan.split_pv_head_dim,
             )
-        query_descriptor = (
-            _make_query_descriptor(
-                prepared_qk.query,
-                plan.block_m,
-            )
-            if plan.use_tensor_descriptors and plan.block_m == 128
-            else None
-        )
-        output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-        return _PreparedPiperAttention(
-            query=prepared_qk.query,
-            query_descriptor=query_descriptor,
+        return _PreparedPiperContext(
             key=key_argument,
             value=value_argument,
-            query_scale=prepared_qk.query_scale,
-            key_scale=prepared_qk.key_scale,
+            key_scale=key_scale,
             value_scale_multiplier=value_scale_multiplier,
             value_log_scale=value_log_scale,
             value_mean=value_mean,
-            output=output,
             key_length=key_length,
             is_causal=is_causal,
             plan=plan,
         )
 
 
-def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
-    """Launch only the fused attention recurrence on prepared integer inputs."""
-    batch, heads, query_length, head_dim = prepared.output.shape
-    plan = prepared.plan
+def _prepare_piper_query(
+    query: torch.Tensor,
+    scale: float,
+    *,
+    execution_plan: _policy.PiperAttentionExecutionPlan,
+) -> _PreparedPiperQuery:
+    """Prepare validated Q using the same plan as its K/V context."""
+    batch, heads, query_length, head_dim = query.shape
+    plan = execution_plan
+    with device_context(query.device):
+        query_int8, query_scale = qk_quantization.prepare_query(
+            query,
+            scale,
+            grouped=plan.grouped_qk,
+        )
+        descriptor = (
+            _make_query_descriptor(query_int8, plan.block_m)
+            if plan.use_tensor_descriptors and plan.block_m == 128
+            else None
+        )
+    return _PreparedPiperQuery(
+        data=query_int8,
+        scale=query_scale,
+        descriptor=descriptor,
+        shape=(batch, heads, query_length, head_dim),
+        dtype=query.dtype,
+    )
+
+
+def _prepare_piper_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    *,
+    execution_plan: _policy.PiperAttentionExecutionPlan,
+) -> _PreparedPiperAttention:
+    """Prepare all operands and allocate output before timed or captured launches."""
+    context = _prepare_piper_context(key, value, is_causal=is_causal, execution_plan=execution_plan)
+    prepared_query = _prepare_piper_query(query, scale, execution_plan=execution_plan)
+    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+    return _PreparedPiperAttention(context=context, query=prepared_query, output=output)
+
+
+def _launch_piper_attention_into(
+    context: _PreparedPiperContext,
+    query: _PreparedPiperQuery,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Launch compatible prepared operands into contiguous output storage.
+
+    Q and K/V must match in batch, head dimension, device, and execution plan;
+    Q heads must be divisible by K/V heads. Causal attention requires a full
+    query sequence with the same logical length as K/V.
+    """
+    validate_output_buffer(output, shape=query.shape, dtype=query.dtype, device=query.data.device)
+    batch, heads, query_length, head_dim = query.shape
+    plan = context.plan
     attention_kernel = cast(Any, _piper_attention_kernel)
-    use_query_tensor_descriptor = prepared.query_descriptor is not None
-    with device_context(prepared.output.device):
+    use_query_tensor_descriptor = query.descriptor is not None
+    with device_context(query.data.device):
         attention_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
-            prepared.query,
-            prepared.query_descriptor if use_query_tensor_descriptor else prepared.query,
-            prepared.key,
-            prepared.value,
-            prepared.query_scale,
-            prepared.key_scale,
-            prepared.value_scale_multiplier,
-            prepared.value_log_scale,
-            prepared.value_mean,
-            prepared.output,
+            query.data,
+            query.descriptor if use_query_tensor_descriptor else query.data,
+            context.key,
+            context.value,
+            query.scale,
+            context.key_scale,
+            context.value_scale_multiplier,
+            context.value_log_scale,
+            context.value_mean,
+            output,
             query_length,
-            prepared.key_length,
-            is_causal=prepared.is_causal,
+            context.key_length,
+            is_causal=context.is_causal,
             grouped_qk=plan.grouped_qk,
             split_pv_head_dim=plan.split_pv_head_dim,
             aligned_queries=query_length % plan.block_m == 0,
-            unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
+            unmasked_key_tiles=(not context.is_causal and context.key_length % _BLOCK_N == 0),
             heads=heads,
-            head_groups=heads // prepared.key_scale.shape[1],
+            head_groups=heads // context.key_scale.shape[1],
             head_dim=head_dim,
             block_m=plan.block_m,
             block_n=_BLOCK_N,
@@ -916,7 +973,12 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             num_warps=plan.num_warps,
             num_stages=plan.num_stages,
         )
-    return prepared.output
+    return output
+
+
+def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
+    """Reuse the prepared output without allocating or preparing operands."""
+    return _launch_piper_attention_into(prepared.context, prepared.query, prepared.output)
 
 
 def _run_piper_attention(

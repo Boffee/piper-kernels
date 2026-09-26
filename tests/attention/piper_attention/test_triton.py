@@ -395,7 +395,7 @@ def test_derived_value_log_bound_skips_log_metadata() -> None:
         )
         output = _launch_piper_attention(prepared).clone()
 
-    assert prepared.value_log_scale.numel() == 1
+    assert prepared.context.value_log_scale.numel() == 1
     assert torch.isfinite(output).all()
 
 
@@ -445,8 +445,8 @@ def test_derived_value_log_bound_runs_all_common_modes(
             qk_quantization=_qk_quantization(),
         )
 
-    assert stored_prepared.value_log_scale.numel() == key_length
-    assert derived_prepared.value_log_scale.numel() == 1
+    assert stored_prepared.context.value_log_scale.numel() == key_length
+    assert derived_prepared.context.value_log_scale.numel() == 1
     assert torch.isfinite(derived).all()
     assert _sqnr_db(derived, reference) >= 40.0
     assert _sqnr_db(derived, stored) >= 35.0
@@ -525,8 +525,8 @@ def test_large_value_scale_multiplier_remains_finite() -> None:
         )
         actual = _launch_piper_attention(prepared)
 
-    assert prepared.value_scale_multiplier.dtype is torch.float32
-    assert torch.isfinite(prepared.value_scale_multiplier).all()
+    assert prepared.context.value_scale_multiplier.dtype is torch.float32
+    assert torch.isfinite(prepared.context.value_scale_multiplier).all()
     assert torch.isfinite(actual).all()
 
 
@@ -579,10 +579,10 @@ def test_long_descriptor_path_matches_pointer_path(
         )
         pointer = _launch_piper_attention(pointer_prepared)
 
-    assert isinstance(descriptor_prepared.query, torch.Tensor)
-    assert isinstance(descriptor_prepared.query_descriptor, TensorDescriptor)
-    assert descriptor_prepared.query_descriptor.block_shape == [1, 128, 128]
-    assert pointer_prepared.query_descriptor is None
+    assert isinstance(descriptor_prepared.query.data, torch.Tensor)
+    assert isinstance(descriptor_prepared.query.descriptor, TensorDescriptor)
+    assert descriptor_prepared.query.descriptor.block_shape == [1, 128, 128]
+    assert pointer_prepared.query.descriptor is None
     torch.testing.assert_close(descriptor, pointer, atol=2**-9, rtol=0.0)
 
 
@@ -605,10 +605,12 @@ def test_ragged_query_tail_falls_back_to_masked_pointer_load() -> None:
             execution_plan=plan,
         )
         descriptor = _launch_piper_attention(prepared).clone()
-        pointer = _launch_piper_attention(replace(prepared, query_descriptor=None))
+        pointer = _launch_piper_attention(
+            replace(prepared, query=replace(prepared.query, descriptor=None))
+        )
 
-    assert isinstance(prepared.query_descriptor, TensorDescriptor)
-    assert prepared.query_descriptor.shape == [1, sequence, 128]
+    assert isinstance(prepared.query.descriptor, TensorDescriptor)
+    assert prepared.query.descriptor.shape == [1, sequence, 128]
     assert torch.isfinite(descriptor).all()
     torch.testing.assert_close(descriptor, pointer, atol=2**-9, rtol=0.0)
 
@@ -669,6 +671,50 @@ def test_one_launch_covers_all_query_rows(monkeypatch, query_length, head_dim, i
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_context_reused_with_new_queries_and_caller_outputs(
+    monkeypatch, head_dim, dtype, is_causal
+) -> None:
+    torch.manual_seed(421)
+    key_length = 193
+    key = torch.randn(2, key_length, 2, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
+    value = torch.randn_like(key)
+    queries = [
+        torch.randn(2, key_length, 4, head_dim, device="cuda", dtype=dtype).transpose(1, 2),
+        torch.randn(
+            2, key_length if is_causal else 65, 6, head_dim, device="cuda", dtype=dtype
+        ).transpose(1, 2),
+    ]
+    scale = head_dim**-0.5
+    plan = _default_piper_attention_execution_plan(queries[0], is_causal)
+    with torch.no_grad():
+        expected = [
+            _run_piper_attention(query, key, value, scale, is_causal, execution_plan=plan)
+            for query in queries
+        ]
+        context = _backend._prepare_piper_context(
+            key, value, is_causal=is_causal, execution_plan=plan
+        )
+
+        def unexpected_kv_preparation(*args, **kwargs):
+            pytest.fail("query preparation and launch must reuse the prepared K/V context")
+
+        monkeypatch.setattr(_backend._quantization, "compute_kv_means", unexpected_kv_preparation)
+        monkeypatch.setattr(_backend.qk_quantization, "prepare_key", unexpected_kv_preparation)
+        monkeypatch.setattr(_backend, "_quantize_value_per_key_kernel", unexpected_kv_preparation)
+        for query, reference in zip(queries, expected, strict=True):
+            prepared_query = _backend._prepare_piper_query(query, scale, execution_plan=plan)
+            guarded = torch.full((query.numel() + 32,), 7.0, device=query.device, dtype=dtype)
+            output = guarded[16:-16].view(query.shape)
+            actual = _backend._launch_piper_attention_into(context, prepared_query, output)
+            assert actual is output
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+            assert torch.all(guarded[:16] == 7.0)
+            assert torch.all(guarded[-16:] == 7.0)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_ragged_single_launch_replays_with_updated_queries(head_dim, is_causal) -> None:
     torch.manual_seed(420)
@@ -689,7 +735,7 @@ def test_ragged_single_launch_replays_with_updated_queries(head_dim, is_causal) 
     with torch.cuda.graph(graph):
         _launch_piper_attention(prepared)
 
-    prepared.query.zero_()
+    prepared.query.data.zero_()
     expected = _launch_piper_attention(prepared).clone()
     prepared.output.fill_(float("nan"))
     graph.replay()

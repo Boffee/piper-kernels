@@ -127,22 +127,28 @@ def test_preparation_retains_per_token_scales_and_compact_gqa_storage(head_dim, 
     key = torch.randn(2, 2, 65, head_dim, device="cuda", dtype=query.dtype)
     value = torch.randn_like(key)
     prepared = backend.prepare_attention(query, key, value, head_dim**-0.5, causal)
-    assert prepared.query.shape == (2, 6, 128, head_dim)
+    assert prepared.query.data.shape == (2, 6, 128, head_dim)
+    assert prepared.query.shape == tuple(query.shape)
+    assert prepared.query.dtype is query.dtype
     for tensor in (
-        prepared.key,
-        prepared.value,
-        prepared.key_scale,
-        prepared.multiplier,
-        prepared.log_scale,
+        prepared.context.key,
+        prepared.context.value,
+        prepared.context.key_scale,
+        prepared.context.multiplier,
+        prepared.context.log_scale,
     ):
         assert tensor.shape[1] == 2
     centered = value.float() if causal else value.float() - value.float().mean(2, keepdim=True)
     scale = centered.abs().amax(-1) / 127 + 1e-7
-    torch.testing.assert_close(prepared.multiplier[..., :65], scale * 255, rtol=2e-6, atol=1e-7)
-    assert prepared.multiplier.shape == (2, 2, 128)
+    torch.testing.assert_close(
+        prepared.context.multiplier[..., :65], scale * 255, rtol=2e-6, atol=1e-7
+    )
+    assert prepared.context.multiplier.shape == (2, 2, 128)
     tokens = torch.arange(64, device="cuda")
     packed_tokens = (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
-    unpacked = prepared.value[..., packed_tokens].transpose(-1, -2).reshape(2, 2, 128, head_dim)
+    unpacked = (
+        prepared.context.value[..., packed_tokens].transpose(-1, -2).reshape(2, 2, 128, head_dim)
+    )
     normalized = centered / scale[..., None]
     expected = (
         (normalized + torch.where(normalized >= 0, 0.5, -0.5)).clamp(-127, 127).to(torch.int8)
@@ -155,6 +161,25 @@ def test_preparation_retains_per_token_scales_and_compact_gqa_storage(head_dim, 
         atol=0,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_prepared_context_can_fill_independent_outputs_for_reused_queries(head_dim, causal):
+    torch.manual_seed(994)
+    key = torch.randn(2, 2, 65, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    context = backend.prepare_context(key, value, is_causal=causal)
+    for query_length in (65, 65) if causal else (31, 97):
+        query = torch.randn(2, 6, query_length, head_dim, device="cuda", dtype=key.dtype)
+        prepared_query = backend.prepare_query(query, head_dim**-0.5)
+        output = torch.empty_like(query)
+        assert backend.launch_attention_into(context, prepared_query, output) is output
+        expected = piper_attention(query, key, value, is_causal=causal)
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        second_output = torch.empty_like(query)
+        backend.launch_attention_into(context, prepared_query, second_output)
+        torch.testing.assert_close(second_output, output, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])

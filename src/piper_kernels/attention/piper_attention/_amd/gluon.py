@@ -26,6 +26,7 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 
 from .._quantization import compute_kv_means
+from .._validation import validate_output_buffer
 from .triton import prepare_value
 
 
@@ -173,39 +174,48 @@ def _dense_piper_kernel(
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedAttention:
-    """Per-call operands; K/V storage scales with KV heads, never query heads."""
+class PreparedContext:
+    """Reusable K/V operands whose storage scales with KV heads."""
 
-    query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
-    query_scale: torch.Tensor
     key_scale: torch.Tensor
     multiplier: torch.Tensor
     log_scale: torch.Tensor
     value_mean: torch.Tensor
-    output: torch.Tensor
     key_length: int
     is_causal: bool
 
 
-def prepare_attention(
-    query: torch.Tensor,
+@dataclass(frozen=True, slots=True)
+class PreparedQuery:
+    """Quantized Q with its unpadded logical shape and original floating dtype."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    shape: tuple[int, int, int, int]
+    dtype: torch.dtype
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAttention:
+    """Prepared K/V and Q with one reusable output for full attention."""
+
+    context: PreparedContext
+    query: PreparedQuery
+    output: torch.Tensor
+
+
+def prepare_context(
     key: torch.Tensor,
     value: torch.Tensor,
-    scale: float,
+    *,
     is_causal: bool,
-) -> PreparedAttention:
-    query_storage = triton.cdiv(query.shape[2], 64) * 64
+) -> PreparedContext:
+    """Prepare validated K/V once, independently of Q and output storage."""
     key_storage = triton.cdiv(key.shape[2], 64) * 64
-    with device_context(query.device):
+    with device_context(key.device):
         key_mean, value_mean = compute_kv_means(key, value, is_causal=is_causal)
-        query_int8, query_scale = qk_quantization.prepare_query(
-            query,
-            scale,
-            grouped=True,
-            storage_query_length=query_storage,
-        )
         key_int8, key_scale = qk_quantization.prepare_key(
             key,
             key_mean,
@@ -218,54 +228,99 @@ def prepare_attention(
             is_causal=is_causal,
             storage_length=key_storage,
         )
-        output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
-    return PreparedAttention(
-        query=query_int8,
+    return PreparedContext(
         key=key_int8,
         value=packed_value,
-        query_scale=query_scale,
         key_scale=key_scale,
         multiplier=multiplier,
         log_scale=log_scale,
         value_mean=value_mean,
-        output=output,
         key_length=key.shape[2],
         is_causal=is_causal,
     )
 
 
-def launch_attention(prepared: PreparedAttention) -> torch.Tensor:
-    batch, heads, query_length, head_dim = prepared.output.shape
-    query_storage = prepared.query.shape[2]
-    key_storage = prepared.key.shape[2]
+def prepare_query(query: torch.Tensor, scale: float) -> PreparedQuery:
+    """Prepare Q storage while retaining its logical length and output dtype."""
+    batch, heads, query_length, head_dim = query.shape
+    query_storage = triton.cdiv(query_length, 64) * 64
+    with device_context(query.device):
+        query_int8, query_scale = qk_quantization.prepare_query(
+            query,
+            scale,
+            grouped=True,
+            storage_query_length=query_storage,
+        )
+    return PreparedQuery(
+        data=query_int8,
+        scale=query_scale,
+        shape=(batch, heads, query_length, head_dim),
+        dtype=query.dtype,
+    )
+
+
+def prepare_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+) -> PreparedAttention:
+    """Prepare operands and allocate the reusable output before timed launches."""
+    context = prepare_context(key, value, is_causal=is_causal)
+    prepared_query = prepare_query(query, scale)
+    output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    return PreparedAttention(context=context, query=prepared_query, output=output)
+
+
+def launch_attention_into(
+    context: PreparedContext,
+    query: PreparedQuery,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Fill a caller-owned contiguous output using logical query metadata.
+
+    Q and K/V must match in batch, head dimension, and device; Q heads must be
+    divisible by K/V heads. Causal attention requires a full query sequence
+    with the same logical length as K/V.
+    """
+    validate_output_buffer(output, shape=query.shape, dtype=query.dtype, device=query.data.device)
+    batch, heads, query_length, head_dim = query.shape
+    query_storage = query.data.shape[2]
+    key_storage = context.key.shape[2]
     if batch == 0:
-        return prepared.output
-    with device_context(prepared.output.device):
+        return output
+    with device_context(query.data.device):
         _dense_piper_kernel[(query_storage // 64, heads, batch)](
-            prepared.query,
-            prepared.key,
-            prepared.value,
-            prepared.query_scale,
-            prepared.key_scale,
-            prepared.multiplier,
-            prepared.log_scale,
-            prepared.value_mean,
-            prepared.output,
+            query.data,
+            context.key,
+            context.value,
+            query.scale,
+            context.key_scale,
+            context.multiplier,
+            context.log_scale,
+            context.value_mean,
+            output,
             query_length,
-            prepared.key_length,
+            context.key_length,
             query_storage,
             key_storage,
             heads,
-            heads // prepared.key.shape[1],
+            heads // context.key.shape[1],
             head_dim,
-            prepared.is_causal,
+            context.is_causal,
             query_storage * (head_dim // 8) > (1 << 31),
             key_storage * head_dim > (1 << 32),
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=(("target-features", "+cumode"),),
         )
-    return prepared.output
+    return output
+
+
+def launch_attention(prepared: PreparedAttention) -> torch.Tensor:
+    """Reuse the prepared output without allocating or preparing operands."""
+    return launch_attention_into(prepared.context, prepared.query, prepared.output)
 
 
 def run_attention(
