@@ -1,16 +1,13 @@
 """Host-side execution-plan policy tests for INT8 ConvRot."""
 
 from dataclasses import replace
-from unittest.mock import Mock
 
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
-from piper_kernels.linear.convrot.int8._nvidia.policy import (
-    NvidiaExecutionPlan,
-    select_execution_plan,
-)
+from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
+from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
@@ -241,41 +238,21 @@ def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
     ) == select_execution_plan(target, in_features=3072)
 
 
-@pytest.mark.parametrize(
-    ("architecture", "policy_name"),
-    [("sm120", "_sm120_execution_plan"), ("sm86", "_sm8x_execution_plan")],
-)
-@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
-def test_architecture_policy_owns_preparation_and_matmul(
-    monkeypatch, architecture, policy_name, rows, out_features
-):
-    base = select_execution_plan(_SM120, in_features=5376)
-    expected = replace(
-        base,
-        fuse_rotation_quantization=False,
-        fused_num_warps=16,
-        rotation_num_warps=8,
-        quantization_num_warps=2,
-        matmul_block_m=16,
-        matmul_block_n=128,
-        matmul_block_k=64,
-        matmul_num_warps=4,
-        matmul_num_stages=2,
-    )
-    architecture_policy = Mock(return_value=expected)
-    monkeypatch.setattr(nvidia_policy, policy_name, architecture_policy)
-
-    actual = select_execution_plan(
-        AcceleratorTarget("cuda", architecture),
-        in_features=5376,
-        rows=rows,
-        out_features=out_features,
-    )
-
-    assert actual is expected
-    architecture_policy.assert_called_once_with(
-        in_features=5376, rows=rows, out_features=out_features
-    )
+@pytest.mark.parametrize("architecture", ["sm120", "sm86"])
+@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048), (8192, 4096)])
+def test_matmul_selection_is_independent_of_preparation_width(architecture, rows, out_features):
+    target = AcceleratorTarget("cuda", architecture)
+    plans = [
+        select_execution_plan(target, in_features=k, rows=rows, out_features=out_features)
+        for k in (512, 5376, 14336, 28672, 49408)
+    ]
+    matmul_choices = [
+        {name: value for name, value in plan.as_dict().items() if name.startswith("matmul_")}
+        for plan in plans
+    ]
+    assert all(choices == matmul_choices[0] for choices in matmul_choices)
+    assert len({plan.fused_num_warps for plan in plans}) > 1
+    assert {plan.fuse_rotation_quantization for plan in plans} == {True, False}
 
 
 @pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)

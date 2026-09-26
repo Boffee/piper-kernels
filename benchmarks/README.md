@@ -597,8 +597,9 @@ to 128 columns. SM8x launches do not specialize on M either: both GEMM kernels l
 their JIT keys, and the Triton tiles branch per tile at run time instead of compiling an
 `aligned_m` variant. A layer therefore compiles at most three GEMMs, plus one preparation
 kernel, as its row count changes. Across 26 row counts from 1 to 131073, an H3 layer compiled
-three GEMMs on SM8x and nine with the SM120 plan. Both policies return a `NvidiaExecutionPlan`
-with explicit `matmul_kernel` and `matmul_group_m` fields. `triton_specialize_m` and
+three GEMMs on SM8x and nine with the SM120 plan. Policy selects preparation independently
+from a complete GEMM schedule, then constructs one `NvidiaExecutionPlan` with explicit
+`matmul_kernel` and `matmul_group_m` fields. `triton_specialize_m` and
 `triton_explicit_bias_fma` configure the Triton implementation only. Benchmark metadata reports
 the effective `matmul_specialize_m` and `matmul_explicit_bias_fma` values; for Gluon these are
 always false and true, respectively, even when a candidate inherits SM120's Triton options.

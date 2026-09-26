@@ -11,6 +11,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as gluon
 from piper_kernels.linear.convrot.int8._nvidia import policy
+from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 
@@ -103,7 +104,7 @@ def test_sm8x_schedules_compile_within_consumer_shared_memory(
         rows=rows,
         out_features=out_features,
     )
-    assert isinstance(plan, policy.NvidiaExecutionPlan)
+    assert isinstance(plan, NvidiaExecutionPlan)
     compiled = _compile_int8_matmul(
         plan,
         architecture,

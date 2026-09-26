@@ -5,7 +5,7 @@ from dataclasses import replace
 import torch
 
 from piper_kernels.linear.convrot.int8 import _backend as convrot_int8_backend
-from piper_kernels.linear.convrot.int8._nvidia.policy import NvidiaExecutionPlan
+from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 
 

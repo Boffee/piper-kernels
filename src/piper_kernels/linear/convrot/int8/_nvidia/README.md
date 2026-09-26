@@ -5,13 +5,21 @@ orchestration, and implementation-owned launchers:
 
 | Module | Responsibility |
 |---|---|
-| `policy.py` | Validate NVIDIA plans and select measured SM8x/SM120 schedules from host metadata. |
+| `policy.py` | Independently select preparation and a measured SM8x/SM120 GEMM schedule. |
+| `_plan.py` | Define immutable schedule/plan values, validate configurations, and report effective choices. |
 | `dispatch.py` | Prepare shared operands, allocate or reuse outputs, and dispatch the selected GEMM. |
 | `triton.py` | Launch shared preparation kernels and the portable Triton GEMM. |
 | `gluon_async_copy.py` | Own the `cp.async`/MMAv2 GEMM, alignment requirements, and launch. |
 | `../_kernels/triton.py` | Shared NVIDIA/AMD INT8 arithmetic and reusable projection tile. |
 
-Both target policies return the same `NvidiaExecutionPlan`. Kernel selection is explicit:
+Each architecture's GEMM selector returns a complete, named `MatmulSchedule`. Preparation
+selection depends only on the target family and input width. The two choices are combined
+into one `NvidiaExecutionPlan`; production selection does not build or rewrite intermediate
+plans. The grouped Triton alignment fallback reuses the same schedule as large narrow SM8x
+projections and retains the existing preparation choices. Benchmarks use
+`baseline_execution_plan` for comparisons against the historical fixed schedule.
+
+Kernel selection remains explicit:
 `matmul_kernel="triton"` or `"gluon_async_copy"`. Changing a tile with `dataclasses.replace`
 never changes its implementation. Plan validation checks the selected kernel's supported
 tile geometry; unsupported tuning combinations are reported and skipped by the offline tuner.

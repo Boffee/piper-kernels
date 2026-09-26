@@ -193,7 +193,7 @@ def _run_case(case: Case, args: argparse.Namespace, target: AcceleratorTarget) -
     )
     outputs = [torch.empty(rows, n, device=device, dtype=torch.bfloat16) for _ in dense]
     production = nvidia.default_execution_plan(weights[0][0], rows=rows)
-    original = policy._base_execution_plan(in_features=k)
+    original = policy.baseline_execution_plan(in_features=k)
 
     def int8(
         plan: LinearExecutionPlan,

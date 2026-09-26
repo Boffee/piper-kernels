@@ -14,6 +14,7 @@ from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 from .._kernels.triton import int8_matmul_kernel
 from . import policy
+from ._plan import NvidiaExecutionPlan
 
 # A runtime M and per-tile tail branch keep one compiled kernel per schedule.
 dynamic_m_int8_matmul_kernel = triton.jit(do_not_specialize=["m"])(int8_matmul_kernel.fn)
@@ -107,7 +108,7 @@ def launch_int8_matmul(
     second_bias: torch.Tensor | None,
     *,
     paired: bool,
-    plan: policy.NvidiaExecutionPlan,
+    plan: NvidiaExecutionPlan,
 ) -> None:
     """Launch the shared INT8 arithmetic with the plan's explicit Triton schedule."""
     m, k = input_qdata.shape

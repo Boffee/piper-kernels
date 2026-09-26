@@ -72,7 +72,7 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
     single_out = torch.empty_like(split_out)
     branch_out = torch.empty_like(split_out)
     # Every provider keeps the fixed 128x256 tile, which SM8x no longer selects by default.
-    plan = policy._base_execution_plan(in_features=k)
+    plan = policy.baseline_execution_plan(in_features=k)
 
     def split_gemm() -> torch.Tensor:
         return legacy_matmul(prepared, qdata, scale, split_out, plan)

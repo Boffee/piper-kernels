@@ -27,7 +27,7 @@ from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
 
 from piper_kernels._triton.runtime import device_context
 
-from .policy import NvidiaExecutionPlan
+from ._plan import NvidiaExecutionPlan
 
 # Warp tiles are 64 columns wide, so every supported tile uses two warp columns.
 _WARPS_N = 2

@@ -42,7 +42,7 @@ from lib.tuning import (
     validate_tuning_candidate_count,
 )
 
-from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_plan
+from piper_kernels.linear.convrot.int8._nvidia import _plan as convrot_int8_plan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 

@@ -11,6 +11,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from .._plan import LinearExecutionPlan
 from . import gluon_async_copy, policy
 from . import triton as triton_kernels
+from ._plan import NvidiaExecutionPlan
 
 
 def default_execution_plan(
@@ -18,7 +19,7 @@ def default_execution_plan(
     *,
     target: AcceleratorTarget | None = None,
     rows: int | None = None,
-) -> policy.NvidiaExecutionPlan:
+) -> NvidiaExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
     return policy.select_execution_plan(
@@ -132,7 +133,7 @@ def execute_prepared_linear(
         raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     if not m or not n:
         return result
-    if not isinstance(execution_plan, policy.NvidiaExecutionPlan):
+    if not isinstance(execution_plan, NvidiaExecutionPlan):
         raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
     plan = execution_plan
     launcher = triton_kernels.launch_int8_matmul

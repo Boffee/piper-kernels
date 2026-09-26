@@ -156,7 +156,7 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
     selected = nvidia.default_execution_plan(qdata, rows=m)
     production = selected
     # The original plan on every target: shared preparation and fixed 128x256 tiles.
-    previous = policy._base_execution_plan(in_features=k)
+    previous = policy.baseline_execution_plan(in_features=k)
     small_tile, medium_tile = _SM120_SMALL_TILE, _SM120_MEDIUM_TILE
     if AcceleratorTarget.from_device(qdata.device).is_cuda_capability(8):
         small_tile, medium_tile = _SM8X_SMALL_TILE, _SM8X_MEDIUM_TILE
