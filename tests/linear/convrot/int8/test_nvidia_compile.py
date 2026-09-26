@@ -9,7 +9,8 @@ from triton.experimental.gluon._runtime import GluonASTSource
 from piper_kernels._triton import convrot_int8 as kernels_weights
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._kernels import triton as kernels
-from piper_kernels.linear.convrot.int8._nvidia import gluon, policy
+from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as gluon
+from piper_kernels.linear.convrot.int8._nvidia import policy
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 
@@ -88,7 +89,7 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture, 
 _SM8X_SHARED_MEMORY_LIMIT = 99 * 1024
 
 
-@pytest.mark.parametrize("architecture", [80, 86, 89])
+@pytest.mark.parametrize("architecture", [80, 86, 89, 120])
 @pytest.mark.parametrize(
     ("rows", "out_features"), [(1, 4096), (256, 1024), (8192, 128), (2048, 1024), (8192, 4096)]
 )
@@ -97,12 +98,12 @@ def test_sm8x_schedules_compile_within_consumer_shared_memory(
     architecture, rows, out_features, aligned
 ):
     plan = policy.select_execution_plan(
-        AcceleratorTarget("cuda", f"sm{architecture}"),
+        AcceleratorTarget("cuda", "sm89"),
         in_features=5376,
         rows=rows,
         out_features=out_features,
     )
-    assert isinstance(plan, policy.Sm8xExecutionPlan)
+    assert isinstance(plan, policy.NvidiaExecutionPlan)
     compiled = _compile_int8_matmul(
         plan,
         architecture,
@@ -143,7 +144,7 @@ def _compile_int8_matmul(
     }
     flags = {"has_bias": True, "paired": paired, "second_has_bias": paired}
     target = GPUTarget("cuda", architecture, 32)
-    if isinstance(plan, policy.Sm8xExecutionPlan) and plan.matmul_kernel == "gluon":
+    if plan.matmul_kernel == "gluon_async_copy":
         # Runtime specialization marks 16-byte-aligned INT8 operands and K, which the
         # launcher requires before selecting the Gluon GEMM.
         kernel = gluon.int8_matmul_gluon_kernel
@@ -174,7 +175,8 @@ def _compile_int8_matmul(
             "aligned_m": aligned_m,
             "aligned_nk": aligned_nk,
             "group_m": group_m,
-            "explicit_bias_fma": isinstance(plan, policy.Sm8xExecutionPlan),
+            "explicit_bias_fma": plan.matmul_explicit_bias_fma,
+            "per_tile_tail": bool(group_m) or not plan.matmul_specialize_m,
             **flags,
         },
     )

@@ -569,8 +569,8 @@ about 15%. Ordinary single-projection selection is unchanged.
 SM8x (SM80, SM86, SM87, SM89) uses its own five GEMM configurations, at most three per output
 width. The fixed 128x256 tile needs 255 registers with 176 spilled values and 96 KiB of shared
 memory on SM89, and reaches about 50 TOPS. Short and narrow projections use 64-column tiles of
-the shared Triton kernel. Wider projections use an SM8x Gluon GEMM,
-`linear/convrot/int8/_nvidia/gluon.py`:
+the shared Triton kernel. Wider projections use the NVIDIA async-copy Gluon GEMM,
+`linear/convrot/int8/_nvidia/gluon_async_copy.py`:
 
 | Configuration | Kernel | BLOCK_M | BLOCK_N | BLOCK_K | Warps | Stages | GROUP_M |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -597,8 +597,11 @@ to 128 columns. SM8x launches do not specialize on M either: both GEMM kernels l
 their JIT keys, and the Triton tiles branch per tile at run time instead of compiling an
 `aligned_m` variant. A layer therefore compiles at most three GEMMs, plus one preparation
 kernel, as its row count changes. Across 26 row counts from 1 to 131073, an H3 layer compiled
-three GEMMs on SM8x and nine with the SM120 plan. A plan's tile selects its kernel: on SM8x,
-exactly the 128x128x64 tile with four warps and the 256x128x64 tile with eight warps run Gluon.
+three GEMMs on SM8x and nine with the SM120 plan. Both policies return a `NvidiaExecutionPlan`
+with explicit `matmul_kernel`, `matmul_group_m`, `matmul_specialize_m`, and
+`matmul_explicit_bias_fma` fields. Replacing tile dimensions preserves the selected implementation;
+unsupported configurations fail plan validation. The async-copy implementation accepts
+128x128x64 tiles with four warps and 256x128x64 tiles with eight warps.
 The launcher falls back to the grouped Triton tile when an INT8 input or weight row is not
 16-byte aligned, which the Gluon copies require; that tile then takes the Gluon tile's place
 among the three.
@@ -623,9 +626,23 @@ GELU and SwiGLU codes may differ from wider launches by one INT8 code, with scal
 FP32 ulps. This is the same bound the optimized path already allows against the portable path.
 One warp cut 2-6% from the default seven-projection mix. The Triton large tile groups sixteen
 row blocks and the Gluon tiles eight. Without grouping, the 128x64 tile was up to 1.5x slower
-at `M=8192, K>=12288`, where the input does not fit in L2. SM8x plans carry their grouping as a
-plan field, so SM120 launches, including the H3 VAE's ungrouped 128x128 schedules, are
-unchanged.
+at `M=8192, K>=12288`, where the input does not fit in L2. Grouping is explicit in every NVIDIA
+plan, including SM120's production tiles and the H3 VAE's ungrouped 128x128 schedules.
+
+The async-copy kernel and one-warp preparation also run on SM120. GPU correctness tests force
+the SM8x schedules on either architecture; production SM120 selection remains unchanged.
+The [NVIDIA implementation layout](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md)
+separates policy, dispatch, and implementation launchers as sparse Piper attention does.
+The tuner accepts `--matmul-kernel triton gluon_async_copy`, `--matmul-group-m 0 8 16`, and
+`--matmul-block-m 256`. It reports unsupported combinations to stderr, measures supported
+candidates, and errors clearly if none remain. For example, on SM80 or newer:
+
+```shell
+uv run python benchmarks/tune_convrot_int8_linear.py \
+  --matmul-kernel triton gluon_async_copy --matmul-group-m 0 8 \
+  --matmul-block-m 128 256 --matmul-block-n 128 --matmul-block-k 64 \
+  --matmul-num-warps 4 8 --matmul-num-stages 2 3 4
+```
 
 The Triton tiles were chosen from a 210-shape GEMM sweep on SM89 with 13 tiles, with and
 without grouping. The Gluon thresholds come from a second, 247-shape sweep. It crossed 13 row
@@ -740,7 +757,8 @@ loads/stores and tail tiles use masks. Scaling and bias stay inside the branch t
 floating-point rounding. Some grouped tile shapes, including 128x64 and 64x64, still let the
 compiler move an identical paired bias add below the branch, where it rounds separately from
 the scale multiply. SM8x launches therefore write bias adds as explicit FMAs. That path is
-compiled only for SM8x plans; SM120 and AMD code is instruction-identical. Unaligned N/K uses
+selected explicitly by the SM8x policy; SM120 and AMD defaults are unchanged. Tail branching
+has its own kernel flag, independent of bias rounding. Unaligned N/K uses
 the original masked loop in one launch. Neither NVIDIA nor AMD retains a separate tail launch;
 tail handling is independent of tile selection.
 

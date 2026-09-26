@@ -20,8 +20,9 @@ import torch
 from lib.environment import capture_environment
 from triton.testing import do_bench_cudagraph
 
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.linear.convrot.int8._nvidia import policy
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
@@ -36,6 +37,8 @@ SHAPES = (
 
 # Forced configurations for --compare-schedules, per production policy family.
 _SM120_SMALL_TILE = {
+    "matmul_kernel": "triton",
+    "matmul_group_m": 0,
     "matmul_block_m": 32,
     "matmul_block_n": 64,
     "matmul_block_k": 128,
@@ -43,6 +46,8 @@ _SM120_SMALL_TILE = {
     "matmul_num_stages": 4,
 }
 _SM120_MEDIUM_TILE = {
+    "matmul_kernel": "triton",
+    "matmul_group_m": 0,
     "matmul_block_m": 64,
     "matmul_block_n": 64,
     "matmul_block_k": 128,
@@ -50,6 +55,7 @@ _SM120_MEDIUM_TILE = {
     "matmul_num_stages": 3,
 }
 _SM8X_SMALL_TILE = {
+    "matmul_kernel": "triton",
     "matmul_block_m": 16,
     "matmul_block_n": 64,
     "matmul_block_k": 128,
@@ -152,7 +158,7 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
     # The original plan on every target: shared preparation and fixed 128x256 tiles.
     previous = policy._base_execution_plan(in_features=k)
     small_tile, medium_tile = _SM120_SMALL_TILE, _SM120_MEDIUM_TILE
-    if isinstance(selected, policy.Sm8xExecutionPlan):
+    if AcceleratorTarget.from_device(qdata.device).is_cuda_capability(8):
         small_tile, medium_tile = _SM8X_SMALL_TILE, _SM8X_MEDIUM_TILE
     if args.compare_schedules:
         production = replace(selected, **small_tile)

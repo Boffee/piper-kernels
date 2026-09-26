@@ -1,4 +1,4 @@
-"""SM8x Gluon GEMM for ConvRot INT8 projections.
+"""NVIDIA async-copy Gluon GEMM for ConvRot INT8 projections.
 
 The kernel follows the CUTLASS SM80 INT8 schedule: 16-byte ``cp.async`` copies into
 swizzled shared memory, ``ldmatrix`` operands, and m16n8k32 INT8 MMAs with 64x64 warp tiles.
@@ -8,7 +8,8 @@ tiles are whole skip per-element copy masks; edge tiles zero-fill rows and K col
 problem. The kernel does not specialize on M, so one compiled kernel serves every row count.
 Accumulation is exact INT32, and the epilogue computes
 ``(acc * input_scale) * weight_scale`` with bias added through explicit FMAs, which matches
-the SM8x Triton schedules bitwise.
+the shared Triton arithmetic bitwise. The implementation runs on SM8x and SM120;
+architecture policies choose when to use it.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -25,6 +26,8 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
 
 from piper_kernels._triton.runtime import device_context
+
+from .policy import NvidiaExecutionPlan
 
 # Warp tiles are 64 columns wide, so every supported tile uses two warp columns.
 WARPS_N = 2
@@ -174,7 +177,7 @@ def int8_matmul_gluon_kernel(
 ):
     # Gluon has no ``in`` operator for constexpr tuples.
     three_or_four: gl.constexpr = stages == 3 or stages == 4  # noqa: PLR1714
-    gl.static_assert(three_or_four, "SM8x Gluon GEMM uses three or four stages")
+    gl.static_assert(three_or_four, "Async-copy GEMM uses three or four stages")
     num_warps: gl.constexpr = warps_m * _GL_WARPS_N
     column_tiles = gl.cdiv(n, block_n)
     num_pid_n = column_tiles * (2 if paired else 1)
@@ -290,6 +293,11 @@ def int8_matmul_gluon_kernel(
     gl.store(output_pointers, result, mask=(offsets_m[:, None] < m) & (offsets_n[None, :] < n))
 
 
+def operands_aligned(*operands: torch.Tensor) -> bool:
+    """Return whether INT8 GEMM operands start and step in whole 16-byte copies."""
+    return all(operand.data_ptr() % 16 == 0 and operand.stride(0) % 16 == 0 for operand in operands)
+
+
 def launch_int8_matmul(
     input_qdata: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -302,16 +310,13 @@ def launch_int8_matmul(
     second_bias: torch.Tensor | None,
     *,
     paired: bool,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
-    num_stages: int,
-    group_m: int,
+    plan: NvidiaExecutionPlan,
 ) -> None:
     """Launch one Gluon GEMM over ``[m, k]`` inputs and ``[n, k]`` weights."""
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
+    block_m, block_n, block_k = plan.matmul_block_m, plan.matmul_block_n, plan.matmul_block_k
+    num_warps = plan.matmul_num_warps
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n) * (2 if paired else 1),)
     with device_context(input_qdata.device):
         int8_matmul_gluon_kernel[grid](
@@ -331,8 +336,8 @@ def launch_int8_matmul(
             block_m,
             block_n,
             block_k,
-            num_stages,
-            group_m,
+            plan.matmul_num_stages,
+            plan.matmul_group_m,
             num_warps // WARPS_N,
             bias is not None,
             paired,

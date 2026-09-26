@@ -11,7 +11,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8._amd import triton as amd
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor

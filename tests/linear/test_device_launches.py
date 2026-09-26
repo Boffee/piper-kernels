@@ -20,7 +20,7 @@ from piper_kernels.linear.convrot.int8 import _generic
 from piper_kernels.linear.convrot.int8._amd import triton as amd
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import _gguf
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
@@ -161,9 +161,10 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation):
 def test_prepared_paired_projection_owns_context_for_all_launches(launches, backend, fail):
     launches.backend = "hip" if backend is amd else "cuda"
     launches.fail = fail
-    launches.watch(backend, "int8_matmul_kernel")
+    kernel_backend = nvidia.triton_kernels if backend is nvidia else backend
+    launches.watch(kernel_backend, "int8_matmul_kernel")
     if backend is nvidia:
-        launches.watch(backend, "sm8x_int8_matmul_kernel")
+        launches.watch(kernel_backend, "dynamic_m_int8_matmul_kernel")
     with FakeTensorMode():
         value = torch.empty(129, 256, dtype=torch.int8, device="cuda:0")
         scale = torch.empty(129, device=value.device)

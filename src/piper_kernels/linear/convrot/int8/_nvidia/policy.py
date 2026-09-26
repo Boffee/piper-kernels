@@ -6,28 +6,23 @@ does not imply per-target tuning.
 """
 
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import Literal
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 from .._plan import LinearExecutionPlan
 
-_FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
-_SM8X_FUSED_NUM_WARPS_VALUES = (1, *_FUSED_NUM_WARPS_VALUES)
+_FUSED_NUM_WARPS_VALUES = (1, 2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
 _QUANTIZATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
-_MATMUL_BLOCK_M_VALUES = (16, 32, 64, 128)
-_SM8X_MATMUL_BLOCK_M_VALUES = (*_MATMUL_BLOCK_M_VALUES, 256)
+_MATMUL_BLOCK_M_VALUES = (16, 32, 64, 128, 256)
 _MATMUL_BLOCK_N_VALUES = (16, 32, 64, 128, 256)
 _MATMUL_BLOCK_K_VALUES = (32, 64, 128)
 _MATMUL_NUM_WARPS_VALUES = (2, 4, 8)
 _MATMUL_NUM_STAGES_VALUES = (1, 2, 3, 4)
-_SM8X_MATMUL_GROUP_M_VALUES = (0, 8, 16)
-# SM8x runs exactly these tiles (block_m, block_n, block_k, warps) with the Gluon GEMM in
-# ``gluon.py``: 64x64 warp tiles over 64-column K tiles. Every other tile runs Triton.
-_SM8X_GLUON_TILES = ((128, 128, 64, 4), (256, 128, 64, 8))
-_SM8X_GLUON_NUM_STAGES_VALUES = (3, 4)
+_MATMUL_GROUP_M_VALUES = (0, 8, 16)
+_MATMUL_KERNEL_VALUES = ("triton", "gluon_async_copy")
 
 
 def _choices(values: tuple[int, ...]) -> str:
@@ -37,24 +32,29 @@ def _choices(values: tuple[int, ...]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class NvidiaExecutionPlan(LinearExecutionPlan):
-    """Launch choices accepted by the existing NVIDIA kernels and tuner."""
+    """Explicit implementation and schedule, independent of the selecting architecture.
 
-    fused_num_warps_values: ClassVar[tuple[int, ...]] = _FUSED_NUM_WARPS_VALUES
-    matmul_block_m_values: ClassVar[tuple[int, ...]] = _MATMUL_BLOCK_M_VALUES
+    Triton may specialize on M and contract bias implicitly, or branch per tile and
+    use explicit bias FMAs. Gluon's async-copy implementation always uses dynamic M
+    and explicit FMAs, including in its unaligned-operand fallback.
+    """
+
+    matmul_kernel: Literal["triton", "gluon_async_copy"] = "triton"
+    matmul_group_m: int = 0
+    matmul_specialize_m: bool = True
+    matmul_explicit_bias_fma: bool = False
 
     def __post_init__(self) -> None:
         LinearExecutionPlan.__post_init__(self)
-        if self.fused_num_warps not in self.fused_num_warps_values:
-            choices = _choices(self.fused_num_warps_values)
+        if self.fused_num_warps not in _FUSED_NUM_WARPS_VALUES:
+            choices = _choices(_FUSED_NUM_WARPS_VALUES)
             raise ValueError(f"ConvRot fused preparation num_warps must be {choices}")
         if self.rotation_num_warps not in _ROTATION_NUM_WARPS_VALUES:
             raise ValueError("ConvRot split rotation num_warps must be 1, 2, 4, or 8")
         if self.quantization_num_warps not in _QUANTIZATION_NUM_WARPS_VALUES:
             raise ValueError("ConvRot split quantization num_warps must be 1, 2, 4, or 8")
-        if self.matmul_block_m not in self.matmul_block_m_values:
-            raise ValueError(
-                f"ConvRot matmul block_m must be {_choices(self.matmul_block_m_values)}"
-            )
+        if self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
+            raise ValueError(f"ConvRot matmul block_m must be {_choices(_MATMUL_BLOCK_M_VALUES)}")
         if self.matmul_block_n not in _MATMUL_BLOCK_N_VALUES:
             raise ValueError("ConvRot matmul block_n must be 16, 32, 64, 128, or 256")
         if self.matmul_block_k not in _MATMUL_BLOCK_K_VALUES:
@@ -63,47 +63,33 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
             raise ValueError("ConvRot matmul num_warps must be 2, 4, or 8")
         if self.matmul_num_stages not in _MATMUL_NUM_STAGES_VALUES:
             raise ValueError("ConvRot matmul num_stages must be 1, 2, 3, or 4")
+        self._validate_matmul()
 
-
-@dataclass(frozen=True, slots=True)
-class Sm8xExecutionPlan(NvidiaExecutionPlan):
-    """SM8x launch choices with explicit GEMM grouping.
-
-    The base 128x256 tile spills on SM8x. The 128x128x64 tile with four warps and the
-    256x128x64 tile with eight warps run the Gluon GEMM in ``gluon.py``; other tiles run the
-    shared Triton kernel, so replacing a plan's tile also selects its kernel. Other plans
-    derive grouping from the 128x256 tile, which SM120 schedules keep unchanged. SM8x
-    launches also write bias adds as explicit FMAs. One-warp fused preparation is measured
-    only on SM8x.
-    """
-
-    fused_num_warps_values: ClassVar[tuple[int, ...]] = _SM8X_FUSED_NUM_WARPS_VALUES
-    matmul_block_m_values: ClassVar[tuple[int, ...]] = _SM8X_MATMUL_BLOCK_M_VALUES
-    matmul_group_m: int = 0
-
-    def __post_init__(self) -> None:
-        NvidiaExecutionPlan.__post_init__(self)
+    def _validate_matmul(self) -> None:
+        """Validate implementation capabilities independently of measured target defaults."""
+        if self.matmul_kernel not in _MATMUL_KERNEL_VALUES:
+            raise ValueError("ConvRot matmul kernel must be triton or gluon_async_copy")
+        for name in ("matmul_specialize_m", "matmul_explicit_bias_fma"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"ConvRot {name} must be boolean")
         group_m = self.matmul_group_m
-        if isinstance(group_m, bool) or group_m not in _SM8X_MATMUL_GROUP_M_VALUES:
+        if type(group_m) is not int or group_m not in _MATMUL_GROUP_M_VALUES:
             raise ValueError("ConvRot matmul group_m must be 0, 8, or 16")
-        if self.matmul_kernel == "gluon":
-            if self.matmul_num_stages not in _SM8X_GLUON_NUM_STAGES_VALUES:
-                raise ValueError("ConvRot SM8x Gluon tiles use 3 or 4 stages")
-        elif self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
-            raise ValueError(
-                "ConvRot SM8x 256-row tiles must be 256x128x64 Gluon tiles with 8 warps"
-            )
-
-    @property
-    def matmul_kernel(self) -> str:
-        """Return ``gluon`` for the Gluon GEMM tiles and ``triton`` otherwise."""
-        tile = (
-            self.matmul_block_m,
-            self.matmul_block_n,
-            self.matmul_block_k,
-            self.matmul_num_warps,
-        )
-        return "gluon" if tile in _SM8X_GLUON_TILES else "triton"
+        if self.matmul_kernel == "gluon_async_copy":
+            # Two 64-column warp tiles and two/four 64-row warp tiles per CTA.
+            if (
+                self.matmul_block_m not in (128, 256)
+                or self.matmul_block_n != 128
+                or self.matmul_block_k != 64
+                or self.matmul_num_warps != self.matmul_block_m // 32
+                or self.matmul_num_stages not in (3, 4)
+            ):
+                raise ValueError(
+                    "ConvRot async-copy GEMM requires 128x128x64/4-warps or "
+                    "256x128x64/8-warps, with 3 or 4 stages"
+                )
+        elif self.matmul_block_m == 256:
+            raise ValueError("ConvRot Triton matmul block_m must be 16, 32, 64, or 128")
 
 
 _FUSED_MAX_CHUNK_SIZE = 16_384
@@ -156,6 +142,7 @@ def _base_execution_plan(*, in_features: int) -> NvidiaExecutionPlan:
         matmul_block_k=128,
         matmul_num_warps=8,
         matmul_num_stages=3,
+        matmul_group_m=16,
     )
 
 
@@ -171,12 +158,16 @@ def _sm120_execution_plan(
         return plan
     small_tiles = ((rows + 31) // 32) * ((out_features + 63) // 64)
     if rows <= 32 or small_tiles <= _SM120_SMALL_TILE_LIMIT:
-        return replace(plan, matmul_block_m=32, matmul_block_n=64, matmul_num_stages=4)
+        return replace(
+            plan, matmul_block_m=32, matmul_block_n=64, matmul_num_stages=4, matmul_group_m=0
+        )
     large_columns = (out_features + 255) // 256
     # Count useful 128-row tiles so a one-row tail is not a full tile.
     # When N fits one 64-column tile, wider tiles add no input reuse.
     if out_features <= 64 or rows * large_columns < 128 * _SM120_LARGE_TILE_THRESHOLD:
-        return replace(plan, matmul_block_m=64, matmul_block_n=64, matmul_num_warps=4)
+        return replace(
+            plan, matmul_block_m=64, matmul_block_n=64, matmul_num_warps=4, matmul_group_m=0
+        )
     return plan
 
 
@@ -185,7 +176,7 @@ def _sm8x_execution_plan(
     in_features: int,
     rows: int | None,
     out_features: int | None,
-) -> Sm8xExecutionPlan:
+) -> NvidiaExecutionPlan:
     """Apply measured SM8x policy to the shared preparation plan.
 
     Short and narrow projections use 64-column Triton tiles, where the base 128x256
@@ -201,24 +192,25 @@ def _sm8x_execution_plan(
     # plain inputs do not.
     if in_features <= _SM8X_ONE_WARP_MAX_COLUMNS:
         fused_num_warps = 1
-    plan = Sm8xExecutionPlan(
-        fuse_rotation_quantization=base.fuse_rotation_quantization,
+    plan = replace(
+        base,
         fused_num_warps=fused_num_warps,
-        rotation_num_warps=base.rotation_num_warps,
-        quantization_num_warps=base.quantization_num_warps,
+        matmul_kernel="gluon_async_copy",
         matmul_block_m=256,
         matmul_block_n=128,
         matmul_block_k=64,
         matmul_num_warps=8,
         matmul_num_stages=4,
         matmul_group_m=8,
+        matmul_specialize_m=False,
+        matmul_explicit_bias_fma=True,
     )
     if not rows or not out_features:
         return plan
     column_tiles = (out_features + 63) // 64
     small_tiles = ((rows + _SM8X_SMALL_ROWS - 1) // _SM8X_SMALL_ROWS) * column_tiles
     if rows <= _SM8X_SMALL_ROWS or small_tiles <= _SM8X_SMALL_TILE_LIMIT:
-        return _sm8x_triton_plan(plan, block_m=16, num_stages=4, group_m=0)
+        return _narrow_triton_plan(plan, block_m=16, num_stages=4, group_m=0)
     # Count useful tiles so a one-row tail is not a full tile. Wide outputs step from the
     # 64-row Triton tile to one Gluon tile; narrow outputs to the 128-row Triton tile.
     if out_features >= _SM8X_GLUON_MIN_COLUMNS:
@@ -230,27 +222,30 @@ def _sm8x_execution_plan(
         if rows >= _SM8X_GLUON_MIN_ROWS and rows * wide_columns >= gluon_tiles:
             return gluon
     elif rows * column_tiles >= 128 * _SM8X_LARGE_TILE_THRESHOLD:
-        return sm8x_large_triton_plan(plan)
-    return _sm8x_triton_plan(plan, block_m=64, num_stages=4, group_m=0)
+        return async_copy_fallback_plan(plan)
+    return _narrow_triton_plan(plan, block_m=64, num_stages=4, group_m=0)
 
 
-def sm8x_large_triton_plan(plan: Sm8xExecutionPlan) -> Sm8xExecutionPlan:
+def async_copy_fallback_plan(plan: NvidiaExecutionPlan) -> NvidiaExecutionPlan:
     """Return the grouped 128x64 Triton tile, also used when Gluon operands are unaligned."""
-    return _sm8x_triton_plan(plan, block_m=128, num_stages=3, group_m=16)
+    return _narrow_triton_plan(plan, block_m=128, num_stages=3, group_m=16)
 
 
-def _sm8x_triton_plan(
-    plan: Sm8xExecutionPlan, *, block_m: int, num_stages: int, group_m: int
-) -> Sm8xExecutionPlan:
-    """Return a 64-column, 4-warp Triton tile with the plan's preparation."""
+def _narrow_triton_plan(
+    plan: NvidiaExecutionPlan, *, block_m: int, num_stages: int, group_m: int
+) -> NvidiaExecutionPlan:
+    """Return a dynamic-M, explicit-FMA Triton tile with the plan's preparation."""
     return replace(
         plan,
+        matmul_kernel="triton",
         matmul_block_m=block_m,
         matmul_block_n=64,
         matmul_block_k=128,
         matmul_num_warps=4,
         matmul_num_stages=num_stages,
         matmul_group_m=group_m,
+        matmul_specialize_m=False,
+        matmul_explicit_bias_fma=True,
     )
 
 

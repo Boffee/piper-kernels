@@ -14,7 +14,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
-from piper_kernels.linear.convrot.int8._nvidia import triton as int8_nvidia
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as int8_nvidia
 from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 from piper_kernels.linear.convrot.int8.reference import linear, linear_prepared
 from piper_kernels.weights.convrot._rotation import build_hadamard, rotate_groups
@@ -229,7 +229,7 @@ def test_fused_rotation_quantization_matches_fp32_rotation_exactly(
     expected_qdata = torch.empty_like(activation, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     convrot_backend.rotate_input(activation, rotated, 256, num_warps=4)
-    int8_nvidia.quantize_input(
+    int8_nvidia.triton_kernels.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
@@ -238,7 +238,7 @@ def test_fused_rotation_quantization_matches_fp32_rotation_exactly(
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    int8_nvidia.fused_rotate_quantize_input(
+    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
         activation,
         actual_qdata,
         actual_scale,
@@ -273,7 +273,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
     expected_qdata = torch.empty_like(activation, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     convrot_backend.rotate_input(activation, rotated, 256, num_warps=4)
-    int8_nvidia.quantize_input(
+    int8_nvidia.triton_kernels.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
@@ -282,7 +282,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    int8_nvidia.fused_rotate_quantize_input(
+    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
         raw_activation,
         actual_qdata,
         actual_scale,
@@ -323,7 +323,7 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
     expected_qdata = torch.empty_like(activated_input, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     convrot_backend.rotate_input(activated_input, rotated, 256, num_warps=4)
-    int8_nvidia.quantize_input(
+    int8_nvidia.triton_kernels.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
@@ -332,7 +332,7 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    int8_nvidia.fused_rotate_quantize_input(
+    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
         raw_input,
         actual_qdata,
         actual_scale,
@@ -440,6 +440,8 @@ def test_injected_linear_execution_plan_matches_reference(activation_fn: str | N
     candidate = replace(
         production,
         fuse_rotation_quantization=False,
+        matmul_kernel="triton",
+        matmul_group_m=0,
         matmul_block_m=16,
         matmul_block_n=32,
         matmul_block_k=64,
@@ -625,7 +627,7 @@ def test_fused_preparation_keeps_rotation_beyond_fp16_range(activation_fn):
         maximum = 131072.0
     output = torch.empty((1, 256), device="cuda", dtype=torch.int8)
     scale = torch.empty(1, device="cuda")
-    int8_nvidia.fused_rotate_quantize_input(
+    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
         activation,
         output,
         scale,
@@ -767,14 +769,14 @@ def test_per_tile_tail_matches_split_with_bias_and_strided_output(rows, k, n, dt
     assert torch.all(storage[..., width:] == 42)
 
 
-def _sm8x_available() -> bool:
+def _mma_v2_available() -> bool:
     return torch.cuda.is_available() and AcceleratorTarget.from_device(
         torch.device("cuda")
-    ).is_cuda_capability(8)
+    ).cuda_capability_at_least(8)
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize(
     ("rows", "k", "n"),
     [
@@ -824,7 +826,10 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
     width = n * (2 if paired else 1)
     storage = torch.full((1, rows, width + 13), 42, device="cuda", dtype=dtype)
     out = storage[..., :width]
-    actual = int8_nvidia.linear_prepared(*args, out=out, second_projection=second)
+    selected = select_execution_plan(
+        AcceleratorTarget("cuda", "sm89"), in_features=k, rows=rows, out_features=n
+    )
+    actual = int8_nvidia.execute_prepared_linear(*args, selected, out=out, second_projection=second)
     assert actual is out
     assert torch.equal(actual, expected)
     assert torch.all(storage[..., width:] == 42)
@@ -833,7 +838,7 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
     classes = ((1, 64), (256, 1024), (8192, 128), (2048, 1024), (8192, 4096))
     for class_rows, class_n in classes:
         plan = select_execution_plan(
-            AcceleratorTarget.from_device(value.device),
+            AcceleratorTarget("cuda", "sm89"),
             in_features=k,
             rows=class_rows,
             out_features=class_n,
@@ -843,11 +848,14 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize(("k", "n"), [(256, 1024), (256, 2048), (512, 96)])
 def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
     # Clear in-memory caches so earlier tests cannot hide a per-row-count compile.
-    kernels = (int8_nvidia.sm8x_int8_matmul_kernel, int8_nvidia.gluon.int8_matmul_gluon_kernel)
+    kernels = (
+        int8_nvidia.triton_kernels.dynamic_m_int8_matmul_kernel,
+        int8_nvidia.gluon_async_copy.int8_matmul_gluon_kernel,
+    )
     for kernel in kernels:
         kernel.device_caches.clear()
     torch.manual_seed(k + n)
@@ -857,15 +865,19 @@ def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
     for rows in (1, 2, 15, 16, 17, 64, 97, 128, 255, 256, 769, 1535, 1536, 2048, 4097, 8192):
         value = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
         row_scale = torch.rand(rows, device="cuda") * 0.01
-        int8_nvidia.linear_prepared(value, row_scale, weight, scale, None, torch.bfloat16)
-        plan = int8_nvidia.default_execution_plan(weight, rows=rows)
+        plan = int8_nvidia.default_execution_plan(
+            weight, target=AcceleratorTarget("cuda", "sm89"), rows=rows
+        )
+        int8_nvidia.execute_prepared_linear(
+            value, row_scale, weight, scale, None, torch.bfloat16, plan
+        )
         tiles.add((plan.matmul_block_m, plan.matmul_block_n))
     compiled = sum(len(cache[0]) for kernel in kernels for cache in kernel.device_caches.values())
     assert len(tiles) == compiled == 3
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize(("n", "group_m"), [(1000, 0), (1000, 16), (2000, 0)])
 def test_sm8x_gluon_gemm_matches_base_schedule_with_any_grouping(n, group_m):
     # Tuner candidates keep the production plan's grouping, which may be 0 (ungrouped).
@@ -878,15 +890,20 @@ def test_sm8x_gluon_gemm_matches_base_schedule_with_any_grouping(n, group_m):
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     args = (value, row_scale, weight, scale, bias, torch.bfloat16)
     base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
-    plan = replace(int8_nvidia.default_execution_plan(weight, rows=rows), matmul_group_m=group_m)
+    plan = replace(
+        int8_nvidia.default_execution_plan(
+            weight, target=AcceleratorTarget("cuda", "sm89"), rows=rows
+        ),
+        matmul_group_m=group_m,
+    )
 
-    assert plan.matmul_kernel == "gluon"
+    assert plan.matmul_kernel == "gluon_async_copy"
     actual = int8_nvidia.execute_prepared_linear(*args, plan)
     assert torch.equal(actual, int8_nvidia.execute_prepared_linear(*args, base))
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize(("offset", "k"), [(0, 512), (8, 512), (0, 520)])
 def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, k):
     # An unaligned input pointer or a K that is not a multiple of 16 bytes runs Triton.
@@ -900,24 +917,60 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, 
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     args = (value, row_scale, weight, scale, bias, torch.bfloat16)
     base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
-    plan = int8_nvidia.default_execution_plan(weight, rows=rows)
+    plan = int8_nvidia.default_execution_plan(
+        weight, target=AcceleratorTarget("cuda", "sm89"), rows=rows
+    )
     launches = []
-    launch = int8_nvidia.gluon.launch_int8_matmul
+    launch = int8_nvidia.gluon_async_copy.launch_int8_matmul
     monkeypatch.setattr(
-        int8_nvidia.gluon,
+        int8_nvidia.gluon_async_copy,
         "launch_int8_matmul",
-        lambda *a, **kw: launches.append(kw["block_m"]) or launch(*a, **kw),
+        lambda *a, **kw: launches.append(kw["plan"].matmul_block_m) or launch(*a, **kw),
     )
 
     actual = int8_nvidia.execute_prepared_linear(*args, plan)
 
-    assert plan.matmul_kernel == "gluon"
+    assert plan.matmul_kernel == "gluon_async_copy"
     assert launches == ([plan.matmul_block_m] if offset == 0 and k % 16 == 0 else [])
     assert torch.equal(actual, int8_nvidia.execute_prepared_linear(*args, base))
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
+def test_explicit_async_copy_plan_preserves_paired_fma_on_unaligned_input():
+    # Start with SM120's implicit-FMA defaults, then explicitly select Gluon. Its
+    # fallback must retain Gluon's rounding even though this is not an SM8x policy plan.
+    torch.manual_seed(889)
+    rows, k, n = 513, 512, 1024
+    storage = torch.randint(-127, 128, (rows * k + 8,), device="cuda", dtype=torch.int8)
+    value = storage[8:].view(rows, k)
+    row_scale = torch.rand(rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.float32)
+    second = (
+        torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8),
+        torch.rand(n, 1, device="cuda") * 0.01,
+        torch.randn(n, device="cuda", dtype=torch.float16),
+    )
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    plan = replace(
+        base,
+        matmul_kernel="gluon_async_copy",
+        matmul_block_m=128,
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        matmul_num_stages=3,
+    )
+    args = (value, row_scale, weight, scale, bias, torch.float32)
+    actual = int8_nvidia.execute_prepared_linear(*args, plan, second_projection=second)
+    expected = int8_nvidia.execute_prepared_linear(*args, base, second_projection=second)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize(
     ("rows", "in_features", "group_size"),
     [(1, 16, 16), (7, 96, 16), (129, 256, 256), (1000, 768, 64), (1000, 1024, 256)],
@@ -942,7 +995,16 @@ def test_sm8x_one_warp_preparation_stays_within_one_code(
         execution_plan=base,
         target=AcceleratorTarget.from_device(value.device),
     )
-    qdata, scale = int8_nvidia.prepare_input(value, group_size, activation_fn, input_scale)
+    one_warp = replace(base, fused_num_warps=1)
+    qdata, scale = int8_nvidia.prepare_input_with_plan(
+        value,
+        in_features,
+        group_size,
+        activation_fn=activation_fn,
+        input_scale=input_scale,
+        execution_plan=one_warp,
+        target=AcceleratorTarget.from_device(value.device),
+    )
 
     if activation_fn is None:
         # Plain rows do not depend on the preparation warp count.
@@ -965,7 +1027,7 @@ def test_fused_preparation_validates_input_width_from_qdata(
     input_scale = torch.empty(rows, dtype=torch.float32)
 
     with pytest.raises(ValueError, match=f"must have shape \\({rows}, {expected_width}\\)"):
-        int8_nvidia.fused_rotate_quantize_input(
+        int8_nvidia.triton_kernels.fused_rotate_quantize_input(
             activation,
             input_qdata,
             input_scale,
@@ -982,7 +1044,7 @@ def test_fused_preparation_rejects_unsupported_row_width() -> None:
     input_scale = torch.empty(rows, dtype=torch.float32)
 
     with pytest.raises(ValueError, match=f"does not support row width {in_features}"):
-        int8_nvidia.fused_rotate_quantize_input(
+        int8_nvidia.triton_kernels.fused_rotate_quantize_input(
             activation,
             input_qdata,
             input_scale,

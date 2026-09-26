@@ -209,6 +209,7 @@ def int8_matmul_kernel(
     aligned_nk: tl.constexpr,
     group_m: tl.constexpr,
     explicit_bias_fma: tl.constexpr,
+    per_tile_tail: tl.constexpr,
 ):
     if group_m:
         pid = tl.program_id(0)
@@ -248,8 +249,7 @@ def int8_matmul_kernel(
     # Large tiles share one launch. With aligned N/K, complete M tiles take an
     # unmasked branch around the entire projection. Other widths use the masked
     # loop in the same launch; branching for those widths can regress performance.
-    # SM8x launches, which write bias adds as explicit FMAs, branch for every tile.
-    if (group_m or explicit_bias_fma) and aligned_nk:
+    if per_tile_tail and aligned_nk:
         tile_aligned = aligned_m or (pid_m + 1) * block_m <= m
     else:
         tile_aligned = aligned_m and aligned_nk

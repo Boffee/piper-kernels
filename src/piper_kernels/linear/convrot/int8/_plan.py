@@ -27,6 +27,6 @@ class LinearExecutionPlan:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"ConvRot launch dimension {name} must be a positive integer")
 
-    def as_dict(self) -> dict[str, int | bool]:
+    def as_dict(self) -> dict[str, int | bool | str]:
         """Return execution choices as serializable benchmark metadata."""
         return asdict(self)

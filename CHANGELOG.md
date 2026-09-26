@@ -25,7 +25,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - SM8x NVIDIA GPUs (SM80, SM86, SM87, SM89) now select ConvRot INT8 GEMM tiles from the row
   count and output width, using thresholds measured on SM89. Previously these GPUs used the
   fixed 128x256 tile for every shape, which spills registers on SM8x. Short and narrow
-  projections use 64-column Triton tiles. Wider projections run a new SM8x Gluon GEMM that
+  projections use 64-column Triton tiles. Wider projections run a new NVIDIA Gluon GEMM that
   follows the CUTLASS SM80 INT8 schedule, with 128x128 tiles up to 1,024 output columns and
   256x128 tiles beyond. A layer compiles at most three GEMMs as its row count changes. On an RTX
   4070 Ti SUPER, whole linears including preparation run MiniMax H3 transformer blocks at
@@ -38,6 +38,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   linears against the original plan and BF16 in about three minutes.
   `benchmark_convrot_int8_small_m.py` measures the original plan as `previous_linear` on every
   target, and `--compare-schedules` forces the SM8x configurations on SM8x.
+  NVIDIA policy, dispatch, and implementation launchers are separated; one plan type names
+  the kernel, grouping, row specialization, and bias rounding explicitly. The async-copy
+  kernel is also covered on SM120. The tuner supports explicit implementation/grouping axes
+  and 256-row tiles, reporting unsupported combinations without aborting valid candidates.
 
 ## [0.7.6rc1] - 2026-09-25
 

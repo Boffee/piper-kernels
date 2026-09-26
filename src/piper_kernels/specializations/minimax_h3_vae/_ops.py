@@ -5,6 +5,7 @@ from dataclasses import replace
 import torch
 
 from piper_kernels.linear.convrot.int8 import _backend as convrot_int8_backend
+from piper_kernels.linear.convrot.int8._nvidia.policy import NvidiaExecutionPlan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 
 
@@ -16,14 +17,19 @@ def _execution_plan(
         raise ValueError("H3 VAE ConvRot schedule must contain exactly five integers")
     block_m, block_n, block_k, num_warps, num_stages = schedule
     backend = convrot_int8_backend.require_linear_backend(weight_qdata)
-    return replace(
-        backend.default_execution_plan(weight_qdata),
-        matmul_block_m=block_m,
-        matmul_block_n=block_n,
-        matmul_block_k=block_k,
-        matmul_num_warps=num_warps,
-        matmul_num_stages=num_stages,
-    )
+    plan = backend.default_execution_plan(weight_qdata)
+    choices: dict[str, object] = {
+        "matmul_block_m": block_m,
+        "matmul_block_n": block_n,
+        "matmul_block_k": block_k,
+        "matmul_num_warps": num_warps,
+        "matmul_num_stages": num_stages,
+    }
+    if isinstance(plan, NvidiaExecutionPlan):
+        # Translate the legacy five-integer schedule to explicit Triton grouping.
+        choices["matmul_kernel"] = "triton"
+        choices["matmul_group_m"] = 16 if (block_m, block_n) == (128, 256) else 0
+    return replace(plan, **choices)
 
 
 @torch.library.custom_op(

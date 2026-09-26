@@ -53,6 +53,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, ali
             "aligned_nk": aligned_nk,
             "group_m": group_m,
             "explicit_bias_fma": False,
+            "per_tile_tail": bool(group_m),
         },
     )
     compiled = triton.compile(
@@ -103,6 +104,7 @@ def test_rdna4_h3_projection_schedule_compiles(architecture, aligned_nk):
             "aligned_nk": aligned_nk,
             "group_m": 0,
             "explicit_bias_fma": False,
+            "per_tile_tail": False,
         },
     )
     compiled = triton.compile(

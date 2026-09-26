@@ -253,11 +253,14 @@ def test_pass_emits_measured_rdna4_schedule() -> None:
     graph.lint()
 
 
-def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch) -> None:
+@pytest.mark.parametrize("target", [_SM120, AcceleratorTarget("cuda", "sm89")])
+def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch, target) -> None:
     weight = torch.empty(16_384, 2_048, dtype=torch.int8, device="meta")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: _SM120)
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
 
     plan = _execution_plan(weight, [128, 128, 64, 8, 3])
+    assert plan.matmul_kernel == "triton"
+    assert plan.matmul_group_m == 0
 
     assert plan.matmul_block_m == 128
     assert plan.matmul_block_n == 128

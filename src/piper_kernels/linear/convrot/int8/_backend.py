@@ -20,7 +20,7 @@ except ModuleNotFoundError as error:
     _mean_backend = None
 
 try:
-    from ._nvidia import triton as _nvidia_backend
+    from ._nvidia import dispatch as _nvidia_backend
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise

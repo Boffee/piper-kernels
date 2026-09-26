@@ -9,7 +9,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
 from piper_kernels.linear.convrot.int8._nvidia.policy import (
     NvidiaExecutionPlan,
-    Sm8xExecutionPlan,
     select_execution_plan,
 )
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
@@ -21,12 +20,12 @@ _SM8X_TILES = {
     "small": (16, 64, 128, 4, 4, 0, "triton"),
     "medium": (64, 64, 128, 4, 4, 0, "triton"),
     "large": (128, 64, 128, 4, 3, 16, "triton"),
-    "gluon_medium": (128, 128, 64, 4, 3, 8, "gluon"),
-    "gluon_large": (256, 128, 64, 8, 4, 8, "gluon"),
+    "gluon_medium": (128, 128, 64, 4, 3, 8, "gluon_async_copy"),
+    "gluon_large": (256, 128, 64, 8, 4, 8, "gluon_async_copy"),
 }
 
 
-def _sm8x_tile(plan: Sm8xExecutionPlan) -> tuple[int | str, ...]:
+def _sm8x_tile(plan: NvidiaExecutionPlan) -> tuple[int | str, ...]:
     return (
         plan.matmul_block_m,
         plan.matmul_block_n,
@@ -213,6 +212,7 @@ def test_shape_aware_schedule_preserves_preparation(rows, k, n, block_m):
             matmul_block_n=previous.matmul_block_n,
             matmul_num_warps=previous.matmul_num_warps,
             matmul_num_stages=previous.matmul_num_stages,
+            matmul_group_m=previous.matmul_group_m,
         )
         == previous
     )
@@ -318,7 +318,7 @@ def test_sm8x_schedule_uses_its_own_tiles_and_preserves_preparation(architecture
     previous = select_execution_plan(_SM120, in_features=5376)
     actual = select_execution_plan(target, in_features=5376, rows=rows, out_features=n)
 
-    assert isinstance(actual, Sm8xExecutionPlan)
+    assert isinstance(actual, NvidiaExecutionPlan)
     assert _sm8x_tile(actual) == _SM8X_TILES[tile]
     preparation = ("fuse_rotation_quantization", "fused_num_warps")
     preparation += ("rotation_num_warps", "quantization_num_warps")
@@ -359,6 +359,9 @@ def test_sm8x_schedule_without_shape_uses_grouped_large_tile(architecture, in_fe
         "matmul_num_warps": 8,
         "matmul_num_stages": 4,
         "matmul_group_m": 8,
+        "matmul_kernel": "gluon_async_copy",
+        "matmul_specialize_m": False,
+        "matmul_explicit_bias_fma": True,
     }
 
 
@@ -398,15 +401,12 @@ def test_sm8x_preparation_depends_only_on_in_features(architecture, in_features,
         assert plan.quantization_num_warps == previous.quantization_num_warps
 
 
-def test_only_sm8x_plans_accept_one_fused_preparation_warp():
-    sm8x = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
-    sm120 = select_execution_plan(_SM120, in_features=512)
-
-    assert sm8x.fused_num_warps == 1
-    with pytest.raises(ValueError, match="must be 2, 4, 8, or 16"):
-        replace(sm120, fused_num_warps=1)
+@pytest.mark.parametrize("architecture", ["sm89", "sm120"])
+def test_one_warp_preparation_is_an_explicit_nvidia_option(architecture):
+    plan = select_execution_plan(AcceleratorTarget("cuda", architecture), in_features=512)
+    assert replace(plan, fused_num_warps=1).fused_num_warps == 1
     with pytest.raises(ValueError, match="must be 1, 2, 4, 8, or 16"):
-        replace(sm8x, fused_num_warps=3)
+        replace(plan, fused_num_warps=3)
 
 
 @pytest.mark.parametrize(
@@ -422,11 +422,11 @@ def test_sm8x_plan_rejects_unsupported_kernel_tiles(changes):
     # The shape-free SM8x plan is the 256x128 Gluon tile; Triton tiles stop at 128 rows.
     plan = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
 
-    with pytest.raises(ValueError, match="ConvRot SM8x"):
+    with pytest.raises(ValueError, match="ConvRot async-copy"):
         replace(plan, **changes)
 
 
-@pytest.mark.parametrize("group_m", [-1, 1, 4, 32, True, False])
+@pytest.mark.parametrize("group_m", [-1, 1, 4, 32, True, False, 8.0, 16.0])
 def test_sm8x_plan_rejects_invalid_group_m(group_m):
     plan = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
 
@@ -447,6 +447,10 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
         "matmul_block_k": 128,
         "matmul_num_warps": 8,
         "matmul_num_stages": 3,
+        "matmul_kernel": "triton",
+        "matmul_group_m": 16,
+        "matmul_specialize_m": True,
+        "matmul_explicit_bias_fma": False,
     }
 
 
@@ -481,7 +485,34 @@ def test_execution_plan_rejects_invalid_fused_warp_count() -> None:
     plan = select_execution_plan(_SM120, in_features=512)
 
     with pytest.raises(ValueError, match="ConvRot"):
-        replace(plan, fused_num_warps=1)
+        replace(plan, fused_num_warps=3)
+
+
+def test_kernel_selection_is_independent_of_tile_replacement() -> None:
+    sm120 = select_execution_plan(_SM120, in_features=512)
+    triton = replace(
+        sm120,
+        matmul_block_m=128,
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        matmul_num_stages=3,
+    )
+    assert triton.matmul_kernel == "triton"
+    gluon = replace(triton, matmul_kernel="gluon_async_copy")
+    assert replace(gluon, matmul_num_stages=4).matmul_kernel == "gluon_async_copy"
+    with pytest.raises(ValueError, match="async-copy GEMM requires"):
+        replace(gluon, matmul_block_n=64)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"matmul_kernel": "unknown"}, {"matmul_specialize_m": 1}, {"matmul_explicit_bias_fma": 0}],
+)
+def test_execution_plan_rejects_invalid_implementation_options(changes) -> None:
+    plan = select_execution_plan(_SM120, in_features=512)
+    with pytest.raises(ValueError, match="ConvRot"):
+        replace(plan, **changes)
 
 
 @pytest.mark.parametrize(

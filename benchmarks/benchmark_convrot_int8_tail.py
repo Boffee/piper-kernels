@@ -22,8 +22,8 @@ from lib.convrot_int8_legacy import legacy_matmul
 from lib.environment import capture_environment
 from triton.testing import do_bench_cudagraph
 
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.linear.convrot.int8._nvidia import policy
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 
 
 def _positive_int(value: str) -> int:

@@ -32,8 +32,8 @@ import torch
 from lib.environment import capture_environment
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.linear.convrot.int8._nvidia import policy
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 
 _GROUP_SIZE = 256
