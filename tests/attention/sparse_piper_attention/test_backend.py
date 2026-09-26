@@ -173,13 +173,26 @@ def test_score_selection_is_independent_and_uses_operand_target(monkeypatch, tar
     probe.assert_called_once_with(summary.device)
 
 
-@pytest.fixture
-def score_selection_operands(monkeypatch):
+@pytest.mark.parametrize("query_blocks", [65, 128, 384, 385])
+@pytest.mark.parametrize("head_groups", [1, 3])
+def test_score_selection_accepts_large_query_chunks(monkeypatch, query_blocks, head_groups):
+    score = Mock()
+    monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
+    )
+    query = torch.empty(1, 2 * head_groups, query_blocks, 128)
+    primary = torch.empty(1, 2, 17, 128)
+    assert _backend.select_minmax_scores(query, primary, primary) is score
+
+
+@pytest.fixture(params=[32, 384], ids=["small_query", "large_query"])
+def score_selection_operands(monkeypatch, request):
     """Reject unsupported operands before any device probe or kernel launch."""
     score = Mock()
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
-    query = torch.empty(1, 2, 32, 128)
+    query = torch.empty(1, 2, request.param, 128)
     primary = torch.empty(1, 2, 17, 128)
     return [query, primary, torch.empty_like(primary)]
 
@@ -189,7 +202,6 @@ def score_selection_operands(monkeypatch):
     [
         "rank",
         "width",
-        "large_query",
         "empty_query",
         "empty_batch",
         "empty_heads",
@@ -204,8 +216,6 @@ def test_score_selection_rejects_unsupported_shapes(score_selection_operands, in
         query = query[0]
     elif invalid == "width":
         query = query[..., :64]
-    elif invalid == "large_query":
-        query = torch.empty(1, 2, 65, 128)
     elif invalid == "empty_query":
         query = query[:, :, :0]
     elif invalid == "empty_batch":
@@ -227,7 +237,7 @@ def test_score_selection_rejects_unsupported_storage(score_selection_operands, i
     if invalid == "dtype":
         primary = primary.bfloat16()
     elif invalid == "query_stride":
-        query = torch.empty(1, 2, 32, 256)[..., ::2]
+        query = torch.empty(*query.shape[:-1], 256)[..., ::2]
     elif invalid == "key_stride":
         primary = torch.empty(1, 2, 17, 256)[..., ::2]
     else:
@@ -264,14 +274,18 @@ def test_scoring_orchestration_selects_minmax_only_and_forwards_scale(monkeypatc
     select.assert_called_once()
 
 
-def test_score_fallback_keeps_autograd(monkeypatch):
+@pytest.mark.parametrize("query_blocks", [3, 384])
+def test_score_fallback_keeps_autograd(monkeypatch, query_blocks):
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
     score = Mock(side_effect=AssertionError("non-differentiable kernel"))
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
     generator = torch.Generator().manual_seed(673)
-    tensors = [torch.randn(1, 2, 3, 128, generator=generator, requires_grad=True) for _ in range(3)]
+    tensors = [
+        torch.randn(1, 2, blocks, 128, generator=generator, requires_grad=True)
+        for blocks in (query_blocks, 3, 3)
+    ]
     result = _routing.routing_scores(*tensors, _routing_modes._MINMAX_ROUTING, score_scale=0.125)
     expected = torch.maximum(
         tensors[0] @ tensors[1].transpose(-1, -2) * 0.125,
