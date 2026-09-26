@@ -646,7 +646,7 @@ separate coarse-residual API, or SageAttention2++ to GQA.
 ## Sparse Piper Attention
 
 Sparse Piper is a separate non-causal operator for pre-tiled H3-style self-attention,
-with optimized SM120 and RDNA4 backends:
+with optimized SM89, SM120, and RDNA4 backends:
 
 ```python
 from piper_kernels import SparsePiperAttention
@@ -684,9 +684,10 @@ semantic per-layer ratio profile.
 Each opaque attention call derives its temporary physical keep counts, packed offsets, and exact
 route storage from that immutable model configuration and the current prefix length. Dynamic
 compiled graphs accept changed prefix lengths and their resulting route capacities without compiling
-another graph or SM120 attention kernel. Routes remain call-local because both policies depend on
-the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler rewrites preserve
-the selected policy while producing its summaries directly from fused projections.
+another graph or SM120 or SM89 attention kernel. Routes remain call-local because both policies
+depend on the current Q/K values. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 compiler
+rewrites preserve the selected policy while producing its summaries directly from fused
+projections.
 
 When every head's physical budget includes every sparse key block, fine routing skips its
 scores and top-k selection. Standalone attention also skips routing summaries in this case.
@@ -765,10 +766,13 @@ Affine norms continue to infer head width from their weight when `head_dim` is o
 ConvRot INT8 Q/K/V projection biases are added in FP32 inside the existing fused kernels,
 including the global V mean and coarse block means used by centered attention.
 
-The SM120 path supports both head widths, pairs two logical K64 tiles in one physical K128
+The NVIDIA path supports both head widths, pairs two logical K64 tiles in one physical K128
 recurrence, and uses one centered-V INT8 scale per logical tile. It normally reads packed UINT16
 routes. Full-keep D64 calls use `skip_dense_routing` to visit all blocks without a route list;
 D128 retains the list. The online numerator and pre-rounding denominator remain FP32.
+SM120 uses TMA descriptors; SM89 uses `cp.async` copies with Q64 tiles, four warps, and a
+D64 register cap of 168. Both use the shared preparation and routing code. NVIDIA projection
+and output fusions remain restricted to SM120.
 The RDNA4 native path supports D64 and D128, including ConvRot INT8 projection and output
 fusions. Both widths retain packed route lists and the four-wave Q64 schedule.
 Unsupported devices use a slow portable implementation of the same quantized Sparse Piper

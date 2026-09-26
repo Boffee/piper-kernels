@@ -41,7 +41,9 @@ _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 def _reset_attention_kernel_cache():
     """Clear and return the active backend's attention kernel."""
     target = AcceleratorTarget.from_device(torch.device("cuda"))
-    module = attention_backend.amd_gluon if target.is_amd_hip else attention_backend.nvidia_gluon
+    module = (
+        attention_backend.amd_gluon if target.is_amd_hip else attention_backend.nvidia_tma_gluon
+    )
     assert module is not None
     kernel = module._sparse_piper_attention_kernel
     kernel.device_caches.clear()

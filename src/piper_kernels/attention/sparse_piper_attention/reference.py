@@ -92,7 +92,7 @@ def _quantize_query_key(
     query: torch.Tensor,
     key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Match SM120 per-Q32 and per-K64 grouped quantization."""
+    """Match the native per-Q32 and per-K64 grouped quantization."""
     return quantize_query_key(
         query,
         key,
@@ -113,7 +113,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
 ) -> torch.Tensor:
     """Evaluate the selected quantized Sparse Piper algorithm in PyTorch.
 
-    This matches the SM120 algorithmic contract: grouped INT8 Q/K, centered
+    This matches the native algorithmic contract: grouped INT8 Q/K, centered
     tile-scaled INT8 V, paired K128 recurrence, UINT8 probabilities, and a
     pre-rounding FP32 denominator. It is a correctness reference, not a fast
     fallback.

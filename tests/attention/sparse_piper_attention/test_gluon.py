@@ -1,4 +1,4 @@
-"""Integer accumulation checks for the SM120 sparse kernel."""
+"""Integer accumulation checks for the paired PV step shared by SM89 and SM120."""
 
 import pytest
 import torch
@@ -7,16 +7,17 @@ from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._nvidia.gluon import (
-    _piper_pv_pair,
-)
+from piper_kernels.attention.sparse_piper_attention._nvidia._recurrence import piper_pv_pair
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
         not torch.cuda.is_available()
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-        reason="requires exact NVIDIA SM120",
+        or not (
+            AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
+            or AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(8, 9)
+        ),
+        reason="requires exact NVIDIA SM89 or SM120",
     ),
 ]
 
@@ -56,7 +57,7 @@ def _paired_pv_kernel(
     values.index(1).store(gl.load(value_1_ptr + value_offsets))
     gl.barrier()
     output_m = gl.arange(0, query_rows, gl.SliceLayout(1, mma))
-    output = _piper_pv_pair(
+    output = piper_pv_pair(
         probabilities,
         values,
         gl.full([query_rows, head_dim], 0.25, gl.float32, mma),

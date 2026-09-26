@@ -27,9 +27,10 @@ def route_selector():
     target = AcceleratorTarget.from_device(torch.device("cuda"))
     if not (
         target.is_cuda_capability(12, 0)
+        or target.is_cuda_capability(8, 9)
         or (target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"))
     ):
-        pytest.skip("requires SM120 or RDNA4 route selection")
+        pytest.skip("requires SM89, SM120, or RDNA4 route selection")
     selector = _backend.select_route_selector(torch.empty(0, device="cuda", dtype=torch.uint16))
     assert selector is not None
     return selector
