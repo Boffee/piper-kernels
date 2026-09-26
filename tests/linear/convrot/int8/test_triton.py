@@ -830,7 +830,9 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
     assert torch.equal(actual, expected)
     assert torch.all(storage[..., width:] == 42)
     # Every SM8x tile class must agree on each tail shape, not only the selected one.
-    for class_rows, class_n in ((1, 64), (256, 1024), (8192, 4096)):
+    # Small, medium, and large Triton tiles, then the 128- and 256-row Gluon tiles.
+    classes = ((1, 64), (256, 1024), (8192, 128), (2048, 1024), (8192, 4096))
+    for class_rows, class_n in classes:
         plan = select_execution_plan(
             AcceleratorTarget.from_device(value.device),
             in_features=k,
@@ -839,6 +841,36 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
         )
         forced = int8_nvidia.execute_prepared_linear(*args, plan, second_projection=second)
         assert torch.equal(forced, expected), (plan, selected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.parametrize("offset", [0, 8])
+def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset):
+    torch.manual_seed(417)
+    rows, k, n = 1030, 512, 1000
+    storage = torch.randint(-127, 128, (rows * k + 16,), device="cuda", dtype=torch.int8)
+    value = storage[offset : offset + rows * k].view(rows, k)
+    row_scale = torch.rand(rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    args = (value, row_scale, weight, scale, bias, torch.bfloat16)
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    plan = int8_nvidia.default_execution_plan(weight, rows=rows)
+    launches = []
+    launch = int8_nvidia.gluon.launch_int8_matmul
+    monkeypatch.setattr(
+        int8_nvidia.gluon,
+        "launch_int8_matmul",
+        lambda *a, **kw: launches.append(kw["block_m"]) or launch(*a, **kw),
+    )
+
+    actual = int8_nvidia.execute_prepared_linear(*args, plan)
+
+    assert plan.matmul_kernel == "gluon"
+    assert launches == ([plan.matmul_block_m] if offset == 0 else [])
+    assert torch.equal(actual, int8_nvidia.execute_prepared_linear(*args, base))
 
 
 @pytest.mark.gpu

@@ -92,7 +92,10 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
+    gluon_kernel = MagicMock()
     monkeypatch.setattr(backend, "int8_matmul_kernel", kernel)
+    if backend is nvidia:
+        monkeypatch.setattr(nvidia.gluon, "int8_matmul_gluon_kernel", gluon_kernel)
     value = torch.empty(m, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
     row_scale = torch.empty(m, device="meta")
@@ -102,21 +105,25 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
         value, row_scale, weight, scale, None, torch.bfloat16, plan
     )
     assert result.shape == (m, n)
+    uses_gluon = getattr(plan, "matmul_kernel", "triton") == "gluon"
+    launched, unused = (gluon_kernel, kernel) if uses_gluon else (kernel, gluon_kernel)
+    unused.__getitem__.assert_not_called()
     if not m or not n:
-        kernel.__getitem__.assert_not_called()
+        launched.__getitem__.assert_not_called()
     else:
         row_tiles = (m + plan.matmul_block_m - 1) // plan.matmul_block_m
         column_tiles = (n + plan.matmul_block_n - 1) // plan.matmul_block_n
-        assert kernel.__getitem__.call_args_list == [call((row_tiles * column_tiles,))]
-        kernel.__getitem__.return_value.assert_called_once()
-        flags = kernel.__getitem__.return_value.call_args.kwargs
-        assert flags["aligned_m"] == (m % plan.matmul_block_m == 0)
-        assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
+        assert launched.__getitem__.call_args_list == [call((row_tiles * column_tiles,))]
+        launched.__getitem__.return_value.assert_called_once()
+        if not uses_gluon:
+            flags = kernel.__getitem__.return_value.call_args.kwargs
+            assert flags["aligned_m"] == (m % plan.matmul_block_m == 0)
+            assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
 
 
 @pytest.mark.parametrize(
     ("architecture", "rows", "block_m"),
-    [("sm120", None, 128), ("sm120", 1280, 64), ("sm89", None, 128), ("sm86", 256, 64)],
+    [("sm120", None, 128), ("sm120", 1280, 64), ("sm89", None, 256), ("sm86", 256, 64)],
 )
 def test_nvidia_planner_needs_no_device_properties_with_explicit_target(
     monkeypatch, architecture, rows, block_m
@@ -139,10 +146,10 @@ def test_nvidia_planner_needs_no_device_properties_with_explicit_target(
         ("sm120", 4096, None, 16),
         ("sm120", 4096, (128, 128, 128, 4, 2), 0),
         ("sm120", 64, None, 0),
-        ("sm89", 4096, None, 16),
+        ("sm89", 512, None, 16),
         ("sm89", 256, None, 0),
         ("sm89", 4, None, 0),
-        ("sm86", 4096, (128, 256, 128, 8, 3), 16),
+        ("sm86", 512, (128, 256, 128, 8, 3), 16),
     ],
 )
 @pytest.mark.parametrize("paired", [False, True])
@@ -183,6 +190,39 @@ def test_nvidia_launch_grouping_follows_the_plan(
     grid = (row_tiles * column_tiles,) if group_m else (row_tiles, column_tiles)
     assert kernel.__getitem__.call_args_list == [call(grid)]
     assert kernel.__getitem__.return_value.call_args.kwargs["group_m"] == group_m
+
+
+@pytest.mark.parametrize(("rows", "block_m", "num_warps"), [(4096, 256, 8), (2048, 128, 4)])
+@pytest.mark.parametrize("paired", [False, True])
+def test_sm8x_wide_projections_launch_the_gluon_kernel(
+    monkeypatch, rows, block_m, num_warps, paired
+):
+    target = AcceleratorTarget("cuda", "sm89")
+    monkeypatch.setattr(nvidia, "device_context", lambda device: nullcontext())
+    kernel = MagicMock()
+    gluon_kernel = MagicMock()
+    monkeypatch.setattr(nvidia, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(nvidia.gluon, "int8_matmul_gluon_kernel", gluon_kernel)
+    k, n = 1024, 1000
+    value = torch.empty(rows, k, device="meta", dtype=torch.int8)
+    weight = torch.empty(n, k, device="meta", dtype=torch.int8)
+    plan = nvidia.default_execution_plan(weight, target=target, rows=rows)
+    second = (weight, torch.empty(n, 1, device="meta"), None) if paired else None
+    nvidia.execute_prepared_linear(
+        value,
+        torch.empty(rows, device="meta"),
+        weight,
+        torch.empty(n, 1, device="meta"),
+        None,
+        torch.bfloat16,
+        plan,
+        second_projection=second,
+    )
+    tiles = (rows + block_m - 1) // block_m * ((n + 127) // 128) * (2 if paired else 1)
+    assert plan.matmul_kernel == "gluon"
+    kernel.__getitem__.assert_not_called()
+    assert gluon_kernel.__getitem__.call_args_list == [call((tiles,))]
+    assert gluon_kernel.__getitem__.return_value.call_args.kwargs["num_warps"] == num_warps
 
 
 @pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])

@@ -18,13 +18,15 @@ from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 _SM120 = AcceleratorTarget("cuda", "sm120")
 _SM8X_ARCHITECTURES = ["sm80", "sm86", "sm87", "sm89"]
 _SM8X_TILES = {
-    16: (16, 64, 128, 4, 4, 0),
-    64: (64, 64, 128, 4, 4, 0),
-    128: (128, 64, 128, 4, 3, 16),
+    "small": (16, 64, 128, 4, 4, 0, "triton"),
+    "medium": (64, 64, 128, 4, 4, 0, "triton"),
+    "large": (128, 64, 128, 4, 3, 16, "triton"),
+    "gluon_medium": (128, 128, 64, 4, 3, 8, "gluon"),
+    "gluon_large": (256, 128, 64, 8, 4, 8, "gluon"),
 }
 
 
-def _sm8x_tile(plan: Sm8xExecutionPlan) -> tuple[int, ...]:
+def _sm8x_tile(plan: Sm8xExecutionPlan) -> tuple[int | str, ...]:
     return (
         plan.matmul_block_m,
         plan.matmul_block_n,
@@ -32,6 +34,7 @@ def _sm8x_tile(plan: Sm8xExecutionPlan) -> tuple[int, ...]:
         plan.matmul_num_warps,
         plan.matmul_num_stages,
         plan.matmul_group_m,
+        plan.matmul_kernel,
     )
 
 
@@ -266,34 +269,43 @@ def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_
 
 @pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
 @pytest.mark.parametrize(
-    ("rows", "n", "block_m"),
+    ("rows", "n", "tile"),
     [
-        (1, 14336, 16),
-        (16, 14336, 16),
-        (17, 1024, 16),
-        (96, 1024, 16),
-        (97, 1024, 64),
-        (32, 3072, 16),
-        (33, 3072, 64),
-        (127, 4096, 64),
-        (128, 4096, 128),
-        (511, 1024, 64),
-        (512, 1024, 128),
-        (1536, 16, 16),
-        (1537, 16, 64),
-        (8191, 64, 64),
-        (8192, 64, 128),
-        (100000, 96, 128),
-        (32768, 16384, 128),
+        (1, 14336, "small"),
+        (16, 14336, "small"),
+        (17, 1024, "small"),
+        (96, 1024, "small"),
+        (97, 1024, "medium"),
+        (32, 3072, "small"),
+        (33, 3072, "medium"),
+        (127, 4096, "medium"),
+        (128, 4096, "large"),
+        (255, 16384, "large"),
+        (256, 16384, "gluon_large"),
+        (256, 2048, "large"),
+        (511, 1024, "medium"),
+        (512, 1024, "large"),
+        (767, 1024, "large"),
+        (768, 1024, "gluon_medium"),
+        (4095, 1024, "gluon_medium"),
+        (4096, 1024, "gluon_large"),
+        (1536, 16, "small"),
+        (1537, 16, "medium"),
+        (8191, 64, "medium"),
+        (8192, 64, "large"),
+        (8192, 128, "large"),
+        (8192, 129, "gluon_medium"),
+        (100000, 96, "large"),
+        (32768, 16384, "gluon_large"),
     ],
 )
-def test_sm8x_schedule_uses_its_own_tiles_and_preserves_preparation(architecture, rows, n, block_m):
+def test_sm8x_schedule_uses_its_own_tiles_and_preserves_preparation(architecture, rows, n, tile):
     target = AcceleratorTarget("cuda", architecture)
     previous = select_execution_plan(_SM120, in_features=5376)
     actual = select_execution_plan(target, in_features=5376, rows=rows, out_features=n)
 
     assert isinstance(actual, Sm8xExecutionPlan)
-    assert _sm8x_tile(actual) == _SM8X_TILES[block_m]
+    assert _sm8x_tile(actual) == _SM8X_TILES[tile]
     preparation = ("fuse_rotation_quantization", "fused_num_warps")
     preparation += ("rotation_num_warps", "quantization_num_warps")
     for field in preparation:
@@ -307,14 +319,14 @@ def test_sm8x_schedule_without_shape_uses_grouped_large_tile(architecture, in_fe
     plan = select_execution_plan(target, in_features=in_features)
     previous = select_execution_plan(_SM120, in_features=in_features)
 
-    assert _sm8x_tile(plan) == _SM8X_TILES[128]
+    assert _sm8x_tile(plan) == _SM8X_TILES["gluon_large"]
     assert plan.as_dict() == previous.as_dict() | {
-        "matmul_block_m": 128,
-        "matmul_block_n": 64,
-        "matmul_block_k": 128,
-        "matmul_num_warps": 4,
-        "matmul_num_stages": 3,
-        "matmul_group_m": 16,
+        "matmul_block_m": 256,
+        "matmul_block_n": 128,
+        "matmul_block_k": 64,
+        "matmul_num_warps": 8,
+        "matmul_num_stages": 4,
+        "matmul_group_m": 8,
     }
 
 
@@ -367,7 +379,7 @@ def test_sm8x_schedule_is_monotonic_in_rows(out_features):
         for rows in (*range(1, 9000), 16384, 32768, 100000)
     ]
     assert blocks == sorted(blocks)
-    assert set(blocks) <= set(_SM8X_TILES)
+    assert set(blocks) <= {16, 64, 128, 256}
 
 
 @pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
@@ -406,6 +418,23 @@ def test_only_sm8x_plans_accept_one_fused_preparation_warp():
         replace(sm120, fused_num_warps=1)
     with pytest.raises(ValueError, match="must be 1, 2, 4, 8, or 16"):
         replace(sm8x, fused_num_warps=3)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"matmul_block_k": 128},
+        {"matmul_block_n": 64},
+        {"matmul_num_warps": 4},
+        {"matmul_num_stages": 2},
+    ],
+)
+def test_sm8x_plan_rejects_unsupported_kernel_tiles(changes):
+    # The shape-free SM8x plan is the 256x128 Gluon tile; Triton tiles stop at 128 rows.
+    plan = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
+
+    with pytest.raises(ValueError, match="ConvRot SM8x"):
+        replace(plan, **changes)
 
 
 @pytest.mark.parametrize("group_m", [-1, 1, 4, 32, True])
