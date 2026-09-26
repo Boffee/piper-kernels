@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
@@ -203,76 +204,17 @@ def _validate_output_projection(
         query_chunk_rows,
     )
 
-    validate_storage(
+    output_features = projection_output.validate_output_projection(
         weight_qdata,
         weight_scale,
+        bias,
         group_size,
-        output_dtype,
+        input_features=input_features,
+        device=attention_storage.device,
+        output_dtype=output_dtype,
+        name="fused sparse Piper output",
     )
-    output_features = weight_qdata.shape[0]
-    if weight_qdata.shape[1] != input_features or output_features < 1:
-        raise ValueError(
-            "fused sparse Piper output projection weight must consume all attention heads"
-        )
-    if weight_qdata.device != attention_storage.device:
-        raise ValueError("fused sparse Piper attention and projection must share a device")
-    if bias is not None and (
-        bias.shape != (output_features,)
-        or bias.device != attention_storage.device
-        or bias.layout is not torch.strided
-        or not bias.is_contiguous()
-    ):
-        raise ValueError(
-            "fused sparse Piper output bias must be contiguous with one value per output"
-        )
-    if bias is not None:
-        _bias.validate_dtype(bias, "fused sparse Piper output")
-    if torch.is_grad_enabled() and (
-        weight_scale.requires_grad or (bias is not None and bias.requires_grad)
-    ):
-        raise RuntimeError(
-            "fused sparse Piper output is inference-only and does not support autograd"
-        )
     return input_features, output_features
-
-
-def _project_attention_chunk(  # noqa: PLR0913, PLR0917
-    attention_chunk: torch.Tensor,
-    output: torch.Tensor,
-    start: int,
-    rows: int,
-    prepared_input: torch.Tensor,
-    prepared_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    backend: LinearBackend,
-    output_input_scale: torch.Tensor | None = None,
-) -> None:
-    """Project one ready attention chunk into its final output rows."""
-    batch = attention_chunk.shape[0]
-    input_features = weight_qdata.shape[1]
-    prepared_input = prepared_input[:rows]
-    prepared_scale = prepared_scale[:rows]
-    for batch_index in range(batch):
-        chunk_input = attention_chunk[batch_index, :rows].reshape(rows, input_features)
-        backend.prepare_input(
-            chunk_input,
-            group_size,
-            activation_fn=None,
-            input_scale=output_input_scale,
-            out=(prepared_input, prepared_scale),
-        )
-        backend.linear_prepared(
-            prepared_input,
-            prepared_scale,
-            weight_qdata,
-            weight_scale,
-            bias,
-            output.dtype,
-            out=output[batch_index, start : start + rows],
-        )
 
 
 def _prepare_output_chunk_projector(  # noqa: PLR0913
@@ -288,10 +230,10 @@ def _prepare_output_chunk_projector(  # noqa: PLR0913
     backend: LinearBackend,
     output_dtype: torch.dtype = torch.bfloat16,
     output_input_scale: torch.Tensor | None = None,
-) -> tuple[int, output_common.ChunkProjector, tuple[torch.Tensor, torch.Tensor]]:
+) -> tuple[int, output_common.ChunkProjector, tuple[torch.Tensor, ...]]:
     """Prepare output-chunk buffers using the fusion's already-selected backend."""
     validate_activation_scale(output_input_scale, attention_storage.device)
-    input_features, output_features = _validate_output_projection(
+    _input_features, output_features = _validate_output_projection(
         attention_storage,
         weight_qdata,
         weight_scale,
@@ -301,40 +243,17 @@ def _prepare_output_chunk_projector(  # noqa: PLR0913
         query_chunk_rows,
         output_dtype=output_dtype,
     )
-    capacity = min(sequence_length, query_chunk_rows)
-    prepared_input = torch.empty(
-        (capacity, input_features),
-        device=attention_storage.device,
-        dtype=torch.int8,
+    project_chunk, retained = projection_output.prepare_chunk_projector(
+        sequence_length,
+        query_chunk_rows,
+        weight_qdata,
+        weight_scale,
+        bias,
+        group_size,
+        backend=backend,
+        output_input_scale=output_input_scale,
     )
-    prepared_scale = torch.empty(
-        capacity,
-        device=attention_storage.device,
-        dtype=torch.float32,
-    )
-
-    def project_chunk(
-        attention_chunk: torch.Tensor,
-        output: torch.Tensor,
-        start: int,
-        rows: int,
-    ) -> None:
-        _project_attention_chunk(
-            attention_chunk,
-            output,
-            start,
-            rows,
-            prepared_input,
-            prepared_scale,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend,
-            output_input_scale,
-        )
-
-    return output_features, project_chunk, (prepared_input, prepared_scale)
+    return output_features, project_chunk, retained
 
 
 def _run_attention_output(  # noqa: PLR0913, PLR0917

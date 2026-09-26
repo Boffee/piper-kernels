@@ -40,6 +40,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     is_valid_routing_mode,
 )
+from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as convrot_int8_qk_validation
 from piper_kernels.fusions.convrot_int8_sage_qk import triton as convrot_int8_sage_qk
 from piper_kernels.fusions.projected_qk import triton as projected_qk
@@ -95,6 +96,7 @@ def _source_files() -> tuple[str, ...]:
             query.__file__,
             key.__file__,
             output.__file__,
+            projection_output.__file__,
             value.__file__,
             _coarse_dispatch.__file__,
             _quantized_dispatch.__file__,

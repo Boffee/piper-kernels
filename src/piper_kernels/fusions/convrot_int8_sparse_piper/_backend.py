@@ -4,6 +4,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
+from piper_kernels.fusions.convrot_int8_projection import _validation as projection_validation
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 
@@ -30,10 +31,19 @@ except ModuleNotFoundError as error:
 
 def source_files() -> tuple[str, ...]:
     """Include selection and execution policy in the compiler-pass cache key."""
+    shared_projection_file = None
+    if _nvidia_projection is not None or _amd_projection is not None:
+        from piper_kernels.fusions.convrot_int8_projection import (  # noqa: PLC0415
+            triton as shared_projection,
+        )
+
+        shared_projection_file = shared_projection.__file__
     return tuple(
         path
         for path in (
             __file__,
+            shared_projection_file,
+            projection_validation.__file__,
             _interfaces.__file__,
             nvidia_policy.__file__,
             amd_policy.__file__,

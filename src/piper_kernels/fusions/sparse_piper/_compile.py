@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import operator
-from typing import cast
-
 import torch
 from torch._inductor.pattern_matcher import Match
 from torch.fx.experimental.symbolic_shapes import guard_or_false
@@ -21,7 +18,11 @@ from piper_kernels.fusions.projected_qk._compile import (
     static_int,
 )
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
+from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear._compile_fx import (
+    ordered_tuple_output_producer as ordered_tuple_output_producer,  # noqa: PLC0414 - shared export
+)
 
 _SHAPE_ONLY_VIEW_TARGETS = (
     torch.ops.aten.reshape.default,
@@ -41,33 +42,13 @@ def unwrap_shape_only_views(value: object) -> torch.fx.Node | None:
     return node
 
 
-def ordered_tuple_output_producer(
-    outputs: tuple[object, ...],
-    target: object,
-) -> torch.fx.Node | None:
-    """Return the common producer of ordered ``getitem`` tuple outputs."""
-    if not outputs or not all(isinstance(output, torch.fx.Node) for output in outputs):
-        return None
-    nodes = cast(tuple[torch.fx.Node, ...], outputs)
-    if any(node.target is not operator.getitem or len(node.args) != 2 for node in nodes):
-        return None
-    producer = nodes[0].args[0]
-    if (
-        not isinstance(producer, torch.fx.Node)
-        or producer.target is not target
-        or any(node.args[0] is not producer for node in nodes)
-        or tuple(node.args[1] for node in nodes) != tuple(range(len(nodes)))
-    ):
-        return None
-    return producer
-
-
 def source_files() -> tuple[str, ...]:
     """Return sources that affect shared sparse-attention validation and policy."""
     return tuple(
         file_name
         for file_name in (
             __file__,
+            linear_compile_fx.__file__,
             _dtype.__file__,
             _budget.__file__,
             projected_qk_validation.__file__,

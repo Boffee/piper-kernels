@@ -3,29 +3,15 @@
 # Triton's launch options and constexpr function arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
-from dataclasses import dataclass
-
 import torch
 import triton
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.fusions.convrot_int8_projection.triton import ProjectionConfig
 
 from . import _kernels
 from ._interfaces import KeyOutput, QueryOutput, ValueOutput
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionConfig:
-    """Compute tiles do not change the shared attention scale/summary groups."""
-
-    block_m: int
-    block_k: int
-    heads_per_program: int
-    num_warps: int
-    num_stages: int
-    group_m: int = 0
-    round_rsqrt_to_nearest: bool = False
 
 
 def project_query(
