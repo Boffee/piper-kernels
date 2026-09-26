@@ -1,8 +1,10 @@
 """Tests for ConvRot benchmark records and reference helpers."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -32,6 +34,7 @@ from benchmark_convrot_int8_preparation import (
 from benchmark_convrot_int8_preparation import (
     _validate_args as _validate_preparation_args,
 )
+from lib import convrot_int8_providers
 from lib.convrot import (
     ConvRotConfig,
     ConvRotShape,
@@ -40,14 +43,16 @@ from lib.convrot import (
     raw_input_features,
 )
 from lib.convrot_int8_providers import (
+    make_convrot_int8_phase_operations,
     make_convrot_int8_workload,
+    make_planned_convrot_int8_provider,
     make_public_convrot_int8_provider,
 )
 from lib.environment import EnvironmentInfo
 from lib.providers import ProviderMeasurement
 from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
-from lib.timing import ClockDomain, PhaseTimings, Timing
+from lib.timing import ClockDomain, DeviceTimings, PhaseTimings, Timing
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -220,6 +225,104 @@ def test_shared_public_provider_and_reference_use_the_same_workload() -> None:
         workload.reference(),
     )
     assert workload.production_plan.as_dict().items() <= public.configuration.items()
+    assert public.configuration["input_preparation"] == "fused"
+
+
+def test_unsupported_backend_fails_before_workload_allocation(monkeypatch):
+    make_inputs = Mock(side_effect=AssertionError("allocated workload"))
+    monkeypatch.setattr(convrot_int8_providers, "make_convrot_inputs", make_inputs)
+    with pytest.raises(ValueError, match="no optimized backend"):
+        make_convrot_int8_workload(
+            ConvRotShape("test", 1, 17, 256),
+            ConvRotConfig(torch.bfloat16),
+            device=torch.device("cpu"),
+            target=AcceleratorTarget("hip", "gfx9999"),
+        )
+    make_inputs.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch", "block_k"), [("cuda", "sm120", 128), ("hip", "gfx1201", 64)]
+)
+def test_workload_and_planned_provider_use_the_selected_backend(
+    monkeypatch, backend, arch, block_k
+):
+    workload = make_convrot_int8_workload(
+        ConvRotShape("test", 33, 17, 256),
+        ConvRotConfig(torch.bfloat16),
+        device=torch.device("cpu"),
+        target=AcceleratorTarget(backend, arch),
+    )
+    assert workload.production_plan.matmul_block_k == block_k
+    sentinel = torch.empty(1)
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(workload.backend, "run_linear", run)
+    plan = replace(workload.production_plan, matmul_num_stages=1)
+    provider = make_planned_convrot_int8_provider(workload, plan, name="test")
+    assert provider.run_operator() is sentinel
+    assert calls[0][1]["execution_plan"] is plan
+    assert provider.configuration["matmul_block_k"] == block_k
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("activation", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("bias", [False, True])
+def test_production_phase_buffers_and_integer_reference(dtype, activation, bias):
+    with torch.inference_mode():
+        workload = make_convrot_int8_workload(
+            ConvRotShape("test", 33, 17, 256, activation, bias),
+            ConvRotConfig(dtype),
+            device=torch.device("cuda"),
+        )
+        operations = make_convrot_int8_phase_operations(workload)
+        first = operations["prepare"]()
+        second = operations["prepare"]()
+        assert all(
+            left.data_ptr() == right.data_ptr() for left, right in zip(first, second, strict=True)
+        )
+        output = operations["prepared_gemm"]()
+        assert operations["prepared_gemm"]().data_ptr() == output.data_ptr()
+        torch.testing.assert_close(output, operations["linear"](), rtol=0, atol=0)
+
+
+def test_phase_records_distinguish_clocks_and_phase_scope():
+    shape = ConvRotShape("test", 3, 17, 256)
+    output = torch.ones(1)
+    result = Result(
+        input_preparation=None,
+        piper=ProviderMeasurement("piper-convrot", None, _phase_timings(), {}),
+        quality=measure_quality(output, output),
+        phases={
+            name: DeviceTimings(0, 10, (2.0,), (1.0,))
+            for name in ("prepare", "prepared_gemm", "linear")
+        },
+    )
+    records = _records_for_result(shape, result, _environment())
+    assert len(records) == 4
+    for record in records[1:]:
+        value = record.as_dict()
+        phase = value["configuration"]["phase"]
+        assert value["timings"]["cache_flushed"]["clock"] == "device_event"
+        assert value["timings"]["graph"]["clock"] == "graph_device_event"
+        assert value["extra"]["integer_operations"] == (
+            0 if phase == "prepare" else 2 * 3 * 17 * 256
+        )
+        assert value["configuration"]["output_allocation"] == (
+            "included" if phase == "linear" else "preallocated"
+        )
+        assert value["extra"]["exact_int32_reference"] is (phase != "prepare")
+        if phase == "prepared_gemm":
+            assert value["configuration"]["operation_entrypoint"] == "backend.linear_prepared"
+            assert (
+                value["configuration"]["prepared_execution_scope"] == "gemm_on_prepared_int8_input"
+            )
 
 
 @pytest.mark.parametrize(

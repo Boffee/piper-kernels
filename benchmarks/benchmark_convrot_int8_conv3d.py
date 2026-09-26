@@ -1,14 +1,13 @@
-"""Compare RDNA4 INT8 Conv3D with its reference and standard ROCm FP16 Conv3D.
+"""Compare native INT8 Conv3D with its reference and standard FP16 Conv3D.
 
 Synthetic N,C,T,H,W,O shapes exercise the H3-style encoder channel sizes. These
 are operator measurements, not checkpoint quality or end-to-end encoder results.
-No GPU clock or power settings are changed. JSON lines go to stdout.
+CUDA and ROCm use the same workloads, correctness checks, and timing protocol.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -16,16 +15,17 @@ from types import SimpleNamespace
 from typing import TypedDict, cast
 
 import torch
-import triton
-from lib.environment import capture_environment
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
+from lib.timing import DeviceTimings, measure_device
 from torch.nn import functional
-from triton.testing import do_bench, do_bench_cudagraph
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.conv3d.convrot.int8 import triton as shared
-from piper_kernels.conv3d.convrot.int8._amd import policy
+from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
 from piper_kernels.conv3d.convrot.int8._interfaces import ConvolutionPolicy
+from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
 from piper_kernels.conv3d.convrot.int8._plan import ConvolutionPlan
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
@@ -55,20 +55,34 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", type=_shape, action="append", help="N,C,T,H,W,O; repeatable")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
-    parser.add_argument("--rep-ms", type=int, default=100)
+    parser.add_argument(
+        "--measurement-time-ms", "--rep-ms", dest="measurement_time_ms", type=int, default=100
+    )
+    parser.add_argument("--warmup-ms", type=int, default=25)
+    parser.add_argument("--samples", type=int, default=3)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=871)
     parser.add_argument("--tune", action="store_true", help="sweep prepared convolution tiles")
     parser.add_argument(
-        "--miopen-benchmark", action="store_true", help="enable vendor convolution algorithm search"
+        "--vendor-benchmark", action="store_true", help="enable vendor convolution algorithm search"
     )
     parser.add_argument(
         "--skip-reference-timing",
         action="store_true",
         help="still check the INT8 reference, but time only native and FP16 implementations",
     )
+    add_output_arguments(parser)
     args = parser.parse_args(argv)
-    if args.rep_ms <= 0:
-        parser.error("--rep-ms must be positive")
+    if args.measurement_time_ms <= 0 or args.samples < 1 or args.warmup_ms < 0 or args.device < 0:
+        parser.error("requires positive duration/samples and non-negative warmup/device")
     return args
+
+
+def _convolution_policy(target: AcceleratorTarget) -> ConvolutionPolicy:
+    for policy in (nvidia_policy, amd_policy):
+        if policy.supports_target(target):
+            return cast(ConvolutionPolicy, policy)
+    raise ValueError(f"ConvRot INT8 convolution benchmarking has no optimized backend for {target}")
 
 
 def _standard_conv3d(activation: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -101,9 +115,11 @@ def _standard_group_norm_silu_conv3d(
 def _measure_implementations(
     implementations: Mapping[str, Callable[[], torch.Tensor]],
     *,
-    rep_ms: int,
+    warmup_ms: int,
+    measurement_time_ms: int,
+    samples: int,
     skip_reference_timing: bool,
-) -> dict[str, float]:
+) -> dict[str, DeviceTimings]:
     # Warm/check every implementation before timing, including a skipped reference.
     # FP16 is a separate numerical baseline, not an oracle for quantized outputs.
     torch.testing.assert_close(
@@ -116,18 +132,24 @@ def _measure_implementations(
     for name, operation in implementations.items():
         if name == "reference" and skip_reference_timing:
             continue
-        timings[f"{name}_ms"] = cast(
-            float, do_bench(operation, warmup=25, rep=rep_ms, return_mode="median")
-        )
-        timings[f"{name}_graph_ms"] = cast(
-            float, do_bench_cudagraph(operation, rep=rep_ms, return_mode="median")
+        timings[name] = measure_device(
+            operation,
+            warmup_ms=warmup_ms,
+            measurement_time_ms=measurement_time_ms,
+            samples=samples,
         )
     return timings
 
 
-def _benchmark_shape(shape: tuple[int, ...], args: argparse.Namespace) -> None:
+def _benchmark_shape(
+    shape: tuple[int, ...],
+    args: argparse.Namespace,
+    environment: EnvironmentInfo,
+    target: AcceleratorTarget,
+) -> list[BenchmarkRecord[DeviceTimings]]:
     batch, channels, frames, height, width, outputs = shape
-    torch.manual_seed(871)
+    policy = _convolution_policy(target)
+    torch.manual_seed(args.seed)
     activation = torch.randn(
         batch, channels, frames, height, width, device="cuda", dtype=getattr(torch, args.dtype)
     )
@@ -189,19 +211,59 @@ def _benchmark_shape(shape: tuple[int, ...], args: argparse.Namespace) -> None:
             ),
         },
     }
+    records = []
+    shape_record: dict[str, int] = dict(
+        zip(("batch", "channels", "frames", "height", "width", "out_channels"), shape, strict=True)
+    )
+    configuration = {
+        "dtype": args.dtype,
+        "group_size": group_size,
+        "seed": args.seed,
+        "fp16_baseline_dtype": "float16",
+        "vendor_benchmark": args.vendor_benchmark,
+        "vendor_convolution_enabled": torch.backends.cudnn.enabled,
+        "vendor_convolution_version": torch.backends.cudnn.version(),
+        "vendor_convolution_deterministic": torch.backends.cudnn.deterministic,
+        "miopen_suggest_nhwc": os.environ.get("PYTORCH_MIOPEN_SUGGEST_NHWC")
+        if target.is_amd_hip
+        else None,
+    }
     for name, implementations in operations.items():
         timings = _measure_implementations(
-            implementations, rep_ms=args.rep_ms, skip_reference_timing=args.skip_reference_timing
+            implementations,
+            warmup_ms=args.warmup_ms,
+            measurement_time_ms=args.measurement_time_ms,
+            samples=args.samples,
+            skip_reference_timing=args.skip_reference_timing,
         )
-        print(json.dumps({"shape_ncthwo": shape, "operation": name, **timings}), flush=True)
+        for provider, timing in timings.items():
+            records.append(
+                BenchmarkRecord(
+                    benchmark="convrot-conv3d",
+                    provider=provider,
+                    shape=shape_record,
+                    configuration={
+                        **configuration,
+                        "operation": name,
+                        "phase": "operator_end_to_end",
+                    },
+                    timings=timing,
+                    environment=environment,
+                )
+            )
+            print(
+                f"{shape} {name}/{provider}: cache-flushed {timing.cache_flushed.display()} ms; "
+                f"graph {timing.graph.display()} ms",
+                flush=True,
+            )
     if not args.tune:
-        return
+        return records
     prepared = shared._prepare_input(
         activation,
         group_size,
         weight.act_per_tensor_scale,
         policy=policy,
-        accelerator_backend="hip",
+        accelerator_backend=target.backend,
     )
     candidates = (
         ConvolutionPlan(m, n, k, warps, stages)
@@ -253,56 +315,53 @@ def _benchmark_shape(shape: tuple[int, ...], args: argparse.Namespace) -> None:
             )
 
         torch.testing.assert_close(run(), expected, atol=0, rtol=0)
-        elapsed = cast(float, do_bench_cudagraph(run, rep=args.rep_ms, return_mode="median"))
-        print(
-            json.dumps(
-                {
-                    "shape_ncthwo": shape,
-                    "phase": "prepared",
-                    "plan": plan._asdict(),
-                    "graph_ms": elapsed,
-                }
-            ),
-            flush=True,
+        timing = measure_device(
+            run,
+            warmup_ms=args.warmup_ms,
+            measurement_time_ms=args.measurement_time_ms,
+            samples=args.samples,
         )
+        records.append(
+            BenchmarkRecord(
+                benchmark="convrot-conv3d",
+                provider="candidate",
+                shape=shape_record,
+                configuration={
+                    **configuration,
+                    "operation": "conv3d",
+                    "phase": "prepared_execution",
+                    "plan": plan._asdict(),
+                },
+                timings=timing,
+                environment=environment,
+            )
+        )
+        print(f"{shape} {plan}: graph {timing.graph.display()} ms", flush=True)
+    return records
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    if torch.version.hip is None or not torch.cuda.is_available():
-        raise SystemExit("requires ROCm PyTorch and RDNA4")
+    if not torch.cuda.is_available():
+        raise SystemExit("ConvRot INT8 convolution benchmarking requires a CUDA or ROCm GPU")
+    torch.cuda.set_device(args.device)
     target = AcceleratorTarget.from_device(torch.device("cuda"))
-    if not policy.supports_target(target):
-        raise SystemExit(f"unsupported target: {target}")
-    torch.backends.cudnn.benchmark = args.miopen_benchmark
+    _convolution_policy(target)
+    environment = capture_environment(Path(__file__).resolve().parents[1])
     print(
-        json.dumps(
-            {
-                "environment": capture_environment(Path(__file__).resolve().parents[1]).as_dict(),
-                "gpu": torch.cuda.get_device_name(),
-                "target": str(target),
-                "torch": torch.__version__,
-                "triton": triton.__version__,
-                "dtype": args.dtype,
-                "rep_ms": args.rep_ms,
-                "skip_reference_timing": args.skip_reference_timing,
-                "fp16_baseline_dtype": "float16",
-                "vendor_convolution_enabled": torch.backends.cudnn.enabled,
-                "vendor_convolution_version": torch.backends.cudnn.version(),
-                "miopen_benchmark": torch.backends.cudnn.benchmark,
-                "miopen_deterministic": torch.backends.cudnn.deterministic,
-                "miopen_suggest_nhwc": os.environ.get("PYTORCH_MIOPEN_SUGGEST_NHWC", "0"),
-            }
-        ),
-        flush=True,
+        f"GPU: {environment.gpu_name}; backend: {target.backend}; "
+        f"architecture: {target.architecture}"
     )
+    records = []
     with torch.inference_mode():
         for shape in args.shape or [
             (1, 128, 5, 64, 64, 128),
             (1, 256, 3, 32, 32, 256),
             (1, 512, 3, 16, 16, 512),
         ]:
-            _benchmark_shape(shape, args)
+            with torch.backends.cudnn.flags(benchmark=args.vendor_benchmark):
+                records.extend(_benchmark_shape(shape, args, environment, target))
+    write_records(records, output_target(args))
 
 
 if __name__ == "__main__":

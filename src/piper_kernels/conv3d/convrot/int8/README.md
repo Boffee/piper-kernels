@@ -40,7 +40,7 @@ Use an existing ROCm environment; the repository's default `uv` sources select C
 
 ```shell
 PYTHONPATH=src /path/to/rocm-env/bin/python -m pytest -o addopts='' tests/conv3d/convrot/int8
-PYTHONPATH=src /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d_rocm.py
+PYTHONPATH=src /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d.py
 ```
 
 The hardware regressions also run through `scripts/run_rocm_regressions.py`.
@@ -49,7 +49,7 @@ through 4096, exact INT32 accumulation, fused normalization, dynamic compilation
 and graph capture with live activation-scale changes. Offline tests check integer
 matrix instructions on SM120 and both RDNA4 targets.
 
-The benchmark reports plain and fused convolution timings against the portable
+The shared CUDA/ROCm benchmark reports plain and fused convolution timings against the portable
 reference and standard PyTorch ROCm FP16 convolution, with cache-flushed and
 graph-replay measurements. The FP16 baselines use both contiguous and
 `channels_last_3d` inputs/weights. They include matching causal/reflection padding
@@ -62,7 +62,7 @@ is a performance baseline rather than the INT8 correctness oracle.
 Repeat `--shape N,C,T,H,W,O` to select synthetic cases; `--dtype float32` selects
 FP32 input for INT8/reference (the FP16 baseline still uses FP16), and `--tune`
 sweeps prepared convolution tiles without changing production policy.
-`--miopen-benchmark` enables vendor algorithm search before timing. The report
+`--vendor-benchmark` enables vendor algorithm search before timing. The report
 records that setting and `PYTORCH_MIOPEN_SUGGEST_NHWC`, which gates native
 channels-last MIOpen execution in the tested PyTorch build.
 `--skip-reference-timing` skips only the portable reference's timings, retaining
@@ -70,6 +70,10 @@ the correctness comparison. These measurements do not establish performance or
 quality for an entire encoder or a real checkpoint.
 
 Initial RX 9070 XT measurements (2026-09-19, FP16 inputs, graph replay, milliseconds):
+
+These tables were measured with the former ROCm-only runner. The shared runner uses
+the same workloads and correctness checks; `--samples 1` reproduces the original
+single measurement per mode, with results now written through `--json`/`--jsonl`.
 
 | N,C,T,H,W,O | Native plain | Reference plain | Native fused | Reference fused |
 | --- | ---: | ---: | ---: | ---: |
@@ -82,11 +86,11 @@ convolution. They use the benchmark's seeded synthetic weights and default
 reflection padding, stride, and scales. Environment: Python 3.13.13,
 PyTorch `2.14.0+rocm10.1.0a20260908`, HIP `7.16.26354`, Triton 3.8.0;
 command: `PYTHONPATH=src /path/to/rocm-env/bin/python
-benchmarks/benchmark_convrot_int8_conv3d_rocm.py --rep-ms 100`.
+benchmarks/benchmark_convrot_int8_conv3d.py --rep-ms 100 --samples 1`.
 
 Standard FP16 comparison on the same RX 9070 XT/software stack (2026-09-19):
 median of three separate process runs, graph replay, milliseconds, with
-`--rep-ms 100 --miopen-benchmark` and `PYTORCH_MIOPEN_SUGGEST_NHWC=1`. The table
+`--rep-ms 100 --vendor-benchmark` and `PYTORCH_MIOPEN_SUGGEST_NHWC=1`. The table
 selects the faster FP16 layout per operation/shape: contiguous for C=128 and
 plain C=256; native channels-last for fused C=256 and both C=512 operations.
 
@@ -95,8 +99,8 @@ processes and take the median for each reported timing:
 
 ```shell
 PYTORCH_MIOPEN_SUGGEST_NHWC=1 PYTHONPATH=src \
-  /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d_rocm.py \
-  --rep-ms 100 --miopen-benchmark --skip-reference-timing
+  /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d.py \
+  --rep-ms 100 --samples 1 --vendor-benchmark --skip-reference-timing
 ```
 
 | N,C,T,H,W,O | INT8 plain | FP16 plain | Plain speedup | INT8 fused | FP16 GN/SiLU/conv | Fused speedup |

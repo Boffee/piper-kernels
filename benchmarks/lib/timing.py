@@ -21,11 +21,16 @@ class _TritonTesting(Protocol):
         quantiles: list[float],
     ) -> Sequence[float]: ...
 
+    def do_bench_cudagraph(
+        self, function: Callable[[], Any], *, rep: int, return_mode: str
+    ) -> float: ...
+
 
 class ClockDomain(StrEnum):
     """Clock domains used by benchmark timing implementations."""
 
     DEVICE_EVENT = "device_event"
+    GRAPH_DEVICE_EVENT = "graph_device_event"
     SYNCHRONIZED_WALL = "synchronized_wall"
 
 
@@ -141,6 +146,67 @@ class SampleTimings:
             "operator_end_to_end": self.operator_end_to_end.as_dict(),
             "samples_ms": list(self.samples_ms),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceTimings:
+    """Repeated median measurements with cache flushing and graph replay kept separate."""
+
+    warmup_ms: int
+    measurement_time_ms: int
+    cache_flushed_samples_ms: tuple[float, ...]
+    graph_samples_ms: tuple[float, ...]
+    cache_flushed: Timing = field(init=False)
+    graph: Timing = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.warmup_ms < 0 or self.measurement_time_ms <= 0:
+            raise ValueError("warmup must be non-negative and measurement time must be positive")
+        if len(self.cache_flushed_samples_ms) != len(self.graph_samples_ms):
+            raise ValueError("cache-flushed and graph measurements require equal sample counts")
+        object.__setattr__(
+            self,
+            "cache_flushed",
+            Timing.from_samples(self.cache_flushed_samples_ms, ClockDomain.DEVICE_EVENT),
+        )
+        object.__setattr__(
+            self,
+            "graph",
+            Timing.from_samples(self.graph_samples_ms, ClockDomain.GRAPH_DEVICE_EVENT),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Describe the actual device measurements without inventing wall-clock phases."""
+        return {
+            "warmup_ms": self.warmup_ms,
+            "measurement_time_ms": self.measurement_time_ms,
+            "sample_count": len(self.graph_samples_ms),
+            "sample_statistic": "median",
+            "cache_flushed": self.cache_flushed.as_dict(),
+            "graph": self.graph.as_dict(),
+            "cache_flushed_samples_ms": list(self.cache_flushed_samples_ms),
+            "graph_samples_ms": list(self.graph_samples_ms),
+        }
+
+
+def measure_device(
+    function: Callable[[], Any],
+    *,
+    warmup_ms: int,
+    measurement_time_ms: int,
+    samples: int = 3,
+) -> DeviceTimings:
+    """Use the same cache-flushed and graph timing protocol on CUDA and ROCm."""
+    if samples < 1 or warmup_ms < 0 or measurement_time_ms <= 0:
+        raise ValueError("requires positive samples/duration and non-negative warmup")
+    testing = cast(_TritonTesting, importlib.import_module("triton.testing"))
+    cold, graph = [], []
+    for _ in range(samples):
+        cold.append(triton_benchmark(function, warmup_ms, measurement_time_ms).median_ms)
+        graph.append(
+            testing.do_bench_cudagraph(function, rep=measurement_time_ms, return_mode="median")
+        )
+    return DeviceTimings(warmup_ms, measurement_time_ms, tuple(cold), tuple(graph))
 
 
 def time_first_call(

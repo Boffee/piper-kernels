@@ -26,8 +26,10 @@ from lib.convrot import (
     raw_input_features,
 )
 from lib.convrot_int8_providers import (
+    make_convrot_int8_phase_operations,
     make_convrot_int8_workload,
     make_public_convrot_int8_provider,
+    select_convrot_int8_backend,
 )
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.providers import BenchmarkProvider, ProviderMeasurement, measure_provider
@@ -38,7 +40,9 @@ from lib.reporting import (
     output_target,
     write_records,
 )
+from lib.timing import DeviceTimings, measure_device
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 _MIN_PIPER_SQNR_DB = 20.0
@@ -54,6 +58,7 @@ class Result:
     quality: QualityMetrics
     comfy_kitchen: ProviderMeasurement[None] | None = None
     comfy_kitchen_quality: QualityMetrics | None = None
+    phases: dict[str, DeviceTimings] | None = None
 
     @property
     def comfy_kitchen_speedup(self) -> float | None:
@@ -146,6 +151,9 @@ def _run_shape(
     warmup_ms: int,
     measurement_time_ms: int,
     comfy_kitchen: ModuleType | None,
+    *,
+    phases: bool = False,
+    samples: int = 3,
 ) -> Result:
     workload = make_convrot_int8_workload(
         shape,
@@ -218,12 +226,25 @@ def _run_shape(
         comfy_measurement = _without_output(comfy_with_output)
         del comfy_with_output, comfy_optimized, comfy_activation
 
+    del reference_output
+    phase_timings = None
+    if phases:
+        phase_timings = {
+            name: measure_device(
+                operation,
+                warmup_ms=warmup_ms,
+                measurement_time_ms=measurement_time_ms,
+                samples=samples,
+            )
+            for name, operation in make_convrot_int8_phase_operations(workload).items()
+        }
     return Result(
         input_preparation=workload.input_preparation,
         piper=piper_measurement,
         quality=piper_quality,
         comfy_kitchen=comfy_measurement,
         comfy_kitchen_quality=comfy_quality,
+        phases=phase_timings,
     )
 
 
@@ -271,6 +292,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measurement-time-ms", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--phases",
+        action="store_true",
+        help="also time preparation and GEMM separately with cache flushing and graph replay",
+    )
+    parser.add_argument(
+        "--samples", type=int, default=3, help="repeated device measurements per phase"
+    )
     parser.add_argument(
         "--compare-comfy-kitchen",
         action="store_true",
@@ -307,6 +337,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("rows, out_features, and in_features must all be positive")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
+    if args.device < 0 or args.samples < 1:
+        raise SystemExit("device must be non-negative and samples must be positive")
     if any(in_features % args.group_size for in_features in args.in_features):
         raise SystemExit("every in_features value must be divisible by --group-size")
     if args.compare_comfy_kitchen and args.dtype == "float32":
@@ -367,13 +399,13 @@ def _records_for_result(
     shape: ConvRotShape,
     result: Result,
     environment: EnvironmentInfo,
-) -> list[BenchmarkRecord]:
+) -> list[BenchmarkRecord | BenchmarkRecord[DeviceTimings]]:
     shape_record = shape.as_dict()
     measurements = [
         (result.piper, result.quality),
         (result.comfy_kitchen, result.comfy_kitchen_quality),
     ]
-    records = []
+    records: list[BenchmarkRecord | BenchmarkRecord[DeviceTimings]] = []
     for measurement, quality in measurements:
         if measurement is None:
             continue
@@ -388,6 +420,40 @@ def _records_for_result(
                 environment=environment,
             )
         )
+    for phase, timings in (result.phases or {}).items():
+        operations = (
+            0 if phase == "prepare" else 2 * shape.rows * shape.in_features * shape.out_features
+        )
+        records.append(
+            BenchmarkRecord(
+                benchmark="convrot-linear",
+                provider="piper-convrot",
+                shape=shape_record,
+                configuration={
+                    **result.piper.configuration,
+                    "phase": phase,
+                    "operation_entrypoint": {
+                        "prepare": "backend.prepare_input",
+                        "prepared_gemm": "backend.linear_prepared",
+                        "linear": result.piper.configuration.get("operation_entrypoint"),
+                    }[phase],
+                    "prepared_execution_scope": {
+                        "prepare": "activation_preparation",
+                        "prepared_gemm": "gemm_on_prepared_int8_input",
+                        "linear": "complete_operator_on_fixed_source_tensors",
+                    }[phase],
+                    "output_allocation": "included" if phase == "linear" else "preallocated",
+                },
+                timings=timings,
+                environment=environment,
+                extra={
+                    "exact_int32_reference": phase != "prepare",
+                    "integer_operations": operations,
+                    "cache_flushed_dense_tops": operations / timings.cache_flushed.median_ms / 1e9,
+                    "graph_dense_tops": operations / timings.graph.median_ms / 1e9,
+                },
+            )
+        )
     return records
 
 
@@ -398,6 +464,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     shapes = _benchmark_shapes(args)
     if not torch.cuda.is_available():
         raise SystemExit("ConvRot INT8 benchmarking requires a Triton-supported GPU")
+    torch.cuda.set_device(args.device)
+    target = AcceleratorTarget.from_device(torch.device("cuda", args.device))
+    select_convrot_int8_backend(target)
+    if args.compare_comfy_kitchen and not target.is_nvidia_cuda:
+        raise SystemExit("--compare-comfy-kitchen requires NVIDIA CUDA")
 
     config = ConvRotConfig(
         dtype=convrot_dtype(args.dtype),
@@ -413,7 +484,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"Torch: {torch.__version__}; dtype: {config.dtype}; group size: {config.group_size}")
     print()
     _print_header(args.compare_comfy_kitchen)
-    records: list[BenchmarkRecord] = []
+    records: list[BenchmarkRecord | BenchmarkRecord[DeviceTimings]] = []
     for shape in shapes:
         result = _run_shape(
             shape,
@@ -421,8 +492,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.warmup_ms,
             args.measurement_time_ms,
             comfy_kitchen,
+            phases=args.phases,
+            samples=args.samples,
         )
         _print_result(shape, result)
+        for phase, timings in (result.phases or {}).items():
+            print(
+                f"  {phase}: cache-flushed {timings.cache_flushed.display()} ms; "
+                f"graph {timings.graph.display()} ms"
+            )
         records.extend(_records_for_result(shape, result, environment))
         del result
         torch.cuda.empty_cache()

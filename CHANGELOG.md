@@ -15,6 +15,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- ConvRot INT8 benchmarks share CUDA/ROCm linear and Conv3D runners, production policy
+  selection, and device timing records. Linear phase measurements use `--phases`; sparse
+  QKV projection shares the timing and JSON/JSONL reporting helpers.
 - RDNA4 D128 sparse Piper uses WGP scheduling and prioritizes matrix stages in the
   stock Gluon kernel, preserving dynamic-length reuse and numerical operations.
 - RDNA4 D128 min/max routing uses tiled FP32 scoring for standalone query chunks as well

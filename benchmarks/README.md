@@ -7,10 +7,28 @@ it is not part of the installed `piper_kernels` API.
 
 ## Common provider and timing model
 
-For the modular AMD ConvRot INT8 backend, use `benchmark_convrot_int8_rocm.py`
-with ROCm PyTorch. It reports allocation-free preparation/GEMM, full linear,
-dense INT8 TOPS, and separate cache-flushed/graph timings.
-The older ConvRot phase/tuning utilities below still expose NVIDIA launch policy.
+Use the same operator benchmark on CUDA and ROCm. Production dispatch selects the
+backend; shapes, correctness checks, timing scopes, and output formats stay shared.
+Run with the Python from the matching accelerator environment. In particular, use
+the provisioned ROCm Python without running the CUDA-oriented `uv sync` there.
+
+| Workload | Entry point | Phase or workload selection |
+| --- | --- | --- |
+| ConvRot INT8 linear | `benchmark_convrot_int8.py` | `--phases` adds preparation, prepared GEMM, and full-call device timings |
+| ConvRot INT8 Conv3D | `benchmark_convrot_int8_conv3d.py` | `--shape` selects dimensions; includes ordinary and group-norm/SiLU fusion |
+| Dense attention | `benchmark_attention.py` | Providers select supported implementations on the active accelerator |
+| Sparse attention | `benchmark_sparse_piper.py` | Shared public/prepared/routing/preparation measurements |
+| Sparse routing scores | `benchmark_sparse_piper_scores.py` | `--query-blocks` selects standalone or fused-window score shapes |
+| Sparse QKV projections | `benchmark_sparse_piper_projection.py` | Reports Q, K, V, mean, and combined phases |
+| Complete H3 sparse fusion | `benchmark_sparse_piper_fusion.py` | `--query-chunk-rows` sweeps windows through 150K tokens |
+
+Add workloads or backend adapters to these runners instead of creating accelerator-specific
+copies. Reuse `lib` for input generation, timing, quality, and records. Distinct pipeline
+boundaries remain explicit so kernel-only measurements are not confused with full operators.
+The `small_m`, `tail`, and `preparation` ConvRot scripts are explicit NVIDIA kernel/legacy
+ablations and compiler diagnostics; ordinary production preparation/GEMM measurements use
+`benchmark_convrot_int8.py --phases` on either accelerator. NVFP4 and SageAttention2++ runners
+retain their actual backend support limits.
 
 A provider has two explicit callables:
 
@@ -52,6 +70,13 @@ provider = BenchmarkProvider(
 )
 measurement = measure_provider(provider, warmup_ms=100, measurement_time_ms=500)
 ```
+
+`measure_device()` is the shared protocol for device-phase comparisons. It records repeated
+median samples separately for Triton's cache-flushed events (`device_event`) and graph replay
+(`graph_device_event`), including timing windows and sample counts. These are `DeviceTimings`
+inside the same versioned `BenchmarkRecord`; graph timing is never labeled synchronized wall
+time. Complete H3 fusion uses `SampleTimings` for shuffled, fixed-count synchronized calls.
+Compare matching timing modes and scopes across devices.
 
 `AttentionShape` records batch size, Q/KV head counts, Q/KV sequence lengths, and head
 dimension without assuming self-attention or MHA. `AttentionConfig` records dtype,
@@ -589,6 +614,38 @@ Run the ConvRot provider comparison with:
 ```shell
 uv run python benchmarks/benchmark_convrot_int8.py
 ```
+
+The same entry point now replaces the separate `benchmark_convrot_int8_rocm.py` runner.
+For production phases on either accelerator, use:
+
+```shell
+python benchmarks/benchmark_convrot_int8.py \
+  --rows 8192 --in-features 6144 --out-features 4096 \
+  --phases --samples 3 --measurement-time-ms 200 \
+  --jsonl artifacts/convrot-phases.jsonl
+```
+
+Phase checks compare GEMM/full outputs against independent INT32 products and the matching
+FP32 scale/bias epilogue. Preparation and GEMM reuse caller-owned buffers; the full public call
+includes its allocations. Records identify the phase, clock, and dense integer-operation count.
+The production plan and the offline linear tuner's default now come from the active backend.
+`--device` selects the GPU. The optional Comfy Kitchen provider still requires NVIDIA CUDA.
+
+Conv3D likewise uses `benchmark_convrot_int8_conv3d.py` on SM120 and RDNA4, replacing its
+ROCm-suffixed entry point:
+
+```shell
+python benchmarks/benchmark_convrot_int8_conv3d.py \
+  --shape 1,128,5,64,64,128 --samples 3 --measurement-time-ms 100 \
+  --jsonl artifacts/convrot-conv3d.jsonl
+```
+
+`--vendor-benchmark` enables the active vendor's convolution search. `--tune` measures
+explicit prepared-convolution candidates using that accelerator's preparation/descriptor policy.
+Native/reference correctness checks still run when `--skip-reference-timing` is selected.
+Sparse QKV projection also uses `measure_device()` and supports the standard `--json`/`--jsonl`
+outputs. Existing `--rep-ms` arguments remain aliases for `--measurement-time-ms` there and in
+Conv3D.
 
 The default comparison samples both primary M anchors at the lower-width corner: BF16, group 256,
 no bias, `M=8192/32768`, `N=4096`, and `K=6144`. The three dimension options accept lists and form
