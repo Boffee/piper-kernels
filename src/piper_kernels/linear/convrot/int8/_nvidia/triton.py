@@ -248,12 +248,16 @@ def execute_prepared_linear(
         raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
-    # Cache grouping is intrinsic to the large-tile family.
-    group_m = (
-        _LARGE_MATMUL_GROUP_M_TILES
-        if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
-        else 0
-    )
+    # Cache grouping is intrinsic to the large-tile family. SM8x plans name
+    # their grouping because their large tile is narrower, and write bias adds
+    # as FMAs so per-tile branches round like every other SM8x tile.
+    sm8x = isinstance(plan, policy.Sm8xExecutionPlan)
+    if sm8x:
+        group_m = plan.matmul_group_m
+    elif plan.matmul_block_m == 128 and plan.matmul_block_n == 256:
+        group_m = _LARGE_MATMUL_GROUP_M_TILES
+    else:
+        group_m = 0
     bias_pointer = bias if bias is not None else output
 
     if not m or not n:
@@ -284,6 +288,7 @@ def execute_prepared_linear(
             aligned_m=m % plan.matmul_block_m == 0,
             aligned_nk=n % plan.matmul_block_n == 0 and k % plan.matmul_block_k == 0,
             group_m=group_m,
+            explicit_bias_fma=sm8x,
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
         )

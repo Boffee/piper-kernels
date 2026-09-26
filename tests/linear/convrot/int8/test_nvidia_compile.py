@@ -97,6 +97,7 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture, 
             "aligned_m": False,
             "aligned_nk": aligned_nk,
             "group_m": 16,
+            "explicit_bias_fma": isinstance(plan, policy.Sm8xExecutionPlan),
         },
     )
     compiled = triton.compile(
@@ -105,3 +106,59 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture, 
         options={"num_warps": plan.matmul_num_warps, "num_stages": plan.matmul_num_stages},
     )
     assert "mma.sync" in compiled.asm["ptx"]
+
+
+# SM86/SM89 cap one block's dynamic shared memory at 99 KiB; SM80/SM87 allow more.
+_SM8X_SHARED_MEMORY_LIMIT = 99 * 1024
+
+
+@pytest.mark.parametrize("architecture", [80, 86, 89])
+@pytest.mark.parametrize(("rows", "out_features"), [(1, 4096), (256, 1024), (8192, 4096)])
+@pytest.mark.parametrize("aligned", [False, True])
+def test_sm8x_schedules_compile_within_consumer_shared_memory(
+    architecture, rows, out_features, aligned
+):
+    plan = policy.select_execution_plan(
+        AcceleratorTarget("cuda", f"sm{architecture}"),
+        in_features=5376,
+        rows=rows,
+        out_features=out_features,
+    )
+    assert isinstance(plan, policy.Sm8xExecutionPlan)
+    source = ASTSource(
+        kernels.int8_matmul_kernel,
+        {
+            "input_ptr": "*i8",
+            "weight_ptr": "*i8",
+            "output_ptr": "*bf16",
+            "input_scale_ptr": "*fp32",
+            "weight_scale_ptr": "*fp32",
+            "bias_ptr": "*bf16",
+            "second_weight_ptr": "*i8",
+            "second_scale_ptr": "*fp32",
+            "second_bias_ptr": "*bf16",
+            "m": "i32",
+            "n": "i32",
+            "k": "i32",
+            "output_row_stride": "i32",
+        },
+        constexprs={
+            "block_m": plan.matmul_block_m,
+            "block_n": plan.matmul_block_n,
+            "block_k": plan.matmul_block_k,
+            "has_bias": True,
+            "paired": False,
+            "second_has_bias": False,
+            "aligned_m": aligned,
+            "aligned_nk": aligned,
+            "group_m": plan.matmul_group_m,
+            "explicit_bias_fma": True,
+        },
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("cuda", architecture, 32),
+        options={"num_warps": plan.matmul_num_warps, "num_stages": plan.matmul_num_stages},
+    )
+    assert "mma.sync" in compiled.asm["ptx"]
+    assert compiled.metadata.shared <= _SM8X_SHARED_MEMORY_LIMIT

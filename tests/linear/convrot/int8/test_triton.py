@@ -767,6 +767,154 @@ def test_per_tile_tail_matches_split_with_bias_and_strided_output(rows, k, n, dt
     assert torch.all(storage[..., width:] == 42)
 
 
+def _sm8x_available() -> bool:
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).is_cuda_capability(8)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.parametrize(
+    ("rows", "k", "n"),
+    [
+        (1, 64, 96),
+        (16, 272, 257),
+        (97, 512, 256),
+        (513, 512, 256),
+        (513, 272, 257),
+        (2177, 512, 1024),
+        (2177, 272, 257),
+        (8193, 256, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    ("paired", "bias_dtypes"),
+    [
+        (False, (None, None)),
+        (False, (torch.bfloat16, None)),
+        (True, (None, None)),
+        (True, (torch.float32, None)),
+        (True, (None, torch.float16)),
+        (True, (torch.float32, torch.float16)),
+    ],
+)
+def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired, bias_dtypes):
+    # SM8x bias adds are explicit FMAs; grouped tiles branch per tile on ragged M.
+    torch.manual_seed(889)
+    value = torch.randint(-127, 128, (1, rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(1, rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias_dtype, second_bias_dtype = bias_dtypes
+    bias = None if bias_dtype is None else torch.randn(n, device="cuda", dtype=bias_dtype)
+    second = None
+    if paired:
+        second = (
+            torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8),
+            torch.rand(n, 1, device="cuda") * 0.01,
+            None
+            if second_bias_dtype is None
+            else torch.randn(n, device="cuda", dtype=second_bias_dtype),
+        )
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    args = (value, row_scale, weight, scale, bias, dtype)
+    expected = int8_nvidia.execute_prepared_linear(*args, base, second_projection=second)
+    selected = int8_nvidia.default_execution_plan(weight, rows=rows)
+    width = n * (2 if paired else 1)
+    storage = torch.full((1, rows, width + 13), 42, device="cuda", dtype=dtype)
+    out = storage[..., :width]
+    actual = int8_nvidia.linear_prepared(*args, out=out, second_projection=second)
+    assert actual is out
+    assert torch.equal(actual, expected)
+    assert torch.all(storage[..., width:] == 42)
+    # Every SM8x tile class must agree on each tail shape, not only the selected one.
+    for class_rows, class_n in ((1, 64), (256, 1024), (8192, 4096)):
+        plan = select_execution_plan(
+            AcceleratorTarget.from_device(value.device),
+            in_features=k,
+            rows=class_rows,
+            out_features=class_n,
+        )
+        forced = int8_nvidia.execute_prepared_linear(*args, plan, second_projection=second)
+        assert torch.equal(forced, expected), (plan, selected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.parametrize(
+    ("rows", "in_features", "group_size"), [(1, 14336, 256), (129, 12352, 64), (1000, 16384, 16)]
+)
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("static", [False, True])
+def test_sm8x_preparation_matches_base_preparation(
+    rows, in_features, group_size, activation_fn, dtype, static
+):
+    torch.manual_seed(rows)
+    width = in_features * (2 if activation_fn == "swiglu" else 1)
+    value = (torch.randn(rows, width, device="cuda") * 4).to(dtype)
+    input_scale = torch.tensor(0.05, device="cuda") if static else None
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=in_features)
+    expected = int8_nvidia.prepare_input_with_plan(
+        value,
+        in_features,
+        group_size,
+        activation_fn=activation_fn,
+        input_scale=input_scale,
+        execution_plan=base,
+        target=AcceleratorTarget.from_device(value.device),
+    )
+    actual = int8_nvidia.prepare_input(value, group_size, activation_fn, input_scale)
+    assert (
+        int8_nvidia.default_execution_plan(
+            torch.empty(1, in_features, device="cuda", dtype=torch.int8)
+        ).fused_num_warps
+        != base.fused_num_warps
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.parametrize(
+    ("rows", "in_features", "group_size"),
+    [(1, 16, 16), (7, 96, 16), (129, 256, 256), (1000, 768, 64), (1000, 1024, 256)],
+)
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("static", [False, True])
+def test_sm8x_one_warp_preparation_stays_within_one_code(
+    rows, in_features, group_size, activation_fn, dtype, static
+):
+    torch.manual_seed(rows + in_features)
+    width = in_features * (2 if activation_fn == "swiglu" else 1)
+    value = (torch.randn(rows, width, device="cuda") * 4).to(dtype)
+    input_scale = torch.tensor(0.05, device="cuda") if static else None
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=in_features)
+    expected_qdata, expected_scale = int8_nvidia.prepare_input_with_plan(
+        value,
+        in_features,
+        group_size,
+        activation_fn=activation_fn,
+        input_scale=input_scale,
+        execution_plan=base,
+        target=AcceleratorTarget.from_device(value.device),
+    )
+    qdata, scale = int8_nvidia.prepare_input(value, group_size, activation_fn, input_scale)
+
+    if activation_fn is None:
+        # Plain rows do not depend on the preparation warp count.
+        assert torch.equal(qdata, expected_qdata)
+        assert torch.equal(scale, expected_scale)
+    else:
+        code_error = (qdata.to(torch.int16) - expected_qdata.to(torch.int16)).abs()
+        assert code_error.max().item() <= 1
+        torch.testing.assert_close(scale, expected_scale, rtol=2e-6, atol=0)
+
+
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 def test_fused_preparation_validates_input_width_from_qdata(
     activation_fn: str | None,

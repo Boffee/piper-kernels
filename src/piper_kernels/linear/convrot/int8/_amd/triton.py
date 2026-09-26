@@ -605,6 +605,7 @@ def execute_prepared_linear(
             aligned_m=m % plan.matmul_block_m == 0,
             aligned_nk=n % plan.matmul_block_n == 0 and k % plan.matmul_block_k == 0,
             group_m=group_m,
+            explicit_bias_fma=False,
             **compiler_options,
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,

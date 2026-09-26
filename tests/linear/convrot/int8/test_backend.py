@@ -2,6 +2,7 @@
 
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
 
@@ -113,16 +114,75 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
         assert flags["aligned_nk"] == (n % plan.matmul_block_n == k % plan.matmul_block_k == 0)
 
 
-@pytest.mark.parametrize(("rows", "block_m"), [(None, 128), (1280, 64)])
-def test_nvidia_planner_needs_no_device_properties_with_explicit_target(monkeypatch, rows, block_m):
+@pytest.mark.parametrize(
+    ("architecture", "rows", "block_m"),
+    [("sm120", None, 128), ("sm120", 1280, 64), ("sm89", None, 128), ("sm86", 256, 64)],
+)
+def test_nvidia_planner_needs_no_device_properties_with_explicit_target(
+    monkeypatch, architecture, rows, block_m
+):
     weight = SimpleNamespace(shape=(1024, 1024), device=torch.device("cuda"))
     properties = Mock(side_effect=AssertionError("planner queried device properties"))
     monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
     plan = nvidia.default_execution_plan(
-        weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
+        weight, target=AcceleratorTarget("cuda", architecture), rows=rows
     )
     assert plan.matmul_block_m == block_m
     properties.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("architecture", "rows", "tile", "group_m"),
+    [
+        # SM120 derives grouping from the 128x256 tile, including explicit
+        # 128x128 schedules such as the H3 VAE specialization.
+        ("sm120", 4096, None, 16),
+        ("sm120", 4096, (128, 128, 128, 4, 2), 0),
+        ("sm120", 64, None, 0),
+        ("sm89", 4096, None, 16),
+        ("sm89", 256, None, 0),
+        ("sm89", 4, None, 0),
+        ("sm86", 4096, (128, 256, 128, 8, 3), 16),
+    ],
+)
+@pytest.mark.parametrize("paired", [False, True])
+def test_nvidia_launch_grouping_follows_the_plan(
+    monkeypatch, architecture, rows, tile, group_m, paired
+):
+    target = AcceleratorTarget("cuda", architecture)
+    monkeypatch.setattr(nvidia, "device_context", lambda device: nullcontext())
+    kernel = MagicMock()
+    monkeypatch.setattr(nvidia, "int8_matmul_kernel", kernel)
+    k, n = 1024, 1000
+    value = torch.empty(rows, k, device="meta", dtype=torch.int8)
+    weight = torch.empty(n, k, device="meta", dtype=torch.int8)
+    plan = nvidia.default_execution_plan(weight, target=target, rows=rows)
+    if tile is not None:
+        block_m, block_n, block_k, num_warps, num_stages = tile
+        plan = replace(
+            plan,
+            matmul_block_m=block_m,
+            matmul_block_n=block_n,
+            matmul_block_k=block_k,
+            matmul_num_warps=num_warps,
+            matmul_num_stages=num_stages,
+        )
+    second = (weight, torch.empty(n, 1, device="meta"), None) if paired else None
+    nvidia.execute_prepared_linear(
+        value,
+        torch.empty(rows, device="meta"),
+        weight,
+        torch.empty(n, 1, device="meta"),
+        None,
+        torch.bfloat16,
+        plan,
+        second_projection=second,
+    )
+    row_tiles = (rows + plan.matmul_block_m - 1) // plan.matmul_block_m
+    column_tiles = (n + plan.matmul_block_n - 1) // plan.matmul_block_n * (2 if paired else 1)
+    grid = (row_tiles * column_tiles,) if group_m else (row_tiles, column_tiles)
+    assert kernel.__getitem__.call_args_list == [call(grid)]
+    assert kernel.__getitem__.return_value.call_args.kwargs["group_m"] == group_m
 
 
 @pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])

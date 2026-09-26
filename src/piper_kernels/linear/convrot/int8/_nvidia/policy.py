@@ -1,10 +1,12 @@
 """Support and measured launch policy for the NVIDIA ConvRot INT8 implementation.
 
-These schedules are measured on SM120 and retain the existing defaults on other
-supported NVIDIA targets. Hardware support does not imply per-target tuning.
+These schedules are measured on SM120 and SM89; the SM89 schedule covers the SM8x
+family. Other supported NVIDIA targets retain the existing defaults. Hardware support
+does not imply per-target tuning.
 """
 
 from dataclasses import dataclass, replace
+from typing import ClassVar
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
@@ -12,6 +14,7 @@ from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 from .._plan import LinearExecutionPlan
 
 _FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
+_SM8X_FUSED_NUM_WARPS_VALUES = (1, *_FUSED_NUM_WARPS_VALUES)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
 _QUANTIZATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
 _MATMUL_BLOCK_M_VALUES = (16, 32, 64, 128)
@@ -19,16 +22,23 @@ _MATMUL_BLOCK_N_VALUES = (16, 32, 64, 128, 256)
 _MATMUL_BLOCK_K_VALUES = (32, 64, 128)
 _MATMUL_NUM_WARPS_VALUES = (2, 4, 8)
 _MATMUL_NUM_STAGES_VALUES = (1, 2, 3, 4)
+_MATMUL_GROUP_M_VALUES = (0, 8, 16)
 
 
 @dataclass(frozen=True, slots=True)
 class NvidiaExecutionPlan(LinearExecutionPlan):
     """Launch choices accepted by the existing NVIDIA kernels and tuner."""
 
+    fused_num_warps_values: ClassVar[tuple[int, ...]] = _FUSED_NUM_WARPS_VALUES
+
     def __post_init__(self) -> None:
         LinearExecutionPlan.__post_init__(self)
-        if self.fused_num_warps not in _FUSED_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot fused preparation num_warps must be 2, 4, 8, or 16")
+        if self.fused_num_warps not in self.fused_num_warps_values:
+            *leading, last = self.fused_num_warps_values
+            raise ValueError(
+                "ConvRot fused preparation num_warps must be "
+                f"{', '.join(map(str, leading))}, or {last}"
+            )
         if self.rotation_num_warps not in _ROTATION_NUM_WARPS_VALUES:
             raise ValueError("ConvRot split rotation num_warps must be 1, 2, 4, or 8")
         if self.quantization_num_warps not in _QUANTIZATION_NUM_WARPS_VALUES:
@@ -45,12 +55,36 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
             raise ValueError("ConvRot matmul num_stages must be 1, 2, 3, or 4")
 
 
+@dataclass(frozen=True, slots=True)
+class Sm8xExecutionPlan(NvidiaExecutionPlan):
+    """SM8x launch choices with explicit GEMM tile grouping.
+
+    The base 128x256 tile spills on SM8x, so its large tile is narrower. Other plans
+    derive grouping from the 128x256 tile, which SM120 schedules keep unchanged.
+    SM8x launches also write bias adds as explicit FMAs. One-warp fused preparation
+    is measured only on SM8x.
+    """
+
+    fused_num_warps_values: ClassVar[tuple[int, ...]] = _SM8X_FUSED_NUM_WARPS_VALUES
+    matmul_group_m: int = 0
+
+    def __post_init__(self) -> None:
+        NvidiaExecutionPlan.__post_init__(self)
+        if self.matmul_group_m not in _MATMUL_GROUP_M_VALUES:
+            raise ValueError("ConvRot matmul group_m must be 0, 8, or 16")
+
+
 _FUSED_MAX_CHUNK_SIZE = 16_384
 _TWO_WARP_MAX_CHUNK_SIZE = 2_048
 _DEFAULT_ROTATION_NUM_WARPS = 4
 _DEFAULT_QUANTIZATION_NUM_WARPS = 8
 _SM120_SMALL_TILE_LIMIT = 128
 _SM120_LARGE_TILE_THRESHOLD = 72
+_SM8X_SMALL_ROWS = 16
+_SM8X_SMALL_TILE_LIMIT = 96
+_SM8X_LARGE_TILE_THRESHOLD = 64
+_SM8X_ONE_WARP_MAX_CHUNK_SIZE = 1_024
+_SM8X_EIGHT_WARP_PREPARATION_CHUNKS = (2, 8_192)
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -109,6 +143,53 @@ def _sm120_execution_plan(
     return plan
 
 
+def _sm8x_execution_plan(
+    *,
+    in_features: int,
+    rows: int | None,
+    out_features: int | None,
+) -> Sm8xExecutionPlan:
+    """Apply measured SM8x policy to the shared preparation plan.
+
+    Every SM8x tile is 64 columns wide. The grouped large tile fits SM8x
+    registers and shared memory, where the base 128x256 tile spills.
+    """
+    base = _base_execution_plan(in_features=in_features)
+    fused_num_warps = base.fused_num_warps
+    fused_chunks = fused_preparation_chunks(in_features)
+    if fused_chunks is not None:
+        chunk_count, chunk_size = fused_chunks
+        # One warp keeps a short row in registers without cross-warp reductions. GELU and
+        # SwiGLU codes may differ from wider launches by one INT8 code; plain inputs do not.
+        if chunk_count == 1 and chunk_size <= _SM8X_ONE_WARP_MAX_CHUNK_SIZE:
+            fused_num_warps = 1
+        # Two 8,192-column chunks prepare faster with eight warps and identical bits.
+        elif fused_chunks == _SM8X_EIGHT_WARP_PREPARATION_CHUNKS:
+            fused_num_warps = 8
+    plan = Sm8xExecutionPlan(
+        fuse_rotation_quantization=base.fuse_rotation_quantization,
+        fused_num_warps=fused_num_warps,
+        rotation_num_warps=base.rotation_num_warps,
+        quantization_num_warps=base.quantization_num_warps,
+        matmul_block_m=128,
+        matmul_block_n=64,
+        matmul_block_k=128,
+        matmul_num_warps=4,
+        matmul_num_stages=3,
+        matmul_group_m=16,
+    )
+    if not rows or not out_features:
+        return plan
+    column_tiles = (out_features + 63) // 64
+    small_tiles = ((rows + _SM8X_SMALL_ROWS - 1) // _SM8X_SMALL_ROWS) * column_tiles
+    if rows <= _SM8X_SMALL_ROWS or small_tiles <= _SM8X_SMALL_TILE_LIMIT:
+        return replace(plan, matmul_block_m=16, matmul_num_stages=4, matmul_group_m=0)
+    # Count useful 128-row tiles so a one-row tail is not a full tile.
+    if rows * column_tiles < 128 * _SM8X_LARGE_TILE_THRESHOLD:
+        return replace(plan, matmul_block_m=64, matmul_num_stages=4, matmul_group_m=0)
+    return plan
+
+
 def select_execution_plan(
     target: AcceleratorTarget,
     *,
@@ -121,4 +202,6 @@ def select_execution_plan(
         raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
     if target.is_architecture("sm120"):
         return _sm120_execution_plan(in_features=in_features, rows=rows, out_features=out_features)
+    if target.is_cuda_capability(8):
+        return _sm8x_execution_plan(in_features=in_features, rows=rows, out_features=out_features)
     return _base_execution_plan(in_features=in_features)
