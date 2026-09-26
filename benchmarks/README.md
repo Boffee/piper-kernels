@@ -83,6 +83,46 @@ dimension without assuming self-attention or MHA. `AttentionConfig` records dtyp
 causality, scale, and seed. Generated benchmark inputs always use the recorded `BHSD` QKV
 layout and are independently reproducible from their shape and configuration.
 
+## Dense Piper projection and output fusion
+
+`benchmark_piper_fusion.py` compares compiled Q/K/V fusion with the optional
+bounded output pipeline. Defaults use synthetic H3 transformer dimensions:
+B1/H56/D128, width 5376, BF16, noncausal self-attention, and sequences through
+100000 tokens. Both paths include input preparation, Q/K/V projections,
+norm/RoPE, attention, and output projection. Compilation and tensor construction
+are excluded. This is not a checkpoint-level benchmark.
+
+```shell
+uv run python benchmarks/benchmark_piper_fusion.py --json artifacts/piper-fusion-h3.json
+uv run python benchmarks/benchmark_piper_fusion.py --sequence 32768 100000 \
+  --chunk-rows 4096 --json artifacts/piper-fusion-cap4k.json
+uv run python benchmarks/benchmark_piper_fusion.py --sequence 1024 4097 8192 \
+  --heads 4 --kv-heads 2 --head-dim 64 --width 1024 --causal
+uv run python benchmarks/benchmark_piper_fusion.py \
+  --heads 48 --kv-heads 12 --head-dim 128 --width 6144 --rotary-dim 128 \
+  --sequence 4096 4097 16384 16385 32768 32769 65536 65537 100000 100001 \
+  --json artifacts/piper-fusion-krea2-shapes.json
+```
+
+The last command uses Krea2's main transformer GQA dimensions and full-head
+RoPE. It measures the synthetic unmasked projection/attention pipeline; Krea2's
+text padding mask and sigmoid output gate are outside this benchmark. Use
+`--rotary-dim` to override the default three-quarter-head rotary width.
+
+The benchmark requires one dynamic graph per provider and verifies that the
+advertised Q/K/V and output fusions actually occurred. It checks exact output
+agreement on ordinary calls and CUDA graph replay, including ragged tails.
+Samples use shuffled paired order. Standard `timings` records contain synchronized
+wall samples; `extra.cuda_graph` contains separate device-event samples of the
+whole captured operation. `--no-cuda-graph` disables replay measurements.
+Peak extra allocated bytes include output and execution workspace, excluding
+resident inputs/weights and graph pools. The chunk cap, selected aligned window,
+and any explicit override are recorded alongside the shape and environment.
+`--chunk-rows` overrides the cap only on the output operator in the benchmark's
+captured graph. Windows are balanced under that cap, with SM120 non-causal windows
+adjusted when the device's SM count and kernel occupancy predict fewer scheduling
+waves. The final window covers the remaining rows.
+
 ## Offline configuration tuning
 
 `tune_candidates()` provides a small offline search loop for development. Kernel-specific
