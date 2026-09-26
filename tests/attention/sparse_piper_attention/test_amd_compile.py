@@ -68,7 +68,7 @@ def _compile_attention(
         options={
             "num_warps": 4,
             "num_stages": 1,
-            "llvm_fn_attrs": (("target-features", "+cumode"),),
+            "llvm_fn_attrs": (("target-features", "-cumode" if head_dim == 128 else "+cumode"),),
         },
     )
 

@@ -15,6 +15,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
     concat_columns,
+    pipeline_boundary,
     pv_tiles,
     qk_tiles,
     query_fragments,
@@ -146,6 +147,10 @@ def _sparse_piper_attention_kernel(
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
     parameters = parameters_ptr + kv_batch_head * sequence_tiles * PARAMETER_COUNT
+    # D128 benefits from prioritizing matrix work over the intervening softmax.
+    # Keep sequence lengths dynamic so projection windows share this schedule.
+    matrix_priority: gl.constexpr = 3 if head_dim == 128 else None
+    softmax_priority: gl.constexpr = 0 if head_dim == 128 else None
 
     for pair in range(pair_count):
         tile_0 = tile_offset(
@@ -173,6 +178,7 @@ def _sparse_piper_attention_kernel(
             tile_1,
             use_64bit_context_offsets,
             head_dim,
+            pipeline_priority=matrix_priority,
         )
         parameters_0 = parameters + tile_0 * PARAMETER_COUNT
         parameters_1 = parameters + tile_1 * PARAMETER_COUNT
@@ -246,8 +252,7 @@ def _sparse_piper_attention_kernel(
             )
             packed += (words,)
             sums += (total,)
-            with gl.amd.warp_pipeline_stage("softmax"):
-                pass
+            pipeline_boundary("softmax", softmax_priority)
         denominator = (
             denominator * old_weight + ((sums[0] + sums[1]) + (sums[2] + sums[3])) * current_weight
         )
@@ -262,6 +267,7 @@ def _sparse_piper_attention_kernel(
             numerator,
             current_weight,
             use_64bit_context_offsets,
+            pipeline_priority=matrix_priority,
         )
         running_max = next_max
 
@@ -403,5 +409,7 @@ def _launch_sparse_piper_attention(
             launch.apply_coarse_residual,
             num_warps=4,
             num_stages=1,
-            llvm_fn_attrs=(("target-features", "+cumode"),),
+            llvm_fn_attrs=(
+                ("target-features", "-cumode" if launch.head_dim == 128 else "+cumode"),
+            ),
         )

@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import benchmark_sparse_piper_projection as benchmark
 import pytest
 import torch
-from lib.timing import ClockDomain, Timing
+from lib.timing import ClockDomain, DeviceTimings, Timing
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
@@ -42,7 +42,7 @@ def test_unsupported_backend_rejects_before_large_allocations_or_input_preparati
     )
     args = benchmark._parse_args(["--device", "1", "--sequence", "100000"])
     with FakeTensorMode(), pytest.raises(ValueError, match="sparse projections are unavailable"):
-        benchmark._benchmark(args, args.sequence[0])
+        benchmark._benchmark(args, args.sequence[0], Mock())
     select.assert_called_once()
     probe = select.call_args.args[0]
     assert probe.device == torch.device("cuda:1")
@@ -53,16 +53,14 @@ def test_unsupported_backend_rejects_before_large_allocations_or_input_preparati
 def test_measure_reports_medians_and_does_not_credit_mean_reduction_with_integer_ops(
     monkeypatch, operations
 ):
-    cold = Mock(side_effect=[3.0, 2.0, 1.0])
-    graph = Mock(side_effect=[4.0, 3.0, 2.0])
+    timing = DeviceTimings(60, 100, (3.0, 2.0, 1.0), (4.0, 3.0, 2.0))
     wall = Timing(5.0, 4.0, 6.0, ClockDomain.SYNCHRONIZED_WALL)
-    monkeypatch.setattr(benchmark, "do_bench", cold)
-    monkeypatch.setattr(benchmark, "do_bench_cudagraph", graph)
+    timer = Mock(return_value=timing)
+    monkeypatch.setattr(benchmark, "measure_device", timer)
     monkeypatch.setattr(benchmark, "synchronized_wall_benchmark", Mock(return_value=wall))
-    result = benchmark._measure(lambda: None, operations, benchmark._parse_args([]))
-    assert result["cache_flushed_samples_ms"] == [3.0, 2.0, 1.0]
-    assert result["graph_samples_ms"] == [4.0, 3.0, 2.0]
-    assert result["graph_median_ms"] == 3.0
+    measured, result = benchmark._measure(lambda: None, operations, benchmark._parse_args([]))
+    assert measured is timing
+    assert timer.call_args.kwargs == {"warmup_ms": 60, "measurement_time_ms": 100, "samples": 3}
     assert result["integer_operations"] == operations
     assert result["cache_flushed_effective_tops"] == (3.0 if operations else None)
     assert result["graph_effective_tops"] == (2.0 if operations else None)

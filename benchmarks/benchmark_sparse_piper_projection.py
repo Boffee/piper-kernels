@@ -12,17 +12,14 @@ phases need not sum exactly to the combined measurement.
 """
 
 import argparse
-import json
-import statistics
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
-from typing import cast
 
 import torch
-from lib.environment import capture_environment
-from lib.timing import synchronized_wall_benchmark
-from triton.testing import do_bench, do_bench_cudagraph
+from lib.environment import EnvironmentInfo, capture_environment
+from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
+from lib.timing import DeviceTimings, measure_device, synchronized_wall_benchmark
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
@@ -45,44 +42,46 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-features", type=_positive_int, default=5376)
     parser.add_argument("--batch", type=_positive_int, default=1)
     parser.add_argument("--routing", choices=["minmax", "mean"], default="minmax")
-    parser.add_argument("--rep-ms", type=_positive_int, default=100)
+    parser.add_argument(
+        "--measurement-time-ms", "--rep-ms", dest="rep_ms", type=_positive_int, default=100
+    )
+    parser.add_argument("--warmup-ms", type=int, default=60)
     parser.add_argument("--samples", type=_positive_int, default=3)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=882)
+    add_output_arguments(parser)
     args = parser.parse_args(argv)
     if min(args.sequence) < 64 or args.input_features % 256:
         parser.error("requires at least 64 tokens and input features divisible by 256")
+    if args.device < 0 or args.warmup_ms < 0:
+        parser.error("requires non-negative device and warmup")
     return args
 
 
 def _measure(
     function: Callable[[], object], operations: int, args: argparse.Namespace
-) -> dict[str, object]:
-    cold = [
-        cast(float, do_bench(function, warmup=60, rep=args.rep_ms, return_mode="median"))
-        for _ in range(args.samples)
-    ]
-    graph = [
-        cast(float, do_bench_cudagraph(function, rep=args.rep_ms, return_mode="median"))
-        for _ in range(args.samples)
-    ]
-    wall = synchronized_wall_benchmark(
-        function, 60, args.rep_ms, synchronize=torch.cuda.synchronize
+) -> tuple[DeviceTimings, dict[str, object]]:
+    timing = measure_device(
+        function, warmup_ms=args.warmup_ms, measurement_time_ms=args.rep_ms, samples=args.samples
     )
-    return {
-        "cache_flushed_samples_ms": cold,
-        "graph_samples_ms": graph,
-        "graph_median_ms": statistics.median(graph),
+    wall = synchronized_wall_benchmark(
+        function, args.warmup_ms, args.rep_ms, synchronize=torch.cuda.synchronize
+    )
+    return timing, {
         "wall": wall.as_dict(),
         "integer_operations": operations,
         "cache_flushed_effective_tops": (
-            operations / statistics.median(cold) / 1e9 if operations else None
+            operations / timing.cache_flushed.median_ms / 1e9 if operations else None
         ),
-        "graph_effective_tops": operations / statistics.median(graph) / 1e9 if operations else None,
+        "graph_effective_tops": operations / timing.graph.median_ms / 1e9 if operations else None,
     }
 
 
-def _benchmark(args: argparse.Namespace, sequence: int) -> None:
+def _benchmark(
+    args: argparse.Namespace,
+    sequence: int,
+    environment: EnvironmentInfo,
+) -> list[BenchmarkRecord[DeviceTimings]]:
     device = torch.device("cuda", args.device)
     backend = _backend.require_projection_backend(torch.empty(0, device=device))
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -128,24 +127,49 @@ def _benchmark(args: argparse.Namespace, sequence: int) -> None:
         assert all(torch.isfinite(tensor).all() for tensor in output[1:])
     operations = 2 * args.batch * sequence * args.input_features * args.heads * 128
     phases = {
-        "query": _measure(q_call, operations, args),
-        "key": _measure(k_call, operations, args),
-        "value": _measure(v_call, operations, args),
-        "input_mean": _measure(mean_call, 0, args),
-        "mean_and_qkv": _measure(combined_call, operations * 3, args),
+        "query": (q_call, operations),
+        "key": (k_call, operations),
+        "value": (v_call, operations),
+        "input_mean": (mean_call, 0),
+        "mean_and_qkv": (combined_call, operations * 3),
     }
-    print(
-        json.dumps(
-            {
-                "shape_bskn": [args.batch, sequence, args.input_features, args.heads * 128],
-                "input_source": "synthetic_bf16_normal",
-                "routing": args.routing,
-                "emit_value_block_means": True,
-                "phases": phases,
-            }
-        ),
-        flush=True,
-    )
+    records = []
+    for phase, (operation, integer_operations) in phases.items():
+        timing, extra = _measure(operation, integer_operations, args)
+        records.append(
+            BenchmarkRecord(
+                benchmark="sparse_piper_projection",
+                provider="piper-convrot",
+                shape={
+                    "batch": args.batch,
+                    "sequence": sequence,
+                    "heads": args.heads,
+                    "head_dim": 128,
+                    "input_features": args.input_features,
+                },
+                configuration={
+                    "input_source": "synthetic_bf16_normal",
+                    "routing": args.routing,
+                    "emit_value_block_means": True,
+                    "seed": args.seed,
+                    "dtype": "bfloat16",
+                    "group_size": 256,
+                    "phase": phase,
+                    "output_allocation": "mean_only"
+                    if phase in ("input_mean", "mean_and_qkv")
+                    else "preallocated",
+                },
+                timings=timing,
+                environment=environment,
+                extra=extra,
+            )
+        )
+        print(
+            f"S={sequence} {phase}: cache-flushed {timing.cache_flushed.display()} ms; "
+            f"graph {timing.graph.display()} ms",
+            flush=True,
+        )
+    return records
 
 
 @torch.inference_mode()
@@ -154,19 +178,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("requires a fused sparse-projection GPU backend")
     with device_context(torch.device("cuda", args.device)):
-        print(
-            json.dumps(
-                {
-                    "environment": capture_environment(
-                        Path(__file__).resolve().parents[1]
-                    ).as_dict(),
-                    "arguments": vars(args),
-                }
-            ),
-            flush=True,
-        )
+        environment = capture_environment(Path(__file__).resolve().parents[1])
+        print(f"GPU: {environment.gpu_name}; backend: {environment.accelerator_backend}")
+        records = []
         for sequence in args.sequence:
-            _benchmark(args, sequence)
+            records.extend(_benchmark(args, sequence, environment))
+        write_records(records, output_target(args))
 
 
 if __name__ == "__main__":

@@ -41,8 +41,7 @@ from lib.tuning import (
     validate_tuning_candidate_count,
 )
 
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_plan
+from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 
@@ -88,52 +87,53 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    # The selected backend's plan validates this union of CUDA/ROCm tuning axes.
     parser.add_argument(
         "--fused-num-warps",
         type=int,
-        choices=convrot_int8_plan._FUSED_NUM_WARPS_VALUES,
+        choices=(1, 2, 4, 8, 16, 32),
         nargs="+",
     )
     parser.add_argument(
         "--rotation-num-warps",
         type=int,
-        choices=convrot_int8_plan._ROTATION_NUM_WARPS_VALUES,
+        choices=(1, 2, 4, 8, 16, 32),
         nargs="+",
     )
     parser.add_argument(
         "--quantization-num-warps",
         type=int,
-        choices=convrot_int8_plan._QUANTIZATION_NUM_WARPS_VALUES,
+        choices=(1, 2, 4, 8, 16, 32),
         nargs="+",
     )
     parser.add_argument(
         "--matmul-block-m",
         type=int,
-        choices=convrot_int8_plan._MATMUL_BLOCK_M_VALUES,
+        choices=(16, 32, 64, 128, 256),
         nargs="+",
     )
     parser.add_argument(
         "--matmul-block-n",
         type=int,
-        choices=convrot_int8_plan._MATMUL_BLOCK_N_VALUES,
+        choices=(16, 32, 64, 128, 256),
         nargs="+",
     )
     parser.add_argument(
         "--matmul-block-k",
         type=int,
-        choices=convrot_int8_plan._MATMUL_BLOCK_K_VALUES,
+        choices=(16, 32, 64, 128, 256),
         nargs="+",
     )
     parser.add_argument(
         "--matmul-num-warps",
         type=int,
-        choices=convrot_int8_plan._MATMUL_NUM_WARPS_VALUES,
+        choices=(2, 4, 8),
         nargs="+",
     )
     parser.add_argument(
         "--matmul-num-stages",
         type=int,
-        choices=convrot_int8_plan._MATMUL_NUM_STAGES_VALUES,
+        choices=(1, 2, 3, 4),
         nargs="+",
     )
     add_tuning_arguments(parser)
@@ -150,8 +150,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: convrot_int8_plan.LinearExecutionPlan,
-) -> tuple[convrot_int8_plan.LinearExecutionPlan, ...]:
+    production_plan: LinearExecutionPlan,
+) -> tuple[LinearExecutionPlan, ...]:
     """Build a bounded explicit search around the production execution plan."""
     fusion_axis = boolean_tuning_axis(
         args.fuse_rotation_quantization,
@@ -214,7 +214,7 @@ def _candidate_plans(
     )
 
 
-def _plan_name(plan: convrot_int8_plan.LinearExecutionPlan) -> str:
+def _plan_name(plan: LinearExecutionPlan) -> str:
     preparation = (
         f"fused-pw{plan.fused_num_warps}"
         if plan.fuse_rotation_quantization
@@ -228,7 +228,7 @@ def _plan_name(plan: convrot_int8_plan.LinearExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: convrot_int8_plan.LinearExecutionPlan,
+    plan: LinearExecutionPlan,
     workload: ConvRotInt8Workload,
 ) -> TuningCandidate[ConvRotInputs, torch.Tensor]:
     """Wrap one plan around the complete production-paid ConvRot device path."""
@@ -254,11 +254,8 @@ def _main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     _validate_args(args)
     if not torch.cuda.is_available():
-        raise SystemExit("ConvRot INT8 linear tuning requires an available NVIDIA GPU")
+        raise SystemExit("ConvRot INT8 linear tuning requires an available CUDA or ROCm GPU")
     device = torch.device("cuda")
-    target = AcceleratorTarget.from_device(device)
-    if not target.is_nvidia_cuda or not target.cuda_capability_at_least(7, 5):
-        raise SystemExit("ConvRot INT8 linear tuning requires NVIDIA SM75 or newer")
 
     shape = ConvRotShape(
         "custom",

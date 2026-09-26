@@ -1,21 +1,24 @@
-"""Argument, measurement, and baseline contracts for the ROCm convolution benchmark."""
+"""Shared argument, measurement, and baseline contracts for convolution benchmarks."""
 
 import argparse
 from unittest.mock import Mock
 
-import benchmark_convrot_int8_conv3d_rocm as benchmark
+import benchmark_convrot_int8_conv3d as benchmark
 import pytest
 import torch
+from lib.timing import DeviceTimings
 from torch.nn import functional
+
+from piper_kernels._triton.targets import AcceleratorTarget
 
 
 def test_default_arguments():
     args = benchmark._parse_args([])
     assert args.shape is None
     assert args.dtype == "float16"
-    assert args.rep_ms == 100
+    assert args.measurement_time_ms == 100
     assert not args.tune
-    assert not args.miopen_benchmark
+    assert not args.vendor_benchmark
     assert not args.skip_reference_timing
 
 
@@ -31,15 +34,15 @@ def test_shape_and_dtype_arguments():
             "--rep-ms",
             "25",
             "--tune",
-            "--miopen-benchmark",
+            "--vendor-benchmark",
             "--skip-reference-timing",
         ]
     )
     assert args.shape == [(1, 128, 5, 64, 64, 128), (2, 4096, 1, 3, 3, 7)]
     assert args.dtype == "float32"
-    assert args.rep_ms == 25
+    assert args.measurement_time_ms == 25
     assert args.tune
-    assert args.miopen_benchmark
+    assert args.vendor_benchmark
     assert args.skip_reference_timing
 
 
@@ -58,29 +61,26 @@ def test_measurements_always_check_outputs_before_timing(monkeypatch, skip_refer
 
     def measured(operation, **kwargs):
         assert all(implementation.call_count == 1 for implementation in implementations.values())
-        return 1.25 if "warmup" in kwargs else 0.75
+        return DeviceTimings(25, 25, (1.25,), (0.75,))
 
-    eager_timer = Mock(side_effect=measured)
-    graph_timer = Mock(side_effect=measured)
-    monkeypatch.setattr(benchmark, "do_bench", eager_timer)
-    monkeypatch.setattr(benchmark, "do_bench_cudagraph", graph_timer)
+    timer = Mock(side_effect=measured)
+    monkeypatch.setattr(benchmark, "measure_device", timer)
     timings = benchmark._measure_implementations(
-        implementations, rep_ms=25, skip_reference_timing=skip_reference_timing
+        implementations,
+        warmup_ms=25,
+        measurement_time_ms=25,
+        samples=1,
+        skip_reference_timing=skip_reference_timing,
     )
     timed = {
         name: operation
         for name, operation in implementations.items()
         if name != "reference" or not skip_reference_timing
     }
-    assert timings == {
-        f"{name}{suffix}": elapsed
-        for name in timed
-        for suffix, elapsed in (("_ms", 1.25), ("_graph_ms", 0.75))
-    }
-    assert eager_timer.call_count == graph_timer.call_count == len(timed)
+    assert timings == {name: DeviceTimings(25, 25, (1.25,), (0.75,)) for name in timed}
+    assert timer.call_count == len(timed)
     for operation in timed.values():
-        eager_timer.assert_any_call(operation, warmup=25, rep=25, return_mode="median")
-        graph_timer.assert_any_call(operation, rep=25, return_mode="median")
+        timer.assert_any_call(operation, warmup_ms=25, measurement_time_ms=25, samples=1)
 
 
 @pytest.mark.parametrize("skip_reference_timing", [False, True])
@@ -91,15 +91,35 @@ def test_incorrect_outputs_fail_before_timing(monkeypatch, skip_reference_timing
         for name in ("native", "reference", "fp16", "fp16_channels_last")
     }
     implementations[incorrect].return_value = torch.tensor(2.0)
-    eager_timer, graph_timer = Mock(), Mock()
-    monkeypatch.setattr(benchmark, "do_bench", eager_timer)
-    monkeypatch.setattr(benchmark, "do_bench_cudagraph", graph_timer)
+    timer = Mock()
+    monkeypatch.setattr(benchmark, "measure_device", timer)
     with pytest.raises(AssertionError):
         benchmark._measure_implementations(
-            implementations, rep_ms=25, skip_reference_timing=skip_reference_timing
+            implementations,
+            warmup_ms=25,
+            measurement_time_ms=25,
+            samples=1,
+            skip_reference_timing=skip_reference_timing,
         )
-    eager_timer.assert_not_called()
-    graph_timer.assert_not_called()
+    timer.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch", "policy"),
+    [
+        ("cuda", "sm120", benchmark.nvidia_policy),
+        ("hip", "gfx1200", benchmark.amd_policy),
+        ("hip", "gfx1201", benchmark.amd_policy),
+    ],
+)
+def test_convolution_selects_the_production_policy(backend, arch, policy):
+    assert benchmark._convolution_policy(AcceleratorTarget(backend, arch)) is policy
+
+
+@pytest.mark.parametrize(("backend", "arch"), [("cuda", "sm89"), ("hip", "gfx9999"), ("cpu", None)])
+def test_unsupported_targets_cannot_benchmark_a_portable_fallback(backend, arch):
+    with pytest.raises(ValueError, match="no optimized backend"):
+        benchmark._convolution_policy(AcceleratorTarget(backend, arch))
 
 
 @pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])

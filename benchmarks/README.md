@@ -7,10 +7,28 @@ it is not part of the installed `piper_kernels` API.
 
 ## Common provider and timing model
 
-For the modular AMD ConvRot INT8 backend, use `benchmark_convrot_int8_rocm.py`
-with ROCm PyTorch. It reports allocation-free preparation/GEMM, full linear,
-dense INT8 TOPS, and separate cache-flushed/graph timings.
-The older ConvRot phase/tuning utilities below still expose NVIDIA launch policy.
+Use the same operator benchmark on CUDA and ROCm. Production dispatch selects the
+backend; shapes, correctness checks, timing scopes, and output formats stay shared.
+Run with the Python from the matching accelerator environment. In particular, use
+the provisioned ROCm Python without running the CUDA-oriented `uv sync` there.
+
+| Workload | Entry point | Phase or workload selection |
+| --- | --- | --- |
+| ConvRot INT8 linear | `benchmark_convrot_int8.py` | `--phases` adds preparation, prepared GEMM, and full-call device timings |
+| ConvRot INT8 Conv3D | `benchmark_convrot_int8_conv3d.py` | `--shape` selects dimensions; includes ordinary and group-norm/SiLU fusion |
+| Dense attention | `benchmark_attention.py` | Providers select supported implementations on the active accelerator |
+| Sparse attention | `benchmark_sparse_piper.py` | Shared public/prepared/routing/preparation measurements |
+| Sparse routing scores | `benchmark_sparse_piper_scores.py` | `--query-blocks` selects standalone or fused-window score shapes |
+| Sparse QKV projections | `benchmark_sparse_piper_projection.py` | Reports Q, K, V, mean, and combined phases |
+| Complete H3 sparse fusion | `benchmark_sparse_piper_fusion.py` | `--query-chunk-rows` sweeps windows through 150K tokens |
+
+Add workloads or backend adapters to these runners instead of creating accelerator-specific
+copies. Reuse `lib` for input generation, timing, quality, and records. Distinct pipeline
+boundaries remain explicit so kernel-only measurements are not confused with full operators.
+The `small_m`, `tail`, and `preparation` ConvRot scripts are explicit NVIDIA kernel/legacy
+ablations and compiler diagnostics; ordinary production preparation/GEMM measurements use
+`benchmark_convrot_int8.py --phases` on either accelerator. NVFP4 and SageAttention2++ runners
+retain their actual backend support limits.
 
 A provider has two explicit callables:
 
@@ -52,6 +70,13 @@ provider = BenchmarkProvider(
 )
 measurement = measure_provider(provider, warmup_ms=100, measurement_time_ms=500)
 ```
+
+`measure_device()` is the shared protocol for device-phase comparisons. It records repeated
+median samples separately for Triton's cache-flushed events (`device_event`) and graph replay
+(`graph_device_event`), including timing windows and sample counts. These are `DeviceTimings`
+inside the same versioned `BenchmarkRecord`; graph timing is never labeled synchronized wall
+time. Complete H3 fusion uses `SampleTimings` for shuffled, fixed-count synchronized calls.
+Compare matching timing modes and scopes across devices.
 
 `AttentionShape` records batch size, Q/KV head counts, Q/KV sequence lengths, and head
 dimension without assuming self-attention or MHA. `AttentionConfig` records dtype,
@@ -590,6 +615,38 @@ Run the ConvRot provider comparison with:
 uv run python benchmarks/benchmark_convrot_int8.py
 ```
 
+The same entry point now replaces the separate `benchmark_convrot_int8_rocm.py` runner.
+For production phases on either accelerator, use:
+
+```shell
+python benchmarks/benchmark_convrot_int8.py \
+  --rows 8192 --in-features 6144 --out-features 4096 \
+  --phases --samples 3 --measurement-time-ms 200 \
+  --jsonl artifacts/convrot-phases.jsonl
+```
+
+Phase checks compare GEMM/full outputs against independent INT32 products and the matching
+FP32 scale/bias epilogue. Preparation and GEMM reuse caller-owned buffers; the full public call
+includes its allocations. Records identify the phase, clock, and dense integer-operation count.
+The production plan and the offline linear tuner's default now come from the active backend.
+`--device` selects the GPU. The optional Comfy Kitchen provider still requires NVIDIA CUDA.
+
+Conv3D likewise uses `benchmark_convrot_int8_conv3d.py` on SM120 and RDNA4, replacing its
+ROCm-suffixed entry point:
+
+```shell
+python benchmarks/benchmark_convrot_int8_conv3d.py \
+  --shape 1,128,5,64,64,128 --samples 3 --measurement-time-ms 100 \
+  --jsonl artifacts/convrot-conv3d.jsonl
+```
+
+`--vendor-benchmark` enables the active vendor's convolution search. `--tune` measures
+explicit prepared-convolution candidates using that accelerator's preparation/descriptor policy.
+Native/reference correctness checks still run when `--skip-reference-timing` is selected.
+Sparse QKV projection also uses `measure_device()` and supports the standard `--json`/`--jsonl`
+outputs. Existing `--rep-ms` arguments remain aliases for `--measurement-time-ms` there and in
+Conv3D.
+
 The default comparison samples both primary M anchors at the lower-width corner: BF16, group 256,
 no bias, `M=8192/32768`, `N=4096`, and `K=6144`. The three dimension options accept lists and form
 a Cartesian product. Run the complete eight-cell primary matrix with:
@@ -798,6 +855,85 @@ warps. The length crossovers were checked at 32 and 56 heads over 8k/16k/32k and
 the budget guard excludes the 1%-keep regression found in the broader sparse-budget screen.
 These choices retain the same quantization and FP32 recurrence. Coarse attention still computes
 its own scores even when fine-route selection is unnecessary.
+
+RDNA4 D128 min/max routing uses the same tiled FP32 scorer for fused projection windows
+and standalone chunks of up to 384 query blocks. To compare it with two Torch GEMMs plus
+the maximum epilogue, run with the Python from a provisioned ROCm environment:
+
+```shell
+python benchmarks/benchmark_sparse_piper_scores.py \
+  --sequence 8192 32768 100000 150000 --query-blocks 64 128 384 --samples 5 --rep-ms 100
+```
+
+Omitting `--query-blocks` retains the full and final chunks of the 4096-token fused pipeline.
+The benchmark checks scores against FP64 and includes score allocation. On an RX 9070 XT,
+Torch `2.14.0+rocm10.1.0a20260908` and matching Triton `3.8.0+git675c5987`, synthetic
+B1/H56/D128 summaries gave these device-event medians across five paired panels:
+
+| Query blocks | Key blocks | Torch scoring (ms) | Tiled scoring (ms) |
+|---:|---:|---:|---:|
+| 128 | 128 | 0.174 | 0.062 |
+| 384 | 512 | 2.154 | 0.494 |
+| 384 | 1562 | 6.649 | 1.659 |
+| 384 | 2343 | 9.915 | 2.485 |
+
+These are cache-flushed scoring measurements, not complete attention speedups. H3-shaped
+BF16 public calls at B1/H56/D128 and 25% keep were compared with the old 64-query-block
+dispatch limit using seven shuffled pairs per process:
+
+| Tokens | Initial old / new (ms) | Confirmation old / new (ms) |
+|---:|---:|---:|
+| 100,000 | 538.18 / 519.26 | 522.21 / 521.13 |
+| 150,000 | 1203.05 / 1160.58 | 1161.15 / 1159.92 |
+
+The initial 3.5% complete-call gain did not reproduce; the confirmation gain was only
+0.1-0.2%. Routes and outputs matched exactly in both runs, and peak allocation was unchanged.
+At 150K, the tiled scorer removes one 192 MiB auxiliary score matrix per full standalone
+chunk, but other attention buffers dominate the full-call peak. Default fused 4096-row
+projection windows already used native scoring and are unaffected. General FP32 scores can
+differ from Torch in their rounding; exact-score ties retain lower-index selection. Mean
+routing and D64 retain their existing scoring paths.
+
+The complete ConvRot INT8 fusion benchmark can compare query windows at the H3
+B1/H56/D128 shape, with hidden/output width 5376, BF16 activations, min/max routing,
+and 25% keep:
+
+```shell
+python benchmarks/benchmark_sparse_piper_fusion.py \
+  --sequence 100000 150000 --query-chunk-rows 4096 8192 16384 --samples 7 \
+  --json artifacts/sparse_piper_fusion_windows.json
+```
+
+Each variant uses the same seeded inputs and weights. A benchmark-only graph pass
+sets and checks the actual fused operator's query-window argument, and each variant
+must reuse one dynamic graph across sequence lengths. Complete outputs are compared
+with the quantized materialized baseline using a CPU reference and bounded slices;
+compilation and these comparisons are outside the shuffled timing samples. Peak extra
+allocation includes the returned output and execution workspace. The benchmark defaults
+to a 4096-row window and sequences 8192, 32768, 100000, and 150000.
+
+On the same RX 9070 XT/software stack above, seven paired samples gave these
+synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`):
+
+| Tokens | Materialized | Fused 4096 | Fused 8192 | Fused 16384 |
+|---:|---:|---:|---:|---:|
+| 100,000 | 654.11 | 661.56 | 656.22 | 653.29 |
+| 150,000 | 1349.31 | 1369.85 | 1362.52 | 1367.09 |
+
+Every fused output matched the materialized result exactly, including an 8193-token
+tail control, and each window reused one graph across all three lengths. At 150K,
+peak extra allocation was 6882 MiB materialized versus 5722, 5928, and 6340 MiB for
+the three fused windows. The materialized baseline releases prepared input after V
+projection and Q/K/V after attention, before output projection.
+
+Two earlier independent window sweeps also found only 0.4-0.6% lower latency with
+8192 rows at 150K. A separate projected-coarse-gate control found a 0.6% gain while
+adding 354 MiB; 16384 rows added about 1060 MiB without beating 8192. At 100K,
+16384 rows also reduce the gate pipeline to seven chunks, below its eight-chunk
+overlap threshold. These synthetic measurements favor retaining the 4096-row
+production default: the modest latency benefit requires more workspace, and the
+fused pipeline's main benefit here is bounded memory. No production window policy
+changes are included in this benchmark extension.
 
 Compiler inspection and external profiling are available for one shape at a time:
 

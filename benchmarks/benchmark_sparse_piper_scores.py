@@ -1,7 +1,8 @@
 """Compare selected FP32 minmax scoring with the two-GEMM Torch baseline.
 
 Uses synthetic summaries at H3's B1/H56/D128, with full and final query chunks
-from a 4096-token fused pipeline. K retains the sparse-prefix view of the padded
+from a 4096-token fused pipeline by default. --query-blocks also measures larger
+standalone routing chunks. K retains the sparse-prefix view of the padded
 sequence allocation. Scores are checked against FP64 before timing. Timings
 include score allocation and the maximum epilogue, but not summary generation
 or route selection. These are FP32 operations, not INT8 TOPS.
@@ -27,7 +28,8 @@ _WARMUP_MS = 20
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequence", type=int, nargs="+", default=[8192, 32768, 100000])
+    parser.add_argument("--sequence", type=int, nargs="+", default=[8192, 32768, 100000, 150000])
+    parser.add_argument("--query-blocks", type=int, nargs="+")
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--rep-ms", type=int, default=100)
     parser.add_argument("--device", type=int, default=0)
@@ -36,6 +38,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if min(args.sequence) < 64 or args.samples < 1 or args.rep_ms < 1 or args.device < 0:
         parser.error("requires sequence >= 64, positive samples/rep-ms, and a nonnegative device")
+    if args.query_blocks is not None and min(args.query_blocks) < 1:
+        parser.error("query blocks must be positive")
     return args
 
 
@@ -139,7 +143,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         environment = capture_environment(Path(__file__).resolve().parents[1])
         records = []
         for sequence in args.sequence:
-            for rows in _query_chunks(sequence):
+            for rows in args.query_blocks or _query_chunks(sequence):
                 for record in _benchmark(args, sequence, rows, environment):
                     records.append(record)
                     print(

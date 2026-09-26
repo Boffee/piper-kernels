@@ -1,7 +1,59 @@
 import time
+from unittest.mock import Mock
 
 import pytest
-from lib.timing import ClockDomain, SampleTimings, Timing, synchronized_wall_benchmark
+from lib import timing as timing_module
+from lib.timing import (
+    ClockDomain,
+    DeviceTimings,
+    SampleTimings,
+    Timing,
+    measure_device,
+    synchronized_wall_benchmark,
+)
+
+
+def test_device_timing_preserves_cache_and_graph_measurements(monkeypatch):
+    import triton.testing  # noqa: PLC0415
+
+    cold = Mock(
+        side_effect=[
+            Timing(value, value, value, ClockDomain.DEVICE_EVENT) for value in (3.0, 1.0, 2.0)
+        ]
+    )
+    graph = Mock(side_effect=[6.0, 4.0, 5.0])
+    monkeypatch.setattr(timing_module, "triton_benchmark", cold)
+    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", graph)
+    operation = Mock()
+    result = measure_device(operation, warmup_ms=10, measurement_time_ms=20, samples=3)
+    assert result.cache_flushed_samples_ms == (3.0, 1.0, 2.0)
+    assert result.graph_samples_ms == (6.0, 4.0, 5.0)
+    assert result.cache_flushed.median_ms == 2.0
+    assert result.graph.median_ms == 5.0
+    assert result.as_dict()["sample_statistic"] == "median"
+    assert result.cache_flushed.clock is ClockDomain.DEVICE_EVENT
+    assert result.graph.clock is ClockDomain.GRAPH_DEVICE_EVENT
+    assert cold.call_count == graph.call_count == 3
+    cold.assert_called_with(operation, 10, 20)
+    graph.assert_called_with(operation, rep=20, return_mode="median")
+
+
+@pytest.mark.parametrize(("warmup", "duration", "samples"), [(-1, 1, 1), (0, 0, 1), (0, 1, 0)])
+def test_device_timing_rejects_invalid_windows_before_launch(
+    monkeypatch, warmup, duration, samples
+):
+    timer = Mock()
+    monkeypatch.setattr(timing_module, "triton_benchmark", timer)
+    with pytest.raises(ValueError, match="requires positive"):
+        measure_device(Mock(), warmup_ms=warmup, measurement_time_ms=duration, samples=samples)
+    timer.assert_not_called()
+
+
+def test_device_timings_reject_mismatched_or_empty_samples():
+    with pytest.raises(ValueError, match="equal sample counts"):
+        DeviceTimings(0, 1, (1.0,), (1.0, 2.0))
+    with pytest.raises(ValueError, match="latency samples"):
+        DeviceTimings(0, 1, (), ())
 
 
 @pytest.mark.parametrize("clock", list(ClockDomain))

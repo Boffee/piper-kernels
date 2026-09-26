@@ -76,6 +76,24 @@ def test_omitted_axes_measure_only_the_production_plan() -> None:
     assert _candidate_plans(_parse_args([]), production_plan) == (production_plan,)
 
 
+def test_amd_tuning_accepts_its_preparation_warp_count_and_preserves_backend_constraints():
+    workload = make_convrot_int8_workload(
+        ConvRotShape("test", 2, 3, 16384),
+        ConvRotConfig(torch.bfloat16),
+        device=torch.device("cpu"),
+        target=AcceleratorTarget("hip", "gfx1201"),
+    )
+    assert workload.production_plan.fused_num_warps == 32
+    arguments = _parse_args(["--fused-num-warps", "32", "--matmul-block-k", "256"])
+    (plan,) = _candidate_plans(arguments, workload.production_plan)
+    assert plan.fused_num_warps == 32
+    assert plan.matmul_block_k == 256
+    with pytest.raises(ValueError, match="fused preparation num_warps"):
+        _candidate_plans(arguments, _production_plan())
+    with pytest.raises(ValueError, match="matmul_num_warps"):
+        _candidate_plans(_parse_args(["--matmul-num-warps", "2"]), workload.production_plan)
+
+
 def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
     arguments = _parse_args(
         [

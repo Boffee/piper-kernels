@@ -40,6 +40,18 @@ _RESCALE_CONSTRAINTS = gl.constexpr(
 
 
 @gluon.jit
+def pipeline_boundary(label: gl.constexpr, priority: gl.constexpr = None):
+    """End a warp-pipeline stage, preserving the compiler's default priority."""
+    # Omit the keyword: Gluon cannot unwrap an explicitly passed constexpr(None).
+    if priority is None:
+        with gl.amd.warp_pipeline_stage(label):
+            pass
+    else:
+        with gl.amd.warp_pipeline_stage(label, priority=priority):
+            pass
+
+
+@gluon.jit
 def split_columns(value):
     return gl.split(
         value.reshape([value.shape[0], value.shape[1], 2, value.shape[2] // 2]).permute(
@@ -139,6 +151,7 @@ def qk_tiles(
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
+    pipeline_priority: gl.constexpr = None,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
 
@@ -168,8 +181,7 @@ def qk_tiles(
                 acc = int8_wmma(query[k], key, acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
             results += (gl.fma(result.to(gl.float32, bitcast=True), 67108864.0, -10680707.0),)
-        with gl.amd.warp_pipeline_stage("qk"):
-            pass
+        pipeline_boundary("qk", pipeline_priority)
     return _join_matrix(results)
 
 
@@ -246,6 +258,7 @@ def pv_tiles(
     current_weight,
     use_64bit_context_offsets: gl.constexpr,
     two_tiles: gl.constexpr = True,
+    pipeline_priority: gl.constexpr = None,
 ):
     """Accumulate D16 products into the already-rescaled numerator.
 
@@ -288,6 +301,5 @@ def pv_tiles(
                     gl.convert_layout(numerators[column_tile], MMA_LAYOUT),
                 ),
             )
-        with gl.amd.warp_pipeline_stage("pv"):
-            pass
+        pipeline_boundary("pv", pipeline_priority)
     return _join_matrix(results)

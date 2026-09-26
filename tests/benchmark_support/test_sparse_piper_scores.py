@@ -29,15 +29,16 @@ def test_invalid_arguments_are_rejected(arguments):
         (8192, [64]),
         (32768, [64]),
         (100000, [64, 27]),
+        (150000, [64, 40]),
     ],
 )
 def test_scoring_uses_actual_full_and_tail_chunk_sizes(sequence, chunks):
     assert benchmark._query_chunks(sequence) == chunks
 
 
-def test_defaults_cover_h3_through_100k():
+def test_defaults_cover_h3_through_150k():
     args = benchmark._parse_args([])
-    assert args.sequence == [8192, 32768, 100000]
+    assert args.sequence == [8192, 32768, 100000, 150000]
     assert args.samples == 7
 
 

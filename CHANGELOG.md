@@ -7,9 +7,21 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- H3 ConvRot INT8 sparse-attention fusion benchmarks can sweep query-window sizes through
+  150,000 tokens, checking the emitted fusion, complete outputs, latency, and peak allocation.
 - Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
+
+### Changed
+
+- ConvRot INT8 benchmarks share CUDA/ROCm linear and Conv3D runners, production policy
+  selection, and device timing records. Linear phase measurements use `--phases`; sparse
+  QKV projection shares the timing and JSON/JSONL reporting helpers.
+- RDNA4 D128 sparse Piper uses WGP scheduling and prioritizes matrix stages in the
+  stock Gluon kernel, preserving dynamic-length reuse and numerical operations.
+- RDNA4 D128 min/max routing uses tiled FP32 scoring for standalone query chunks as well
+  as fused projection windows, avoiding a second global score matrix for larger chunks.
 
 ## [0.7.6rc1] - 2026-09-25
 

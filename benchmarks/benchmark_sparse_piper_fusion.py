@@ -7,6 +7,9 @@ output projection. The materialized reference uses the same quantized operator
 boundaries; it is not an unfused BF16 model. Compilation and weight creation are
 excluded. Shuffled, synchronized wall samples include allocation and host work.
 Peak extra allocated bytes include the returned output and execution workspace.
+Use --query-chunk-rows 4096 8192 16384 to compare fused query windows with the
+same weights and inputs. Complete correctness references stay on CPU so checking
+150K-token outputs does not retain two full outputs on the accelerator.
 """
 
 import argparse
@@ -46,7 +49,8 @@ _FUSED_OUTPUT = "piper_kernels.convrot_int8_sparse_piper_projected_query_attenti
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequence", type=int, nargs="+", default=[8192, 32768, 100000])
+    parser.add_argument("--sequence", type=int, nargs="+", default=[8192, 32768, 100000, 150000])
+    parser.add_argument("--query-chunk-rows", type=int, nargs="+", default=[4096])
     parser.add_argument("--samples", type=int, default=11)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=881)
@@ -56,6 +60,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("requires sequence >= 64, positive samples, and a nonnegative device")
     if max(args.sequence) // 64 > 65536:
         parser.error("sparse key prefixes must fit UINT16 route indices")
+    if any(rows < 64 or rows % 64 for rows in args.query_chunk_rows):
+        parser.error("query chunks must be positive multiples of 64 rows")
+    if len(set(args.query_chunk_rows)) != len(args.query_chunk_rows):
+        parser.error("query chunks must be unique")
     return args
 
 
@@ -139,6 +147,8 @@ class _H3Attention(torch.nn.Module):
         )
         mean = _ops.dequantized_input_mean(data, scale)
         v = value._project_value_op(data, scale, mean, vw.qdata, vw.scale)
+        # All projections have consumed the shared prepared input before attention.
+        del data, scale, mean
         attended = _sparse_piper_attention_from_quantized_op(
             *q,
             *k,
@@ -150,7 +160,7 @@ class _H3Attention(torch.nn.Module):
         )
         # Match the materialized attention boundary's lifetimes before output
         # projection; retaining Q/K/V here would inflate its memory footprint.
-        del q, k, v, data, scale, mean
+        del q, k, v
         return linear_backend.require_linear_backend(attended).linear(
             attended.reshape(hidden.shape[0], hidden.shape[1], 7168),
             ow.qdata,
@@ -163,15 +173,44 @@ class _H3Attention(torch.nn.Module):
 class _CaptureFusion(CustomInferenceAwareGraphPass):
     """Fail the benchmark if the advertised fusion is absent or retraces."""
 
-    def __init__(self) -> None:
+    def __init__(self, query_chunk_rows: int | None = None) -> None:
         self.calls = 0
         self.targets: list[str] = []
+        self.requested_query_chunk_rows = query_chunk_rows
+        self.actual_query_chunk_rows: int | None = None
         self._uuid = uuid.uuid4().bytes
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         assert is_inference
         self.calls += 1
-        self.targets = [str(node.target) for node in graph.nodes if node.op == "call_function"]
+        calls = [node for node in graph.nodes if node.op == "call_function"]
+        self.targets = [str(node.target) for node in calls]
+        fused = [node for node in calls if str(node.target) == _FUSED_OUTPUT]
+        if len(fused) != 1:
+            return
+        node = fused[0]
+        schema = cast(Any, node.target)._schema
+        index = next(
+            index
+            for index, argument in enumerate(schema.arguments)
+            if argument.name == "query_chunk_rows"
+        )
+        if self.requested_query_chunk_rows is not None:
+            arguments, keywords = list(node.args), dict(node.kwargs)
+            if index < len(arguments):
+                arguments[index] = self.requested_query_chunk_rows
+                keywords.pop("query_chunk_rows", None)
+            else:
+                keywords["query_chunk_rows"] = self.requested_query_chunk_rows
+            node.args, node.kwargs = tuple(arguments), keywords
+            graph.lint()
+        actual = (
+            node.args[index]
+            if index < len(node.args)
+            else node.kwargs.get("query_chunk_rows", schema.arguments[index].default_value)
+        )
+        assert isinstance(actual, int)
+        self.actual_query_chunk_rows = actual
 
     def uuid(self) -> bytes:
         return self._uuid
@@ -180,22 +219,57 @@ class _CaptureFusion(CustomInferenceAwareGraphPass):
         assert self.calls == 1, f"expected one dynamic graph, got {self.calls}"
         assert self.targets.count(_FUSED_OUTPUT) == 1, self.targets
         assert "piper_kernels.convrot_int8_sparse_piper_project_query.default" not in self.targets
+        if self.requested_query_chunk_rows is not None:
+            assert self.actual_query_chunk_rows == self.requested_query_chunk_rows
+
+
+def _compile_variants(
+    model: torch.nn.Module, query_chunk_rows: Sequence[int]
+) -> dict[str, tuple[Callable[..., torch.Tensor], _CaptureFusion]]:
+    variants = {}
+    for rows in query_chunk_rows:
+        capture = _CaptureFusion(rows)
+        options = convrot_int8_sparse_piper_compile_options()
+        passes = options["post_grad_custom_pre_pass"]
+        assert isinstance(passes, tuple)
+        options["post_grad_custom_pre_pass"] = (*passes, capture)
+        # Each capture's UUID isolates the requested window in Inductor's cache.
+        # Torch's options annotation does not include tuples of graph passes.
+        compiled = torch.compile(model, dynamic=True, fullgraph=True, options=cast(Any, options))
+        name = "compiled_fused" if len(query_chunk_rows) == 1 else f"compiled_fused_q{rows}"
+        variants[name] = (compiled, capture)
+    return variants
 
 
 def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype
     error, energy = 0.0, 0.0
-    for start in range(0, actual.shape[1], 4096):
+    for start in range(0, actual.shape[1], 256):
         left, right = (
-            actual[:, start : start + 4096].float(),
-            expected[:, start : start + 4096].float(),
+            actual[:, start : start + 256].cpu().float(),
+            expected[:, start : start + 256].cpu().float(),
         )
         assert bool(torch.isfinite(left).all())
         assert bool(torch.isfinite(right).all())
         error += float((left - right).square().sum())
         energy += float(right.square().sum())
     return (error / max(energy, 1e-30)) ** 0.5
+
+
+def _compare_variants(
+    functions: dict[str, Callable[[], torch.Tensor]], captures: dict[str, _CaptureFusion]
+) -> dict[str, float]:
+    expected = functions["materialized"]().cpu()
+    errors = {"materialized": 0.0}
+    for name, capture in captures.items():
+        actual = functions[name]()
+        error = _relative_l2(actual, expected)
+        assert error < 0.015, error
+        capture.check()
+        errors[name] = error
+        del actual
+    return errors
 
 
 def _measure(
@@ -233,13 +307,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         _backend.require_projection_backend(probe)
         _backend.require_output_backend(probe)
         model = _H3Attention(torch.Generator(device=device).manual_seed(args.seed)).eval()
-        capture = _CaptureFusion()
-        options = convrot_int8_sparse_piper_compile_options()
-        passes = options["post_grad_custom_pre_pass"]
-        assert isinstance(passes, tuple)
-        options["post_grad_custom_pre_pass"] = (*passes, capture)
-        # Torch's options annotation does not include tuples of graph passes.
-        compiled = torch.compile(model, dynamic=True, fullgraph=True, options=cast(Any, options))
+        variants = _compile_variants(model, args.query_chunk_rows)
+        captures = {name: capture for name, (_, capture) in variants.items()}
         environment = capture_environment(Path(__file__).resolve().parents[1])
         records: list[BenchmarkRecord[SampleTimings]] = []
         for sequence in args.sequence:
@@ -252,16 +321,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             del angles
             functions = {
                 "materialized": partial(model.materialized, hidden, cos, sin, sequence // 64),
-                "compiled_fused": partial(compiled, hidden, cos, sin, sequence // 64),
+                **{
+                    name: partial(compiled, hidden, cos, sin, sequence // 64)
+                    for name, (compiled, _) in variants.items()
+                },
             }
-            expected, actual = functions["materialized"](), functions["compiled_fused"]()
-            error = _relative_l2(actual, expected)
-            assert error < 0.015, error
-            capture.check()
-            del expected, actual
+            errors = _compare_variants(functions, captures)
             measurements = _measure(functions, args)
-            capture.check()
+            for capture in captures.values():
+                capture.check()
             for name, (timings, peak) in measurements.items():
+                capture = captures.get(name)
                 record = BenchmarkRecord(
                     benchmark="sparse_piper_fusion",
                     provider=name,
@@ -284,13 +354,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         "measurement_order": "shuffled_paired_calls",
                         "compile_time_included": False,
+                        "requested_query_chunk_rows": (
+                            capture.requested_query_chunk_rows if capture is not None else None
+                        ),
+                        "actual_query_chunk_rows": (
+                            capture.actual_query_chunk_rows if capture is not None else None
+                        ),
                     },
                     timings=timings,
                     environment=environment,
                     extra={
-                        "relative_l2_vs_materialized": error if name == "compiled_fused" else 0.0,
-                        "compile_calls": capture.calls if name == "compiled_fused" else 0,
-                        "fused_operator": _FUSED_OUTPUT if name == "compiled_fused" else None,
+                        "relative_l2_vs_materialized": errors[name],
+                        "compile_calls": capture.calls if capture is not None else 0,
+                        "fused_operator": _FUSED_OUTPUT if capture is not None else None,
                         "peak_extra_allocated_bytes": peak,
                     },
                 )
