@@ -39,6 +39,13 @@ def test_dense_amd_compilation(architecture, head_dim, causal, dtype, wide):
         )
     )
     signature.update(query_ptr="*i8", key_ptr="*i8", value_ptr="*i8", output_ptr=f"*{dtype}")
+    if wide:
+        signature.update(
+            dict.fromkeys(
+                ("query_start", "global_query_start", "stride_ob", "stride_oh", "stride_om"),
+                "i64",
+            )
+        )
     compiled = triton.compile(
         GluonASTSource(_dense_piper_kernel, signature, constexprs=constants),
         target=GPUTarget("hip", architecture, 32),

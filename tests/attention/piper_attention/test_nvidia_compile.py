@@ -48,6 +48,8 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         aligned_queries=aligned_queries,
         unmasked_key_tiles=not causal,
         use_query_tensor_descriptor=False,
+        full_query=False,
+        contiguous_output=False,
     )
     signature = {name: "i32" for name in _piper_attention_kernel.arg_names if name not in constants}
     signature.update(

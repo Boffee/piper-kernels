@@ -30,7 +30,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from .. import _quantization
-from .._validation import validate_output_buffer
+from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
 from . import policy as _policy
 
 _BLOCK_N = 64
@@ -379,6 +379,12 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     query_block,
     query_length,
     key_length,
+    query_start,
+    query_rows,
+    global_query_start,
+    stride_ob,
+    stride_oh,
+    stride_om,
     heads,
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
@@ -394,6 +400,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     loop_licm: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    contiguous_output: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     use_query_tensor_descriptor: tl.constexpr,
 ):
@@ -402,16 +409,20 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     batch = tl.program_id(2)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // head_groups) + head // head_groups
-    offsets_m = query_block * block_m + tl.arange(0, block_m)
+    output_rows = query_block * block_m + tl.arange(0, block_m)
+    offsets_m = query_start + output_rows
+    global_rows = global_query_start + output_rows
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
     if unmasked_query_tiles:
         valid_queries = tl.full((block_m,), True, dtype=tl.int1)
     else:
-        valid_queries = offsets_m < query_length
+        valid_queries = output_rows < query_rows
 
     if use_query_tensor_descriptor:
-        query = query_ptr.load([batch_head, query_block * block_m, 0]).reshape((block_m, head_dim))
+        query = query_ptr.load([batch_head, query_start + query_block * block_m, 0]).reshape(
+            (block_m, head_dim)
+        )
     else:
         query = tl.load(
             query_ptr
@@ -422,7 +433,10 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
         )
     if grouped_qk:
         query_scale = tl.load(
-            query_scale_ptr + batch_head * tl.cdiv(query_length, 32) + offsets_m // 32,
+            query_scale_ptr
+            + batch_head * tl.cdiv(query_length, 32)
+            + query_start // 32
+            + output_rows // 32,
             mask=valid_queries,
             other=0.0,
         )
@@ -444,14 +458,14 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     running_max = tl.full((block_m,), -float("inf"), dtype=tl.float32)
     end_n = key_length
     if is_causal:
-        end_n = tl.minimum(key_length, (query_block + 1) * block_m)
+        end_n = tl.minimum(key_length, global_query_start + (query_block + 1) * block_m)
 
     if is_causal and optimize_causal_traversal:
         numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator  # pyright: ignore[reportPossiblyUnboundVariable]
         # Only complete K tiles strictly before the first query row are
         # mask-free. Keep ragged tails and diagonal overlap in the boundary.
         full_key_end = key_length // block_n * block_n
-        causal_prefix_end = query_block * block_m // block_n * block_n
+        causal_prefix_end = (global_query_start + query_block * block_m) // block_n * block_n
         prefix_end = tl.minimum(causal_prefix_end, full_key_end)
         for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             0,
@@ -473,7 +487,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 running_max,
                 kv_batch_head,
                 start_n,
-                offsets_m,
+                global_rows,
                 offsets_n,
                 offsets_d,
                 valid_queries,
@@ -509,7 +523,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 running_max,
                 kv_batch_head,
                 start_n,
-                offsets_m,
+                global_rows,
                 offsets_n,
                 offsets_d,
                 valid_queries,
@@ -551,7 +565,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 running_max,
                 kv_batch_head,
                 start_n,
-                offsets_m,
+                global_rows,
                 offsets_n,
                 offsets_d,
                 valid_queries,
@@ -573,6 +587,17 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             accumulator = numerator
     denominator_safe = tl.maximum(denominator, 1e-30)[:, None]
     denominator_code_units = denominator_safe * _P_UINT8_RANGE
+    if contiguous_output:
+        output_base = (
+            output_ptr + (batch_head.to(tl.int64) * query_rows + output_rows[:, None]) * head_dim
+        )
+    else:
+        output_base = (
+            output_ptr
+            + batch.to(tl.int64) * stride_ob
+            + head.to(tl.int64) * stride_oh
+            + output_rows[:, None].to(tl.int64) * stride_om
+        )
     if split_pv_head_dim:
         output_low = accumulator_low / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         output_high = accumulator_high / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -580,7 +605,6 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             value_mean_base = value_mean_ptr + kv_batch_head * head_dim
             output_low += tl.load(value_mean_base + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
             output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
-        output_base = output_ptr + (batch_head * query_length + offsets_m[:, None]) * head_dim
         tl.store(
             output_base + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
             output_low,
@@ -596,15 +620,25 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
         if not is_causal:
             output += tl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d)[None, :]
         tl.store(
-            output_ptr
-            + (batch_head * query_length + offsets_m[:, None]) * head_dim
-            + offsets_d[None, :],
+            output_base + offsets_d[None, :],
             output,
             mask=valid_queries[:, None],
         )
 
 
-@triton.jit(do_not_specialize=["query_length", "key_length", "heads"])
+@triton.jit(
+    do_not_specialize=[
+        "query_length",
+        "key_length",
+        "heads",
+        "query_start",
+        "query_rows",
+        "global_query_start",
+        "stride_ob",
+        "stride_oh",
+        "stride_om",
+    ]
+)
 def _piper_attention_kernel(
     query_ptr,
     query_descriptor,
@@ -618,6 +652,12 @@ def _piper_attention_kernel(
     output_ptr,
     query_length,
     key_length,
+    query_start,
+    query_rows,
+    global_query_start,
+    stride_ob,
+    stride_oh,
+    stride_om,
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
@@ -635,8 +675,17 @@ def _piper_attention_kernel(
     loop_licm: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    full_query: tl.constexpr,
+    contiguous_output: tl.constexpr,
 ):
     """Cover full query tiles and their ragged tail in one grid."""
+    # Preserve the measured full-launch path instead of carrying window
+    # coordinates through every Q load. Contiguous outputs likewise retain
+    # flattened indexing in the tile epilogue.
+    if full_query:
+        query_start = 0
+        global_query_start = 0
+        query_rows = query_length
     query_block = tl.program_id(0)
     if is_causal and optimize_causal_traversal:
         query_block = tl.num_programs(0) - 1 - query_block
@@ -652,6 +701,12 @@ def _piper_attention_kernel(
         query_block,
         query_length,
         key_length,
+        query_start,
+        query_rows,
+        global_query_start,
+        stride_ob,
+        stride_oh,
+        stride_om,
         heads,
     )
     tile_options = tl.constexpr(
@@ -670,11 +725,12 @@ def _piper_attention_kernel(
             loop_licm,
             use_packed_probability_conversion,
             derive_value_log_bound,
+            contiguous_output,
         )
     )
     # This CTA-uniform branch folds away for aligned queries. Only the tail
     # needs masked pointer loads; full tiles retain the Q descriptor if present.
-    if aligned_queries or query_block < query_length // block_m:
+    if aligned_queries or query_block < query_rows // block_m:
         _piper_attention_query_tile(
             query_descriptor if use_query_tensor_descriptor else query_ptr,
             *tile_args,
@@ -775,6 +831,7 @@ class _PreparedPiperQuery:
     descriptor: TensorDescriptor | None
     shape: tuple[int, int, int, int]
     dtype: torch.dtype
+    global_row_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,10 +940,16 @@ def _prepare_piper_query(
     scale: float,
     *,
     execution_plan: _policy.PiperAttentionExecutionPlan,
+    global_row_offset: int = 0,
 ) -> _PreparedPiperQuery:
-    """Prepare validated Q using the same plan as its K/V context."""
+    """Prepare Q using its K/V plan and a tile-aligned global origin.
+
+    To match full-sequence quantization, chunks must contain complete Q32 scale
+    groups except at the sequence tail. Launch windows may end within a group.
+    """
     batch, heads, query_length, head_dim = query.shape
     plan = execution_plan
+    validate_query_offset(global_row_offset, block_rows=plan.block_m, name="global_row_offset")
     with device_context(query.device):
         query_int8, query_scale = qk_quantization.prepare_query(
             query,
@@ -904,6 +967,7 @@ def _prepare_piper_query(
         descriptor=descriptor,
         shape=(batch, heads, query_length, head_dim),
         dtype=query.dtype,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -927,20 +991,40 @@ def _launch_piper_attention_into(
     context: _PreparedPiperContext,
     query: _PreparedPiperQuery,
     output: torch.Tensor,
+    *,
+    query_start: int = 0,
+    query_rows: int | None = None,
 ) -> torch.Tensor:
-    """Launch compatible prepared operands into contiguous output storage.
+    """Launch a local Q window into caller-owned BHSD output storage.
 
     Q and K/V must match in batch, head dimension, device, and execution plan;
-    Q heads must be divisible by K/V heads. Causal attention requires a full
-    query sequence with the same logical length as K/V.
+    Q heads must be divisible by K/V heads. The local start and global origin
+    are aligned to plan.block_m; rows may include a ragged tail. Causal masking
+    uses the global origin plus local start. query_start is local to prepared Q;
+    query_rows=None selects its remaining logical rows. Output may have padded
+    or permuted outer strides, with contiguous head features and no overlap.
     """
-    validate_output_buffer(output, shape=query.shape, dtype=query.dtype, device=query.data.device)
     batch, heads, query_length, head_dim = query.shape
     plan = context.plan
+    rows = resolve_query_window(
+        query_length,
+        query_start=query_start,
+        query_rows=query_rows,
+        global_row_offset=query.global_row_offset,
+        block_rows=plan.block_m,
+        key_length=context.key_length,
+        is_causal=context.is_causal,
+    )
+    validate_output_buffer(
+        output,
+        shape=(batch, heads, rows, head_dim),
+        dtype=query.dtype,
+        device=query.data.device,
+    )
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = query.descriptor is not None
     with device_context(query.data.device):
-        attention_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
+        attention_kernel[(triton.cdiv(rows, plan.block_m), heads, batch)](
             query.data,
             query.descriptor if use_query_tensor_descriptor else query.data,
             context.key,
@@ -953,10 +1037,16 @@ def _launch_piper_attention_into(
             output,
             query_length,
             context.key_length,
+            query_start,
+            rows,
+            query.global_row_offset + query_start,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
             is_causal=context.is_causal,
             grouped_qk=plan.grouped_qk,
             split_pv_head_dim=plan.split_pv_head_dim,
-            aligned_queries=query_length % plan.block_m == 0,
+            aligned_queries=rows % plan.block_m == 0,
             unmasked_key_tiles=(not context.is_causal and context.key_length % _BLOCK_N == 0),
             heads=heads,
             head_groups=heads // context.key_scale.shape[1],
@@ -970,6 +1060,8 @@ def _launch_piper_attention_into(
             loop_licm=plan.loop_licm,
             use_packed_probability_conversion=plan.use_packed_probability_conversion,
             derive_value_log_bound=plan.derive_value_log_bound,
+            full_query=query_start == 0 and query.global_row_offset == 0 and rows == query_length,
+            contiguous_output=output.is_contiguous(),
             num_warps=plan.num_warps,
             num_stages=plan.num_stages,
         )

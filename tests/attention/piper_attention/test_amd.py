@@ -274,3 +274,70 @@ def test_empty_batch():
     output = piper_attention(query, query, query)
     assert output.shape == query.shape
     assert output.is_contiguous()
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd", "padded_bshd"])
+def test_query_windows_match_full_attention_with_strided_outputs(head_dim, causal, layout):
+    torch.manual_seed(998)
+    query = torch.randn(2, 6, 193, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 193 if causal else 225, head_dim, device="cuda", dtype=query.dtype)
+    prepared = backend.prepare_attention(query, key, torch.randn_like(key), head_dim**-0.5, causal)
+    expected = backend.launch_attention(prepared).clone()
+    for start, rows in ((0, 31), (64, 65), (128, 65)):
+        if layout == "bhsd":
+            output = torch.empty((2, 6, rows, head_dim), device=query.device, dtype=query.dtype)
+        else:
+            capacity = rows + (17 if layout == "padded_bshd" else 0)
+            backing = torch.full(
+                (2, capacity, 6, head_dim), float("nan"), device=query.device, dtype=query.dtype
+            )
+            output = backing[:, :rows].transpose(1, 2)
+        backend.launch_attention_into(
+            prepared.context, prepared.query, output, query_start=start, query_rows=rows
+        )
+        torch.testing.assert_close(output, expected[:, :, start : start + rows], atol=0, rtol=0)
+        if layout == "padded_bshd":
+            assert torch.isnan(backing[:, rows:]).all()
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_fresh_query_chunks_keep_global_causal_positions(head_dim, causal):
+    torch.manual_seed(999)
+    query = torch.randn(2, 6, 257, head_dim, device="cuda", dtype=torch.float16)
+    key = torch.randn(2, 2, 257 if causal else 293, head_dim, device="cuda", dtype=query.dtype)
+    prepared = backend.prepare_attention(query, key, torch.randn_like(key), head_dim**-0.5, causal)
+    expected = backend.launch_attention(prepared).clone()
+    chunk = backend.prepare_query(query[:, :, 128:], head_dim**-0.5, global_row_offset=128)
+    for local_start in (0, 64):
+        rows = chunk.shape[2] - local_start
+        output = torch.empty(
+            (2, rows, 6, head_dim), device=query.device, dtype=query.dtype
+        ).transpose(1, 2)
+        backend.launch_attention_into(prepared.context, chunk, output, query_start=local_start)
+        torch.testing.assert_close(output, expected[:, :, 128 + local_start :], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_window_graph_replay_updates_live_query_data_and_strided_output(causal):
+    torch.manual_seed(1000)
+    query = torch.randn(2, 6, 193, 64, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 193, 64, device="cuda", dtype=query.dtype)
+    context = backend.prepare_context(key, torch.randn_like(key), is_causal=causal)
+    chunk = backend.prepare_query(query[:, :, 64:], 64**-0.5, global_row_offset=64)
+    backing = torch.full((2, 96, 6, 64), float("nan"), device=query.device, dtype=query.dtype)
+    output = backing[:, :65].transpose(1, 2)
+    backend.launch_attention_into(context, chunk, output, query_start=64)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.launch_attention_into(context, chunk, output, query_start=64)
+    chunk.data.zero_()
+    backend.launch_attention_into(context, chunk, output, query_start=64)
+    expected = output.clone()
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert torch.isnan(backing[:, 65:]).all()
