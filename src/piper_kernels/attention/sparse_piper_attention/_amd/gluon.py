@@ -15,6 +15,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
     concat_columns,
+    pipeline_boundary,
     pv_tiles,
     qk_tiles,
     query_fragments,
@@ -149,6 +150,7 @@ def _sparse_piper_attention_kernel(
     # D128 benefits from prioritizing matrix work over the intervening softmax.
     # Keep sequence lengths dynamic so projection windows share this schedule.
     matrix_priority: gl.constexpr = 3 if head_dim == 128 else None
+    softmax_priority: gl.constexpr = 0 if head_dim == 128 else None
 
     for pair in range(pair_count):
         tile_0 = tile_offset(
@@ -250,12 +252,7 @@ def _sparse_piper_attention_kernel(
             )
             packed += (words,)
             sums += (total,)
-            if head_dim == 128:
-                with gl.amd.warp_pipeline_stage("softmax", priority=0):
-                    pass
-            else:
-                with gl.amd.warp_pipeline_stage("softmax"):
-                    pass
+            pipeline_boundary("softmax", softmax_priority)
         denominator = (
             denominator * old_weight + ((sums[0] + sums[1]) + (sums[2] + sums[3])) * current_weight
         )
