@@ -88,7 +88,7 @@ def _source_files() -> tuple[str, ...]:
             convrot_int8_sage_qk.__file__,
             convrot_int8_qk_validation.__file__,
             *sparse_piper_compile.source_files(),
-            sparse_piper_output.__file__,
+            *sparse_piper_output.source_files(),
             sparse_piper_pattern.__file__,
             linear_compile_fx.__file__,
             projected_qk.__file__,

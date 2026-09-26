@@ -23,6 +23,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
+from piper_kernels.fusions.attention import _output as attention_output
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
@@ -39,6 +40,8 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import triton as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_compile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
+from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
+from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.sparse_piper import _output as output_common
 
 
@@ -443,7 +446,18 @@ def _assert_shared_fusion_boundary(source):
 
 
 @pytest.mark.parametrize(
-    "module", [query, key, value, output, _compile, _output_compile, output_common, qk_validation]
+    "module",
+    [
+        query,
+        key,
+        value,
+        output,
+        _compile,
+        _output_compile,
+        output_common,
+        attention_output,
+        qk_validation,
+    ],
 )
 def test_shared_fusion_does_not_inspect_targets_or_launch_kernels(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
@@ -458,6 +472,9 @@ def test_compiler_cache_keys_include_projection_validation_and_attention_policy(
     assert projection.__file__ in _compile._source_files()
     for compiler in (_compile, nvfp4_compile):
         assert attention_policy.__file__ in compiler._source_files()
+        assert attention_output.__file__ in compiler._source_files()
+        assert projected_qk_compile.__file__ in compiler._source_files()
+        assert projected_qk_pattern.__file__ in compiler._source_files()
 
 
 @pytest.mark.parametrize("vendor", ["_nvidia", "_amd"])

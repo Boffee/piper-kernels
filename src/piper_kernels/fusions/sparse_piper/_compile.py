@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import operator
 from typing import cast
 
@@ -13,7 +12,14 @@ from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.sparse_piper_attention import _backend, _budget, _dtype
+from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
+from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.projected_qk import _validation as projected_qk_validation
+from piper_kernels.fusions.projected_qk._compile import (
+    integer_scalar_argument,
+    integer_scalar_metadata,
+    static_int,
+)
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
@@ -21,31 +27,6 @@ _SHAPE_ONLY_VIEW_TARGETS = (
     torch.ops.aten.reshape.default,
     torch.ops.aten.view.default,
 )
-
-
-def static_int(value: object) -> int | None:
-    """Return a non-boolean static integer."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def integer_scalar_metadata(value: object) -> int | torch.SymInt | None:
-    """Resolve static or symbolic integer metadata from an FX argument."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, torch.SymInt)):
-        return value
-    if isinstance(value, torch.fx.Node):
-        metadata = value.meta.get("val")
-        if isinstance(metadata, (int, torch.SymInt)) and not isinstance(metadata, bool):
-            return metadata
-    return None
-
-
-def integer_scalar_argument(value: object) -> Argument | None:
-    """Return an FX-compatible integer argument when its metadata is valid."""
-    if integer_scalar_metadata(value) is None:
-        return None
-    return value if isinstance(value, (int, torch.SymInt, torch.fx.Node)) else None
 
 
 def unwrap_shape_only_views(value: object) -> torch.fx.Node | None:
@@ -81,13 +62,6 @@ def ordered_tuple_output_producer(
     return producer
 
 
-def _positive_float(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    converted = float(value)
-    return converted if math.isfinite(converted) and converted > 0 else None
-
-
 def source_files() -> tuple[str, ...]:
     """Return sources that affect shared sparse-attention validation and policy."""
     return tuple(
@@ -97,6 +71,8 @@ def source_files() -> tuple[str, ...]:
             _dtype.__file__,
             _budget.__file__,
             projected_qk_validation.__file__,
+            projected_qk_compile.__file__,
+            projected_qk_pattern.__file__,
             *_backend.source_files(),
         )
         if file_name is not None
@@ -112,7 +88,7 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
         return False
     gate = preparation_sharing.tensor_metadata(gate_node)
     output = preparation_sharing.tensor_metadata(match.output_node())
-    coarse_scale = _positive_float(match.kwargs["coarse_scale"])
+    coarse_scale = projected_qk_compile.positive_float(match.kwargs["coarse_scale"])
     sparse_key_blocks = integer_scalar_metadata(match.kwargs["sparse_key_blocks"])
     coarse_key_blocks = integer_scalar_metadata(match.kwargs["coarse_key_blocks"])
     return bool(
@@ -201,7 +177,7 @@ def attention_head_dim(match: Match) -> int | None:
     return head_dim if head_dim in SUPPORTED_HEAD_DIMS else None
 
 
-def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
+def valid_sparse_piper_attention(  # noqa: PLR0911
     match: Match,
     *,
     batch: int | torch.SymInt,
@@ -212,19 +188,6 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
     tile_rows: int,
 ) -> bool:
     """Validate the projection-independent portion of a sparse Piper match."""
-    names = ("sparse_cos", "sparse_sin")
-    if any(not isinstance(match.kwargs[name], torch.fx.Node) for name in names):
-        return False
-    metadata = {
-        name: preparation_sharing.tensor_metadata(match.kwargs[name])  # type: ignore[arg-type]
-        for name in names
-    }
-    if any(
-        value is None or value.layout is not torch.strided or not value.is_contiguous()
-        for value in metadata.values()
-    ):
-        return False
-
     shape = match.kwargs["sparse_attention_shape"]
     output = preparation_sharing.tensor_metadata(match.output_node())
     if (
@@ -256,65 +219,28 @@ def valid_sparse_piper_attention(  # noqa: PLR0911, PLR0912
     ):
         return False
 
-    for name in ("sparse_q_norm_weight", "sparse_k_norm_weight"):
-        norm_node = match.kwargs.get(name)
-        if norm_node is None:
-            continue
-        if not isinstance(norm_node, torch.fx.Node):
-            return False
-        norm = preparation_sharing.tensor_metadata(norm_node)
-        if (
-            norm is None
-            or norm.layout is not torch.strided
-            or not norm.is_contiguous()
-            or norm.dtype not in _dtype.SUPPORTED_DTYPES
-            or tuple(norm.shape) != (head_dim,)
-            or norm.device != device
-        ):
-            return False
-    if any(
-        _positive_float(match.kwargs[name]) is None
-        for name in (
-            "sparse_q_norm_epsilon",
-            "sparse_k_norm_epsilon",
-            "sparse_softmax_scale",
-        )
-    ):
-        return False
-
-    rotary_dim = integer_scalar_metadata(match.kwargs["sparse_rotary_dim"])
-    half_rotary_dim = integer_scalar_metadata(match.kwargs["sparse_half_rotary_dim"])
-    cos = metadata["sparse_cos"]
-    sin = metadata["sparse_sin"]
-    assert cos is not None
-    assert sin is not None
     if (
-        rotary_dim is None
-        or half_rotary_dim is None
-        or cos.dtype is not torch.float32
-        or sin.dtype is not torch.float32
-        or cos.ndim != 2
-        or sin.ndim != 2
-        or preparation_sharing.dimension_key(cos.shape[0])
-        != preparation_sharing.dimension_key(sequence_length)
-        or preparation_sharing.dimension_key(sin.shape[0])
-        != preparation_sharing.dimension_key(sequence_length)
-        or preparation_sharing.dimension_key(cos.shape[1])
-        != preparation_sharing.dimension_key(rotary_dim)
-        or preparation_sharing.dimension_key(sin.shape[1])
-        != preparation_sharing.dimension_key(rotary_dim)
-        or preparation_sharing.dimension_key(half_rotary_dim)
-        != preparation_sharing.dimension_key((rotary_dim + 1) // 2)
-        or cos.device != device
-        or sin.device != device
+        any(
+            not projected_qk_compile.valid_rmsnorm(
+                match.kwargs.get(f"{prefix}_norm_weight"),
+                match.kwargs[f"{prefix}_norm_epsilon"],
+                head_dim=head_dim,
+                device=device,
+                supported_dtypes=_dtype.SUPPORTED_DTYPES,
+            )
+            for prefix in ("sparse_q", "sparse_k")
+        )
+        or projected_qk_compile.positive_float(match.kwargs["sparse_softmax_scale"]) is None
     ):
         return False
-    if isinstance(rotary_dim, int) and (
-        rotary_dim < 2
-        or rotary_dim > head_dim
-        or rotary_dim % 2
-        or not isinstance(half_rotary_dim, int)
-        or half_rotary_dim != rotary_dim // 2
+    if not projected_qk_compile.valid_rope_tables(
+        match.kwargs["sparse_cos"],
+        match.kwargs["sparse_sin"],
+        match.kwargs["sparse_rotary_dim"],
+        match.kwargs["sparse_half_rotary_dim"],
+        sequence_length=sequence_length,
+        head_dim=head_dim,
+        device=device,
     ):
         return False
 
