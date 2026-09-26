@@ -178,10 +178,12 @@ def int8_matmul_gluon_kernel(
     num_warps: gl.constexpr = warps_m * _GL_WARPS_N
     column_tiles = gl.cdiv(n, block_n)
     num_pid_n = column_tiles * (2 if paired else 1)
-    group_size = group_m * num_pid_n
+    # Without grouping (group_m == 0), each group holds a single row of tiles.
+    group_rows: gl.constexpr = group_m if group_m else 1
+    group_size = group_rows * num_pid_n
     pid = gl.program_id(0)
-    first_m = (pid // group_size) * group_m
-    rows_in_group = gl.minimum(gl.cdiv(m, block_m) - first_m, group_m)
+    first_m = (pid // group_size) * group_rows
+    rows_in_group = gl.minimum(gl.cdiv(m, block_m) - first_m, group_rows)
     pid_m = first_m + (pid % group_size) % rows_in_group
     pid_n = (pid % group_size) // rows_in_group
     second = pid_n >= column_tiles
@@ -307,7 +309,7 @@ def launch_int8_matmul(
     num_stages: int,
     group_m: int,
 ) -> None:
-    """Launch one grouped Gluon GEMM over ``[m, k]`` inputs and ``[n, k]`` weights."""
+    """Launch one Gluon GEMM over ``[m, k]`` inputs and ``[n, k]`` weights."""
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n) * (2 if paired else 1),)

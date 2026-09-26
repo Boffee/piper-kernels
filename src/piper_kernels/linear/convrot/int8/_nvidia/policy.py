@@ -89,8 +89,6 @@ class Sm8xExecutionPlan(NvidiaExecutionPlan):
         if self.matmul_kernel == "gluon":
             if self.matmul_num_stages not in _SM8X_GLUON_NUM_STAGES_VALUES:
                 raise ValueError("ConvRot SM8x Gluon tiles use 3 or 4 stages")
-            if not group_m:
-                raise ValueError("ConvRot SM8x Gluon tiles need group_m 8 or 16")
         elif self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
             raise ValueError(
                 "ConvRot SM8x 256-row tiles must be 256x128x64 Gluon tiles with 8 warps"

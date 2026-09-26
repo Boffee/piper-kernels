@@ -866,6 +866,27 @@ def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
+@pytest.mark.parametrize(("n", "group_m"), [(1000, 0), (1000, 16), (2000, 0)])
+def test_sm8x_gluon_gemm_matches_base_schedule_with_any_grouping(n, group_m):
+    # Tuner candidates keep the production plan's grouping, which may be 0 (ungrouped).
+    torch.manual_seed(n + group_m)
+    rows, k = 1537, 512
+    value = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(rows, device="cuda") * 0.01
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    args = (value, row_scale, weight, scale, bias, torch.bfloat16)
+    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    plan = replace(int8_nvidia.default_execution_plan(weight, rows=rows), matmul_group_m=group_m)
+
+    assert plan.matmul_kernel == "gluon"
+    actual = int8_nvidia.execute_prepared_linear(*args, plan)
+    assert torch.equal(actual, int8_nvidia.execute_prepared_linear(*args, base))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sm8x_available(), reason="requires NVIDIA SM8x")
 @pytest.mark.parametrize(("offset", "k"), [(0, 512), (8, 512), (0, 520)])
 def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, k):
     # An unaligned input pointer or a K that is not a multiple of 16 bytes runs Triton.

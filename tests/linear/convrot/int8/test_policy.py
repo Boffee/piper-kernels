@@ -416,7 +416,6 @@ def test_only_sm8x_plans_accept_one_fused_preparation_warp():
         {"matmul_block_n": 64},
         {"matmul_num_warps": 4},
         {"matmul_num_stages": 2},
-        {"matmul_group_m": 0},
     ],
 )
 def test_sm8x_plan_rejects_unsupported_kernel_tiles(changes):
