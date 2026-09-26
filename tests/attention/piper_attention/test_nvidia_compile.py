@@ -40,6 +40,10 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
     constants = plan.as_dict()
     constants.pop("num_warps")
     constants.pop("num_stages")
+    constants.pop("retain_query_tail_for_strided_output")
+    constants.pop("output_ctas_per_sm")
+    constants.pop("strided_output_query_group")
+    constants.pop("ragged_strided_output_maxnreg")
     constants.update(
         head_groups=3,
         head_dim=head_dim,
@@ -50,6 +54,7 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         use_query_tensor_descriptor=False,
         full_query=False,
         contiguous_output=False,
+        query_group_size=8 if architecture == 120 and head_dim == 64 and causal else 0,
     )
     signature = {name: "i32" for name in _piper_attention_kernel.arg_names if name not in constants}
     signature.update(

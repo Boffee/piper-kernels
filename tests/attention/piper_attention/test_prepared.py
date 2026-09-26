@@ -32,7 +32,9 @@ class _RecordingKernel:
         return launch
 
 
-def _prepared(dtype=torch.bfloat16, *, query_length=65, key_length=97, block_m=64):
+def _prepared(
+    dtype=torch.bfloat16, *, query_length=65, key_length=97, block_m=64, heads=6, kv_heads=2
+):
     plan = PiperAttentionExecutionPlan(
         block_m=block_m,
         grouped_qk=True,
@@ -41,21 +43,21 @@ def _prepared(dtype=torch.bfloat16, *, query_length=65, key_length=97, block_m=6
     )
     with torch.device("meta"):
         context = backend._PreparedPiperContext(
-            key=torch.empty((2, 2, key_length, 64), dtype=torch.int8),
-            value=torch.empty((2, 2, 64, key_length), dtype=torch.int8),
-            key_scale=torch.empty((2, 2, (key_length + 63) // 64)),
-            value_scale_multiplier=torch.empty((2, 2, key_length)),
-            value_log_scale=torch.empty((2, 2, key_length), dtype=torch.float16),
-            value_mean=torch.empty((2, 2, 64)),
+            key=torch.empty((2, kv_heads, key_length, 64), dtype=torch.int8),
+            value=torch.empty((2, kv_heads, 64, key_length), dtype=torch.int8),
+            key_scale=torch.empty((2, kv_heads, (key_length + 63) // 64)),
+            value_scale_multiplier=torch.empty((2, kv_heads, key_length)),
+            value_log_scale=torch.empty((2, kv_heads, key_length), dtype=torch.float16),
+            value_mean=torch.empty((2, kv_heads, 64)),
             key_length=key_length,
             is_causal=False,
             plan=plan,
         )
         query = backend._PreparedPiperQuery(
-            data=torch.empty((2, 6, query_length, 64), dtype=torch.int8),
-            scale=torch.empty((2, 6, (query_length + 31) // 32)),
+            data=torch.empty((2, heads, query_length, 64), dtype=torch.int8),
+            scale=torch.empty((2, heads, (query_length + 31) // 32)),
             descriptor=None,
-            shape=(2, 6, query_length, 64),
+            shape=(2, heads, query_length, 64),
             dtype=dtype,
         )
     return context, query
@@ -124,6 +126,71 @@ def test_launch_reuses_caller_outputs_and_logical_query_metadata_without_allocat
         assert kwargs["head_dim"] == 64
         assert kwargs["aligned_queries"] is False
         assert kwargs["unmasked_key_tiles"] is False
+
+
+@pytest.mark.parametrize(
+    ("query_rows", "key_rows", "strided", "retain_tail", "aligned"),
+    [
+        (128, 129, True, True, False),
+        (128, 128, True, True, True),
+        (128, 129, False, True, True),
+        (128, 129, True, False, True),
+        (129, 128, True, True, False),
+    ],
+)
+def test_query_tail_specialization_uses_key_mask_and_output_layout_without_tensor_work(
+    monkeypatch, query_rows, key_rows, strided, retain_tail, aligned
+):
+    context, query = _prepared(query_length=query_rows, key_length=key_rows, block_m=128)
+    context = replace(
+        context,
+        plan=replace(context.plan, retain_query_tail_for_strided_output=retain_tail),
+    )
+    output = torch.empty(
+        (2, query_rows, 6, 64) if strided else query.shape, device="meta", dtype=query.dtype
+    )
+    if strided:
+        output = output.transpose(1, 2)
+    kernel = _RecordingKernel()
+    monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
+    monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
+    with _NoTensorOperations():
+        backend._launch_piper_attention_into(context, query, output)
+    assert kernel.calls[0][2]["aligned_queries"] is aligned
+
+
+@pytest.mark.parametrize(
+    ("rows", "heads", "strided", "group", "registers"),
+    [
+        (512, 6, True, 0, None),  # One group would preserve the original order.
+        (513, 6, True, 8, 168),  # Partial final group and partial query tile.
+        (576, 6, True, 8, None),
+        (1025, 6, False, 0, None),
+        (1025, 1, True, 0, 168),  # No heads to interleave.
+    ],
+)
+def test_strided_schedule_uses_only_output_and_query_metadata(
+    monkeypatch, rows, heads, strided, group, registers
+):
+    context, query = _prepared(
+        query_length=rows, key_length=4097, heads=heads, kv_heads=1 if heads == 1 else 2
+    )
+    context = replace(
+        context,
+        is_causal=True,
+        plan=replace(context.plan, strided_output_query_group=8, ragged_strided_output_maxnreg=168),
+    )
+    output = torch.empty(query.shape, device="meta", dtype=query.dtype)
+    if strided:
+        output = torch.empty((2, rows + 7, heads, 64), device="meta", dtype=query.dtype)
+        output = output[:, :rows].transpose(1, 2)
+    kernel = _RecordingKernel()
+    monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
+    monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
+    with _NoTensorOperations():
+        backend._launch_piper_attention_into(context, query, output)
+    assert kernel.calls[0][2]["query_group_size"] == group
+    assert kernel.calls[0][2]["maxnreg"] == registers
 
 
 @pytest.mark.parametrize(

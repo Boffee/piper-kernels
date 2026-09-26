@@ -215,11 +215,12 @@ def _main(argv: Sequence[str] | None = None) -> None:
         seed=args.seed,
     )
     inputs = make_attention_inputs(shape, config=config, device=device)
-    query, _, _ = inputs
+    query, key, _ = inputs
     production_plan = piper_attention_backend._default_piper_attention_execution_plan(
         query,
         args.causal,
         target=target,
+        key_length=key.shape[2],
     )
     candidates = tuple(
         _make_candidate(

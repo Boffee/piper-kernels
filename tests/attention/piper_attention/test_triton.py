@@ -782,6 +782,55 @@ def test_explicit_execution_plan_runs_native_loop_controls() -> None:
     assert error.max().item() < 0.12
 
 
+@pytest.mark.skipif(not _sm120_available(), reason="D64 descriptor policy requires SM120")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("contents", ["random", "zeros", "constant"])
+def test_d64_public_descriptor_path_matches_pointer_preparation_and_graph_replay(
+    monkeypatch, dtype, causal, contents
+) -> None:
+    torch.manual_seed(763)
+    key_rows = 4097
+    query = torch.randn(
+        2, key_rows if causal else 385, 4, 64, device="cuda", dtype=dtype
+    ).transpose(1, 2)
+    key = torch.randn(2, key_rows, 2, 64, device="cuda", dtype=dtype).transpose(1, 2)
+    value = torch.randn_like(key)
+    if contents != "random":
+        for operand in (query, key, value):
+            operand.fill_(0.0 if contents == "zeros" else 0.5)
+
+    plan = _default_piper_attention_execution_plan(query, causal, key_length=key_rows)
+    pointer_plan = replace(plan, use_tensor_descriptors=False, num_stages=3)
+    descriptor_calls = []
+    make_descriptors = _backend._make_key_value_descriptors
+
+    def descriptors(*args, **kwargs):
+        descriptor_calls.append(args[0].shape)
+        return make_descriptors(*args, **kwargs)
+
+    monkeypatch.setattr(_backend, "_make_key_value_descriptors", descriptors)
+    with torch.no_grad():
+        expected = _run_piper_attention(
+            query, key, value, 64**-0.5, causal, execution_plan=pointer_plan
+        )
+        actual = piper_attention(query, key, value, is_causal=causal)
+        assert descriptor_calls == [(2, 2, 4160, 64)]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = piper_attention(query, key, value, is_causal=causal)
+        graph.replay()
+        torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+
+        # Replay must prepare the updated operands, including zero-scale guards.
+        query.zero_()
+        value.zero_()
+        graph.replay()
+        assert torch.count_nonzero(captured) == 0
+
+
 def test_triton_runs_under_torch_compile() -> None:
     torch.manual_seed(60)
     query_storage = torch.randn(3, 2, 128, 64, device="cuda", dtype=torch.float16)

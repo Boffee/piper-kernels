@@ -132,13 +132,18 @@ def _load_key_tile(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     if use_tensor_descriptors:
         return key_ptr.load([batch_head, start_n, 0]).reshape((block_n, head_dim)).T
     else:
         return tl.load(
             key_ptr
-            + (batch_head * key_length + current_n[None, :]) * head_dim
+            + (
+                batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+                + current_n[None, :]
+            )
+            * head_dim
             + offsets_d[:, None],
             mask=current_n[None, :] < key_length,
             other=0,
@@ -158,6 +163,7 @@ def _load_value_tile(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     if use_tensor_descriptors:
         return (
@@ -166,7 +172,8 @@ def _load_value_tile(
     else:
         return tl.load(
             value_ptr
-            + (batch_head * head_dim + feature_start + offsets_d[None, :]) * key_length
+            + (batch_head * head_dim + feature_start + offsets_d[None, :])
+            * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
             + current_n[:, None],
             mask=current_n[:, None] < key_length,
             other=0,
@@ -202,6 +209,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     use_tensor_descriptors: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     """Advance online-softmax state by one key tile.
 
@@ -220,6 +228,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
         head_dim,
         block_n,
         use_tensor_descriptors,
+        padded_kv=padded_kv,
     )
     integer_scores = tl.dot(query, key, out_dtype=tl.int32)
     if grouped_qk:
@@ -250,14 +259,18 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
 
     if derive_value_log_bound:
         value_scale_multiplier = tl.load(
-            value_scale_multiplier_ptr + batch_head * key_length + current_n,
+            value_scale_multiplier_ptr
+            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+            + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
         value_log_scale = _conservative_value_log_scale_bound(value_scale_multiplier)
     else:
         value_log_scale = tl.load(
-            value_log_scale_ptr + batch_head * key_length + current_n,
+            value_log_scale_ptr
+            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+            + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -287,7 +300,9 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     denominator = denominator * old_weight + tl.sum(probabilities, axis=1) * current_weight
     if not derive_value_log_bound:
         value_scale_multiplier = tl.load(
-            value_scale_multiplier_ptr + batch_head * key_length + current_n,
+            value_scale_multiplier_ptr
+            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+            + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -317,6 +332,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             head_dim,
             block_n,
             use_tensor_descriptors,
+            padded_kv=padded_kv,
         )
         value_high = _load_value_tile(
             value_ptr,
@@ -330,6 +346,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             head_dim,
             block_n,
             use_tensor_descriptors,
+            padded_kv=padded_kv,
         )
         partial_low = uint8_int8_dot(probability_uint8, value_low)
         partial_high = uint8_int8_dot(probability_uint8, value_high)
@@ -356,6 +373,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             head_dim,
             block_n,
             use_tensor_descriptors,
+            padded_kv=padded_kv,
         )
         partial = uint8_int8_dot(probability_uint8, value_tile)
         accumulator = (
@@ -377,6 +395,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     value_mean_ptr,
     output_ptr,
     query_block,
+    head,
     query_storage_length,
     key_length,
     query_start,
@@ -403,9 +422,9 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     contiguous_output: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     use_query_tensor_descriptor: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     """Evaluate one complete or masked query tile with the same FP32 recurrence."""
-    head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // head_groups) + head // head_groups
@@ -502,6 +521,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                padded_kv=padded_kv,
             )
         for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             prefix_end,
@@ -538,6 +558,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                padded_kv=padded_kv,
             )
         if split_pv_head_dim:
             accumulator_low, accumulator_high = numerator
@@ -580,6 +601,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                padded_kv=padded_kv,
             )
         if split_pv_head_dim:
             accumulator_low, accumulator_high = numerator
@@ -677,6 +699,8 @@ def _piper_attention_kernel(
     derive_value_log_bound: tl.constexpr,
     full_query: tl.constexpr,
     contiguous_output: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
+    query_group_size: tl.constexpr = 0,  # pyright: ignore[reportArgumentType]
 ):
     """Cover full query tiles and their ragged tail in one grid."""
     # Preserve the measured full-launch path instead of carrying window
@@ -687,6 +711,18 @@ def _piper_attention_kernel(
         global_query_start = 0
         query_rows = query_storage_length
     query_block = tl.program_id(0)
+    head = tl.program_id(1)
+    if query_group_size > 0:
+        # Visit a small group of Q tiles across all heads before the next
+        # group. The final group may contain fewer tiles; map it densely so
+        # every (head, query tile) occurs exactly once without padding CTAs.
+        query_tiles = tl.num_programs(0)
+        linear = head * query_tiles + query_block
+        group = linear // (query_group_size * heads)
+        group_rows = tl.minimum(query_tiles - group * query_group_size, query_group_size)
+        group_offset = linear % (query_group_size * heads)
+        head = group_offset // group_rows
+        query_block = group * query_group_size + group_offset % group_rows
     if is_causal and optimize_causal_traversal:
         query_block = tl.num_programs(0) - 1 - query_block
     tile_args = (
@@ -699,6 +735,7 @@ def _piper_attention_kernel(
         value_mean_ptr,
         output_ptr,
         query_block,
+        head,
         query_storage_length,
         key_length,
         query_start,
@@ -737,6 +774,7 @@ def _piper_attention_kernel(
             *tile_options,
             unmasked_query_tiles=tl.constexpr(True),
             use_query_tensor_descriptor=use_query_tensor_descriptor,
+            padded_kv=padded_kv,
         )
     else:
         _piper_attention_query_tile(
@@ -745,6 +783,7 @@ def _piper_attention_kernel(
             *tile_options,
             unmasked_query_tiles=tl.constexpr(False),
             use_query_tensor_descriptor=tl.constexpr(False),
+            padded_kv=padded_kv,
         )
 
 
@@ -795,6 +834,7 @@ def _default_piper_attention_execution_plan(
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
+    key_length: int | None = None,
 ) -> _policy.PiperAttentionExecutionPlan:
     """Resolve production policy for preparation, benchmarks, and tuning."""
     head_dim = query.shape[3]
@@ -804,6 +844,7 @@ def _default_piper_attention_execution_plan(
         head_dim=head_dim,
         is_causal=is_causal,
         query_length=query.shape[2],
+        key_length=key_length,
     )
 
 
@@ -820,6 +861,7 @@ class _PreparedPiperContext:
     key_length: int
     is_causal: bool
     plan: _policy.PiperAttentionExecutionPlan
+    padded_kv: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,8 +1065,19 @@ def _launch_piper_attention_into(
     )
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = query.descriptor is not None
+    contiguous_output = output.is_contiguous()
+    retain_query_tail = (
+        plan.retain_query_tail_for_strided_output
+        and not contiguous_output
+        and context.key_length % _BLOCK_N != 0
+    )
+    aligned_queries = rows % plan.block_m == 0 and not retain_query_tail
+    query_tiles = triton.cdiv(rows, plan.block_m)
+    query_group_size = plan.strided_output_query_group if not contiguous_output else 0
+    if heads == 1 or query_tiles <= query_group_size:
+        query_group_size = 0  # The grouped mapping would be the identity.
     with device_context(query.data.device):
-        attention_kernel[(triton.cdiv(rows, plan.block_m), heads, batch)](
+        attention_kernel[(query_tiles, heads, batch)](
             query.data,
             query.descriptor if use_query_tensor_descriptor else query.data,
             context.key,
@@ -1046,7 +1099,7 @@ def _launch_piper_attention_into(
             is_causal=context.is_causal,
             grouped_qk=plan.grouped_qk,
             split_pv_head_dim=plan.split_pv_head_dim,
-            aligned_queries=rows % plan.block_m == 0,
+            aligned_queries=aligned_queries,
             unmasked_key_tiles=(not context.is_causal and context.key_length % _BLOCK_N == 0),
             heads=heads,
             head_groups=heads // context.key_scale.shape[1],
@@ -1063,9 +1116,16 @@ def _launch_piper_attention_into(
             full_query=(
                 query_start == 0 and query.global_row_offset == 0 and rows == query.data.shape[2]
             ),
-            contiguous_output=output.is_contiguous(),
+            contiguous_output=contiguous_output,
+            padded_kv=context.padded_kv,
+            query_group_size=query_group_size,
             num_warps=plan.num_warps,
             num_stages=plan.num_stages,
+            maxnreg=(
+                plan.ragged_strided_output_maxnreg
+                if not contiguous_output and not aligned_queries
+                else None
+            ),
         )
     return output
 
@@ -1091,6 +1151,7 @@ def _run_piper_attention(
         else _default_piper_attention_execution_plan(
             query,
             is_causal,
+            key_length=key.shape[2],
         )
     )
     prepared = _prepare_piper_attention(
