@@ -337,7 +337,7 @@ def _benchmark_shape(
                     **configuration,
                     "operation": "conv3d",
                     "phase": "prepared_execution",
-                    "plan": schedule._asdict(),
+                    "schedule": schedule._asdict(),
                 },
                 timings=timing,
                 environment=environment,

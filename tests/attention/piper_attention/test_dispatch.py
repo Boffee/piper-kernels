@@ -72,7 +72,7 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         stop_at_preprocessing,
     )
     query, key, value = _inputs()
-    plan = piper_attention_backend._default_piper_attention_execution_plan(
+    plan = piper_attention_backend.default_execution_plan(
         query,
         True,
     )

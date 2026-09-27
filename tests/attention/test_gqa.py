@@ -10,9 +10,9 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from piper_kernels import SparsePiperAttention, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia.triton import (
-    _default_piper_attention_execution_plan,
     _prepare_piper_attention,
     _run_piper_attention,
+    default_execution_plan,
 )
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._budget import _resolve_route_layout
@@ -127,7 +127,7 @@ def test_dense_gqa_compile_and_prepared_storage(query_length):
         value,
         128**-0.5,
         False,
-        execution_plan=_default_piper_attention_execution_plan(query, False),
+        execution_plan=default_execution_plan(query, False),
     )
     assert dense.query.data.shape[1] == 8
     for tensor in (
@@ -227,7 +227,7 @@ def test_dense_gqa_per_thread_preparation(causal):
     key = torch.randn(2, 2, 67, 128, device="cuda", dtype=query.dtype)
     value = torch.randn_like(key)
     plan = replace(
-        _default_piper_attention_execution_plan(query, causal),
+        default_execution_plan(query, causal),
         grouped_qk=False,
         use_tensor_descriptors=False,
     )

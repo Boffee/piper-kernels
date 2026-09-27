@@ -11,6 +11,7 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
 from piper_kernels.attention.piper_attention import _quantized_dispatch
+from piper_kernels.attention.piper_attention._nvidia import _plan as attention_plan
 from piper_kernels.fusions.convrot_int8_piper import (
     _backend,
     _compile,
@@ -220,6 +221,7 @@ def test_compile_options_preserve_external_order_and_are_idempotent():
     assert original["post_grad_custom_pre_pass"] == [before, linear_compile.compile_pass, after]
     assert convrot_int8_piper_compile_options(options) == options
     assert _compile.compile_pass.uuid() == _compile.compile_pass.uuid()
+    assert attention_plan.__file__ in _compile._source_files()
 
 
 def test_output_pipeline_is_explicit_and_preserves_pass_order():

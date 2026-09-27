@@ -6,13 +6,11 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage_attention_2pp._policy import (
-    SageAttention2ppExecutionPlan,
-    select_execution_plan,
-)
+from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
+from piper_kernels.attention.sage_attention_2pp._policy import select_execution_plan
 from piper_kernels.attention.sage_attention_2pp.triton import (
-    _default_sage_attention_2pp_execution_plan,
     _prepare_sage_attention_2pp,
+    default_execution_plan,
 )
 
 _SM89 = AcceleratorTarget(backend="cuda", architecture="sm89")
@@ -24,7 +22,7 @@ _SM121 = AcceleratorTarget(backend="cuda", architecture="sm121")
 def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> None:
     query = torch.empty((1, 8, sequence, 128), device="meta")
 
-    plan = _default_sage_attention_2pp_execution_plan(
+    plan = default_execution_plan(
         query,
         False,
         target=_SM120,

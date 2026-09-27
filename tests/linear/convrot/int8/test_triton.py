@@ -925,7 +925,7 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, 
     monkeypatch.setattr(
         int8_nvidia.gluon_async_copy,
         "launch_int8_matmul",
-        lambda *a, **kw: launches.append(kw["plan"].matmul_block_m) or launch(*a, **kw),
+        lambda *a, **kw: launches.append(kw["execution_plan"].matmul_block_m) or launch(*a, **kw),
     )
 
     actual = int8_nvidia.execute_prepared_linear(*args, plan)

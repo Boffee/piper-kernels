@@ -19,6 +19,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Execution-plan and schedule types follow shared naming and module ownership conventions.
+  Attention and AMD INT8 linear plan types live in `_plan.py`; sparse Piper uses a named
+  `AttentionSchedule`. Benchmark records distinguish `execution_plan` from `schedule`;
+  the benchmark guide lists renamed JSON/JSONL fields.
 - ConvRot INT8 benchmarks share CUDA/ROCm linear and Conv3D runners, production policy
   selection, and device timing records. Linear phase measurements use `--phases`; sparse
   QKV projection shares the timing and JSON/JSONL reporting helpers.

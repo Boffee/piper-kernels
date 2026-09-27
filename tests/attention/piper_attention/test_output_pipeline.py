@@ -28,7 +28,7 @@ def test_dense_windows_feed_reusable_output_pipeline(is_causal, prepare_chunks):
     key = torch.randn(batch, 2, sequence, head_dim, device=query.device, dtype=query.dtype)
     value = torch.randn_like(key)
     scale = head_dim**-0.5
-    plan = backend._default_piper_attention_execution_plan(query, is_causal)
+    plan = backend.default_execution_plan(query, is_causal)
     prepared = backend._prepare_piper_attention(
         query, key, value, scale, is_causal, execution_plan=plan
     )

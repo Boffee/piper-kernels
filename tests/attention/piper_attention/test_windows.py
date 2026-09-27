@@ -50,7 +50,7 @@ def _operands(head_dim, causal, descriptors, *, optimize_causal=None, kernel="tr
     value = torch.randn_like(key)
     if kernel == "triton":
         plan = replace(
-            backend._default_piper_attention_execution_plan(query, causal),
+            backend.default_execution_plan(query, causal),
             attention_kernel="triton",
             max_registers=None,
             fuse_query_quantization=False,
@@ -217,7 +217,7 @@ def test_grouped_causal_windows_cover_partial_groups_and_replay_live_queries(
     query = torch.randn(batch, heads, sequence, head_dim, device="cuda", dtype=dtype)
     key = torch.randn(batch, kv_heads, sequence, head_dim, device="cuda", dtype=dtype)
     value = torch.randn_like(key)
-    plan = backend._default_piper_attention_execution_plan(query, True)
+    plan = backend.default_execution_plan(query, True)
     assert plan.strided_output_query_group == 8
     assert plan.ragged_strided_output_maxnreg == 168
     prepared = backend._prepare_piper_attention(

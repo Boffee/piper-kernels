@@ -108,9 +108,10 @@ def launch_int8_matmul(
     second_bias: torch.Tensor | None,
     *,
     paired: bool,
-    plan: NvidiaExecutionPlan,
+    execution_plan: NvidiaExecutionPlan,
 ) -> None:
     """Launch the shared INT8 arithmetic with the plan's explicit Triton schedule."""
+    plan = execution_plan
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)

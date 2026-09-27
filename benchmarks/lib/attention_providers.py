@@ -18,8 +18,8 @@ from piper_kernels.attention.piper_attention._amd import gluon as amd_piper
 from piper_kernels.attention.piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.piper_attention._amd import triton as amd_preparation
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
-from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
+from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 
 from .attention import AttentionConfig, AttentionInputs, run_sdpa
 from .providers import BenchmarkProvider
@@ -174,7 +174,7 @@ def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
 
 
 def _sage_attention_2pp_jit_functions(
-    plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
+    plan: SageAttention2ppExecutionPlan,
 ) -> dict[str, object]:
     key_name, key_kernel = (
         ("quantize-key-per-block", qk_backend.quantize_key_per_block_kernel)
@@ -220,7 +220,7 @@ def _make_piper_attention_provider(
         return _make_amd_piper_attention_provider(inputs, config=config, target=target)
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
-    plan = piper_attention_backend._default_piper_attention_execution_plan(
+    plan = piper_attention_backend.default_execution_plan(
         query,
         config.is_causal,
         target=target,
@@ -312,7 +312,7 @@ def _make_sage_attention_2pp_provider(
     target: AcceleratorTarget,
 ) -> AttentionProvider:
     query, _, _ = inputs
-    plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+    plan = sage_attention_2pp_backend.default_execution_plan(
         query,
         config.is_causal,
         target=target,

@@ -222,9 +222,7 @@ def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
     query = torch.randn(1, 2, 193, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
-        query, False
-    )
+    production_plan = sage_attention_2pp_backend.default_execution_plan(query, False)
     alternate_plan = replace(
         production_plan,
         block_m=64,
@@ -315,7 +313,7 @@ def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     pointer_plan = replace(
-        sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+        sage_attention_2pp_backend.default_execution_plan(
             query,
             False,
         ),

@@ -261,7 +261,7 @@ def _run_case(case: Case, args: argparse.Namespace, target: AcceleratorTarget) -
         "projections": case.projections,
         "activation": case.activation,
         "bias": args.bias,
-        "production_plan": production.as_dict(),
+        "production_execution_plan": production.as_dict(),
         "exact_vs_original": exact,
         "median_us": median_us,
         "spread": {name: max(v) / min(v) - 1 for name, v in samples.items()},

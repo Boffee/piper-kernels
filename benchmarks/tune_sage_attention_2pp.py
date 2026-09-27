@@ -38,8 +38,8 @@ from lib.tuning import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage_attention_2pp import _policy as sage_attention_2pp_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
+from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 
 _validate_args = validate_attention_tuning_arguments
 
@@ -85,7 +85,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _candidate_choices(
     args: argparse.Namespace,
-    production_plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
+    production_plan: SageAttention2ppExecutionPlan,
 ) -> tuple[_SageAttention2ppTuningChoice, ...]:
     """Form the explicit Cartesian search, defaulting omitted axes to production."""
     axes = (
@@ -113,12 +113,12 @@ def _candidate_choices(
 
 def _resolve_plan(
     choice: _SageAttention2ppTuningChoice,
-    production_plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
+    production_plan: SageAttention2ppExecutionPlan,
     *,
     target: AcceleratorTarget,
     head_dim: int,
     is_causal: bool,
-) -> sage_attention_2pp_policy.SageAttention2ppExecutionPlan:
+) -> SageAttention2ppExecutionPlan:
     if choice.use_tensor_descriptors and (
         not target.is_cuda_capability(12) or choice.block_m != 128 or head_dim != 128
     ):
@@ -147,7 +147,7 @@ def _make_candidate(
     choice: _SageAttention2ppTuningChoice,
     inputs: AttentionInputs,
     *,
-    production_plan: sage_attention_2pp_policy.SageAttention2ppExecutionPlan,
+    production_plan: SageAttention2ppExecutionPlan,
     config: AttentionConfig,
     target: AcceleratorTarget,
 ) -> TuningCandidate[AttentionInputs, torch.Tensor]:
@@ -240,7 +240,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     inputs = make_attention_inputs(shape, config=config, device=device)
     query, _, _ = inputs
-    production_plan = sage_attention_2pp_backend._default_sage_attention_2pp_execution_plan(
+    production_plan = sage_attention_2pp_backend.default_execution_plan(
         query,
         args.causal,
         target=target,

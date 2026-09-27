@@ -157,7 +157,7 @@ def execute_prepared_linear(
         second_scale,
         second_bias,
         paired=paired,
-        plan=plan,
+        execution_plan=plan,
     )
     return result
 
