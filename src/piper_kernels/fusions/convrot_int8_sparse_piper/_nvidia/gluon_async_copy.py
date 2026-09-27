@@ -7,8 +7,9 @@ memory, and ``mma_v2`` accumulates exact INT32 products.
 Q and K split warps only across rows and permute the weight rows, so each thread
 holds 4 consecutive features of every row it owns, with the other feature bits in
 registers or its lane quad. Loads of cos/sin are then 16 bytes wide, and RoPE
-pairs stay in registers. Five of the seven Hadamard stages stay in registers;
-the other two use butterfly shuffles.
+pairs stay in registers. Q applies the signed Hadamard with five of its seven
+stages in registers and the other two as butterfly shuffles. K stores BF16 rows
+and FP32 tile sums for the shared encoder, which centers K by its global mean.
 
 V keeps a 2x2 warp grid. Its epilogue spreads rows across lanes, so the
 transposed stores are coalesced.
@@ -29,10 +30,12 @@ from triton.experimental.gluon import language as gl
 from triton.language.extra import libdevice
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
 )
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
 from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
     _accumulate as _accumulate_tiles,
 )
@@ -70,7 +73,7 @@ _GL_SHUFFLE_LANE_2 = gl.constexpr("shfl.sync.bfly.b32 $0, $1, 0x2, 0x1f, 0xfffff
 # Every thread copies 16 bytes of a K64 slice; each warp copies 8 rows per step.
 _GL_COPY_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 16], [8, 4], [_NUM_WARPS, 1], [1, 0]))
 _GL_COPY_ROWS = gl.constexpr(gl.SliceLayout(1, _GL_COPY_LAYOUT.value))
-# Q/K rows leave in 16-byte stores; each warp writes 4 whole D128 rows.
+# Each thread stores 16 consecutive features of a Q/K row; each warp writes 4 whole rows.
 _GL_STORE_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 16], [4, 8], [_NUM_WARPS, 1], [1, 0]))
 _GL_SUMMARY_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 4], [1, 32], [1, _NUM_WARPS], [1, 0]))
 
@@ -387,7 +390,7 @@ def _summarize_blocks(
 
 @gluon.jit
 def _store_rows(pointer, values, first_row, storage_rows, mask_rows: gl.constexpr):
-    """Store a 128-row INT8 Q/K tile of one [S, D128] head in 16-byte chunks."""
+    """Store a 128-row Q/K tile of one [S, D128] head in contiguous feature chunks."""
     values = gl.convert_layout(gl.reshape(values, [_GL_BLOCK_M, _GL_HEAD_DIM]), _GL_STORE_LAYOUT)
     rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_STORE_LAYOUT))
     features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_STORE_LAYOUT))
@@ -550,8 +553,8 @@ def _key_kernel(
     norm_weight_ptr,
     cos_ptr,
     sin_ptr,
-    key_ptr,
-    key_scale_ptr,
+    stored_ptr,
+    partial_ptr,
     key_summary_ptr,
     key_aux_ptr,
     block_lengths_ptr,
@@ -566,7 +569,11 @@ def _key_kernel(
     mask_block_lengths: gl.constexpr,
     mask_rows: gl.constexpr,
 ):
-    """Project a K tile once and emit K64 INT8 rows, scales, and routing summaries."""
+    """Project a K tile and emit BF16 rows, FP32 tile sums, and routing summaries.
+
+    Summaries describe the FP32 transform; the sums describe the stored BF16 values,
+    which the shared encoder centers by their global mean.
+    """
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
@@ -603,24 +610,24 @@ def _key_kernel(
     )
 
     tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
-    smoothed = gl.reshape(_signed_hadamard(values, features), [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM])
-    key_scale = (
-        gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
-    )
-    quantized = _round_to_int8(smoothed / key_scale[:, None, None])
+    stored = values.to(gl.bfloat16)
+    stored_tiles = gl.reshape(stored.to(gl.float32), [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM])
+    tile_sums = gl.sum(stored_tiles, axis=1)
 
     batch_head = batch * heads + head
     storage_rows = storage_tiles * _GL_TILE_ROWS
     first_tile = row_block * tiles
     tile_row = batch_head * storage_tiles
     _store_rows(
-        key_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
-        quantized,
+        stored_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
+        stored,
         first_row,
         storage_rows,
         mask_rows,
     )
-    _store_scales(key_scale_ptr + tile_row, key_scale, first_tile, storage_tiles, mask_rows)
+    _store_summaries(
+        partial_ptr + tile_row * _GL_HEAD_DIM, tile_sums, first_tile, storage_tiles, mask_rows
+    )
     _store_summaries(
         key_summary_ptr + tile_row * _GL_HEAD_DIM, key_summary, first_tile, storage_tiles, mask_rows
     )
@@ -838,9 +845,15 @@ def project_key(
     out: KeyOutput,
     bias: torch.Tensor | None = None,
 ) -> None:
-    """Fill K64 INT8 keys, scales, and routing summaries for supported operands."""
+    """Fill centered K64 INT8 keys, scales, and routing summaries for supported operands."""
     key, key_scale, key_summary, key_aux = out
-    batch, heads, storage_sequence_length, _head_dim = key.shape
+    batch, heads, storage_sequence_length, head_dim = key.shape
+    sequence_length = input_qdata.shape[1]
+    if batch == 0:
+        return
+    stored, partials, mean = centered_projection.allocate_workspace(
+        input_qdata, (batch, heads, storage_sequence_length, head_dim), tile_rows=TILE_ROWS
+    )
     mask_block_lengths = block_lengths is not None
 
     with device_context(input_qdata.device):
@@ -855,11 +868,11 @@ def project_key(
                 norm_weight,
                 cos,
                 sin,
-                key,
-                key_scale,
+                stored,
+                partials,
                 key_summary,
                 key_aux,
-                block_lengths if mask_block_lengths else key_scale,
+                block_lengths if mask_block_lengths else partials,
                 input_qdata.shape[1],
                 row_block_offset,
                 storage_sequence_length // TILE_ROWS,
@@ -873,7 +886,16 @@ def project_key(
                 num_warps=_NUM_WARPS,
             )
 
-        _launch_rows(input_qdata.shape[1], launch, mask_block_lengths=mask_block_lengths)
+        _launch_rows(sequence_length, launch, mask_block_lengths=mask_block_lengths)
+        # Zeroed internal padding stays in the logical denominator, as in the shared path.
+        centered_projection.finalize_mean(partials, sequence_length, out=mean)
+        qk_quantization.prepare_key(
+            stored.narrow(2, 0, sequence_length),
+            mean,
+            grouped=True,
+            storage_key_length=storage_sequence_length,
+            out=(key, key_scale),
+        )
 
 
 def project_value(

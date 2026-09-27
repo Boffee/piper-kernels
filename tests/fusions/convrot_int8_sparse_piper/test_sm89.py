@@ -183,6 +183,9 @@ def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(
     monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(gluon_async_copy, "device_context", guard)
+    finalize_mean, encode_key = Mock(), Mock()
+    monkeypatch.setattr(gluon_async_copy.centered_projection, "finalize_mean", finalize_mean)
+    monkeypatch.setattr(gluon_async_copy.qk_quantization, "prepare_key", encode_key)
     sequence, window = 448, (64, 300)
     rows = window[1] if operation == "query" else sequence
     storage = padded_sequence_length(rows)
@@ -219,6 +222,25 @@ def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(
         assert mean_kernel.__getitem__.return_value.call_args.kwargs["block_n"] == 128
     else:
         mean_kernel.__getitem__.assert_not_called()
+    if operation == "key":
+        _assert_centered_key_encoding(calls[0], out, finalize_mean, encode_key, sequence, storage)
+    else:
+        finalize_mean.assert_not_called()
+        encode_key.assert_not_called()
+
+
+def _assert_centered_key_encoding(call, out, finalize_mean, encode_key, sequence, storage):
+    """The kernels store BF16 K and tile sums; the shared encoder centers and quantizes K."""
+    stored, partials = call.args[8:10]
+    assert stored.dtype is torch.bfloat16
+    assert stored.shape == out[0].shape
+    assert partials.shape == (2, 3, storage // 64, 128)
+    finalize_mean.assert_called_once()
+    assert finalize_mean.call_args.args == (partials, sequence)
+    encode_key.assert_called_once()
+    assert encode_key.call_args.kwargs["grouped"] is True
+    assert encode_key.call_args.kwargs["storage_key_length"] == storage
+    assert encode_key.call_args.kwargs["out"] == (out[0], out[1])
 
 
 _POINTER_TYPES = {
@@ -227,6 +249,7 @@ _POINTER_TYPES = {
     "query_ptr": "*i8",
     "key_ptr": "*i8",
     "value_ptr": "*i8",
+    "stored_ptr": "*bf16",
     "block_lengths_ptr": "*i32",
     "norm_weight_ptr": "*bf16",
     "bias_ptr": "*bf16",
@@ -273,14 +296,18 @@ def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
     assert compiled.asm["cubin"]
     # Two programs share each SM's 99 KiB of shared memory.
     assert compiled.metadata.shared <= 99 * 1024 // 2
-    assert "arith.truncf" not in compiled.asm["ttgir"]
+    truncations = [line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line]
+    # Only K rounds its transformed rows to BF16, for the shared centered encoder.
+    assert bool(truncations) is (operation == "key")
+    assert all("f32" in line and "bf16" in line for line in truncations)
 
 
-def _assert_matches(actual, expected):
+def _assert_matches(actual, expected, *, scale_rtol=1e-5):
     codes = (actual[0].to(torch.int16) - expected[0].to(torch.int16)).abs()
     assert int(codes.max()) <= 1
     assert float((codes > 0).float().mean()) < 1e-4
-    for left, right in zip(actual[1:], expected[1:], strict=True):
+    torch.testing.assert_close(actual[1], expected[1], rtol=scale_rtol, atol=0)
+    for left, right in zip(actual[2:], expected[2:], strict=True):
         # Q summaries add a block's maximum and minimum, so compare against the block scale.
         scale = float(right[torch.isfinite(right)].abs().max()) if right.numel() else 1.0
         torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-6 * scale, equal_nan=True)
@@ -351,4 +378,6 @@ def test_sm89_gluon_projections_match_the_triton_launchers(operation, case):
     _launch(projection, operation, operands, expected, config=sm89._CONFIG, **options)
     _launch(gluon_async_copy, operation, operands, actual, **options)
 
-    _assert_matches(actual, expected)
+    # K scales come from BF16 K storage, where 1-ulp FP32 differences can cross a rounding
+    # boundary, as between dense and sparse K.
+    _assert_matches(actual, expected, scale_rtol=3e-3 if operation == "key" else 1e-5)

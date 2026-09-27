@@ -3,7 +3,7 @@
 from piper_kernels._triton.targets import AcceleratorTarget
 
 # SM89 splits the fused attention output into 8,192-row query windows. Against the shared
-# 4,096 rows, the H3 fusion benchmark ran 0.9-3.0% faster at 8K-150K tokens for 61-238 MiB
+# 4,096 rows, the H3 fusion benchmark ran 1.4-3.0% faster at 8K-150K tokens for 61-238 MiB
 # more workspace (see benchmarks/README.md).
 SM89_QUERY_CHUNK_ROWS = 8_192
 

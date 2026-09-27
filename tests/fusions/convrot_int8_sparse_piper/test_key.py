@@ -15,7 +15,7 @@ from piper_kernels.fusions.convrot_int8_piper import key as dense_key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
-from ._helpers import projection_available
+from ._helpers import dense_projection_available, projection_available
 from ._reference import composed_key_projection, composed_mean_pool_summary
 
 
@@ -273,8 +273,8 @@ def test_constant_transformed_keys_are_centered_to_fp32_roundoff(routing_mode, s
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("sequence_length", [65, 192, 1025])
 def test_dense_and_sparse_keys_share_centering_and_cuda_graph_results(head_dim, sequence_length):
-    if not projection_available(head_dim):
-        pytest.skip("requires this fused projection width")
+    if not projection_available(head_dim) or not dense_projection_available(head_dim):
+        pytest.skip("requires dense and sparse fused projections at this width")
     operands = _random_operands(
         batch=2, sequence_length=sequence_length, heads=3, head_dim=head_dim
     )

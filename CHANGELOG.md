@@ -20,14 +20,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - ConvRot INT8 sparse-Piper fusion (`convrot_int8_sparse_piper_compile_options`) on NVIDIA
   SM89, matching the native SM89 sparse Piper attention. D128 heads use Gluon Q/K/V
   projections that share the SM8x ConvRot INT8 GEMM's pipeline and apply RMSNorm, RoPE, and
-  the signed Hadamard in registers. On an RTX 4070 Ti SUPER they reach 265-275 TOPS for Q and
-  K and 270-295 TOPS for V at 2K-100K tokens, 1.27-1.33x the shared Triton kernels, within one
-  INT8 code of them; other shapes use the Triton kernels with SM89 tiles. SM89 splits the
-  fused attention output into 8,192-row query windows, 0.9-3.0% faster than the shared 4,096
-  rows for up to 238 MiB more workspace. The compiled H3 attention block (Q/K/V projections,
-  25%-keep routing and attention, and the output projection) runs 1.05-1.24x faster than
-  without the fusion at 8K-100K tokens and needs 28-58% less peak memory. SM120's compiled
-  kernels are unchanged.
+  the signed Hadamard in registers. On an RTX 4070 Ti SUPER, Q and V reach 268-276 and 267-294
+  TOPS at 2K-100K tokens, 1.25-1.32x the shared Triton kernels, within one INT8 code of them.
+  K, which stores BF16 rows for the shared centered encoder, reaches 216-236 TOPS including
+  that encoder, 1.14-1.23x. Other shapes use the Triton kernels with SM89 tiles. SM89 splits
+  the fused attention output into 8,192-row query windows, 1.4-3.0% faster than the shared
+  4,096 rows for up to 238 MiB more workspace. The compiled H3 attention block (Q/K/V
+  projections, 25%-keep routing and attention, and the output projection) runs 1.04-1.20x
+  faster than without the fusion at 8K-100K tokens and needs 28-58% less peak memory. SM120's
+  compiled kernels are unchanged.
 
 ### Changed
 
