@@ -554,22 +554,33 @@ def prepare_key(
     *,
     grouped: bool,
     storage_key_length: int,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate and quantize centered K with the selected SageAttention granularity."""
+    """Quantize centered K, optionally filling validated caller-owned storage."""
     batch, heads, key_length, head_dim = key.shape
     key_shape = (batch, heads, storage_key_length, head_dim)
     key_int8 = (
-        torch.zeros(key_shape, device=key.device, dtype=torch.int8)
-        if storage_key_length != key_length
-        else torch.empty(key_shape, device=key.device, dtype=torch.int8)
+        out[0]
+        if out is not None
+        else (
+            torch.zeros(key_shape, device=key.device, dtype=torch.int8)
+            if storage_key_length != key_length
+            else torch.empty(key_shape, device=key.device, dtype=torch.int8)
+        )
     )
+    if out is not None and storage_key_length != key_length:
+        key_int8.zero_()
     with device_context(key.device):
         if grouped:
             scale_groups = int(triton.cdiv(key_length, _KEY_BLOCK))
-            key_scale = torch.empty(
-                (batch, heads, scale_groups),
-                device=key.device,
-                dtype=torch.float32,
+            key_scale = (
+                out[1]
+                if out is not None
+                else torch.empty(
+                    (batch, heads, scale_groups),
+                    device=key.device,
+                    dtype=torch.float32,
+                )
             )
             quantize_key_per_block_kernel[(scale_groups, heads, batch)](
                 key,
@@ -591,7 +602,11 @@ def prepare_key(
                 num_warps=4,
             )
         else:
-            key_scale = torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
+            key_scale = (
+                out[1]
+                if out is not None
+                else torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
+            )
             quantize_key_per_thread_kernel[(triton.cdiv(key_length, _KEY_BLOCK) * 4, heads, batch)](
                 key,
                 key_mean,

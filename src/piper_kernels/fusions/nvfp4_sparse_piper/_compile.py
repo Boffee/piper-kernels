@@ -74,7 +74,7 @@ def _source_files() -> tuple[str, ...]:
             layout.__file__,
             sparse_piper_triton.__file__,
             *sparse_piper_compile.source_files(),
-            sparse_piper_output.__file__,
+            *sparse_piper_output.source_files(),
             sparse_piper_pattern.__file__,
             linear_compile_fx.__file__,
             nvfp4_layout.__file__,

@@ -224,6 +224,7 @@ def _make_piper_attention_provider(
         query,
         config.is_causal,
         target=target,
+        key_length=key.shape[2],
     )
 
     def prepare() -> object:

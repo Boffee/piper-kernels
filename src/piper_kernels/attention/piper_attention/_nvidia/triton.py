@@ -30,6 +30,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from .. import _quantization
+from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
 from . import policy as _policy
 
 _BLOCK_N = 64
@@ -131,13 +132,18 @@ def _load_key_tile(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     if use_tensor_descriptors:
         return key_ptr.load([batch_head, start_n, 0]).reshape((block_n, head_dim)).T
     else:
         return tl.load(
             key_ptr
-            + (batch_head * key_length + current_n[None, :]) * head_dim
+            + (
+                batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+                + current_n[None, :]
+            )
+            * head_dim
             + offsets_d[:, None],
             mask=current_n[None, :] < key_length,
             other=0,
@@ -157,6 +163,7 @@ def _load_value_tile(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
     use_tensor_descriptors: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     if use_tensor_descriptors:
         return (
@@ -165,7 +172,8 @@ def _load_value_tile(
     else:
         return tl.load(
             value_ptr
-            + (batch_head * head_dim + feature_start + offsets_d[None, :]) * key_length
+            + (batch_head * head_dim + feature_start + offsets_d[None, :])
+            * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
             + current_n[:, None],
             mask=current_n[:, None] < key_length,
             other=0,
@@ -201,6 +209,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     use_tensor_descriptors: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     """Advance online-softmax state by one key tile.
 
@@ -219,6 +228,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
         head_dim,
         block_n,
         use_tensor_descriptors,
+        padded_kv=padded_kv,
     )
     integer_scores = tl.dot(query, key, out_dtype=tl.int32)
     if grouped_qk:
@@ -249,14 +259,18 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
 
     if derive_value_log_bound:
         value_scale_multiplier = tl.load(
-            value_scale_multiplier_ptr + batch_head * key_length + current_n,
+            value_scale_multiplier_ptr
+            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+            + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
         value_log_scale = _conservative_value_log_scale_bound(value_scale_multiplier)
     else:
         value_log_scale = tl.load(
-            value_log_scale_ptr + batch_head * key_length + current_n,
+            value_log_scale_ptr
+            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+            + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -286,7 +300,9 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     denominator = denominator * old_weight + tl.sum(probabilities, axis=1) * current_weight
     if not derive_value_log_bound:
         value_scale_multiplier = tl.load(
-            value_scale_multiplier_ptr + batch_head * key_length + current_n,
+            value_scale_multiplier_ptr
+            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
+            + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -316,6 +332,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             head_dim,
             block_n,
             use_tensor_descriptors,
+            padded_kv=padded_kv,
         )
         value_high = _load_value_tile(
             value_ptr,
@@ -329,6 +346,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             head_dim,
             block_n,
             use_tensor_descriptors,
+            padded_kv=padded_kv,
         )
         partial_low = uint8_int8_dot(probability_uint8, value_low)
         partial_high = uint8_int8_dot(probability_uint8, value_high)
@@ -355,6 +373,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             head_dim,
             block_n,
             use_tensor_descriptors,
+            padded_kv=padded_kv,
         )
         partial = uint8_int8_dot(probability_uint8, value_tile)
         accumulator = (
@@ -376,8 +395,15 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     value_mean_ptr,
     output_ptr,
     query_block,
-    query_length,
+    head,
+    query_storage_length,
     key_length,
+    query_start,
+    query_rows,
+    global_query_start,
+    stride_ob,
+    stride_oh,
+    stride_om,
     heads,
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
@@ -393,41 +419,49 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     loop_licm: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    contiguous_output: tl.constexpr,
     unmasked_query_tiles: tl.constexpr,
     use_query_tensor_descriptor: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     """Evaluate one complete or masked query tile with the same FP32 recurrence."""
-    head = tl.program_id(1)
     batch = tl.program_id(2)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // head_groups) + head // head_groups
-    offsets_m = query_block * block_m + tl.arange(0, block_m)
+    output_rows = query_block * block_m + tl.arange(0, block_m)
+    offsets_m = query_start + output_rows
+    global_rows = global_query_start + output_rows
     offsets_n = tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
     if unmasked_query_tiles:
         valid_queries = tl.full((block_m,), True, dtype=tl.int1)
     else:
-        valid_queries = offsets_m < query_length
+        valid_queries = output_rows < query_rows
 
     if use_query_tensor_descriptor:
-        query = query_ptr.load([batch_head, query_block * block_m, 0]).reshape((block_m, head_dim))
+        query = query_ptr.load([batch_head, query_start + query_block * block_m, 0]).reshape(
+            (block_m, head_dim)
+        )
     else:
         query = tl.load(
             query_ptr
-            + ((batch_head * query_length + offsets_m[:, None]) * head_dim)
+            + ((batch_head * query_storage_length + offsets_m[:, None]) * head_dim)
             + offsets_d[None, :],
             mask=valid_queries[:, None],
             other=0,
         )
     if grouped_qk:
         query_scale = tl.load(
-            query_scale_ptr + batch_head * tl.cdiv(query_length, 32) + offsets_m // 32,
+            query_scale_ptr
+            + batch_head * tl.cdiv(query_storage_length, 32)
+            + query_start // 32
+            + output_rows // 32,
             mask=valid_queries,
             other=0.0,
         )
     else:
         query_scale = tl.load(
-            query_scale_ptr + batch_head * query_length + offsets_m,
+            query_scale_ptr + batch_head * query_storage_length + offsets_m,
             mask=valid_queries,
             other=0.0,
         )
@@ -443,14 +477,14 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     running_max = tl.full((block_m,), -float("inf"), dtype=tl.float32)
     end_n = key_length
     if is_causal:
-        end_n = tl.minimum(key_length, (query_block + 1) * block_m)
+        end_n = tl.minimum(key_length, global_query_start + (query_block + 1) * block_m)
 
     if is_causal and optimize_causal_traversal:
         numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator  # pyright: ignore[reportPossiblyUnboundVariable]
         # Only complete K tiles strictly before the first query row are
         # mask-free. Keep ragged tails and diagonal overlap in the boundary.
         full_key_end = key_length // block_n * block_n
-        causal_prefix_end = query_block * block_m // block_n * block_n
+        causal_prefix_end = (global_query_start + query_block * block_m) // block_n * block_n
         prefix_end = tl.minimum(causal_prefix_end, full_key_end)
         for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             0,
@@ -472,7 +506,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 running_max,
                 kv_batch_head,
                 start_n,
-                offsets_m,
+                global_rows,
                 offsets_n,
                 offsets_d,
                 valid_queries,
@@ -487,6 +521,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                padded_kv=padded_kv,
             )
         for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
             prefix_end,
@@ -508,7 +543,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 running_max,
                 kv_batch_head,
                 start_n,
-                offsets_m,
+                global_rows,
                 offsets_n,
                 offsets_d,
                 valid_queries,
@@ -523,6 +558,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                padded_kv=padded_kv,
             )
         if split_pv_head_dim:
             accumulator_low, accumulator_high = numerator
@@ -550,7 +586,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 running_max,
                 kv_batch_head,
                 start_n,
-                offsets_m,
+                global_rows,
                 offsets_n,
                 offsets_d,
                 valid_queries,
@@ -565,6 +601,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                padded_kv=padded_kv,
             )
         if split_pv_head_dim:
             accumulator_low, accumulator_high = numerator
@@ -572,6 +609,17 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             accumulator = numerator
     denominator_safe = tl.maximum(denominator, 1e-30)[:, None]
     denominator_code_units = denominator_safe * _P_UINT8_RANGE
+    if contiguous_output:
+        output_base = (
+            output_ptr + (batch_head.to(tl.int64) * query_rows + output_rows[:, None]) * head_dim
+        )
+    else:
+        output_base = (
+            output_ptr
+            + batch.to(tl.int64) * stride_ob
+            + head.to(tl.int64) * stride_oh
+            + output_rows[:, None].to(tl.int64) * stride_om
+        )
     if split_pv_head_dim:
         output_low = accumulator_low / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         output_high = accumulator_high / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -579,7 +627,6 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             value_mean_base = value_mean_ptr + kv_batch_head * head_dim
             output_low += tl.load(value_mean_base + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
             output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
-        output_base = output_ptr + (batch_head * query_length + offsets_m[:, None]) * head_dim
         tl.store(
             output_base + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
             output_low,
@@ -595,15 +642,25 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
         if not is_causal:
             output += tl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d)[None, :]
         tl.store(
-            output_ptr
-            + (batch_head * query_length + offsets_m[:, None]) * head_dim
-            + offsets_d[None, :],
+            output_base + offsets_d[None, :],
             output,
             mask=valid_queries[:, None],
         )
 
 
-@triton.jit(do_not_specialize=["query_length", "key_length", "heads"])
+@triton.jit(
+    do_not_specialize=[
+        "query_storage_length",
+        "key_length",
+        "heads",
+        "query_start",
+        "query_rows",
+        "global_query_start",
+        "stride_ob",
+        "stride_oh",
+        "stride_om",
+    ]
+)
 def _piper_attention_kernel(
     query_ptr,
     query_descriptor,
@@ -615,8 +672,14 @@ def _piper_attention_kernel(
     value_log_scale_ptr,
     value_mean_ptr,
     output_ptr,
-    query_length,
+    query_storage_length,
     key_length,
+    query_start,
+    query_rows,
+    global_query_start,
+    stride_ob,
+    stride_oh,
+    stride_om,
     is_causal: tl.constexpr,
     grouped_qk: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
@@ -634,9 +697,32 @@ def _piper_attention_kernel(
     loop_licm: tl.constexpr,
     use_packed_probability_conversion: tl.constexpr,
     derive_value_log_bound: tl.constexpr,
+    full_query: tl.constexpr,
+    contiguous_output: tl.constexpr,
+    padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
+    query_group_size: tl.constexpr = 0,  # pyright: ignore[reportArgumentType]
 ):
     """Cover full query tiles and their ragged tail in one grid."""
+    # Preserve the measured full-launch path instead of carrying window
+    # coordinates through every Q load. Contiguous outputs likewise retain
+    # flattened indexing in the tile epilogue.
+    if full_query:
+        query_start = 0
+        global_query_start = 0
+        query_rows = query_storage_length
     query_block = tl.program_id(0)
+    head = tl.program_id(1)
+    if query_group_size > 0:
+        # Visit a small group of Q tiles across all heads before the next
+        # group. The final group may contain fewer tiles; map it densely so
+        # every (head, query tile) occurs exactly once without padding CTAs.
+        query_tiles = tl.num_programs(0)
+        linear = head * query_tiles + query_block
+        group = linear // (query_group_size * heads)
+        group_rows = tl.minimum(query_tiles - group * query_group_size, query_group_size)
+        group_offset = linear % (query_group_size * heads)
+        head = group_offset // group_rows
+        query_block = group * query_group_size + group_offset % group_rows
     if is_causal and optimize_causal_traversal:
         query_block = tl.num_programs(0) - 1 - query_block
     tile_args = (
@@ -649,8 +735,15 @@ def _piper_attention_kernel(
         value_mean_ptr,
         output_ptr,
         query_block,
-        query_length,
+        head,
+        query_storage_length,
         key_length,
+        query_start,
+        query_rows,
+        global_query_start,
+        stride_ob,
+        stride_oh,
+        stride_om,
         heads,
     )
     tile_options = tl.constexpr(
@@ -669,17 +762,19 @@ def _piper_attention_kernel(
             loop_licm,
             use_packed_probability_conversion,
             derive_value_log_bound,
+            contiguous_output,
         )
     )
     # This CTA-uniform branch folds away for aligned queries. Only the tail
     # needs masked pointer loads; full tiles retain the Q descriptor if present.
-    if aligned_queries or query_block < query_length // block_m:
+    if aligned_queries or query_block < query_rows // block_m:
         _piper_attention_query_tile(
             query_descriptor if use_query_tensor_descriptor else query_ptr,
             *tile_args,
             *tile_options,
             unmasked_query_tiles=tl.constexpr(True),
             use_query_tensor_descriptor=use_query_tensor_descriptor,
+            padded_kv=padded_kv,
         )
     else:
         _piper_attention_query_tile(
@@ -688,6 +783,7 @@ def _piper_attention_kernel(
             *tile_options,
             unmasked_query_tiles=tl.constexpr(False),
             use_query_tensor_descriptor=tl.constexpr(False),
+            padded_kv=padded_kv,
         )
 
 
@@ -738,6 +834,7 @@ def _default_piper_attention_execution_plan(
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
+    key_length: int | None = None,
 ) -> _policy.PiperAttentionExecutionPlan:
     """Resolve production policy for preparation, benchmarks, and tuning."""
     head_dim = query.shape[3]
@@ -747,43 +844,62 @@ def _default_piper_attention_execution_plan(
         head_dim=head_dim,
         is_causal=is_causal,
         query_length=query.shape[2],
+        key_length=key_length,
     )
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedPiperAttention:
-    query: torch.Tensor
-    query_descriptor: TensorDescriptor | None
+class _PreparedPiperContext:
+    """Reusable K/V operands and the plan defining their quantization and layout."""
+
     key: torch.Tensor | TensorDescriptor
     value: torch.Tensor | TensorDescriptor
-    query_scale: torch.Tensor
     key_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_log_scale: torch.Tensor
     value_mean: torch.Tensor
-    output: torch.Tensor
     key_length: int
     is_causal: bool
     plan: _policy.PiperAttentionExecutionPlan
+    padded_kv: bool = False
 
 
-def _prepare_piper_attention(
-    query: torch.Tensor,
+@dataclass(frozen=True, slots=True)
+class _PreparedPiperQuery:
+    """Quantized Q with its unpadded logical shape and original floating dtype."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    descriptor: TensorDescriptor | None
+    shape: tuple[int, int, int, int]
+    dtype: torch.dtype
+    global_row_offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPiperAttention:
+    """Prepared K/V and Q with one reusable output for full attention."""
+
+    context: _PreparedPiperContext
+    query: _PreparedPiperQuery
+    output: torch.Tensor
+
+
+def _prepare_piper_context(
     key: torch.Tensor,
     value: torch.Tensor,
-    scale: float,
-    is_causal: bool,
     *,
+    is_causal: bool,
     execution_plan: _policy.PiperAttentionExecutionPlan,
-) -> _PreparedPiperAttention:
-    """Quantize Q/K/V and construct the selected launch specialization."""
+) -> _PreparedPiperContext:
+    """Prepare validated K/V once, independently of Q and output storage."""
     batch, kv_heads, key_length, head_dim = key.shape
     plan = execution_plan
     if plan.split_pv_head_dim and head_dim != 128:
         raise ValueError("split-PV Piper Attention requires head_dim=128")
     if plan.optimize_causal_traversal and not is_causal:
         raise ValueError("optimized causal traversal requires causal attention")
-    with device_context(query.device):
+    with device_context(key.device):
         install_uint8_int8_dot_hook()
         padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
         storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
@@ -795,11 +911,9 @@ def _prepare_piper_attention(
             value,
             is_causal=is_causal,
         )
-        prepared_qk = qk_quantization.prepare_query_key(
-            query,
+        key_int8, key_scale = qk_quantization.prepare_key(
             key,
             key_mean,
-            scale,
             grouped=plan.grouped_qk,
             storage_key_length=storage_key_length,
         )
@@ -842,67 +956,153 @@ def _prepare_piper_attention(
             num_warps=4,
         )
 
-        key_argument: torch.Tensor | TensorDescriptor = prepared_qk.key
+        key_argument: torch.Tensor | TensorDescriptor = key_int8
         value_argument: torch.Tensor | TensorDescriptor = value_int8
         if plan.use_tensor_descriptors:
             key_argument, value_argument = _make_key_value_descriptors(
-                prepared_qk.key,
+                key_int8,
                 value_int8,
                 split_pv_head_dim=plan.split_pv_head_dim,
             )
-        query_descriptor = (
-            _make_query_descriptor(
-                prepared_qk.query,
-                plan.block_m,
-            )
-            if plan.use_tensor_descriptors and plan.block_m == 128
-            else None
-        )
-        output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
-        return _PreparedPiperAttention(
-            query=prepared_qk.query,
-            query_descriptor=query_descriptor,
+        return _PreparedPiperContext(
             key=key_argument,
             value=value_argument,
-            query_scale=prepared_qk.query_scale,
-            key_scale=prepared_qk.key_scale,
+            key_scale=key_scale,
             value_scale_multiplier=value_scale_multiplier,
             value_log_scale=value_log_scale,
             value_mean=value_mean,
-            output=output,
             key_length=key_length,
             is_causal=is_causal,
             plan=plan,
         )
 
 
-def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
-    """Launch only the fused attention recurrence on prepared integer inputs."""
-    batch, heads, query_length, head_dim = prepared.output.shape
-    plan = prepared.plan
+def _prepare_piper_query(
+    query: torch.Tensor,
+    scale: float,
+    *,
+    execution_plan: _policy.PiperAttentionExecutionPlan,
+    global_row_offset: int = 0,
+) -> _PreparedPiperQuery:
+    """Prepare Q using its K/V plan and a tile-aligned global origin.
+
+    To match full-sequence quantization, chunks must contain complete Q32 scale
+    groups except at the sequence tail. Launch windows may end within a group.
+    """
+    batch, heads, query_length, head_dim = query.shape
+    plan = execution_plan
+    validate_query_offset(global_row_offset, block_rows=plan.block_m, name="global_row_offset")
+    with device_context(query.device):
+        query_int8, query_scale = qk_quantization.prepare_query(
+            query,
+            scale,
+            grouped=plan.grouped_qk,
+        )
+        descriptor = (
+            _make_query_descriptor(query_int8, plan.block_m)
+            if plan.use_tensor_descriptors and plan.block_m == 128
+            else None
+        )
+    return _PreparedPiperQuery(
+        data=query_int8,
+        scale=query_scale,
+        descriptor=descriptor,
+        shape=(batch, heads, query_length, head_dim),
+        dtype=query.dtype,
+        global_row_offset=global_row_offset,
+    )
+
+
+def _prepare_piper_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    *,
+    execution_plan: _policy.PiperAttentionExecutionPlan,
+) -> _PreparedPiperAttention:
+    """Prepare all operands and allocate output before timed or captured launches."""
+    context = _prepare_piper_context(key, value, is_causal=is_causal, execution_plan=execution_plan)
+    prepared_query = _prepare_piper_query(query, scale, execution_plan=execution_plan)
+    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+    return _PreparedPiperAttention(context=context, query=prepared_query, output=output)
+
+
+def _launch_piper_attention_into(
+    context: _PreparedPiperContext,
+    query: _PreparedPiperQuery,
+    output: torch.Tensor,
+    *,
+    query_start: int = 0,
+    query_rows: int | None = None,
+) -> torch.Tensor:
+    """Launch a local Q window into caller-owned BHSD output storage.
+
+    Q and K/V must match in batch, head dimension, device, and execution plan;
+    Q heads must be divisible by K/V heads. The local start and global origin
+    are aligned to plan.block_m; rows may include a ragged tail. Causal masking
+    uses the global origin plus local start. query_start is local to prepared Q;
+    query_rows=None selects its remaining logical rows. Output may have padded
+    or permuted outer strides, with contiguous head features and no overlap.
+    """
+    batch, heads, query_length, head_dim = query.shape
+    plan = context.plan
+    rows = resolve_query_window(
+        query_length,
+        query_start=query_start,
+        query_rows=query_rows,
+        global_row_offset=query.global_row_offset,
+        block_rows=plan.block_m,
+        key_length=context.key_length,
+        is_causal=context.is_causal,
+    )
+    validate_output_buffer(
+        output,
+        shape=(batch, heads, rows, head_dim),
+        dtype=query.dtype,
+        device=query.data.device,
+    )
     attention_kernel = cast(Any, _piper_attention_kernel)
-    use_query_tensor_descriptor = prepared.query_descriptor is not None
-    with device_context(prepared.output.device):
-        attention_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
-            prepared.query,
-            prepared.query_descriptor if use_query_tensor_descriptor else prepared.query,
-            prepared.key,
-            prepared.value,
-            prepared.query_scale,
-            prepared.key_scale,
-            prepared.value_scale_multiplier,
-            prepared.value_log_scale,
-            prepared.value_mean,
-            prepared.output,
-            query_length,
-            prepared.key_length,
-            is_causal=prepared.is_causal,
+    use_query_tensor_descriptor = query.descriptor is not None
+    contiguous_output = output.is_contiguous()
+    retain_query_tail = (
+        plan.retain_query_tail_for_strided_output
+        and not contiguous_output
+        and context.key_length % _BLOCK_N != 0
+    )
+    aligned_queries = rows % plan.block_m == 0 and not retain_query_tail
+    query_tiles = triton.cdiv(rows, plan.block_m)
+    query_group_size = plan.strided_output_query_group if not contiguous_output else 0
+    if heads == 1 or query_tiles <= query_group_size:
+        query_group_size = 0  # The grouped mapping would be the identity.
+    with device_context(query.data.device):
+        attention_kernel[(query_tiles, heads, batch)](
+            query.data,
+            query.descriptor if use_query_tensor_descriptor else query.data,
+            context.key,
+            context.value,
+            query.scale,
+            context.key_scale,
+            context.value_scale_multiplier,
+            context.value_log_scale,
+            context.value_mean,
+            output,
+            query.data.shape[2],
+            context.key_length,
+            query_start,
+            rows,
+            query.global_row_offset + query_start,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            is_causal=context.is_causal,
             grouped_qk=plan.grouped_qk,
             split_pv_head_dim=plan.split_pv_head_dim,
-            aligned_queries=query_length % plan.block_m == 0,
-            unmasked_key_tiles=(not prepared.is_causal and prepared.key_length % _BLOCK_N == 0),
+            aligned_queries=aligned_queries,
+            unmasked_key_tiles=(not context.is_causal and context.key_length % _BLOCK_N == 0),
             heads=heads,
-            head_groups=heads // prepared.key_scale.shape[1],
+            head_groups=heads // context.key_scale.shape[1],
             head_dim=head_dim,
             block_m=plan.block_m,
             block_n=_BLOCK_N,
@@ -913,10 +1113,26 @@ def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
             loop_licm=plan.loop_licm,
             use_packed_probability_conversion=plan.use_packed_probability_conversion,
             derive_value_log_bound=plan.derive_value_log_bound,
+            full_query=(
+                query_start == 0 and query.global_row_offset == 0 and rows == query.data.shape[2]
+            ),
+            contiguous_output=contiguous_output,
+            padded_kv=context.padded_kv,
+            query_group_size=query_group_size,
             num_warps=plan.num_warps,
             num_stages=plan.num_stages,
+            maxnreg=(
+                plan.ragged_strided_output_maxnreg
+                if not contiguous_output and not aligned_queries
+                else None
+            ),
         )
-    return prepared.output
+    return output
+
+
+def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:
+    """Reuse the prepared output without allocating or preparing operands."""
+    return _launch_piper_attention_into(prepared.context, prepared.query, prepared.output)
 
 
 def _run_piper_attention(
@@ -935,6 +1151,7 @@ def _run_piper_attention(
         else _default_piper_attention_execution_plan(
             query,
             is_causal,
+            key_length=key.shape[2],
         )
     )
     prepared = _prepare_piper_attention(

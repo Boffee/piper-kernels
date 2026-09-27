@@ -10,12 +10,19 @@ here are part of preparation or attention, not implicit input validation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
 
+For opt-in Q/K/V and output-projection fusion, see
+[ConvRot INT8 projection fusion](../../fusions/convrot_int8_piper/README.md).
+Its compiler boundaries preserve dense K centering and per-token V scales.
+
 ## NVIDIA scheduling
 
 The attention recurrence handles full query tiles and a ragged final tile in one
 launch. Full tiles retain unmasked access, including Q descriptor loads when selected;
-the tail uses masked Q pointer loads and output stores. Aligned grids compile without
-the tail branch. Optimized causal traversal visits query tiles in reverse order.
+the tail uses masked Q pointer loads and output stores. Aligned grids normally compile
+without the tail branch. The SM120 non-causal D128 kernel retains that CTA-uniform
+branch for strided output with a ragged K tail, where it improves generated code;
+full query tiles still use unmasked access. Optimized causal traversal visits query
+tiles in reverse order.
 Quantization and statistics preparation use separate launches.
 
 Exact SM120 uses Q64 tiles for causal attention and Q128 for non-causal attention,
@@ -28,6 +35,18 @@ probability-code units until the output epilogue.
   that boundary to avoid descriptor setup overhead in short eager calls. Both use
   three pipeline stages.
 - Non-causal D128 uses K/V descriptors and two pipeline stages at every length.
+- D64 uses K/V descriptors once the context contains at least 64 full K64 tiles.
+  This conservative traversal-work crossover amortizes descriptor setup even
+  with a single query tile/head; short contexts retain pointer loads. Selection
+  uses the actual K length for rectangular attention. Descriptor schedules use
+  two pipeline stages for non-causal attention and three for causal attention.
+- Causal D64 descriptor kernels with strided output interleave heads within
+  groups of eight query tiles. This distributes their different causal prefix
+  lengths across the GPU; the final group can be shorter. Single-head and
+  single-group grids retain their original order. Ragged strided kernels also
+  use a 168-register budget to allow three resident four-warp CTAs per SM.
+  Aligned kernels retain their unconstrained register allocation. These choices
+  use output and query metadata and preserve the numerical recurrence.
 
 Selection uses host metadata only. See [_nvidia/policy.py](_nvidia/policy.py) for
 launch choices and the [benchmark guide](../../../../benchmarks/README.md#attention-tuning-workload-anchors)

@@ -3,29 +3,16 @@
 # Triton's launch options and constexpr function arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
-from dataclasses import dataclass
-
 import torch
 import triton
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.fusions.convrot_int8_projection.triton import ProjectionConfig
+from piper_kernels.fusions.convrot_int8_sage_qk import key as key_projection
 
 from . import _kernels
 from ._interfaces import KeyOutput, QueryOutput, ValueOutput
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionConfig:
-    """Compute tiles do not change the shared attention scale/summary groups."""
-
-    block_m: int
-    block_k: int
-    heads_per_program: int
-    num_warps: int
-    num_stages: int
-    group_m: int = 0
-    round_rsqrt_to_nearest: bool = False
 
 
 def project_query(
@@ -125,69 +112,24 @@ def project_key(
     out: KeyOutput,
     bias: torch.Tensor | None = None,
 ) -> None:
-    """Launch K64 quantization and routing summaries for global key storage."""
+    """Prepare globally centered K64 operands with FP32 routing summaries."""
     key, key_scale, key_summary, key_aux = out
-    batch, heads, storage_sequence_length, head_dim = key.shape
-    logical_sequence_length = input_qdata.shape[1]
-    rotary_dim = cos.shape[1]
-    mean_pool_summary = routing_mode == _MEAN_ROUTING
-    has_block_lengths = block_lengths is not None
-    block_lengths_ptr = block_lengths if has_block_lengths else key_scale
-    with device_context(input_qdata.device):
-
-        def launch(row_block_count: int, row_block_offset: int, *, aligned_rows: bool) -> None:
-            _kernels._convrot_project_quantize_key_kernel[
-                (
-                    row_block_count,
-                    triton.cdiv(heads, config.heads_per_program),
-                    batch,
-                )
-            ](
-                input_qdata,
-                input_scale,
-                weight_qdata,
-                weight_scale,
-                norm_weight,
-                cos,
-                sin,
-                key,
-                key_scale,
-                key_summary,
-                key_aux,
-                block_lengths_ptr,
-                batch * logical_sequence_length,
-                logical_sequence_length,
-                storage_sequence_length,
-                row_block_offset,
-                input_features=input_qdata.shape[2],
-                bias_ptr=bias,
-                heads=heads,
-                heads_per_program=config.heads_per_program,
-                head_dim=head_dim,
-                rotary_dim=rotary_dim,
-                round_rsqrt_to_nearest=config.round_rsqrt_to_nearest,
-                norm_epsilon=norm_epsilon,
-                mean_pool_summary=mean_pool_summary,
-                mask_block_lengths=has_block_lengths,
-                aligned_projection=(
-                    aligned_rows
-                    and input_qdata.shape[2] % config.block_k == 0
-                    and heads % config.heads_per_program == 0
-                ),
-                mask_ragged_tail=not aligned_rows,
-                block_m=config.block_m,
-                block_n=head_dim * config.heads_per_program,
-                block_k=config.block_k,
-                group_m=config.group_m,
-                num_warps=config.num_warps,
-                num_stages=config.num_stages,
-            )
-
-        full_row_blocks = logical_sequence_length // config.block_m
-        if full_row_blocks:
-            launch(full_row_blocks, 0, aligned_rows=True)
-        if logical_sequence_length % config.block_m:
-            launch(1, full_row_blocks, aligned_rows=False)
+    key_projection.project_key(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        bias,
+        config=config,
+        out=(key, key_scale),
+        routing_out=(key_summary, key_aux),
+        routing_mode=routing_mode,
+        block_lengths=block_lengths,
+    )
 
 
 def project_value(

@@ -11,6 +11,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
+from piper_kernels.fusions.convrot_int8_piper import key as dense_key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
@@ -115,7 +116,7 @@ def _random_operands(
 )
 @pytest.mark.parametrize("affine", [True, False])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
-def test_fused_key_projection_matches_the_fp32_composed_contract(
+def test_fused_key_projection_matches_the_centered_bf16_storage_contract(
     bias_dtype: torch.dtype | None, affine: bool, sequence_length: int, head_dim: int
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
@@ -228,6 +229,58 @@ def test_fused_key_projection_ignores_internal_padding(routing_mode: int) -> Non
     )
 
     assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+    reference = composed_key_projection(
+        *operands.as_tuple(), norm_epsilon=1e-5, block_lengths=block_lengths
+    )
+    assert (actual[0].short() - reference.key.short()).abs().max() <= 1
+    torch.testing.assert_close(actual[1], reference.key_scale, atol=1e-6, rtol=3e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
+@pytest.mark.parametrize("sequence_length", [65, 193])
+def test_constant_transformed_keys_are_centered_to_fp32_roundoff(routing_mode, sequence_length):
+    operands = _random_operands(sequence_length=sequence_length)
+    operands.input_qdata[:, 1:] = operands.input_qdata[:, :1].clone()
+    operands.input_scale[:, 1:] = operands.input_scale[:, :1].clone()
+    operands.cos.fill_(1)
+    operands.sin.zero_()
+    key, scale, summary, _ = key_fusion._project_key_op(*operands.as_tuple(), 1e-5, routing_mode)
+    # Dividing the global sum by a non-power-of-two sequence length can leave
+    # FP32 roundoff. With epsilon-sized scales even that can produce nonzero codes.
+    decoded = key.float() * scale.repeat_interleave(64, dim=2)[..., None]
+    error_bound = 4 * torch.finfo(torch.float32).eps * key.shape[-1] ** 0.5 * summary.abs().max()
+    assert decoded.abs().max() <= error_bound
+    assert (scale > 0).all()
+    # Centering K must not center or round the values used to choose sparse routes.
+    assert torch.count_nonzero(summary) > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("sequence_length", [65, 192, 1025])
+def test_dense_and_sparse_keys_share_centering_and_cuda_graph_results(head_dim, sequence_length):
+    if not projection_available(head_dim):
+        pytest.skip("requires this fused projection width")
+    operands = _random_operands(
+        batch=2, sequence_length=sequence_length, heads=3, head_dim=head_dim
+    )
+    bias = torch.randn(3 * head_dim, device="cuda")
+    arguments = operands.as_tuple()
+    dense = dense_key_fusion._project_key_op(*arguments, 1e-5, bias, head_dim=head_dim)
+    sparse = key_fusion._project_key_op(*arguments, 1e-5, _MINMAX_ROUTING, bias=bias)
+    # Different projection tile layouts can straddle BF16/INT8 rounding boundaries.
+    assert (sparse[0].short() - dense[0].short()).abs().max() <= 1
+    torch.testing.assert_close(sparse[1], dense[1], atol=1e-7, rtol=3e-3)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        replayed = key_fusion._project_key_op(*arguments, 1e-5, _MINMAX_ROUTING, bias=bias)
+    graph.replay()
+    for actual, expected in zip(replayed, sparse, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.gpu

@@ -1,4 +1,4 @@
-"""One-pass ConvRot INT8 projection and sparse-Piper INT8 key preparation."""
+"""ConvRot INT8 projection and globally centered sparse-Piper K64 preparation."""
 
 from __future__ import annotations
 

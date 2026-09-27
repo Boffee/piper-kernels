@@ -98,6 +98,29 @@ def test_other_targets_retain_causal_d128_load_schedule(
     assert plan == _select(target, is_causal=True)
 
 
+@pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
+@pytest.mark.parametrize("query_length", [65, 8193])
+@pytest.mark.parametrize("key_length", [4095, 4096, 4097, 131073])
+def test_d64_descriptors_depend_on_key_traversal_not_query_length(target, query_length, key_length):
+    query = torch.empty((2, 6, query_length, 64), device="meta")
+    plan = _default_piper_attention_execution_plan(
+        query, False, target=target, key_length=key_length
+    )
+    assert plan.use_tensor_descriptors is (target == _SM120 and key_length >= 4096)
+    assert plan.num_stages == (2 if plan.use_tensor_descriptors else 3)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("sequence", [4095, 4096, 4097, 131073])
+def test_d64_self_attention_default_key_length_matches_explicit_metadata(causal, sequence):
+    plan = select_execution_plan(_SM120, head_dim=64, is_causal=causal, query_length=sequence)
+    assert plan == select_execution_plan(
+        _SM120, head_dim=64, is_causal=causal, query_length=sequence, key_length=sequence
+    )
+    assert plan.use_tensor_descriptors is (sequence >= 4096)
+    assert plan.num_stages == (2 if plan.use_tensor_descriptors and not causal else 3)
+
+
 @pytest.mark.parametrize("target", [_SM120, _SM121])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -152,6 +175,8 @@ def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
                 derive_value_log_bound=True,
                 num_stages=2,
                 use_packed_probability_conversion=True,
+                retain_query_tail_for_strided_output=True,
+                output_ctas_per_sm=2,
             ),
         ),
         (
@@ -349,7 +374,36 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "loop_num_stages": 2,
         "loop_licm": True,
         "use_packed_probability_conversion": False,
+        "retain_query_tail_for_strided_output": False,
+        "output_ctas_per_sm": 0,
+        "strided_output_query_group": 0,
+        "ragged_strided_output_maxnreg": None,
     }
+
+
+@pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_output_tuning_stays_with_the_measured_noncausal_sm120_plan(target, head_dim, is_causal):
+    plan = _select(target, head_dim=head_dim, is_causal=is_causal)
+    tuned = target == _SM120 and not is_causal
+    assert plan.retain_query_tail_for_strided_output is (tuned and head_dim == 128)
+    assert plan.output_ctas_per_sm == (2 if tuned else 0)
+
+
+@pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("sequence", [4095, 4096, 4097, 131073])
+def test_causal_strided_schedule_stays_with_sm120_d64_descriptors(
+    target, head_dim, is_causal, sequence
+):
+    plan = select_execution_plan(
+        target, head_dim=head_dim, is_causal=is_causal, query_length=sequence
+    )
+    tuned = target == _SM120 and head_dim == 64 and is_causal and plan.use_tensor_descriptors
+    assert plan.strided_output_query_group == (8 if tuned else 0)
+    assert plan.ragged_strided_output_maxnreg == (168 if tuned else None)
 
 
 def test_execution_plan_rejects_optimized_traversal_for_noncausal_invocation() -> None:

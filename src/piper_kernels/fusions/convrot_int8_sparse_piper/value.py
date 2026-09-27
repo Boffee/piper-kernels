@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.linear import _bias
+from piper_kernels.fusions.convrot_int8_projection._validation import validate_projection_inputs
 
 from . import _backend
 from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, padded_sequence_length, validate_block_lengths
@@ -22,37 +22,18 @@ def _validate_inputs(
 ) -> tuple[int, int, int]:
     if head_dim not in SUPPORTED_HEAD_DIMS:
         raise ValueError("V projection requires head_dim=64 or 128")
-    if input_qdata.ndim != 3 or input_qdata.dtype is not torch.int8:
-        raise ValueError("V projection input must be [batch,sequence,features] INT8")
-    batch, sequence_length, input_features = input_qdata.shape
-    if input_scale.shape != (batch, sequence_length) or input_scale.dtype is not torch.float32:
-        raise ValueError("V projection input scale must be a batch/sequence FP32 matrix")
-    if input_mean.shape != (batch, input_features) or input_mean.dtype is not torch.float32:
-        raise ValueError("V projection represented-input mean must be a batch/feature FP32 matrix")
-    if weight_qdata.ndim != 2 or weight_qdata.dtype is not torch.int8:
-        raise ValueError("V projection weight must be a two-dimensional INT8 tensor")
-    if weight_qdata.shape[1] != input_features or weight_qdata.shape[0] % head_dim:
-        raise ValueError("V projection weight must map the input to complete D64/D128 heads")
-    if weight_scale.shape != (weight_qdata.shape[0], 1) or weight_scale.dtype is not torch.float32:
-        raise ValueError("V projection weight scale must be one FP32 value per output feature")
-    if bias is not None:
-        _bias.validate_dtype(bias, "V projection")
-        if bias.shape != (weight_qdata.shape[0],):
-            raise ValueError("V projection bias must have one value per output feature")
-    operands = tuple(
-        operand
-        for operand in (input_qdata, input_scale, input_mean, weight_qdata, weight_scale, bias)
-        if operand is not None
+    batch, sequence_length, heads = validate_projection_inputs(
+        input_qdata, input_scale, weight_qdata, weight_scale, bias, head_dim=head_dim, name="V"
     )
-    if any(operand.device != input_qdata.device for operand in operands):
+    if input_mean.shape != (batch, input_qdata.shape[2]) or input_mean.dtype is not torch.float32:
+        raise ValueError("V projection represented-input mean must be a batch/feature FP32 matrix")
+    if input_mean.device != input_qdata.device:
         raise ValueError("V projection operands must share a device")
-    if any(
-        operand.layout is not torch.strided or not operand.is_contiguous() for operand in operands
-    ):
+    if input_mean.layout is not torch.strided or not input_mean.is_contiguous():
         raise ValueError("V projection operands must be contiguous")
     if sequence_length < TILE_ROWS:
         raise ValueError(f"V projection requires at least {TILE_ROWS} sequence rows")
-    return batch, sequence_length, weight_qdata.shape[0] // head_dim
+    return batch, sequence_length, heads
 
 
 def _launch_value_projection(

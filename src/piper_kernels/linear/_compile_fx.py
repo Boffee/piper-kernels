@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import operator
+from typing import cast
 
 import torch
 
@@ -26,4 +27,25 @@ def emit_tuple_result(
     return tuple(outputs)
 
 
-__all__ = ["emit_tuple_result"]
+def ordered_tuple_output_producer(
+    outputs: tuple[object, ...],
+    target: object,
+) -> torch.fx.Node | None:
+    """Return the common producer of ordered ``getitem`` tuple outputs."""
+    if not outputs or not all(isinstance(output, torch.fx.Node) for output in outputs):
+        return None
+    nodes = cast(tuple[torch.fx.Node, ...], outputs)
+    if any(node.target is not operator.getitem or len(node.args) != 2 for node in nodes):
+        return None
+    producer = nodes[0].args[0]
+    if (
+        not isinstance(producer, torch.fx.Node)
+        or producer.target is not target
+        or any(node.args[0] is not producer for node in nodes)
+        or tuple(node.args[1] for node in nodes) != tuple(range(len(nodes)))
+    ):
+        return None
+    return producer
+
+
+__all__ = ["emit_tuple_result", "ordered_tuple_output_producer"]

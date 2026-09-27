@@ -129,8 +129,12 @@ def test_dense_gqa_compile_and_prepared_storage(query_length):
         False,
         execution_plan=_default_piper_attention_execution_plan(query, False),
     )
-    assert dense.query.shape[1] == 8
-    for tensor in (dense.key_scale, dense.value_scale_multiplier, dense.value_mean):
+    assert dense.query.data.shape[1] == 8
+    for tensor in (
+        dense.context.key_scale,
+        dense.context.value_scale_multiplier,
+        dense.context.value_mean,
+    ):
         assert tensor.shape[1] == 2
     torch.testing.assert_close(
         torch.compile(dense_attention, fullgraph=True, dynamic=True)(query, key, value),
