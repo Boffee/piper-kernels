@@ -10,9 +10,8 @@ from piper_kernels.weights.convrot.int8._quantization import validate_activation
 
 from . import _backend, _schedule, query
 
-# Dense attention benefits from larger windows when repeatedly traversing K/V.
-# Keep the window bounded without tying its size to a model or sequence range.
-DEFAULT_QUERY_CHUNK_ROWS = 16384
+# Share the storage cap with sparse; dense scheduling may select smaller windows.
+DEFAULT_QUERY_CHUNK_ROWS = pipeline.DEFAULT_QUERY_CHUNK_ROWS
 
 
 def _validate_inputs(  # noqa: PLR0913, PLR0917

@@ -40,6 +40,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     query,
     value,
 )
+from piper_kernels.fusions.sparse_piper._output import DEFAULT_QUERY_CHUNK_ROWS
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -50,7 +51,9 @@ _FUSED_OUTPUT = "piper_kernels.convrot_int8_sparse_piper_projected_query_attenti
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", type=int, nargs="+", default=[8192, 32768, 100000, 150000])
-    parser.add_argument("--query-chunk-rows", type=int, nargs="+", default=[4096])
+    parser.add_argument(
+        "--query-chunk-rows", type=int, nargs="+", default=[DEFAULT_QUERY_CHUNK_ROWS]
+    )
     parser.add_argument("--samples", type=int, default=11)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=881)

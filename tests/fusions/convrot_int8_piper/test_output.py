@@ -137,7 +137,7 @@ def test_output_graph_capture_reads_live_input_and_static_scale(chunk_rows, outp
 @pytest.mark.parametrize(
     ("chunk_rows", "sequence"),
     [
-        (None, 16385),
+        (None, 2 * output.DEFAULT_QUERY_CHUNK_ROWS + 1),
         (128, 385),
         (512, 1025),
     ],

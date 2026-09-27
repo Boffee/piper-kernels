@@ -25,11 +25,11 @@ def test_invalid_arguments_are_rejected(arguments):
     [
         (64, [1]),
         (4096, [64]),
-        (4097, [64, 1]),
-        (8192, [64]),
-        (32768, [64]),
-        (100000, [64, 27]),
-        (150000, [64, 40]),
+        (8193, [128, 1]),
+        (8192, [128]),
+        (32768, [128]),
+        (100000, [128, 27]),
+        (150000, [128, 40]),
     ],
 )
 def test_scoring_uses_actual_full_and_tail_chunk_sizes(sequence, chunks):

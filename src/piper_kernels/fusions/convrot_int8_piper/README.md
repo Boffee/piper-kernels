@@ -87,15 +87,16 @@ storage before overwriting those rows. Narrower outputs retain up to two
 attention buffers. Other projector types must explicitly support this
 read-before-write guarantee to use output storage.
 
-Dense output fusion defaults to a 16384-row chunk cap. Balanced windows use the
-smallest 128-aligned uniform size preserving the minimum chunk count. SM120
-non-causal attention also considers windows below a GPU scheduling-wave
-boundary, using the SM count and measured two resident CTAs per SM. It chooses
-such a window only if it reduces total predicted waves, including the remainder.
+Dense output fusion defaults to an 8192-row chunk cap shared with sparse Piper.
+Balanced windows use the smallest 128-aligned uniform size preserving the
+minimum chunk count. SM120 non-causal attention also considers windows below
+a GPU scheduling-wave boundary, using the SM count and measured two resident
+CTAs per SM. It chooses such a window only if it reduces total predicted waves,
+including the remainder.
 Causal attention and other targets use balanced windows. `query_chunk_rows` on
-the internal output operator overrides the cap. Sparse Piper keeps its fixed
-4096-row windows. These rules do not depend on model identities or benchmark
-sequence ranges.
+the internal output operator overrides the cap. Sparse Piper uses fixed
+8192-row windows. This default applies to NVIDIA and AMD targets. These rules
+do not depend on model identities or benchmark sequence ranges.
 
 The final output, prepared input, and global K/V remain full size. Q and output
 preparation scratch are bounded by the selected window. K preparation still
@@ -105,9 +106,19 @@ determine peak allocation.
 
 ## Performance and limitations
 
-The measurements below predate BF16 K temporary storage. Output fusion has no
-automatic profitability guard. RTX 5090 synthetic BF16 D128 benchmarks using
-H3 and Krea2 shapes reached roughly parity or modest speedups
+With BF16 K storage, paired RTX 5090 H3 measurements at 32,769, 65,537, and
+100,001 rows put the 8192-row cap within 0.3-1.3% of the 16384-row cap. At
+100,001 rows, it saved about 352 MiB of peak extra allocation. Sparse Piper at
+the same length and 20% keep with mean routing was about 1.1% slower with fixed
+8192-row windows than with 16384 rows, saving about 387 MiB. These synthetic
+BF16 B1/H56/D128, width-5376 measurements include the full fused pipeline;
+allocation figures include output/workspace and exclude resident inputs and
+weights. The 8192-row default balances the measured latency and memory costs;
+explicit overrides remain available for other workloads.
+
+The measurements below predate BF16 K temporary storage and the shared 8192-row
+default. Output fusion has no automatic profitability guard. RTX 5090 synthetic
+BF16 D128 benchmarks using H3 and Krea2 shapes reached roughly parity or modest speedups
 against Q/K/V fusion plus a separate output projection. Controls covered nearby
 head counts, batch sizes 1 and 2, FP16/BF16, causal/non-causal attention, and
 aligned/ragged lengths. Outputs matched the Q/K/V-fused baseline exactly in
@@ -128,8 +139,8 @@ output retains separate attention buffers.
 A paired chunk-cap sweep found the existing scheduler with a 4096-row cap within
 about 0.7-2.1% of the 16384-row cap across the measured H3/Krea2 cases. Smaller
 windows save scratch, but may not reduce peak allocation when K preparation
-already dominates. The default remains 16384; compare caps on the intended
-workload rather than assuming the same tradeoff everywhere.
+already dominates. Compare caps on the intended workload rather than assuming
+the same tradeoff everywhere.
 
 D64 uses descriptor loads when K traversal amortizes setup. Causal strided D64
 also groups query tiles across heads and limits ragged-kernel registers to
