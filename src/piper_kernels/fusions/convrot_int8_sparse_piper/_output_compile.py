@@ -430,7 +430,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
             target,
             args=(
                 *common_arguments,
-                _backend.query_chunk_rows(original.meta["val"], output._DEFAULT_QUERY_CHUNK_ROWS),
+                output._DEFAULT_QUERY_CHUNK_ROWS,
                 *bounded_arguments,
                 *gate_arguments,
             ),

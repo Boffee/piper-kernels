@@ -97,12 +97,6 @@ def require_projection_backend(
     return backend
 
 
-def query_chunk_rows(output: torch.Tensor, default: int) -> int:
-    """Query rows per fused attention-output chunk on the output's device."""
-    target = AcceleratorTarget.from_device(output.device)
-    return nvidia_policy.SM89_QUERY_CHUNK_ROWS if nvidia_policy.is_sm89(target) else default
-
-
 def select_output_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
     """Select the validated chunked attention-to-output integration on this device."""
     target = AcceleratorTarget.from_device(input.device)

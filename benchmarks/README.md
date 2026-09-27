@@ -1183,9 +1183,9 @@ in MiB:
 | 100,000 | 451.94 | 472.55 | 459.11 | 3999 / 3208 / 3423 |
 | 150,000 | 937.02 | 982.83 | 952.86 | 6045 / 4726 / 4964 |
 
-On SM89, 8192-row windows are 1.4-3.0% faster than 4096-row windows, for 61-238 MiB of
-extra workspace, and still allocate 14-18% less than the materialized path from 100K
-tokens. SM89 therefore uses 8192 rows; the other targets keep 4096.
+On SM89, the shared 8192-row windows are 1.4-3.0% faster than 4096-row windows, for
+61-238 MiB of extra workspace, and still allocate 14-18% less than the materialized path
+from 100K tokens.
 
 On the same SM89 stack, the stages of the H3 block's materialized path took these CUDA-event
 medians in milliseconds (seven iterations after two warm-ups). The fused path runs the same

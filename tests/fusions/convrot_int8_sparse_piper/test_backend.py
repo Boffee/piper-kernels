@@ -265,22 +265,6 @@ def test_output_support_is_independent_of_qkv_projection_support(
 
 
 @pytest.mark.parametrize(
-    ("target", "rows"),
-    [
-        (AcceleratorTarget("cuda", "sm120"), 4096),
-        (AcceleratorTarget("cuda", "sm89"), 8192),
-        (AcceleratorTarget("hip", "gfx1201"), 4096),
-    ],
-)
-def test_only_sm89_widens_fused_output_query_chunks(monkeypatch, target, rows):
-    probe = Mock(return_value=target)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
-    output = SimpleNamespace(device=torch.device("cuda:1"))
-    assert _backend.query_chunk_rows(output, 4096) == rows
-    probe.assert_called_once_with(output.device)
-
-
-@pytest.mark.parametrize(
     ("platform", "target"),
     [
         ("linux", AcceleratorTarget("hip", "gfx1100")),
