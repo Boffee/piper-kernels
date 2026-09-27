@@ -79,9 +79,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _convolution_policy(target: AcceleratorTarget) -> ConvolutionPolicy:
-    for policy in (nvidia_policy, amd_policy):
-        if policy.supports_target(target):
-            return cast(ConvolutionPolicy, policy)
+    if nvidia_policy.supports_target(target):
+        return nvidia_policy.select_policy(target)
+    if amd_policy.supports_target(target):
+        return cast(ConvolutionPolicy, amd_policy)
     raise ValueError(f"ConvRot INT8 convolution benchmarking has no optimized backend for {target}")
 
 

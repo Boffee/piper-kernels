@@ -12,6 +12,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
+- Native NVIDIA SM8x (SM80, SM86, SM87, SM89) ConvRot INT8 Conv3D, which previously used the
+  FP32 portable reference. SM8x runs the shared Triton kernels with its own tiles, since
+  SM120's spill registers there. On an RTX 4070 Ti SUPER, one MiniMax-H3 encoder tile's 29
+  convolutions take 49.6 ms (reference 721 ms, cuDNN FP16 182 ms), bitwise equal to SM120 tiles.
 
 ### Changed
 

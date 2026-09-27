@@ -20,9 +20,10 @@ plus bias, stride, and spatial padding. Quantization state belongs to the weight
   height and width greater than one. Strides are three positive integers;
   dilation and convolution groups are not supported.
 
-Optimized backends target NVIDIA SM120 and ROCm RDNA4 (`gfx1200`/`gfx1201`);
-other devices use the portable reference. RX 9070 XT (`gfx1201`) has hardware
-correctness/performance coverage; `gfx1200` also has offline compilation coverage.
+Optimized backends target NVIDIA SM120, NVIDIA SM8x (SM80, SM86, SM87, SM89), and ROCm
+RDNA4 (`gfx1200`/`gfx1201`); other devices use the portable reference. RX 9070 XT
+(`gfx1201`) and RTX 4070 Ti SUPER (SM89) have hardware correctness/performance coverage;
+`gfx1200` also has offline compilation coverage.
 GroupNorm statistics, affine transforms, SiLU, rotation, rescaling, bias, and
 residual addition use FP32 intermediates. The convolution accumulates INT8
 products in INT32. Eliminated FP16 intermediate rounding is not reproduced.
@@ -30,8 +31,10 @@ products in INT32. Eliminated FP16 intermediate rounding is not reproduced.
 The public operations and weight format are shared. `_backend.py` selects a
 vendor implementation; `_nvidia/` and `_amd/` own target support and launch policy.
 Both use the common Triton kernels and launch mechanics in `triton.py`. AMD uses
-HIP quantization rounding and pointer-based weight loads; NVIDIA retains its
-SM120 tile policy and optional weight descriptors. No activation-scale conversion
+HIP quantization rounding and pointer-based weight loads. NVIDIA selects SM120 or SM8x
+tiles; only SM120 uses weight descriptors, since SM8x has no TMA. SM120's 128x128
+four-warp tile spills registers on SM8x, so SM8x uses 64x128 tiles, 64x64 tiles below
+2,048 output rows, and 32x32 tiles for at most 64 outputs. No activation-scale conversion
 or checkpoint migration is needed when moving between supported devices.
 
 ## ROCm validation and benchmarks
@@ -47,7 +50,7 @@ The hardware regressions also run through `scripts/run_rocm_regressions.py`.
 They cover FP16/FP32 and noncontiguous inputs, all padding modes, channel counts
 through 4096, exact INT32 accumulation, fused normalization, dynamic compilation,
 and graph capture with live activation-scale changes. Offline tests check integer
-matrix instructions on SM120 and both RDNA4 targets.
+matrix instructions on SM120, SM89, and both RDNA4 targets.
 
 The shared CUDA/ROCm benchmark reports plain and fused convolution timings against the portable
 reference and standard PyTorch ROCm FP16 convolution, with cache-flushed and

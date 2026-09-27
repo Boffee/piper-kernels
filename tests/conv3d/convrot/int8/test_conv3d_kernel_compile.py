@@ -7,6 +7,7 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import triton as kernels
 from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
@@ -18,6 +19,7 @@ from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
     "target",
     [
         GPUTarget("cuda", 120, 32),
+        GPUTarget("cuda", 89, 32),
         pytest.param(
             GPUTarget("hip", "gfx1200", 32),
             marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux"),
@@ -29,7 +31,11 @@ from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
     ],
 )
 def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
-    policy = amd_policy if target.backend == "hip" else nvidia_policy
+    policy = (
+        amd_policy
+        if target.backend == "hip"
+        else nvidia_policy.select_policy(AcceleratorTarget.from_compiler_target(target))
+    )
     plan = policy.convolution_plan(channels, 128, rows)
     source = ASTSource(
         kernels._conv3d_kernel,

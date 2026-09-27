@@ -13,12 +13,20 @@ from piper_kernels.conv3d.convrot.int8._amd import policy as amd
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia
 from piper_kernels.specializations.minimax_h3_vae.conv3d import _compile
 
+SM120 = nvidia.select_policy(AcceleratorTarget("cuda", "sm120"))
+SM8X = nvidia.select_policy(AcceleratorTarget("cuda", "sm89"))
+
 
 @pytest.mark.parametrize(
     ("target", "vendor"),
     [
         (AcceleratorTarget("cuda", "sm120"), "nvidia"),
+        (AcceleratorTarget("cuda", "sm89"), "nvidia"),
+        (AcceleratorTarget("cuda", "sm86"), "nvidia"),
+        (AcceleratorTarget("cuda", "sm80"), "nvidia"),
+        (AcceleratorTarget("cuda", "sm90"), None),
         (AcceleratorTarget("cuda", "sm100"), None),
+        (AcceleratorTarget("cuda", "sm75"), None),
         (AcceleratorTarget("hip", "gfx1200"), "amd"),
         (AcceleratorTarget("hip", "gfx1201"), "amd"),
         (AcceleratorTarget("hip", "gfx1100"), None),
@@ -97,7 +105,7 @@ def test_custom_op_uses_selected_backend_or_reference(monkeypatch, fused):
     ],
 )
 def test_nvidia_convolution_policy_preserves_existing_tiles(channels, outputs, rows, expected):
-    assert nvidia.convolution_plan(channels, outputs, rows) == expected
+    assert SM120.convolution_plan(channels, outputs, rows) == expected
 
 
 @pytest.mark.parametrize(
@@ -114,7 +122,8 @@ def test_nvidia_convolution_policy_preserves_existing_tiles(channels, outputs, r
     ],
 )
 def test_nvidia_preparation_policy_preserves_existing_tiles(channels, rows, group_norm, expected):
-    assert nvidia.preparation_plan(channels, rows, group_norm=group_norm) == expected
+    assert SM120.preparation_plan(channels, rows, group_norm=group_norm) == expected
+    assert SM8X.preparation_plan(channels, rows, group_norm=group_norm) == expected
 
 
 @pytest.mark.parametrize(
@@ -129,7 +138,36 @@ def test_nvidia_preparation_policy_preserves_existing_tiles(channels, rows, grou
     ],
 )
 def test_nvidia_descriptor_policy(channels, outputs, height, aligned, expected):
-    assert nvidia.use_weight_descriptor(channels, outputs, height, 128, aligned=aligned) is expected
+    assert SM120.use_weight_descriptor(channels, outputs, height, 128, aligned=aligned) is expected
+    assert not SM8X.use_weight_descriptor(channels, outputs, height, 128, aligned=aligned)
+
+
+@pytest.mark.parametrize("architecture", ["sm80", "sm86", "sm87", "sm89"])
+def test_nvidia_selects_sm8x_policy_for_the_family(architecture):
+    assert nvidia.select_policy(AcceleratorTarget("cuda", architecture)) is SM8X
+
+
+@pytest.mark.parametrize("target", [AcceleratorTarget("cuda", "sm90"), AcceleratorTarget("cpu")])
+def test_nvidia_policy_rejects_unsupported_targets(target):
+    with pytest.raises(ValueError, match="no NVIDIA policy"):
+        nvidia.select_policy(target)
+
+
+@pytest.mark.parametrize(
+    ("channels", "outputs", "rows", "expected"),
+    [
+        (128, 128, 1_114_112, (64, 128, 128, 4, 3)),
+        (256, 512, 5120, (64, 128, 128, 4, 3)),
+        (1024, 1024, 2048, (64, 128, 128, 4, 3)),
+        (512, 512, 2047, (64, 64, 128, 4, 3)),
+        (1024, 1024, 1280, (64, 64, 128, 4, 3)),
+        (1024, 65, 1280, (64, 64, 128, 4, 3)),
+        (1024, 64, 1280, (32, 32, 128, 2, 3)),
+        (64, 7, 1_000_000, (32, 32, 128, 2, 3)),
+    ],
+)
+def test_sm8x_convolution_policy_uses_measured_tiles(channels, outputs, rows, expected):
+    assert SM8X.convolution_plan(channels, outputs, rows) == expected
 
 
 def test_compiler_cache_tracks_backend_sources(monkeypatch):
