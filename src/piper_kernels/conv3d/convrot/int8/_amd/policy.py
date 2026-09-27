@@ -7,7 +7,7 @@ import sys
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .._plan import ConvolutionPlan, PreparationPlan
+from .._plan import ConvolutionExecutionPlan, ConvolutionPlan, PreparationPlan
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -19,7 +19,7 @@ def supports_target(target: AcceleratorTarget) -> bool:
     )
 
 
-def convolution_plan(channels: int, outputs: int, rows: int) -> ConvolutionPlan:
+def _convolution_plan(channels: int, outputs: int, rows: int) -> ConvolutionPlan:
     # RX 9070 XT synthetic H3-style sweeps: larger row tiles amortize the
     # implicit 3-D gather at high resolution; smaller tiles keep enough work
     # in flight for deeper, low-resolution convolutions.
@@ -37,12 +37,27 @@ def preparation_plan(channels: int, rows: int, *, group_norm: bool) -> Preparati
     return PreparationPlan(max(1, min(16, 4096 // channels)), 4)
 
 
-def use_weight_descriptor(
+def select_execution_plan(
+    target: AcceleratorTarget,
+    *,
     channels: int,
     outputs: int,
-    height: int,
-    block_n: int,
-    *,
-    aligned: bool,
-) -> bool:
-    return False
+    input_rows: int,
+    output_rows: int,
+    output_height: int,
+    weight_aligned: bool,
+    group_norm: bool,
+    convolution_plan: ConvolutionPlan | None = None,
+) -> ConvolutionExecutionPlan:
+    """Resolve the RDNA4 schedules and pointer loads before shared execution."""
+    if not supports_target(target):
+        raise ValueError(f"ConvRot INT8 convolution has no AMD policy for {target}")
+    return ConvolutionExecutionPlan(
+        preparation=preparation_plan(channels, input_rows, group_norm=group_norm),
+        convolution=(
+            _convolution_plan(channels, outputs, output_rows)
+            if convolution_plan is None
+            else convolution_plan
+        ),
+        use_weight_descriptor=False,
+    )

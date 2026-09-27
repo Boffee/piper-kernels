@@ -7,8 +7,9 @@ from torch.nn import functional
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import _backend, conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.conv3d.convrot.int8 import triton as shared
+from piper_kernels.conv3d.convrot.int8._amd import dispatch as amd
 from piper_kernels.conv3d.convrot.int8._amd import policy
-from piper_kernels.conv3d.convrot.int8._amd import triton as amd
+from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 pytestmark = [
@@ -39,15 +40,16 @@ def test_preparation_matches_reference(channels, group_size, dtype):
     activation[:, :, 0, 0, 1] = -32
     activation = activation.transpose(3, 4)
     scale = torch.tensor(0.125, device="cuda")
+    plan = policy.preparation_plan(channels, 2 * 3 * 5 * 7, group_norm=False)
     actual = shared._prepare_input(
-        activation, group_size, scale, policy=policy, accelerator_backend="hip"
+        activation, group_size, scale, plan=plan, accelerator_backend="hip"
     )
     expected = reference._prepare_input(activation, group_size, scale)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert actual.min() == -128
     assert actual.max() == 127
     actual = shared._prepare_input(
-        torch.zeros_like(activation), group_size, scale, policy=policy, accelerator_backend="hip"
+        torch.zeros_like(activation), group_size, scale, plan=plan, accelerator_backend="hip"
     )
     assert torch.count_nonzero(actual) == 0
 
@@ -71,7 +73,15 @@ def test_prepared_convolution_matches_exact_integer_accumulation(channels, paddi
         None,
         input_scale,
         stride,
-        policy=policy,
+        execution_plan=default_execution_plan(
+            prepared.permute(0, 4, 1, 2, 3),
+            weight,
+            stride,
+            policy=policy,
+            group_norm=False,
+            symmetric_spatial_padding=padding == "reflect",
+            right_spatial_padding=padding == "reflect_right",
+        ),
         symmetric_spatial_padding=padding == "reflect",
         right_spatial_padding=padding == "reflect_right",
         residual=None,

@@ -107,7 +107,7 @@ def test_incorrect_outputs_fail_before_timing(monkeypatch, skip_reference_timing
 @pytest.mark.parametrize("arch", ["sm120", "sm89"])
 def test_convolution_selects_the_production_nvidia_policy(arch):
     target = AcceleratorTarget("cuda", arch)
-    assert benchmark._convolution_policy(target) is benchmark.nvidia_policy.select_policy(target)
+    assert benchmark._convolution_policy(target) is benchmark.nvidia_policy
 
 
 @pytest.mark.parametrize("arch", ["gfx1200", "gfx1201"])

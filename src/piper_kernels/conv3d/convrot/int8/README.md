@@ -30,12 +30,22 @@ products in INT32. Eliminated FP16 intermediate rounding is not reproduced.
 
 The public operations and weight format are shared. `_backend.py` selects a
 vendor implementation; `_nvidia/` and `_amd/` own target support and launch policy.
-`_nvidia/policy.py` selects target-specific schedules, and `_nvidia/dispatch.py`
-resolves the input device's policy through typed backend entry points. Shared
-schedule values live in `_plan.py`. Both vendors use the common Triton kernels
-and launch mechanics in `triton.py`. AMD uses HIP quantization rounding and
-pointer-based weight loads. NVIDIA selects SM120 or SM8x
-tiles; only SM120 uses weight descriptors, since SM8x has no TMA. SM120's 128x128
+
+| Module | Responsibility |
+| --- | --- |
+| Vendor `policy.py` | Select preparation, convolution, and weight-load choices from target and shape metadata. |
+| `_plan.py` | Define immutable schedule values and the concrete `ConvolutionExecutionPlan`. |
+| `_dispatch.py` | Resolve input/output dimensions and weight alignment for production and tuning. |
+| Vendor `dispatch.py` | Select a plan through typed backend entry points and invoke shared execution. |
+| `triton.py` | Run shared preparation and convolution kernels using the selected plan. |
+
+Preparation uses input rows; convolution uses output rows after padding and stride.
+Plans contain concrete choices and carry no architecture flags or policy callbacks.
+The tuner supplies an explicit convolution tile to the same selector, retaining
+production preparation and recomputing descriptor eligibility for that tile.
+
+AMD uses HIP quantization rounding and pointer-based weight loads. NVIDIA selects
+SM120 or SM8x tiles; only SM120 uses weight descriptors, since SM8x has no TMA. SM120's 128x128
 four-warp tile spills registers on SM8x, so SM8x uses 64x128 tiles, 64x64 tiles below
 2,048 output rows, and 32x32 tiles for at most 64 outputs. No activation-scale conversion
 or checkpoint migration is needed when moving between supported devices.

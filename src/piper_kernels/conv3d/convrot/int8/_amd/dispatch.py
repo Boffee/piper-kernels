@@ -1,4 +1,4 @@
-"""NVIDIA ConvRot INT8 convolution dispatch over shared Triton launchers."""
+"""RDNA4 ConvRot INT8 convolution dispatch over shared Triton launchers."""
 
 import torch
 
@@ -20,7 +20,7 @@ def conv3d(
     right_spatial_padding: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Launch with the SM8x or SM120 execution plan of the input's device."""
+    """Launch with the RDNA4 execution plan of the input's device."""
     plan = default_execution_plan(
         input,
         weight_qdata,
@@ -39,7 +39,7 @@ def conv3d(
         input_scale,
         stride,
         execution_plan=plan,
-        accelerator_backend="cuda",
+        accelerator_backend="hip",
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
@@ -63,7 +63,7 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
     right_spatial_padding: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Launch with the SM8x or SM120 execution plan of the input's device."""
+    """Launch with the RDNA4 execution plan of the input's device."""
     plan = default_execution_plan(
         input,
         weight_qdata,
@@ -86,7 +86,7 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
         input_scale,
         stride,
         execution_plan=plan,
-        accelerator_backend="cuda",
+        accelerator_backend="hip",
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,

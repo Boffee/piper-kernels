@@ -310,6 +310,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
     activation = (offsets + 0.5 * torch.randn(1, 128, 2, 33, 35, device="cuda")).half()
     weight, bias = torch.ones(128, device="cuda"), torch.zeros(128, device="cuda")
     target = AcceleratorTarget.from_device(activation.device)
+    policy = amd_policy if target.is_amd_hip else nvidia_policy
     actual = backend._prepare_group_norm_silu_input(
         activation,
         weight,
@@ -318,7 +319,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
         1e-6,
         64,
         torch.tensor(0.02, device="cuda"),
-        policy=amd_policy if target.is_amd_hip else nvidia_policy.select_policy(target),
+        plan=policy.preparation_plan(128, 2 * 33 * 35, group_norm=True),
         accelerator_backend=target.backend,
     )
     expected = reference._prepare_group_norm_silu_input(
@@ -368,8 +369,10 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
     shape, outputs, padding, stride, fused, tile
 ):
     from piper_kernels.conv3d.convrot.int8 import triton as backend  # noqa: PLC0415
+    from piper_kernels.conv3d.convrot.int8._dispatch import (  # noqa: PLC0415
+        default_execution_plan,
+    )
     from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy  # noqa: PLC0415
-    from piper_kernels.conv3d.convrot.int8._validation import _output_shape  # noqa: PLC0415
 
     torch.manual_seed(2718)
     channels = shape[1]
@@ -383,14 +386,26 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
     operands = (weight.qdata, weight.scale, bias, group_size, weight.act_per_tensor_scale, stride)
     flags = {"symmetric_spatial_padding": symmetric, "right_spatial_padding": right}
     norm = (activation, norm_weight, norm_bias, 32, 1e-6)
-    sm8x = nvidia_policy.select_policy(AcceleratorTarget("cuda", "sm89"))
-    batch, _, frames, height, width = _output_shape(shape, outputs, stride, symmetric, right)
-    assert sm8x.convolution_plan(channels, outputs, batch * frames * height * width) == tile
+    sm8x = default_execution_plan(
+        activation,
+        weight.qdata,
+        stride,
+        policy=nvidia_policy,
+        target=AcceleratorTarget("cuda", "sm89"),
+        group_norm=fused,
+        **flags,
+    )
+    assert sm8x.convolution == tile
 
     with torch.no_grad():
         if fused:
             actual = backend.group_norm_silu_conv3d(
-                *norm, *operands, policy=sm8x, accelerator_backend="cuda", residual=None, **flags
+                *norm,
+                *operands,
+                execution_plan=sm8x,
+                accelerator_backend="cuda",
+                residual=None,
+                **flags,
             )
             production = group_norm_silu_conv3d(*norm, weight, bias, stride=stride, padding=padding)
             expected = reference.group_norm_silu_conv3d(*norm, *operands, residual=None, **flags)
@@ -398,7 +413,7 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
             actual = backend.conv3d(
                 activation,
                 *operands,
-                policy=sm8x,
+                execution_plan=sm8x,
                 accelerator_backend="cuda",
                 residual=None,
                 **flags,

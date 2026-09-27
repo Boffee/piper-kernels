@@ -31,12 +31,17 @@ from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
     ],
 )
 def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
-    policy = (
-        amd_policy
-        if target.backend == "hip"
-        else nvidia_policy.select_policy(AcceleratorTarget.from_compiler_target(target))
-    )
-    plan = policy.convolution_plan(channels, 128, rows)
+    policy = amd_policy if target.backend == "hip" else nvidia_policy
+    plan = policy.select_execution_plan(
+        AcceleratorTarget.from_compiler_target(target),
+        channels=channels,
+        outputs=128,
+        input_rows=rows,
+        output_rows=rows,
+        output_height=17,
+        weight_aligned=True,
+        group_norm=False,
+    ).convolution
     source = ASTSource(
         kernels._conv3d_kernel,
         {
