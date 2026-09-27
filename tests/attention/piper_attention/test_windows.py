@@ -37,8 +37,14 @@ def _operands(head_dim, causal, descriptors, *, optimize_causal=None):
         2, sequence if causal else sequence + 31, 2, head_dim, device="cuda", dtype=query.dtype
     ).transpose(1, 2)
     value = torch.randn_like(key)
+    plan = backend._default_piper_attention_execution_plan(query, causal)
+    if plan.use_gluon_kernel:
+        # The Gluon kernel always stops causal rows at the diagonal.
+        if optimize_causal:
+            pytest.skip("the Gluon kernel has a single causal traversal")
+        return query, key, value, replace(plan, block_m=block_m)
     plan = replace(
-        backend._default_piper_attention_execution_plan(query, causal),
+        plan,
         block_m=block_m,
         use_tensor_descriptors=descriptors,
         optimize_causal_traversal=causal if optimize_causal is None else optimize_causal,

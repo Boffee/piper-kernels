@@ -7,9 +7,13 @@ import pytest
 import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
+from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.mixed_int8 import _MixedInt8StageHook
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.piper_attention._nvidia.gluon_async_copy import (
+    _dense_piper_attention_kernel,
+)
 from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _piper_attention_kernel,
@@ -37,13 +41,13 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         ),
         use_tensor_descriptors=False,
     )
-    constants = plan.as_dict()
-    constants.pop("num_warps")
-    constants.pop("num_stages")
-    constants.pop("retain_query_tail_for_strided_output")
-    constants.pop("output_ctas_per_sm")
-    constants.pop("strided_output_query_group")
-    constants.pop("ragged_strided_output_maxnreg")
+    # Launch options and plan fields for other kernels or launch paths are not
+    # Triton kernel parameters.
+    constants = {
+        name: value
+        for name, value in plan.as_dict().items()
+        if name in _piper_attention_kernel.arg_names
+    }
     constants.update(
         head_groups=3,
         head_dim=head_dim,
@@ -77,6 +81,69 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         ASTSource(_piper_attention_kernel, signature, constexprs=constants),
         target=GPUTarget("cuda", architecture, 32),
         options={"num_warps": plan.num_warps, "num_stages": plan.num_stages},
+    )
+    assert compiled.asm["cubin"]
+    assert ".s32.s8.s8.s32" in compiled.asm["ptx"]
+    assert ".s32.u8.s8.s32" in compiled.asm["ptx"]
+    assert "piper_attention_u8s8_dot_marker" not in compiled.asm["ptx"]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("full_launch", [False, True])
+def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, causal, full_launch):
+    plan = select_execution_plan(
+        AcceleratorTarget("cuda", "sm89"),
+        head_dim=head_dim,
+        is_causal=causal,
+        query_length=129,
+    )
+    assert plan.use_gluon_kernel
+    constants = {
+        "head_groups": 3,
+        "head_dim": head_dim,
+        "is_causal": causal,
+        "block_q": plan.block_m,
+        "quantize_query": plan.fuse_query_quantization,
+        "full_query": full_launch,
+        "contiguous_output": full_launch,
+    }
+    signature = {
+        name: "i32" for name in _dense_piper_attention_kernel.arg_names if name not in constants
+    }
+    signature.update(
+        query_ptr="*bf16" if plan.fuse_query_quantization else "*i8",
+        key_ptr="*i8",
+        value_ptr="*i8",
+        query_scale_ptr="*fp32",
+        key_scale_ptr="*fp32",
+        multiplier_ptr="*fp32",
+        value_mean_ptr="*fp32",
+        output_ptr="*bf16",
+        softmax_scale="fp32",
+    )
+    # A launch specializes pointers, K64/Q64-padded storage lengths, and Q strides
+    # as 16-byte aligned, which every cp.async copy requires. Window coordinates and
+    # output strides stay unspecialized.
+    aligned = [
+        name
+        for name in signature
+        if name.endswith(("_ptr", "_storage")) or name.startswith("stride_q")
+    ]
+    attrs = {
+        (_dense_piper_attention_kernel.arg_names.index(name),): [["tt.divisibility", 16]]
+        for name in aligned
+    }
+    options = {"num_warps": plan.num_warps, "num_stages": plan.num_stages}
+    if plan.max_registers is not None:
+        options["maxnreg"] = plan.max_registers
+    monkeypatch.setattr(
+        triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+    )
+    compiled = triton.compile(
+        GluonASTSource(_dense_piper_attention_kernel, signature, constexprs=constants, attrs=attrs),
+        target=GPUTarget("cuda", 89, 32),
+        options=options,
     )
     assert compiled.asm["cubin"]
     assert ".s32.s8.s8.s32" in compiled.asm["ptx"]

@@ -5,7 +5,8 @@ are shared by NVIDIA and AMD. Dispatch inspects operand-device metadata only.
 Unsupported targets retain the portable quantized reference. Numerical reductions
 here are part of preparation or attention, not implicit input validation.
 
-- `_nvidia/`: the existing SM8x/SM12x Triton kernels and measured launch policies.
+- `_nvidia/`: the existing SM8x/SM12x Triton kernels, the `cp.async` Gluon kernel
+  (`gluon_async_copy.py`), and measured launch policies.
 - `_amd/`: ROCm RDNA4 (`gfx1200`/`gfx1201`) Gluon attention and packed V preparation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
@@ -47,6 +48,15 @@ probability-code units until the output epilogue.
   use a 168-register budget to allow three resident four-warp CTAs per SM.
   Aligned kernels retain their unconstrained register allocation. These choices
   use output and query metadata and preserve the numerical recurrence.
+
+Exact SM89 runs the Gluon kernel instead, staging Q, K, V, and per-key V multipliers
+through `cp.async` commit groups with K64 tiles and four warps. It keeps per-thread
+Q/K scales and derives the V log-scale bound. D64 uses Q128 tiles, 32 rows per warp,
+and quantizes Q in the kernel prologue; D128 uses Q64 tiles under a 232-register cap so
+two CTAs share an SM. Only the final K64 tile carries masks, plus the diagonal tile
+before it for causal Q128 tiles, so ragged lengths reuse one compiled kernel. Causal
+grids start with the longest query rows. Query windows and strided outputs follow the
+same contract as the Triton kernel.
 
 Selection uses host metadata only. See [_nvidia/policy.py](_nvidia/policy.py) for
 launch choices and the [benchmark guide](../../../../benchmarks/README.md#attention-tuning-workload-anchors)
