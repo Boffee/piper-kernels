@@ -10,13 +10,12 @@ import triton.language as tl
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 from piper_kernels.attention.piper_attention import _quantization
-from piper_kernels.fusions.convrot_int8_projection.triton import projection_tile_ids
+from piper_kernels.fusions.convrot_int8_projection.triton import project_tile, projection_tile_ids
 from piper_kernels.fusions.convrot_int8_sage_qk.triton import project_rmsnorm_rope_tile
-from piper_kernels.linear.convrot.int8._kernels import triton as matmul
 
 
 @triton.jit
-def _project_qk_kernel(  # noqa: PLR0913, PLR0917
+def _project_query_kernel(  # noqa: PLR0913, PLR0917
     input_ptr,
     input_scale_ptr,
     weight_ptr,
@@ -24,8 +23,8 @@ def _project_qk_kernel(  # noqa: PLR0913, PLR0917
     norm_weight_ptr,
     cos_ptr,
     sin_ptr,
-    output_ptr,
-    statistics_ptr,
+    query_ptr,
+    query_scale_ptr,
     row_block_offset,
     chunk_start,
     chunk_rows,
@@ -45,7 +44,6 @@ def _project_qk_kernel(  # noqa: PLR0913, PLR0917
     aligned_projection: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
     bias_ptr=None,
-    is_query: tl.constexpr = True,
 ):
     block_m: tl.constexpr = 64
     block_n: tl.constexpr = heads_per_program * head_dim
@@ -82,53 +80,35 @@ def _project_qk_kernel(  # noqa: PLR0913, PLR0917
         round_rsqrt_to_nearest,
         bias_ptr=bias_ptr,
     )
-    if is_query:
-        group_offsets = tl.arange(0, 2)
-        group_valid = head_offsets[:, None] < heads
-        if mask_ragged_tail:
-            transformed = tl.where(
-                sequence_offsets[:, None, None] < chunk_rows,
-                transformed,
-                0.0,
-            )
-            group_valid = group_valid & (
-                row_block * block_m + group_offsets[None, :] * 32 < chunk_rows
-            )
-        quantized, scale = qk_quantization.quantize_query_tile(
+    group_offsets = tl.arange(0, 2)
+    group_valid = head_offsets[:, None] < heads
+    if mask_ragged_tail:
+        transformed = tl.where(
+            sequence_offsets[:, None, None] < chunk_rows,
             transformed,
-            group_valid,
-            softmax_scale,
-            heads_per_program,
-            head_dim,
-            block_m,
-            32,
+            0.0,
         )
-        batch_heads = batch * heads + head_offsets.to(tl.int64)
-        query_offsets = (
-            batch_heads[:, None, None] * storage_length * head_dim
-            + sequence_offsets[None, :, None] * head_dim
-            + tl.arange(0, head_dim)[None, None, :]
-        )
-        tl.store(output_ptr + query_offsets, quantized, mask=head_offsets[:, None, None] < heads)
-        scale_offsets = (
-            batch_heads[:, None] * (storage_length // 32) + row_block * 2 + group_offsets[None, :]
-        )
-        tl.store(statistics_ptr + scale_offsets, scale, mask=head_offsets[:, None] < heads)
-    else:
-        transformed = tl.where(sequence_offsets[:, None, None] < chunk_rows, transformed, 0.0)
-        batch_heads = batch * heads + head_offsets.to(tl.int64)
-        offsets = (
-            batch_heads[None, :, None] * storage_length * head_dim
-            + sequence_offsets[:, None, None] * head_dim
-            + tl.arange(0, head_dim)[None, None, :]
-        )
-        tl.store(output_ptr + offsets, transformed, head_offsets[None, :, None] < heads)
-        partial_offsets = (
-            batch_heads[:, None] * (storage_length // 64) + row_block
-        ) * head_dim + tl.arange(0, head_dim)[None, :]
-        tl.store(
-            statistics_ptr + partial_offsets, tl.sum(transformed, 0), head_offsets[:, None] < heads
-        )
+        group_valid = group_valid & (row_block * block_m + group_offsets[None, :] * 32 < chunk_rows)
+    quantized, scale = qk_quantization.quantize_query_tile(
+        transformed,
+        group_valid,
+        softmax_scale,
+        heads_per_program,
+        head_dim,
+        block_m,
+        32,
+    )
+    batch_heads = batch * heads + head_offsets.to(tl.int64)
+    query_offsets = (
+        batch_heads[:, None, None] * storage_length * head_dim
+        + sequence_offsets[None, :, None] * head_dim
+        + tl.arange(0, head_dim)[None, None, :]
+    )
+    tl.store(query_ptr + query_offsets, quantized, mask=head_offsets[:, None, None] < heads)
+    scale_offsets = (
+        batch_heads[:, None] * (storage_length // 32) + row_block * 2 + group_offsets[None, :]
+    )
+    tl.store(query_scale_ptr + scale_offsets, scale, mask=head_offsets[:, None] < heads)
 
 
 @triton.jit
@@ -163,25 +143,22 @@ def _project_value_kernel(  # noqa: PLR0913, PLR0917
     batch = tl.program_id(2)
     rows = row_block * block_m + tl.arange(0, block_m)
     features = head_block * block_n + tl.arange(0, block_n)
-    value = matmul.scaled_int8_matmul(
+    value = project_tile(
         input_ptr,
-        weight_ptr,
         input_scale_ptr,
+        weight_ptr,
         weight_scale_ptr,
         batch * sequence_length + rows,
         features,
         batch_size * sequence_length,
-        heads * head_dim,
         input_features,
+        heads * head_dim,
+        aligned_projection,
         block_m,
         block_n,
         block_k,
-        aligned_projection,
+        bias_ptr=bias_ptr,
     )
-    if bias_ptr is not None:
-        value += tl.load(bias_ptr + features, features < heads * head_dim, 0).to(tl.float32)[
-            None, :
-        ]
     if not is_causal:
         mean = tl.load(
             mean_ptr + batch * heads * head_dim + features, features < heads * head_dim, 0

@@ -68,7 +68,9 @@ class ProjectionBackend(Protocol):
         """Fill (K[B,H,S,D], scales[B,H,S/64], summaries, auxiliary), D=64 or 128.
 
         Minmax routing uses two [B,H,S/64,D] summary tensors. Mean routing
-        uses one summary tensor and an empty auxiliary [B,H,0,D].
+        uses one summary tensor and an empty auxiliary [B,H,0,D]. K is centered
+        by its global mean; routing summaries describe the uncentered FP32
+        transform values before BF16 K storage.
         """
 
     def project_value(

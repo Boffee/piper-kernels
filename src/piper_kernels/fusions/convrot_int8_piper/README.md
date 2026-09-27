@@ -36,13 +36,16 @@ operations. RMSNorm may be affine or non-affine, RoPE may cover part or all of a
 head, and projections may have bias. Output preparation supports dynamic
 per-token scales and a supplied static scale.
 
-Projection, RMSNorm, and RoPE intermediates stay in FP32 until quantization,
-matching sparse Piper's projection design. Results can differ slightly from a
-graph that materializes each intermediate in FP16/BF16. K retains its global
-post-transform mean: its producer writes transformed FP32 K and tile sums,
-reduces the mean, then performs centered K64 quantization. Non-causal V projects
-the represented input mean before per-token quantization; causal V skips that
-reduction and remains uncentered.
+Projection, RMSNorm, and RoPE arithmetic stay in FP32. K uses BF16 temporary
+storage and FP32 tile sums of those represented values; it reduces the global
+post-transform mean and centers K in FP32 before K64 quantization. Dense and
+sparse Piper use the same K producer, mean reduction, and quantization path.
+Sparse routing summaries retain the uncentered FP32 transform values. Q and V
+retain FP32 intermediates until quantization. These rounding boundaries can
+produce different results from materializing each operation in FP16/BF16 or
+keeping a full FP32 K temporary. Non-causal V projects the represented input
+mean before per-token quantization; causal V skips that reduction and remains
+uncentered.
 
 The internal producer boundaries are
 `piper_kernels::convrot_int8_piper_project_query`,
@@ -56,15 +59,20 @@ V has FP32 per-token multipliers and log scales. V codes use transposed storage
 on NVIDIA and packed WMMA tiles on RDNA4. NVIDIA log scales preserve the existing
 FP16 rounding. Numerical contents are producer preconditions. Validation reads
 host metadata only; fake execution allocates only outputs and does not select
-hardware or inspect tensor contents.
+hardware or inspect tensor contents. Transformed K must remain finite in BF16
+storage; this numerical precondition is not checked at runtime.
 
 ## Shared implementation and bounded storage
 
 Dense and sparse Piper share ConvRot projection storage validation, the
 RMSNorm/RoPE projection tile, projection configuration and tile indexing, the
 projected-mean kernel, output validation and chunk projector, compiler tuple
-matching, and the attention-to-output stream pipeline. Dense centering and
-per-token V quantization remain separate from sparse summaries and tile scales.
+matching, and the attention-to-output stream pipeline.
+`convrot_int8_centered_projection` provides BF16 storage and FP32 statistics for
+projection tiles independently of their Q/K/V role. The shared
+`convrot_int8_sage_qk.key` adapter owns K transforms and centered K64 encoding,
+with optional FP32 sparse routing summaries. Dense
+per-token V quantization remains separate from sparse V tile scales.
 Both producers use typed backend methods with caller-owned buffers; target
 configurations live in separate NVIDIA and RDNA4 modules. As in sparse Piper,
 `_kernels.py` contains device kernels and `triton.py` owns their launchers.
@@ -91,12 +99,15 @@ sequence ranges.
 
 The final output, prepared input, and global K/V remain full size. Q and output
 preparation scratch are bounded by the selected window. K preparation still
-requires a global FP32 temporary, which can dominate peak allocation.
+requires a global BF16 temporary plus compact FP32 mean-reduction storage.
+This halves the K temporary relative to FP32, though another stage may still
+determine peak allocation.
 
 ## Performance and limitations
 
-Output fusion has no automatic profitability guard. RTX 5090 synthetic BF16 D128
-benchmarks using H3 and Krea2 shapes reached roughly parity or modest speedups
+The measurements below predate BF16 K temporary storage. Output fusion has no
+automatic profitability guard. RTX 5090 synthetic BF16 D128 benchmarks using
+H3 and Krea2 shapes reached roughly parity or modest speedups
 against Q/K/V fusion plus a separate output projection. Controls covered nearby
 head counts, batch sizes 1 and 2, FP16/BF16, causal/non-causal attention, and
 aligned/ragged lengths. Outputs matched the Q/K/V-fused baseline exactly in

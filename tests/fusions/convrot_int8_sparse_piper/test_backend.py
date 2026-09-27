@@ -24,7 +24,10 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.attention import _output as attention_output
+from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
+from piper_kernels.fusions.convrot_int8_sage_qk import _key_kernels as key_kernels
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
+from piper_kernels.fusions.convrot_int8_sage_qk import key as key_projection
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
     _compile,
@@ -463,13 +466,21 @@ def test_shared_fusion_does_not_inspect_targets_or_launch_kernels(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
 
 
-def test_shared_projection_launcher_does_not_own_target_policy():
-    _assert_shared_fusion_boundary(Path(projection.__file__).read_text())
+@pytest.mark.parametrize("module", [projection, key_projection])
+def test_shared_projection_launcher_does_not_own_target_policy(module):
+    _assert_shared_fusion_boundary(Path(module.__file__).read_text())
 
 
 def test_compiler_cache_keys_include_projection_validation_and_attention_policy():
     assert qk_validation.__file__ in _compile._source_files()
     assert projection.__file__ in _compile._source_files()
+    for compiler in (_compile, dense_compile):
+        assert key_projection.__file__ in compiler._source_files()
+        assert key_kernels.__file__ in compiler._source_files()
+        assert set(key_projection.centered_projection.source_files()) <= set(
+            compiler._source_files()
+        )
+        assert key_projection.qk_quantization.__file__ in compiler._source_files()
     for compiler in (_compile, nvfp4_compile):
         assert attention_policy.__file__ in compiler._source_files()
         assert attention_output.__file__ in compiler._source_files()
@@ -602,22 +613,41 @@ def _capture_projection(
 ):
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
-        "key": _kernels._convrot_project_quantize_key_kernel,
+        "key": key_kernels._project_key_kernel,
         "value": _kernels._convrot_project_quantize_sparse_value_kernel,
     }
     function = functions[operation]
     kernel = MagicMock()
-    monkeypatch.setattr(_kernels, function.__name__, kernel)
+    monkeypatch.setattr(key_kernels if operation == "key" else _kernels, function.__name__, kernel)
     mean_kernel = MagicMock()
     monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
     monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(projection, "device_context", guard)
+    monkeypatch.setattr(
+        key_projection if operation == "key" else projection, "device_context", guard
+    )
+    if operation == "key":
+        mean_guard = Mock(side_effect=lambda device: nullcontext())
+        monkeypatch.setattr(key_projection.centered_projection, "device_context", mean_guard)
+        monkeypatch.setattr(
+            key_projection.centered_projection._kernels, "_mean_finalize_kernel", MagicMock()
+        )
+        monkeypatch.setattr(key_projection.qk_quantization, "prepare_key", Mock())
     with FakeTensorMode():
         operands = _operands(head_dim=head_dim)
         bias = operands[3].new_empty((3 * head_dim,)) if with_bias else None
         _call(operation, operands, emit_block_mean=True, bias=bias)
     guard.assert_called_once_with(torch.device("cuda:1"))
+    if operation == "key":
+        mean_guard.assert_called_once_with(torch.device("cuda:1"))
+        preparation = key_projection.qk_quantization.prepare_key.call_args
+        assert preparation.args[0].dtype is torch.bfloat16
+        assert preparation.args[1].dtype is torch.float32
+        finalization = key_projection.centered_projection._kernels._mean_finalize_kernel
+        assert all(
+            argument.dtype is torch.float32
+            for argument in finalization.__getitem__.return_value.call_args.args[:2]
+        )
     for call in kernel.__getitem__.return_value.call_args_list:
         assert call.kwargs["bias_ptr"] is bias
     if operation == "value":
@@ -680,7 +710,7 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
     [GPUTarget("cuda", 120, 32), GPUTarget("hip", "gfx1200", 32), GPUTarget("hip", "gfx1201", 32)],
 )
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_production_launches_compile_without_intermediate_bf16(
+def test_production_launches_compile_with_expected_storage_precision(
     monkeypatch, operation, target, head_dim, affine, with_bias
 ):
     if target.backend == "hip" and sys.platform != "linux":
@@ -729,7 +759,11 @@ def test_production_launches_compile_without_intermediate_bf16(
         else:
             assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
             assert compiled.metadata.shared <= 65536
-        assert "arith.truncf" not in compiled.asm["ttgir"]
+        truncations = [
+            line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line
+        ]
+        assert bool(truncations) is (operation == "key")
+        assert all("f32" in line and "bf16" in line for line in truncations)
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])

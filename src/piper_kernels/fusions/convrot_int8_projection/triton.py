@@ -1,10 +1,12 @@
-"""Compute configuration, grouped tile indexing, and projected means shared by fusions."""
+"""Shared ConvRot projection/bias arithmetic, compute configuration, indexing, and means."""
 
 # pyright: reportArgumentType=false, reportCallIssue=false
 from dataclasses import dataclass
 
 import triton
 import triton.language as tl
+
+from piper_kernels.linear.convrot.int8._kernels import triton as convrot_int8_kernels
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +36,47 @@ def projection_tile_ids(group_m: tl.constexpr):
         row = first_row + within_group % group_rows
         head = within_group // group_rows
     return row, head
+
+
+@triton.jit
+def project_tile(
+    input_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    row_offsets,
+    weight_offsets,
+    rows,
+    input_features: tl.constexpr,
+    output_features: tl.constexpr,
+    aligned_projection: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    bias_ptr=None,
+):
+    """Return an FP32 ConvRot projection tile with optional bias, before transforms."""
+    projection = convrot_int8_kernels.scaled_int8_matmul(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        row_offsets,
+        weight_offsets,
+        rows,
+        output_features,
+        input_features,
+        block_m,
+        block_n,
+        block_k,
+        aligned_projection,
+    )
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + weight_offsets, weight_offsets < output_features, 0).to(
+            tl.float32
+        )
+        projection += bias[None, :]
+    return projection
 
 
 @triton.jit

@@ -32,17 +32,23 @@ except ModuleNotFoundError as error:
 def source_files() -> tuple[str, ...]:
     """Include selection and execution policy in the compiler-pass cache key."""
     shared_projection_file = None
+    key_files: tuple[str, ...] = ()
     if _nvidia_projection is not None or _amd_projection is not None:
         from piper_kernels.fusions.convrot_int8_projection import (  # noqa: PLC0415
             triton as shared_projection,
         )
+        from piper_kernels.fusions.convrot_int8_sage_qk import (  # noqa: PLC0415
+            key as key_projection,
+        )
 
         shared_projection_file = shared_projection.__file__
+        key_files = key_projection.source_files()
     return tuple(
         path
         for path in (
             __file__,
             shared_projection_file,
+            *key_files,
             projection_validation.__file__,
             _interfaces.__file__,
             nvidia_policy.__file__,

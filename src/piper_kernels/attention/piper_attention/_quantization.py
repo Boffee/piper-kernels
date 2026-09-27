@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.reductions import store_mean_from_partials
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
@@ -108,30 +109,18 @@ def _kv_mean_finalize_kernel(
     block_d: tl.constexpr,
 ):
     """Merge K and optional non-causal V partials into compact FP32 means."""
-    batch_head = tl.program_id(0)
-    feature_block = tl.program_id(1)
-    offsets_c = tl.arange(0, block_chunks)
-    offsets_d = feature_block * block_d + tl.arange(0, block_d)
-    mask = (offsets_c[:, None] < num_chunks) & (offsets_d[None, :] < head_dim)
-    partial_offsets = (batch_head * num_chunks + offsets_c[:, None]) * head_dim + offsets_d[None, :]
-    key_partials = tl.load(key_partial_ptr + partial_offsets, mask=mask, other=0.0)
-    output_offsets = batch_head * head_dim + offsets_d
-    output_mask = offsets_d < head_dim
-    tl.store(
-        key_mean_ptr + output_offsets,
-        tl.sum(key_partials, axis=0) / key_length,
-        mask=output_mask,
+    store_mean_from_partials(
+        key_partial_ptr, key_mean_ptr, key_length, num_chunks, head_dim, block_chunks, block_d
     )
     if not is_causal:
-        value_partials = tl.load(
-            value_partial_ptr + partial_offsets,
-            mask=mask,
-            other=0.0,
-        )
-        tl.store(
-            value_mean_ptr + output_offsets,
-            tl.sum(value_partials, axis=0) / key_length,
-            mask=output_mask,
+        store_mean_from_partials(
+            value_partial_ptr,
+            value_mean_ptr,
+            key_length,
+            num_chunks,
+            head_dim,
+            block_chunks,
+            block_d,
         )
 
 

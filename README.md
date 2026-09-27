@@ -275,17 +275,27 @@ attention storage; only the final projection tile is masked, and the result reta
 length. It fails closed for unsupported shapes, layouts, or parameters; the ordinary ConvRot and
 sparse-attention APIs remain independent.
 
-Because no projected activation is externally observable in the fused region, projection,
-RMSNorm, and RoPE stay in FP32 until the final INT8 Q/K/V encoding. This removes otherwise
-redundant FP32-to-BF16-to-FP32 round trips without materializing FP32 activation tensors.
+Projection, RMSNorm, and RoPE arithmetic stay in FP32. Dense and sparse ConvRot INT8 Piper
+share K preparation: the producer stores post-RoPE K in BF16 and accumulates its tile sums
+in FP32, then reduces the global mean and centers K in FP32 before K64 INT8 encoding.
+The mean describes the stored BF16 values. Sparse routing summaries use the original
+uncentered FP32 transform values; internal padding contributes zero K to the global mean.
+Q and V retain FP32 intermediates until their INT8 encoding. These fused rounding boundaries
+can produce different results from separately materialized FP16/BF16 operations.
 
 The internal `piper_kernels.fusions.projected_qk` layer owns projection-independent RMSNorm and
 RoPE. The existing Sage Q/K quantization layer owns signed-Hadamard grouped Q/K encoding shared
-with dense Piper, while `piper_kernels.attention.kernels.sparse_piper` owns only sparse Piper's
-tile-scaled V encoding. `piper_kernels.fusions.convrot_int8_sage_qk` adapts ConvRot projection tiles
-to those boundaries and owns ConvRot validation; the explicit sparse fusion adds routing summaries,
-storage, and graph rewriting. Another projection backend can therefore compose the same pieces
-without depending on ConvRot internals or adding a backend protocol to attention.
+with dense Piper, while `piper_kernels.attention.kernels.sparse_piper` owns sparse routing
+summaries and tile-scaled V encoding. `piper_kernels.fusions.convrot_int8_sage_qk` adapts
+ConvRot projection tiles to those boundaries and owns ConvRot validation.
+`convrot_int8_projection` owns projection/bias arithmetic, and
+`convrot_int8_centered_projection` owns BF16 projection storage and FP32 represented-value
+statistics without prescribing Q/K/V transforms or encoding. The shared
+`convrot_int8_sage_qk.key` adapter composes these with RMSNorm/RoPE, centered K64 encoding,
+and optional sparse routing outputs. The explicit sparse fusion adds storage contracts and
+graph rewriting.
+Another projection backend can compose the same pieces without depending on ConvRot internals or
+adding a backend protocol to attention.
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)`, while `add_`
 accepts an exact-shape dense logical update and computes `weight = weight + alpha * update`.

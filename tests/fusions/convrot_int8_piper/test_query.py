@@ -269,9 +269,9 @@ def test_projection_selector_uses_validated_targets(monkeypatch, target, support
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("affine", [False, True])
 def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim, affine):
-    function = _kernels._project_qk_kernel
+    function = _kernels._project_query_kernel
     kernel = MagicMock()
-    monkeypatch.setattr(_kernels, "_project_qk_kernel", kernel)
+    monkeypatch.setattr(_kernels, "_project_query_kernel", kernel)
     monkeypatch.setattr(projection, "device_context", lambda _: nullcontext())
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", arch))
     operands = _operands("meta", sequence=193, head_dim=head_dim, affine=affine)
@@ -308,6 +308,8 @@ def _compile_rdna4_launch(function, call, arch):
     compiled = triton.compile(
         ASTSource(function, signature, constexprs=constants),
         target=GPUTarget("hip", arch, 32),
-        options={name: call.kwargs[name] for name in ("num_warps", "num_stages")},
+        options={
+            name: call.kwargs[name] for name in ("num_warps", "num_stages") if name in call.kwargs
+        },
     )
     return compiled

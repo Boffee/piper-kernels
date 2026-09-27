@@ -70,6 +70,9 @@ def source_files() -> tuple[str, ...]:
             triton as shared_projection,
         )
         from piper_kernels.fusions.convrot_int8_sage_qk import (  # noqa: PLC0415
+            key as key_projection,
+        )
+        from piper_kernels.fusions.convrot_int8_sage_qk import (  # noqa: PLC0415
             triton as projection_qk,
         )
         from piper_kernels.fusions.projected_qk import triton as transforms  # noqa: PLC0415
@@ -83,6 +86,7 @@ def source_files() -> tuple[str, ...]:
             (
                 _projection.__file__,
                 _kernels.__file__,
+                *key_projection.source_files(),
                 _amd_projection.__file__ if _amd_projection is not None else None,
                 _nvidia_projection.__file__ if _nvidia_projection is not None else None,
                 shared_projection.__file__,

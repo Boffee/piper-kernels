@@ -221,11 +221,10 @@ def composed_key_projection(
     *,
     norm_epsilon: float,
     bias: torch.Tensor | None = None,
+    block_lengths: torch.Tensor | None = None,
 ) -> ProjectedKey:
-    """Materialize the FP32 operations fused by one-pass key projection."""
-    batch, sequence_length, _input_features = input_qdata.shape
-    head_dim = norm_weight.shape[0]
-    heads = weight_qdata.shape[0] // head_dim
+    """Compose FP32 transforms, BF16 K storage, FP32 centering and raw summaries."""
+    sequence_length = input_qdata.shape[1]
     key = _materialized_fp32_qk(
         input_qdata,
         input_scale,
@@ -238,13 +237,17 @@ def composed_key_projection(
         bias=bias,
     )
     storage_length = padded_sequence_length(sequence_length)
+    blocks, valid = _padded_blocks(key)
+    if block_lengths is not None:
+        valid &= torch.arange(_BLOCK_ROWS, device=key.device)[None, :] < block_lengths[:, None]
+    stored = blocks.masked_fill(~valid[None, None, :, :, None], 0).flatten(2, 3).bfloat16()
+    stored = stored[:, :, :sequence_length]
     key_int8, key_scale = qk_quantization.prepare_key(
-        key,
-        torch.zeros((batch, heads, head_dim), device=key.device, dtype=torch.float32),
+        stored,
+        stored.float().mean(2),
         grouped=True,
         storage_key_length=storage_length,
     )
-    blocks, valid = _padded_blocks(key.float())
     key_max = blocks.masked_fill(~valid[None, None, :, :, None], -torch.inf).amax(dim=3)
     key_min = blocks.masked_fill(~valid[None, None, :, :, None], torch.inf).amin(dim=3)
     return ProjectedKey(key_int8, key_scale, key_max, key_min)

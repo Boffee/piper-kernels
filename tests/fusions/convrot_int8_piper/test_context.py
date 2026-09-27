@@ -50,17 +50,33 @@ def test_key_uses_global_post_transform_mean(head_dim, sequence, affine):
     operands = _operands("cuda", sequence=sequence, head_dim=head_dim, affine=affine)
     bias = torch.randn(3 * head_dim, device="cuda")
     actual, scales = key._project_key_op(*operands, 1e-6, bias, head_dim=head_dim)
-    reference = _key_reference(operands, bias, head_dim)
+    reference = _key_reference(operands, bias, head_dim).bfloat16()
     expected, expected_scale = quantization.prepare_key(
         reference,
-        reference.mean(2),
+        reference.float().mean(2),
         grouped=True,
         storage_key_length=actual.shape[2],
     )
-    # Different FP32 reduction trees can straddle an INT8 rounding boundary.
+    # Projection/reduction ordering can straddle BF16 and INT8 rounding boundaries.
     assert (actual.int() - expected.int()).abs().max() <= 1
     torch.testing.assert_close(scales, expected_scale, atol=2e-7, rtol=3e-5)
     assert torch.count_nonzero(actual[:, :, sequence:]) == 0
+
+
+@pytest.mark.gpu
+@_NATIVE
+def test_key_storage_preserves_values_above_fp16_range():
+    operands = _operands("cuda", sequence=65, head_dim=64)
+    operands[4].fill_(131072)
+    reference = _key_reference(operands, None, 64).bfloat16()
+    assert reference.abs().max() > torch.finfo(torch.float16).max
+    actual, scales = key._project_key_op(*operands, 1e-6, head_dim=64)
+    expected, expected_scales = quantization.prepare_key(
+        reference, reference.float().mean(2), grouped=True, storage_key_length=actual.shape[2]
+    )
+    assert torch.isfinite(scales).all()
+    assert (actual.short() - expected.short()).abs().max() <= 1
+    torch.testing.assert_close(scales, expected_scales, atol=2e-7, rtol=3e-5)
 
 
 @pytest.mark.gpu

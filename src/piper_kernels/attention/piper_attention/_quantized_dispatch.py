@@ -2,7 +2,7 @@
 
 import torch
 
-from piper_kernels._triton import mixed_int8, runtime, targets
+from piper_kernels._triton import mixed_int8, reductions, runtime, targets
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.piper._amd import _wmma, fragments
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import _rotation as qk_rotation
@@ -20,6 +20,7 @@ def source_files() -> tuple[str, ...]:
     """Include preparation, dispatch, and launch semantics in compiler cache keys."""
     modules = (
         mixed_int8,
+        reductions,
         runtime,
         targets,
         _wmma,

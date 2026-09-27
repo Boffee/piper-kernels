@@ -5,8 +5,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from piper_kernels.fusions.convrot_int8_projection.triton import project_tile
 from piper_kernels.fusions.projected_qk import triton as projected_qk
-from piper_kernels.linear.convrot.int8._kernels import triton as convrot_int8_kernels
 
 
 @triton.jit
@@ -38,26 +38,22 @@ def project_rmsnorm_rope_tile(
     bias_ptr=None,
 ):
     """Return one FP32 normalized and rotated projection tile."""
-    projection = convrot_int8_kernels.scaled_int8_matmul(
+    projection = project_tile(
         input_ptr,
-        weight_ptr,
         input_scale_ptr,
+        weight_ptr,
         weight_scale_ptr,
         row_offsets,
         weight_offsets,
         rows,
-        output_features,
         input_features,
+        output_features,
+        aligned_projection,
         block_m,
         block_n,
         block_k,
-        aligned_projection,
+        bias_ptr=bias_ptr,
     )
-    if bias_ptr is not None:
-        bias = tl.load(bias_ptr + weight_offsets, weight_offsets < output_features, 0).to(
-            tl.float32
-        )
-        projection += bias[None, :]
     projection = tl.reshape(projection, (block_m, heads_per_program, head_dim))
     return projected_qk.rmsnorm_rope_tile(
         projection,
