@@ -2,9 +2,9 @@
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-# SM89 splits the fused attention output into 8,192-row query chunks. Against the shared
-# 4,096-row chunks, the compiled H3 attention block runs 1.6-3% faster at 8K-100K tokens with
-# the SM8x ConvRot INT8 GEMM, for 0.06-0.21 GiB more peak memory.
+# SM89 splits the fused attention output into 8,192-row query windows. Against the shared
+# 4,096 rows, the H3 fusion benchmark ran 0.9-3.0% faster at 8K-150K tokens for 61-238 MiB
+# more workspace (see benchmarks/README.md).
 SM89_QUERY_CHUNK_ROWS = 8_192
 
 

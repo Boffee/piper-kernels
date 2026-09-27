@@ -7,7 +7,7 @@ import torch
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from .._layout import TILE_ROWS
-from . import gluon
+from . import gluon_async_copy
 
 # Triton configuration for the shapes that the Gluon kernels do not cover. SM120's tiles need more
 # than SM89's 99 KiB of shared memory (K) or spill (V's 128x256 accumulator). Tiles of 64 rows by
@@ -44,8 +44,8 @@ def project_query(  # noqa: PLR0913, PLR0917
 ) -> None:
     """Project a query window, with the Gluon kernel when it covers the operands."""
     launch = (
-        gluon.project_query
-        if gluon.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
+        gluon_async_copy.project_query
+        if gluon_async_copy.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
         else partial(projection.project_query, config=_CONFIG)
     )
     launch(
@@ -84,8 +84,8 @@ def project_key(  # noqa: PLR0913
 ) -> None:
     """Project keys, with the Gluon kernel when it covers the operands."""
     launch = (
-        gluon.project_key
-        if gluon.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
+        gluon_async_copy.project_key
+        if gluon_async_copy.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
         else partial(projection.project_key, config=_CONFIG)
     )
     launch(
@@ -118,8 +118,8 @@ def project_value(
 ) -> None:
     """Project values, with the Gluon kernel when it covers the operands."""
     launch = (
-        gluon.project_value
-        if gluon.supports_projection(input_qdata, out[0].shape[2])
+        gluon_async_copy.project_value
+        if gluon_async_copy.supports_projection(input_qdata, out[0].shape[2])
         else partial(projection.project_value, config=_CONFIG)
     )
     launch(

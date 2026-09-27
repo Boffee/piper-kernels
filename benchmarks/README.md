@@ -1171,6 +1171,22 @@ windows. Dense and sparse ConvRot INT8 fusion now share an 8192-row default;
 the sparse windows remain fixed and dense schedules under the cap. Larger
 windows still trade additional workspace for workload-dependent latency gains.
 
+On an RTX 4070 Ti SUPER (SM89, Windows 11, Torch 2.14.0+cu130, Triton 3.8.0),
+`--sequence 8192 32768 100000 150000 --query-chunk-rows 4096 8192 --samples 7` gave these
+synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`) and peak extra allocations
+in MiB:
+
+| Tokens | Materialized | Fused 4096 | Fused 8192 | Peak: materialized / 4096 / 8192 |
+|---:|---:|---:|---:|---:|
+| 8,192 | 12.08 | 12.42 | 12.24 | 299 / 419 / 481 |
+| 32,768 | 73.18 | 74.43 | 73.76 | 1254 / 1165 / 1350 |
+| 100,000 | 448.45 | 469.26 | 456.80 | 3999 / 3210 / 3424 |
+| 150,000 | 923.79 | 976.08 | 947.08 | 6046 / 4727 / 4965 |
+
+On SM89, 8192-row windows are 0.9-3.0% faster than 4096-row windows, for 61-238 MiB of
+extra workspace, and still allocate 14-18% less than the materialized path from 100K
+tokens. SM89 therefore uses 8192 rows; the other targets keep 4096.
+
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell

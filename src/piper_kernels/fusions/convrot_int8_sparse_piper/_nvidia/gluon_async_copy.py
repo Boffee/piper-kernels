@@ -1,8 +1,8 @@
 """SM89 Gluon kernels for the fused ConvRot INT8 sparse-Piper Q/K/V projections.
 
-Each program projects 128 rows onto one D128 head. ``cp.async`` copies stage K64
-slices of the INT8 operands in shared memory, and ``mma_v2`` accumulates exact
-INT32 products.
+Each program projects 128 rows onto one D128 head through the SM8x ConvRot INT8
+GEMM's pipeline: ``cp.async`` copies stage K64 slices of the INT8 operands in shared
+memory, and ``mma_v2`` accumulates exact INT32 products.
 
 Q and K split warps only across rows and permute the weight rows, so each thread
 holds 4 consecutive features of every row it owns, with the other feature bits in
@@ -26,7 +26,6 @@ from __future__ import annotations
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
 from triton.language.extra import libdevice
 
 from piper_kernels._triton.runtime import device_context
@@ -34,6 +33,9 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import 
     SIGNED_HADAMARD_MASK,
 )
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
+    _accumulate as _accumulate_tiles,
+)
 
 from .. import _kernels
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
@@ -98,23 +100,8 @@ def _project_int8(
     accumulator,
     input_features: gl.constexpr,
 ):
-    """Accumulate ``input[rows] @ weight[weight_rows].T`` over staged K64 slices."""
-    block_m: gl.constexpr = accumulator.shape[0]
-    head_dim: gl.constexpr = accumulator.shape[1]
-    k_tiles: gl.constexpr = input_features // _GL_BLOCK_K
+    """Accumulate ``input[rows] @ weight[weight_rows].T`` in the SM8x GEMM's copy pipeline."""
     mma_layout: gl.constexpr = accumulator.type.layout
-    input_layout: gl.constexpr = gl.DotOperandLayout(0, mma_layout, k_width=4)
-    weight_layout: gl.constexpr = gl.DotOperandLayout(1, mma_layout, k_width=4)
-    input_stages = gl.allocate_shared_memory(
-        gl.int8,
-        [_GL_NUM_STAGES, block_m, _GL_BLOCK_K],
-        gl.NVMMASharedLayout.get_default_for([block_m, _GL_BLOCK_K], gl.int8),
-    )
-    weight_stages = gl.allocate_shared_memory(
-        gl.int8,
-        [_GL_NUM_STAGES, head_dim, _GL_BLOCK_K],
-        gl.NVMMASharedLayout.get_default_for([head_dim, _GL_BLOCK_K], gl.int8),
-    )
     features = gl.arange(0, _GL_BLOCK_K, gl.SliceLayout(0, _GL_COPY_LAYOUT))
     input_pointers = (
         input_ptr + input_rows.to(gl.int64)[:, None] * input_features + features[None, :]
@@ -122,37 +109,22 @@ def _project_int8(
     weight_pointers = (
         weight_ptr + weight_rows.to(gl.int64)[:, None] * input_features + features[None, :]
     )
-    for stage in gl.static_range(_GL_NUM_STAGES - 1):
-        if stage < k_tiles:
-            async_copy.async_load(input_stages.index(stage), input_pointers + stage * _GL_BLOCK_K)
-            async_copy.async_load(weight_stages.index(stage), weight_pointers + stage * _GL_BLOCK_K)
-        async_copy.commit_group()
-    for first_tile in range(0, k_tiles, _GL_NUM_STAGES):
-        for current in gl.static_range(_GL_NUM_STAGES):
-            tile = first_tile + current
-            # Rounds keep every stage's buffer static; a partial last round skips its extra tiles.
-            if k_tiles % _GL_NUM_STAGES == 0 or tile < k_tiles:
-                async_copy.wait_group(_GL_NUM_STAGES - 2)
-                # Every warp has finished reading the slot that the next copy refills.
-                gl.barrier()
-                prefetch = tile + _GL_NUM_STAGES - 1
-                slot = (current + _GL_NUM_STAGES - 1) % _GL_NUM_STAGES
-                async_copy.async_load(
-                    input_stages.index(slot),
-                    input_pointers + prefetch * _GL_BLOCK_K,
-                    mask=prefetch < k_tiles,
-                )
-                async_copy.async_load(
-                    weight_stages.index(slot),
-                    weight_pointers + prefetch * _GL_BLOCK_K,
-                    mask=prefetch < k_tiles,
-                )
-                async_copy.commit_group()
-                values = input_stages.index(current).load(input_layout)
-                weight = weight_stages.index(current).permute([1, 0]).load(weight_layout)
-                accumulator = mma_v2(values, weight, accumulator)
-    async_copy.wait_group(0)
-    return accumulator
+    # Rows are in bounds and K64 slices are whole, so copies need no row or column masks.
+    return _accumulate_tiles(
+        input_pointers,
+        weight_pointers,
+        None,
+        None,
+        features,
+        input_features,
+        input_features // _GL_BLOCK_K,
+        accumulator,
+        _GL_BLOCK_K,
+        _GL_NUM_STAGES,
+        gl.DotOperandLayout(0, mma_layout, k_width=4),
+        gl.DotOperandLayout(1, mma_layout, k_width=4),
+        False,
+    )
 
 
 @gluon.jit

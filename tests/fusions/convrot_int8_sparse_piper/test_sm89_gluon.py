@@ -17,7 +17,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import _compile, _kernels
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import gluon, sm89
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import gluon_async_copy, sm89
 
 _SM89 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9)
 
@@ -146,7 +146,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
     monkeypatch, operation, head_dim, input_features, rotary_dim, supported
 ):
     gluon_launch, triton_launch = Mock(), Mock()
-    monkeypatch.setattr(gluon, f"project_{operation}", gluon_launch)
+    monkeypatch.setattr(gluon_async_copy, f"project_{operation}", gluon_launch)
     monkeypatch.setattr(projection, f"project_{operation}", triton_launch)
     with FakeTensorMode():
         operands = _operands(
@@ -168,7 +168,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
 
 def test_compiler_cache_keys_include_the_sm89_projection_kernels():
     assert sm89.__file__ in _compile._source_files()
-    assert gluon.__file__ in _compile._source_files()
+    assert gluon_async_copy.__file__ in _compile._source_files()
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
@@ -176,13 +176,13 @@ def test_compiler_cache_keys_include_the_sm89_projection_kernels():
 def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(
     monkeypatch, operation, with_block_lengths
 ):
-    function = getattr(gluon, f"_{operation}_kernel")
+    function = getattr(gluon_async_copy, f"_{operation}_kernel")
     kernel = MagicMock()
-    monkeypatch.setattr(gluon, function.__name__, kernel)
+    monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
     mean_kernel = MagicMock()
     monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(gluon, "device_context", guard)
+    monkeypatch.setattr(gluon_async_copy, "device_context", guard)
     sequence, window = 448, (64, 300)
     rows = window[1] if operation == "query" else sequence
     storage = padded_sequence_length(rows)
@@ -194,7 +194,9 @@ def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(
             else None
         )
         out = _outputs(operation, "cuda:1", storage=storage)
-        _launch(gluon, operation, operands, out, block_lengths=block_lengths, window=window)
+        _launch(
+            gluon_async_copy, operation, operands, out, block_lengths=block_lengths, window=window
+        )
 
     guard.assert_called_once_with(torch.device("cuda:1"))
     # Heads vary fastest, then 128-row blocks, then the batch.
@@ -236,7 +238,7 @@ _POINTER_TYPES = {
     "variant", ["full_tiles", "masked_tail", "mean_routing", "block_lengths", "bias_without_norm"]
 )
 def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
-    function = getattr(gluon, f"_{operation}_kernel")
+    function = getattr(gluon_async_copy, f"_{operation}_kernel")
     constants = {
         "input_features": 256,
         "heads": 3,
@@ -347,6 +349,6 @@ def test_sm89_gluon_projections_match_the_triton_launchers(operation, case):
     actual = _outputs(operation, "cuda", **allocation)
 
     _launch(projection, operation, operands, expected, config=sm89._CONFIG, **options)
-    _launch(gluon, operation, operands, actual, **options)
+    _launch(gluon_async_copy, operation, operands, actual, **options)
 
     _assert_matches(actual, expected)

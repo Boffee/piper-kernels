@@ -9,6 +9,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - H3 ConvRot INT8 sparse-attention fusion benchmarks can sweep query-window sizes through
   150,000 tokens, checking the emitted fusion, complete outputs, latency, and peak allocation.
+  By default they measure each target's production window.
 - Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
@@ -18,13 +19,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   convolutions take 49.6 ms (reference 721 ms, cuDNN FP16 182 ms), bitwise equal to SM120 tiles.
 - ConvRot INT8 sparse-Piper fusion (`convrot_int8_sparse_piper_compile_options`) on NVIDIA
   SM89, matching the native SM89 sparse Piper attention. D128 heads use Gluon Q/K/V
-  projections that apply RMSNorm, RoPE, and the signed Hadamard in registers. On an RTX 4070
-  Ti SUPER they reach 265-275 TOPS for Q and K and 270-295 TOPS for V at 2K-100K tokens,
-  1.27-1.33x the shared Triton kernels, within one INT8 code of them; other shapes use the
-  Triton kernels with SM89 tiles. The compiled H3 attention block (Q/K/V projections, 25%-keep
-  routing and attention, and the output projection) needs 28-58% less peak memory at 8K-100K
-  tokens and runs 1.7-2.5x faster than without the fusion, or 1.05-1.23x with the SM8x ConvRot
-  INT8 GEMM policy. SM120's compiled kernels are unchanged.
+  projections that share the SM8x ConvRot INT8 GEMM's pipeline and apply RMSNorm, RoPE, and
+  the signed Hadamard in registers. On an RTX 4070 Ti SUPER they reach 265-275 TOPS for Q and
+  K and 270-295 TOPS for V at 2K-100K tokens, 1.27-1.33x the shared Triton kernels, within one
+  INT8 code of them; other shapes use the Triton kernels with SM89 tiles. SM89 splits the
+  fused attention output into 8,192-row query windows, 0.9-3.0% faster than the shared 4,096
+  rows for up to 238 MiB more workspace. The compiled H3 attention block (Q/K/V projections,
+  25%-keep routing and attention, and the output projection) runs 1.05-1.24x faster than
+  without the fusion at 8K-100K tokens and needs 28-58% less peak memory. SM120's compiled
+  kernels are unchanged.
 
 ### Changed
 
