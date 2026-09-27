@@ -8,7 +8,7 @@ import triton.language as tl
 
 
 @triton.jit
-def scaled_int8_matmul(
+def _row_scaled_int8_matmul(
     input_ptr,
     weight_ptr,
     input_scale_ptr,
@@ -23,14 +23,7 @@ def scaled_int8_matmul(
     block_k: tl.constexpr,
     aligned_tiles: tl.constexpr,
 ):
-    """Return one FP32 ConvRot projection tile before its output epilogue.
-
-    Inputs are the prepared rowwise-INT8 activation and the rotated rowwise-INT8
-    weight. Their FP32 scales are applied after the exact INT32 dot product. The
-    caller owns bias handling, logical-dtype rounding, and the final store so the
-    same projection can feed either the ordinary linear epilogue or a fused
-    attention epilogue.
-    """
+    """Return the exact INT32 tile product scaled by input rows, and the weight scales."""
     offsets_k = tl.arange(0, block_k)
     offsets_m_i64 = offsets_m.to(tl.int64)
     offsets_n_i64 = offsets_n.to(tl.int64)
@@ -73,7 +66,58 @@ def scaled_int8_matmul(
             mask=offsets_n < n,
             other=0.0,
         )
-    return accumulator.to(tl.float32) * input_scale[:, None] * weight_scale[None, :]
+    return accumulator.to(tl.float32) * input_scale[:, None], weight_scale
+
+
+@triton.jit
+def scaled_int8_matmul(
+    input_ptr,
+    weight_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    offsets_m,
+    offsets_n,
+    m,
+    n,
+    k,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    aligned_tiles: tl.constexpr,
+):
+    """Return one FP32 ConvRot projection tile before its output epilogue.
+
+    Inputs are the prepared rowwise-INT8 activation and the rotated rowwise-INT8
+    weight. Their FP32 scales are applied after the exact INT32 dot product. The
+    caller owns bias handling, logical-dtype rounding, and the final store so the
+    same projection can feed either the ordinary linear epilogue or a fused
+    attention epilogue.
+    """
+    row_scaled, weight_scale = _row_scaled_int8_matmul(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        offsets_m,
+        offsets_n,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        aligned_tiles,
+    )
+    return row_scaled * weight_scale[None, :]
+
+
+@triton.jit
+def _add_bias(result, row_scaled, weight_scale, bias, explicit_bias_fma: tl.constexpr):
+    if explicit_bias_fma:
+        # Per-tile branches can let the compiler sink an identical bias add below the
+        # branch, away from its scale multiply, which would round twice.
+        return tl.fma(row_scaled, weight_scale[None, :], bias.to(tl.float32)[None, :])
+    return result + bias[None, :]
 
 
 @triton.jit
@@ -97,9 +141,10 @@ def _int8_matmul_with_bias(
     paired: tl.constexpr,
     second_has_bias: tl.constexpr,
     aligned_tiles: tl.constexpr,
+    explicit_bias_fma: tl.constexpr,
 ):
     # Keep scaling and bias together in each branch to preserve FMA rounding.
-    result = scaled_int8_matmul(
+    row_scaled, weight_scale = _row_scaled_int8_matmul(
         input_ptr,
         weight_ptr,
         input_scale_ptr,
@@ -114,6 +159,7 @@ def _int8_matmul_with_bias(
         block_k,
         aligned_tiles,
     )
+    result = row_scaled * weight_scale[None, :]
     if paired and (has_bias or second_has_bias):
         # Select FP32 values rather than pointers: biases may have different dtypes.
         bias = tl.full((block_n,), 0, tl.float32)
@@ -126,13 +172,14 @@ def _int8_matmul_with_bias(
             second_bias = tl.load(
                 second_bias_ptr + offsets_n, (offsets_n < n) & second, other=0.0
             ).to(tl.float32)
-        result += tl.where(second, second_bias, bias)[None, :]
+        bias = tl.where(second, second_bias, bias)
+        result = _add_bias(result, row_scaled, weight_scale, bias, explicit_bias_fma)
     elif has_bias:
         if aligned_tiles:
             bias = tl.load(bias_ptr + offsets_n)
         else:
             bias = tl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0)
-        result += bias[None, :]
+        result = _add_bias(result, row_scaled, weight_scale, bias, explicit_bias_fma)
 
     return result
 
@@ -161,6 +208,8 @@ def int8_matmul_kernel(
     aligned_m: tl.constexpr,
     aligned_nk: tl.constexpr,
     group_m: tl.constexpr,
+    explicit_bias_fma: tl.constexpr,
+    per_tile_tail: tl.constexpr,
 ):
     if group_m:
         pid = tl.program_id(0)
@@ -200,7 +249,7 @@ def int8_matmul_kernel(
     # Large tiles share one launch. With aligned N/K, complete M tiles take an
     # unmasked branch around the entire projection. Other widths use the masked
     # loop in the same launch; branching for those widths can regress performance.
-    if group_m and aligned_nk:
+    if per_tile_tail and aligned_nk:
         tile_aligned = aligned_m or (pid_m + 1) * block_m <= m
     else:
         tile_aligned = aligned_m and aligned_nk
@@ -214,6 +263,7 @@ def int8_matmul_kernel(
             paired,
             second_has_bias,
             True,
+            explicit_bias_fma,
         )
     else:
         result = _int8_matmul_with_bias(
@@ -225,6 +275,7 @@ def int8_matmul_kernel(
             paired,
             second_has_bias,
             False,
+            explicit_bias_fma,
         )
     output_pointers = (
         output_ptr

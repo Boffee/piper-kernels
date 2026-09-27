@@ -1,56 +1,58 @@
-"""Support and measured launch policy for the NVIDIA ConvRot INT8 implementation.
+"""Measured NVIDIA ConvRot INT8 preparation and GEMM schedules.
 
-These schedules are measured on SM120 and retain the existing defaults on other
-supported NVIDIA targets. Hardware support does not imply per-target tuning.
+SM120 and SM8x select GEMM schedules independently of preparation. SM8x thresholds
+are measured on SM89; other supported NVIDIA targets retain the baseline schedule.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
-from .._plan import LinearExecutionPlan
+from ._plan import MatmulSchedule, NvidiaExecutionPlan
 
-_FUSED_NUM_WARPS_VALUES = (2, 4, 8, 16)
-_ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
-_QUANTIZATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
-_MATMUL_BLOCK_M_VALUES = (16, 32, 64, 128)
-_MATMUL_BLOCK_N_VALUES = (16, 32, 64, 128, 256)
-_MATMUL_BLOCK_K_VALUES = (32, 64, 128)
-_MATMUL_NUM_WARPS_VALUES = (2, 4, 8)
-_MATMUL_NUM_STAGES_VALUES = (1, 2, 3, 4)
+# Measured crossovers in useful tiles, not exact model shapes or sequence lengths.
+_SM120_SMALL_MAX_TILES = 128
+_SM120_LARGE_MIN_TILES = 72
+_SM8X_SMALL_MAX_TILES = 96
+_SM8X_LARGE_MIN_TILES = 64
+_SM8X_GLUON_MIN_TILES = 48
 
-
-@dataclass(frozen=True, slots=True)
-class NvidiaExecutionPlan(LinearExecutionPlan):
-    """Launch choices accepted by the existing NVIDIA kernels and tuner."""
-
-    def __post_init__(self) -> None:
-        LinearExecutionPlan.__post_init__(self)
-        if self.fused_num_warps not in _FUSED_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot fused preparation num_warps must be 2, 4, 8, or 16")
-        if self.rotation_num_warps not in _ROTATION_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot split rotation num_warps must be 1, 2, 4, or 8")
-        if self.quantization_num_warps not in _QUANTIZATION_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot split quantization num_warps must be 1, 2, 4, or 8")
-        if self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
-            raise ValueError("ConvRot matmul block_m must be 16, 32, 64, or 128")
-        if self.matmul_block_n not in _MATMUL_BLOCK_N_VALUES:
-            raise ValueError("ConvRot matmul block_n must be 16, 32, 64, 128, or 256")
-        if self.matmul_block_k not in _MATMUL_BLOCK_K_VALUES:
-            raise ValueError("ConvRot matmul block_k must be 32, 64, or 128")
-        if self.matmul_num_warps not in _MATMUL_NUM_WARPS_VALUES:
-            raise ValueError("ConvRot matmul num_warps must be 2, 4, or 8")
-        if self.matmul_num_stages not in _MATMUL_NUM_STAGES_VALUES:
-            raise ValueError("ConvRot matmul num_stages must be 1, 2, 3, or 4")
-
-
-_FUSED_MAX_CHUNK_SIZE = 16_384
-_TWO_WARP_MAX_CHUNK_SIZE = 2_048
-_DEFAULT_ROTATION_NUM_WARPS = 4
-_DEFAULT_QUANTIZATION_NUM_WARPS = 8
-_SM120_SMALL_TILE_LIMIT = 128
-_SM120_LARGE_TILE_THRESHOLD = 72
+# Complete schedules: M, N, K, warps, stages, grouping, and implementation options.
+_BASE_MATMUL = MatmulSchedule(128, 256, 128, 8, 3, 16)
+_SM120_SMALL = MatmulSchedule(32, 64, 128, 8, 4, 0)
+_SM120_MEDIUM = MatmulSchedule(64, 64, 128, 4, 3, 0)
+_SM8X_SMALL = MatmulSchedule(
+    16, 64, 128, 4, 4, 0, triton_specialize_m=False, triton_explicit_bias_fma=True
+)
+_SM8X_MEDIUM = MatmulSchedule(
+    64, 64, 128, 4, 4, 0, triton_specialize_m=False, triton_explicit_bias_fma=True
+)
+_GROUPED_TRITON = MatmulSchedule(
+    128, 64, 128, 4, 3, 16, triton_specialize_m=False, triton_explicit_bias_fma=True
+)
+_SM8X_GLUON_MEDIUM = MatmulSchedule(
+    128,
+    128,
+    64,
+    4,
+    3,
+    8,
+    "gluon_async_copy",
+    triton_specialize_m=False,
+    triton_explicit_bias_fma=True,
+)
+_SM8X_GLUON_LARGE = MatmulSchedule(
+    256,
+    128,
+    64,
+    8,
+    4,
+    8,
+    "gluon_async_copy",
+    triton_specialize_m=False,
+    triton_explicit_bias_fma=True,
+)
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -63,50 +65,81 @@ def supports_preparation_target(target: AcceleratorTarget) -> bool:
     return target.is_nvidia_cuda
 
 
-def _base_execution_plan(*, in_features: int) -> NvidiaExecutionPlan:
-    """Build shared NVIDIA preparation and fixed GEMM defaults."""
+def _preparation_schedule(in_features: int, *, sm8x: bool) -> tuple[bool, int]:
+    """Select fusion and warp count without consulting rows or output width."""
     fused_chunks = fused_preparation_chunks(in_features)
     fused_num_warps = 4
-    if fused_chunks is not None:
+    if sm8x and in_features <= 1024:
+        # One warp holds a short row in registers without cross-warp reductions.
+        fused_num_warps = 1
+    elif fused_chunks is not None:
         chunk_count, chunk_size = fused_chunks
-        if chunk_count > 1 and chunk_size <= _TWO_WARP_MAX_CHUNK_SIZE:
+        if chunk_count > 1 and chunk_size <= 2048:
             fused_num_warps = 2
-        elif chunk_size == _FUSED_MAX_CHUNK_SIZE:
+        elif chunk_size == 16384:
             fused_num_warps = 8
+    return fused_chunks is not None, fused_num_warps
+
+
+def _sm120_matmul_schedule(rows: int | None, out_features: int | None) -> MatmulSchedule:
+    """Select one of three measured tiles using useful work and available parallelism."""
+    if not rows or not out_features:
+        return _BASE_MATMUL
+    small_tiles = ((rows + 31) // 32) * ((out_features + 63) // 64)
+    if rows <= 32 or small_tiles <= _SM120_SMALL_MAX_TILES:
+        return _SM120_SMALL
+    large_columns = (out_features + 255) // 256
+    # A one-row tail is not a full tile; wide tiles cannot reuse a single 64-column tile.
+    if out_features <= 64 or rows * large_columns < 128 * _SM120_LARGE_MIN_TILES:
+        return _SM120_MEDIUM
+    return _BASE_MATMUL
+
+
+def _sm8x_matmul_schedule(rows: int | None, out_features: int | None) -> MatmulSchedule:
+    """Select Triton for short/narrow work and Gluon when enough wide tiles are useful.
+
+    Each output width uses at most three schedules as rows increase. All SM8x
+    schedules use dynamic M, bounding the number of compiled GEMMs per layer.
+    """
+    if not rows or not out_features:
+        return _SM8X_GLUON_LARGE
+    column_tiles = (out_features + 63) // 64
+    small_tiles = ((rows + 15) // 16) * column_tiles
+    if rows <= 16 or small_tiles <= _SM8X_SMALL_MAX_TILES:
+        return _SM8X_SMALL
+    if out_features > 128:
+        # Up to 1024 columns, 256-row tiles leave too few CTAs; use 128-row tiles.
+        gluon = _SM8X_GLUON_MEDIUM if out_features <= 1024 else _SM8X_GLUON_LARGE
+        wide_columns = (out_features + 127) // 128
+        if rows >= 256 and rows * wide_columns >= gluon.matmul_block_m * _SM8X_GLUON_MIN_TILES:
+            return gluon
+    elif rows * column_tiles >= 128 * _SM8X_LARGE_MIN_TILES:
+        return _GROUPED_TRITON
+    return _SM8X_MEDIUM
+
+
+def _execution_plan(
+    in_features: int, matmul: MatmulSchedule, *, sm8x: bool = False
+) -> NvidiaExecutionPlan:
+    """Combine independently selected preparation and GEMM choices once."""
+    fused, fused_num_warps = _preparation_schedule(in_features, sm8x=sm8x)
     return NvidiaExecutionPlan(
-        # Prepared inputs may feed weights with different output widths.
-        # Keep every preparation choice independent of output width.
-        fuse_rotation_quantization=fused_chunks is not None,
+        fuse_rotation_quantization=fused,
         fused_num_warps=fused_num_warps,
-        rotation_num_warps=_DEFAULT_ROTATION_NUM_WARPS,
-        quantization_num_warps=_DEFAULT_QUANTIZATION_NUM_WARPS,
-        matmul_block_m=128,
-        matmul_block_n=256,
-        matmul_block_k=128,
-        matmul_num_warps=8,
-        matmul_num_stages=3,
+        rotation_num_warps=4,
+        quantization_num_warps=8,
+        **matmul._asdict(),
     )
 
 
-def _sm120_execution_plan(
-    *,
-    in_features: int,
-    rows: int | None,
-    out_features: int | None,
-) -> NvidiaExecutionPlan:
-    """Apply measured SM120 policy to the full base plan."""
-    plan = _base_execution_plan(in_features=in_features)
-    if not rows or not out_features:
-        return plan
-    small_tiles = ((rows + 31) // 32) * ((out_features + 63) // 64)
-    if rows <= 32 or small_tiles <= _SM120_SMALL_TILE_LIMIT:
-        return replace(plan, matmul_block_m=32, matmul_block_n=64, matmul_num_stages=4)
-    large_columns = (out_features + 255) // 256
-    # Count useful 128-row tiles so a one-row tail is not a full tile.
-    # When N fits one 64-column tile, wider tiles add no input reuse.
-    if out_features <= 64 or rows * large_columns < 128 * _SM120_LARGE_TILE_THRESHOLD:
-        return replace(plan, matmul_block_m=64, matmul_block_n=64, matmul_num_warps=4)
-    return plan
+def baseline_execution_plan(*, in_features: int) -> NvidiaExecutionPlan:
+    """Build the historical fixed schedule for explicit benchmark comparisons."""
+    return _execution_plan(in_features, _BASE_MATMUL)
+
+
+def grouped_triton_plan(plan: NvidiaExecutionPlan) -> NvidiaExecutionPlan:
+    """Keep preparation while selecting the rounding-compatible alignment fallback."""
+    return replace(plan, **_GROUPED_TRITON._asdict())
 
 
 def select_execution_plan(
@@ -116,9 +149,14 @@ def select_execution_plan(
     rows: int | None = None,
     out_features: int | None = None,
 ) -> NvidiaExecutionPlan:
-    """Dispatch full architecture policies, retaining the base plan for other targets."""
+    """Select preparation and a concrete GEMM schedule, then build one execution plan."""
     if not supports_target(target):
         raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
-    if target.is_architecture("sm120"):
-        return _sm120_execution_plan(in_features=in_features, rows=rows, out_features=out_features)
-    return _base_execution_plan(in_features=in_features)
+    sm8x = target.is_cuda_capability(8)
+    if sm8x:
+        matmul = _sm8x_matmul_schedule(rows, out_features)
+    elif target.is_architecture("sm120"):
+        matmul = _sm120_matmul_schedule(rows, out_features)
+    else:
+        matmul = _BASE_MATMUL
+    return _execution_plan(in_features, matmul, sm8x=sm8x)

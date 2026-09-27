@@ -204,11 +204,18 @@ always has shape `[..., out_features]`.
 `activation_fn="swiglu"` computes `up * silu(gate)` from `[up | gate]`. Portable paths use
 PyTorch operations; optimized NVIDIA preparation uses shared Triton activation primitives and
 native approximate tanh, so GELU preparation may differ from the portable path by one INT8 code
-rather than being bitwise identical. NVIDIA preparation uses up to three equal
+rather than being bitwise identical. SM8x prepares rows of at most 1,024 columns with one warp,
+so its GELU and SwiGLU codes may also differ from other NVIDIA targets by one INT8 code.
+NVIDIA preparation uses up to three equal
 power-of-two chunks of at most 16,384 columns, fusing rows through 49,152 columns across every
 supported ConvRot group size, logical dtype, row count, and NVIDIA target. This selection is
 measured on exact SM120 and optimistic on other targets. Larger rows materialize the activation
-and retain the same semantics. Both
+and retain the same semantics. NVIDIA GEMM tiles are chosen from the row count and output
+width by measured policies for exact SM120 and for SM8x (measured on SM89); other NVIDIA
+targets keep one fixed schedule. Wide SM8x projections use a Gluon GEMM with CUTLASS-style
+64x64 warp tiles, and an SM8x layer compiles at most three GEMMs as its row count changes.
+Tile and kernel selection do not change output bits; see the
+[ConvRot INT8 benchmark notes](benchmarks/README.md#convrot-int8). Both
 `F.linear` with a ConvRot INT8 weight and the explicit INT8 entry point are inference-only and
 reject autograd inputs.
 

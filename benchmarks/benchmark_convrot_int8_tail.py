@@ -22,7 +22,8 @@ from lib.convrot_int8_legacy import legacy_matmul
 from lib.environment import capture_environment
 from triton.testing import do_bench_cudagraph
 
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
+from piper_kernels.linear.convrot.int8._nvidia import policy
 
 
 def _positive_int(value: str) -> int:
@@ -70,9 +71,8 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
     split_out = torch.empty(m, n, device=value.device, dtype=value.dtype)
     single_out = torch.empty_like(split_out)
     branch_out = torch.empty_like(split_out)
-    plan = nvidia.default_execution_plan(qdata)
-    if (plan.matmul_block_m, plan.matmul_block_n, plan.matmul_block_k) != (128, 256, 128):
-        raise AssertionError("this experiment requires the production large-tile plan")
+    # Every provider keeps the fixed 128x256 tile, which SM8x no longer selects by default.
+    plan = policy.baseline_execution_plan(in_features=k)
 
     def split_gemm() -> torch.Tensor:
         return legacy_matmul(prepared, qdata, scale, split_out, plan)

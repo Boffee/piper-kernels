@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 from dataclasses import replace
 from itertools import product
@@ -41,6 +42,7 @@ from lib.tuning import (
     validate_tuning_candidate_count,
 )
 
+from piper_kernels.linear.convrot.int8._nvidia import _plan as convrot_int8_plan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
@@ -136,6 +138,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=(1, 2, 3, 4),
         nargs="+",
     )
+    parser.add_argument(
+        "--matmul-kernel",
+        choices=convrot_int8_plan._MATMUL_KERNEL_VALUES,
+        nargs="+",
+        help="NVIDIA implementations to compare; omitted axes retain the production value",
+    )
+    parser.add_argument(
+        "--matmul-group-m",
+        type=int,
+        choices=convrot_int8_plan._MATMUL_GROUP_M_VALUES,
+        nargs="+",
+        help="NVIDIA GEMM row-tile grouping; zero disables grouping",
+    )
     add_tuning_arguments(parser)
     return parser.parse_args(argv)
 
@@ -175,43 +190,40 @@ def _candidate_plans(
         args.quantization_num_warps if not fusion_axis[0] else None,
         production_plan.quantization_num_warps,
     )
-    axes = (
-        fusion_axis,
-        fused_warps_axis,
-        rotation_warps_axis,
-        quantization_warps_axis,
-        tuning_axis(args.matmul_block_m, production_plan.matmul_block_m),
-        tuning_axis(args.matmul_block_n, production_plan.matmul_block_n),
-        tuning_axis(args.matmul_block_k, production_plan.matmul_block_k),
-        tuning_axis(args.matmul_num_warps, production_plan.matmul_num_warps),
-        tuning_axis(args.matmul_num_stages, production_plan.matmul_num_stages),
-    )
-    validate_tuning_candidate_count(axes, args.max_candidates)
-    return tuple(
-        replace(
-            production_plan,
-            fuse_rotation_quantization=fuse_rotation_quantization,
-            fused_num_warps=fused_num_warps,
-            rotation_num_warps=rotation_num_warps,
-            quantization_num_warps=quantization_num_warps,
-            matmul_block_m=block_m,
-            matmul_block_n=block_n,
-            matmul_block_k=block_k,
-            matmul_num_warps=num_warps,
-            matmul_num_stages=num_stages,
+    axes = {
+        "fuse_rotation_quantization": fusion_axis,
+        "fused_num_warps": fused_warps_axis,
+        "rotation_num_warps": rotation_warps_axis,
+        "quantization_num_warps": quantization_warps_axis,
+        "matmul_block_m": tuning_axis(args.matmul_block_m, production_plan.matmul_block_m),
+        "matmul_block_n": tuning_axis(args.matmul_block_n, production_plan.matmul_block_n),
+        "matmul_block_k": tuning_axis(args.matmul_block_k, production_plan.matmul_block_k),
+        "matmul_num_warps": tuning_axis(args.matmul_num_warps, production_plan.matmul_num_warps),
+        "matmul_num_stages": tuning_axis(args.matmul_num_stages, production_plan.matmul_num_stages),
+    }
+    if isinstance(production_plan, convrot_int8_plan.NvidiaExecutionPlan):
+        axes.update(
+            matmul_kernel=tuning_axis(args.matmul_kernel, production_plan.matmul_kernel),
+            matmul_group_m=tuning_axis(args.matmul_group_m, production_plan.matmul_group_m),
         )
-        for (
-            fuse_rotation_quantization,
-            fused_num_warps,
-            rotation_num_warps,
-            quantization_num_warps,
-            block_m,
-            block_n,
-            block_k,
-            num_warps,
-            num_stages,
-        ) in product(*axes)
-    )
+    elif args.matmul_kernel is not None or args.matmul_group_m is not None:
+        raise SystemExit("--matmul-kernel and --matmul-group-m require an NVIDIA execution plan")
+    validate_tuning_candidate_count(tuple(axes.values()), args.max_candidates)
+    plans = []
+    skipped: dict[str, int] = {}
+    for values in product(*axes.values()):
+        try:
+            plan = replace(production_plan, **dict(zip(axes, values, strict=True)))
+        except ValueError as error:
+            reason = str(error)
+            skipped[reason] = skipped.get(reason, 0) + 1
+        else:
+            plans.append(plan)
+    for reason, count in skipped.items():
+        print(f"Skipped {count} unsupported candidate(s): {reason}", file=sys.stderr)
+    if not plans:
+        raise SystemExit("no supported execution plans in the requested search")
+    return tuple(plans)
 
 
 def _plan_name(plan: LinearExecutionPlan) -> str:
@@ -220,8 +232,13 @@ def _plan_name(plan: LinearExecutionPlan) -> str:
         if plan.fuse_rotation_quantization
         else (f"split-rw{plan.rotation_num_warps}-qw{plan.quantization_num_warps}")
     )
+    implementation = (
+        f"{plan.matmul_kernel}-g{plan.matmul_group_m}-"
+        if isinstance(plan, convrot_int8_plan.NvidiaExecutionPlan)
+        else ""
+    )
     return (
-        f"{preparation}-"
+        f"{preparation}-{implementation}"
         f"m{plan.matmul_block_m}-n{plan.matmul_block_n}-k{plan.matmul_block_k}-"
         f"w{plan.matmul_num_warps}-s{plan.matmul_num_stages}"
     )

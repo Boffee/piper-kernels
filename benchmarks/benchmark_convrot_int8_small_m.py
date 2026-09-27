@@ -20,7 +20,9 @@ import torch
 from lib.environment import capture_environment
 from triton.testing import do_bench_cudagraph
 
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
+from piper_kernels.linear.convrot.int8._nvidia import policy
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
@@ -32,6 +34,36 @@ SHAPES = (
     (1024, 3072, ("gate", "up")),
     (3072, 1024, ("down",)),
 )
+
+# Forced configurations for --compare-schedules, per production policy family.
+_SM120_SMALL_TILE = {
+    "matmul_kernel": "triton",
+    "matmul_group_m": 0,
+    "matmul_block_m": 32,
+    "matmul_block_n": 64,
+    "matmul_block_k": 128,
+    "matmul_num_warps": 8,
+    "matmul_num_stages": 4,
+}
+_SM120_MEDIUM_TILE = {
+    "matmul_kernel": "triton",
+    "matmul_group_m": 0,
+    "matmul_block_m": 64,
+    "matmul_block_n": 64,
+    "matmul_block_k": 128,
+    "matmul_num_warps": 4,
+    "matmul_num_stages": 3,
+}
+_SM8X_SMALL_TILE = {
+    "matmul_kernel": "triton",
+    "matmul_block_m": 16,
+    "matmul_block_n": 64,
+    "matmul_block_k": 128,
+    "matmul_num_warps": 4,
+    "matmul_num_stages": 4,
+    "matmul_group_m": 0,
+}
+_SM8X_MEDIUM_TILE = _SM8X_SMALL_TILE | {"matmul_block_m": 64}
 
 
 def _positive_int(value: str) -> int:
@@ -123,29 +155,14 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
     output = torch.empty(m, n * (2 if args.paired else 1), device=value.device, dtype=value.dtype)
     selected = nvidia.default_execution_plan(qdata, rows=m)
     production = selected
+    # The original plan on every target: shared preparation and fixed 128x256 tiles.
+    previous = policy.baseline_execution_plan(in_features=k)
+    small_tile, medium_tile = _SM120_SMALL_TILE, _SM120_MEDIUM_TILE
+    if AcceleratorTarget.from_device(qdata.device).is_cuda_capability(8):
+        small_tile, medium_tile = _SM8X_SMALL_TILE, _SM8X_MEDIUM_TILE
     if args.compare_schedules:
-        production = replace(
-            production,
-            matmul_block_m=32,
-            matmul_block_n=64,
-            matmul_block_k=128,
-            matmul_num_warps=8,
-            matmul_num_stages=4,
-        )
-    previous = replace(
-        production,
-        matmul_block_m=128,
-        matmul_block_n=256,
-        matmul_block_k=128,
-        matmul_num_warps=8,
-        matmul_num_stages=3,
-    )
-    medium = replace(
-        previous,
-        matmul_block_m=64,
-        matmul_block_n=64,
-        matmul_num_warps=4,
-    )
+        production = replace(selected, **small_tile)
+    medium = replace(selected, **medium_tile)
 
     def with_plan(plan: LinearExecutionPlan) -> torch.Tensor:
         if second_projection is None:

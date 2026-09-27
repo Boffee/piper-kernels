@@ -507,10 +507,10 @@ Paired gate/up projections still share one GEMM launch; their combined width doe
 change the tile choice.
 
 These fixed heuristics were measured on an RTX 5090. Performance on other SM120 devices
-has not been established. Other architectures retain their existing schedules. Selection uses
-no device-property query, runtime autotuning, or model-specific table. M/N/K remain runtime
-values; alignment, dtype, bias, and paired operation can still create compiled variants of
-each configuration.
+has not been established. SM8x uses its own policy, described below; other architectures
+retain their existing schedules. Selection uses no device-property query, runtime autotuning,
+or model-specific table. M/N/K remain runtime values; alignment, dtype, bias, and paired
+operation can still create compiled variants of each configuration.
 
 Compare the full ConvRot operator with fixed large tiles and BF16 cuBLAS using CUDA graphs:
 
@@ -566,6 +566,173 @@ Earlier paired measurements used projection count in selection. The full-FFN abl
 factor: it improved some short FFNs but regressed the tested K5120/N25600 FFN at M64 by
 about 15%. Ordinary single-projection selection is unchanged.
 
+SM8x (SM80, SM86, SM87, SM89) uses its own five GEMM configurations, at most three per output
+width. The fixed 128x256 tile needs 255 registers with 176 spilled values and 96 KiB of shared
+memory on SM89, and reaches about 50 TOPS. Short and narrow projections use 64-column tiles of
+the shared Triton kernel. Wider projections use the NVIDIA async-copy Gluon GEMM,
+`linear/convrot/int8/_nvidia/gluon_async_copy.py`:
+
+| Configuration | Kernel | BLOCK_M | BLOCK_N | BLOCK_K | Warps | Stages | GROUP_M |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Small | Triton | 16 | 64 | 128 | 4 | 4 | none |
+| Medium | Triton | 64 | 64 | 128 | 4 | 4 | none |
+| Large | Triton | 128 | 64 | 128 | 4 | 3 | 16 |
+| Gluon medium | Gluon | 128 | 128 | 64 | 4 | 3 | 8 |
+| Gluon large | Gluon | 256 | 128 | 64 | 8 | 4 | 8 |
+
+Apply these rules in order:
+
+1. Use small tiles when `M <= 16` or `ceil(M/16) * ceil(N/64) <= 96`.
+2. When `128 < N <= 1024`, use Gluon medium tiles when `M >= 256` and
+   `M * ceil(N/128) >= 128 * 48`.
+3. When `N > 1024`, use Gluon large tiles when `M >= 256` and `M * ceil(N/128) >= 256 * 48`.
+4. When `N <= 128`, use Triton large tiles when `M * ceil(N/64) >= 128 * 64`.
+5. Otherwise use medium tiles.
+
+Without shape metadata the plan is the Gluon large tile. The counts use actual M, so a one-row
+tail is not a full tile. Selection is monotonic in M for fixed N, and K affects preparation but
+not tile selection. As M grows, each output width steps through small, medium, and one larger
+tile: Gluon large above 1,024 columns, Gluon medium for 129-1,024 columns, and Triton large up
+to 128 columns. SM8x launches do not specialize on M either: both GEMM kernels leave M out of
+their JIT keys, and the Triton tiles branch per tile at run time instead of compiling an
+`aligned_m` variant. A layer therefore compiles at most three GEMMs, plus one preparation
+kernel, as its row count changes. Across 26 row counts from 1 to 131073, an H3 layer compiled
+three GEMMs on SM8x and nine with the SM120 plan. Policy selects preparation independently
+from a complete GEMM schedule, then constructs one `NvidiaExecutionPlan` with explicit
+`matmul_kernel` and `matmul_group_m` fields. `triton_specialize_m` and
+`triton_explicit_bias_fma` configure the Triton implementation only. Benchmark metadata reports
+the effective `matmul_specialize_m` and `matmul_explicit_bias_fma` values; for Gluon these are
+always false and true, respectively, even when a candidate inherits SM120's Triton options.
+Replacing tile dimensions preserves the selected implementation;
+unsupported configurations fail plan validation. The async-copy implementation accepts
+128x128x64 tiles with four warps and 256x128x64 tiles with eight warps.
+The launcher falls back to the grouped Triton tile when an INT8 input or weight row is not
+16-byte aligned, which the Gluon copies require; that tile then takes the Gluon tile's place
+among the three.
+
+The Gluon GEMM follows the CUTLASS SM80 INT8 schedule that cuBLAS selects on this GPU
+(`256x128_64x3`): 16-byte `cp.async` copies into swizzled shared memory, `ldmatrix` operands,
+and m16n8k32 INT8 MMAs with 64x64 warp tiles, one CTA of eight warps per SM. Each pipeline
+stage has its own shared-memory allocation and the K loop is unrolled by the stage count. With
+static stage indices, Gluon's barrier analysis can see that the stage being refilled differs
+from the one being read, so each K tile needs one barrier instead of two. That raised the GEMM
+from about 290 to 303 TOPS on four large shapes. Interior tiles whose K tiles are whole skip
+per-element copy masks, which keeps the unrolled loop within 255 registers without spills. Edge
+tiles zero-fill rows and K columns. The epilogue matches the SM8x Triton tiles bitwise: exact
+INT32 accumulation, then `(acc * input_scale) * weight_scale` with bias added through explicit
+FMAs. Sustained GEMM-only throughput at H3 shapes was 297-310 TOPS, against 222-230 for the
+grouped Triton tile and 304-319 for cuBLAS `torch._int_mm`, which writes INT32 without the
+ConvRot epilogue.
+
+Preparation follows the shared NVIDIA plan with one SM8x exception. Rows of at most 1,024
+columns use one warp, which avoids cross-warp reductions. Plain inputs keep identical bits, but
+GELU and SwiGLU codes may differ from wider launches by one INT8 code, with scales within a few
+FP32 ulps. This is the same bound the optimized path already allows against the portable path.
+One warp cut 2-6% from the default seven-projection mix. The Triton large tile groups sixteen
+row blocks and the Gluon tiles eight. Without grouping, the 128x64 tile was up to 1.5x slower
+at `M=8192, K>=12288`, where the input does not fit in L2. Grouping is explicit in every NVIDIA
+plan, including SM120's production tiles and the H3 VAE's ungrouped 128x128 schedules.
+
+The async-copy kernel and one-warp preparation also run on SM120. GPU correctness tests force
+the SM8x schedules on either architecture; production SM120 selection remains unchanged.
+The [NVIDIA implementation layout](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md)
+separates policy, dispatch, and implementation launchers as sparse Piper attention does.
+For NVIDIA plans, the tuner accepts `--matmul-kernel triton gluon_async_copy` and
+`--matmul-group-m 0 8 16`; those two axes are rejected for AMD plans. Shared tile and warp
+axes retain CUDA/ROCm support, including 256-row tiles and AMD's 32-warp preparation.
+The tuner reports unsupported combinations to stderr, measures supported candidates, and
+errors clearly if none remain. For example, on SM80 or newer:
+
+```shell
+uv run python benchmarks/tune_convrot_int8_linear.py \
+  --matmul-kernel triton gluon_async_copy --matmul-group-m 0 8 \
+  --matmul-block-m 128 256 --matmul-block-n 128 --matmul-block-k 64 \
+  --matmul-num-warps 4 8 --matmul-num-stages 2 3 4
+```
+
+The Triton tiles were chosen from a 210-shape GEMM sweep on SM89 with 13 tiles, with and
+without grouping. The Gluon thresholds come from a second, 247-shape sweep. It crossed 13 row
+counts from 64 to 32768 with 19 K/N pairs: the projection mix, H3 transformer and VAE widths,
+anchors, and narrow outputs down to N=16. Against the fastest of the five configurations per
+shape, the policy averaged 1.047x (geometric mean) and 1.006x of total time. Stepping through
+both Gluon tiles at every width averaged 1.016x and 1.002x, but would compile a fourth GEMM per
+layer. Using only the large Gluon tile averaged 1.055x and 1.006x. Up to 1,024 columns, 256-row
+tiles leave SMs idle at a few thousand rows: whole N=1024 linears with 768-1024 rows ran 16-33%
+faster on the medium Gluon tile than on the medium Triton tile, and at most 7% slower than on
+the large Gluon tile from 2048 rows up. Wider outputs keep the large Gluon tile, which was 2-8%
+faster at 4096 rows and more; moving N=2048-3072 to the medium tile also slowed the H3 VAE's
+2048-column layers by 4-6%. The Triton-only policy averaged 1.15x and 1.27x. Gluon tiles need
+more than one 128-column tile, because narrow outputs are bound by input reads and the Triton
+tile's larger grid pulls more bandwidth. They also need at least 256 rows. Only SM89 was
+measured. SM80, SM86 and SM87 share the INT8 MMA path, and every configuration compiles for
+them within the 99 KiB per-block shared-memory limit of SM86/SM89, but their best thresholds
+may differ.
+
+Measure representative workloads in about three minutes:
+
+```shell
+uv run python benchmarks/benchmark_convrot_int8_realistic.py > convrot-realistic.jsonl
+```
+
+The cases follow MiniMax H3. Transformer blocks use hidden width 5376, 56x128 attention, and
+a tanh-GELU FFN of width 14336 at 8K, 32K, 131072, and 131073 rows. Q/K/V share one
+preparation, and GELU is fused into the down-projection preparation. The H3 VAE linears run
+at 1797 and 7188 rows. The short-M cases use the projection mix at M=1-1024 and H3 widths
+at M=1-512. The eight primary anchors are also included. Each case captures one CUDA graph
+per variant over preallocated buffers:
+
+- the production plan;
+- the original plan, with shared preparation and fixed 128x256 tiles;
+- BF16 cuBLAS, multiplying the same inputs without a separate GELU pass. This favors BF16
+  in the down projection.
+
+The graphs are replayed interleaved for three rounds in one process. Each sample lasts at least
+250 ms, or 1,000 calls for the shortest cases, after a 10 s warmup. Shorter bursts ran up to 7%
+above sustained, power-limited clocks. With these settings, the H3 block and VAE totals were
+within 1-2% of three-process Triton `do_bench_cudagraph` measurements. Those took about an hour
+for the same coverage. The benchmark checks production outputs bitwise against the original
+plan in row chunks. JSON lines include per-sample times and TOPS, and stderr prints the group
+table. Select rows with `--h3-rows`, `--vae-rows`, `--mix-rows`, `--h3-short-rows`, and
+`--anchor-rows`.
+
+RTX 4070 Ti SUPER (SM89, 66 SMs), Torch 2.14.0+cu130, Triton 3.8.0, driver 596.49, Windows,
+2026-09-26, BF16, no bias. Totals sum each group's linears, including preparation. Every
+output agreed bitwise with the original plan:
+
+| Group | Rows | SM8x policy (TOPS) | Original plan (TOPS) | BF16 cuBLAS (TFLOPS) | vs original | vs BF16 |
+|---|---:|---:|---:|---:|---:|---:|
+| H3 block | 8192 | 18.12 ms (279) | 99.79 ms (51) | 56.53 ms (89) | 5.51x | 3.12x |
+| H3 block | 32768 | 71.43 ms (283) | 393.11 ms (51) | 221.39 ms (91) | 5.50x | 3.10x |
+| H3 block | 131072 | 285.47 ms (283) | 1561.91 ms (52) | 881.94 ms (92) | 5.47x | 3.09x |
+| H3 block | 131073 | 286.62 ms (282) | 1550.10 ms (52) | 884.07 ms (91) | 5.41x | 3.08x |
+| H3 VAE | 1797 | 0.87 ms (226) | 4.40 ms (45) | 2.46 ms (80) | 5.09x | 2.84x |
+| H3 VAE | 7188 | 3.30 ms (238) | 16.24 ms (48) | 9.03 ms (87) | 4.93x | 2.74x |
+| Projection mix | 1 | 26.7 us | 577.8 us | 29.5 us | 21.66x | 1.11x |
+| Projection mix | 16 | 26.2 us (14) | 584.4 us (1) | 39.3 us (9) | 22.27x | 1.50x |
+| Projection mix | 128 | 43.4 us (68) | 602.6 us (5) | 69.4 us (43) | 13.89x | 1.60x |
+| Projection mix | 1024 | 137.4 us (172) | 773.8 us (31) | 281.5 us (84) | 5.63x | 2.05x |
+| H3 widths | 1 | 276.0 us | 1773.0 us | 600.3 us | 6.42x | 2.18x |
+| H3 widths | 64 | 307.7 us (80) | 1807.6 us (14) | 688.1 us (36) | 5.87x | 2.24x |
+| H3 widths | 512 | 921.6 us (214) | 4923.0 us (40) | 2456.4 us (80) | 5.34x | 2.67x |
+| Anchors | 8192 | 24.23 ms (284) | 134.19 ms (51) | 76.08 ms (90) | 5.54x | 3.14x |
+| Anchors | 32768 | 95.98 ms (286) | 532.82 ms (52) | 300.49 ms (91) | 5.55x | 3.13x |
+
+Single-row cases are bound by weight reads, so their throughput is omitted. At 131072 rows, the
+H3 stages ran at 295 TOPS for Q/K/V, 272 for the output projection, 291 for the FFN up
+projection, and 265 for the GELU-fused down projection. The original plan ran at 51-52 TOPS.
+The N=16384 anchors ran at 291-296 TOPS. The N=4096 anchors ran at 251-260 TOPS, because
+preparation takes a larger share of those calls. The projection mix at 1024 rows is bound by
+its small grids and by preparation, which takes about a fifth of its time; its layers ran at
+149-197 TOPS, and cuBLAS INT8 alone, without preparation or the epilogue, reached 187 TOPS on
+the mix. A four-step ladder with both Gluon tiles at every width, which compiles a fourth GEMM
+per layer, ran the whole benchmark within 0.1% of this policy. With Triton tiles only, the H3
+blocks ran at 220-221 TOPS, the VAE at 191-199, and the anchors at 223. Bias and paired
+projections with ragged M agreed bitwise.
+
+On SM8x, `benchmark_convrot_int8_small_m.py --compare-schedules` forces the SM8x small and
+medium configurations, and `previous_linear` is the original plan on every target. The local
+records are in `artifacts/convrot-sm8x-policy-20260925/`.
+
 Compare the original split-tail GEMM with a fully masked single launch and the production
 single launch, all using the fixed `128x256x128` tile configuration:
 
@@ -593,8 +760,13 @@ benchmark/correctness helper `lib/convrot_int8_legacy.py`.
 
 For aligned N/K, production branches around the entire projection: full M tiles use unmasked
 loads/stores and tail tiles use masks. Scaling and bias stay inside the branch to preserve
-floating-point rounding. Unaligned N/K uses the original masked loop in one launch. Neither
-NVIDIA nor AMD retains a separate tail launch; tail handling is independent of tile selection.
+floating-point rounding. Some grouped tile shapes, including 128x64 and 64x64, still let the
+compiler move an identical paired bias add below the branch, where it rounds separately from
+the scale multiply. SM8x launches therefore write bias adds as explicit FMAs. That path is
+selected explicitly by the SM8x policy; SM120 and AMD defaults are unchanged. Tail branching
+has its own kernel flag, independent of bias rounding. Unaligned N/K uses
+the original masked loop in one launch. Neither NVIDIA nor AMD retains a separate tail launch;
+tail handling is independent of tile selection.
 
 On the shared local GPU, first POST `{"id":"<unique-lease-id>"}` to
 `http://127.0.0.1:8080/piper/engine/register`, then `/piper/engine/acquire`; wait for acquire

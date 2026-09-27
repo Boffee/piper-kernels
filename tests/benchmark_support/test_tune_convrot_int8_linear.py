@@ -9,11 +9,11 @@ from tune_convrot_int8_linear import (
     _candidate_plans,
     _make_candidate,
     _parse_args,
+    _plan_name,
     _validate_args,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._nvidia import triton as convrot_int8_backend
 from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 
 
@@ -24,12 +24,18 @@ def _production_plan():
     )
 
 
-def _workload(*, rows: int = 2, out_features: int = 96, in_features: int = 512):
+def _workload(
+    *,
+    rows: int = 2,
+    out_features: int = 96,
+    in_features: int = 512,
+    target: AcceleratorTarget | None = None,
+):
     return make_convrot_int8_workload(
         ConvRotShape("custom", rows, out_features, in_features),
         ConvRotConfig(torch.bfloat16, 256, 0),
         device=torch.device("cpu"),
-        target=AcceleratorTarget("cuda", "sm120"),
+        target=target if target is not None else AcceleratorTarget("cuda", "sm120"),
     )
 
 
@@ -88,10 +94,72 @@ def test_amd_tuning_accepts_its_preparation_warp_count_and_preserves_backend_con
     (plan,) = _candidate_plans(arguments, workload.production_plan)
     assert plan.fused_num_warps == 32
     assert plan.matmul_block_k == 256
-    with pytest.raises(ValueError, match="fused preparation num_warps"):
+    with pytest.raises(SystemExit, match="no supported execution plans"):
         _candidate_plans(arguments, _production_plan())
-    with pytest.raises(ValueError, match="matmul_num_warps"):
+    with pytest.raises(SystemExit, match="no supported execution plans"):
         _candidate_plans(_parse_args(["--matmul-num-warps", "2"]), workload.production_plan)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--matmul-kernel", "triton"],
+        ["--matmul-kernel", "gluon_async_copy"],
+        ["--matmul-group-m", "16"],
+    ],
+)
+def test_amd_tuning_rejects_nvidia_only_axes(arguments):
+    workload = _workload(target=AcceleratorTarget("hip", "gfx1201"))
+    with pytest.raises(SystemExit, match="require an NVIDIA execution plan"):
+        _candidate_plans(_parse_args(arguments), workload.production_plan)
+
+
+def _sm8x_plan():
+    return select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=6144)
+
+
+def test_tuner_accepts_large_async_copy_tile() -> None:
+    production = _sm8x_plan()
+    assert _candidate_plans(_parse_args(["--matmul-block-m", "256"]), production) == (production,)
+
+
+def test_tuner_skips_unsupported_stage_combinations(capsys) -> None:
+    plans = _candidate_plans(_parse_args(["--matmul-num-stages", "2", "3", "4"]), _sm8x_plan())
+    assert {plan.matmul_num_stages for plan in plans} == {3, 4}
+    assert "Skipped 1 unsupported candidate" in capsys.readouterr().err
+
+
+def test_tuner_compares_explicit_kernels_and_grouping_on_sm120() -> None:
+    args = _parse_args(
+        [
+            "--matmul-kernel",
+            "triton",
+            "gluon_async_copy",
+            "--matmul-block-m",
+            "128",
+            "256",
+            "--matmul-block-n",
+            "128",
+            "--matmul-block-k",
+            "64",
+            "--matmul-num-warps",
+            "4",
+            "8",
+            "--matmul-group-m",
+            "0",
+            "8",
+        ]
+    )
+    plans = _candidate_plans(args, _production_plan())
+    assert len(plans) == 8
+    assert {plan.matmul_kernel for plan in plans} == {"triton", "gluon_async_copy"}
+    assert {plan.matmul_group_m for plan in plans} == {0, 8}
+    assert len({_plan_name(plan) for plan in plans}) == len(plans)
+
+
+def test_tuner_rejects_search_with_no_supported_configurations() -> None:
+    with pytest.raises(SystemExit, match="no supported execution plans"):
+        _candidate_plans(_parse_args(["--matmul-num-stages", "1", "2"]), _sm8x_plan())
 
 
 def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
@@ -212,18 +280,21 @@ def test_candidate_configuration_contains_flat_execution_plan_fields() -> None:
     assert candidate.configuration["dtype"] == "bfloat16"
 
 
+@pytest.mark.parametrize(
+    "target", [AcceleratorTarget("cuda", "sm120"), AcceleratorTarget("hip", "gfx1201")]
+)
 def test_candidate_provider_injects_plan_into_complete_operator(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, target: AcceleratorTarget
 ) -> None:
-    plan = _production_plan()
-    workload = _workload()
+    workload = _workload(target=target)
+    plan = workload.production_plan
     calls = []
 
     def fake_run(*args, **kwargs):
         calls.append((args, kwargs))
         return torch.empty((2, 96), device="meta")
 
-    monkeypatch.setattr(convrot_int8_backend, "run_linear", fake_run)
+    monkeypatch.setattr(workload.backend, "run_linear", fake_run)
     provider = _make_candidate(plan, workload).make_provider()
 
     prepared = provider.prepare()

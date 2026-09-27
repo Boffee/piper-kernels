@@ -1,20 +1,37 @@
 """Host-side execution-plan policy tests for INT8 ConvRot."""
 
 from dataclasses import replace
-from unittest.mock import Mock
 
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
-from piper_kernels.linear.convrot.int8._nvidia.policy import (
-    NvidiaExecutionPlan,
-    select_execution_plan,
-)
+from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
+from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 _SM120 = AcceleratorTarget("cuda", "sm120")
+_SM8X_ARCHITECTURES = ["sm80", "sm86", "sm87", "sm89"]
+_SM8X_TILES = {
+    "small": (16, 64, 128, 4, 4, 0, "triton"),
+    "medium": (64, 64, 128, 4, 4, 0, "triton"),
+    "large": (128, 64, 128, 4, 3, 16, "triton"),
+    "gluon_medium": (128, 128, 64, 4, 3, 8, "gluon_async_copy"),
+    "gluon_large": (256, 128, 64, 8, 4, 8, "gluon_async_copy"),
+}
+
+
+def _sm8x_tile(plan: NvidiaExecutionPlan) -> tuple[int | str, ...]:
+    return (
+        plan.matmul_block_m,
+        plan.matmul_block_n,
+        plan.matmul_block_k,
+        plan.matmul_num_warps,
+        plan.matmul_num_stages,
+        plan.matmul_group_m,
+        plan.matmul_kernel,
+    )
 
 
 def test_shared_plan_does_not_impose_nvidia_warp_limits():
@@ -32,7 +49,7 @@ def test_shared_plan_does_not_impose_nvidia_warp_limits():
         NvidiaExecutionPlan(**shared.as_dict())
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, 4.0])
 def test_shared_plan_rejects_invalid_launch_dimensions(value):
     with pytest.raises(ValueError, match="positive integer"):
         LinearExecutionPlan(
@@ -46,7 +63,7 @@ def test_shared_plan_rejects_invalid_launch_dimensions(value):
         )
 
 
-@pytest.mark.parametrize("architecture", ["sm75", "sm80", "sm89", "sm90", "sm100", "sm121"])
+@pytest.mark.parametrize("architecture", ["sm75", "sm90", "sm100", "sm121"])
 @pytest.mark.parametrize("in_features", [512, 5_376, 14_336, 28_672, 49_152, 49_408])
 def test_supported_nvidia_targets_keep_the_existing_schedule(architecture, in_features):
     target = AcceleratorTarget("cuda", architecture)
@@ -192,6 +209,7 @@ def test_shape_aware_schedule_preserves_preparation(rows, k, n, block_m):
             matmul_block_n=previous.matmul_block_n,
             matmul_num_warps=previous.matmul_num_warps,
             matmul_num_stages=previous.matmul_num_stages,
+            matmul_group_m=previous.matmul_group_m,
         )
         == previous
     )
@@ -212,7 +230,7 @@ def test_shape_aware_schedule_is_monotonic_in_rows(out_features):
     assert set(blocks) <= {32, 64, 128}
 
 
-@pytest.mark.parametrize("architecture", ["sm75", "sm80", "sm89", "sm90", "sm100", "sm121"])
+@pytest.mark.parametrize("architecture", ["sm75", "sm90", "sm100", "sm121"])
 def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
     target = AcceleratorTarget("cuda", architecture)
     assert select_execution_plan(
@@ -220,30 +238,177 @@ def test_shape_aware_schedule_keeps_unmeasured_targets_unchanged(architecture):
     ) == select_execution_plan(target, in_features=3072)
 
 
-@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048)])
-def test_architecture_policy_owns_preparation_and_matmul(monkeypatch, rows, out_features):
-    base = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=5376)
-    expected = replace(
-        base,
-        fuse_rotation_quantization=False,
-        fused_num_warps=16,
-        rotation_num_warps=8,
-        quantization_num_warps=2,
-        matmul_block_m=16,
-        matmul_block_n=128,
-        matmul_block_k=64,
-        matmul_num_warps=4,
-        matmul_num_stages=2,
-    )
-    architecture_policy = Mock(return_value=expected)
-    monkeypatch.setattr(nvidia_policy, "_sm120_execution_plan", architecture_policy)
+@pytest.mark.parametrize("architecture", ["sm120", "sm86"])
+@pytest.mark.parametrize(("rows", "out_features"), [(None, None), (128, 2048), (8192, 4096)])
+def test_matmul_selection_is_independent_of_preparation_width(architecture, rows, out_features):
+    target = AcceleratorTarget("cuda", architecture)
+    plans = [
+        select_execution_plan(target, in_features=k, rows=rows, out_features=out_features)
+        for k in (512, 5376, 14336, 28672, 49408)
+    ]
+    matmul_choices = [
+        {name: value for name, value in plan.as_dict().items() if name.startswith("matmul_")}
+        for plan in plans
+    ]
+    assert all(choices == matmul_choices[0] for choices in matmul_choices)
+    assert len({plan.fused_num_warps for plan in plans}) > 1
+    assert {plan.fuse_rotation_quantization for plan in plans} == {True, False}
 
-    actual = select_execution_plan(_SM120, in_features=5376, rows=rows, out_features=out_features)
 
-    assert actual is expected
-    architecture_policy.assert_called_once_with(
-        in_features=5376, rows=rows, out_features=out_features
-    )
+@pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
+@pytest.mark.parametrize(
+    ("rows", "n", "tile"),
+    [
+        (1, 14336, "small"),
+        (16, 14336, "small"),
+        (17, 1024, "small"),
+        (96, 1024, "small"),
+        (97, 1024, "medium"),
+        (32, 3072, "small"),
+        (33, 3072, "medium"),
+        (127, 4096, "medium"),
+        (128, 4096, "medium"),
+        (255, 16384, "medium"),
+        (256, 16384, "gluon_large"),
+        (256, 2048, "medium"),
+        (767, 2048, "medium"),
+        (768, 2048, "gluon_large"),
+        (767, 1024, "medium"),
+        (768, 1024, "gluon_medium"),
+        (100000, 1024, "gluon_medium"),
+        (1365, 1025, "medium"),
+        (1366, 1025, "gluon_large"),
+        (1536, 16, "small"),
+        (1537, 16, "medium"),
+        (8191, 64, "medium"),
+        (8192, 64, "large"),
+        (4095, 128, "medium"),
+        (4096, 128, "large"),
+        (3071, 129, "medium"),
+        (3072, 129, "gluon_medium"),
+        (100000, 96, "large"),
+        (32768, 16384, "gluon_large"),
+    ],
+)
+def test_sm8x_schedule_uses_its_own_tiles_and_preserves_preparation(architecture, rows, n, tile):
+    target = AcceleratorTarget("cuda", architecture)
+    previous = select_execution_plan(_SM120, in_features=5376)
+    actual = select_execution_plan(target, in_features=5376, rows=rows, out_features=n)
+
+    assert isinstance(actual, NvidiaExecutionPlan)
+    assert _sm8x_tile(actual) == _SM8X_TILES[tile]
+    preparation = ("fuse_rotation_quantization", "fused_num_warps")
+    preparation += ("rotation_num_warps", "quantization_num_warps")
+    for field in preparation:
+        assert getattr(actual, field) == getattr(previous, field)
+
+
+@pytest.mark.parametrize(
+    "out_features", [16, 64, 65, 96, 128, 129, 256, 1024, 1025, 3072, 5376, 16384, 65536]
+)
+def test_sm8x_layer_steps_through_at_most_three_tiles_as_rows_grow(out_features):
+    # Each tile is one compiled GEMM because SM8x launches do not specialize on M.
+    target = AcceleratorTarget("cuda", "sm89")
+    rows = [*range(1, 9000), *(2**power + d for power in range(14, 21) for d in (-1, 0, 1))]
+    tiles = [
+        _sm8x_tile(
+            select_execution_plan(target, in_features=2048, rows=row, out_features=out_features)
+        )
+        for row in rows
+    ]
+    block_m = [tile[0] for tile in tiles]
+    assert block_m == sorted(block_m)
+    assert len(set(tiles)) <= 3
+
+
+@pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
+@pytest.mark.parametrize("in_features", [2_048, 5_376, 49_408])
+def test_sm8x_schedule_without_shape_uses_grouped_large_tile(architecture, in_features):
+    target = AcceleratorTarget("cuda", architecture)
+    plan = select_execution_plan(target, in_features=in_features)
+    previous = select_execution_plan(_SM120, in_features=in_features)
+
+    assert _sm8x_tile(plan) == _SM8X_TILES["gluon_large"]
+    assert plan.as_dict() == previous.as_dict() | {
+        "matmul_block_m": 256,
+        "matmul_block_n": 128,
+        "matmul_block_k": 64,
+        "matmul_num_warps": 8,
+        "matmul_num_stages": 4,
+        "matmul_group_m": 8,
+        "matmul_kernel": "gluon_async_copy",
+        "matmul_specialize_m": False,
+        "matmul_explicit_bias_fma": True,
+    }
+
+
+@pytest.mark.parametrize("architecture", _SM8X_ARCHITECTURES)
+@pytest.mark.parametrize(
+    ("in_features", "fused_num_warps"),
+    [
+        (16, 1),
+        (96, 1),
+        (512, 1),
+        (1_024, 1),
+        (1_025, 4),
+        (2_048, 4),
+        (5_376, 2),
+        (12_288, 4),
+        (12_289, 4),
+        (14_336, 4),
+        (16_384, 4),
+        (16_385, 4),
+        (28_672, 8),
+        (49_408, 4),
+    ],
+)
+def test_sm8x_preparation_depends_only_on_in_features(architecture, in_features, fused_num_warps):
+    target = AcceleratorTarget("cuda", architecture)
+    previous = select_execution_plan(_SM120, in_features=in_features)
+    plans = [
+        select_execution_plan(target, in_features=in_features, rows=rows, out_features=n)
+        for rows, n in ((None, None), (1, 64), (256, 1024), (8192, 4096))
+    ]
+
+    # Only single chunks of at most 1,024 columns change warps; the rest is shared.
+    for plan in plans:
+        assert plan.fused_num_warps == fused_num_warps
+        assert plan.fuse_rotation_quantization is previous.fuse_rotation_quantization
+        assert plan.rotation_num_warps == previous.rotation_num_warps
+        assert plan.quantization_num_warps == previous.quantization_num_warps
+
+
+@pytest.mark.parametrize("architecture", ["sm89", "sm120"])
+def test_one_warp_preparation_is_an_explicit_nvidia_option(architecture):
+    plan = select_execution_plan(AcceleratorTarget("cuda", architecture), in_features=512)
+    assert replace(plan, fused_num_warps=1).fused_num_warps == 1
+    with pytest.raises(ValueError, match="must be 1, 2, 4, 8, or 16"):
+        replace(plan, fused_num_warps=3)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"matmul_block_k": 128},
+        {"matmul_block_n": 64},
+        {"matmul_num_warps": 4},
+        {"matmul_num_stages": 2},
+    ],
+)
+def test_sm8x_plan_rejects_unsupported_kernel_tiles(changes):
+    # The shape-free SM8x plan is the 256x128 Gluon tile; Triton tiles stop at 128 rows.
+    plan = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
+
+    with pytest.raises(ValueError, match="ConvRot async-copy"):
+        replace(plan, **changes)
+
+
+@pytest.mark.parametrize("group_m", [-1, 1, 4, 32, True, False, 8.0, 16.0])
+def test_sm8x_plan_rejects_invalid_group_m(group_m):
+    plan = select_execution_plan(AcceleratorTarget("cuda", "sm89"), in_features=512)
+
+    with pytest.raises(ValueError, match="group_m"):
+        replace(plan, matmul_group_m=group_m)
 
 
 def test_execution_plan_serializes_flat_tuning_fields() -> None:
@@ -259,6 +424,10 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
         "matmul_block_k": 128,
         "matmul_num_warps": 8,
         "matmul_num_stages": 3,
+        "matmul_kernel": "triton",
+        "matmul_group_m": 16,
+        "matmul_specialize_m": True,
+        "matmul_explicit_bias_fma": False,
     }
 
 
@@ -266,9 +435,12 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
     "changes",
     [
         {"matmul_block_m": 8},
+        {"matmul_block_m": 256},
         {"matmul_block_n": 512},
+        {"matmul_block_n": 128.0},
         {"matmul_block_k": 16},
         {"matmul_num_warps": 16},
+        {"matmul_num_warps": True},
         {"matmul_num_stages": 5},
     ],
 )
@@ -293,7 +465,63 @@ def test_execution_plan_rejects_invalid_fused_warp_count() -> None:
     plan = select_execution_plan(_SM120, in_features=512)
 
     with pytest.raises(ValueError, match="ConvRot"):
-        replace(plan, fused_num_warps=1)
+        replace(plan, fused_num_warps=3)
+
+
+def test_kernel_selection_is_independent_of_tile_replacement() -> None:
+    sm120 = select_execution_plan(_SM120, in_features=512)
+    triton = replace(
+        sm120,
+        matmul_block_m=128,
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        matmul_num_stages=3,
+    )
+    assert triton.matmul_kernel == "triton"
+    gluon = replace(triton, matmul_kernel="gluon_async_copy")
+    assert replace(gluon, matmul_num_stages=4).matmul_kernel == "gluon_async_copy"
+    with pytest.raises(ValueError, match="async-copy GEMM requires"):
+        replace(gluon, matmul_block_n=64)
+
+
+@pytest.mark.parametrize("specialize_m", [False, True])
+@pytest.mark.parametrize("explicit_bias_fma", [False, True])
+def test_gluon_reports_effective_behavior_and_preserves_triton_options(
+    specialize_m, explicit_bias_fma
+) -> None:
+    triton = replace(
+        select_execution_plan(_SM120, in_features=512),
+        matmul_block_n=128,
+        matmul_block_k=64,
+        matmul_num_warps=4,
+        triton_specialize_m=specialize_m,
+        triton_explicit_bias_fma=explicit_bias_fma,
+    )
+    gluon = replace(triton, matmul_kernel="gluon_async_copy")
+
+    assert gluon.matmul_specialize_m is False
+    assert gluon.matmul_explicit_bias_fma is True
+    assert gluon.as_dict() == triton.as_dict() | {
+        "matmul_kernel": "gluon_async_copy",
+        "matmul_specialize_m": False,
+        "matmul_explicit_bias_fma": True,
+    }
+    assert replace(gluon, matmul_kernel="triton") == triton
+    fallback = nvidia_policy.grouped_triton_plan(gluon)
+    assert fallback.matmul_kernel == "triton"
+    assert fallback.matmul_specialize_m is False
+    assert fallback.matmul_explicit_bias_fma is True
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"matmul_kernel": "unknown"}, {"triton_specialize_m": 1}, {"triton_explicit_bias_fma": 0}],
+)
+def test_execution_plan_rejects_invalid_implementation_options(changes) -> None:
+    plan = select_execution_plan(_SM120, in_features=512)
+    with pytest.raises(ValueError, match="ConvRot"):
+        replace(plan, **changes)
 
 
 @pytest.mark.parametrize(
