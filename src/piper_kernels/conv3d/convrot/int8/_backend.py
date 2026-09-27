@@ -11,7 +11,7 @@ from ._nvidia import policy as nvidia_policy
 
 try:
     from . import triton as _shared
-    from ._nvidia import triton as _nvidia_backend
+    from ._nvidia import dispatch as _nvidia_backend
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise

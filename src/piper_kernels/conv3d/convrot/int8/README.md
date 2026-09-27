@@ -30,8 +30,11 @@ products in INT32. Eliminated FP16 intermediate rounding is not reproduced.
 
 The public operations and weight format are shared. `_backend.py` selects a
 vendor implementation; `_nvidia/` and `_amd/` own target support and launch policy.
-Both use the common Triton kernels and launch mechanics in `triton.py`. AMD uses
-HIP quantization rounding and pointer-based weight loads. NVIDIA selects SM120 or SM8x
+`_nvidia/policy.py` selects target-specific schedules, and `_nvidia/dispatch.py`
+resolves the input device's policy through typed backend entry points. Shared
+schedule values live in `_plan.py`. Both vendors use the common Triton kernels
+and launch mechanics in `triton.py`. AMD uses HIP quantization rounding and
+pointer-based weight loads. NVIDIA selects SM120 or SM8x
 tiles; only SM120 uses weight descriptors, since SM8x has no TMA. SM120's 128x128
 four-warp tile spills registers on SM8x, so SM8x uses 64x128 tiles, 64x64 tiles below
 2,048 output rows, and 32x32 tiles for at most 64 outputs. No activation-scale conversion

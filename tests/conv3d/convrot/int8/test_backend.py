@@ -185,7 +185,7 @@ def test_compiler_cache_tracks_backend_sources(monkeypatch):
     } <= set(files)
     if _backend._shared is not None:
         assert {
-            str(root / path) for path in ("triton.py", "_nvidia/triton.py", "_amd/triton.py")
+            str(root / path) for path in ("triton.py", "_nvidia/dispatch.py", "_amd/triton.py")
         } <= set(files)
     capture = Mock(return_value=b"cache-key")
     monkeypatch.setattr(_compile, "get_hash_for_files", capture)
