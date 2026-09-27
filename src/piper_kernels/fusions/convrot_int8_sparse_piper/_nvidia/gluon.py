@@ -17,7 +17,7 @@ Shapes outside ``supports_projection`` use the shared Triton launchers.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
-# ruff: noqa: ANN001, ANN202, PLR0912, PLR0913, PLR0915, PLR0917
+# ruff: noqa: ANN001, ANN202, PLR0913, PLR0915, PLR0917
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
 
@@ -130,6 +130,7 @@ def _project_int8(
     for first_tile in range(0, k_tiles, _GL_NUM_STAGES):
         for current in gl.static_range(_GL_NUM_STAGES):
             tile = first_tile + current
+            # Rounds keep every stage's buffer static; a partial last round skips its extra tiles.
             if k_tiles % _GL_NUM_STAGES == 0 or tile < k_tiles:
                 async_copy.wait_group(_GL_NUM_STAGES - 2)
                 # Every warp has finished reading the slot that the next copy refills.
@@ -298,15 +299,26 @@ def _project_rmsnorm_rope(
     norm_weight_ptr,
     cos_ptr,
     sin_ptr,
-    input_row_start,
-    positions,
-    copy_positions,
+    batch,
     head,
+    first_row,
+    logical_sequence_length,
     input_features: gl.constexpr,
     rotary_dim: gl.constexpr,
     norm_epsilon: gl.constexpr,
+    mask_rows: gl.constexpr,
 ):
-    """Project one [128, D128] Q/K tile, then apply FP32 RMSNorm and RoPE by feature."""
+    """Project 128 rows onto a D128 head, then apply FP32 RMSNorm and RoPE by feature.
+
+    Returns the tile, its sequence positions, and its features. With ``mask_rows``,
+    rows past the sequence end repeat its last row; callers mask their outputs.
+    """
+    positions = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
+    copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
+    if mask_rows:
+        positions = gl.minimum(positions, logical_sequence_length - 1)
+        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+    input_row_start = batch * logical_sequence_length
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[_GL_NUM_WARPS, 1], instr_shape=[16, 8]
     )
@@ -338,7 +350,18 @@ def _project_rmsnorm_rope(
     cos = gl.load(cos_ptr + rope_offsets, mask=rotary_features[None, :], other=1.0)
     sin = gl.load(sin_ptr + rope_offsets, mask=rotary_features[None, :], other=0.0)
     rotary = normalized * cos + _rotate_half(normalized, rotary_dim) * sin
-    return gl.where(rotary_features[None, :], rotary, normalized), features
+    return gl.where(rotary_features[None, :], rotary, normalized), positions, features
+
+
+@gluon.jit
+def _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths: gl.constexpr):
+    """Mark rows before ``row_end`` or, with block lengths, in each K64 block's valid prefix.
+
+    Block lengths are read at the clamped positions, which stay inside the sequence.
+    """
+    if mask_block_lengths:
+        return rows % _GL_TILE_ROWS < gl.load(block_lengths_ptr + positions // _GL_TILE_ROWS)
+    return rows < row_end
 
 
 @gluon.jit
@@ -358,6 +381,44 @@ def _summarize(values, valid, mean_pool_summary: gl.constexpr, mask_rows: gl.con
             _minmax,
         )
     return gl.reduce((values, values), 1, _minmax)
+
+
+@gluon.jit
+def _store_rows(pointer, values, first_row, storage_rows, mask_rows: gl.constexpr):
+    """Store a 128-row INT8 Q/K tile of one [S, D128] head in 16-byte chunks."""
+    values = gl.convert_layout(gl.reshape(values, [_GL_BLOCK_M, _GL_HEAD_DIM]), _GL_STORE_LAYOUT)
+    rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_STORE_LAYOUT))
+    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_STORE_LAYOUT))
+    pointers = pointer + rows[:, None] * _GL_HEAD_DIM + features[None, :]
+    if mask_rows:
+        gl.store(pointers, values, mask=rows[:, None] < storage_rows)
+    else:
+        gl.store(pointers, values)
+
+
+@gluon.jit
+def _store_scales(pointer, scales, first_group, storage_groups, mask_rows: gl.constexpr):
+    """Store one tile's per-group scales into one head's scale row."""
+    layout: gl.constexpr = gl.SliceLayout(1, _GL_SUMMARY_LAYOUT)
+    groups = first_group + gl.arange(0, scales.shape[0], layout)
+    scales = gl.convert_layout(scales, layout)
+    if mask_rows:
+        gl.store(pointer + groups, scales, mask=groups < storage_groups)
+    else:
+        gl.store(pointer + groups, scales)
+
+
+@gluon.jit
+def _store_summaries(pointer, summaries, first_block, storage_blocks, mask_rows: gl.constexpr):
+    """Store one tile's [blocks, D128] summaries or means into one head's block rows."""
+    blocks = first_block + gl.arange(0, summaries.shape[0], gl.SliceLayout(1, _GL_SUMMARY_LAYOUT))
+    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_SUMMARY_LAYOUT))
+    pointers = pointer + blocks[:, None] * _GL_HEAD_DIM + features[None, :]
+    summaries = gl.convert_layout(summaries, _GL_SUMMARY_LAYOUT)
+    if mask_rows:
+        gl.store(pointers, summaries, mask=(blocks < storage_blocks)[:, None])
+    else:
+        gl.store(pointers, summaries)
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_QUERY)
@@ -392,17 +453,8 @@ def _query_kernel(
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
-    storage_sequence_length = storage_tiles * _GL_TILE_ROWS
-    input_row_start = batch * logical_sequence_length
-    rows_layout: gl.constexpr = gl.SliceLayout(1, _GL_FEATURE_LAYOUT)
-    global_start = chunk_start + row_block * _GL_BLOCK_M
-    positions = global_start + gl.arange(0, _GL_BLOCK_M, rows_layout)
-    copy_positions = global_start + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
-    if mask_rows:
-        # Rows past the sequence end repeat its last row; their outputs are masked below.
-        positions = gl.minimum(positions, logical_sequence_length - 1)
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
-    values, features = _project_rmsnorm_rope(
+    first_row = chunk_start + row_block * _GL_BLOCK_M
+    values, positions, features = _project_rmsnorm_rope(
         input_ptr,
         input_scale_ptr,
         weight_ptr,
@@ -411,23 +463,22 @@ def _query_kernel(
         norm_weight_ptr,
         cos_ptr,
         sin_ptr,
-        input_row_start,
-        positions,
-        copy_positions,
+        batch,
         head,
+        first_row,
+        logical_sequence_length,
         input_features,
         rotary_dim,
         norm_epsilon,
+        mask_rows,
     )
 
     blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
     groups: gl.constexpr = _GL_BLOCK_M // _GL_QUERY_SCALE_ROWS
-    global_rows = global_start + gl.arange(0, _GL_BLOCK_M, rows_layout)
-    if mask_block_lengths:
-        block_length = gl.load(block_lengths_ptr + global_rows // _GL_TILE_ROWS)
-        valid_rows = global_rows % _GL_TILE_ROWS < block_length
-    else:
-        valid_rows = global_rows < query_sequence_end
+    rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
+    valid_rows = _valid_rows(
+        rows, positions, query_sequence_end, block_lengths_ptr, mask_block_lengths
+    )
     valid = valid_rows[:, None] & (features >= 0)[None, :]
     if mask_rows:
         values = gl.where(valid, values, 0.0)
@@ -447,63 +498,46 @@ def _query_kernel(
     raw_scale = (
         gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
     )
-    group_layout: gl.constexpr = raw_scale.type.layout  # pyright: ignore[reportAttributeAccessIssue]
-    group_offsets = gl.arange(0, groups, group_layout)
     if mask_rows:
-        group_starts = global_start + group_offsets * _GL_QUERY_SCALE_ROWS
-        if mask_block_lengths:
-            group_block_length = gl.load(block_lengths_ptr + group_starts // _GL_TILE_ROWS)
-            group_valid = group_starts % _GL_TILE_ROWS < group_block_length
-        else:
-            group_valid = group_starts < query_sequence_end
+        group_layout: gl.constexpr = raw_scale.type.layout  # pyright: ignore[reportAttributeAccessIssue]
+        group_starts = first_row + gl.arange(0, groups, group_layout) * _GL_QUERY_SCALE_ROWS
+        group_valid = _valid_rows(
+            group_starts,
+            gl.minimum(group_starts, logical_sequence_length - 1),
+            query_sequence_end,
+            block_lengths_ptr,
+            mask_block_lengths,
+        )
         raw_scale = gl.where(group_valid, raw_scale, 1.0)
         stored_scale = gl.where(group_valid, raw_scale * (softmax_scale * _GL_LOG2_E), 0.0)
     else:
         stored_scale = raw_scale * (softmax_scale * _GL_LOG2_E)
     quantized = _round_to_int8(smoothed / raw_scale[:, None, None])
 
-    quantized = gl.reshape(quantized, [_GL_BLOCK_M, _GL_HEAD_DIM])
-    quantized = gl.convert_layout(quantized, _GL_STORE_LAYOUT)
-    store_rows = gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_STORE_LAYOUT))
-    storage_rows = row_block * _GL_BLOCK_M + store_rows
-    store_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_STORE_LAYOUT))
     batch_head = batch * heads + head
-    query_offsets = storage_rows[:, None] * _GL_HEAD_DIM + store_features[None, :]
-    query_base = query_ptr + batch_head.to(gl.int64) * storage_sequence_length * _GL_HEAD_DIM
-    if mask_rows:
-        gl.store(
-            query_base + query_offsets,
-            quantized,
-            mask=storage_rows[:, None] < storage_sequence_length,
-        )
-    else:
-        gl.store(query_base + query_offsets, quantized)
-
-    summary_blocks = row_block * blocks + gl.arange(
-        0, blocks, gl.SliceLayout(1, _GL_SUMMARY_LAYOUT)
+    storage_rows = storage_tiles * _GL_TILE_ROWS
+    storage_groups = storage_rows // _GL_QUERY_SCALE_ROWS
+    _store_rows(
+        query_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
+        quantized,
+        row_block * _GL_BLOCK_M,
+        storage_rows,
+        mask_rows,
     )
-    summary_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_SUMMARY_LAYOUT))
-    summary_rows = batch_head * storage_tiles + summary_blocks
-    summary_offsets = summary_rows[:, None] * _GL_HEAD_DIM + summary_features[None, :]
-    summary = gl.convert_layout(summary, _GL_SUMMARY_LAYOUT)
-    scale_offsets = (
-        batch_head * (storage_sequence_length // _GL_QUERY_SCALE_ROWS) + row_block * groups
+    _store_scales(
+        query_scale_ptr + batch_head * storage_groups,
+        stored_scale,
+        row_block * groups,
+        storage_groups,
+        mask_rows,
     )
-    if mask_rows:
-        gl.store(
-            query_summary_ptr + summary_offsets,
-            summary,
-            mask=summary_blocks[:, None] < storage_tiles,
-        )
-        gl.store(
-            query_scale_ptr + scale_offsets + group_offsets,
-            stored_scale,
-            mask=row_block * groups + group_offsets
-            < storage_sequence_length // _GL_QUERY_SCALE_ROWS,
-        )
-    else:
-        gl.store(query_summary_ptr + summary_offsets, summary)
-        gl.store(query_scale_ptr + scale_offsets + group_offsets, stored_scale)
+    _store_summaries(
+        query_summary_ptr + batch_head * storage_tiles * _GL_HEAD_DIM,
+        summary,
+        row_block * blocks,
+        storage_tiles,
+        mask_rows,
+    )
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE)
@@ -536,16 +570,8 @@ def _key_kernel(
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
-    input_row_start = batch * logical_sequence_length
-    rows_layout: gl.constexpr = gl.SliceLayout(1, _GL_FEATURE_LAYOUT)
-    sequence = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, rows_layout)
-    copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
-    positions = sequence
-    if mask_rows:
-        # Rows past the sequence end repeat its last row; their outputs are masked below.
-        positions = gl.minimum(positions, logical_sequence_length - 1)
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
-    values, features = _project_rmsnorm_rope(
+    first_row = row_block * _GL_BLOCK_M
+    values, positions, features = _project_rmsnorm_rope(
         input_ptr,
         input_scale_ptr,
         weight_ptr,
@@ -554,25 +580,21 @@ def _key_kernel(
         norm_weight_ptr,
         cos_ptr,
         sin_ptr,
-        input_row_start,
-        positions,
-        copy_positions,
+        batch,
         head,
+        first_row,
+        logical_sequence_length,
         input_features,
         rotary_dim,
         norm_epsilon,
+        mask_rows,
     )
 
     tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
-    if mask_block_lengths:
-        tile_length = gl.load(
-            block_lengths_ptr + sequence // _GL_TILE_ROWS,
-            mask=sequence // _GL_TILE_ROWS < storage_tiles,
-            other=0,
-        )
-        valid_rows = sequence % _GL_TILE_ROWS < tile_length
-    else:
-        valid_rows = sequence < logical_sequence_length
+    rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
+    valid_rows = _valid_rows(
+        rows, positions, logical_sequence_length, block_lengths_ptr, mask_block_lengths
+    )
     valid = valid_rows[:, None] & (features >= 0)[None, :]
     if mask_rows:
         values = gl.where(valid, values, 0.0)
@@ -589,41 +611,25 @@ def _key_kernel(
     )
     quantized = _round_to_int8(smoothed / key_scale[:, None, None])
 
-    storage_sequence_length = storage_tiles * _GL_TILE_ROWS
-    quantized = gl.reshape(quantized, [_GL_BLOCK_M, _GL_HEAD_DIM])
-    quantized = gl.convert_layout(quantized, _GL_STORE_LAYOUT)
-    store_rows = gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_STORE_LAYOUT))
-    store_rows += row_block * _GL_BLOCK_M
-    store_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_STORE_LAYOUT))
     batch_head = batch * heads + head
-    key_offsets = store_rows[:, None] * _GL_HEAD_DIM + store_features[None, :]
-    key_base = key_ptr + batch_head.to(gl.int64) * storage_sequence_length * _GL_HEAD_DIM
-    if mask_rows:
-        gl.store(
-            key_base + key_offsets, quantized, mask=store_rows[:, None] < storage_sequence_length
+    storage_rows = storage_tiles * _GL_TILE_ROWS
+    first_tile = row_block * tiles
+    tile_row = batch_head * storage_tiles
+    _store_rows(
+        key_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
+        quantized,
+        first_row,
+        storage_rows,
+        mask_rows,
+    )
+    _store_scales(key_scale_ptr + tile_row, key_scale, first_tile, storage_tiles, mask_rows)
+    _store_summaries(
+        key_summary_ptr + tile_row * _GL_HEAD_DIM, key_summary, first_tile, storage_tiles, mask_rows
+    )
+    if not mean_pool_summary:
+        _store_summaries(
+            key_aux_ptr + tile_row * _GL_HEAD_DIM, key_aux, first_tile, storage_tiles, mask_rows
         )
-    else:
-        gl.store(key_base + key_offsets, quantized)
-
-    tile_offsets = row_block * tiles + gl.arange(0, tiles, gl.SliceLayout(1, _GL_SUMMARY_LAYOUT))
-    summary_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_SUMMARY_LAYOUT))
-    scale_offsets = batch_head * storage_tiles + tile_offsets
-    summary_offsets = scale_offsets[:, None] * _GL_HEAD_DIM + summary_features[None, :]
-    key_scale = gl.convert_layout(key_scale, gl.SliceLayout(1, _GL_SUMMARY_LAYOUT))
-    key_summary = gl.convert_layout(key_summary, _GL_SUMMARY_LAYOUT)
-    if mask_rows:
-        stored_tiles = tile_offsets < storage_tiles
-        gl.store(key_scale_ptr + scale_offsets, key_scale, mask=stored_tiles)
-        gl.store(key_summary_ptr + summary_offsets, key_summary, mask=stored_tiles[:, None])
-        if not mean_pool_summary:
-            key_aux = gl.convert_layout(key_aux, _GL_SUMMARY_LAYOUT)
-            gl.store(key_aux_ptr + summary_offsets, key_aux, mask=stored_tiles[:, None])
-    else:
-        gl.store(key_scale_ptr + scale_offsets, key_scale)
-        gl.store(key_summary_ptr + summary_offsets, key_summary)
-        if not mean_pool_summary:
-            key_aux = gl.convert_layout(key_aux, _GL_SUMMARY_LAYOUT)
-            gl.store(key_aux_ptr + summary_offsets, key_aux)
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE)
@@ -651,13 +657,14 @@ def _value_kernel(
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
+    first_row = row_block * _GL_BLOCK_M
     input_row_start = batch * logical_sequence_length
+    copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
+    if mask_rows:
+        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
     )
-    copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
-    if mask_rows:
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
     accumulator = _project_int8(
         input_ptr,
         weight_ptr,
@@ -673,12 +680,11 @@ def _value_kernel(
         [1, 1, 4], [1, 32, 1], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
     )
     tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
-    tile_layout: gl.constexpr = gl.SliceLayout(1, tile_rows_layout)
-    features_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, layout))
-    tile_offsets = row_block * tiles + gl.arange(0, tiles, tile_layout)
+    first_tile = row_block * tiles
+    tile_offsets = first_tile + gl.arange(0, tiles, gl.SliceLayout(1, tile_rows_layout))
     rows_in_tile = gl.arange(0, _GL_TILE_ROWS, gl.SliceLayout(0, tile_rows_layout))
     sequence = tile_offsets[:, None] * _GL_TILE_ROWS + rows_in_tile[None, :]
-    features = gl.arange(0, _GL_HEAD_DIM, features_layout)
+    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, gl.SliceLayout(1, layout)))
     positions = sequence
     if mask_rows:
         positions = gl.minimum(positions, logical_sequence_length - 1)
@@ -692,8 +698,6 @@ def _value_kernel(
         bias = gl.load(bias_ptr + head * _GL_HEAD_DIM + features).to(gl.float32)
         projection += bias[None, None, :]
 
-    batch_head = batch * heads + head
-    value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + features)
     if mask_block_lengths:
         tile_length = gl.load(
             block_lengths_ptr + tile_offsets, mask=tile_offsets < storage_tiles, other=0
@@ -701,23 +705,25 @@ def _value_kernel(
         valid = rows_in_tile[None, :] < tile_length[:, None]
     else:
         valid = sequence < logical_sequence_length
-    scale_offsets = batch_head * storage_tiles + tile_offsets
-    stored_tiles = tile_offsets < storage_tiles
+    batch_head = batch * heads + head
+    tile_row = batch_head * storage_tiles
     if emit_block_mean:
-        mean_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, layout))
-        mean_offsets = gl.convert_layout(scale_offsets, mean_layout)
-        mean_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, gl.SliceLayout(1, layout)))
-        mean_pointers = (
-            block_mean_ptr + mean_offsets[:, None] * _GL_HEAD_DIM + mean_features[None, :]
-        )
         if mask_rows:
             valid_count = gl.maximum(gl.sum(valid.to(gl.int32), axis=1), 1)
+            count_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, layout))
             block_sum = gl.sum(gl.where(valid[:, :, None], projection, 0.0), axis=1)
-            block_mean = block_sum / gl.convert_layout(valid_count, mean_layout)[:, None]
-            stored_means = gl.convert_layout(stored_tiles, mean_layout)
-            gl.store(mean_pointers, block_mean, mask=stored_means[:, None])
+            block_mean = block_sum / gl.convert_layout(valid_count, count_layout)[:, None]
         else:
-            gl.store(mean_pointers, gl.sum(projection, axis=1) / _GL_TILE_ROWS)
+            block_mean = gl.sum(projection, axis=1) / _GL_TILE_ROWS
+        _store_summaries(
+            block_mean_ptr + tile_row * _GL_HEAD_DIM,
+            block_mean,
+            first_tile,
+            storage_tiles,
+            mask_rows,
+        )
+
+    value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + features)
     centered = projection - value_mean[None, None, :]
     if mask_rows:
         centered = gl.where(valid[:, :, None], centered, 0.0)
@@ -726,21 +732,24 @@ def _value_kernel(
     )
     quantized = _round_to_int8(centered / value_scale[:, None, None])
 
-    storage_sequence_length = storage_tiles * _GL_TILE_ROWS
+    storage_rows = storage_tiles * _GL_TILE_ROWS
     value_pointers = (
         value_ptr
-        + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_sequence_length
-        + features[None, None, :].to(gl.int64) * storage_sequence_length
+        + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_rows
+        + features[None, None, :].to(gl.int64) * storage_rows
         + sequence[:, :, None]
     )
     if mask_rows:
-        gl.store(value_pointers, quantized, mask=stored_tiles[:, None, None])
-        gl.store(
-            value_scale_ptr + scale_offsets, value_scale * _GL_P_UINT8_RANGE, mask=stored_tiles
-        )
+        gl.store(value_pointers, quantized, mask=(tile_offsets < storage_tiles)[:, None, None])
     else:
         gl.store(value_pointers, quantized)
-        gl.store(value_scale_ptr + scale_offsets, value_scale * _GL_P_UINT8_RANGE)
+    _store_scales(
+        value_scale_ptr + tile_row,
+        value_scale * _GL_P_UINT8_RANGE,
+        first_tile,
+        storage_tiles,
+        mask_rows,
+    )
 
 
 def _launch_rows(sequence_rows: int, launch) -> None:

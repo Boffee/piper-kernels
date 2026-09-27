@@ -685,7 +685,8 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
 ):
     _, kernel = _capture_projection(monkeypatch, operation, implementation, head_dim)
     is_amd = implementation is amd
-    # SM89 runs one 64-row, one-head schedule for Q, K, and V.
+    # These operands' 272 input features fall outside SM89's Gluon kernels, so SM89 runs
+    # its Triton schedule: 64 rows by one head for Q, K, and V.
     is_sm89 = implementation is nvidia_sm89
     heads_per_program = 1 if is_sm89 or (is_amd and operation != "value") else 2
     block_m = 64 if is_sm89 or operation == "query" or (is_amd and operation == "key") else 128

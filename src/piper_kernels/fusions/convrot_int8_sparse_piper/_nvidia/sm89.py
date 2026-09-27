@@ -1,5 +1,7 @@
 """SM89 fused projections: Gluon kernels for D128 heads, shared Triton launchers otherwise."""
 
+from functools import partial
+
 import torch
 
 from .. import triton as projection
@@ -40,8 +42,13 @@ def project_query(  # noqa: PLR0913, PLR0917
     out: QueryOutput,
     bias: torch.Tensor | None = None,
 ) -> None:
-    """Project a query window with the Gluon kernel when it covers the operands."""
-    arguments = (
+    """Project a query window, with the Gluon kernel when it covers the operands."""
+    launch = (
+        gluon.project_query
+        if gluon.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
+        else partial(projection.project_query, config=_CONFIG)
+    )
+    launch(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -53,12 +60,11 @@ def project_query(  # noqa: PLR0913, PLR0917
         softmax_scale,
         routing_mode,
         block_lengths,
+        chunk_start=chunk_start,
+        chunk_rows=chunk_rows,
+        out=out,
+        bias=bias,
     )
-    window = {"chunk_start": chunk_start, "chunk_rows": chunk_rows, "out": out, "bias": bias}
-    if gluon.supports_projection(input_qdata, out[0].shape[3], cos.shape[1]):
-        gluon.project_query(*arguments, **window)
-    else:
-        projection.project_query(*arguments, config=_CONFIG, **window)
 
 
 def project_key(  # noqa: PLR0913
@@ -76,8 +82,13 @@ def project_key(  # noqa: PLR0913
     out: KeyOutput,
     bias: torch.Tensor | None = None,
 ) -> None:
-    """Project keys with the Gluon kernel when it covers the operands."""
-    arguments = (
+    """Project keys, with the Gluon kernel when it covers the operands."""
+    launch = (
+        gluon.project_key
+        if gluon.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
+        else partial(projection.project_key, config=_CONFIG)
+    )
+    launch(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -88,11 +99,9 @@ def project_key(  # noqa: PLR0913
         norm_epsilon,
         routing_mode,
         block_lengths,
+        out=out,
+        bias=bias,
     )
-    if gluon.supports_projection(input_qdata, out[0].shape[3], cos.shape[1]):
-        gluon.project_key(*arguments, out=out, bias=bias)
-    else:
-        projection.project_key(*arguments, config=_CONFIG, out=out, bias=bias)
 
 
 def project_value(
@@ -107,11 +116,20 @@ def project_value(
     out: ValueOutput,
     bias: torch.Tensor | None = None,
 ) -> None:
-    """Project values with the Gluon kernel when it covers the operands."""
-    arguments = (input_qdata, input_scale, input_mean, weight_qdata, weight_scale, block_lengths)
-    if gluon.supports_projection(input_qdata, out[0].shape[2]):
-        gluon.project_value(*arguments, emit_block_mean=emit_block_mean, out=out, bias=bias)
-    else:
-        projection.project_value(
-            *arguments, config=_CONFIG, emit_block_mean=emit_block_mean, out=out, bias=bias
-        )
+    """Project values, with the Gluon kernel when it covers the operands."""
+    launch = (
+        gluon.project_value
+        if gluon.supports_projection(input_qdata, out[0].shape[2])
+        else partial(projection.project_value, config=_CONFIG)
+    )
+    launch(
+        input_qdata,
+        input_scale,
+        input_mean,
+        weight_qdata,
+        weight_scale,
+        block_lengths,
+        emit_block_mean=emit_block_mean,
+        out=out,
+        bias=bias,
+    )

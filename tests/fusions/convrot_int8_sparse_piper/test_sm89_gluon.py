@@ -25,34 +25,19 @@ _SM89 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 
 def _operands(
     device, *, batch=2, sequence=193, heads=3, input_features=256, head_dim=128, rotary_dim=96
 ):
-    if device == "cuda":
-        input_qdata = torch.randint(
-            -127, 128, (batch, sequence, input_features), device=device, dtype=torch.int8
-        )
-        weight_qdata = torch.randint(
-            -127, 128, (heads * head_dim, input_features), device=device, dtype=torch.int8
-        )
-        input_scale = torch.rand((batch, sequence), device=device).mul_(0.01).add_(0.001)
-        weight_scale = torch.rand((heads * head_dim, 1), device=device).mul_(0.01).add_(0.001)
-        norm_weight = torch.rand(head_dim, device=device).add_(0.5).bfloat16()
-        angles = torch.rand((sequence, rotary_dim), device=device).mul_(2 * torch.pi)
-        return (
-            input_qdata,
-            input_scale,
-            weight_qdata,
-            weight_scale,
-            norm_weight,
-            angles.cos(),
-            angles.sin(),
-        )
+    input_shape, weight_shape = (
+        (batch, sequence, input_features),
+        (heads * head_dim, input_features),
+    )
+    angles = torch.rand((sequence, rotary_dim), device=device).mul_(2 * torch.pi)
     return (
-        torch.empty((batch, sequence, input_features), device=device, dtype=torch.int8),
-        torch.empty((batch, sequence), device=device),
-        torch.empty((heads * head_dim, input_features), device=device, dtype=torch.int8),
-        torch.empty((heads * head_dim, 1), device=device),
-        torch.empty(head_dim, device=device, dtype=torch.bfloat16),
-        torch.empty((sequence, rotary_dim), device=device),
-        torch.empty((sequence, rotary_dim), device=device),
+        torch.randint(-127, 128, input_shape, device=device, dtype=torch.int8),
+        torch.rand((batch, sequence), device=device).mul_(0.01).add_(0.001),
+        torch.randint(-127, 128, weight_shape, device=device, dtype=torch.int8),
+        torch.rand((heads * head_dim, 1), device=device).mul_(0.01).add_(0.001),
+        torch.rand(head_dim, device=device).add_(0.5).bfloat16(),
+        angles.cos(),
+        angles.sin(),
     )
 
 
@@ -309,6 +294,7 @@ def _assert_matches(actual, expected):
         {"batch": 2, "sequence": 1000, "input_features": 320, "window": (64, 700)},
         # The last 128-row tile ends 64 rows past the padded storage.
         {"batch": 1, "sequence": 8256, "rotary_dim": 64, "routing": "mean", "window": (0, 8256)},
+        # The Q tail tile reaches 64 rows past the sequence, whose block lengths it must not read.
         {
             "batch": 2,
             "sequence": 1024,
@@ -316,7 +302,7 @@ def _assert_matches(actual, expected):
             "block_lengths": True,
             "bias": True,
             "affine": False,
-            "window": (128, 700),
+            "window": (64, 960),
         },
         {
             "batch": 1,

@@ -2,9 +2,9 @@
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-# Query rows per fused attention-output chunk on SM89. With the shared 4,096-row chunks, the
-# compiled H3 attention block ran 3% slower at 100K tokens than without the fusion; 8,192
-# rows remove that loss and keep most of the memory saving.
+# SM89 splits the fused attention output into 8,192-row query chunks. Against the shared
+# 4,096-row chunks, the compiled H3 attention block runs 1.6-3% faster at 8K-100K tokens with
+# the SM8x ConvRot INT8 GEMM, for 0.06-0.21 GiB more peak memory.
 SM89_QUERY_CHUNK_ROWS = 8_192
 
 
@@ -14,5 +14,5 @@ def supports_target(target: AcceleratorTarget) -> bool:
 
 
 def is_sm89(target: AcceleratorTarget) -> bool:
-    """SM89 projects with its own measured configuration; SM120 keeps the original one."""
+    """SM89 has its own projection kernels and output chunks; SM120 keeps the shared ones."""
     return target.is_cuda_capability(8, 9)
