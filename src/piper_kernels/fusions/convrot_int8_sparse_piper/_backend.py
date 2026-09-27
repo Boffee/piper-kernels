@@ -78,7 +78,9 @@ def select_projection_backend(
         return None
     target = AcceleratorTarget.from_device(input.device)
     if nvidia_policy.supports_target(target):
-        return _nvidia_sm89_projection if nvidia_policy.is_sm89(target) else _nvidia_projection
+        if nvidia_policy.uses_async_copies(target):
+            return _nvidia_sm89_projection
+        return _nvidia_projection
     return (
         _amd_projection
         if amd_policy.supports_target(target) and amd_policy.supports_head_dim(head_dim)
