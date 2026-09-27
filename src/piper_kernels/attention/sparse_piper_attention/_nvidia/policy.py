@@ -6,6 +6,8 @@ loads operands with TMA; SM89 has no TMA and uses Ampere-style ``cp.async``.
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from .._plan import AttentionSchedule
+
 
 def uses_tensor_descriptors(target: AcceleratorTarget) -> bool:
     """Select the TMA kernel on exact NVIDIA SM120; HIP capability tuples are not CUDA."""
@@ -39,7 +41,7 @@ def select_sm120_attention_schedule(
     skip_dense_routing: bool,
     has_coarse_residual: bool,
     selected_key_rows: int,
-) -> tuple[int, int]:
+) -> AttentionSchedule:
     """Select measured D64 schedules; retain Q64/four warps for D128.
 
     Crossover checks cover 32/56 heads at 8k, 16k, and 32k rows. Small
@@ -48,14 +50,14 @@ def select_sm120_attention_schedule(
     Selected key rows are the rounded-down head average, including dense keys.
     """
     if head_dim != 64:
-        return 64, 4
+        return AttentionSchedule(64, 4)
     if skip_dense_routing:
         if min(query_rows, key_rows) >= 32768 and not has_coarse_residual:
-            return 128, 4
-        return 64, 4
+            return AttentionSchedule(128, 4)
+        return AttentionSchedule(64, 4)
     if min(query_rows, key_rows) >= 8192 and selected_key_rows >= 1024:
-        return 64, 2
-    return 64, 4
+        return AttentionSchedule(64, 2)
+    return AttentionSchedule(64, 4)
 
 
 def use_sm120_fused_preparation(head_dim: int, sequence_length: int) -> bool:

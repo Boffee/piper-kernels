@@ -5,6 +5,27 @@ reports hardware, software, Git state, shapes, kernel configuration, numerical q
 applicable, and consistently named timing phases. The support code in `lib/` is development-only;
 it is not part of the installed `piper_kernels` API.
 
+## Execution-plan and schedule metadata
+
+An execution plan records all choices for an operator invocation. A schedule records
+work organization, such as tile sizes, warps, pipeline stages, or chunk sizes. A plan
+may contain schedules or store their fields directly. The naming and ownership rules
+are documented in [contributor guidance](../AGENTS.md#execution-plans-and-schedules).
+
+Nested benchmark configurations use `execution_plan` for a complete plan and `schedule`
+for a separately measured schedule. Existing providers that report flat execution-plan
+fields continue to do so.
+
+The convention update renames the following JSON/JSONL fields; readers of older artifacts
+should use the historical names for those artifacts:
+
+| Runner | Previous field | Current field |
+| --- | --- | --- |
+| `benchmark_convrot_int8_conv3d.py` tuning candidates | `configuration.plan` | `configuration.schedule` |
+| `benchmark_convrot_int8_tail.py` | `plan` | `execution_plan` |
+| `benchmark_convrot_int8_small_m.py` | `plan`, `selected_plan`, `previous_plan`, `medium_plan` | `execution_plan`, `selected_execution_plan`, `previous_execution_plan`, `medium_execution_plan` |
+| `benchmark_convrot_int8_realistic.py` | `production_plan` | `production_execution_plan` |
+
 ## Common provider and timing model
 
 Use the same operator benchmark on CUDA and ROCm. Production dispatch selects the

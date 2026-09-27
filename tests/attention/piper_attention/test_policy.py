@@ -6,13 +6,11 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention._nvidia.policy import (
-    PiperAttentionExecutionPlan,
-    select_execution_plan,
-)
+from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
+from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 from piper_kernels.attention.piper_attention._nvidia.triton import (
-    _default_piper_attention_execution_plan,
     _prepare_piper_attention,
+    default_execution_plan,
 )
 
 _SM80 = AcceleratorTarget(backend="cuda", architecture="sm80")
@@ -39,7 +37,7 @@ def _select(
 def test_noncausal_d128_execution_plan_is_sequence_length_invariant(sequence: int) -> None:
     query = torch.empty((1, 8, sequence, 128), device="meta")
 
-    plan = _default_piper_attention_execution_plan(
+    plan = default_execution_plan(
         query,
         False,
         target=_SM120,
@@ -76,7 +74,7 @@ def test_sm120_causal_d128_load_schedule_uses_query_metadata(
 ) -> None:
     query = torch.empty((batch, heads, sequence, 128), device="meta")
 
-    plan = _default_piper_attention_execution_plan(query, True, target=_SM120)
+    plan = default_execution_plan(query, True, target=_SM120)
 
     # The short plan supplies all numerical choices and the three-stage launch.
     assert plan == replace(
@@ -93,7 +91,7 @@ def test_other_targets_retain_causal_d128_load_schedule(
 ) -> None:
     query = torch.empty((1, 16, sequence, 128), device="meta")
 
-    plan = _default_piper_attention_execution_plan(query, True, target=target)
+    plan = default_execution_plan(query, True, target=target)
 
     assert plan == _select(target, is_causal=True)
 
@@ -103,9 +101,7 @@ def test_other_targets_retain_causal_d128_load_schedule(
 @pytest.mark.parametrize("key_length", [4095, 4096, 4097, 131073])
 def test_d64_descriptors_depend_on_key_traversal_not_query_length(target, query_length, key_length):
     query = torch.empty((2, 6, query_length, 64), device="meta")
-    plan = _default_piper_attention_execution_plan(
-        query, False, target=target, key_length=key_length
-    )
+    plan = default_execution_plan(query, False, target=target, key_length=key_length)
     assert plan.use_tensor_descriptors is (target == _SM120 and key_length >= 4096)
     # The Gluon kernel issues its own copies and compiles one stage.
     pointer_stages = 1 if plan.attention_kernel == "gluon_async_copy" else 3
@@ -138,7 +134,7 @@ def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
     ragged: bool,
 ) -> None:
     query = torch.empty((1, 8, sequence, head_dim), device="meta")
-    plan = _default_piper_attention_execution_plan(query, is_causal, target=target)
+    plan = default_execution_plan(query, is_causal, target=target)
     assert plan.loop_licm is (target == _SM120 and head_dim == 64 and is_causal and ragged)
 
 

@@ -310,9 +310,10 @@ def launch_int8_matmul(
     second_bias: torch.Tensor | None,
     *,
     paired: bool,
-    plan: NvidiaExecutionPlan,
+    execution_plan: NvidiaExecutionPlan,
 ) -> None:
     """Launch one Gluon GEMM over ``[m, k]`` inputs and ``[n, k]`` weights."""
+    plan = execution_plan
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
     block_m, block_n, block_k = plan.matmul_block_m, plan.matmul_block_n, plan.matmul_block_k

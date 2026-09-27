@@ -38,8 +38,11 @@ from lib.tuning import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.piper_attention._nvidia import policy as piper_attention_policy
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention._nvidia._plan import (
+    ATTENTION_KERNELS,
+    PiperAttentionExecutionPlan,
+)
 
 
 def _validate_args(arguments: argparse.Namespace) -> None:
@@ -66,7 +69,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--attention-kernel",
-        choices=piper_attention_policy.ATTENTION_KERNELS,
+        choices=ATTENTION_KERNELS,
         nargs="+",
         help="attention implementations to compare; omitted retains production",
     )
@@ -75,8 +78,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: piper_attention_policy.PiperAttentionExecutionPlan,
-) -> tuple[piper_attention_policy.PiperAttentionExecutionPlan, ...]:
+    production_plan: PiperAttentionExecutionPlan,
+) -> tuple[PiperAttentionExecutionPlan, ...]:
     """Build an explicit bounded search around production policy."""
     axes = (
         tuning_axis(args.block_m, production_plan.block_m),
@@ -140,7 +143,7 @@ def _candidate_plans(
     return plans
 
 
-def _plan_name(plan: piper_attention_policy.PiperAttentionExecutionPlan) -> str:
+def _plan_name(plan: PiperAttentionExecutionPlan) -> str:
     load_path = "descriptor" if plan.use_tensor_descriptors else "pointer"
     loop_stages = plan.loop_num_stages if plan.loop_num_stages is not None else "default"
     licm = "licm" if plan.loop_licm else "no-licm"
@@ -158,7 +161,7 @@ def _plan_name(plan: piper_attention_policy.PiperAttentionExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: piper_attention_policy.PiperAttentionExecutionPlan,
+    plan: PiperAttentionExecutionPlan,
     inputs: AttentionInputs,
     *,
     config: AttentionConfig,
@@ -239,7 +242,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     )
     inputs = make_attention_inputs(shape, config=config, device=device)
     query, key, _ = inputs
-    production_plan = piper_attention_backend._default_piper_attention_execution_plan(
+    production_plan = piper_attention_backend.default_execution_plan(
         query,
         args.causal,
         target=target,

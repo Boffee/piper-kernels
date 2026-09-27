@@ -770,11 +770,16 @@ from piper_kernels._triton.targets import AcceleratorTarget
 query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
 assert _backend.select_attention_backend(query) is None
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
+from piper_kernels.attention.sparse_piper_attention._plan import AttentionSchedule
 assert policy.skip_dense_routing(64)
-assert policy.select_sm120_attention_schedule(
+schedule = policy.select_sm120_attention_schedule(
     64, 32768, 32768, skip_dense_routing=True,
     has_coarse_residual=False, selected_key_rows=32768,
-) == (128, 4)
+)
+assert isinstance(schedule, AttentionSchedule)
+assert (schedule.block_m, schedule.num_warps) == (128, 4)
+import piper_kernels.attention.sparse_piper_attention._plan as schedule_types
+assert schedule_types.__file__ in _backend.source_files()
 assert torch.equal(SparsePiperAttention((0.5,))(query, query, query, sparse_key_blocks=2), query)
 # Even a supported target cannot select absent optional implementations.
 AcceleratorTarget.from_device = lambda device: AcceleratorTarget("cuda", "sm120")

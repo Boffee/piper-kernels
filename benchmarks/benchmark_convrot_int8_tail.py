@@ -124,7 +124,7 @@ def _benchmark_shape(m: int, k: int, n: int, args: argparse.Namespace) -> dict[s
         json.dumps(
             {
                 "shape_mkn": (m, k, n),
-                "plan": plan.as_dict(),
+                "execution_plan": plan.as_dict(),
                 "group_size": group_size,
                 "exact_agreement": True,
                 "tail_rows": m % 128,

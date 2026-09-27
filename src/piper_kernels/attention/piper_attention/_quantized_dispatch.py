@@ -12,6 +12,7 @@ from . import _quantization, _validation
 from ._amd import gluon as amd_backend
 from ._amd import policy as amd_policy
 from ._amd import triton as amd_preparation
+from ._nvidia import _plan as nvidia_plan
 from ._nvidia import policy as nvidia_policy
 from ._nvidia import triton as nvidia_backend
 
@@ -33,6 +34,7 @@ def source_files() -> tuple[str, ...]:
         amd_policy,
         amd_preparation,
         nvidia_policy,
+        nvidia_plan,
         nvidia_backend,
     )
     return (__file__, *(module.__file__ for module in modules if module.__file__ is not None))
@@ -363,7 +365,7 @@ def prepare_quantized_context(
             value_mean=value_mean,
             key_length=key_length,
             is_causal=is_causal,
-            plan=plan,
+            execution_plan=plan,
             padded_kv=True,
         )
     return amd_backend.PreparedContext(
@@ -390,7 +392,7 @@ def launch_quantized_attention_into(
     batch, heads, rows, head_dim = output.shape
     shape = (batch, heads, rows, head_dim)
     if isinstance(context, nvidia_backend._PreparedPiperContext):
-        plan = context.plan
+        plan = context.execution_plan
         descriptor = (
             nvidia_backend._make_query_descriptor(query, plan.block_m)
             if plan.use_tensor_descriptors and plan.block_m == 128

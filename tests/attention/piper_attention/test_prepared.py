@@ -11,7 +11,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as backend
-from piper_kernels.attention.piper_attention._nvidia.policy import PiperAttentionExecutionPlan
+from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
 from piper_kernels.attention.piper_attention._validation import validate_output_buffer
 
 _QUERY_SHAPE = (2, 6, 65, 64)
@@ -52,7 +52,7 @@ def _prepared(
             value_mean=torch.empty((2, kv_heads, 64)),
             key_length=key_length,
             is_causal=False,
-            plan=plan,
+            execution_plan=plan,
         )
         query = backend._PreparedPiperQuery(
             data=torch.empty((2, heads, query_length, 64), dtype=torch.int8),
@@ -72,9 +72,7 @@ def _offset_output(device, dtype):
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 def test_fused_query_preparation_reuses_input_without_tensor_operations(device):
     query = torch.empty(_QUERY_SHAPE, device=device, dtype=torch.bfloat16)
-    plan = backend._default_piper_attention_execution_plan(
-        query, False, target=AcceleratorTarget("cuda", "sm89")
-    )
+    plan = backend.default_execution_plan(query, False, target=AcceleratorTarget("cuda", "sm89"))
 
     with _NoTensorOperations():
         prepared = backend._prepare_piper_query(
@@ -164,7 +162,9 @@ def test_query_tail_specialization_uses_key_mask_and_output_layout_without_tenso
     context, query = _prepared(query_length=query_rows, key_length=key_rows, block_m=128)
     context = replace(
         context,
-        plan=replace(context.plan, retain_query_tail_for_strided_output=retain_tail),
+        execution_plan=replace(
+            context.execution_plan, retain_query_tail_for_strided_output=retain_tail
+        ),
     )
     output = torch.empty(
         (2, query_rows, 6, 64) if strided else query.shape, device="meta", dtype=query.dtype
@@ -198,7 +198,9 @@ def test_strided_schedule_uses_only_output_and_query_metadata(
     context = replace(
         context,
         is_causal=True,
-        plan=replace(context.plan, strided_output_query_group=8, ragged_strided_output_maxnreg=168),
+        execution_plan=replace(
+            context.execution_plan, strided_output_query_group=8, ragged_strided_output_maxnreg=168
+        ),
     )
     output = torch.empty(query.shape, device="meta", dtype=query.dtype)
     if strided:
@@ -333,7 +335,7 @@ def test_query_preparation_rejects_unaligned_origin_before_tensor_operations(mon
 
     with _NoTensorOperations(), pytest.raises((TypeError, ValueError), match="global_row_offset"):
         backend._prepare_piper_query(
-            floating_query, 0.125, execution_plan=context.plan, global_row_offset=origin
+            floating_query, 0.125, execution_plan=context.execution_plan, global_row_offset=origin
         )
 
     guard.assert_not_called()

@@ -23,6 +23,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from . import _policy
+from ._plan import SageAttention2ppExecutionPlan
 
 # Triton 3.7 requires globals referenced inside JIT functions to be constexpr.
 _BLOCK_N = tl.constexpr(64)
@@ -656,12 +657,12 @@ def _make_attention_tensor_descriptors(
         return key_descriptor, value_descriptor
 
 
-def _default_sage_attention_2pp_execution_plan(
+def default_execution_plan(
     query: torch.Tensor,
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
-) -> _policy.SageAttention2ppExecutionPlan:
+) -> SageAttention2ppExecutionPlan:
     """Resolve the production plan used by both benchmark metadata and launch."""
     head_dim = query.shape[3]
     target = AcceleratorTarget.from_device(query.device) if target is None else target
@@ -686,7 +687,7 @@ class _PreparedSageAttention2pp:
     output: torch.Tensor
     key_length: int
     is_causal: bool
-    plan: _policy.SageAttention2ppExecutionPlan
+    execution_plan: SageAttention2ppExecutionPlan
 
 
 def _compute_kv_statistics(
@@ -779,7 +780,7 @@ def _prepare_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _policy.SageAttention2ppExecutionPlan,
+    execution_plan: SageAttention2ppExecutionPlan,
 ) -> _PreparedSageAttention2pp:
     """Quantize inputs and construct the selected attention specialization."""
     key_length = key.shape[2]
@@ -825,14 +826,14 @@ def _prepare_sage_attention_2pp(
         output=output,
         key_length=key_length,
         is_causal=is_causal,
-        plan=plan,
+        execution_plan=plan,
     )
 
 
 def _launch_sage_attention_2pp(prepared: _PreparedSageAttention2pp) -> torch.Tensor:
     """Launch only the fused attention recurrence on prepared quantized inputs."""
     batch, heads, query_length, head_dim = prepared.output.shape
-    plan = prepared.plan
+    plan = prepared.execution_plan
     with device_context(prepared.output.device):
         _sage_attention_2pp_kernel[(triton.cdiv(query_length, plan.block_m), heads, batch)](
             prepared.query,
@@ -871,13 +872,13 @@ def _run_sage_attention_2pp(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _policy.SageAttention2ppExecutionPlan | None = None,
+    execution_plan: SageAttention2ppExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run SageAttention2++ preprocessing and its fused recurrence."""
     plan = (
         execution_plan
         if execution_plan is not None
-        else _default_sage_attention_2pp_execution_plan(
+        else default_execution_plan(
             query,
             is_causal,
         )

@@ -12,8 +12,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from piper_kernels._triton import convrot as rotation
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage_attention_2pp import _policy as sage_policy
 from piper_kernels.attention.sage_attention_2pp import triton as sage
+from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import _generic
@@ -227,7 +227,7 @@ def test_attention_and_fusion_epilogue_launchers_own_context(launches):
             value_scale=value,
             key_length=64,
             is_causal=False,
-            plan=sage_policy.SageAttention2ppExecutionPlan(64, False, False),
+            execution_plan=SageAttention2ppExecutionPlan(64, False, False),
         )
         assert sage._launch_sage_attention_2pp(prepared) is prepared.output
         updates = SimpleNamespace(

@@ -7,6 +7,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
+from . import _plan
 from ._amd import policy as amd_policy
 from ._dtype import SUPPORTED_DTYPES
 from ._interfaces import (
@@ -141,7 +142,7 @@ def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
 
 def source_files() -> tuple[str, ...]:
     """Sources governing backend selection, policy, and shared NVIDIA arithmetic."""
-    paths = [__file__, nvidia_policy.__file__, amd_policy.__file__]
+    paths = [__file__, _plan.__file__, nvidia_policy.__file__, amd_policy.__file__]
     if nvidia_fragments is not None:
         paths.append(nvidia_fragments.__file__)
     return tuple(path for path in paths if path is not None)

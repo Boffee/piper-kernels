@@ -21,13 +21,14 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 from piper_kernels.attention.piper_attention._nvidia import gluon_async_copy as _gluon_async_copy
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
+from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _conservative_value_log_scale_bound,
-    _default_piper_attention_execution_plan,
     _launch_piper_attention,
     _prepare_piper_attention,
     _ptx_float32_to_uint8x4,
     _run_piper_attention,
+    default_execution_plan,
 )
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
@@ -55,16 +56,16 @@ def _sqnr_db(actual: torch.Tensor, reference: torch.Tensor) -> float:
     return float(10 * torch.log10(signal_energy / error_energy))
 
 
-def _on_triton(plan: _policy.PiperAttentionExecutionPlan) -> _policy.PiperAttentionExecutionPlan:
+def _on_triton(plan: PiperAttentionExecutionPlan) -> PiperAttentionExecutionPlan:
     """Return the same recurrence on the Triton kernel, dropping Gluon-only choices."""
     return replace(
         plan, attention_kernel="triton", max_registers=None, fuse_query_quantization=False
     )
 
 
-def _triton_plan(query: torch.Tensor, is_causal: bool) -> _policy.PiperAttentionExecutionPlan:
+def _triton_plan(query: torch.Tensor, is_causal: bool) -> PiperAttentionExecutionPlan:
     """Return the production plan for Triton-kernel controls, even where Gluon is default."""
-    return _on_triton(_default_piper_attention_execution_plan(query, is_causal))
+    return _on_triton(default_execution_plan(query, is_causal))
 
 
 pytestmark = [
@@ -345,9 +346,9 @@ def test_optimized_causal_traversal_matches_fully_masked_loop(
 def _sm89_plans(
     query: torch.Tensor,
     is_causal: bool,
-) -> tuple[_policy.PiperAttentionExecutionPlan, _policy.PiperAttentionExecutionPlan]:
+) -> tuple[PiperAttentionExecutionPlan, PiperAttentionExecutionPlan]:
     """Return the SM89 Gluon plan and the Triton plan with the same recurrence."""
-    gluon_plan = _default_piper_attention_execution_plan(
+    gluon_plan = default_execution_plan(
         query,
         is_causal,
         target=AcceleratorTarget(backend="cuda", architecture="sm89"),
@@ -585,7 +586,7 @@ def test_sm89_measured_schedule_clears_relative_quality_gate(
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     target = AcceleratorTarget(backend="cuda", architecture="sm89")
-    specialized_plan = _default_piper_attention_execution_plan(
+    specialized_plan = default_execution_plan(
         query,
         is_causal,
         target=target,
@@ -632,7 +633,7 @@ def test_derived_value_log_bound_skips_log_metadata() -> None:
     key = torch.randn(1, 1, 257, 128, device="cuda", dtype=torch.bfloat16)
     value = torch.randn_like(key)
     target = AcceleratorTarget(backend="cuda", architecture="sm89")
-    base_plan = _default_piper_attention_execution_plan(
+    base_plan = default_execution_plan(
         query,
         False,
         target=target,
@@ -767,7 +768,7 @@ def test_large_value_scale_multiplier_remains_finite() -> None:
     key[:, :, 0] = -1
     value = torch.ones_like(query)
     value[:, :, 0] = 40000
-    plan = _default_piper_attention_execution_plan(query, False)
+    plan = default_execution_plan(query, False)
 
     with torch.no_grad():
         prepared = _prepare_piper_attention(
@@ -813,7 +814,7 @@ def test_long_descriptor_path_matches_pointer_path(
     value = torch.randn_like(query)
     arguments = (query, key, value, 128**-0.5, False)
     descriptor_plan = replace(
-        _default_piper_attention_execution_plan(query, False),
+        default_execution_plan(query, False),
         derive_value_log_bound=derive_value_log_bound,
     )
     pointer_plan = replace(
@@ -848,7 +849,7 @@ def test_ragged_query_tail_falls_back_to_masked_pointer_load() -> None:
     query = torch.randn(1, 1, sequence, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    plan = _default_piper_attention_execution_plan(query, False)
+    plan = default_execution_plan(query, False)
 
     with torch.no_grad():
         prepared = _prepare_piper_attention(
@@ -951,7 +952,7 @@ def test_context_reused_with_new_queries_and_caller_outputs(
         ).transpose(1, 2),
     ]
     scale = head_dim**-0.5
-    plan = _default_piper_attention_execution_plan(queries[0], is_causal)
+    plan = default_execution_plan(queries[0], is_causal)
     with torch.no_grad():
         expected = [
             _run_piper_attention(query, key, value, scale, is_causal, execution_plan=plan)
@@ -991,7 +992,7 @@ def test_ragged_single_launch_replays_with_updated_queries(head_dim, is_causal) 
         value,
         head_dim**-0.5,
         is_causal,
-        execution_plan=_default_piper_attention_execution_plan(query, is_causal),
+        execution_plan=default_execution_plan(query, is_causal),
     )
     _launch_piper_attention(prepared)
     torch.cuda.synchronize()
@@ -1064,7 +1065,7 @@ def test_d64_public_descriptor_path_matches_pointer_preparation_and_graph_replay
         for operand in (query, key, value):
             operand.fill_(0.0 if contents == "zeros" else 0.5)
 
-    plan = _default_piper_attention_execution_plan(query, causal, key_length=key_rows)
+    plan = default_execution_plan(query, causal, key_length=key_rows)
     pointer_plan = replace(plan, use_tensor_descriptors=False, num_stages=3)
     descriptor_calls = []
     make_descriptors = _backend._make_key_value_descriptors

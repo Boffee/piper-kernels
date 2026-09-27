@@ -33,6 +33,7 @@ from .. import _quantization
 from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
 from . import gluon_async_copy as _gluon_async_copy
 from . import policy as _policy
+from ._plan import PiperAttentionExecutionPlan
 
 _BLOCK_N = 64
 _P_UINT8_RANGE = tl.constexpr(255.0)
@@ -838,13 +839,13 @@ def _make_query_descriptor(
         )
 
 
-def _default_piper_attention_execution_plan(
+def default_execution_plan(
     query: torch.Tensor,
     is_causal: bool,
     *,
     target: AcceleratorTarget | None = None,
     key_length: int | None = None,
-) -> _policy.PiperAttentionExecutionPlan:
+) -> PiperAttentionExecutionPlan:
     """Resolve production policy for preparation, benchmarks, and tuning."""
     head_dim = query.shape[3]
     target = AcceleratorTarget.from_device(query.device) if target is None else target
@@ -869,7 +870,7 @@ class _PreparedPiperContext:
     value_mean: torch.Tensor
     key_length: int
     is_causal: bool
-    plan: _policy.PiperAttentionExecutionPlan
+    execution_plan: PiperAttentionExecutionPlan
     padded_kv: bool = False
 
 
@@ -904,7 +905,7 @@ def _prepare_piper_context(
     value: torch.Tensor,
     *,
     is_causal: bool,
-    execution_plan: _policy.PiperAttentionExecutionPlan,
+    execution_plan: PiperAttentionExecutionPlan,
 ) -> _PreparedPiperContext:
     """Prepare validated K/V once, independently of Q and output storage."""
     batch, kv_heads, key_length, head_dim = key.shape
@@ -995,7 +996,7 @@ def _prepare_piper_context(
             value_mean=value_mean,
             key_length=key_length,
             is_causal=is_causal,
-            plan=plan,
+            execution_plan=plan,
         )
 
 
@@ -1003,7 +1004,7 @@ def _prepare_piper_query(
     query: torch.Tensor,
     scale: float,
     *,
-    execution_plan: _policy.PiperAttentionExecutionPlan,
+    execution_plan: PiperAttentionExecutionPlan,
     global_row_offset: int = 0,
 ) -> _PreparedPiperQuery:
     """Prepare Q using its K/V plan and a tile-aligned global origin.
@@ -1061,7 +1062,7 @@ def _prepare_piper_attention(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _policy.PiperAttentionExecutionPlan,
+    execution_plan: PiperAttentionExecutionPlan,
 ) -> _PreparedPiperAttention:
     """Prepare all operands and allocate output before timed or captured launches."""
     context = _prepare_piper_context(key, value, is_causal=is_causal, execution_plan=execution_plan)
@@ -1088,7 +1089,7 @@ def _launch_piper_attention_into(
     or permuted outer strides, with contiguous head features and no overlap.
     """
     batch, heads, query_length, head_dim = query.shape
-    plan = context.plan
+    plan = context.execution_plan
     rows = resolve_query_window(
         query_length,
         query_start=query_start,
@@ -1205,13 +1206,13 @@ def _run_piper_attention(
     scale: float,
     is_causal: bool,
     *,
-    execution_plan: _policy.PiperAttentionExecutionPlan | None = None,
+    execution_plan: PiperAttentionExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run Piper Attention preprocessing and its fused recurrence."""
     plan = (
         execution_plan
         if execution_plan is not None
-        else _default_piper_attention_execution_plan(
+        else default_execution_plan(
             query,
             is_causal,
             key_length=key.shape[2],
