@@ -34,11 +34,14 @@ except ModuleNotFoundError as error:
     nvidia_tma_gluon = None
 
 try:
+    from piper_kernels.attention.kernels.piper._nvidia import fragments as nvidia_fragments
+
     from ._nvidia import gluon_async_copy as nvidia_async_copy_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
     nvidia_async_copy_gluon = None
+    nvidia_fragments = None
 
 try:
     from ._amd import gluon as amd_gluon
@@ -137,8 +140,11 @@ def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
 
 
 def source_files() -> tuple[str, ...]:
-    """Sources governing backend selection and execution policy for compiler caches."""
-    return __file__, nvidia_policy.__file__, amd_policy.__file__
+    """Sources governing backend selection, policy, and shared NVIDIA arithmetic."""
+    paths = [__file__, nvidia_policy.__file__, amd_policy.__file__]
+    if nvidia_fragments is not None:
+        paths.append(nvidia_fragments.__file__)
+    return tuple(path for path in paths if path is not None)
 
 
 def require_attention_backend(query: torch.Tensor) -> AttentionBackend:

@@ -1,7 +1,10 @@
+from dataclasses import replace
+
 import pytest
 import torch
 from lib.attention import AttentionConfig
 from lib.providers import ProviderPhase
+from lib.tuning import UnsupportedTuningCandidateError
 from tune_piper_attention import (
     _candidate_plans,
     _make_candidate,
@@ -25,10 +28,10 @@ def _production_plan(*, is_causal: bool = False):
     )
 
 
-def _sm89_production_plan():
+def _sm89_production_plan(head_dim: int = 128):
     return select_execution_plan(
         _SM89,
-        head_dim=128,
+        head_dim=head_dim,
         is_causal=False,
         query_length=8192,
     )
@@ -47,6 +50,7 @@ def test_tuner_defaults_to_production_plan() -> None:
     assert arguments.use_packed_probability_conversion is None
     assert arguments.derive_value_log_bound is None
     assert arguments.optimize_causal_traversal is None
+    assert arguments.attention_kernel is None
     assert not hasattr(arguments, "reverse_causal_blocks")
 
 
@@ -61,6 +65,59 @@ def test_sm89_tuner_defaults_to_production_preparation() -> None:
     production_plan = _sm89_production_plan()
 
     assert _candidate_plans(_parse_args([]), production_plan) == (production_plan,)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_sm89_tuner_can_measure_the_triton_recurrence(head_dim: int) -> None:
+    production_plan = _sm89_production_plan(head_dim)
+
+    plans = _candidate_plans(_parse_args(["--attention-kernel", "triton"]), production_plan)
+
+    assert production_plan.attention_kernel == "gluon_async_copy"
+    assert [plan.attention_kernel for plan in plans] == ["triton"]
+    assert not plans[0].fuse_query_quantization
+    assert plans[0].max_registers is None
+
+
+def test_attention_kernel_axis_compares_both_implementations() -> None:
+    plans = _candidate_plans(
+        _parse_args(["--attention-kernel", "triton", "gluon_async_copy", "triton"]),
+        _sm89_production_plan(64),
+    )
+
+    assert [plan.attention_kernel for plan in plans] == ["triton", "gluon_async_copy"]
+    for plan in plans:
+        plan.validate_kernel()
+    assert not plans[0].fuse_query_quantization
+    assert plans[1].fuse_query_quantization
+
+
+def test_gluon_candidate_with_triton_tiling_is_unsupported() -> None:
+    plan = replace(_sm89_production_plan(), num_warps=8)
+    tensor = torch.empty((1, 1, 8, 128), device="meta")
+    candidate = _make_candidate(
+        plan,
+        (tensor, tensor, tensor),
+        config=AttentionConfig(dtype=torch.float16, scale=128**-0.5, seed=7),
+        target=_SM89,
+    )
+
+    assert candidate.name.startswith("gluon-regs232-")
+    with pytest.raises(UnsupportedTuningCandidateError, match="Gluon kernel requires"):
+        candidate.make_provider()
+
+
+def test_uncapped_gluon_candidate_name_has_no_register_field() -> None:
+    tensor = torch.empty((1, 1, 8, 64), device="meta")
+    candidate = _make_candidate(
+        _sm89_production_plan(64),
+        (tensor, tensor, tensor),
+        config=AttentionConfig(dtype=torch.float16, scale=64**-0.5, seed=7),
+        target=_SM89,
+    )
+
+    assert candidate.name.startswith("gluon-")
+    assert "regs" not in candidate.name
 
 
 def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:

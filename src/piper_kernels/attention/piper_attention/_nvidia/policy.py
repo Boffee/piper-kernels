@@ -1,6 +1,7 @@
 """NVIDIA execution planning for Piper Attention."""
 
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.scheduling import (
@@ -15,6 +16,7 @@ _SM120_CAUSAL_DESCRIPTOR_MIN_QUERY_LENGTH = 1024
 # floating-input path. Sixty-four full K64 tiles clear the measured crossover
 # even for a single query tile/head; the rule also covers rectangular attention.
 _SM120_D64_DESCRIPTOR_MIN_KEY_TILES = 64
+ATTENTION_KERNELS = ("triton", "gluon_async_copy")
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -24,7 +26,13 @@ def supports_target(target: AcceleratorTarget) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class PiperAttentionExecutionPlan:
-    """Host-side specialization and launch choices for one Piper invocation."""
+    """Host-side specialization and launch choices for one Piper invocation.
+
+    ``attention_kernel`` names the implementation independently of the target.
+    ``max_registers`` and ``fuse_query_quantization`` apply only to ``gluon_async_copy``.
+    ``unspecialized_value_stride`` quantizes V without specializing on its
+    key-length-dependent row stride.
+    """
 
     block_m: int
     grouped_qk: bool
@@ -41,8 +49,14 @@ class PiperAttentionExecutionPlan:
     output_ctas_per_sm: int = 0
     strided_output_query_group: int = 0
     ragged_strided_output_maxnreg: int | None = None
+    unspecialized_value_stride: bool = False
+    attention_kernel: Literal["triton", "gluon_async_copy"] = "triton"
+    max_registers: int | None = None
+    fuse_query_quantization: bool = False
 
     def __post_init__(self) -> None:
+        if self.attention_kernel not in ATTENTION_KERNELS:
+            raise ValueError("Piper Attention kernel must be triton or gluon_async_copy")
         if self.block_m not in BLOCK_M_VALUES:
             raise ValueError("Piper Attention block_m must be 64 or 128")
         if self.num_warps not in NUM_WARPS_VALUES:
@@ -55,6 +69,39 @@ class PiperAttentionExecutionPlan:
     def as_dict(self) -> dict[str, object]:
         """Return execution choices as serializable benchmark metadata."""
         return asdict(self)
+
+    def validate_kernel(self) -> None:
+        """Check implementation capabilities before preparation or tuner execution.
+
+        Tuning may construct unsupported combinations; validate them here so
+        the tuner can report those candidates without aborting the whole search.
+        """
+        if self.attention_kernel == "triton":
+            if self.fuse_query_quantization:
+                raise ValueError("fused query quantization requires the Gluon kernel")
+            if self.max_registers is not None:
+                raise ValueError("a register cap requires the Gluon kernel")
+            return
+        if (
+            self.num_warps != 4
+            or self.num_stages != 1
+            or self.grouped_qk
+            or self.split_pv_head_dim
+            or self.use_tensor_descriptors
+            or not self.derive_value_log_bound
+            or not self.use_packed_probability_conversion
+            or self.optimize_causal_traversal
+            or self.loop_num_stages is not None
+            or self.loop_licm
+            or self.retain_query_tail_for_strided_output
+            or self.strided_output_query_group
+            or self.ragged_strided_output_maxnreg is not None
+        ):
+            raise ValueError(
+                "the Gluon kernel requires Q64 or Q128 tiles on four warps, per-thread Q/K scales, "
+                "an unsplit PV product, pointer loads, a derived V log bound, and packed "
+                "probability codes, with no Triton loop or strided-output controls"
+            )
 
 
 def _generic_execution_plan(
@@ -77,22 +124,30 @@ def _generic_execution_plan(
     )
 
 
-def _sm89_execution_plan(
-    *,
-    head_dim: int,
-    is_causal: bool,
-) -> PiperAttentionExecutionPlan:
-    """Build the exact-SM89 plan, including its measured D128 schedule."""
-    noncausal_d128 = not is_causal and head_dim == 128
+def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
+    """Build the exact-SM89 plan measured on an RTX 4070 Ti SUPER.
+
+    Every mode runs the ``cp.async`` Gluon kernel with per-thread Q/K scales:
+    SM120's grouped scales raise the error against exact attention by 7-12% here.
+    D64 gives each warp 32 query rows and quantizes Q in the kernel prologue. D128
+    gives each warp 16 rows under a register cap that fits two CTAs per SM; there
+    the prologue would cost more than the Q preparation pass it replaces. V
+    quantization leaves the V row stride unspecialized, which keeps SM89 within
+    SM120's compile count and is also 3-5x faster here.
+    """
+    wide = head_dim == 128
     return PiperAttentionExecutionPlan(
-        block_m=64 if is_causal else 128,
+        block_m=64 if wide else 128,
         grouped_qk=False,
-        split_pv_head_dim=noncausal_d128,
+        split_pv_head_dim=False,
         use_tensor_descriptors=False,
-        num_stages=1 if noncausal_d128 else 3,
-        loop_num_stages=3 if noncausal_d128 else None,
-        loop_licm=noncausal_d128,
-        use_packed_probability_conversion=noncausal_d128,
+        derive_value_log_bound=True,
+        num_stages=1,
+        use_packed_probability_conversion=True,
+        unspecialized_value_stride=True,
+        attention_kernel="gluon_async_copy",
+        max_registers=232 if wide else None,
+        fuse_query_quantization=not wide,
     )
 
 
@@ -154,10 +209,7 @@ def select_execution_plan(
 ) -> PiperAttentionExecutionPlan:
     """Combine capability defaults with measured policy; omitted K length means self-attention."""
     if target.is_cuda_capability(8, 9):
-        return _sm89_execution_plan(
-            head_dim=head_dim,
-            is_causal=is_causal,
-        )
+        return _sm89_execution_plan(head_dim=head_dim)
     if target.is_cuda_capability(12, 0):
         return _sm120_execution_plan(
             head_dim=head_dim,

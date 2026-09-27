@@ -64,6 +64,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="use reverse CTA order with an unmasked prefix and masked boundary",
     )
+    parser.add_argument(
+        "--attention-kernel",
+        choices=piper_attention_policy.ATTENTION_KERNELS,
+        nargs="+",
+        help="attention implementations to compare; omitted retains production",
+    )
     return parser.parse_args(argv)
 
 
@@ -94,6 +100,7 @@ def _candidate_plans(
             args.optimize_causal_traversal,
             production_plan.optimize_causal_traversal,
         ),
+        tuning_axis(args.attention_kernel, production_plan.attention_kernel),
     )
     validate_tuning_candidate_count(axes, args.max_candidates)
     plans = tuple(
@@ -108,6 +115,14 @@ def _candidate_plans(
             use_packed_probability_conversion=use_packed_probability_conversion,
             derive_value_log_bound=derive_value_log_bound,
             optimize_causal_traversal=optimize_causal_traversal,
+            attention_kernel=attention_kernel,
+            # The register cap and in-kernel Q quantization exist only in the Gluon kernel.
+            max_registers=(
+                production_plan.max_registers if attention_kernel == "gluon_async_copy" else None
+            ),
+            fuse_query_quantization=(
+                production_plan.fuse_query_quantization and attention_kernel == "gluon_async_copy"
+            ),
         )
         for (
             block_m,
@@ -119,6 +134,7 @@ def _candidate_plans(
             use_packed_probability_conversion,
             derive_value_log_bound,
             optimize_causal_traversal,
+            attention_kernel,
         ) in product(*axes)
     )
     return plans
@@ -131,8 +147,11 @@ def _plan_name(plan: piper_attention_policy.PiperAttentionExecutionPlan) -> str:
     probability_conversion = "packed-p" if plan.use_packed_probability_conversion else "stock-p"
     value_metadata = "derived-vlog" if plan.derive_value_log_bound else "stored-vlog"
     causal_traversal = "optimized-causal" if plan.optimize_causal_traversal else "monolithic"
+    kernel = ""
+    if plan.attention_kernel == "gluon_async_copy":
+        kernel = "gluon-" if plan.max_registers is None else f"gluon-regs{plan.max_registers}-"
     return (
-        f"{load_path}-m{plan.block_m}-w{plan.num_warps}-s{plan.num_stages}-"
+        f"{kernel}{load_path}-m{plan.block_m}-w{plan.num_warps}-s{plan.num_stages}-"
         f"loop{loop_stages}-{licm}-{probability_conversion}-{value_metadata}-"
         f"{causal_traversal}"
     )
@@ -154,6 +173,10 @@ def _make_candidate(
             raise UnsupportedTuningCandidateError(
                 "the tensor-descriptor candidate currently targets SM12x"
             )
+        try:
+            plan.validate_kernel()
+        except ValueError as error:
+            raise UnsupportedTuningCandidateError(str(error)) from error
 
         def prepare() -> object:
             return piper_attention_backend._prepare_piper_attention(

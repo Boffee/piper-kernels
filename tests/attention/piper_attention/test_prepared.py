@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as backend
 from piper_kernels.attention.piper_attention._nvidia.policy import PiperAttentionExecutionPlan
 from piper_kernels.attention.piper_attention._validation import validate_output_buffer
@@ -66,6 +67,25 @@ def _prepared(
 def _offset_output(device, dtype):
     storage = torch.empty(prod(_QUERY_SHAPE) + 19, device=device, dtype=dtype)
     return storage[19:].view(_QUERY_SHAPE)
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_fused_query_preparation_reuses_input_without_tensor_operations(device):
+    query = torch.empty(_QUERY_SHAPE, device=device, dtype=torch.bfloat16)
+    plan = backend._default_piper_attention_execution_plan(
+        query, False, target=AcceleratorTarget("cuda", "sm89")
+    )
+
+    with _NoTensorOperations():
+        prepared = backend._prepare_piper_query(
+            query, 0.125, execution_plan=plan, global_row_offset=plan.block_m
+        )
+
+    assert prepared.data is query
+    assert prepared.scale is None
+    assert prepared.softmax_scale == 0.125
+    assert prepared.shape == query.shape
+    assert prepared.global_row_offset == plan.block_m
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])

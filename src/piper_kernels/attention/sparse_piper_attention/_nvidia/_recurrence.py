@@ -19,6 +19,11 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 
+from piper_kernels.attention.kernels.piper._nvidia.fragments import (
+    packed_float32_to_uint8,
+    rescale_packed,
+    uint8_int8_mma,
+)
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
 _LOG2_255 = 7.994353436858858
@@ -26,45 +31,6 @@ _LOG2_255 = 7.994353436858858
 _GL_BLOCK_N = gl.constexpr(TILE_ROWS)
 _GL_LOG2_255 = gl.constexpr(_LOG2_255)
 _GL_VALUE_LOG_BOUND_CORRECTION = gl.constexpr(0.086085)
-
-
-@gluon.jit
-def _uint8_int8_mma(lhs, rhs, accumulator):
-    gl.static_assert(lhs.dtype == gl.uint8, "lhs must be UINT8")
-    gl.static_assert(rhs.dtype == gl.int8, "rhs must be INT8")
-    lhs_bits = lhs.to(gl.int8, bitcast=True)
-    result = mma_v2(lhs_bits, rhs, accumulator)
-    return gl.inline_asm_elementwise(
-        asm="piper_attention_u8s8_dot_marker $0, $1;",
-        constraints="=r,r",
-        args=[result],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _packed_float32_to_uint8(values):
-    return gl.inline_asm_elementwise(
-        asm="""
-        {
-            .reg .s32 a, b, c, d;
-            .reg .b32 lo;
-            cvt.rzi.s32.f32 a, $1;
-            cvt.rzi.s32.f32 b, $2;
-            cvt.rzi.s32.f32 c, $3;
-            cvt.rzi.s32.f32 d, $4;
-            cvt.pack.sat.u8.s32.b32 lo, d, c, 0;
-            cvt.pack.sat.u8.s32.b32 $0, b, a, lo;
-        }
-        """,
-        constraints="=r,f,f,f,f",
-        args=[values],
-        dtype=gl.uint8,
-        is_pure=True,
-        pack=4,
-    )
 
 
 @gluon.jit
@@ -200,7 +166,7 @@ def piper_probability_pair(
         valid_keys = (paired_columns < _GL_BLOCK_N) | has_second
         shifted_scores = gl.where(valid_keys[None, :], shifted_scores, -float("inf"))
     probabilities = gl.exp2(shifted_scores)
-    probability_uint8 = _packed_float32_to_uint8(
+    probability_uint8 = packed_float32_to_uint8(
         probabilities * value_scale_multiplier[None, :] + 0.5
     )
     probability_uint8 = gl.convert_layout(probability_uint8, probability_layout)
@@ -212,143 +178,6 @@ def piper_probability_pair(
         next_max,
         old_weight,
         current_weight,
-    )
-
-
-@gluon.jit
-def _rescale_packed(partial, accumulator, old_weight, current_weight):
-    """Update the FP32 numerator, skipping rescaling when both row weights are one.
-
-    Validated for M64/D64 MMA[2,1] or [4,1], M128/D64 MMA[4,1], and
-    M64/D128 MMA[4,1]: register order A,A,B,B repeats within each 32-element
-    pack. Checking elements 0 and 2 covers both rows. No MMA instruction or
-    collective synchronization occurs inside the branch.
-    """
-    return gl.inline_asm_elementwise(
-        asm="""
-            {
-            .reg .pred keep_a, keep_b, keep_pair;
-            .reg .f32 product;
-            setp.eq.f32 keep_a, $96, 0f3f800000;
-            setp.eq.f32 keep_b, $98, 0f3f800000;
-            and.pred keep_pair, keep_a, keep_b;
-            @keep_pair bra PIPER_RESCALE_DONE;
-            mul.rn.f32 $0, $0, $96;
-            mul.rn.f32 $1, $1, $97;
-            mul.rn.f32 $2, $2, $98;
-            mul.rn.f32 $3, $3, $99;
-            mul.rn.f32 $4, $4, $100;
-            mul.rn.f32 $5, $5, $101;
-            mul.rn.f32 $6, $6, $102;
-            mul.rn.f32 $7, $7, $103;
-            mul.rn.f32 $8, $8, $104;
-            mul.rn.f32 $9, $9, $105;
-            mul.rn.f32 $10, $10, $106;
-            mul.rn.f32 $11, $11, $107;
-            mul.rn.f32 $12, $12, $108;
-            mul.rn.f32 $13, $13, $109;
-            mul.rn.f32 $14, $14, $110;
-            mul.rn.f32 $15, $15, $111;
-            mul.rn.f32 $16, $16, $112;
-            mul.rn.f32 $17, $17, $113;
-            mul.rn.f32 $18, $18, $114;
-            mul.rn.f32 $19, $19, $115;
-            mul.rn.f32 $20, $20, $116;
-            mul.rn.f32 $21, $21, $117;
-            mul.rn.f32 $22, $22, $118;
-            mul.rn.f32 $23, $23, $119;
-            mul.rn.f32 $24, $24, $120;
-            mul.rn.f32 $25, $25, $121;
-            mul.rn.f32 $26, $26, $122;
-            mul.rn.f32 $27, $27, $123;
-            mul.rn.f32 $28, $28, $124;
-            mul.rn.f32 $29, $29, $125;
-            mul.rn.f32 $30, $30, $126;
-            mul.rn.f32 $31, $31, $127;
-            PIPER_RESCALE_DONE:
-            cvt.rn.f32.s32 product, $32;
-            fma.rn.f32 $0, product, $128, $0;
-            cvt.rn.f32.s32 product, $33;
-            fma.rn.f32 $1, product, $129, $1;
-            cvt.rn.f32.s32 product, $34;
-            fma.rn.f32 $2, product, $130, $2;
-            cvt.rn.f32.s32 product, $35;
-            fma.rn.f32 $3, product, $131, $3;
-            cvt.rn.f32.s32 product, $36;
-            fma.rn.f32 $4, product, $132, $4;
-            cvt.rn.f32.s32 product, $37;
-            fma.rn.f32 $5, product, $133, $5;
-            cvt.rn.f32.s32 product, $38;
-            fma.rn.f32 $6, product, $134, $6;
-            cvt.rn.f32.s32 product, $39;
-            fma.rn.f32 $7, product, $135, $7;
-            cvt.rn.f32.s32 product, $40;
-            fma.rn.f32 $8, product, $136, $8;
-            cvt.rn.f32.s32 product, $41;
-            fma.rn.f32 $9, product, $137, $9;
-            cvt.rn.f32.s32 product, $42;
-            fma.rn.f32 $10, product, $138, $10;
-            cvt.rn.f32.s32 product, $43;
-            fma.rn.f32 $11, product, $139, $11;
-            cvt.rn.f32.s32 product, $44;
-            fma.rn.f32 $12, product, $140, $12;
-            cvt.rn.f32.s32 product, $45;
-            fma.rn.f32 $13, product, $141, $13;
-            cvt.rn.f32.s32 product, $46;
-            fma.rn.f32 $14, product, $142, $14;
-            cvt.rn.f32.s32 product, $47;
-            fma.rn.f32 $15, product, $143, $15;
-            cvt.rn.f32.s32 product, $48;
-            fma.rn.f32 $16, product, $144, $16;
-            cvt.rn.f32.s32 product, $49;
-            fma.rn.f32 $17, product, $145, $17;
-            cvt.rn.f32.s32 product, $50;
-            fma.rn.f32 $18, product, $146, $18;
-            cvt.rn.f32.s32 product, $51;
-            fma.rn.f32 $19, product, $147, $19;
-            cvt.rn.f32.s32 product, $52;
-            fma.rn.f32 $20, product, $148, $20;
-            cvt.rn.f32.s32 product, $53;
-            fma.rn.f32 $21, product, $149, $21;
-            cvt.rn.f32.s32 product, $54;
-            fma.rn.f32 $22, product, $150, $22;
-            cvt.rn.f32.s32 product, $55;
-            fma.rn.f32 $23, product, $151, $23;
-            cvt.rn.f32.s32 product, $56;
-            fma.rn.f32 $24, product, $152, $24;
-            cvt.rn.f32.s32 product, $57;
-            fma.rn.f32 $25, product, $153, $25;
-            cvt.rn.f32.s32 product, $58;
-            fma.rn.f32 $26, product, $154, $26;
-            cvt.rn.f32.s32 product, $59;
-            fma.rn.f32 $27, product, $155, $27;
-            cvt.rn.f32.s32 product, $60;
-            fma.rn.f32 $28, product, $156, $28;
-            cvt.rn.f32.s32 product, $61;
-            fma.rn.f32 $29, product, $157, $29;
-            cvt.rn.f32.s32 product, $62;
-            fma.rn.f32 $30, product, $158, $30;
-            cvt.rn.f32.s32 product, $63;
-            fma.rn.f32 $31, product, $159, $31;
-            }
-        """,
-        constraints=(
-            # $0..31: FP32 outputs, written before all inputs are consumed.
-            "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
-            "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
-            # $32..63: INT32 PV products.
-            "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-            # $64..95: FP32 accumulator inputs tied to the output registers.
-            "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,"
-            # $96..127: old row weights (elements 0 and 2 are $96 and $98).
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            # $128..159: current row weights.
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f"
-        ),
-        args=[partial, accumulator, old_weight[:, None], current_weight[:, None]],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=32,
     )
 
 
@@ -374,12 +203,12 @@ def piper_pv_pair(
     value = gl.convert_layout(value, value_layout)
     # Each product sum is bounded by 128 * 255 * 128 = 4,177,920 in magnitude:
     # safe in INT32 and exactly representable when converted to FP32.
-    partial = _uint8_int8_mma(
+    partial = uint8_int8_mma(
         probability_uint8,
         value,
         gl.zeros([block_m, head_dim], gl.int32, mma_layout),
     )
-    return _rescale_packed(partial, accumulator, old_weight, current_weight)
+    return rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
 @gluon.jit

@@ -31,6 +31,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 
 from .. import _quantization
 from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
+from . import gluon_async_copy as _gluon_async_copy
 from . import policy as _policy
 
 _BLOCK_N = 64
@@ -119,6 +120,14 @@ def _quantize_value_per_key_kernel(
         head_dim,
         block_n,
     )
+
+
+# The same launcher without specializing on the key-length-dependent V row
+# stride: one variant for every key length, and on SM89 3-5x faster than the
+# variant that vectorizes stores for a 16-byte-divisible stride.
+_quantize_value_per_key_unspecialized_kernel = triton.jit(
+    do_not_specialize=["key_length", "heads", "stride_od"],
+)(_quantize_value_per_key_kernel.fn)
 
 
 @triton.jit
@@ -866,14 +875,19 @@ class _PreparedPiperContext:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedPiperQuery:
-    """Quantized Q with its unpadded logical shape and original floating dtype."""
+    """Prepared Q with its unpadded logical shape and original floating dtype.
+
+    With fused query quantization, ``data`` is the floating-point Q, ``scale`` is None, and
+    ``softmax_scale`` is applied when the Gluon kernel quantizes each tile.
+    """
 
     data: torch.Tensor
-    scale: torch.Tensor
+    scale: torch.Tensor | None
     descriptor: TensorDescriptor | None
     shape: tuple[int, int, int, int]
     dtype: torch.dtype
     global_row_offset: int = 0
+    softmax_scale: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -899,10 +913,13 @@ def _prepare_piper_context(
         raise ValueError("split-PV Piper Attention requires head_dim=128")
     if plan.optimize_causal_traversal and not is_causal:
         raise ValueError("optimized causal traversal requires causal attention")
+    plan.validate_kernel()
     with device_context(key.device):
         install_uint8_int8_dot_hook()
         padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
-        storage_key_length = padded_key_length if plan.use_tensor_descriptors else key_length
+        # Descriptors and the Gluon kernel's cp.async copies read whole K64 tiles.
+        pad_storage = plan.use_tensor_descriptors or plan.attention_kernel == "gluon_async_copy"
+        storage_key_length = padded_key_length if pad_storage else key_length
 
         # A sequence-wide V mean is valid only for non-causal attention. Per-row
         # INT8 rounding would otherwise let future V rows perturb earlier outputs.
@@ -934,7 +951,12 @@ def _prepare_piper_context(
             device=value.device,
             dtype=torch.float16,
         )
-        _quantize_value_per_key_kernel[(triton.cdiv(key_length, _BLOCK_N), kv_heads, batch)](
+        value_kernel = (
+            _quantize_value_per_key_unspecialized_kernel
+            if plan.unspecialized_value_stride
+            else _quantize_value_per_key_kernel
+        )
+        value_kernel[(triton.cdiv(key_length, _BLOCK_N), kv_heads, batch)](
             value,
             value_mean,
             value_scale_multiplier,
@@ -992,11 +1014,30 @@ def _prepare_piper_query(
     batch, heads, query_length, head_dim = query.shape
     plan = execution_plan
     validate_query_offset(global_row_offset, block_rows=plan.block_m, name="global_row_offset")
+    plan.validate_kernel()
+    if plan.fuse_query_quantization:
+        # The Gluon kernel reads floating-point Q and quantizes each tile itself.
+        return _PreparedPiperQuery(
+            data=query,
+            scale=None,
+            descriptor=None,
+            shape=(batch, heads, query_length, head_dim),
+            dtype=query.dtype,
+            global_row_offset=global_row_offset,
+            softmax_scale=scale,
+        )
+    # The Gluon kernel copies whole query tiles; padded rows and scales are zero.
+    storage_query_length = (
+        int(triton.cdiv(query_length, plan.block_m)) * plan.block_m
+        if plan.attention_kernel == "gluon_async_copy"
+        else None
+    )
     with device_context(query.device):
         query_int8, query_scale = qk_quantization.prepare_query(
             query,
             scale,
             grouped=plan.grouped_qk,
+            storage_query_length=storage_query_length,
         )
         descriptor = (
             _make_query_descriptor(query_int8, plan.block_m)
@@ -1063,6 +1104,28 @@ def _launch_piper_attention_into(
         dtype=query.dtype,
         device=query.data.device,
     )
+    if plan.attention_kernel == "gluon_async_copy":
+        assert isinstance(context.key, torch.Tensor)
+        assert isinstance(context.value, torch.Tensor)
+        return _gluon_async_copy.launch_attention(
+            query.data,
+            context.key,
+            context.value,
+            query.scale,
+            context.key_scale,
+            context.value_scale_multiplier,
+            context.value_mean,
+            output,
+            softmax_scale=query.softmax_scale,
+            query_length=query.shape[2],
+            key_length=context.key_length,
+            is_causal=context.is_causal,
+            block_q=plan.block_m,
+            quantize_query=plan.fuse_query_quantization,
+            max_registers=plan.max_registers,
+            query_start=query_start,
+            global_query_start=query.global_row_offset + query_start,
+        )
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = query.descriptor is not None
     contiguous_output = output.is_contiguous()
