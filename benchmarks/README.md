@@ -1187,6 +1187,34 @@ On SM89, 8192-row windows are 0.9-3.0% faster than 4096-row windows, for 61-238 
 extra workspace, and still allocate 14-18% less than the materialized path from 100K
 tokens. SM89 therefore uses 8192 rows; the other targets keep 4096.
 
+On the same SM89 stack, the stages of the H3 block's materialized path took these CUDA-event
+medians in milliseconds (seven iterations after two warm-ups). The fused path runs the same
+input preparation and projections; its output operator chunks Q projection, attention, and
+output projection by query window:
+
+| Tokens | Input preparation | Q | K | Mean + V | Sparse attention | Output projection | Total |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8,192 | 0.36 | 2.34 | 2.30 | 2.23 | 2.47 | 2.39 | 12.09 |
+| 32,768 | 1.01 | 9.08 | 9.03 | 8.61 | 35.12 | 9.48 | 72.34 |
+| 100,000 | 2.86 | 27.50 | 27.89 | 26.47 | 332.44 | 28.86 | 446.02 |
+
+Sparse attention grows with the square of the sequence, from 20% of the block at 8K tokens
+to 75% at 100K, while the Q/K/V projections fall from 57% to 18%. With
+`benchmark_sparse_piper_projection.py --sequence 8192 32768 100000`, the SM89 Gluon
+projections reached 274-276 TOPS for Q, 273-275 TOPS for K, and 286-291 TOPS for V in CUDA
+graphs. `benchmark_sparse_piper.py --head-dim 128 --heads 56 --sequence 8192 32768 100000
+--ratios 0.25 1.0 --routing minmax --samples 7` measured sparse attention alone:
+
+| Tokens | 25% keep kernel | Routing | Full-keep kernel | BF16 Q/K/V preparation |
+|---:|---:|---:|---:|---:|
+| 8,192 | 2.33 ms, 206 TOPS | 0.67 ms | 8.72 ms, 221 TOPS | 1.37 ms |
+| 32,768 | 34.69 ms, 222 TOPS | 2.78 ms | 134.81 ms, 228 TOPS | 5.13 ms |
+| 100,000 | 324.49 ms, 221 TOPS | 13.69 ms | 1283.77 ms, 223 TOPS | 16.48 ms |
+
+Kernel TOPS count only the selected QK and PV work. The standalone call quantizes BF16 Q/K/V
+before attention; the fused projections emit those INT8 operands and routing summaries
+directly, so that preparation does not appear in the block.
+
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell

@@ -136,6 +136,7 @@ def _round_to_int8(values):
 
 @gluon.jit
 def _minmax(maximum_0, minimum_0, maximum_1, minimum_1):
+    """Combine (maximum, minimum) pairs in one reduction."""
     return gl.maximum(maximum_0, maximum_1), gl.minimum(minimum_0, minimum_1)
 
 
@@ -177,6 +178,7 @@ def _by_feature(accumulator):
 
 @gluon.jit
 def _rotated_group(groups, group: gl.constexpr, half_groups: gl.constexpr):
+    """Return one 16-feature group's split-half RoPE partner."""
     if group < half_groups:
         return -groups[group + half_groups]
     if group < 2 * half_groups:
@@ -337,22 +339,50 @@ def _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths:
 
 
 @gluon.jit
-def _summarize(values, valid, mean_pool_summary: gl.constexpr, mask_rows: gl.constexpr):
-    """Reduce [blocks, 64, D] rows to (primary, auxiliary) routing summaries."""
+def _summarize_blocks(
+    values,
+    positions,
+    features,
+    first_row,
+    row_end,
+    block_lengths_ptr,
+    mean_pool_summary: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
+    mask_rows: gl.constexpr,
+):
+    """Zero invalid rows and reduce each 64-row block to its routing summaries.
+
+    Returns the masked tile with (primary, auxiliary) summaries: the block mean twice, or
+    its maximum and minimum.
+    """
+    blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
+    rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
+    valid = _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths)
+    valid = valid[:, None] & (features >= 0)[None, :]
+    if mask_rows:
+        values = gl.where(valid, values, 0.0)
+    block_values = gl.reshape(values, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
+    block_valid = gl.reshape(valid, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
     if mean_pool_summary:
         if mask_rows:
-            valid_count = gl.sum(valid.to(gl.int32), axis=1)
-            mean = gl.sum(gl.where(valid, values, 0.0), axis=1) / valid_count  # pyright: ignore[reportOperatorIssue]
+            valid_count = gl.sum(block_valid.to(gl.int32), axis=1)
+            block_sum = gl.sum(gl.where(block_valid, block_values, 0.0), axis=1)
+            mean = block_sum / valid_count  # pyright: ignore[reportOperatorIssue]
         else:
-            mean = gl.sum(values, axis=1) / _GL_TILE_ROWS
-        return mean, mean
+            mean = gl.sum(block_values, axis=1) / _GL_TILE_ROWS
+        return values, mean, mean
     if mask_rows:
-        return gl.reduce(
-            (gl.where(valid, values, -float("inf")), gl.where(valid, values, float("inf"))),
+        maximum, minimum = gl.reduce(
+            (
+                gl.where(block_valid, block_values, -float("inf")),
+                gl.where(block_valid, block_values, float("inf")),
+            ),
             1,
             _minmax,
         )
-    return gl.reduce((values, values), 1, _minmax)
+    else:
+        maximum, minimum = gl.reduce((block_values, block_values), 1, _minmax)
+    return values, maximum, minimum
 
 
 @gluon.jit
@@ -445,25 +475,23 @@ def _query_kernel(
         mask_rows,
     )
 
-    blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
-    groups: gl.constexpr = _GL_BLOCK_M // _GL_QUERY_SCALE_ROWS
-    rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
-    valid_rows = _valid_rows(
-        rows, positions, query_sequence_end, block_lengths_ptr, mask_block_lengths
-    )
-    valid = valid_rows[:, None] & (features >= 0)[None, :]
-    if mask_rows:
-        values = gl.where(valid, values, 0.0)
-    maximum, minimum = _summarize(
-        gl.reshape(values, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM]),
-        gl.reshape(valid, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM]),
+    values, maximum, minimum = _summarize_blocks(
+        values,
+        positions,
+        features,
+        first_row,
+        query_sequence_end,
+        block_lengths_ptr,
         mean_pool_summary,
+        mask_block_lengths,
         mask_rows,
     )
     summary = maximum
     if not mean_pool_summary:
         summary += minimum
 
+    blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
+    groups: gl.constexpr = _GL_BLOCK_M // _GL_QUERY_SCALE_ROWS
     smoothed = gl.reshape(
         _signed_hadamard(values, features), [groups, _GL_QUERY_SCALE_ROWS, _GL_HEAD_DIM]
     )
@@ -562,21 +590,19 @@ def _key_kernel(
         mask_rows,
     )
 
-    tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
-    rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
-    valid_rows = _valid_rows(
-        rows, positions, logical_sequence_length, block_lengths_ptr, mask_block_lengths
-    )
-    valid = valid_rows[:, None] & (features >= 0)[None, :]
-    if mask_rows:
-        values = gl.where(valid, values, 0.0)
-    key_summary, key_aux = _summarize(
-        gl.reshape(values, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]),
-        gl.reshape(valid, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]),
+    values, key_summary, key_aux = _summarize_blocks(
+        values,
+        positions,
+        features,
+        first_row,
+        logical_sequence_length,
+        block_lengths_ptr,
         mean_pool_summary,
+        mask_block_lengths,
         mask_rows,
     )
 
+    tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
     smoothed = gl.reshape(_signed_hadamard(values, features), [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM])
     key_scale = (
         gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
@@ -724,15 +750,17 @@ def _value_kernel(
     )
 
 
-def _launch_rows(sequence_rows: int, launch) -> None:
+def _launch_rows(sequence_rows: int, launch, *, mask_block_lengths: bool) -> None:
     """Launch full 128-row tiles, then one masked tile for the remainder.
 
-    Heads vary fastest, so the programs that run together share their input rows in L2.
-    Grouping several row blocks per head, as the Triton kernels do, measured 1-3% slower.
+    Block lengths can end any K64 block early, so they mask every tile. Launch grids put
+    heads on the fastest axis, so the programs that run together share their input rows
+    in L2; grouping several row blocks per head, as the Triton kernels do, measured 1-3%
+    slower.
     """
     full_row_blocks = sequence_rows // _BLOCK_M
     if full_row_blocks:
-        launch(full_row_blocks, 0, mask_rows=False)
+        launch(full_row_blocks, 0, mask_rows=mask_block_lengths)
     if sequence_rows % _BLOCK_M:
         launch(1, full_row_blocks, mask_rows=True)
 
@@ -788,12 +816,11 @@ def project_query(
                 softmax_scale=softmax_scale,
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=mask_block_lengths,
-                # Block lengths can end any K64 block early, so they mask every tile.
-                mask_rows=mask_rows or mask_block_lengths,
+                mask_rows=mask_rows,
                 num_warps=_NUM_WARPS,
             )
 
-        _launch_rows(chunk_rows, launch)
+        _launch_rows(chunk_rows, launch, mask_block_lengths=mask_block_lengths)
 
 
 def project_key(
@@ -842,11 +869,11 @@ def project_key(
                 norm_epsilon=norm_epsilon,
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=mask_block_lengths,
-                mask_rows=mask_rows or mask_block_lengths,
+                mask_rows=mask_rows,
                 num_warps=_NUM_WARPS,
             )
 
-        _launch_rows(input_qdata.shape[1], launch)
+        _launch_rows(input_qdata.shape[1], launch, mask_block_lengths=mask_block_lengths)
 
 
 def project_value(
@@ -887,7 +914,7 @@ def project_value(
                 heads=heads,
                 mask_block_lengths=mask_block_lengths,
                 emit_block_mean=emit_block_mean,
-                mask_rows=mask_rows or mask_block_lengths,
+                mask_rows=mask_rows,
                 num_warps=_NUM_WARPS,
             )
 
@@ -903,4 +930,4 @@ def project_value(
             block_k=_MEAN_BLOCK_K,
             num_warps=_NUM_WARPS,
         )
-        _launch_rows(input_qdata.shape[1], launch)
+        _launch_rows(input_qdata.shape[1], launch, mask_block_lengths=mask_block_lengths)
