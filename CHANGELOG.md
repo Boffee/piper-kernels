@@ -52,6 +52,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   (52 vs 86 on a mixed workload; SM89 previously compiled 86): ragged query and key lengths
   reuse one kernel, and Q/K/V quantization no longer specializes on length-dependent strides.
   SM120 kernels are unchanged.
+- `benchmarks/tune_piper_attention.py` gains `--use-gluon-kernel`.
 
 ## [0.7.6rc1] - 2026-09-25
 
