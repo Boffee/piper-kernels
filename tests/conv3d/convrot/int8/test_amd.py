@@ -40,16 +40,20 @@ def test_preparation_matches_reference(channels, group_size, dtype):
     activation[:, :, 0, 0, 1] = -32
     activation = activation.transpose(3, 4)
     scale = torch.tensor(0.125, device="cuda")
-    plan = policy.preparation_plan(channels, 2 * 3 * 5 * 7, group_norm=False)
+    schedule = policy._preparation_schedule(channels, 2 * 3 * 5 * 7, group_norm=False)
     actual = shared._prepare_input(
-        activation, group_size, scale, plan=plan, accelerator_backend="hip"
+        activation, group_size, scale, schedule=schedule, accelerator_backend="hip"
     )
     expected = reference._prepare_input(activation, group_size, scale)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert actual.min() == -128
     assert actual.max() == 127
     actual = shared._prepare_input(
-        torch.zeros_like(activation), group_size, scale, plan=plan, accelerator_backend="hip"
+        torch.zeros_like(activation),
+        group_size,
+        scale,
+        schedule=schedule,
+        accelerator_backend="hip",
     )
     assert torch.count_nonzero(actual) == 0
 

@@ -7,7 +7,7 @@ choices, including whether to use an aligned weight descriptor.
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .._plan import ConvolutionExecutionPlan, ConvolutionPlan, PreparationPlan
+from .._plan import ConvolutionExecutionPlan, ConvolutionSchedule, PreparationSchedule
 
 # Historical SM120 crossovers, retained along with their channel/output predicates.
 _SM120_C256_LARGE_MIN_ROWS = 200_000
@@ -17,22 +17,22 @@ _SM120_C512_LARGE_MIN_ROWS = 5_000
 # SM89 measurements favor narrower tiles below 32 row tiles of 64.
 _SM8X_WIDE_MIN_ROWS = 2048
 
-_BASE_CONVOLUTION = ConvolutionPlan(64, 128, 128, 4, 3)
-_SM120_K64 = ConvolutionPlan(128, 128, 64, 4, 3)
-_SM120_K64_DEEP_PIPELINE = ConvolutionPlan(128, 128, 64, 4, 4)
-_SM120_K64_SHORT_PIPELINE = ConvolutionPlan(128, 128, 64, 4, 2)
-_SM120_LARGE_M = ConvolutionPlan(128, 128, 128, 8, 3)
-_SM120_LARGE_K = ConvolutionPlan(32, 128, 256, 8, 3)
-_SM120_NARROW_OUTPUT = ConvolutionPlan(64, 64, 64, 4, 3)
-_SM8X_SHORT = ConvolutionPlan(64, 64, 128, 4, 3)
-_SM8X_NARROW_OUTPUT = ConvolutionPlan(32, 32, 128, 2, 3)
+_BASE_CONVOLUTION = ConvolutionSchedule(64, 128, 128, 4, 3)
+_SM120_K64 = ConvolutionSchedule(128, 128, 64, 4, 3)
+_SM120_K64_DEEP_PIPELINE = ConvolutionSchedule(128, 128, 64, 4, 4)
+_SM120_K64_SHORT_PIPELINE = ConvolutionSchedule(128, 128, 64, 4, 2)
+_SM120_LARGE_M = ConvolutionSchedule(128, 128, 128, 8, 3)
+_SM120_LARGE_K = ConvolutionSchedule(32, 128, 256, 8, 3)
+_SM120_NARROW_OUTPUT = ConvolutionSchedule(64, 64, 64, 4, 3)
+_SM8X_SHORT = ConvolutionSchedule(64, 64, 128, 4, 3)
+_SM8X_NARROW_OUTPUT = ConvolutionSchedule(32, 32, 128, 2, 3)
 
-_PREPARE_DEFAULT = PreparationPlan(8, 8)
-_PREPARE_WIDE = PreparationPlan(64, 4)
-_PREPARE_MEDIUM = PreparationPlan(32, 4)
-_PREPARE_SHORT = PreparationPlan(16, 4)
-_PREPARE_MEDIUM_8_WARPS = PreparationPlan(32, 8)
-_PREPARE_SHORT_8_WARPS = PreparationPlan(16, 8)
+_PREPARE_DEFAULT = PreparationSchedule(8, 8)
+_PREPARE_WIDE = PreparationSchedule(64, 4)
+_PREPARE_MEDIUM = PreparationSchedule(32, 4)
+_PREPARE_SHORT = PreparationSchedule(16, 4)
+_PREPARE_MEDIUM_8_WARPS = PreparationSchedule(32, 8)
+_PREPARE_SHORT_8_WARPS = PreparationSchedule(16, 8)
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -48,7 +48,7 @@ def _sm120_use_weight_descriptor(
     )
 
 
-def _sm120_convolution_plan(channels: int, outputs: int, rows: int) -> ConvolutionPlan:
+def _sm120_convolution_schedule(channels: int, outputs: int, rows: int) -> ConvolutionSchedule:
     """Select a complete historical SM120 convolution schedule."""
     if channels == 128:
         return _SM120_K64
@@ -67,14 +67,14 @@ def _sm120_convolution_plan(channels: int, outputs: int, rows: int) -> Convoluti
     return _SM120_NARROW_OUTPUT if outputs <= 64 else _BASE_CONVOLUTION
 
 
-def _sm8x_convolution_plan(outputs: int, rows: int) -> ConvolutionPlan:
+def _sm8x_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
     """Select one of three measured SM8x tiles from output width and rows."""
     if outputs <= 64:
         return _SM8X_NARROW_OUTPUT
     return _BASE_CONVOLUTION if rows >= _SM8X_WIDE_MIN_ROWS else _SM8X_SHORT
 
 
-def preparation_plan(channels: int, rows: int, *, group_norm: bool) -> PreparationPlan:
+def _preparation_schedule(channels: int, rows: int, *, group_norm: bool) -> PreparationSchedule:
     """Select preparation independently of output dimensions for both target families.
 
     Preparation is bandwidth-bound; no measured SM89 tile beat SM120's schedule.
@@ -100,7 +100,7 @@ def select_execution_plan(
     output_height: int,
     weight_aligned: bool,
     group_norm: bool,
-    convolution_plan: ConvolutionPlan | None = None,
+    convolution_schedule: ConvolutionSchedule | None = None,
 ) -> ConvolutionExecutionPlan:
     """Resolve preparation, convolution, and descriptor choices once before execution.
 
@@ -110,17 +110,17 @@ def select_execution_plan(
     if not supports_target(target):
         raise ValueError(f"ConvRot INT8 convolution has no NVIDIA policy for {target}")
     sm8x = target.is_cuda_capability(8)
-    if convolution_plan is None:
-        convolution_plan = (
-            _sm8x_convolution_plan(outputs, output_rows)
+    if convolution_schedule is None:
+        convolution_schedule = (
+            _sm8x_convolution_schedule(outputs, output_rows)
             if sm8x
-            else _sm120_convolution_plan(channels, outputs, output_rows)
+            else _sm120_convolution_schedule(channels, outputs, output_rows)
         )
     return ConvolutionExecutionPlan(
-        preparation=preparation_plan(channels, input_rows, group_norm=group_norm),
-        convolution=convolution_plan,
+        preparation=_preparation_schedule(channels, input_rows, group_norm=group_norm),
+        convolution=convolution_schedule,
         use_weight_descriptor=not sm8x
         and _sm120_use_weight_descriptor(
-            channels, outputs, output_height, convolution_plan.block_n, aligned=weight_aligned
+            channels, outputs, output_height, convolution_schedule.block_n, aligned=weight_aligned
         ),
     )

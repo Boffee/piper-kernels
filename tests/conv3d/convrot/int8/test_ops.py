@@ -319,7 +319,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
         1e-6,
         64,
         torch.tensor(0.02, device="cuda"),
-        plan=policy.preparation_plan(128, 2 * 33 * 35, group_norm=True),
+        schedule=policy._preparation_schedule(128, 2 * 33 * 35, group_norm=True),
         accelerator_backend=target.backend,
     )
     expected = reference._prepare_group_norm_silu_input(

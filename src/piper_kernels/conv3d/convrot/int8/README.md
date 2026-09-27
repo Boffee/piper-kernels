@@ -40,6 +40,8 @@ vendor implementation; `_nvidia/` and `_amd/` own target support and launch poli
 | `triton.py` | Run shared preparation and convolution kernels using the selected plan. |
 
 Preparation uses input rows; convolution uses output rows after padding and stride.
+`PreparationSchedule` and `ConvolutionSchedule` describe individual kernel launches;
+`ConvolutionExecutionPlan` combines those schedules with the weight-load choice.
 Plans contain concrete choices and carry no architecture flags or policy callbacks.
 The tuner supplies an explicit convolution tile to the same selector, retaining
 production preparation and recomputing descriptor eligibility for that tile.

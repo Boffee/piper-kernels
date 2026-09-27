@@ -32,7 +32,7 @@ from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
 )
 def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
     policy = amd_policy if target.backend == "hip" else nvidia_policy
-    plan = policy.select_execution_plan(
+    schedule = policy.select_execution_plan(
         AcceleratorTarget.from_compiler_target(target),
         channels=channels,
         outputs=128,
@@ -76,22 +76,22 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
             "stride_frames": 1,
             "stride_height": 1,
             "stride_width": 1,
-            "block_m": plan.block_m,
-            "block_n": plan.block_n,
-            "block_k": plan.block_k,
+            "block_m": schedule.block_m,
+            "block_n": schedule.block_n,
+            "block_k": schedule.block_k,
             "bias_stride": 2,
             "has_bias": True,
             "has_residual": True,
             "symmetric_spatial_padding": True,
             "right_spatial_padding": False,
             "use_weight_descriptor": False,
-            "loop_num_stages": plan.num_stages,
+            "loop_num_stages": schedule.num_stages,
         },
     )
     compiled = triton.compile(
         source,
         target=target,
-        options={"num_warps": plan.num_warps, "num_stages": plan.num_stages},
+        options={"num_warps": schedule.num_warps, "num_stages": schedule.num_stages},
     )
     if target.backend == "hip":
         assert "v_wmma_i32" in compiled.asm["amdgcn"]
@@ -107,7 +107,7 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
 def test_amd_preparation_compiles_without_intermediate_rounding(
     architecture, channels, dtype, fused
 ):
-    plan = amd_policy.preparation_plan(channels, 1024, group_norm=fused)
+    schedule = amd_policy._preparation_schedule(channels, 1024, group_norm=fused)
     signature = {
         "input_ptr": f"*{dtype}",
         "output_ptr": "*i8",
@@ -122,7 +122,7 @@ def test_amd_preparation_compiles_without_intermediate_rounding(
         "channels": channels,
         "group_size": 64,
         "accelerator_backend": "hip",
-        "block_m": plan.block_m,
+        "block_m": schedule.block_m,
     }
     if fused:
         signature.update(
@@ -143,7 +143,7 @@ def test_amd_preparation_compiles_without_intermediate_rounding(
         constexprs=constants,
     )
     compiled = triton.compile(
-        source, target=GPUTarget("hip", architecture, 32), options={"num_warps": plan.num_warps}
+        source, target=GPUTarget("hip", architecture, 32), options={"num_warps": schedule.num_warps}
     )
     assert compiled.asm["hsaco"]
     assert "arith.truncf" not in compiled.asm["ttir"]

@@ -6,7 +6,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from ._plan import ConvolutionExecutionPlan, ConvolutionPlan
+from ._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 
 
 class ConvolutionPolicy(Protocol):
@@ -23,7 +23,7 @@ class ConvolutionPolicy(Protocol):
         output_height: int,
         weight_aligned: bool,
         group_norm: bool,
-        convolution_plan: ConvolutionPlan | None = None,
+        convolution_schedule: ConvolutionSchedule | None = None,
     ) -> ConvolutionExecutionPlan: ...
 
 

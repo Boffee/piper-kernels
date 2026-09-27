@@ -7,7 +7,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._interfaces import ConvolutionPolicy
-from ._plan import ConvolutionExecutionPlan, ConvolutionPlan
+from ._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 from ._validation import _output_shape
 
 
@@ -21,7 +21,7 @@ def default_execution_plan(
     symmetric_spatial_padding: bool,
     right_spatial_padding: bool,
     target: AcceleratorTarget | None = None,
-    convolution_plan: ConvolutionPlan | None = None,
+    convolution_schedule: ConvolutionSchedule | None = None,
 ) -> ConvolutionExecutionPlan:
     """Use production policy, with explicit target/tile overrides for offline tuning."""
     target = AcceleratorTarget.from_device(input.device) if target is None else target
@@ -39,5 +39,5 @@ def default_execution_plan(
         output_height=output_shape[3],
         weight_aligned=weight_qdata.data_ptr() % 16 == 0,
         group_norm=group_norm,
-        convolution_plan=convolution_plan,
+        convolution_schedule=convolution_schedule,
     )

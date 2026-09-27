@@ -27,7 +27,7 @@ from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
 from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
 from piper_kernels.conv3d.convrot.int8._interfaces import ConvolutionPolicy
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
-from piper_kernels.conv3d.convrot.int8._plan import ConvolutionExecutionPlan, ConvolutionPlan
+from piper_kernels.conv3d.convrot.int8._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
@@ -276,11 +276,11 @@ def _benchmark_shape(
         activation,
         group_size,
         weight.act_per_tensor_scale,
-        plan=production_plan.preparation,
+        schedule=production_plan.preparation,
         accelerator_backend=target.backend,
     )
     candidates = (
-        ConvolutionPlan(m, n, k, warps, stages)
+        ConvolutionSchedule(m, n, k, warps, stages)
         for m, n, k, warps in (
             (32, 64, 64, 4),
             (32, 64, 128, 4),
@@ -306,8 +306,8 @@ def _benchmark_shape(
         execution_plan=production_plan,
         **flags,
     )
-    for plan in candidates:
-        candidate = execution_plan_for(convolution_plan=plan)
+    for schedule in candidates:
+        candidate = execution_plan_for(convolution_schedule=schedule)
 
         def run(candidate: ConvolutionExecutionPlan = candidate) -> torch.Tensor:
             return shared._conv3d_prepared(
@@ -337,13 +337,13 @@ def _benchmark_shape(
                     **configuration,
                     "operation": "conv3d",
                     "phase": "prepared_execution",
-                    "plan": plan._asdict(),
+                    "plan": schedule._asdict(),
                 },
                 timings=timing,
                 environment=environment,
             )
         )
-        print(f"{shape} {plan}: graph {timing.graph.display()} ms", flush=True)
+        print(f"{shape} {schedule}: graph {timing.graph.display()} ms", flush=True)
     return records
 
 

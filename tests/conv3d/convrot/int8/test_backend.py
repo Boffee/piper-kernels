@@ -13,7 +13,7 @@ from piper_kernels.conv3d.convrot.int8 import _backend, _ops, reference
 from piper_kernels.conv3d.convrot.int8._amd import policy as amd
 from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia
-from piper_kernels.conv3d.convrot.int8._plan import ConvolutionPlan
+from piper_kernels.conv3d.convrot.int8._plan import ConvolutionSchedule
 from piper_kernels.specializations.minimax_h3_vae.conv3d import _compile
 
 _nvidia_plan = partial(
@@ -239,8 +239,8 @@ def test_tuning_tile_recomputes_descriptor_eligibility(architecture, aligned, bl
         right_spatial_padding=False,
     )
     production = select()
-    tile = ConvolutionPlan(64, block_n, 128, 4, 3)
-    candidate = select(convolution_plan=tile)
+    tile = ConvolutionSchedule(64, block_n, 128, 4, 3)
+    candidate = select(convolution_schedule=tile)
     assert candidate.convolution == tile
     assert candidate.preparation == production.preparation
     assert not production.use_weight_descriptor
@@ -281,10 +281,10 @@ def test_amd_policy_rejects_unsupported_platform(monkeypatch):
 @pytest.mark.parametrize("channels", [64, 128, 256, 512, 1024, 2048, 4096])
 def test_amd_preparation_bounds_rotation_tile_and_never_uses_descriptors(channels):
     for fused in (False, True):
-        plan = amd.preparation_plan(channels, 32768, group_norm=fused)
-        assert plan.block_m * channels <= 4096
-        assert plan.block_m > 0
-        assert plan == amd.preparation_plan(channels, 16, group_norm=fused)
+        schedule = amd._preparation_schedule(channels, 32768, group_norm=fused)
+        assert schedule.block_m * channels <= 4096
+        assert schedule.block_m > 0
+        assert schedule == amd._preparation_schedule(channels, 16, group_norm=fused)
     assert not RDNA4(channels=channels, outputs=256, output_height=256).use_weight_descriptor
 
 
