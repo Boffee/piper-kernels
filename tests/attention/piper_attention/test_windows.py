@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.piper_attention._nvidia import policy
 from piper_kernels.attention.piper_attention._nvidia import triton as backend
 
 
@@ -25,10 +26,20 @@ pytestmark = [
 ]
 
 
-def _operands(head_dim, causal, descriptors, *, optimize_causal=None):
-    if descriptors and torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("tensor descriptor window coverage requires SM120")
-    block_m = 64 if causal else 128
+def _operands(head_dim, causal, descriptors, *, optimize_causal=None, kernel="triton"):
+    if kernel == "gluon_async_copy":
+        # Exercise the actual SM89 plan on every supported NVIDIA test device.
+        plan = policy.select_execution_plan(
+            AcceleratorTarget("cuda", "sm89"),
+            head_dim=head_dim,
+            is_causal=causal,
+            query_length=1,
+        )
+        block_m = plan.block_m
+    else:
+        if descriptors and torch.cuda.get_device_capability() != (12, 0):
+            pytest.skip("tensor descriptor window coverage requires SM120")
+        block_m = 64 if causal else 128
     sequence = 2 * block_m + 17
     torch.manual_seed(529)
     query = torch.randn(2, sequence, 6, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -37,18 +48,16 @@ def _operands(head_dim, causal, descriptors, *, optimize_causal=None):
         2, sequence if causal else sequence + 31, 2, head_dim, device="cuda", dtype=query.dtype
     ).transpose(1, 2)
     value = torch.randn_like(key)
-    plan = backend._default_piper_attention_execution_plan(query, causal)
-    if plan.use_gluon_kernel:
-        # The Gluon kernel always stops causal rows at the diagonal.
-        if optimize_causal:
-            pytest.skip("the Gluon kernel has a single causal traversal")
-        return query, key, value, replace(plan, block_m=block_m)
-    plan = replace(
-        plan,
-        block_m=block_m,
-        use_tensor_descriptors=descriptors,
-        optimize_causal_traversal=causal if optimize_causal is None else optimize_causal,
-    )
+    if kernel == "triton":
+        plan = replace(
+            backend._default_piper_attention_execution_plan(query, causal),
+            attention_kernel="triton",
+            max_registers=None,
+            fuse_query_quantization=False,
+            block_m=block_m,
+            use_tensor_descriptors=descriptors,
+            optimize_causal_traversal=causal if optimize_causal is None else optimize_causal,
+        )
     return query, key, value, plan
 
 
@@ -79,23 +88,27 @@ def _guarded_output(rows, head_dim, layout):
 
 
 @pytest.mark.parametrize(
-    ("head_dim", "causal", "descriptors", "optimize_causal"),
+    ("head_dim", "causal", "descriptors", "optimize_causal", "kernel"),
     [
-        (64, False, False, False),
-        (64, False, True, False),
-        (64, True, False, False),
-        (64, True, False, True),
-        (64, True, True, True),
-        (128, False, False, False),
-        (128, False, True, False),
-        (128, True, True, True),
+        (64, False, False, False, "triton"),
+        (64, False, True, False, "triton"),
+        (64, True, False, False, "triton"),
+        (64, True, False, True, "triton"),
+        (64, True, True, True, "triton"),
+        (128, False, False, False, "triton"),
+        (128, False, True, False, "triton"),
+        (128, True, True, True, "triton"),
+        (64, False, False, False, "gluon_async_copy"),
+        (64, True, False, False, "gluon_async_copy"),
+        (128, False, False, False, "gluon_async_copy"),
+        (128, True, False, False, "gluon_async_copy"),
     ],
 )
 def test_query_windows_and_independent_chunks_match_full_attention(
-    head_dim, causal, descriptors, optimize_causal
+    head_dim, causal, descriptors, optimize_causal, kernel
 ):
     query, key, value, plan = _operands(
-        head_dim, causal, descriptors, optimize_causal=optimize_causal
+        head_dim, causal, descriptors, optimize_causal=optimize_causal, kernel=kernel
     )
     block_m = plan.block_m
     with torch.no_grad():
@@ -148,11 +161,20 @@ def test_query_windows_and_independent_chunks_match_full_attention(
 
 
 @pytest.mark.parametrize(
-    ("head_dim", "causal", "descriptors"),
-    [(64, True, False), (64, False, True), (64, True, True), (128, False, True)],
+    ("head_dim", "causal", "descriptors", "kernel"),
+    [
+        (64, True, False, "triton"),
+        (64, False, True, "triton"),
+        (64, True, True, "triton"),
+        (128, False, True, "triton"),
+        (64, False, False, "gluon_async_copy"),
+        (64, True, False, "gluon_async_copy"),
+        (128, False, False, "gluon_async_copy"),
+        (128, True, False, "gluon_async_copy"),
+    ],
 )
-def test_window_graph_replay_uses_live_query_storage(head_dim, causal, descriptors):
-    query, key, value, plan = _operands(head_dim, causal, descriptors)
+def test_window_graph_replay_uses_live_query_storage(head_dim, causal, descriptors, kernel):
+    query, key, value, plan = _operands(head_dim, causal, descriptors, kernel=kernel)
     context = backend._prepare_piper_context(key, value, is_causal=causal, execution_plan=plan)
     query_suffix = backend._prepare_piper_query(
         query[:, :, plan.block_m :],

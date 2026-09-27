@@ -10,6 +10,8 @@ here are part of preparation or attention, not implicit input validation.
 - `_amd/`: ROCm RDNA4 (`gfx1200`/`gfx1201`) Gluon attention and packed V preparation.
 - `_quantization.py`: shared FP32 K/V statistics and per-token V quantization.
 - `attention/kernels/piper/_amd/`: shared dense/sparse AMD matrix fragments.
+- `attention/kernels/piper/_nvidia/`: shared dense/sparse NVIDIA mixed-sign MMA,
+  packed probability conversion, and accumulator rescaling.
 
 For opt-in Q/K/V and output-projection fusion, see
 [ConvRot INT8 projection fusion](../../fusions/convrot_int8_piper/README.md).
@@ -57,6 +59,10 @@ two CTAs share an SM. Only the final K64 tile carries masks, plus the diagonal t
 before it for causal Q128 tiles, so ragged lengths reuse one compiled kernel. Causal
 grids start with the longest query rows. Query windows and strided outputs follow the
 same contract as the Triton kernel.
+
+The execution plan names the implementation with `attention_kernel` (`triton` or
+`gluon_async_copy`) and owns its capability checks. The offline tuner accepts
+`--attention-kernel triton gluon_async_copy` to compare both implementations.
 
 Selection uses host metadata only. See [_nvidia/policy.py](_nvidia/policy.py) for
 launch choices and the [benchmark guide](../../../../benchmarks/README.md#attention-tuning-workload-anchors)

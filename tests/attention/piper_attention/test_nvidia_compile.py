@@ -98,7 +98,7 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
         is_causal=causal,
         query_length=129,
     )
-    assert plan.use_gluon_kernel
+    assert plan.attention_kernel == "gluon_async_copy"
     constants = {
         "head_groups": 3,
         "head_dim": head_dim,
@@ -108,6 +108,8 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
         "full_query": full_launch,
         "contiguous_output": full_launch,
     }
+    if plan.fuse_query_quantization:
+        constants["query_scale_ptr"] = None
     signature = {
         name: "i32" for name in _dense_piper_attention_kernel.arg_names if name not in constants
     }
@@ -115,7 +117,7 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
         query_ptr="*bf16" if plan.fuse_query_quantization else "*i8",
         key_ptr="*i8",
         value_ptr="*i8",
-        query_scale_ptr="*fp32",
+        query_scale_ptr="constexpr" if plan.fuse_query_quantization else "*fp32",
         key_scale_ptr="*fp32",
         multiplier_ptr="*fp32",
         value_mean_ptr="*fp32",
@@ -128,7 +130,8 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
     aligned = [
         name
         for name in signature
-        if name.endswith(("_ptr", "_storage")) or name.startswith("stride_q")
+        if name not in constants
+        and (name.endswith(("_ptr", "_storage")) or name.startswith("stride_q"))
     ]
     attrs = {
         (_dense_piper_attention_kernel.arg_names.index(name),): [["tt.divisibility", 16]]

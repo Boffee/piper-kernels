@@ -857,37 +857,6 @@ def _default_piper_attention_execution_plan(
     )
 
 
-def _check_gluon_plan(plan: _policy.PiperAttentionExecutionPlan) -> None:
-    """Reject plans that mix Gluon-only and Triton-only launch choices."""
-    if not plan.use_gluon_kernel:
-        if plan.fuse_query_quantization:
-            raise ValueError("fused query quantization requires the Gluon kernel")
-        if plan.max_registers is not None:
-            raise ValueError("a register cap requires the Gluon kernel")
-        return
-    if (
-        plan.block_m not in _gluon_async_copy.BLOCK_Q_VALUES
-        or plan.num_warps != 4
-        or plan.num_stages != 1
-        or plan.grouped_qk
-        or plan.split_pv_head_dim
-        or plan.use_tensor_descriptors
-        or not plan.derive_value_log_bound
-        or not plan.use_packed_probability_conversion
-        or plan.optimize_causal_traversal
-        or plan.loop_num_stages is not None
-        or plan.loop_licm
-        or plan.retain_query_tail_for_strided_output
-        or plan.strided_output_query_group
-        or plan.ragged_strided_output_maxnreg is not None
-    ):
-        raise ValueError(
-            "the Gluon kernel requires Q64 or Q128 tiles on four warps, per-thread Q/K scales, "
-            "an unsplit PV product, pointer loads, a derived V log bound, and packed "
-            "probability codes, with no Triton loop or strided-output controls"
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class _PreparedPiperContext:
     """Reusable K/V operands and the plan defining their quantization and layout."""
@@ -906,14 +875,14 @@ class _PreparedPiperContext:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedPiperQuery:
-    """Quantized Q with its unpadded logical shape and original floating dtype.
+    """Prepared Q with its unpadded logical shape and original floating dtype.
 
-    With fused query quantization, ``data`` is the floating-point Q and
+    With fused query quantization, ``data`` is the floating-point Q, ``scale`` is None, and
     ``softmax_scale`` is applied when the Gluon kernel quantizes each tile.
     """
 
     data: torch.Tensor
-    scale: torch.Tensor
+    scale: torch.Tensor | None
     descriptor: TensorDescriptor | None
     shape: tuple[int, int, int, int]
     dtype: torch.dtype
@@ -944,12 +913,12 @@ def _prepare_piper_context(
         raise ValueError("split-PV Piper Attention requires head_dim=128")
     if plan.optimize_causal_traversal and not is_causal:
         raise ValueError("optimized causal traversal requires causal attention")
-    _check_gluon_plan(plan)
+    plan.validate_kernel()
     with device_context(key.device):
         install_uint8_int8_dot_hook()
         padded_key_length = int(triton.cdiv(key_length, _BLOCK_N)) * _BLOCK_N
         # Descriptors and the Gluon kernel's cp.async copies read whole K64 tiles.
-        pad_storage = plan.use_tensor_descriptors or plan.use_gluon_kernel
+        pad_storage = plan.use_tensor_descriptors or plan.attention_kernel == "gluon_async_copy"
         storage_key_length = padded_key_length if pad_storage else key_length
 
         # A sequence-wide V mean is valid only for non-causal attention. Per-row
@@ -1045,12 +1014,12 @@ def _prepare_piper_query(
     batch, heads, query_length, head_dim = query.shape
     plan = execution_plan
     validate_query_offset(global_row_offset, block_rows=plan.block_m, name="global_row_offset")
-    _check_gluon_plan(plan)
+    plan.validate_kernel()
     if plan.fuse_query_quantization:
         # The Gluon kernel reads floating-point Q and quantizes each tile itself.
         return _PreparedPiperQuery(
             data=query,
-            scale=query.new_empty(0, dtype=torch.float32),
+            scale=None,
             descriptor=None,
             shape=(batch, heads, query_length, head_dim),
             dtype=query.dtype,
@@ -1060,7 +1029,7 @@ def _prepare_piper_query(
     # The Gluon kernel copies whole query tiles; padded rows and scales are zero.
     storage_query_length = (
         int(triton.cdiv(query_length, plan.block_m)) * plan.block_m
-        if plan.use_gluon_kernel
+        if plan.attention_kernel == "gluon_async_copy"
         else None
     )
     with device_context(query.device):
@@ -1135,7 +1104,7 @@ def _launch_piper_attention_into(
         dtype=query.dtype,
         device=query.data.device,
     )
-    if plan.use_gluon_kernel:
+    if plan.attention_kernel == "gluon_async_copy":
         assert isinstance(context.key, torch.Tensor)
         assert isinstance(context.value, torch.Tensor)
         return _gluon_async_copy.launch_attention(

@@ -1,6 +1,7 @@
 """NVIDIA execution planning for Piper Attention."""
 
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.scheduling import (
@@ -15,6 +16,7 @@ _SM120_CAUSAL_DESCRIPTOR_MIN_QUERY_LENGTH = 1024
 # floating-input path. Sixty-four full K64 tiles clear the measured crossover
 # even for a single query tile/head; the rule also covers rectangular attention.
 _SM120_D64_DESCRIPTOR_MIN_KEY_TILES = 64
+ATTENTION_KERNELS = ("triton", "gluon_async_copy")
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -26,8 +28,8 @@ def supports_target(target: AcceleratorTarget) -> bool:
 class PiperAttentionExecutionPlan:
     """Host-side specialization and launch choices for one Piper invocation.
 
-    ``use_gluon_kernel`` replaces the Triton recurrence with the ``cp.async`` Gluon
-    kernel; ``max_registers`` and ``fuse_query_quantization`` apply only to it.
+    ``attention_kernel`` names the implementation independently of the target.
+    ``max_registers`` and ``fuse_query_quantization`` apply only to ``gluon_async_copy``.
     ``unspecialized_value_stride`` quantizes V without specializing on its
     key-length-dependent row stride.
     """
@@ -48,11 +50,13 @@ class PiperAttentionExecutionPlan:
     strided_output_query_group: int = 0
     ragged_strided_output_maxnreg: int | None = None
     unspecialized_value_stride: bool = False
-    use_gluon_kernel: bool = False
+    attention_kernel: Literal["triton", "gluon_async_copy"] = "triton"
     max_registers: int | None = None
     fuse_query_quantization: bool = False
 
     def __post_init__(self) -> None:
+        if self.attention_kernel not in ATTENTION_KERNELS:
+            raise ValueError("Piper Attention kernel must be triton or gluon_async_copy")
         if self.block_m not in BLOCK_M_VALUES:
             raise ValueError("Piper Attention block_m must be 64 or 128")
         if self.num_warps not in NUM_WARPS_VALUES:
@@ -65,6 +69,39 @@ class PiperAttentionExecutionPlan:
     def as_dict(self) -> dict[str, object]:
         """Return execution choices as serializable benchmark metadata."""
         return asdict(self)
+
+    def validate_kernel(self) -> None:
+        """Check implementation capabilities before preparation or tuner execution.
+
+        Tuning may construct unsupported combinations; validate them here so
+        the tuner can report those candidates without aborting the whole search.
+        """
+        if self.attention_kernel == "triton":
+            if self.fuse_query_quantization:
+                raise ValueError("fused query quantization requires the Gluon kernel")
+            if self.max_registers is not None:
+                raise ValueError("a register cap requires the Gluon kernel")
+            return
+        if (
+            self.num_warps != 4
+            or self.num_stages != 1
+            or self.grouped_qk
+            or self.split_pv_head_dim
+            or self.use_tensor_descriptors
+            or not self.derive_value_log_bound
+            or not self.use_packed_probability_conversion
+            or self.optimize_causal_traversal
+            or self.loop_num_stages is not None
+            or self.loop_licm
+            or self.retain_query_tail_for_strided_output
+            or self.strided_output_query_group
+            or self.ragged_strided_output_maxnreg is not None
+        ):
+            raise ValueError(
+                "the Gluon kernel requires Q64 or Q128 tiles on four warps, per-thread Q/K scales, "
+                "an unsplit PV product, pointer loads, a derived V log bound, and packed "
+                "probability codes, with no Triton loop or strided-output controls"
+            )
 
 
 def _generic_execution_plan(
@@ -108,7 +145,7 @@ def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
         num_stages=1,
         use_packed_probability_conversion=True,
         unspecialized_value_stride=True,
-        use_gluon_kernel=True,
+        attention_kernel="gluon_async_copy",
         max_registers=232 if wide else None,
         fuse_query_quantization=not wide,
     )

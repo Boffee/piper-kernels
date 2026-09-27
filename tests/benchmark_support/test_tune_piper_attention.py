@@ -50,6 +50,7 @@ def test_tuner_defaults_to_production_plan() -> None:
     assert arguments.use_packed_probability_conversion is None
     assert arguments.derive_value_log_bound is None
     assert arguments.optimize_causal_traversal is None
+    assert arguments.attention_kernel is None
     assert not hasattr(arguments, "reverse_causal_blocks")
 
 
@@ -70,12 +71,25 @@ def test_sm89_tuner_defaults_to_production_preparation() -> None:
 def test_sm89_tuner_can_measure_the_triton_recurrence(head_dim: int) -> None:
     production_plan = _sm89_production_plan(head_dim)
 
-    plans = _candidate_plans(_parse_args(["--no-use-gluon-kernel"]), production_plan)
+    plans = _candidate_plans(_parse_args(["--attention-kernel", "triton"]), production_plan)
 
-    assert production_plan.use_gluon_kernel
-    assert [plan.use_gluon_kernel for plan in plans] == [False]
+    assert production_plan.attention_kernel == "gluon_async_copy"
+    assert [plan.attention_kernel for plan in plans] == ["triton"]
     assert not plans[0].fuse_query_quantization
     assert plans[0].max_registers is None
+
+
+def test_attention_kernel_axis_compares_both_implementations() -> None:
+    plans = _candidate_plans(
+        _parse_args(["--attention-kernel", "triton", "gluon_async_copy", "triton"]),
+        _sm89_production_plan(64),
+    )
+
+    assert [plan.attention_kernel for plan in plans] == ["triton", "gluon_async_copy"]
+    for plan in plans:
+        plan.validate_kernel()
+    assert not plans[0].fuse_query_quantization
+    assert plans[1].fuse_query_quantization
 
 
 def test_gluon_candidate_with_triton_tiling_is_unsupported() -> None:

@@ -108,7 +108,7 @@ def test_d64_descriptors_depend_on_key_traversal_not_query_length(target, query_
     )
     assert plan.use_tensor_descriptors is (target == _SM120 and key_length >= 4096)
     # The Gluon kernel issues its own copies and compiles one stage.
-    pointer_stages = 1 if plan.use_gluon_kernel else 3
+    pointer_stages = 1 if plan.attention_kernel == "gluon_async_copy" else 3
     assert plan.num_stages == (2 if plan.use_tensor_descriptors else pointer_stages)
 
 
@@ -165,7 +165,7 @@ def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
                 num_stages=1,
                 use_packed_probability_conversion=True,
                 unspecialized_value_stride=True,
-                use_gluon_kernel=True,
+                attention_kernel="gluon_async_copy",
                 max_registers=232,
             ),
         ),
@@ -221,7 +221,7 @@ def test_sm89_runs_the_gluon_kernel_in_every_mode(
         is_causal=is_causal,
     )
 
-    assert plan.use_gluon_kernel
+    assert plan.attention_kernel == "gluon_async_copy"
     assert plan.max_registers == max_registers
     assert plan.block_m == block_m
     assert plan.fuse_query_quantization is fuse_query_quantization
@@ -248,7 +248,7 @@ def test_gluon_only_choices_require_the_gluon_kernel(
     query = torch.empty((1, 1, 64, 64), device="meta")
     triton_plan = replace(
         _select(_SM89, head_dim=64),
-        use_gluon_kernel=False,
+        attention_kernel="triton",
         max_registers=None,
         fuse_query_quantization=False,
     )
@@ -437,7 +437,7 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "strided_output_query_group": 0,
         "ragged_strided_output_maxnreg": None,
         "unspecialized_value_stride": False,
-        "use_gluon_kernel": False,
+        "attention_kernel": "triton",
         "max_registers": None,
         "fuse_query_quantization": False,
     }

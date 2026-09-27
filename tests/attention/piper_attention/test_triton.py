@@ -1,4 +1,4 @@
-"""GPU tests for the pure-Triton Piper Attention backend."""
+"""GPU tests for NVIDIA Piper preparation and the Triton/Gluon recurrences."""
 
 import math
 from dataclasses import replace
@@ -57,7 +57,9 @@ def _sqnr_db(actual: torch.Tensor, reference: torch.Tensor) -> float:
 
 def _on_triton(plan: _policy.PiperAttentionExecutionPlan) -> _policy.PiperAttentionExecutionPlan:
     """Return the same recurrence on the Triton kernel, dropping Gluon-only choices."""
-    return replace(plan, use_gluon_kernel=False, max_registers=None, fuse_query_quantization=False)
+    return replace(
+        plan, attention_kernel="triton", max_registers=None, fuse_query_quantization=False
+    )
 
 
 def _triton_plan(query: torch.Tensor, is_causal: bool) -> _policy.PiperAttentionExecutionPlan:
@@ -921,7 +923,7 @@ def test_one_launch_covers_all_query_rows(
             value,
             head_dim**-0.5,
             is_causal,
-            qk_quantization=_qk_quantization(),
+            qk_quantization="per_warp" if plan.grouped_qk else "per_thread",
         )
     assert len(launches) == 1
     assert torch.isfinite(actual).all()

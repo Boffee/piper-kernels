@@ -34,6 +34,11 @@ from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.piper._nvidia.fragments import (
+    packed_float32_to_uint8,
+    rescale_packed,
+    uint8_int8_mma,
+)
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
 )
@@ -41,7 +46,6 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import 
 if TYPE_CHECKING:
     import torch
 
-BLOCK_Q_VALUES = (64, 128)
 _BLOCK_N = 64
 _NUM_WARPS = 4
 # ``cp.async`` moves at most 16 bytes per thread and instruction.
@@ -61,181 +65,6 @@ _GL_HADAMARD_WORD_0 = gl.constexpr(SIGNED_HADAMARD_MASK[0])
 _GL_HADAMARD_WORD_1 = gl.constexpr(SIGNED_HADAMARD_MASK[1])
 _GL_HADAMARD_WORD_2 = gl.constexpr(SIGNED_HADAMARD_MASK[2])
 _GL_HADAMARD_WORD_3 = gl.constexpr(SIGNED_HADAMARD_MASK[3])
-
-
-@gluon.jit
-def _uint8_int8_mma(lhs, rhs, accumulator):
-    gl.static_assert(lhs.dtype == gl.uint8, "lhs must be UINT8")
-    gl.static_assert(rhs.dtype == gl.int8, "rhs must be INT8")
-    result = mma_v2(lhs.to(gl.int8, bitcast=True), rhs, accumulator)
-    return gl.inline_asm_elementwise(
-        asm="piper_attention_u8s8_dot_marker $0, $1;",
-        constraints="=r,r",
-        args=[result],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _packed_float32_to_uint8(values):
-    """Truncate and saturate four probability codes with packed SM72+ PTX."""
-    return gl.inline_asm_elementwise(
-        asm="""
-        {
-            .reg .s32 a, b, c, d;
-            .reg .b32 lo;
-            cvt.rzi.s32.f32 a, $1;
-            cvt.rzi.s32.f32 b, $2;
-            cvt.rzi.s32.f32 c, $3;
-            cvt.rzi.s32.f32 d, $4;
-            cvt.pack.sat.u8.s32.b32 lo, d, c, 0;
-            cvt.pack.sat.u8.s32.b32 $0, b, a, lo;
-        }
-        """,
-        constraints="=r,f,f,f,f",
-        args=[values],
-        dtype=gl.uint8,
-        is_pure=True,
-        pack=4,
-    )
-
-
-@gluon.jit
-def _rescale_packed(partial, accumulator, old_weight, current_weight):
-    """Update the FP32 numerator, skipping rescaling when both row weights are one.
-
-    Validated with MMA warps [4, 1] for M64 at D64 and D128 and for M128 at D64:
-    register order A,A,B,B repeats within each 32-element pack, so elements 0
-    and 2 cover both rows. No MMA instruction or collective synchronization occurs in the branch.
-    """
-    return gl.inline_asm_elementwise(
-        asm="""
-            {
-            .reg .pred keep_a, keep_b, keep_pair;
-            .reg .f32 product;
-            setp.eq.f32 keep_a, $96, 0f3f800000;
-            setp.eq.f32 keep_b, $98, 0f3f800000;
-            and.pred keep_pair, keep_a, keep_b;
-            @keep_pair bra PIPER_DENSE_RESCALE_DONE;
-            mul.rn.f32 $0, $0, $96;
-            mul.rn.f32 $1, $1, $97;
-            mul.rn.f32 $2, $2, $98;
-            mul.rn.f32 $3, $3, $99;
-            mul.rn.f32 $4, $4, $100;
-            mul.rn.f32 $5, $5, $101;
-            mul.rn.f32 $6, $6, $102;
-            mul.rn.f32 $7, $7, $103;
-            mul.rn.f32 $8, $8, $104;
-            mul.rn.f32 $9, $9, $105;
-            mul.rn.f32 $10, $10, $106;
-            mul.rn.f32 $11, $11, $107;
-            mul.rn.f32 $12, $12, $108;
-            mul.rn.f32 $13, $13, $109;
-            mul.rn.f32 $14, $14, $110;
-            mul.rn.f32 $15, $15, $111;
-            mul.rn.f32 $16, $16, $112;
-            mul.rn.f32 $17, $17, $113;
-            mul.rn.f32 $18, $18, $114;
-            mul.rn.f32 $19, $19, $115;
-            mul.rn.f32 $20, $20, $116;
-            mul.rn.f32 $21, $21, $117;
-            mul.rn.f32 $22, $22, $118;
-            mul.rn.f32 $23, $23, $119;
-            mul.rn.f32 $24, $24, $120;
-            mul.rn.f32 $25, $25, $121;
-            mul.rn.f32 $26, $26, $122;
-            mul.rn.f32 $27, $27, $123;
-            mul.rn.f32 $28, $28, $124;
-            mul.rn.f32 $29, $29, $125;
-            mul.rn.f32 $30, $30, $126;
-            mul.rn.f32 $31, $31, $127;
-            PIPER_DENSE_RESCALE_DONE:
-            cvt.rn.f32.s32 product, $32;
-            fma.rn.f32 $0, product, $128, $0;
-            cvt.rn.f32.s32 product, $33;
-            fma.rn.f32 $1, product, $129, $1;
-            cvt.rn.f32.s32 product, $34;
-            fma.rn.f32 $2, product, $130, $2;
-            cvt.rn.f32.s32 product, $35;
-            fma.rn.f32 $3, product, $131, $3;
-            cvt.rn.f32.s32 product, $36;
-            fma.rn.f32 $4, product, $132, $4;
-            cvt.rn.f32.s32 product, $37;
-            fma.rn.f32 $5, product, $133, $5;
-            cvt.rn.f32.s32 product, $38;
-            fma.rn.f32 $6, product, $134, $6;
-            cvt.rn.f32.s32 product, $39;
-            fma.rn.f32 $7, product, $135, $7;
-            cvt.rn.f32.s32 product, $40;
-            fma.rn.f32 $8, product, $136, $8;
-            cvt.rn.f32.s32 product, $41;
-            fma.rn.f32 $9, product, $137, $9;
-            cvt.rn.f32.s32 product, $42;
-            fma.rn.f32 $10, product, $138, $10;
-            cvt.rn.f32.s32 product, $43;
-            fma.rn.f32 $11, product, $139, $11;
-            cvt.rn.f32.s32 product, $44;
-            fma.rn.f32 $12, product, $140, $12;
-            cvt.rn.f32.s32 product, $45;
-            fma.rn.f32 $13, product, $141, $13;
-            cvt.rn.f32.s32 product, $46;
-            fma.rn.f32 $14, product, $142, $14;
-            cvt.rn.f32.s32 product, $47;
-            fma.rn.f32 $15, product, $143, $15;
-            cvt.rn.f32.s32 product, $48;
-            fma.rn.f32 $16, product, $144, $16;
-            cvt.rn.f32.s32 product, $49;
-            fma.rn.f32 $17, product, $145, $17;
-            cvt.rn.f32.s32 product, $50;
-            fma.rn.f32 $18, product, $146, $18;
-            cvt.rn.f32.s32 product, $51;
-            fma.rn.f32 $19, product, $147, $19;
-            cvt.rn.f32.s32 product, $52;
-            fma.rn.f32 $20, product, $148, $20;
-            cvt.rn.f32.s32 product, $53;
-            fma.rn.f32 $21, product, $149, $21;
-            cvt.rn.f32.s32 product, $54;
-            fma.rn.f32 $22, product, $150, $22;
-            cvt.rn.f32.s32 product, $55;
-            fma.rn.f32 $23, product, $151, $23;
-            cvt.rn.f32.s32 product, $56;
-            fma.rn.f32 $24, product, $152, $24;
-            cvt.rn.f32.s32 product, $57;
-            fma.rn.f32 $25, product, $153, $25;
-            cvt.rn.f32.s32 product, $58;
-            fma.rn.f32 $26, product, $154, $26;
-            cvt.rn.f32.s32 product, $59;
-            fma.rn.f32 $27, product, $155, $27;
-            cvt.rn.f32.s32 product, $60;
-            fma.rn.f32 $28, product, $156, $28;
-            cvt.rn.f32.s32 product, $61;
-            fma.rn.f32 $29, product, $157, $29;
-            cvt.rn.f32.s32 product, $62;
-            fma.rn.f32 $30, product, $158, $30;
-            cvt.rn.f32.s32 product, $63;
-            fma.rn.f32 $31, product, $159, $31;
-            }
-        """,
-        constraints=(
-            # $0..31: FP32 outputs, written before all inputs are consumed.
-            "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
-            "=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,=&f,"
-            # $32..63: INT32 PV products.
-            "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-            # $64..95: FP32 accumulator inputs tied to the output registers.
-            "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,"
-            # $96..127: old row weights (elements 0 and 2 are $96 and $98).
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            # $128..159: current row weights.
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f"
-        ),
-        args=[partial, accumulator, old_weight[:, None], current_weight[:, None]],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=32,
-    )
 
 
 @gluon.jit
@@ -403,7 +232,7 @@ def _probability_tile(
         exponent = gl.where(valid, exponent, -float("inf"))
     probabilities = gl.exp2(exponent)
     denominator = denominator * old_weight + gl.sum(probabilities, axis=1) * current_weight
-    codes = _packed_float32_to_uint8(probabilities * multiplier[None, :] + 0.5)
+    codes = packed_float32_to_uint8(probabilities * multiplier[None, :] + 0.5)
     codes = gl.convert_layout(codes, probability_layout)
     return codes, denominator, next_max, old_weight, current_weight
 
@@ -420,8 +249,8 @@ def _pv_tile(
 ):
     """Accumulate one K64 PV product in INT32 and update the FP32 numerator."""
     value = value_shared.permute([1, 0]).load(value_layout)
-    partial = _uint8_int8_mma(codes, value, gl.zeros(accumulator.shape, gl.int32, mma_layout))
-    return _rescale_packed(partial, accumulator, old_weight, current_weight)
+    partial = uint8_int8_mma(codes, value, gl.zeros(accumulator.shape, gl.int32, mma_layout))
+    return rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
 # Storage lengths are whole K64/Q64 blocks, so their specialization never varies
@@ -748,7 +577,7 @@ def launch_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    query_scale: torch.Tensor,
+    query_scale: torch.Tensor | None,
     key_scale: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
@@ -767,7 +596,7 @@ def launch_attention(
     """Launch the recurrence on INT8 K/V stored in whole K64 tiles.
 
     With ``quantize_query``, ``query`` is the FP16/BF16 ``[batch, heads,
-    query_length, head_dim]`` input and ``query_scale`` is unused. Otherwise it is
+    query_length, head_dim]`` input and ``query_scale`` is None. Otherwise it is
     prepared INT8 ``[batch, heads, query_storage, head_dim]`` storage with rows,
     and Q scales, padded to a multiple of ``block_q``. ``key`` is ``[batch,
     kv_heads, key_storage, head_dim]`` and ``value`` its transposed ``[batch,
