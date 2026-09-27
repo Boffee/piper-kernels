@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-DEFAULT_QUERY_CHUNK_ROWS = 4096
+DEFAULT_QUERY_CHUNK_ROWS = 8192
 
 type AttentionProjector = Callable[[torch.Tensor], torch.Tensor]
 type ChunkProjector = Callable[[torch.Tensor, torch.Tensor, int, int], None]

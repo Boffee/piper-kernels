@@ -1077,7 +1077,7 @@ python benchmarks/benchmark_sparse_piper_scores.py \
   --sequence 8192 32768 100000 150000 --query-blocks 64 128 384 --samples 5 --rep-ms 100
 ```
 
-Omitting `--query-blocks` retains the full and final chunks of the 4096-token fused pipeline.
+Omitting `--query-blocks` retains the full and final chunks of the 8192-token fused pipeline.
 The benchmark checks scores against FP64 and includes score allocation. On an RX 9070 XT,
 Torch `2.14.0+rocm10.1.0a20260908` and matching Triton `3.8.0+git675c5987`, synthetic
 B1/H56/D128 summaries gave these device-event medians across five paired panels:
@@ -1101,8 +1101,9 @@ dispatch limit using seven shuffled pairs per process:
 The initial 3.5% complete-call gain did not reproduce; the confirmation gain was only
 0.1-0.2%. Routes and outputs matched exactly in both runs, and peak allocation was unchanged.
 At 150K, the tiled scorer removes one 192 MiB auxiliary score matrix per full standalone
-chunk, but other attention buffers dominate the full-call peak. Default fused 4096-row
-projection windows already used native scoring and are unaffected. General FP32 scores can
+chunk, but other attention buffers dominate the full-call peak. The then-default fused 4096-row
+projection windows already used native scoring. Both 4096- and 8192-row windows fit the
+native scorer's query-block limit. General FP32 scores can
 differ from Torch in their rounding; exact-score ties retain lower-index selection. Mean
 routing and D64 retain their existing scoring paths.
 
@@ -1122,9 +1123,11 @@ must reuse one dynamic graph across sequence lengths. Complete outputs are compa
 with the quantized materialized baseline using a CPU reference and bounded slices;
 compilation and these comparisons are outside the shuffled timing samples. Peak extra
 allocation includes the returned output and execution workspace. The benchmark defaults
-to a 4096-row window and sequences 8192, 32768, 100000, and 150000.
+to an 8192-row window, shared with the production default, and sequences
+8192, 32768, 100000, and 150000.
 
-On the same RX 9070 XT/software stack above, seven paired samples gave these
+Before BF16 K temporary storage and the 8192-row default, seven paired samples
+on the same RX 9070 XT/software stack above gave these
 synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`):
 
 | Tokens | Materialized | Fused 4096 | Fused 8192 | Fused 16384 |
@@ -1142,10 +1145,10 @@ Two earlier independent window sweeps also found only 0.4-0.6% lower latency wit
 8192 rows at 150K. A separate projected-coarse-gate control found a 0.6% gain while
 adding 354 MiB; 16384 rows added about 1060 MiB without beating 8192. At 100K,
 16384 rows also reduce the gate pipeline to seven chunks, below its eight-chunk
-overlap threshold. These synthetic measurements favor retaining the 4096-row
-production default: the modest latency benefit requires more workspace, and the
-fused pipeline's main benefit here is bounded memory. No production window policy
-changes are included in this benchmark extension.
+overlap threshold. These earlier measurements used the then-default 4096-row
+windows. Dense and sparse ConvRot INT8 fusion now share an 8192-row default;
+the sparse windows remain fixed and dense schedules under the cap. Larger
+windows still trade additional workspace for workload-dependent latency gains.
 
 Compiler inspection and external profiling are available for one shape at a time:
 

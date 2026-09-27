@@ -35,7 +35,7 @@ def test_invalid_arguments_are_rejected(arguments):
 def test_defaults_cover_h3_through_150k():
     args = benchmark._parse_args([])
     assert args.sequence == [8192, 32768, 100000, 150000]
-    assert args.query_chunk_rows == [4096]
+    assert args.query_chunk_rows == [8192]
     assert args.samples == 11
 
 

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from piper_kernels.fusions.convrot_int8_piper import _backend, _compile, _output_compile
+from piper_kernels.fusions.convrot_int8_piper import _backend, _compile, _output_compile, output
 from piper_kernels.linear.convrot.int8 import _ops
 
 from .test_compile import (
@@ -67,7 +67,7 @@ def test_compiler_folds_complete_dense_attention_output(head_dim, causal, dtype,
     )
     compiled, capture = _compiled_model(model, dynamic=True, fuse_output=True)
     with torch.no_grad():
-        for sequence in (65, 4353):
+        for sequence in (65, output.DEFAULT_QUERY_CHUNK_ROWS + 129):
             args = _qkv_inputs(model, sequence, sequence if causal else sequence + 32, dtype)
             actual = compiled(*args)
             attended = _explicit_qkv(model, args).transpose(1, 2).reshape(2, sequence, -1)

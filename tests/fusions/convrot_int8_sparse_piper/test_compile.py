@@ -1718,8 +1718,9 @@ def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     )
 
     with torch.no_grad():
-        # Cross the default 4096-row chunk boundary twice without retracing.
-        for sequence, sparse_key_blocks in ((193, 2), (256, 3), (257, 3), (8193, 120)):
+        # Cross two default chunk boundaries without retracing.
+        long_sequence = 2 * output_fusion._DEFAULT_QUERY_CHUNK_ROWS + 1
+        for sequence, sparse_key_blocks in ((193, 2), (256, 3), (257, 3), (long_sequence, 120)):
             hidden_states = torch.randn(
                 model.batch,
                 sequence,

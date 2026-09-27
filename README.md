@@ -760,7 +760,9 @@ immediately consumes the quantized attention result, the bounded output rewrite 
 It passes the coarse result and coarse gate into
 each ranged attention launch and projects that chunk directly, so the full attention output is
 not materialized. ConvRot INT8 retains this bounded path with either static or dynamic per-row
-input scaling. Independent Q/coarse-gate input scales are prepared within each query window,
+input scaling. Dense and sparse ConvRot INT8 output fusion share an 8,192-row default:
+dense schedules aligned windows under that cap, while sparse uses fixed windows.
+Independent Q/coarse-gate input scales are prepared within each query window,
 avoiding two full-sequence prepared inputs. When the floating-point source is a fresh,
 exclusive intermediate with the same shape and dtype as the projected output, its consumed
 rows become output storage. Compiler ownership checks exclude caller inputs, aliases, and

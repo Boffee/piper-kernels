@@ -1,7 +1,7 @@
 """Compare selected FP32 minmax scoring with the two-GEMM Torch baseline.
 
 Uses synthetic summaries at H3's B1/H56/D128, with full and final query chunks
-from a 4096-token fused pipeline by default. --query-blocks also measures larger
+from an 8192-token fused pipeline by default. --query-blocks also measures larger
 standalone routing chunks. K retains the sparse-prefix view of the padded
 sequence allocation. Scores are checked against FP64 before timing. Timings
 include score allocation and the maximum epilogue, but not summary generation
@@ -22,6 +22,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._routing import routing_scores
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
+from piper_kernels.fusions.sparse_piper._output import DEFAULT_QUERY_CHUNK_ROWS
 
 _WARMUP_MS = 20
 
@@ -45,8 +46,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _query_chunks(sequence: int) -> list[int]:
     blocks = (sequence + 63) // 64
-    full, tail = divmod(blocks, 64)
-    return ([64] if full else []) + ([tail] if tail else [])
+    chunk_blocks = DEFAULT_QUERY_CHUNK_ROWS // 64
+    full, tail = divmod(blocks, chunk_blocks)
+    return ([chunk_blocks] if full else []) + ([tail] if tail else [])
 
 
 def _torch_scores(
