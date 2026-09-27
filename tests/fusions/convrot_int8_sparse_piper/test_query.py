@@ -114,13 +114,18 @@ def _random_operands(
 )
 @pytest.mark.parametrize("affine", [True, False])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
+# SM89 projects 256 input features with Gluon and 272 with the shared Triton launchers.
+@pytest.mark.parametrize("input_features", [256, 272])
 def test_fused_query_projection_matches_the_fp32_composed_contract(
+    input_features: int,
     bias_dtype: torch.dtype | None,
     affine: bool,
     sequence_length: int,
     head_dim: int,
 ) -> None:
-    operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    operands = _random_operands(
+        sequence_length=sequence_length, input_features=input_features, head_dim=head_dim
+    )
     bias = (
         torch.randn(2 * head_dim, device="cuda", dtype=bias_dtype)
         if bias_dtype is not None
@@ -243,8 +248,11 @@ def test_query_projection_range_uses_local_storage_and_global_rope_positions(
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
-def test_fused_query_projection_ignores_internal_padding(routing_mode: int) -> None:
-    operands = _random_operands(sequence_length=192)
+@pytest.mark.parametrize("input_features", [256, 272])
+def test_fused_query_projection_ignores_internal_padding(
+    routing_mode: int, input_features: int
+) -> None:
+    operands = _random_operands(sequence_length=192, input_features=input_features)
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = torch.arange(192, device="cuda") % 64
     valid_rows = valid_rows < block_lengths.repeat_interleave(64)

@@ -302,7 +302,9 @@ statistics without prescribing Q/K/V transforms or encoding. The shared
 and optional sparse routing outputs. The explicit sparse fusion adds storage contracts and
 graph rewriting.
 Another projection backend can compose the same pieces without depending on ConvRot internals or
-adding a backend protocol to attention.
+adding a backend protocol to attention. On SM89, D128 projections instead run Gluon kernels that
+apply the same FP32 steps in the matrix-multiply register layout and match the shared path within
+one INT8 code; other shapes use the shared path.
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)`, while `add_`
 accepts an exact-shape dense logical update and computes `weight = weight + alpha * update`.

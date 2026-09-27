@@ -17,15 +17,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   SM120's spill registers there. On an RTX 4070 Ti SUPER, one MiniMax-H3 encoder tile's 29
   convolutions take 49.6 ms (reference 721 ms, cuDNN FP16 182 ms), bitwise equal to SM120 tiles.
 - ConvRot INT8 sparse-Piper fusion (`convrot_int8_sparse_piper_compile_options`) on NVIDIA
-  SM89, matching the native SM89 sparse Piper attention. SM89 projects Q, K, and V with its
-  own tile configuration, because SM120's tiles exceed SM89's 99 KiB of shared memory (K) or
-  spill registers (V), and computes the attention output in 8,192-row query chunks. The fused
-  V projection now also accepts one-head and 64-row tiles; SM120's compiled kernels are
-  unchanged. On an RTX 4070 Ti SUPER, the compiled H3 attention block (Q/K/V projections,
-  25%-keep routing and attention, and the output projection) needs 28-58% less peak memory at
-  8K-100K tokens. With the current SM89 ConvRot INT8 GEMM it runs 1.6-2.3x faster than without
-  the fusion; with the SM8x ConvRot INT8 GEMM policy, it is 3-8% faster through 32K tokens and
-  on par at 100K.
+  SM89, matching the native SM89 sparse Piper attention. SM89 projects D128 heads with Gluon
+  kernels that stage 128-row tiles through `cp.async` copies into `mma_v2` and apply RMSNorm,
+  RoPE, and the signed Hadamard in the accumulator's registers. On an RTX 4070 Ti SUPER they
+  reach 265-275 TOPS for Q and K and 265-292 TOPS for V at 2K-100K tokens, 1.25-1.33x the
+  shared Triton launchers, and stay within one INT8 code of them. Other shapes use those
+  launchers with SM89 tiles, because SM120's tiles exceed SM89's 99 KiB of shared memory (K)
+  or spill registers (V). The attention output is computed in 8,192-row query chunks. The
+  fused V projection now also accepts one-head and 64-row tiles; SM120's compiled kernels are
+  unchanged. The compiled H3 attention block (Q/K/V projections, 25%-keep routing and
+  attention, and the output projection) needs 28-58% less peak memory at 8K-100K tokens. With
+  the current SM89 ConvRot INT8 GEMM it runs 1.7-2.5x faster than without the fusion, and with
+  the SM8x ConvRot INT8 GEMM policy 1.05-1.23x faster.
 
 ### Changed
 

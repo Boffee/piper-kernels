@@ -1,0 +1,925 @@
+"""SM89 Gluon kernels for the fused ConvRot INT8 sparse-Piper Q/K/V projections.
+
+Each program projects 128 rows onto one D128 head. ``cp.async`` copies stage K64
+slices of the INT8 operands in shared memory, and ``mma_v2`` accumulates exact
+INT32 products.
+
+Q and K split warps only across rows and permute the weight rows, so each thread
+holds 4 consecutive features of every row it owns, with the other feature bits in
+registers or its lane quad. Loads of cos/sin are then 16 bytes wide, and RoPE
+pairs stay in registers. Five of the seven Hadamard stages stay in registers;
+the other two use butterfly shuffles.
+
+V keeps a 2x2 warp grid. Its epilogue spreads rows across lanes, so the
+transposed stores are coalesced.
+
+Shapes outside ``supports_projection`` use the shared Triton launchers.
+"""
+
+# Gluon exposes low-level signatures that are not fully modeled by type checkers.
+# ruff: noqa: ANN001, ANN202, PLR0912, PLR0913, PLR0915, PLR0917
+# pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
+# pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
+
+from __future__ import annotations
+
+import torch
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
+from triton.language.extra import libdevice
+
+from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
+    SIGNED_HADAMARD_MASK,
+)
+from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+
+from .. import _kernels
+from .._interfaces import KeyOutput, QueryOutput, ValueOutput
+from .._layout import QUERY_SCALE_ROWS, TILE_ROWS
+
+_HEAD_DIM = 128
+_BLOCK_M = 128
+_BLOCK_K = 64
+_NUM_STAGES = 3
+_NUM_WARPS = 4
+# The projected V mean is one row per head; its launcher reuses the Triton kernel.
+_MEAN_BLOCK_K = 128
+
+_GL_HEAD_DIM = gl.constexpr(_HEAD_DIM)
+_GL_BLOCK_M = gl.constexpr(_BLOCK_M)
+_GL_BLOCK_K = gl.constexpr(_BLOCK_K)
+_GL_NUM_STAGES = gl.constexpr(_NUM_STAGES)
+_GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
+_GL_TILE_ROWS = gl.constexpr(TILE_ROWS)
+_GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
+_GL_SCALE_EPSILON = gl.constexpr(1e-7)
+_GL_INT8_RANGE = gl.constexpr(127.0)
+_GL_P_UINT8_RANGE = gl.constexpr(255.0)
+_GL_LOG2_E = gl.constexpr(1.4426950408889634)
+_GL_HADAMARD_NORM = gl.constexpr(0.08838834764831845)
+_GL_HADAMARD_WORD_0 = gl.constexpr(SIGNED_HADAMARD_MASK[0])
+_GL_HADAMARD_WORD_1 = gl.constexpr(SIGNED_HADAMARD_MASK[1])
+_GL_HADAMARD_WORD_2 = gl.constexpr(SIGNED_HADAMARD_MASK[2])
+_GL_HADAMARD_WORD_3 = gl.constexpr(SIGNED_HADAMARD_MASK[3])
+_GL_SHUFFLE_LANE_1 = gl.constexpr("shfl.sync.bfly.b32 $0, $1, 0x1, 0x1f, 0xffffffff;")
+_GL_SHUFFLE_LANE_2 = gl.constexpr("shfl.sync.bfly.b32 $0, $1, 0x2, 0x1f, 0xffffffff;")
+# Every thread copies 16 bytes of a K64 slice; each warp copies 8 rows per step.
+_GL_COPY_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 16], [8, 4], [_NUM_WARPS, 1], [1, 0]))
+_GL_COPY_ROWS = gl.constexpr(gl.SliceLayout(1, _GL_COPY_LAYOUT.value))
+# Q/K rows leave in 16-byte stores; each warp writes 4 whole D128 rows.
+_GL_STORE_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 16], [4, 8], [_NUM_WARPS, 1], [1, 0]))
+_GL_SUMMARY_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 4], [1, 32], [1, _NUM_WARPS], [1, 0]))
+
+# Sequence lengths and offsets vary per call; specializing them would compile one
+# kernel per divisibility class. Storage extents arrive as K64 tile counts, so the
+# kernels still know that row strides are multiples of 64.
+_DO_NOT_SPECIALIZE = ("logical_sequence_length", "row_block_offset", "storage_tiles")
+_DO_NOT_SPECIALIZE_QUERY = (*_DO_NOT_SPECIALIZE, "chunk_start", "query_sequence_end")
+
+
+def supports_projection(input_qdata: torch.Tensor, head_dim: int, rotary_dim: int = 0) -> bool:
+    """Return whether these kernels cover the operands; Q/K pass their RoPE width."""
+    return (
+        head_dim == _HEAD_DIM
+        and input_qdata.shape[2] % _BLOCK_K == 0
+        # RoPE pairs must differ only in feature bits 4-6, which each thread holds.
+        and rotary_dim % 32 == 0
+    )
+
+
+@gluon.jit
+def _project_int8(
+    input_ptr,
+    weight_ptr,
+    input_rows,
+    weight_rows,
+    accumulator,
+    input_features: gl.constexpr,
+):
+    """Accumulate ``input[rows] @ weight[weight_rows].T`` over staged K64 slices."""
+    block_m: gl.constexpr = accumulator.shape[0]
+    head_dim: gl.constexpr = accumulator.shape[1]
+    k_tiles: gl.constexpr = input_features // _GL_BLOCK_K
+    mma_layout: gl.constexpr = accumulator.type.layout
+    input_layout: gl.constexpr = gl.DotOperandLayout(0, mma_layout, k_width=4)
+    weight_layout: gl.constexpr = gl.DotOperandLayout(1, mma_layout, k_width=4)
+    input_stages = gl.allocate_shared_memory(
+        gl.int8,
+        [_GL_NUM_STAGES, block_m, _GL_BLOCK_K],
+        gl.NVMMASharedLayout.get_default_for([block_m, _GL_BLOCK_K], gl.int8),
+    )
+    weight_stages = gl.allocate_shared_memory(
+        gl.int8,
+        [_GL_NUM_STAGES, head_dim, _GL_BLOCK_K],
+        gl.NVMMASharedLayout.get_default_for([head_dim, _GL_BLOCK_K], gl.int8),
+    )
+    features = gl.arange(0, _GL_BLOCK_K, gl.SliceLayout(0, _GL_COPY_LAYOUT))
+    input_pointers = (
+        input_ptr + input_rows.to(gl.int64)[:, None] * input_features + features[None, :]
+    )
+    weight_pointers = (
+        weight_ptr + weight_rows.to(gl.int64)[:, None] * input_features + features[None, :]
+    )
+    for stage in gl.static_range(_GL_NUM_STAGES - 1):
+        if stage < k_tiles:
+            async_copy.async_load(input_stages.index(stage), input_pointers + stage * _GL_BLOCK_K)
+            async_copy.async_load(weight_stages.index(stage), weight_pointers + stage * _GL_BLOCK_K)
+        async_copy.commit_group()
+    for first_tile in range(0, k_tiles, _GL_NUM_STAGES):
+        for current in gl.static_range(_GL_NUM_STAGES):
+            tile = first_tile + current
+            if k_tiles % _GL_NUM_STAGES == 0 or tile < k_tiles:
+                async_copy.wait_group(_GL_NUM_STAGES - 2)
+                # Every warp has finished reading the slot that the next copy refills.
+                gl.barrier()
+                prefetch = tile + _GL_NUM_STAGES - 1
+                slot = (current + _GL_NUM_STAGES - 1) % _GL_NUM_STAGES
+                async_copy.async_load(
+                    input_stages.index(slot),
+                    input_pointers + prefetch * _GL_BLOCK_K,
+                    mask=prefetch < k_tiles,
+                )
+                async_copy.async_load(
+                    weight_stages.index(slot),
+                    weight_pointers + prefetch * _GL_BLOCK_K,
+                    mask=prefetch < k_tiles,
+                )
+                async_copy.commit_group()
+                values = input_stages.index(current).load(input_layout)
+                weight = weight_stages.index(current).permute([1, 0]).load(weight_layout)
+                accumulator = mma_v2(values, weight, accumulator)
+    async_copy.wait_group(0)
+    return accumulator
+
+
+@gluon.jit
+def _round_to_int8(values):
+    """Round half away from zero and clamp to the symmetric INT8 range."""
+    rounded = values + 0.5 * gl.where(values >= 0, 1.0, -1.0)
+    return gl.maximum(-_GL_INT8_RANGE, gl.minimum(_GL_INT8_RANGE, rounded)).to(gl.int8)
+
+
+@gluon.jit
+def _minmax(maximum_0, minimum_0, maximum_1, minimum_1):
+    return gl.maximum(maximum_0, maximum_1), gl.minimum(minimum_0, minimum_1)
+
+
+# Q/K feature placement. Accumulator column c holds feature c0->f0, c3->f1, c1->f2, c2->f3,
+# c4-c6->f4-f6: thread registers then own f0, f1, and f4-f6 of each row, and the lane
+# quad owns f2 and f3.
+
+
+def _feature_layout() -> gl.DistributedLinearLayout:
+    """The Q/K accumulator of a [4, 1] mma_v2 warp grid, indexed by feature."""
+    return gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [8, 0], [0, 16], [0, 32], [0, 64], [16, 0]],
+        lane_bases=[[0, 4], [0, 8], [1, 0], [2, 0], [4, 0]],
+        warp_bases=[[32, 0], [64, 0]],
+        block_bases=[],
+        shape=[_BLOCK_M, _HEAD_DIM],
+    )
+
+
+_GL_FEATURE_LAYOUT = gl.constexpr(_feature_layout())
+
+
+@gluon.jit
+def _column_features(columns):
+    """Return the head feature that each accumulator column projects."""
+    return (
+        (columns & 1) | (((columns >> 3) & 1) << 1) | (((columns >> 1) & 3) << 2) | (columns & 0x70)
+    )
+
+
+@gluon.jit
+def _by_feature(accumulator):
+    """Reindex the accumulator columns by feature without moving data between threads."""
+    rows: gl.constexpr = accumulator.shape[0]
+    bits = gl.reshape(accumulator, [rows, 2, 2, 2, 2, 2, 2, 2])
+    ordered = gl.permute(bits, [0, 1, 2, 3, 5, 6, 4, 7])
+    return gl.convert_layout(gl.reshape(ordered, [rows, _GL_HEAD_DIM]), _GL_FEATURE_LAYOUT)
+
+
+@gluon.jit
+def _rotated_group(groups, group: gl.constexpr, half_groups: gl.constexpr):
+    if group < half_groups:
+        return -groups[group + half_groups]
+    if group < 2 * half_groups:
+        return groups[group - half_groups]
+    return groups[group]
+
+
+@gluon.jit
+def _rotate_half(values, rotary_dim: gl.constexpr):
+    """Return split-half RoPE partners, negated below half the rotary width.
+
+    Features 16g+r pair with 16(g +- rotary_dim/32)+r, a move in the register
+    bits f4-f6 only.
+    """
+    rows: gl.constexpr = values.shape[0]
+    half_groups: gl.constexpr = rotary_dim // 32
+    by_group = gl.permute(gl.reshape(values, [rows, 2, 2, 2, 16]), [0, 4, 3, 2, 1])
+    groups_0123, groups_4567 = gl.split(by_group)
+    groups_01, groups_23 = gl.split(groups_0123)
+    groups_45, groups_67 = gl.split(groups_4567)
+    group_0, group_1 = gl.split(groups_01)
+    group_2, group_3 = gl.split(groups_23)
+    group_4, group_5 = gl.split(groups_45)
+    group_6, group_7 = gl.split(groups_67)
+    groups = (group_0, group_1, group_2, group_3, group_4, group_5, group_6, group_7)
+    rotated = gl.join(
+        gl.join(
+            gl.join(_rotated_group(groups, 0, half_groups), _rotated_group(groups, 1, half_groups)),
+            gl.join(_rotated_group(groups, 2, half_groups), _rotated_group(groups, 3, half_groups)),
+        ),
+        gl.join(
+            gl.join(_rotated_group(groups, 4, half_groups), _rotated_group(groups, 5, half_groups)),
+            gl.join(_rotated_group(groups, 6, half_groups), _rotated_group(groups, 7, half_groups)),
+        ),
+    )
+    rotated = gl.reshape(gl.permute(rotated, [0, 4, 3, 2, 1]), [rows, _GL_HEAD_DIM])
+    return gl.convert_layout(rotated, values.type.layout)
+
+
+@gluon.jit
+def _register_butterfly(values, distance: gl.constexpr):
+    """One Hadamard stage over a feature bit that each thread holds in registers."""
+    rows: gl.constexpr = values.shape[0]
+    outer: gl.constexpr = _GL_HEAD_DIM // (2 * distance)
+    pairs = gl.permute(gl.reshape(values, [rows, outer, 2, distance]), [0, 1, 3, 2])
+    low, high = gl.split(pairs)
+    transformed = gl.permute(gl.join(low + high, low - high), [0, 1, 3, 2])
+    return gl.convert_layout(gl.reshape(transformed, [rows, _GL_HEAD_DIM]), values.type.layout)
+
+
+@gluon.jit
+def _lane_butterfly(values, features, distance: gl.constexpr, shuffle: gl.constexpr):
+    """One Hadamard stage over a feature bit held by the lane quad."""
+    partner = gl.inline_asm_elementwise(
+        shuffle, "=r,r", [values], dtype=gl.float32, is_pure=True, pack=1
+    )
+    return gl.where(((features & distance) == 0)[None, :], values + partner, partner - values)
+
+
+@gluon.jit
+def _signed_hadamard(values, features):
+    """Apply the signed, normalized D128 Hadamard in the Triton stage order."""
+    word_group = features // 32
+    words = gl.where(
+        word_group == 0,
+        _GL_HADAMARD_WORD_0,
+        gl.where(
+            word_group == 1,
+            _GL_HADAMARD_WORD_1,
+            gl.where(word_group == 2, _GL_HADAMARD_WORD_2, _GL_HADAMARD_WORD_3),
+        ),
+    ).to(gl.uint32)
+    signs = gl.where(((words >> (features % 32).to(gl.uint32)) & 1) != 0, 1.0, -1.0)
+    values *= signs[None, :]
+    values = _register_butterfly(values, 1)
+    values = _register_butterfly(values, 2)
+    values = _lane_butterfly(values, features, 4, _GL_SHUFFLE_LANE_1)
+    values = _lane_butterfly(values, features, 8, _GL_SHUFFLE_LANE_2)
+    values = _register_butterfly(values, 16)
+    values = _register_butterfly(values, 32)
+    values = _register_butterfly(values, 64)
+    return values * _GL_HADAMARD_NORM
+
+
+@gluon.jit
+def _project_rmsnorm_rope(
+    input_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    norm_weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    input_row_start,
+    positions,
+    copy_positions,
+    head,
+    input_features: gl.constexpr,
+    rotary_dim: gl.constexpr,
+    norm_epsilon: gl.constexpr,
+):
+    """Project one [128, D128] Q/K tile, then apply FP32 RMSNorm and RoPE by feature."""
+    mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
+        version=[2, 0], warps_per_cta=[_GL_NUM_WARPS, 1], instr_shape=[16, 8]
+    )
+    columns = gl.arange(0, _GL_HEAD_DIM, _GL_COPY_ROWS)
+    accumulator = _project_int8(
+        input_ptr,
+        weight_ptr,
+        input_row_start + copy_positions,
+        head * _GL_HEAD_DIM + _column_features(columns),
+        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        input_features,
+    )
+    accumulator = _by_feature(accumulator)
+
+    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_FEATURE_LAYOUT))
+    input_scale = gl.load(input_scale_ptr + input_row_start + positions)
+    weight_scale = gl.load(weight_scale_ptr + head * _GL_HEAD_DIM + features)
+    projection = accumulator.to(gl.float32) * input_scale[:, None] * weight_scale[None, :]
+    if bias_ptr is not None:
+        projection += gl.load(bias_ptr + head * _GL_HEAD_DIM + features).to(gl.float32)[None, :]
+
+    variance = gl.sum(projection * projection, axis=1) / _GL_HEAD_DIM + norm_epsilon
+    inverse_rms = libdevice.rsqrt_rn(variance)
+    normalized = projection * inverse_rms[:, None]  # pyright: ignore[reportOptionalSubscript]
+    if norm_weight_ptr is not None:
+        normalized = normalized * gl.load(norm_weight_ptr + features).to(gl.float32)[None, :]
+    rotary_features = features < rotary_dim
+    rope_offsets = positions[:, None] * rotary_dim + features[None, :]
+    cos = gl.load(cos_ptr + rope_offsets, mask=rotary_features[None, :], other=1.0)
+    sin = gl.load(sin_ptr + rope_offsets, mask=rotary_features[None, :], other=0.0)
+    rotary = normalized * cos + _rotate_half(normalized, rotary_dim) * sin
+    return gl.where(rotary_features[None, :], rotary, normalized), features
+
+
+@gluon.jit
+def _summarize(values, valid, mean_pool_summary: gl.constexpr, mask_rows: gl.constexpr):
+    """Reduce [blocks, 64, D] rows to (primary, auxiliary) routing summaries."""
+    if mean_pool_summary:
+        if mask_rows:
+            valid_count = gl.sum(valid.to(gl.int32), axis=1)
+            mean = gl.sum(gl.where(valid, values, 0.0), axis=1) / valid_count  # pyright: ignore[reportOperatorIssue]
+        else:
+            mean = gl.sum(values, axis=1) / _GL_TILE_ROWS
+        return mean, mean
+    if mask_rows:
+        return gl.reduce(
+            (gl.where(valid, values, -float("inf")), gl.where(valid, values, float("inf"))),
+            1,
+            _minmax,
+        )
+    return gl.reduce((values, values), 1, _minmax)
+
+
+@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_QUERY)
+def _query_kernel(
+    input_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    norm_weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    query_ptr,
+    query_scale_ptr,
+    query_summary_ptr,
+    block_lengths_ptr,
+    logical_sequence_length,
+    row_block_offset,
+    chunk_start,
+    query_sequence_end,
+    storage_tiles,
+    input_features: gl.constexpr,
+    heads: gl.constexpr,
+    rotary_dim: gl.constexpr,
+    norm_epsilon: gl.constexpr,
+    softmax_scale: gl.constexpr,
+    mean_pool_summary: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
+    mask_rows: gl.constexpr,
+):
+    """Project a Q window tile and emit Q32 INT8 rows, scales, and Q64 summaries."""
+    head = gl.program_id(0)
+    row_block = row_block_offset + gl.program_id(1)
+    batch = gl.program_id(2)
+    storage_sequence_length = storage_tiles * _GL_TILE_ROWS
+    input_row_start = batch * logical_sequence_length
+    rows_layout: gl.constexpr = gl.SliceLayout(1, _GL_FEATURE_LAYOUT)
+    global_start = chunk_start + row_block * _GL_BLOCK_M
+    positions = global_start + gl.arange(0, _GL_BLOCK_M, rows_layout)
+    copy_positions = global_start + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
+    if mask_rows:
+        # Rows past the sequence end repeat its last row; their outputs are masked below.
+        positions = gl.minimum(positions, logical_sequence_length - 1)
+        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+    values, features = _project_rmsnorm_rope(
+        input_ptr,
+        input_scale_ptr,
+        weight_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        norm_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        input_row_start,
+        positions,
+        copy_positions,
+        head,
+        input_features,
+        rotary_dim,
+        norm_epsilon,
+    )
+
+    blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
+    groups: gl.constexpr = _GL_BLOCK_M // _GL_QUERY_SCALE_ROWS
+    global_rows = global_start + gl.arange(0, _GL_BLOCK_M, rows_layout)
+    if mask_block_lengths:
+        block_length = gl.load(block_lengths_ptr + global_rows // _GL_TILE_ROWS)
+        valid_rows = global_rows % _GL_TILE_ROWS < block_length
+    else:
+        valid_rows = global_rows < query_sequence_end
+    valid = valid_rows[:, None] & (features >= 0)[None, :]
+    if mask_rows:
+        values = gl.where(valid, values, 0.0)
+    maximum, minimum = _summarize(
+        gl.reshape(values, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM]),
+        gl.reshape(valid, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM]),
+        mean_pool_summary,
+        mask_rows,
+    )
+    summary = maximum
+    if not mean_pool_summary:
+        summary += minimum
+
+    smoothed = gl.reshape(
+        _signed_hadamard(values, features), [groups, _GL_QUERY_SCALE_ROWS, _GL_HEAD_DIM]
+    )
+    raw_scale = (
+        gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
+    )
+    group_layout: gl.constexpr = raw_scale.type.layout  # pyright: ignore[reportAttributeAccessIssue]
+    group_offsets = gl.arange(0, groups, group_layout)
+    if mask_rows:
+        group_starts = global_start + group_offsets * _GL_QUERY_SCALE_ROWS
+        if mask_block_lengths:
+            group_block_length = gl.load(block_lengths_ptr + group_starts // _GL_TILE_ROWS)
+            group_valid = group_starts % _GL_TILE_ROWS < group_block_length
+        else:
+            group_valid = group_starts < query_sequence_end
+        raw_scale = gl.where(group_valid, raw_scale, 1.0)
+        stored_scale = gl.where(group_valid, raw_scale * (softmax_scale * _GL_LOG2_E), 0.0)
+    else:
+        stored_scale = raw_scale * (softmax_scale * _GL_LOG2_E)
+    quantized = _round_to_int8(smoothed / raw_scale[:, None, None])
+
+    quantized = gl.reshape(quantized, [_GL_BLOCK_M, _GL_HEAD_DIM])
+    quantized = gl.convert_layout(quantized, _GL_STORE_LAYOUT)
+    store_rows = gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_STORE_LAYOUT))
+    storage_rows = row_block * _GL_BLOCK_M + store_rows
+    store_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_STORE_LAYOUT))
+    batch_head = batch * heads + head
+    query_offsets = storage_rows[:, None] * _GL_HEAD_DIM + store_features[None, :]
+    query_base = query_ptr + batch_head.to(gl.int64) * storage_sequence_length * _GL_HEAD_DIM
+    if mask_rows:
+        gl.store(
+            query_base + query_offsets,
+            quantized,
+            mask=storage_rows[:, None] < storage_sequence_length,
+        )
+    else:
+        gl.store(query_base + query_offsets, quantized)
+
+    summary_blocks = row_block * blocks + gl.arange(
+        0, blocks, gl.SliceLayout(1, _GL_SUMMARY_LAYOUT)
+    )
+    summary_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_SUMMARY_LAYOUT))
+    summary_rows = batch_head * storage_tiles + summary_blocks
+    summary_offsets = summary_rows[:, None] * _GL_HEAD_DIM + summary_features[None, :]
+    summary = gl.convert_layout(summary, _GL_SUMMARY_LAYOUT)
+    scale_offsets = (
+        batch_head * (storage_sequence_length // _GL_QUERY_SCALE_ROWS) + row_block * groups
+    )
+    if mask_rows:
+        gl.store(
+            query_summary_ptr + summary_offsets,
+            summary,
+            mask=summary_blocks[:, None] < storage_tiles,
+        )
+        gl.store(
+            query_scale_ptr + scale_offsets + group_offsets,
+            stored_scale,
+            mask=row_block * groups + group_offsets
+            < storage_sequence_length // _GL_QUERY_SCALE_ROWS,
+        )
+    else:
+        gl.store(query_summary_ptr + summary_offsets, summary)
+        gl.store(query_scale_ptr + scale_offsets + group_offsets, stored_scale)
+
+
+@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE)
+def _key_kernel(
+    input_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    norm_weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    key_ptr,
+    key_scale_ptr,
+    key_summary_ptr,
+    key_aux_ptr,
+    block_lengths_ptr,
+    logical_sequence_length,
+    row_block_offset,
+    storage_tiles,
+    input_features: gl.constexpr,
+    heads: gl.constexpr,
+    rotary_dim: gl.constexpr,
+    norm_epsilon: gl.constexpr,
+    mean_pool_summary: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
+    mask_rows: gl.constexpr,
+):
+    """Project a K tile once and emit K64 INT8 rows, scales, and routing summaries."""
+    head = gl.program_id(0)
+    row_block = row_block_offset + gl.program_id(1)
+    batch = gl.program_id(2)
+    input_row_start = batch * logical_sequence_length
+    rows_layout: gl.constexpr = gl.SliceLayout(1, _GL_FEATURE_LAYOUT)
+    sequence = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, rows_layout)
+    copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
+    positions = sequence
+    if mask_rows:
+        # Rows past the sequence end repeat its last row; their outputs are masked below.
+        positions = gl.minimum(positions, logical_sequence_length - 1)
+        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+    values, features = _project_rmsnorm_rope(
+        input_ptr,
+        input_scale_ptr,
+        weight_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        norm_weight_ptr,
+        cos_ptr,
+        sin_ptr,
+        input_row_start,
+        positions,
+        copy_positions,
+        head,
+        input_features,
+        rotary_dim,
+        norm_epsilon,
+    )
+
+    tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
+    if mask_block_lengths:
+        tile_length = gl.load(
+            block_lengths_ptr + sequence // _GL_TILE_ROWS,
+            mask=sequence // _GL_TILE_ROWS < storage_tiles,
+            other=0,
+        )
+        valid_rows = sequence % _GL_TILE_ROWS < tile_length
+    else:
+        valid_rows = sequence < logical_sequence_length
+    valid = valid_rows[:, None] & (features >= 0)[None, :]
+    if mask_rows:
+        values = gl.where(valid, values, 0.0)
+    key_summary, key_aux = _summarize(
+        gl.reshape(values, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]),
+        gl.reshape(valid, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]),
+        mean_pool_summary,
+        mask_rows,
+    )
+
+    smoothed = gl.reshape(_signed_hadamard(values, features), [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM])
+    key_scale = (
+        gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
+    )
+    quantized = _round_to_int8(smoothed / key_scale[:, None, None])
+
+    storage_sequence_length = storage_tiles * _GL_TILE_ROWS
+    quantized = gl.reshape(quantized, [_GL_BLOCK_M, _GL_HEAD_DIM])
+    quantized = gl.convert_layout(quantized, _GL_STORE_LAYOUT)
+    store_rows = gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_STORE_LAYOUT))
+    store_rows += row_block * _GL_BLOCK_M
+    store_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_STORE_LAYOUT))
+    batch_head = batch * heads + head
+    key_offsets = store_rows[:, None] * _GL_HEAD_DIM + store_features[None, :]
+    key_base = key_ptr + batch_head.to(gl.int64) * storage_sequence_length * _GL_HEAD_DIM
+    if mask_rows:
+        gl.store(
+            key_base + key_offsets, quantized, mask=store_rows[:, None] < storage_sequence_length
+        )
+    else:
+        gl.store(key_base + key_offsets, quantized)
+
+    tile_offsets = row_block * tiles + gl.arange(0, tiles, gl.SliceLayout(1, _GL_SUMMARY_LAYOUT))
+    summary_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, _GL_SUMMARY_LAYOUT))
+    scale_offsets = batch_head * storage_tiles + tile_offsets
+    summary_offsets = scale_offsets[:, None] * _GL_HEAD_DIM + summary_features[None, :]
+    key_scale = gl.convert_layout(key_scale, gl.SliceLayout(1, _GL_SUMMARY_LAYOUT))
+    key_summary = gl.convert_layout(key_summary, _GL_SUMMARY_LAYOUT)
+    if mask_rows:
+        stored_tiles = tile_offsets < storage_tiles
+        gl.store(key_scale_ptr + scale_offsets, key_scale, mask=stored_tiles)
+        gl.store(key_summary_ptr + summary_offsets, key_summary, mask=stored_tiles[:, None])
+        if not mean_pool_summary:
+            key_aux = gl.convert_layout(key_aux, _GL_SUMMARY_LAYOUT)
+            gl.store(key_aux_ptr + summary_offsets, key_aux, mask=stored_tiles[:, None])
+    else:
+        gl.store(key_scale_ptr + scale_offsets, key_scale)
+        gl.store(key_summary_ptr + summary_offsets, key_summary)
+        if not mean_pool_summary:
+            key_aux = gl.convert_layout(key_aux, _GL_SUMMARY_LAYOUT)
+            gl.store(key_aux_ptr + summary_offsets, key_aux)
+
+
+@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE)
+def _value_kernel(
+    input_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    value_mean_ptr,
+    value_ptr,
+    value_scale_ptr,
+    block_mean_ptr,
+    block_lengths_ptr,
+    logical_sequence_length,
+    row_block_offset,
+    storage_tiles,
+    input_features: gl.constexpr,
+    heads: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
+    emit_block_mean: gl.constexpr,
+    mask_rows: gl.constexpr,
+):
+    """Project a V tile and emit centered, K64-scaled, transposed INT8 values."""
+    head = gl.program_id(0)
+    row_block = row_block_offset + gl.program_id(1)
+    batch = gl.program_id(2)
+    input_row_start = batch * logical_sequence_length
+    mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
+        version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
+    )
+    copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
+    if mask_rows:
+        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+    accumulator = _project_int8(
+        input_ptr,
+        weight_ptr,
+        input_row_start + copy_positions,
+        head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, _GL_COPY_ROWS),
+        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        input_features,
+    )
+
+    # [K64 tiles, rows, features] with lanes along rows for the transposed V stores.
+    tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 4], [1, 32, 1], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
+    )
+    tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
+    tile_layout: gl.constexpr = gl.SliceLayout(1, tile_rows_layout)
+    features_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, layout))
+    tile_offsets = row_block * tiles + gl.arange(0, tiles, tile_layout)
+    rows_in_tile = gl.arange(0, _GL_TILE_ROWS, gl.SliceLayout(0, tile_rows_layout))
+    sequence = tile_offsets[:, None] * _GL_TILE_ROWS + rows_in_tile[None, :]
+    features = gl.arange(0, _GL_HEAD_DIM, features_layout)
+    positions = sequence
+    if mask_rows:
+        positions = gl.minimum(positions, logical_sequence_length - 1)
+    input_scale = gl.load(input_scale_ptr + input_row_start + positions)
+    weight_scale = gl.load(weight_scale_ptr + head * _GL_HEAD_DIM + features)
+    accumulator = gl.convert_layout(
+        gl.reshape(accumulator, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]), layout
+    )
+    projection = accumulator.to(gl.float32) * input_scale[:, :, None] * weight_scale[None, None, :]
+    if bias_ptr is not None:
+        bias = gl.load(bias_ptr + head * _GL_HEAD_DIM + features).to(gl.float32)
+        projection += bias[None, None, :]
+
+    batch_head = batch * heads + head
+    value_mean = gl.load(value_mean_ptr + batch_head * _GL_HEAD_DIM + features)
+    if mask_block_lengths:
+        tile_length = gl.load(
+            block_lengths_ptr + tile_offsets, mask=tile_offsets < storage_tiles, other=0
+        )
+        valid = rows_in_tile[None, :] < tile_length[:, None]
+    else:
+        valid = sequence < logical_sequence_length
+    scale_offsets = batch_head * storage_tiles + tile_offsets
+    stored_tiles = tile_offsets < storage_tiles
+    if emit_block_mean:
+        mean_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, layout))
+        mean_offsets = gl.convert_layout(scale_offsets, mean_layout)
+        mean_features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, gl.SliceLayout(1, layout)))
+        mean_pointers = (
+            block_mean_ptr + mean_offsets[:, None] * _GL_HEAD_DIM + mean_features[None, :]
+        )
+        if mask_rows:
+            valid_count = gl.maximum(gl.sum(valid.to(gl.int32), axis=1), 1)
+            block_sum = gl.sum(gl.where(valid[:, :, None], projection, 0.0), axis=1)
+            block_mean = block_sum / gl.convert_layout(valid_count, mean_layout)[:, None]
+            stored_means = gl.convert_layout(stored_tiles, mean_layout)
+            gl.store(mean_pointers, block_mean, mask=stored_means[:, None])
+        else:
+            gl.store(mean_pointers, gl.sum(projection, axis=1) / _GL_TILE_ROWS)
+    centered = projection - value_mean[None, None, :]
+    if mask_rows:
+        centered = gl.where(valid[:, :, None], centered, 0.0)
+    value_scale = (
+        gl.max(gl.max(gl.abs(centered), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
+    )
+    quantized = _round_to_int8(centered / value_scale[:, None, None])
+
+    storage_sequence_length = storage_tiles * _GL_TILE_ROWS
+    value_pointers = (
+        value_ptr
+        + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_sequence_length
+        + features[None, None, :].to(gl.int64) * storage_sequence_length
+        + sequence[:, :, None]
+    )
+    if mask_rows:
+        gl.store(value_pointers, quantized, mask=stored_tiles[:, None, None])
+        gl.store(
+            value_scale_ptr + scale_offsets, value_scale * _GL_P_UINT8_RANGE, mask=stored_tiles
+        )
+    else:
+        gl.store(value_pointers, quantized)
+        gl.store(value_scale_ptr + scale_offsets, value_scale * _GL_P_UINT8_RANGE)
+
+
+def _launch_rows(sequence_rows: int, launch) -> None:
+    """Launch full 128-row tiles, then one masked tile for the remainder.
+
+    Heads vary fastest, so the programs that run together share their input rows in L2.
+    Grouping several row blocks per head, as the Triton kernels do, measured 1-3% slower.
+    """
+    full_row_blocks = sequence_rows // _BLOCK_M
+    if full_row_blocks:
+        launch(full_row_blocks, 0, mask_rows=False)
+    if sequence_rows % _BLOCK_M:
+        launch(1, full_row_blocks, mask_rows=True)
+
+
+def project_query(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    softmax_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    chunk_start: int,
+    chunk_rows: int,
+    out: QueryOutput,
+    bias: torch.Tensor | None = None,
+) -> None:
+    """Fill Q32 INT8 queries, scales, and Q64 summaries for a supported query window."""
+    query, query_scale, query_summary = out
+    batch, heads, storage_sequence_length, _head_dim = query.shape
+    mask_block_lengths = block_lengths is not None
+
+    with device_context(input_qdata.device):
+
+        def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
+            _query_kernel[(heads, row_blocks, batch)](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                bias,
+                norm_weight,
+                cos,
+                sin,
+                query,
+                query_scale,
+                query_summary,
+                block_lengths if mask_block_lengths else query_scale,
+                input_qdata.shape[1],
+                row_block_offset,
+                chunk_start,
+                chunk_start + chunk_rows,
+                storage_sequence_length // TILE_ROWS,
+                input_features=input_qdata.shape[2],
+                heads=heads,
+                rotary_dim=cos.shape[1],
+                norm_epsilon=norm_epsilon,
+                softmax_scale=softmax_scale,
+                mean_pool_summary=routing_mode == _MEAN_ROUTING,
+                mask_block_lengths=mask_block_lengths,
+                # Block lengths can end any K64 block early, so they mask every tile.
+                mask_rows=mask_rows or mask_block_lengths,
+                num_warps=_NUM_WARPS,
+            )
+
+        _launch_rows(chunk_rows, launch)
+
+
+def project_key(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    out: KeyOutput,
+    bias: torch.Tensor | None = None,
+) -> None:
+    """Fill K64 INT8 keys, scales, and routing summaries for supported operands."""
+    key, key_scale, key_summary, key_aux = out
+    batch, heads, storage_sequence_length, _head_dim = key.shape
+    mask_block_lengths = block_lengths is not None
+
+    with device_context(input_qdata.device):
+
+        def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
+            _key_kernel[(heads, row_blocks, batch)](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                bias,
+                norm_weight,
+                cos,
+                sin,
+                key,
+                key_scale,
+                key_summary,
+                key_aux,
+                block_lengths if mask_block_lengths else key_scale,
+                input_qdata.shape[1],
+                row_block_offset,
+                storage_sequence_length // TILE_ROWS,
+                input_features=input_qdata.shape[2],
+                heads=heads,
+                rotary_dim=cos.shape[1],
+                norm_epsilon=norm_epsilon,
+                mean_pool_summary=routing_mode == _MEAN_ROUTING,
+                mask_block_lengths=mask_block_lengths,
+                mask_rows=mask_rows or mask_block_lengths,
+                num_warps=_NUM_WARPS,
+            )
+
+        _launch_rows(input_qdata.shape[1], launch)
+
+
+def project_value(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    input_mean: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_lengths: torch.Tensor | None,
+    *,
+    emit_block_mean: bool,
+    out: ValueOutput,
+    bias: torch.Tensor | None = None,
+) -> None:
+    """Fill centered K64-scaled INT8 values, the projected mean, and block means."""
+    value, value_scale_multiplier, value_mean, block_mean = out
+    batch, heads, _head_dim, storage_sequence_length = value.shape
+    mask_block_lengths = block_lengths is not None
+
+    with device_context(input_qdata.device):
+
+        def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
+            _value_kernel[(heads, row_blocks, batch)](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                bias,
+                value_mean,
+                value,
+                value_scale_multiplier,
+                block_mean,
+                block_lengths if mask_block_lengths else value_mean,
+                input_qdata.shape[1],
+                row_block_offset,
+                storage_sequence_length // TILE_ROWS,
+                input_features=input_qdata.shape[2],
+                heads=heads,
+                mask_block_lengths=mask_block_lengths,
+                emit_block_mean=emit_block_mean,
+                mask_rows=mask_rows or mask_block_lengths,
+                num_warps=_NUM_WARPS,
+            )
+
+        _kernels._project_prepared_input_mean_kernel[(heads, batch)](
+            input_mean,
+            weight_qdata,
+            weight_scale,
+            value_mean,
+            bias_ptr=bias,
+            input_features=input_qdata.shape[2],
+            output_features=heads * _HEAD_DIM,
+            block_n=_HEAD_DIM,
+            block_k=_MEAN_BLOCK_K,
+            num_warps=_NUM_WARPS,
+        )
+        _launch_rows(input_qdata.shape[1], launch)

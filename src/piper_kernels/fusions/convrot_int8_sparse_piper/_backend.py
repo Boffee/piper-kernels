@@ -14,6 +14,7 @@ from ._interfaces import ProjectionBackend
 from ._nvidia import policy as nvidia_policy
 
 try:
+    from ._nvidia import gluon as _nvidia_sm89_gluon
     from ._nvidia import sm89 as _nvidia_sm89_projection
     from ._nvidia import triton as _nvidia_projection
 except ModuleNotFoundError as error:
@@ -21,6 +22,7 @@ except ModuleNotFoundError as error:
         raise
     _nvidia_projection = None
     _nvidia_sm89_projection = None
+    _nvidia_sm89_gluon = None
 
 
 try:
@@ -57,6 +59,7 @@ def source_files() -> tuple[str, ...]:
             amd_policy.__file__,
             None if _nvidia_projection is None else _nvidia_projection.__file__,
             None if _nvidia_sm89_projection is None else _nvidia_sm89_projection.__file__,
+            None if _nvidia_sm89_gluon is None else _nvidia_sm89_gluon.__file__,
             None if _amd_projection is None else _amd_projection.__file__,
             linear_backend.__file__,
             attention_backend.__file__,

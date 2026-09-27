@@ -86,10 +86,14 @@ def _random_operands(
     ],
 )
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
+# SM89 projects 256 input features with Gluon and 272 with the shared Triton launchers.
+@pytest.mark.parametrize("input_features", [256, 272])
 def test_fused_value_projection_matches_the_fp32_composed_contract(
-    bias_dtype: torch.dtype | None, sequence_length: int, head_dim: int
+    input_features: int, bias_dtype: torch.dtype | None, sequence_length: int, head_dim: int
 ) -> None:
-    operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    operands = _random_operands(
+        sequence_length=sequence_length, input_features=input_features, head_dim=head_dim
+    )
     bias = (
         torch.randn(2 * head_dim, device="cuda", dtype=bias_dtype)
         if bias_dtype is not None
@@ -164,8 +168,9 @@ def test_fused_value_projection_optionally_emits_valid_prefix_block_means(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
-def test_fused_value_block_means_respect_internal_block_lengths() -> None:
-    operands = _random_operands(sequence_length=128)
+@pytest.mark.parametrize("input_features", [256, 272])
+def test_fused_value_block_means_respect_internal_block_lengths(input_features: int) -> None:
+    operands = _random_operands(sequence_length=128, input_features=input_features)
     block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
     dequantized = operands.input_qdata.float() * operands.input_scale[..., None]
     input_mean = torch.cat((dequantized[:, :64], dequantized[:, 64:81]), dim=1).mean(dim=1)
