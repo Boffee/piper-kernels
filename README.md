@@ -365,7 +365,7 @@ ROCm environment rather than `uv sync` in that environment.
 `from_hp()`, `from_quantized()`, and `dequantize()` API. It carries packed INT8
 weights, FP32 weight scales, and an optional FP32 `act_per_tensor_scale` tensor.
 `piper_kernels.conv3d.convrot.int8.ConvRotInt8Conv3d` consumes that weight with a
-fixed activation scale. Optimized backends target SM120 and ROCm RDNA4
+fixed activation scale. Optimized backends target SM120, SM8x, and ROCm RDNA4
 (`gfx1200`/`gfx1201`), with a portable reference elsewhere. Loading contiguous
 checkpoint tensors preserves mmap storage. H3 encoder compile options fuse framewise
 GroupNorm, SiLU, padding, and residuals around explicitly installed quantized convolutions.

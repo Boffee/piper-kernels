@@ -4,19 +4,27 @@ from typing import Protocol
 
 import torch
 
-from ._plan import ConvolutionPlan, PreparationPlan
+from piper_kernels._triton.targets import AcceleratorTarget
+
+from ._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 
 
 class ConvolutionPolicy(Protocol):
-    def convolution_plan(self, channels: int, outputs: int, rows: int) -> ConvolutionPlan: ...
+    """Select a complete execution plan using only target and operand metadata."""
 
-    def preparation_plan(
-        self, channels: int, rows: int, *, group_norm: bool
-    ) -> PreparationPlan: ...
-
-    def use_weight_descriptor(
-        self, channels: int, outputs: int, height: int, block_n: int, *, aligned: bool
-    ) -> bool: ...
+    def select_execution_plan(
+        self,
+        target: AcceleratorTarget,
+        *,
+        channels: int,
+        outputs: int,
+        input_rows: int,
+        output_rows: int,
+        output_height: int,
+        weight_aligned: bool,
+        group_norm: bool,
+        convolution_schedule: ConvolutionSchedule | None = None,
+    ) -> ConvolutionExecutionPlan: ...
 
 
 class ConvolutionBackend(Protocol):

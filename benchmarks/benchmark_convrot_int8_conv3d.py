@@ -10,8 +10,8 @@ from __future__ import annotations
 import argparse
 import os
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TypedDict, cast
 
 import torch
@@ -24,9 +24,10 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.conv3d.convrot.int8 import triton as shared
 from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
+from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
 from piper_kernels.conv3d.convrot.int8._interfaces import ConvolutionPolicy
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
-from piper_kernels.conv3d.convrot.int8._plan import ConvolutionPlan
+from piper_kernels.conv3d.convrot.int8._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
@@ -79,9 +80,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _convolution_policy(target: AcceleratorTarget) -> ConvolutionPolicy:
-    for policy in (nvidia_policy, amd_policy):
-        if policy.supports_target(target):
-            return cast(ConvolutionPolicy, policy)
+    if nvidia_policy.supports_target(target):
+        return cast(ConvolutionPolicy, nvidia_policy)
+    if amd_policy.supports_target(target):
+        return cast(ConvolutionPolicy, amd_policy)
     raise ValueError(f"ConvRot INT8 convolution benchmarking has no optimized backend for {target}")
 
 
@@ -258,15 +260,27 @@ def _benchmark_shape(
             )
     if not args.tune:
         return records
+    execution_plan_for = partial(
+        default_execution_plan,
+        activation,
+        weight.qdata,
+        (1, 1, 1),
+        policy=policy,
+        target=target,
+        group_norm=False,
+        symmetric_spatial_padding=True,
+        right_spatial_padding=False,
+    )
+    production_plan = execution_plan_for()
     prepared = shared._prepare_input(
         activation,
         group_size,
         weight.act_per_tensor_scale,
-        policy=policy,
+        schedule=production_plan.preparation,
         accelerator_backend=target.backend,
     )
     candidates = (
-        ConvolutionPlan(m, n, k, warps, stages)
+        ConvolutionSchedule(m, n, k, warps, stages)
         for m, n, k, warps in (
             (32, 64, 64, 4),
             (32, 64, 128, 4),
@@ -289,20 +303,13 @@ def _benchmark_shape(
         None,
         weight.act_per_tensor_scale,
         (1, 1, 1),
-        policy=policy,
+        execution_plan=production_plan,
         **flags,
     )
-    for plan in candidates:
-        candidate = cast(
-            ConvolutionPolicy,
-            SimpleNamespace(
-                convolution_plan=lambda *_, plan=plan: plan,
-                preparation_plan=policy.preparation_plan,
-                use_weight_descriptor=policy.use_weight_descriptor,
-            ),
-        )
+    for schedule in candidates:
+        candidate = execution_plan_for(convolution_schedule=schedule)
 
-        def run(candidate: ConvolutionPolicy = candidate) -> torch.Tensor:
+        def run(candidate: ConvolutionExecutionPlan = candidate) -> torch.Tensor:
             return shared._conv3d_prepared(
                 prepared,
                 weight.qdata,
@@ -310,7 +317,7 @@ def _benchmark_shape(
                 None,
                 weight.act_per_tensor_scale,
                 (1, 1, 1),
-                policy=candidate,
+                execution_plan=candidate,
                 **flags,
             )
 
@@ -330,13 +337,13 @@ def _benchmark_shape(
                     **configuration,
                     "operation": "conv3d",
                     "phase": "prepared_execution",
-                    "plan": plan._asdict(),
+                    "plan": schedule._asdict(),
                 },
                 timings=timing,
                 environment=environment,
             )
         )
-        print(f"{shape} {plan}: graph {timing.graph.display()} ms", flush=True)
+        print(f"{shape} {schedule}: graph {timing.graph.display()} ms", flush=True)
     return records
 
 

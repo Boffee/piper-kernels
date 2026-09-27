@@ -104,19 +104,18 @@ def test_incorrect_outputs_fail_before_timing(monkeypatch, skip_reference_timing
     timer.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("backend", "arch", "policy"),
-    [
-        ("cuda", "sm120", benchmark.nvidia_policy),
-        ("hip", "gfx1200", benchmark.amd_policy),
-        ("hip", "gfx1201", benchmark.amd_policy),
-    ],
-)
-def test_convolution_selects_the_production_policy(backend, arch, policy):
-    assert benchmark._convolution_policy(AcceleratorTarget(backend, arch)) is policy
+@pytest.mark.parametrize("arch", ["sm120", "sm89"])
+def test_convolution_selects_the_production_nvidia_policy(arch):
+    target = AcceleratorTarget("cuda", arch)
+    assert benchmark._convolution_policy(target) is benchmark.nvidia_policy
 
 
-@pytest.mark.parametrize(("backend", "arch"), [("cuda", "sm89"), ("hip", "gfx9999"), ("cpu", None)])
+@pytest.mark.parametrize("arch", ["gfx1200", "gfx1201"])
+def test_convolution_selects_the_production_amd_policy(arch):
+    assert benchmark._convolution_policy(AcceleratorTarget("hip", arch)) is benchmark.amd_policy
+
+
+@pytest.mark.parametrize(("backend", "arch"), [("cuda", "sm90"), ("hip", "gfx9999"), ("cpu", None)])
 def test_unsupported_targets_cannot_benchmark_a_portable_fallback(backend, arch):
     with pytest.raises(ValueError, match="no optimized backend"):
         benchmark._convolution_policy(AcceleratorTarget(backend, arch))

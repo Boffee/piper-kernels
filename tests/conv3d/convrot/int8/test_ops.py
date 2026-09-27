@@ -310,6 +310,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
     activation = (offsets + 0.5 * torch.randn(1, 128, 2, 33, 35, device="cuda")).half()
     weight, bias = torch.ones(128, device="cuda"), torch.zeros(128, device="cuda")
     target = AcceleratorTarget.from_device(activation.device)
+    policy = amd_policy if target.is_amd_hip else nvidia_policy
     actual = backend._prepare_group_norm_silu_input(
         activation,
         weight,
@@ -318,7 +319,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
         1e-6,
         64,
         torch.tensor(0.02, device="cuda"),
-        policy=amd_policy if target.is_amd_hip else nvidia_policy,
+        schedule=policy._preparation_schedule(128, 2 * 33 * 35, group_norm=True),
         accelerator_backend=target.backend,
     )
     expected = reference._prepare_group_norm_silu_input(
@@ -344,4 +345,82 @@ def test_unaligned_contiguous_weight_uses_pointer_loads():
     expected = reference.conv3d(
         *args, symmetric_spatial_padding=True, right_spatial_padding=False, residual=None
     )
+    torch.testing.assert_close(actual, expected, atol=4e-3, rtol=4e-3)
+
+
+def _nvidia_native_available() -> bool:
+    return (
+        _native_available() and AcceleratorTarget.from_device(torch.device("cuda")).is_nvidia_cuda
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _nvidia_native_available(), reason="requires a native NVIDIA backend")
+@pytest.mark.parametrize(
+    ("shape", "outputs", "padding", "stride", "fused", "tile"),
+    [
+        ((1, 128, 3, 32, 32), 256, "reflect", (1, 1, 1), False, (64, 128, 128, 4, 3)),
+        ((1, 256, 3, 16, 16), 128, "reflect", (1, 1, 1), True, (64, 64, 128, 4, 3)),
+        ((2, 256, 5, 17, 19), 130, "reflect_right", (1, 2, 2), False, (64, 64, 128, 4, 3)),
+        ((1, 512, 2, 8, 8), 48, "reflect", (1, 1, 1), True, (32, 32, 128, 2, 3)),
+    ],
+)
+def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
+    shape, outputs, padding, stride, fused, tile
+):
+    from piper_kernels.conv3d.convrot.int8 import triton as backend  # noqa: PLC0415
+    from piper_kernels.conv3d.convrot.int8._dispatch import (  # noqa: PLC0415
+        default_execution_plan,
+    )
+    from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy  # noqa: PLC0415
+
+    torch.manual_seed(2718)
+    channels = shape[1]
+    activation = torch.randn(shape, device="cuda", dtype=torch.float16)
+    weight = _weight(outputs, channels, device="cuda")
+    bias = torch.randn(outputs, device="cuda", dtype=torch.float16).mul_(0.01)
+    norm_weight = 1 + 0.1 * torch.randn(channels, device="cuda")
+    norm_bias = 0.1 * torch.randn(channels, device="cuda")
+    group_size = 64 if channels <= 128 else 256
+    symmetric, right = padding == "reflect", padding == "reflect_right"
+    operands = (weight.qdata, weight.scale, bias, group_size, weight.act_per_tensor_scale, stride)
+    flags = {"symmetric_spatial_padding": symmetric, "right_spatial_padding": right}
+    norm = (activation, norm_weight, norm_bias, 32, 1e-6)
+    sm8x = default_execution_plan(
+        activation,
+        weight.qdata,
+        stride,
+        policy=nvidia_policy,
+        target=AcceleratorTarget("cuda", "sm89"),
+        group_norm=fused,
+        **flags,
+    )
+    assert sm8x.convolution == tile
+
+    with torch.no_grad():
+        if fused:
+            actual = backend.group_norm_silu_conv3d(
+                *norm,
+                *operands,
+                execution_plan=sm8x,
+                accelerator_backend="cuda",
+                residual=None,
+                **flags,
+            )
+            production = group_norm_silu_conv3d(*norm, weight, bias, stride=stride, padding=padding)
+            expected = reference.group_norm_silu_conv3d(*norm, *operands, residual=None, **flags)
+        else:
+            actual = backend.conv3d(
+                activation,
+                *operands,
+                execution_plan=sm8x,
+                accelerator_backend="cuda",
+                residual=None,
+                **flags,
+            )
+            production = conv3d(activation, weight, bias, stride=stride, padding=padding)
+            expected = reference.conv3d(activation, *operands, residual=None, **flags)
+
+    # INT32 accumulation is exact, so every NVIDIA tile gives the production bits.
+    assert torch.equal(actual, production)
     torch.testing.assert_close(actual, expected, atol=4e-3, rtol=4e-3)

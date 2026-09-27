@@ -1,4 +1,4 @@
-"""Shared ConvRot INT8 convolution kernels and policy-driven launch mechanics."""
+"""Shared ConvRot INT8 convolution kernels and execution-plan launch mechanics."""
 
 # pyright: reportCallIssue=false
 
@@ -13,7 +13,7 @@ from piper_kernels._triton import convrot as rotation_backend
 from piper_kernels._triton import convrot_int8 as int8_kernels
 from piper_kernels._triton.runtime import device_context
 
-from ._interfaces import ConvolutionPolicy
+from ._plan import ConvolutionExecutionPlan, PreparationSchedule
 from ._validation import _output_shape
 
 
@@ -372,7 +372,7 @@ def _prepare_input(
     group_size,
     input_scale,
     *,
-    policy: ConvolutionPolicy,
+    schedule: PreparationSchedule,
     accelerator_backend: str,
 ):
     batch, channels, frames, height, width = input.shape
@@ -383,7 +383,7 @@ def _prepare_input(
         device=input.device,
         dtype=torch.int8,
     )
-    block_m, num_warps = policy.preparation_plan(channels, token_count, group_norm=False)
+    block_m, num_warps = schedule
     with device_context(input.device):
         _prepare_channelwise_kernel[(triton.cdiv(token_count, block_m),)](
             input,
@@ -416,7 +416,7 @@ def _prepare_group_norm_silu_input(
     group_size,
     input_scale,
     *,
-    policy: ConvolutionPolicy,
+    schedule: PreparationSchedule,
     accelerator_backend: str,
 ):
     batch, channels, frames, height, width = input.shape
@@ -471,7 +471,7 @@ def _prepare_group_norm_silu_input(
             device=input.device,
             dtype=torch.int8,
         )
-        block_m, num_warps = policy.preparation_plan(channels, token_count, group_norm=True)
+        block_m, num_warps = schedule
         _prepare_group_norm_silu_kernel[(triton.cdiv(token_count, block_m),)](
             input,
             norm_weight,
@@ -511,7 +511,7 @@ def _conv3d_prepared(
     input_scale,
     stride,
     *,
-    policy: ConvolutionPolicy,
+    execution_plan: ConvolutionExecutionPlan,
     symmetric_spatial_padding,
     right_spatial_padding,
     residual,
@@ -531,27 +531,21 @@ def _conv3d_prepared(
     residual_pointer = residual if residual is not None else output
     residual_strides = residual.stride() if residual is not None else output.stride()
     rows = batch * output_frames * output_height * output_width
-    plan = policy.convolution_plan(input_channels, output_channels, rows)
-    use_weight_descriptor = policy.use_weight_descriptor(
-        input_channels,
-        output_channels,
-        output_height,
-        plan.block_n,
-        aligned=weight_qdata.data_ptr() % 16 == 0,
-    )
+    schedule = execution_plan.convolution
+    use_weight_descriptor = execution_plan.use_weight_descriptor
     with device_context(input_qdata.device):
         weight_argument = (
             TensorDescriptor(
                 base=weight_qdata,
                 shape=[output_channels, 27 * input_channels],
                 strides=[27 * input_channels, 1],
-                block_shape=[plan.block_n, plan.block_k],
+                block_shape=[schedule.block_n, schedule.block_k],
             )
             if use_weight_descriptor
             else weight_qdata
         )
         _conv3d_kernel[
-            (triton.cdiv(rows, plan.block_m), triton.cdiv(output_channels, plan.block_n))
+            (triton.cdiv(rows, schedule.block_m), triton.cdiv(output_channels, schedule.block_n))
         ](
             input_qdata,
             weight_argument,
@@ -572,9 +566,9 @@ def _conv3d_prepared(
             stride_frames=stride[0],
             stride_height=stride[1],
             stride_width=stride[2],
-            block_m=plan.block_m,
-            block_n=plan.block_n,
-            block_k=plan.block_k,
+            block_m=schedule.block_m,
+            block_n=schedule.block_n,
+            block_k=schedule.block_k,
             bias_stride=bias.stride(0) if bias is not None else 1,
             has_bias=bias is not None,
             has_residual=residual is not None,
@@ -586,9 +580,9 @@ def _conv3d_prepared(
             residual_stride_frame=residual_strides[2],
             residual_stride_height=residual_strides[3],
             residual_stride_width=residual_strides[4],
-            loop_num_stages=plan.num_stages,
-            num_warps=plan.num_warps,
-            num_stages=plan.num_stages,
+            loop_num_stages=schedule.num_stages,
+            num_warps=schedule.num_warps,
+            num_stages=schedule.num_stages,
         )
     return output
 
@@ -602,14 +596,18 @@ def conv3d(
     input_scale,
     stride,
     *,
-    policy: ConvolutionPolicy,
+    execution_plan: ConvolutionExecutionPlan,
     accelerator_backend: str,
     symmetric_spatial_padding,
     right_spatial_padding,
     residual,
 ):
     prepared = _prepare_input(
-        input, group_size, input_scale, policy=policy, accelerator_backend=accelerator_backend
+        input,
+        group_size,
+        input_scale,
+        schedule=execution_plan.preparation,
+        accelerator_backend=accelerator_backend,
     )
     return _conv3d_prepared(
         prepared,
@@ -618,7 +616,7 @@ def conv3d(
         bias,
         input_scale,
         stride,
-        policy=policy,
+        execution_plan=execution_plan,
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
@@ -638,7 +636,7 @@ def group_norm_silu_conv3d(
     input_scale,
     stride,
     *,
-    policy: ConvolutionPolicy,
+    execution_plan: ConvolutionExecutionPlan,
     accelerator_backend: str,
     symmetric_spatial_padding,
     right_spatial_padding,
@@ -652,7 +650,7 @@ def group_norm_silu_conv3d(
         norm_epsilon,
         group_size,
         input_scale,
-        policy=policy,
+        schedule=execution_plan.preparation,
         accelerator_backend=accelerator_backend,
     )
     return _conv3d_prepared(
@@ -662,7 +660,7 @@ def group_norm_silu_conv3d(
         bias,
         input_scale,
         stride,
-        policy=policy,
+        execution_plan=execution_plan,
         symmetric_spatial_padding=symmetric_spatial_padding,
         right_spatial_padding=right_spatial_padding,
         residual=residual,
