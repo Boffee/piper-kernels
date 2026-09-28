@@ -1,26 +1,30 @@
-"""Dispatch the async-copy projection backend from validated operand metadata."""
-
-from functools import partial
+"""NVIDIA sparse Q/K/V dispatch over Gluon and shared Triton projection kernels."""
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from . import gluon_async_copy, policy
-from ._plan import NvidiaExecutionPlan
+from ._plan import NvidiaExecutionPlan, ProjectionOperation
 
 
 def default_execution_plan(
     input_qdata: torch.Tensor,
     weight_qdata: torch.Tensor,
     *,
+    operation: ProjectionOperation,
     head_dim: int,
     rotary_dim: int = 0,
+    target: AcceleratorTarget | None = None,
 ) -> NvidiaExecutionPlan:
-    """Resolve the async-copy backend's policy from validated operand metadata."""
+    """Resolve operand metadata, accepting an explicit target for offline tuning."""
+    target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
     return policy.select_execution_plan(
+        target,
+        operation=operation,
         input_features=input_qdata.shape[2],
         head_dim=head_dim,
         rotary_dim=rotary_dim,
@@ -45,15 +49,24 @@ def project_query(  # noqa: PLR0913, PLR0917
     chunk_rows: int,
     out: QueryOutput,
     bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project a query window, with the Gluon kernel when it covers the operands."""
-    plan = default_execution_plan(
-        input_qdata, weight_qdata, head_dim=out[0].shape[3], rotary_dim=cos.shape[1]
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="query",
+            head_dim=out[0].shape[3],
+            rotary_dim=cos.shape[1],
+        )
     )
     launch = (
         gluon_async_copy.project_query
-        if plan.execution_plan is None
-        else partial(projection.project_query, execution_plan=plan.execution_plan)
+        if plan.kernel == "gluon_async_copy"
+        else projection.project_query
     )
     launch(
         input_qdata,
@@ -71,6 +84,7 @@ def project_query(  # noqa: PLR0913, PLR0917
         chunk_rows=chunk_rows,
         out=out,
         bias=bias,
+        execution_plan=plan,
     )
 
 
@@ -88,15 +102,24 @@ def project_key(  # noqa: PLR0913
     *,
     out: KeyOutput,
     bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project keys, with the Gluon kernel when it covers the operands."""
-    plan = default_execution_plan(
-        input_qdata, weight_qdata, head_dim=out[0].shape[3], rotary_dim=cos.shape[1]
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="key",
+            head_dim=out[0].shape[3],
+            rotary_dim=cos.shape[1],
+        )
     )
     launch = (
         gluon_async_copy.project_key
-        if plan.execution_plan is None
-        else partial(projection.project_key, execution_plan=plan.execution_plan)
+        if plan.kernel == "gluon_async_copy"
+        else projection.project_key
     )
     launch(
         input_qdata,
@@ -111,6 +134,7 @@ def project_key(  # noqa: PLR0913
         block_lengths,
         out=out,
         bias=bias,
+        execution_plan=plan,
     )
 
 
@@ -125,13 +149,20 @@ def project_value(
     emit_block_mean: bool,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project values, with the Gluon kernel when it covers the operands."""
-    plan = default_execution_plan(input_qdata, weight_qdata, head_dim=out[0].shape[2])
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else default_execution_plan(
+            input_qdata, weight_qdata, operation="value", head_dim=out[0].shape[2]
+        )
+    )
     launch = (
         gluon_async_copy.project_value
-        if plan.execution_plan is None
-        else partial(projection.project_value, execution_plan=plan.execution_plan)
+        if plan.kernel == "gluon_async_copy"
+        else projection.project_value
     )
     launch(
         input_qdata,
@@ -143,4 +174,5 @@ def project_value(
         emit_block_mean=emit_block_mean,
         out=out,
         bias=bias,
+        execution_plan=plan,
     )

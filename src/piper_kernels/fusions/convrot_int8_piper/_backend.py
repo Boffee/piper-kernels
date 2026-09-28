@@ -9,7 +9,9 @@ from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validat
 from piper_kernels.fusions.projected_qk import _validation as head_validation
 
 from . import _interfaces
+from ._amd import policy as amd_projection_policy
 from ._interfaces import ProjectionBackend
+from ._nvidia import policy as nvidia_projection_policy
 
 try:
     from . import triton as _projection
@@ -55,6 +57,8 @@ def source_files() -> tuple[str, ...]:
         __file__,
         _interfaces.__file__,
         amd_policy.__file__,
+        amd_projection_policy.__file__,
+        nvidia_projection_policy.__file__,
         qk_validation.__file__,
         projection_validation.__file__,
         head_validation.__file__,

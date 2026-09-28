@@ -29,8 +29,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- Shared ConvRot projection plans live in `_plan.py`; sparse projection policies own
-  implementation and launch choices, with operand resolution in `dispatch.py`.
+- Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
+  dispatcher and flat plans selected from target, operation, and operand metadata. Dense
+  and sparse projection settings live in policy modules.
 
 - Execution-plan and schedule types follow shared naming and module ownership conventions.
   Attention and AMD INT8 linear plan types live in `_plan.py`; sparse Piper uses a named
@@ -75,6 +76,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   SM120 kernels are unchanged.
 - `benchmarks/tune_piper_attention.py` gains `--attention-kernel` to compare the
   Triton and Gluon async-copy implementations.
+
+### Fixed
+
+- Sparse query projection windows intersect their end with valid-prefix block lengths.
+  Partial final blocks keep neutral padding, zero unused Q32 scales, and routing summaries
+  limited to the requested rows.
 
 ## [0.7.6rc1] - 2026-09-25
 

@@ -1,17 +1,15 @@
-"""RDNA4 configurations for dense projection launchers."""
+"""Bind shared dense projection launchers to target policy."""
 
 from functools import partial
 
-from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
-
 from .. import triton as projection
+from . import policy
 
-_CONFIG = ProjectionExecutionPlan(
-    block_k=64, heads_per_program=1, num_warps=4, num_stages=2, group_m=8
-)
-
-project_query = partial(projection.project_query, execution_plan=_CONFIG)
-project_key = partial(projection.project_key, execution_plan=_CONFIG)
+project_query = partial(projection.project_query, execution_plan=policy.EXECUTION_PLAN)
+project_key = partial(projection.project_key, execution_plan=policy.EXECUTION_PLAN)
 project_value = partial(
-    projection.project_value, execution_plan=_CONFIG, packed_amd=True, mean_block_n=None
+    projection.project_value,
+    execution_plan=policy.EXECUTION_PLAN,
+    packed_amd=policy.PACKED_VALUE,
+    mean_block_n=policy.VALUE_MEAN_BLOCK_N,
 )

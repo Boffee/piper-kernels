@@ -10,6 +10,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -25,7 +26,12 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
     policy,
 )
 
-_SM89 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9)
+_SM89_TARGET = AcceleratorTarget("cuda", "sm89")
+_MMA_V2_AVAILABLE = (
+    torch.cuda.is_available()
+    and torch.version.hip is None
+    and torch.cuda.get_device_capability()[0] >= 8
+)
 
 
 def _operands(
@@ -99,6 +105,21 @@ def _launch(
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
+    if module in (dispatch, gluon_async_copy) and "execution_plan" not in options:
+        metadata = {
+            "operation": operation,
+            "head_dim": out[0].shape[2 if operation == "value" else 3],
+            "rotary_dim": 0 if operation == "value" else operands[5].shape[1],
+        }
+        options["execution_plan"] = (
+            dispatch.default_execution_plan(
+                input_qdata, weight_qdata, target=_SM89_TARGET, **metadata
+            )
+            if module is dispatch
+            else policy.select_execution_plan(
+                _SM89_TARGET, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
+            )
+        )
     if operation == "query":
         module.project_query(
             *operands,
@@ -170,11 +191,12 @@ def test_sm89_uses_gluon_only_for_supported_projections(
     idle.assert_not_called()
     assert launched.call_args.kwargs["out"] is out
     if not uses_gluon:
-        assert (
-            launched.call_args.kwargs["execution_plan"]
-            is policy.select_execution_plan(
-                input_features=272, head_dim=128, operands_aligned=True
-            ).execution_plan
+        assert launched.call_args.kwargs["execution_plan"] is policy.select_execution_plan(
+            _SM89_TARGET,
+            operation=operation,
+            input_features=272,
+            head_dim=128,
+            operands_aligned=True,
         )
 
 
@@ -329,7 +351,7 @@ def _assert_matches(actual, expected, *, scale_rtol=1e-5):
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _SM89, reason="requires an SM89 GPU")
+@pytest.mark.skipif(not _MMA_V2_AVAILABLE, reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize(
     "case",
@@ -396,8 +418,12 @@ def test_sm89_gluon_projections_match_the_triton_launchers(operation, case):
         operands,
         expected,
         execution_plan=policy.select_execution_plan(
-            input_features=272, head_dim=128, operands_aligned=True
-        ).execution_plan,
+            _SM89_TARGET,
+            operation=operation,
+            input_features=272,
+            head_dim=128,
+            operands_aligned=True,
+        ),
         **options,
     )
     _launch(gluon_async_copy, operation, operands, actual, **options)
@@ -414,13 +440,20 @@ def test_execution_plan_checks_both_operand_pointer_alignments(operand_index, of
     original = operands[operand_index]
     storage = torch.empty(original.numel() + offset, dtype=torch.int8)
     operands[operand_index] = storage[offset:].view_as(original)
-    plan = dispatch.default_execution_plan(operands[0], operands[2], head_dim=128, rotary_dim=96)
+    plan = dispatch.default_execution_plan(
+        operands[0],
+        operands[2],
+        target=_SM89_TARGET,
+        operation="query",
+        head_dim=128,
+        rotary_dim=96,
+    )
     assert plan.kernel == ("gluon_async_copy" if offset % 16 == 0 else "triton")
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    not _MMA_V2_AVAILABLE,
     reason="requires NVIDIA SM80 or newer",
 )
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
@@ -439,13 +472,15 @@ def test_unaligned_projections_use_the_triton_fallback(
     monkeypatch.setattr(gluon_async_copy, f"project_{operation}", guard)
     expected = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
     actual = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
-    plan = policy.select_execution_plan(input_features=256, head_dim=128, operands_aligned=False)
+    plan = policy.select_execution_plan(
+        _SM89_TARGET, operation=operation, input_features=256, head_dim=128, operands_aligned=False
+    )
     _launch(
         projection,
         operation,
         operands,
         expected,
-        execution_plan=plan.execution_plan,
+        execution_plan=plan,
         window=(0, 193),
     )
     _launch(dispatch, operation, operands, actual, window=(0, 193))
@@ -456,7 +491,7 @@ def test_unaligned_projections_use_the_triton_fallback(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    not _MMA_V2_AVAILABLE,
     reason="requires NVIDIA SM80 or newer",
 )
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])

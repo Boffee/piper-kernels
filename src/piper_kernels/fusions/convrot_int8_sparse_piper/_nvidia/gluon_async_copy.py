@@ -43,12 +43,19 @@ from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
 from .. import _kernels
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from .._layout import QUERY_SCALE_ROWS, TILE_ROWS
+from ._plan import (
+    GLUON_BLOCK_K,
+    GLUON_BLOCK_M,
+    GLUON_NUM_STAGES,
+    GLUON_NUM_WARPS,
+    NvidiaExecutionPlan,
+)
 
 _HEAD_DIM = 128
-_BLOCK_M = 128
-_BLOCK_K = 64
-_NUM_STAGES = 3
-_NUM_WARPS = 4
+_BLOCK_M = GLUON_BLOCK_M
+_BLOCK_K = GLUON_BLOCK_K
+_NUM_STAGES = GLUON_NUM_STAGES
+_NUM_WARPS = GLUON_NUM_WARPS
 # The projected V mean is one row per head; its launcher reuses the Triton kernel.
 _MEAN_BLOCK_K = 128
 
@@ -781,6 +788,7 @@ def project_query(
     chunk_rows: int,
     out: QueryOutput,
     bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan,
 ) -> None:
     """Fill Q32 INT8 queries, scales, and Q64 summaries for a supported query window."""
     query, query_scale, query_summary = out
@@ -816,7 +824,7 @@ def project_query(
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=mask_block_lengths,
                 mask_rows=mask_rows,
-                num_warps=_NUM_WARPS,
+                num_warps=execution_plan.num_warps,
             )
 
         _launch_rows(chunk_rows, launch, mask_block_lengths=mask_block_lengths)
@@ -836,6 +844,7 @@ def project_key(
     *,
     out: KeyOutput,
     bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan,
 ) -> None:
     """Fill centered K64 INT8 keys, scales, and routing summaries for supported operands."""
     key, key_scale, key_summary, key_aux = out
@@ -875,7 +884,7 @@ def project_key(
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=mask_block_lengths,
                 mask_rows=mask_rows,
-                num_warps=_NUM_WARPS,
+                num_warps=execution_plan.num_warps,
             )
 
         _launch_rows(sequence_length, launch, mask_block_lengths=mask_block_lengths)
@@ -901,6 +910,7 @@ def project_value(
     emit_block_mean: bool,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan,
 ) -> None:
     """Fill centered K64-scaled INT8 values, the projected mean, and block means."""
     value, value_scale_multiplier, value_mean, block_mean = out
@@ -929,7 +939,7 @@ def project_value(
                 mask_block_lengths=mask_block_lengths,
                 emit_block_mean=emit_block_mean,
                 mask_rows=mask_rows,
-                num_warps=_NUM_WARPS,
+                num_warps=execution_plan.num_warps,
             )
 
         _kernels._project_prepared_input_mean_kernel[(heads, batch)](
@@ -942,6 +952,6 @@ def project_value(
             output_features=heads * _HEAD_DIM,
             block_n=_HEAD_DIM,
             block_k=_MEAN_BLOCK_K,
-            num_warps=_NUM_WARPS,
+            num_warps=execution_plan.num_warps,
         )
         _launch_rows(input_qdata.shape[1], launch, mask_block_lengths=mask_block_lengths)
