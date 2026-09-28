@@ -47,7 +47,7 @@ jobs:
         run: uv run pyright
 
       - name: Test portable backends
-        run: uv run pytest
+        run: uv run python scripts/run_tests.py
 
       - name: Build distributions without local sources
         run: uv build --no-sources
@@ -99,5 +99,7 @@ jobs:
           assert version('triton-windows').startswith('3.8.');
           assert triton.__version__.startswith('3.8.')"
 
-      - name: Test portable attention backends
-        run: uv run --no-sync pytest tests/attention tests/triton -m "not gpu"
+      - name: Test portable attention backends and cache lifecycle
+        run: >-
+          uv run --no-sync python scripts/run_tests.py --
+          tests/attention tests/triton tests/test_compile_cache.py -m "not gpu"
