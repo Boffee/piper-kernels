@@ -1,5 +1,6 @@
 """Quantized dense Q keeps metadata validation and native attention semantics."""
 
+from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
@@ -14,6 +15,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as 
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
 from piper_kernels.attention.piper_attention._amd import gluon as amd
 from piper_kernels.attention.piper_attention._amd import policy as amd_policy
+from piper_kernels.attention.piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.piper_attention._nvidia import triton as nvidia
 
 
@@ -48,10 +50,12 @@ def _inputs(
     kv_heads=2,
     head_dim=64,
     causal=False,
+    granularity="per_warp",
 ):
     storage = ((query_length + 63) // 64) * 64
+    scales = storage if granularity == "per_thread" else storage // 32
     query = torch.empty((batch, heads, storage, head_dim), device=device, dtype=torch.int8)
-    scale = torch.empty((batch, heads, storage // 32), device=device, dtype=torch.float32)
+    scale = torch.empty((batch, heads, scales), device=device, dtype=torch.float32)
     # Floating K/V retain projection-style outer strides.
     key = torch.empty((batch, key_length, kv_heads, head_dim), device=device, dtype=dtype)
     key = key.transpose(1, 2)
@@ -71,10 +75,17 @@ def _forbid_runtime(monkeypatch):
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("granularity", ["per_warp", "per_thread"])
 def test_metadata_validation_accepts_ragged_gqa_without_tensor_operations(
-    monkeypatch, device, dtype, causal
+    monkeypatch, device, dtype, causal, granularity
 ):
-    operands = _inputs(device=device, dtype=dtype, key_length=65 if causal else 97, causal=causal)
+    operands = _inputs(
+        device=device,
+        dtype=dtype,
+        key_length=65 if causal else 97,
+        causal=causal,
+        granularity=granularity,
+    )
     _forbid_runtime(monkeypatch)
     with _NoTensorOperations():
         shape = dispatch._validate_quantized_query(*operands)
@@ -237,10 +248,28 @@ def test_gradient_flags_follow_inference_contract(monkeypatch, operand):
 
 
 @pytest.mark.parametrize("architecture", ["sm80", "sm89", "sm90", "sm100", "sm120", "sm121"])
-def test_native_grouped_q32_target_gate(architecture):
+def test_native_quantized_query_target_gate(architecture):
     assert dispatch.supports_quantized_query(AcceleratorTarget("cuda", architecture)) is (
-        architecture in ("sm120", "sm121")
+        architecture in ("sm89", "sm120", "sm121")
     )
+
+
+@pytest.mark.parametrize(
+    ("target", "granularity"),
+    [
+        (AcceleratorTarget("cuda", "sm89"), "per_thread"),
+        (AcceleratorTarget("cuda", "sm120"), "per_warp"),
+        (AcceleratorTarget("cuda", "sm121"), "per_warp"),
+        (AcceleratorTarget("hip", "gfx1201"), "per_warp"),
+    ],
+)
+def test_qk_quantization_granularity_follows_the_target_plans(target, granularity):
+    assert dispatch.qk_quantization_granularity(target) == granularity
+    if target.is_nvidia_cuda:
+        plan = nvidia_policy.select_execution_plan(
+            target, head_dim=64, is_causal=False, query_length=65
+        )
+        assert plan.grouped_qk is (granularity == "per_warp")
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx1100", "gfx942"])
@@ -249,7 +278,7 @@ def test_native_amd_target_gate(architecture):
     assert dispatch.supports_quantized_query(target) is amd_policy.supports_target(target)
 
 
-@pytest.mark.parametrize("architecture", ["sm80", "sm89", "sm90", "sm100"])
+@pytest.mark.parametrize("architecture", ["sm80", "sm90", "sm100"])
 def test_unsupported_native_target_fails_before_kv_preparation(monkeypatch, architecture):
     operands = _inputs(device="cpu")
     _forbid_runtime(monkeypatch)
@@ -257,6 +286,21 @@ def test_unsupported_native_target_fails_before_kv_preparation(monkeypatch, arch
         AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", architecture)
     )
     with pytest.raises(RuntimeError):
+        dispatch._piper_attention_from_quantized_query_op(*operands)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "granularity"), [("sm89", "per_warp"), ("sm120", "per_thread")]
+)
+def test_mismatched_scale_granularity_fails_before_kv_preparation(
+    monkeypatch, architecture, granularity
+):
+    operands = _inputs(device="cpu", granularity=granularity)
+    _forbid_runtime(monkeypatch)
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", architecture)
+    )
+    with pytest.raises(RuntimeError, match=f"{granularity} Q/K scales are unavailable"):
         dispatch._piper_attention_from_quantized_query_op(*operands)
 
 
@@ -276,15 +320,19 @@ def _native_available():
 
 
 _native_only = pytest.mark.skipif(
-    not _native_available(), reason="requires native grouped-Q32 Piper"
+    not _native_available(), reason="requires native quantized-Q Piper"
 )
 
 
-def _quantized_query(query, scale):
+def _granularity():
+    return dispatch.qk_quantization_granularity(AcceleratorTarget.from_device(torch.device("cuda")))
+
+
+def _quantized_query(query, scale, granularity=None):
     return qk_quantization.prepare_query(
         query,
         scale,
-        grouped=True,
+        grouped=(granularity or _granularity()) == "per_warp",
         storage_query_length=((query.shape[2] + 63) // 64) * 64,
     )
 
@@ -348,7 +396,7 @@ def test_native_query_padding_does_not_contribute_to_real_rows():
         query_int8, query_scale, key, value, 65, False
     )
     query_int8[:, :, 65:].fill_(127)
-    query_scale[:, :, 3:].fill_(float("nan"))
+    query_scale[:, :, 65 if _granularity() == "per_thread" else 3 :].fill_(float("nan"))
     actual = dispatch._piper_attention_from_quantized_query_op(
         query_int8, query_scale, key, value, 65, False
     )
@@ -417,4 +465,55 @@ def test_quantized_boundary_graph_capture_recomputes_live_kv_and_query(causal):
         graph.replay()
         expected = run()
     stream.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _pad_keys(metadata, storage):
+    padded = metadata.new_zeros((*metadata.shape[:2], storage))
+    padded[:, :, : metadata.shape[2]] = metadata
+    return padded
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None, reason="requires NVIDIA"
+)
+@pytest.mark.parametrize("query_length", [65, 257, 320])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm89_native_contract_matches_regular_gluon_attention(query_length, head_dim, causal):
+    # Q64-padded storage under Q128 tiles and K64-padded K/V metadata must
+    # reproduce the regular SM89 Gluon path bit for bit on any NVIDIA device.
+    torch.manual_seed(631 + query_length + head_dim)
+    key_length = query_length if causal else query_length + 38
+    query = torch.randn(2, 6, query_length, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(2, 2, key_length, head_dim, device="cuda", dtype=query.dtype)
+    value = torch.randn_like(key)
+    lengths = {"head_dim": head_dim, "is_causal": causal, "query_length": query_length}
+    target = AcceleratorTarget("cuda", "sm89")
+    regular = nvidia_policy.select_execution_plan(target, key_length=key_length, **lengths)
+    quantized = nvidia_policy.select_execution_plan(
+        target, key_length=key_length, quantized_query=True, **lengths
+    )
+    scale = head_dim**-0.5
+    with torch.no_grad():
+        expected = nvidia._run_piper_attention(
+            query, key, value, scale, causal, execution_plan=regular
+        )
+        context = nvidia._prepare_piper_context(
+            key, value, is_causal=causal, execution_plan=regular
+        )
+        assert isinstance(context.key, torch.Tensor)
+        storage = context.key.shape[2]
+        native = replace(
+            context,
+            key_scale=_pad_keys(context.key_scale, storage),
+            value_scale_multiplier=_pad_keys(context.value_scale_multiplier, storage),
+            execution_plan=quantized,
+            padded_kv=True,
+        )
+        query_int8, query_scale = _quantized_query(query, scale, "per_thread")
+        actual = dispatch.launch_quantized_attention_into(
+            native, query_int8, query_scale, torch.empty_like(query)
+        )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
