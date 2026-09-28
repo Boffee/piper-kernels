@@ -26,8 +26,8 @@ repos:
 
       - id: tests
         name: tests (cpu-only)
-        entry: env CUDA_VISIBLE_DEVICES= uv run --frozen pytest -q
+        entry: env CUDA_VISIBLE_DEVICES= uv run --frozen python scripts/run_tests.py -- -q
         language: system
-        files: ^(src/|benchmarks/|tests/|pyproject\.toml)
+        files: ^(src/|benchmarks/|tests/|scripts/|pyproject\.toml)
         pass_filenames: false
         require_serial: true

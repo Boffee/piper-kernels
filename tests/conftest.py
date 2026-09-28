@@ -1,54 +1,10 @@
 """Repository-wide pytest configuration."""
 
 import os
-import shutil
-import sys
 from collections.abc import Iterator
-from pathlib import Path
-from tempfile import TemporaryDirectory, mkdtemp
 
 import pytest
-from _compile_cache import defer_windows_cleanup, ram_cache_directory
 from filelock import FileLock
-
-_COMPILE_CACHE = pytest.StashKey[str]()
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config: pytest.Config) -> None:
-    """Own compilation caches for this run, with cleanup after workers exit."""
-    worker_input = getattr(config, "workerinput", None)
-    if worker_input is not None:
-        root = worker_input["piper_compile_cache"]
-    elif sys.platform == "win32":
-        root = mkdtemp(prefix="piper-kernels-pytest-")
-        try:
-            defer_windows_cleanup(root)
-        except Exception:
-            shutil.rmtree(root)
-            raise
-    else:
-        try:
-            cache = TemporaryDirectory(prefix="piper-kernels-pytest-", dir=ram_cache_directory())
-        except OSError:
-            # Shared memory can disappear or run out of space after the probe.
-            cache = TemporaryDirectory(prefix="piper-kernels-pytest-")
-        config.add_cleanup(cache.cleanup)
-        root = cache.name
-    config.stash[_COMPILE_CACHE] = root
-    environment = pytest.MonkeyPatch()
-    config.add_cleanup(environment.undo)
-    for variable, subdirectory in (
-        ("TRITON_CACHE_DIR", "triton"),
-        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
-    ):
-        environment.setenv(variable, str(Path(root) / subdirectory))
-
-
-@pytest.hookimpl(optionalhook=True)
-def pytest_configure_node(node) -> None:
-    """Share the controller's cache without giving workers cleanup ownership."""
-    node.workerinput["piper_compile_cache"] = node.config.stash[_COMPILE_CACHE]
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)
