@@ -82,6 +82,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Sparse query projection windows intersect their end with valid-prefix block lengths.
   Partial final blocks keep neutral padding, zero unused Q32 scales, and routing summaries
   limited to the requested rows.
+- Quantized weights convert and view under `torch.inference_mode()` as they do under
+  `torch.no_grad()`. Inference mode skips the autograd dispatch that decomposes composite ops
+  such as `Tensor.to`, so `to`, `half`, `type_as`, and `reshape` raised `NotImplementedError`.
+  An autocast linear in an inference-mode region therefore failed for ConvRot INT8, ConvRot
+  NVFP4, and Piper NVFP4 weights, even when the weight already had the autocast dtype. In
+  inference mode, an unindexed same-device `to("cuda")` also copied the weight, and
+  `non_blocking` device moves raised `AssertionError`. Views of a weight created outside
+  inference mode (`t`, `transpose`, `view`, `detach`, `as_strided`, `nn.Parameter`, and
+  `x @ w.t()`) raised `Cannot set version_counter for inference tensor` inside it, eager and
+  compiled.
 
 ## [0.7.6rc1] - 2026-09-25
 

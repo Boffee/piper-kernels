@@ -420,6 +420,11 @@ preserve the represented weight, including ConvRot's rotation axis and NVFP4's p
 Other shape/layout changes raise `NotImplementedError`; transposed weights cannot be made
 contiguous or updated in place.
 
+Floating-point conversions (`to`, `half`, `type_as`, and autocast at a linear) change only the
+logical dtype and reuse the quantized storage. Converting to the current dtype and device returns
+the weight itself. Conversions and views behave the same under `torch.no_grad()` and
+`torch.inference_mode()`, including views of a weight created outside inference mode.
+
 `F.linear` on DTensors constructed with `DTensor.from_local(..., run_check=False)` uses
 Piper's local quantized linear implementation through the transpose and `mm`/`addmm` path.
 `addmm` supports the linear case: `alpha=1`, `beta=1`, and a bias vector with one value per

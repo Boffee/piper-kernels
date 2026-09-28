@@ -17,7 +17,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.weights._dispatch import _explicit_to_copy_args
+from piper_kernels.weights._dispatch import _explicit_to_copy_args, register_inference_mode_dispatch
 from piper_kernels.weights._matmul import register_matrix_ops
 from piper_kernels.weights._views import register_view_ops, require_untransposed
 from piper_kernels.weights.nvfp4._typing import NVFP4Storage
@@ -338,6 +338,7 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         return copied
 
 
+register_inference_mode_dispatch(PiperNVFP4Tensor)
 register_view_ops(PiperNVFP4Tensor)
 register_matrix_ops(PiperNVFP4Tensor)
 

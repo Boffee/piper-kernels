@@ -1298,9 +1298,15 @@ def test_triton_linear_runs_under_fullgraph_compile_with_noncontiguous_input() -
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("grad_mode", [torch.no_grad, torch.inference_mode])
+@pytest.mark.parametrize("autocast_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
-def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
+def test_cuda_autocast_normalizes_semantic_linear(
+    compiled: bool,
+    grad_mode: type[torch.no_grad | torch.inference_mode],
+    autocast_dtype: torch.dtype,
+) -> None:
     torch.manual_seed(126)
     input = torch.randn(17, 256, device="cuda", dtype=torch.float32) * 0.01  # noqa: A001
     source = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16) * 0.01
@@ -1315,16 +1321,16 @@ def test_cuda_fp16_autocast_normalizes_semantic_linear(compiled: bool) -> None:
         if compiled
         else projection
     )
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+    with grad_mode(), torch.autocast("cuda", dtype=autocast_dtype):
         actual = call(input, bias)
     with torch.no_grad():
         expected = torch.nn.functional.linear(
-            input.half(),
-            weight.to(dtype=torch.float16),
-            bias.half(),
+            input.to(autocast_dtype),
+            weight.to(dtype=autocast_dtype),
+            bias.to(autocast_dtype),
         )
 
-    assert actual.dtype is torch.float16
+    assert actual.dtype is autocast_dtype
     assert torch.isfinite(actual).all()
     assert torch.equal(actual, expected)
 
