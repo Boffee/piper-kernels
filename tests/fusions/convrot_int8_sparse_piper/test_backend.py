@@ -25,6 +25,8 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 )
 from piper_kernels.fusions.attention import _output as attention_output
 from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
+from piper_kernels.fusions.convrot_int8_piper._amd import policy as dense_amd_policy
+from piper_kernels.fusions.convrot_int8_piper._nvidia import policy as dense_nvidia_policy
 from piper_kernels.fusions.convrot_int8_sage_qk import _key_kernels as key_kernels
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
 from piper_kernels.fusions.convrot_int8_sage_qk import key as key_projection
@@ -40,7 +42,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import triton as nvidia
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_compile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
 from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
@@ -111,7 +113,7 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
     )
     operand = SimpleNamespace(device=torch.device("cuda:1"))
     expected = None
-    if target.is_cuda_capability(12, 0):
+    if target.is_cuda_capability(12, 0) or target.is_cuda_capability(8, 9):
         expected = nvidia
     elif (
         platform in ("linux", "win32")
@@ -143,7 +145,8 @@ def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, m
         fromlist=(),
         level=0,
     ):
-        if name == vendor and fromlist == ("triton",) and level == 1:
+        implementation = "dispatch" if vendor == "_nvidia" else "triton"
+        if name == vendor and fromlist == (implementation,) and level == 1:
             raise error
         return original_import(name, globals, locals, fromlist, level)
 
@@ -227,6 +230,7 @@ def test_unvalidated_projection_rejects_before_output_allocation(
     "target",
     [
         AcceleratorTarget("cuda", "sm120"),
+        AcceleratorTarget("cuda", "sm89"),
         AcceleratorTarget("hip", "gfx1200"),
         AcceleratorTarget("hip", "gfx1201"),
     ],
@@ -264,8 +268,8 @@ def test_output_support_is_independent_of_qkv_projection_support(
     [
         ("linux", AcceleratorTarget("hip", "gfx1100")),
         ("linux", AcceleratorTarget("cuda", "sm121")),
-        ("linux", AcceleratorTarget("cuda", "sm89")),
-        ("win32", AcceleratorTarget("cuda", "sm89")),
+        ("linux", AcceleratorTarget("cuda", "sm86")),
+        ("win32", AcceleratorTarget("cuda", "sm86")),
         ("linux", AcceleratorTarget("cpu")),
         ("win32", AcceleratorTarget("hip", "gfx1100")),
         ("win32", AcceleratorTarget("cpu")),
@@ -472,6 +476,8 @@ def test_shared_projection_launcher_does_not_own_target_policy(module):
 
 
 def test_compiler_cache_keys_include_projection_validation_and_attention_policy():
+    assert dense_amd_policy.__file__ in dense_compile._source_files()
+    assert dense_nvidia_policy.__file__ in dense_compile._source_files()
     assert qk_validation.__file__ in _compile._source_files()
     assert projection.__file__ in _compile._source_files()
     for compiler in (_compile, dense_compile):
@@ -609,8 +615,12 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
 
 
 def _capture_projection(
-    monkeypatch, operation, implementation=nvidia, head_dim=128, *, with_bias=False
+    monkeypatch, operation, implementation=nvidia, head_dim=128, *, with_bias=False, target=None
 ):
+    monkeypatch.setattr(nvidia.linear_gluon, "operands_aligned", lambda *operands: True)
+    if target is None:
+        target = AcceleratorTarget("cuda", "sm120")
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": key_kernels._project_key_kernel,
@@ -658,14 +668,26 @@ def _capture_projection(
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("implementation", [nvidia, amd])
+@pytest.mark.parametrize(
+    "target",
+    [
+        AcceleratorTarget("cuda", "sm120"),
+        AcceleratorTarget("cuda", "sm89"),
+        AcceleratorTarget("hip", "gfx1201"),
+    ],
+)
 def test_backend_launch_schedule_and_fp32_math_are_preserved(
-    monkeypatch, operation, head_dim, implementation
+    monkeypatch, operation, head_dim, target
 ):
-    _, kernel = _capture_projection(monkeypatch, operation, implementation, head_dim)
-    is_amd = implementation is amd
-    heads_per_program = 1 if is_amd and operation != "value" else 2
-    block_m = 64 if operation == "query" or (is_amd and operation == "key") else 128
+    is_amd = target.is_amd_hip
+    implementation = amd if is_amd else nvidia
+    _, kernel = _capture_projection(monkeypatch, operation, implementation, head_dim, target=target)
+    # These operands' 272 input features fall outside SM89's Gluon kernels, so SM89 runs
+    # its Triton schedule: 64 rows by one head for Q, K, and V.
+    is_sm89 = target.is_cuda_capability(8, 9)
+    heads_per_program = 1 if is_sm89 or (is_amd and operation != "value") else 2
+    block_m = 64 if is_sm89 or operation == "query" or (is_amd and operation == "key") else 128
+    warps = 4 if is_sm89 or (is_amd and operation != "value") else 8
     rows = 129 if operation == "query" else 193
     grid_heads = triton.cdiv(3, heads_per_program)
     grids = [call.args[0] for call in kernel.__getitem__.call_args_list]
@@ -677,8 +699,8 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
         assert call.kwargs["block_n"] == head_dim * heads_per_program
         assert call.kwargs["block_k"] == (64 if is_amd else 128)
         assert call.kwargs["heads_per_program"] == heads_per_program
-        assert call.kwargs["group_m"] == (8 if is_amd else 0)
-        assert call.kwargs["num_warps"] == (4 if is_amd and operation != "value" else 8)
+        assert call.kwargs["group_m"] == (8 if is_sm89 or is_amd else 0)
+        assert call.kwargs["num_warps"] == warps
         assert call.kwargs["num_stages"] == (2 if is_amd else 3)
         assert call.kwargs["aligned_projection"] is False
         assert call.kwargs["mask_block_lengths"] is False
@@ -689,14 +711,14 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
             assert call.args[-1] == (0 if index == 0 else rows // block_m)
     if operation == "value":
         mean = _kernels._project_prepared_input_mean_kernel
-        mean.__getitem__.assert_called_once_with((triton.cdiv(3, 2), 2))
+        mean.__getitem__.assert_called_once_with((triton.cdiv(3, heads_per_program), 2))
         assert mean.__getitem__.return_value.call_args.kwargs == {
             "bias_ptr": None,
             "input_features": 272,
             "output_features": 3 * head_dim,
-            "block_n": 2 * head_dim,
+            "block_n": heads_per_program * head_dim,
             "block_k": 64 if is_amd else 128,
-            "num_warps": 8,
+            "num_warps": warps,
         }
 
 
@@ -707,7 +729,12 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
     "target",
-    [GPUTarget("cuda", 120, 32), GPUTarget("hip", "gfx1200", 32), GPUTarget("hip", "gfx1201", 32)],
+    [
+        GPUTarget("cuda", 120, 32),
+        GPUTarget("cuda", 89, 32),
+        GPUTarget("hip", "gfx1200", 32),
+        GPUTarget("hip", "gfx1201", 32),
+    ],
 )
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_production_launches_compile_with_expected_storage_precision(
@@ -721,6 +748,9 @@ def test_production_launches_compile_with_expected_storage_precision(
         nvidia if target.backend == "cuda" else amd,
         head_dim,
         with_bias=with_bias,
+        target=AcceleratorTarget(
+            target.backend, f"sm{target.arch}" if target.backend == "cuda" else target.arch
+        ),
     )
     for call in kernel.__getitem__.return_value.call_args_list:
         arguments = dict(zip(function.arg_names, call.args, strict=False))
@@ -756,6 +786,9 @@ def test_production_launches_compile_with_expected_storage_precision(
         )
         if target.backend == "cuda":
             assert compiled.asm["cubin"]
+            if target.arch == 89:
+                # SM89 caps one block's dynamic shared memory at 99 KiB.
+                assert compiled.metadata.shared <= 99 * 1024
         else:
             assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
             assert compiled.metadata.shared <= 65536

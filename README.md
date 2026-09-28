@@ -273,8 +273,8 @@ in one GPU launch.
 The cross-operator ConvRot-to-sparse-Piper optimization is enabled explicitly by importing
 `convrot_int8_sparse_piper_compile_options` from
 `piper_kernels.fusions.convrot_int8_sparse_piper`. It installs the fusion pass before the ordinary
-ConvRot pass. On exact SM120, it recognizes a compatible H3-style region containing three
-ConvRot Q/K/V projections with optional FP16/BF16/FP32 bias, D64/D128 RMSNorm and split-half
+ConvRot pass. On exact SM120 and SM89, it recognizes a compatible H3-style region containing
+three ConvRot Q/K/V projections with optional FP16/BF16/FP32 bias, D64/D128 RMSNorm and split-half
 RoPE for Q/K, followed by `sparse_piper_attention`. The rewrite shares input preparation and
 emits quantized Q/K/V plus routing summaries directly, avoiding the three materialized projection
 outputs. Arbitrary logical sequence lengths are written directly into internally K64-padded
@@ -302,7 +302,9 @@ statistics without prescribing Q/K/V transforms or encoding. The shared
 and optional sparse routing outputs. The explicit sparse fusion adds storage contracts and
 graph rewriting.
 Another projection backend can compose the same pieces without depending on ConvRot internals or
-adding a backend protocol to attention.
+adding a backend protocol to attention. On SM89, D128 projections instead run Gluon kernels that
+apply the same FP32 steps in the matrix-multiply register layout and match the shared path within
+one INT8 code; other shapes use the shared path.
 
 `addmm_` computes `weight = beta * weight + alpha * (mat1 @ mat2)`, while `add_`
 accepts an exact-shape dense logical update and computes `weight = weight + alpha * update`.

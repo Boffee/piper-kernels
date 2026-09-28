@@ -1171,6 +1171,51 @@ windows. Dense and sparse ConvRot INT8 fusion now share an 8192-row default;
 the sparse windows remain fixed and dense schedules under the cap. Larger
 windows still trade additional workspace for workload-dependent latency gains.
 
+On an RTX 4070 Ti SUPER (SM89, Windows 11, Torch 2.14.0+cu130, Triton 3.8.0),
+`--sequence 8192 32768 100000 150000 --query-chunk-rows 4096 8192 --samples 7` gave these
+synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`) and peak extra allocations
+in MiB:
+
+| Tokens | Materialized | Fused 4096 | Fused 8192 | Peak: materialized / 4096 / 8192 |
+|---:|---:|---:|---:|---:|
+| 8,192 | 12.38 | 12.66 | 12.49 | 298 / 419 / 480 |
+| 32,768 | 74.16 | 75.59 | 74.53 | 1253 / 1165 / 1350 |
+| 100,000 | 451.94 | 472.55 | 459.11 | 3999 / 3208 / 3423 |
+| 150,000 | 937.02 | 982.83 | 952.86 | 6045 / 4726 / 4964 |
+
+On SM89, the shared 8192-row windows are 1.4-3.0% faster than 4096-row windows, for
+61-238 MiB of extra workspace, and still allocate 14-18% less than the materialized path
+from 100K tokens.
+
+On the same SM89 stack, the stages of the H3 block's materialized path took these CUDA-event
+medians in milliseconds (seven iterations after two warm-ups). The fused path runs the same
+input preparation and projections; its output operator chunks Q projection, attention, and
+output projection by query window:
+
+| Tokens | Input preparation | Q | K | Mean + V | Sparse attention | Output projection | Total |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8,192 | 0.36 | 2.32 | 2.68 | 2.24 | 2.45 | 2.39 | 12.43 |
+| 32,768 | 1.14 | 9.07 | 10.58 | 8.63 | 35.04 | 9.44 | 73.90 |
+| 100,000 | 2.86 | 27.42 | 34.04 | 26.45 | 332.37 | 28.85 | 451.98 |
+
+Sparse attention grows with the square of the sequence, from 20% of the block at 8K tokens
+to 74% at 100K, while the Q/K/V projections fall from 58% to 19%. K includes the shared
+centered encoder that quantizes its BF16 rows. With
+`benchmark_sparse_piper_projection.py --sequence 8192 32768 100000`, the SM89 Gluon
+projections reached 274-276 TOPS for Q, 229-236 TOPS for K, and 286-292 TOPS for V in CUDA
+graphs. `benchmark_sparse_piper.py --head-dim 128 --heads 56 --sequence 8192 32768 100000
+--ratios 0.25 1.0 --routing minmax --samples 7` measured sparse attention alone:
+
+| Tokens | 25% keep kernel | Routing | Full-keep kernel | BF16 Q/K/V preparation |
+|---:|---:|---:|---:|---:|
+| 8,192 | 2.30 ms, 209 TOPS | 0.67 ms | 8.61 ms, 224 TOPS | 1.37 ms |
+| 32,768 | 34.35 ms, 224 TOPS | 2.78 ms | 134.72 ms, 228 TOPS | 5.13 ms |
+| 100,000 | 324.70 ms, 221 TOPS | 13.69 ms | 1285.21 ms, 223 TOPS | 16.48 ms |
+
+Kernel TOPS count only the selected QK and PV work. The standalone call quantizes BF16 Q/K/V
+before attention; the fused projections emit those INT8 operands and routing summaries
+directly, so that preparation does not appear in the block.
+
 Compiler inspection and external profiling are available for one shape at a time:
 
 ```shell

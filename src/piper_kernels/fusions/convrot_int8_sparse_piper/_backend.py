@@ -11,14 +11,20 @@ from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 from . import _interfaces
 from ._amd import policy as amd_policy
 from ._interfaces import ProjectionBackend
+from ._nvidia import _plan as nvidia_plan
 from ._nvidia import policy as nvidia_policy
 
 try:
-    from ._nvidia import triton as _nvidia_projection
+    from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as _linear_async_copy
+
+    from ._nvidia import dispatch as _nvidia_projection
+    from ._nvidia import gluon_async_copy as _nvidia_async_copy_gluon
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _nvidia_projection = None
+    _nvidia_async_copy_gluon = None
+    _linear_async_copy = None
 
 
 try:
@@ -52,8 +58,11 @@ def source_files() -> tuple[str, ...]:
             projection_validation.__file__,
             _interfaces.__file__,
             nvidia_policy.__file__,
+            nvidia_plan.__file__,
+            None if _linear_async_copy is None else _linear_async_copy.__file__,
             amd_policy.__file__,
             None if _nvidia_projection is None else _nvidia_projection.__file__,
+            None if _nvidia_async_copy_gluon is None else _nvidia_async_copy_gluon.__file__,
             None if _amd_projection is None else _amd_projection.__file__,
             linear_backend.__file__,
             attention_backend.__file__,

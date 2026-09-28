@@ -15,7 +15,7 @@ from piper_kernels.fusions.convrot_int8_piper import key as dense_key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
-from ._helpers import projection_available
+from ._helpers import dense_projection_available, projection_available
 from ._reference import composed_key_projection, composed_mean_pool_summary
 
 
@@ -116,10 +116,18 @@ def _random_operands(
 )
 @pytest.mark.parametrize("affine", [True, False])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
+# SM89 projects 256 input features with Gluon and 272 with the shared Triton launchers.
+@pytest.mark.parametrize("input_features", [256, 272])
 def test_fused_key_projection_matches_the_centered_bf16_storage_contract(
-    bias_dtype: torch.dtype | None, affine: bool, sequence_length: int, head_dim: int
+    input_features: int,
+    bias_dtype: torch.dtype | None,
+    affine: bool,
+    sequence_length: int,
+    head_dim: int,
 ) -> None:
-    operands = _random_operands(sequence_length=sequence_length, head_dim=head_dim)
+    operands = _random_operands(
+        sequence_length=sequence_length, input_features=input_features, head_dim=head_dim
+    )
     bias = (
         torch.randn(2 * head_dim, device="cuda", dtype=bias_dtype)
         if bias_dtype is not None
@@ -206,8 +214,11 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
-def test_fused_key_projection_ignores_internal_padding(routing_mode: int) -> None:
-    operands = _random_operands(sequence_length=192)
+@pytest.mark.parametrize("input_features", [256, 272])
+def test_fused_key_projection_ignores_internal_padding(
+    routing_mode: int, input_features: int
+) -> None:
+    operands = _random_operands(sequence_length=192, input_features=input_features)
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = torch.arange(192, device="cuda") % 64
     valid_rows = valid_rows < block_lengths.repeat_interleave(64)
@@ -262,8 +273,8 @@ def test_constant_transformed_keys_are_centered_to_fp32_roundoff(routing_mode, s
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("sequence_length", [65, 192, 1025])
 def test_dense_and_sparse_keys_share_centering_and_cuda_graph_results(head_dim, sequence_length):
-    if not projection_available(head_dim):
-        pytest.skip("requires this fused projection width")
+    if not projection_available(head_dim) or not dense_projection_available(head_dim):
+        pytest.skip("requires dense and sparse fused projections at this width")
     operands = _random_operands(
         batch=2, sequence_length=sequence_length, heads=3, head_dim=head_dim
     )

@@ -1,25 +1,11 @@
 """Shared ConvRot projection/bias arithmetic, compute configuration, indexing, and means."""
 
 # pyright: reportArgumentType=false, reportCallIssue=false
-from dataclasses import dataclass
 
 import triton
 import triton.language as tl
 
 from piper_kernels.linear.convrot.int8._kernels import triton as convrot_int8_kernels
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionConfig:
-    """Compute settings; each consumer owns its numerical groups and target tuning."""
-
-    block_k: int
-    heads_per_program: int
-    num_warps: int
-    num_stages: int
-    block_m: int = 64
-    group_m: int = 0
-    round_rsqrt_to_nearest: bool = False
 
 
 @triton.jit

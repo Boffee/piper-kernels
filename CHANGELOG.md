@@ -16,8 +16,22 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   FP32 portable reference. SM8x runs the shared Triton kernels with its own tiles, since
   SM120's spill registers there. On an RTX 4070 Ti SUPER, one MiniMax-H3 encoder tile's 29
   convolutions take 49.6 ms (reference 721 ms, cuDNN FP16 182 ms), bitwise equal to SM120 tiles.
+- ConvRot INT8 sparse-Piper fusion (`convrot_int8_sparse_piper_compile_options`) on NVIDIA
+  SM89, matching the native SM89 sparse Piper attention. D128 heads use Gluon Q/K/V
+  projections that share the SM8x ConvRot INT8 GEMM's pipeline and apply RMSNorm, RoPE, and
+  the signed Hadamard in registers. On an RTX 4070 Ti SUPER, Q and V reach 268-276 and 267-294
+  TOPS at 2K-100K tokens, 1.25-1.32x the shared Triton kernels, within one INT8 code of them.
+  K, which stores BF16 rows for the shared centered encoder, reaches 216-236 TOPS including
+  that encoder, 1.14-1.23x. Other shapes and unaligned operands use the Triton kernels with SM89 tiles. The compiled
+  H3 attention block (Q/K/V projections, 25%-keep routing and attention, and the output
+  projection) runs 1.04-1.20x faster than without the fusion at 8K-100K tokens and needs
+  28-58% less peak memory. SM120's compiled kernels are unchanged.
 
 ### Changed
+
+- Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
+  dispatcher and flat plans selected from target, operation, and operand metadata. Dense
+  and sparse projection settings live in policy modules.
 
 - Execution-plan and schedule types follow shared naming and module ownership conventions.
   Attention and AMD INT8 linear plan types live in `_plan.py`; sparse Piper uses a named
