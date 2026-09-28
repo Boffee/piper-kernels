@@ -63,6 +63,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - `benchmarks/tune_piper_attention.py` gains `--attention-kernel` to compare the
   Triton and Gluon async-copy implementations.
 
+### Fixed
+
+- Sparse query projection windows intersect their end with valid-prefix block lengths.
+  Partial final blocks keep neutral padding, zero unused Q32 scales, and routing summaries
+  limited to the requested rows.
+
 ## [0.7.6rc1] - 2026-09-25
 
 ### Changed
