@@ -7,8 +7,8 @@ import torch
 import triton
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 from piper_kernels.fusions.convrot_int8_projection.triton import (
-    ProjectionConfig,
     project_prepared_input_mean_kernel,
 )
 from piper_kernels.fusions.convrot_int8_sage_qk.key import (
@@ -32,7 +32,7 @@ def project_query(
     softmax_scale: float,
     bias: torch.Tensor | None = None,
     *,
-    config: ProjectionConfig,
+    execution_plan: ProjectionExecutionPlan,
     out: QueryOutput,
     chunk_start: int = 0,
     chunk_rows: int | None = None,
@@ -48,7 +48,7 @@ def project_query(
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_ragged_tail: bool) -> None:
             _kernels._project_query_kernel[
-                (row_blocks, triton.cdiv(heads, config.heads_per_program), batch)
+                (row_blocks, triton.cdiv(heads, execution_plan.heads_per_program), batch)
             ](
                 input_qdata,
                 input_scale,
@@ -72,18 +72,18 @@ def project_query(
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
                 bias_ptr=bias,
-                heads_per_program=config.heads_per_program,
-                block_k=config.block_k,
-                group_m=config.group_m,
-                round_rsqrt_to_nearest=config.round_rsqrt_to_nearest,
+                heads_per_program=execution_plan.heads_per_program,
+                block_k=execution_plan.block_k,
+                group_m=execution_plan.group_m,
+                round_rsqrt_to_nearest=execution_plan.round_rsqrt_to_nearest,
                 aligned_projection=(
                     not mask_ragged_tail
-                    and input_qdata.shape[2] % config.block_k == 0
-                    and heads % config.heads_per_program == 0
+                    and input_qdata.shape[2] % execution_plan.block_k == 0
+                    and heads % execution_plan.heads_per_program == 0
                 ),
                 mask_ragged_tail=mask_ragged_tail,
-                num_warps=config.num_warps,
-                num_stages=config.num_stages,
+                num_warps=execution_plan.num_warps,
+                num_stages=execution_plan.num_stages,
             )
 
         full_blocks = chunk_rows // 64
@@ -103,14 +103,16 @@ def project_value(
     is_causal: bool,
     packed_amd: bool,
     mean_block_n: int | None,
-    config: ProjectionConfig,
+    execution_plan: ProjectionExecutionPlan,
     out: ValueOutput,
 ) -> None:
     """Project directly into dense per-token V, with an optional global mean."""
     value, multiplier, log_scale, mean = out
     batch, heads, head_dim, storage = value.shape
     sequence = input_qdata.shape[1]
-    mean_block_n = head_dim * config.heads_per_program if mean_block_n is None else mean_block_n
+    mean_block_n = (
+        head_dim * execution_plan.heads_per_program if mean_block_n is None else mean_block_n
+    )
     with device_context(input_qdata.device):
         if not is_causal:
             represented_mean = _ops.dequantized_input_mean(input_qdata, input_scale)
@@ -124,7 +126,7 @@ def project_value(
                 input_features=input_qdata.shape[2],
                 output_features=heads * head_dim,
                 block_n=mean_block_n,
-                block_k=config.block_k,
+                block_k=execution_plan.block_k,
                 bias_ptr=bias,
                 num_warps=4,
             )
@@ -134,7 +136,7 @@ def project_value(
         ):
             if count:
                 _kernels._project_value_kernel[
-                    (count, triton.cdiv(heads, config.heads_per_program), batch)
+                    (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
                 ](
                     input_qdata,
                     input_scale,
@@ -152,16 +154,16 @@ def project_value(
                     input_features=input_qdata.shape[2],
                     heads=heads,
                     head_dim=head_dim,
-                    heads_per_program=config.heads_per_program,
-                    block_k=config.block_k,
-                    group_m=config.group_m,
+                    heads_per_program=execution_plan.heads_per_program,
+                    block_k=execution_plan.block_k,
+                    group_m=execution_plan.group_m,
                     is_causal=is_causal,
                     packed_amd=packed_amd,
                     aligned_projection=(
                         aligned
-                        and input_qdata.shape[2] % config.block_k == 0
-                        and heads % config.heads_per_program == 0
+                        and input_qdata.shape[2] % execution_plan.block_k == 0
+                        and heads % execution_plan.heads_per_program == 0
                     ),
-                    num_warps=config.num_warps,
-                    num_stages=config.num_stages,
+                    num_warps=execution_plan.num_warps,
+                    num_stages=execution_plan.num_stages,
                 )

@@ -40,7 +40,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import sm89 as nvidia_sm89
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia_async_copy
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import triton as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_compile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
@@ -115,7 +115,7 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
     if target.is_cuda_capability(12, 0):
         expected = nvidia
     elif target.is_cuda_capability(8, 9):
-        expected = nvidia_sm89
+        expected = nvidia_async_copy
     elif (
         platform in ("linux", "win32")
         and target.is_amd_hip
@@ -241,7 +241,7 @@ def test_output_support_is_independent_of_qkv_projection_support(
 ):
     monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setattr(_backend, "_nvidia_projection", None)
-    monkeypatch.setattr(_backend, "_nvidia_sm89_projection", None)
+    monkeypatch.setattr(_backend, "_nvidia_async_copy_projection", None)
     monkeypatch.setattr(_backend, "_amd_projection", None)
     probe = Mock(return_value=target)
     monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
@@ -616,6 +616,7 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
 def _capture_projection(
     monkeypatch, operation, implementation=nvidia, head_dim=128, *, with_bias=False
 ):
+    monkeypatch.setattr(nvidia_async_copy.linear_gluon, "operands_aligned", lambda *operands: True)
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": key_kernels._project_key_kernel,
@@ -663,7 +664,7 @@ def _capture_projection(
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("implementation", [nvidia, nvidia_sm89, amd])
+@pytest.mark.parametrize("implementation", [nvidia, nvidia_async_copy, amd])
 def test_backend_launch_schedule_and_fp32_math_are_preserved(
     monkeypatch, operation, head_dim, implementation
 ):
@@ -671,7 +672,7 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
     is_amd = implementation is amd
     # These operands' 272 input features fall outside SM89's Gluon kernels, so SM89 runs
     # its Triton schedule: 64 rows by one head for Q, K, and V.
-    is_sm89 = implementation is nvidia_sm89
+    is_sm89 = implementation is nvidia_async_copy
     heads_per_program = 1 if is_sm89 or (is_amd and operation != "value") else 2
     block_m = 64 if is_sm89 or operation == "query" or (is_amd and operation == "key") else 128
     warps = 4 if is_sm89 or (is_amd and operation != "value") else 8
@@ -729,7 +730,7 @@ def test_production_launches_compile_with_expected_storage_precision(
 ):
     if target.backend == "hip" and sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
-    implementations = {120: nvidia, 89: nvidia_sm89}
+    implementations = {120: nvidia, 89: nvidia_async_copy}
     function, kernel = _capture_projection(
         monkeypatch,
         operation,

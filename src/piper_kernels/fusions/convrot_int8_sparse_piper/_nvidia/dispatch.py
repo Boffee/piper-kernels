@@ -1,27 +1,31 @@
-"""SM89 fused projections: Gluon kernels for D128 heads, shared Triton launchers otherwise."""
+"""Dispatch the async-copy projection backend from validated operand metadata."""
 
 from functools import partial
 
 import torch
 
+from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
+
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
-from .._layout import TILE_ROWS
-from . import gluon_async_copy
+from . import gluon_async_copy, policy
+from ._plan import NvidiaExecutionPlan
 
-# Triton configuration for the shapes that the Gluon kernels do not cover. SM120's tiles need more
-# than SM89's 99 KiB of shared memory (K) or spill (V's 128x256 accumulator). Tiles of 64 rows by
-# one head keep four warps within the register budget, and grouping eight row blocks reuses input
-# rows across heads.
-_CONFIG = projection.ProjectionConfig(
-    block_m=TILE_ROWS,
-    block_k=128,
-    heads_per_program=1,
-    num_warps=4,
-    num_stages=3,
-    group_m=8,
-    round_rsqrt_to_nearest=True,
-)
+
+def default_execution_plan(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    head_dim: int,
+    rotary_dim: int = 0,
+) -> NvidiaExecutionPlan:
+    """Resolve the async-copy backend's policy from validated operand metadata."""
+    return policy.select_execution_plan(
+        input_features=input_qdata.shape[2],
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        operands_aligned=linear_gluon.operands_aligned(input_qdata, weight_qdata),
+    )
 
 
 def project_query(  # noqa: PLR0913, PLR0917
@@ -43,10 +47,13 @@ def project_query(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None = None,
 ) -> None:
     """Project a query window, with the Gluon kernel when it covers the operands."""
+    plan = default_execution_plan(
+        input_qdata, weight_qdata, head_dim=out[0].shape[3], rotary_dim=cos.shape[1]
+    )
     launch = (
         gluon_async_copy.project_query
-        if gluon_async_copy.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
-        else partial(projection.project_query, config=_CONFIG)
+        if plan.execution_plan is None
+        else partial(projection.project_query, execution_plan=plan.execution_plan)
     )
     launch(
         input_qdata,
@@ -83,10 +90,13 @@ def project_key(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
 ) -> None:
     """Project keys, with the Gluon kernel when it covers the operands."""
+    plan = default_execution_plan(
+        input_qdata, weight_qdata, head_dim=out[0].shape[3], rotary_dim=cos.shape[1]
+    )
     launch = (
         gluon_async_copy.project_key
-        if gluon_async_copy.supports_projection(input_qdata, out[0].shape[3], cos.shape[1])
-        else partial(projection.project_key, config=_CONFIG)
+        if plan.execution_plan is None
+        else partial(projection.project_key, execution_plan=plan.execution_plan)
     )
     launch(
         input_qdata,
@@ -117,10 +127,11 @@ def project_value(
     bias: torch.Tensor | None = None,
 ) -> None:
     """Project values, with the Gluon kernel when it covers the operands."""
+    plan = default_execution_plan(input_qdata, weight_qdata, head_dim=out[0].shape[2])
     launch = (
         gluon_async_copy.project_value
-        if gluon_async_copy.supports_projection(input_qdata, out[0].shape[2])
-        else partial(projection.project_value, config=_CONFIG)
+        if plan.execution_plan is None
+        else partial(projection.project_value, execution_plan=plan.execution_plan)
     )
     launch(
         input_qdata,

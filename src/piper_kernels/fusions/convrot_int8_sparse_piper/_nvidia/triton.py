@@ -1,21 +1,10 @@
-"""NVIDIA configurations for the shared fused projection launchers."""
+"""Bind shared projection launchers to target policy."""
 
-from dataclasses import replace
 from functools import partial
 
 from .. import triton as projection
-from .._layout import TILE_ROWS
+from . import policy
 
-_QUERY_CONFIG = projection.ProjectionConfig(
-    block_m=TILE_ROWS,
-    block_k=128,
-    heads_per_program=2,
-    num_warps=8,
-    num_stages=3,
-    round_rsqrt_to_nearest=True,
-)
-_CONTEXT_CONFIG = replace(_QUERY_CONFIG, block_m=2 * TILE_ROWS)
-
-project_query = partial(projection.project_query, config=_QUERY_CONFIG)
-project_key = partial(projection.project_key, config=_CONTEXT_CONFIG)
-project_value = partial(projection.project_value, config=_CONTEXT_CONFIG)
+project_query = partial(projection.project_query, execution_plan=policy.QUERY_EXECUTION_PLAN)
+project_key = partial(projection.project_key, execution_plan=policy.CONTEXT_EXECUTION_PLAN)
+project_value = partial(projection.project_value, execution_plan=policy.CONTEXT_EXECUTION_PLAN)

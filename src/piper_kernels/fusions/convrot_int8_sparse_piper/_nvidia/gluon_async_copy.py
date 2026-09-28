@@ -14,7 +14,7 @@ and FP32 tile sums for the shared encoder, which centers K by its global mean.
 V keeps a 2x2 warp grid. Its epilogue spreads rows across lanes, so the
 transposed stores are coalesced.
 
-Shapes outside ``supports_projection`` use the shared Triton launchers.
+The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -82,16 +82,6 @@ _GL_SUMMARY_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 4], [1, 32], [1, _NUM_WAR
 # kernels still know that row strides are multiples of 64.
 _DO_NOT_SPECIALIZE = ("logical_sequence_length", "row_block_offset", "storage_tiles")
 _DO_NOT_SPECIALIZE_QUERY = (*_DO_NOT_SPECIALIZE, "chunk_start", "query_sequence_end")
-
-
-def supports_projection(input_qdata: torch.Tensor, head_dim: int, rotary_dim: int = 0) -> bool:
-    """Return whether these kernels cover the operands; Q/K pass their RoPE width."""
-    return (
-        head_dim == _HEAD_DIM
-        and input_qdata.shape[2] % _BLOCK_K == 0
-        # RoPE pairs must differ only in feature bits 4-6, which each thread holds.
-        and rotary_dim % 32 == 0
-    )
 
 
 @gluon.jit
@@ -332,12 +322,14 @@ def _project_rmsnorm_rope(
 
 @gluon.jit
 def _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths: gl.constexpr):
-    """Mark rows before ``row_end`` or, with block lengths, in each K64 block's valid prefix.
+    """Intersect the row window with each K64 block's valid prefix.
 
     Block lengths are read at the clamped positions, which stay inside the sequence.
     """
     if mask_block_lengths:
-        return rows % _GL_TILE_ROWS < gl.load(block_lengths_ptr + positions // _GL_TILE_ROWS)
+        return (rows < row_end) & (
+            rows % _GL_TILE_ROWS < gl.load(block_lengths_ptr + positions // _GL_TILE_ROWS)
+        )
     return rows < row_end
 
 

@@ -14,10 +14,16 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
+from piper_kernels.fusions.convrot_int8_projection import _plan as projection_plan
 from piper_kernels.fusions.convrot_int8_sparse_piper import _compile, _kernels
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import gluon_async_copy, sm89
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import _plan as nvidia_plan
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
+    dispatch,
+    gluon_async_copy,
+    policy,
+)
 
 _SM89 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9)
 
@@ -145,6 +151,7 @@ def _launch(
 def test_sm89_uses_gluon_only_for_supported_projections(
     monkeypatch, operation, head_dim, input_features, rotary_dim, supported
 ):
+    monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
     monkeypatch.setattr(gluon_async_copy, f"project_{operation}", gluon_launch)
     monkeypatch.setattr(projection, f"project_{operation}", triton_launch)
@@ -153,7 +160,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
             "cuda:1", input_features=input_features, head_dim=head_dim, rotary_dim=rotary_dim
         )
         out = _outputs(operation, "cuda:1", storage=256, head_dim=head_dim)
-        _launch(sm89, operation, operands, out)
+        _launch(dispatch, operation, operands, out)
     # V has no RoPE, so only its head and input widths matter.
     uses_gluon = supported or (
         operation == "value" and head_dim == 128 and input_features % 64 == 0
@@ -163,12 +170,20 @@ def test_sm89_uses_gluon_only_for_supported_projections(
     idle.assert_not_called()
     assert launched.call_args.kwargs["out"] is out
     if not uses_gluon:
-        assert launched.call_args.kwargs["config"] is sm89._CONFIG
+        assert (
+            launched.call_args.kwargs["execution_plan"]
+            is policy.select_execution_plan(
+                input_features=272, head_dim=128, operands_aligned=True
+            ).execution_plan
+        )
 
 
 def test_compiler_cache_keys_include_the_sm89_projection_kernels():
-    assert sm89.__file__ in _compile._source_files()
+    assert dispatch.__file__ in _compile._source_files()
     assert gluon_async_copy.__file__ in _compile._source_files()
+    assert dispatch.linear_gluon.__file__ in _compile._source_files()
+    assert nvidia_plan.__file__ in _compile._source_files()
+    assert projection_plan.__file__ in _compile._source_files()
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
@@ -375,9 +390,102 @@ def test_sm89_gluon_projections_match_the_triton_launchers(operation, case):
     expected = _outputs(operation, "cuda", **allocation)
     actual = _outputs(operation, "cuda", **allocation)
 
-    _launch(projection, operation, operands, expected, config=sm89._CONFIG, **options)
+    _launch(
+        projection,
+        operation,
+        operands,
+        expected,
+        execution_plan=policy.select_execution_plan(
+            input_features=272, head_dim=128, operands_aligned=True
+        ).execution_plan,
+        **options,
+    )
     _launch(gluon_async_copy, operation, operands, actual, **options)
 
     # K scales come from BF16 K storage, where 1-ulp FP32 differences can cross a rounding
     # boundary, as between dense and sparse K.
     _assert_matches(actual, expected, scale_rtol=3e-3 if operation == "key" else 1e-5)
+
+
+@pytest.mark.parametrize("operand_index", [0, 2], ids=["input", "weight"])
+@pytest.mark.parametrize("offset", [0, 1, 8, 16])
+def test_execution_plan_checks_both_operand_pointer_alignments(operand_index, offset):
+    operands = list(_operands("cpu", batch=1, heads=1))
+    original = operands[operand_index]
+    storage = torch.empty(original.numel() + offset, dtype=torch.int8)
+    operands[operand_index] = storage[offset:].view_as(original)
+    plan = dispatch.default_execution_plan(operands[0], operands[2], head_dim=128, rotary_dim=96)
+    assert plan.kernel == ("gluon_async_copy" if offset % 16 == 0 else "triton")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="requires NVIDIA SM80 or newer",
+)
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize("operand_index", [0, 2], ids=["input", "weight"])
+@pytest.mark.parametrize("offset", [1, 8])
+def test_unaligned_projections_use_the_triton_fallback(
+    monkeypatch, operation, operand_index, offset
+):
+    torch.manual_seed(1109)
+    operands = list(_operands("cuda", batch=1, sequence=193, heads=1))
+    original = operands[operand_index]
+    storage = torch.empty(original.numel() + offset, device="cuda", dtype=torch.int8)
+    operands[operand_index] = storage[offset:].view_as(original).copy_(original)
+    assert operands[operand_index].is_contiguous()
+    guard = Mock(side_effect=AssertionError("unaligned operands reached Gluon"))
+    monkeypatch.setattr(gluon_async_copy, f"project_{operation}", guard)
+    expected = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
+    actual = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
+    plan = policy.select_execution_plan(input_features=256, head_dim=128, operands_aligned=False)
+    _launch(
+        projection,
+        operation,
+        operands,
+        expected,
+        execution_plan=plan.execution_plan,
+        window=(0, 193),
+    )
+    _launch(dispatch, operation, operands, actual, window=(0, 193))
+    guard.assert_not_called()
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="requires NVIDIA SM80 or newer",
+)
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
+@pytest.mark.parametrize("rows", [31, 32, 33, 64, 77, 128])
+@pytest.mark.parametrize("lengths", [(64, 64, 64), (64, 17, 51)])
+def test_gluon_query_window_intersects_block_lengths(routing_mode, rows, lengths):
+    torch.manual_seed(1109)
+    operands = _operands("cuda", batch=1, sequence=192, heads=1)
+    start, storage = 64, padded_sequence_length(rows)
+    actual = _outputs("query", "cuda", storage=storage, batch=1, heads=1)
+    expected = _outputs("query", "cuda", storage=storage, batch=1, heads=1)
+    effective_lengths = list(lengths)
+    if rows % 64:
+        final_block = (start + rows) // 64
+        effective_lengths[final_block] = min(effective_lengths[final_block], rows % 64)
+    for out, window_rows, valid_prefixes in (
+        (actual, rows, lengths),
+        (expected, storage, effective_lengths),
+    ):
+        _launch(
+            dispatch,
+            "query",
+            operands,
+            out,
+            routing_mode=routing_mode,
+            block_lengths=torch.tensor(valid_prefixes, device="cuda", dtype=torch.int32),
+            window=(start, window_rows),
+        )
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert torch.count_nonzero(actual[0][:, :, rows:]) == 0
+    assert torch.count_nonzero(actual[1][:, :, (rows + 31) // 32 :]) == 0
