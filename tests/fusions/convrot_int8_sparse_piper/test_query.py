@@ -326,3 +326,42 @@ def test_fused_query_projection_fake_kernel_propagates_shapes() -> None:
     assert query_scale.dtype is torch.float32
     assert query_summary.shape == (2, 3, 2, 128)
     assert query_summary.dtype is torch.float32
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
+@pytest.mark.parametrize("routing_mode", [_MEAN_ROUTING, _MINMAX_ROUTING])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("rows", [31, 32, 33, 64, 77, 128])
+@pytest.mark.parametrize("lengths", [(64, 64, 64), (64, 17, 51)])
+def test_query_window_intersects_block_lengths(routing_mode, head_dim, rows, lengths):
+    operands = _random_operands(sequence_length=192, head_dim=head_dim)
+    block_lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    start = 64
+    actual = query_fusion._launch_query_projection_range(
+        *operands.as_tuple(),
+        1e-6,
+        head_dim**-0.5,
+        routing_mode,
+        block_lengths,
+        chunk_start=start,
+        chunk_rows=rows,
+    )
+    # An aligned window with the final valid prefix shortened represents the same queries.
+    effective_lengths = list(lengths)
+    if rows % 64:
+        final_block = (start + rows) // 64
+        effective_lengths[final_block] = min(effective_lengths[final_block], rows % 64)
+    expected = query_fusion._launch_query_projection_range(
+        *operands.as_tuple(),
+        1e-6,
+        head_dim**-0.5,
+        routing_mode,
+        torch.tensor(effective_lengths, device="cuda", dtype=torch.int32),
+        chunk_start=start,
+        chunk_rows=padded_sequence_length(rows),
+    )
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert torch.count_nonzero(actual[0][:, :, rows:]) == 0
+    assert torch.count_nonzero(actual[1][:, :, (rows + 31) // 32 :]) == 0

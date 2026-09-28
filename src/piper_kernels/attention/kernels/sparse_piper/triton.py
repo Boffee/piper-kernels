@@ -105,7 +105,9 @@ def store_query_tile(
     block_length = block_m
     if mask_block_lengths:
         block_length = tl.load(block_lengths_ptr + global_query_block)
-        valid_rows = global_sequence_offsets - global_query_block * block_m < block_length
+        valid_rows = valid_rows & (
+            global_sequence_offsets - global_query_block * block_m < block_length
+        )
     if mask_block_lengths or mask_ragged_tail:
         values = tl.where(valid_rows[:, None, None], values, 0.0)
     summary_values = tl.reshape(
@@ -134,7 +136,7 @@ def store_query_tile(
     if mask_block_lengths:
         group_starts = group_offsets * scale_rows
         group_valid = group_valid & (group_starts[None, :] < block_length)
-    elif mask_ragged_tail:
+    if mask_block_lengths or mask_ragged_tail:
         group_starts = global_query_block * block_m + group_offsets * scale_rows
         group_valid = group_valid & (group_starts[None, :] < logical_sequence_length)
     quantized, stored_scale = qk_quantization.quantize_query_tile(
