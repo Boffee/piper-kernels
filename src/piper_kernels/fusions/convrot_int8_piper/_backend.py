@@ -16,7 +16,7 @@ from ._nvidia import policy as nvidia_projection_policy
 try:
     from . import triton as _projection
     from ._amd import triton as _amd_projection
-    from ._nvidia import triton as _nvidia_projection
+    from ._nvidia import dispatch as _nvidia_projection
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
@@ -30,11 +30,11 @@ def select_projection_backend(
     *,
     head_dim: int = 128,
 ) -> ProjectionBackend | None:
-    """Return typed Q/K/V operations for exact SM120 or RDNA4 D64/D128."""
+    """Return typed Q/K/V operations for exact SM120, SM89, or RDNA4 D64/D128."""
     if _projection is None or head_dim not in (64, 128):
         return None
     target = AcceleratorTarget.from_device(input.device)
-    if target.is_cuda_capability(12, 0):
+    if nvidia_projection_policy.supports_target(target):
         return _nvidia_projection
     return _amd_projection if amd_policy.supports_target(target) else None
 

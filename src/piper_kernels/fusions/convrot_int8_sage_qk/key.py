@@ -48,7 +48,10 @@ def project_key(  # noqa: PLR0913
     routing_mode: int | None = None,
     block_lengths: torch.Tensor | None = None,
 ) -> None:
-    """Project once, reduce the represented K mean, then encode centered K64."""
+    """Project once, reduce the represented K mean, then encode centered K64.
+
+    ``out`` holds K64 group scales, or per-key scales for per-thread encoding.
+    """
     batch, sequence_length, _ = input_qdata.shape
     if batch == 0:
         return
@@ -116,7 +119,7 @@ def project_key(  # noqa: PLR0913
         qk_quantization.prepare_key(
             transformed.narrow(2, 0, sequence_length),
             mean,
-            grouped=True,
+            grouped=out[1].shape[-1] != storage_length,
             storage_key_length=storage_length,
             out=out,
         )

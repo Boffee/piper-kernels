@@ -14,7 +14,7 @@ compiled = torch.compile(
 ```
 
 The pass fuses ConvRot INT8 projection, per-head RMSNorm, split-half RoPE,
-signed-Hadamard smoothing, and Q32 INT8 quantization. When K follows the same
+signed-Hadamard smoothing, and INT8 Q quantization. When K follows the same
 normalized RoPE pattern and V is a plain ConvRot projection, it also fuses their
 preparation. Projections sharing an input and static-scale setting reuse ConvRot
 input preparation. Unsupported K/V transforms or escaping operands retain the
@@ -31,7 +31,7 @@ ConvRot INT8 optimizations and preserves caller-supplied compiler options.
 
 The integration supports FP16/BF16, D64/D128, MHA/GQA, ragged sequences, and causal
 or rectangular non-causal attention. Projection backends target NVIDIA SM120 and
-AMD RDNA4. Unsupported targets and unmatched graph patterns retain the original
+SM89 and AMD RDNA4. Unsupported targets and unmatched graph patterns retain the original
 operations. RMSNorm may be affine or non-affine, RoPE may cover part or all of a
 head, and projections may have bias. Output preparation supports dynamic
 per-token scales and a supplied static scale.
@@ -53,8 +53,13 @@ The internal producer boundaries are
 `piper_attention_from_quantized_query` consumes quantized Q with floating K/V;
 `piper_attention_from_quantized` consumes all prepared operands.
 
-Q uses contiguous Q64-padded INT8 storage and FP32 Q32 scales including the
-softmax scale and `log2(e)`. K/V use K64-padded storage. K has FP32 K64 scales;
+Q uses contiguous Q64-padded INT8 storage and FP32 scales including the
+softmax scale and `log2(e)`. K/V use K64-padded storage. Q/K scales use the
+granularity that the target's attention kernels read: Q32 and K64 group scales on
+SM120 and RDNA4, and on SM89, as in its native dense attention, per-thread groups
+stored as one scale per Q row and K key. The compiler chooses the granularity for
+the device; the producer operators take it as `qk_quantization` (`per_warp` or
+`per_thread`), and the attention boundaries read it from the scale shapes.
 V has FP32 per-token multipliers and log scales. V codes use transposed storage
 on NVIDIA and packed WMMA tiles on RDNA4. NVIDIA log scales preserve the existing
 FP16 rounding. Numerical contents are producer preconditions. Validation reads
@@ -76,6 +81,7 @@ per-token V quantization remains separate from sparse V tile scales.
 Both producers use typed backend methods with caller-owned buffers; target
 configurations live in separate NVIDIA and RDNA4 modules. As in sparse Piper,
 `_kernels.py` contains device kernels and `triton.py` owns their launchers.
+On SM89, the Triton launchers use one-head 64-row tiles.
 Compiler matching uses optional backend selection; validated execution requires
 a supported backend through `_backend.py`.
 

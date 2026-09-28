@@ -10,6 +10,7 @@ from torch.fx.node import map_arg
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.attention.piper_attention._nvidia import _plan as attention_plan
 from piper_kernels.fusions.convrot_int8_piper import (
@@ -26,6 +27,8 @@ from piper_kernels.fusions.convrot_int8_piper import (
 )
 from piper_kernels.linear.convrot.int8 import _compile as linear_compile
 from piper_kernels.linear.convrot.int8 import _ops
+
+from .test_query import _qk_quantization
 
 
 def _semantic_graph(*, dtype=torch.bfloat16, affine=True, permute=True):
@@ -317,6 +320,7 @@ def _explicit_fused(model, arguments):
         0.125,
         model.bias,
         head_dim=model.head_dim,
+        qk_quantization=_qk_quantization(),
     )
     return _quantized_dispatch._piper_attention_from_quantized_query_op(
         prepared_query, query_scales, key, value, hidden.shape[1], model.causal
@@ -461,6 +465,7 @@ def _explicit_qkv(model, arguments):
         0.125,
         model.bias,
         head_dim=model.head_dim,
+        qk_quantization=_qk_quantization(),
     )
     k, kscale = key_projection._project_key_op(
         data,
@@ -472,6 +477,7 @@ def _explicit_qkv(model, arguments):
         key_sin,
         1e-5,
         head_dim=model.head_dim,
+        qk_quantization=_qk_quantization(),
     )
     v, mult, logs, mean = value_projection._project_value_op(
         data,
@@ -610,10 +616,29 @@ def _qkv_semantic_graph():
     return graph
 
 
-def test_qkv_fake_rewrite_shares_preparation_without_hardware_execution(monkeypatch):
+@pytest.mark.parametrize(
+    ("architecture", "query_scales", "key_scales"),
+    [("sm120", 4, 2), ("sm89", 128, 128)],
+)
+def test_qkv_fake_rewrite_shares_preparation_without_hardware_execution(
+    monkeypatch, architecture, query_scales, key_scales
+):
     graph = _qkv_semantic_graph()
     monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", architecture)
+    )
     _compile.compile_pass(graph, is_inference=True)
+    granularity = "per_thread" if architecture == "sm89" else "per_warp"
+    for operation, scales in (("query", query_scales), ("key", key_scales)):
+        producer = next(
+            node
+            for node in graph.nodes
+            if node.target
+            is getattr(torch.ops.piper_kernels, f"convrot_int8_piper_project_{operation}").default
+        )
+        assert producer.kwargs["qk_quantization"] == granularity
+        assert producer.meta["val"][1].shape[-1] == scales
     targets = _targets(graph)
     assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     for operation in ("query", "key", "value"):
