@@ -1,8 +1,13 @@
-"""One-pass ConvRot INT8 projection and dense Piper Q32 preparation."""
+"""One-pass ConvRot INT8 projection and dense Piper Q preparation."""
 
 import math
 
 import torch
+
+from piper_kernels.attention.piper_attention._validation import (
+    query_scale_length,
+    validate_qk_quantization,
+)
 
 from . import _backend
 from ._interfaces import QueryOutput
@@ -43,12 +48,14 @@ def _validate_inputs(  # noqa: PLR0913, PLR0917
 def _new_outputs(
     input_qdata: torch.Tensor,
     shape: tuple[int, int, int, int],
+    qk_quantization: str,
 ) -> QueryOutput:
     batch, sequence_length, heads, head_dim = shape
     storage_length = (sequence_length + 63) // 64 * 64
+    scales = query_scale_length(storage_length, validate_qk_quantization(qk_quantization))
     return (
         input_qdata.new_empty((batch, heads, storage_length, head_dim)),
-        input_qdata.new_empty((batch, heads, storage_length // 32), dtype=torch.float32),
+        input_qdata.new_empty((batch, heads, scales), dtype=torch.float32),
     )
 
 
@@ -65,8 +72,9 @@ def _launch_query_projection(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
+    qk_quantization: str = "per_warp",
 ) -> QueryOutput:
-    """Project the complete Q sequence into padded Q32 data and base-2 scales."""
+    """Project the complete Q sequence into padded INT8 data and base-2 scales."""
     shape = _validate_inputs(
         input_qdata,
         input_scale,
@@ -81,9 +89,9 @@ def _launch_query_projection(  # noqa: PLR0913
         head_dim,
     )
     if shape[0] == 0:
-        return _new_outputs(input_qdata, shape)
+        return _new_outputs(input_qdata, shape, qk_quantization)
     backend = _backend.require_projection_backend(input_qdata, head_dim=shape[-1])
-    output = _new_outputs(input_qdata, shape)
+    output = _new_outputs(input_qdata, shape, qk_quantization)
     backend.project_query(
         input_qdata,
         input_scale,
@@ -114,8 +122,13 @@ def _project_query_op(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
+    qk_quantization: str = "per_warp",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse projection, FP32 RMSNorm/RoPE, and signed-Hadamard Q32 quantization."""
+    """Fuse projection, FP32 RMSNorm/RoPE, and signed-Hadamard Q quantization.
+
+    ``qk_quantization`` selects Q32 scales (``per_warp``) or per-thread groups
+    stored per row (``per_thread``), matching the target's quantized attention.
+    """
     return _launch_query_projection(
         input_qdata,
         input_scale,
@@ -128,6 +141,7 @@ def _project_query_op(  # noqa: PLR0913
         softmax_scale,
         bias,
         head_dim=head_dim,
+        qk_quantization=qk_quantization,
     )
 
 
@@ -145,6 +159,7 @@ def _project_query_op_fake(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
+    qk_quantization: str = "per_warp",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shape = _validate_inputs(
         input_qdata,
@@ -159,4 +174,4 @@ def _project_query_op_fake(  # noqa: PLR0913
         bias,
         head_dim,
     )
-    return _new_outputs(input_qdata, shape)
+    return _new_outputs(input_qdata, shape, qk_quantization)

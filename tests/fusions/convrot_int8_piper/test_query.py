@@ -1,4 +1,4 @@
-"""Dense fused Q emits only Q32 data/scales with the shared FP32 transform contract."""
+"""Dense fused Q emits only INT8 data/scales with the shared FP32 transform contract."""
 
 import math
 import sys
@@ -13,6 +13,7 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
+from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.convrot_int8_piper import _backend, _kernels, query
 from piper_kernels.fusions.convrot_int8_piper import triton as projection
 
@@ -28,7 +29,13 @@ def _available():
     )
 
 
-_NATIVE = pytest.mark.skipif(not _available(), reason="requires exact SM120 or RDNA4")
+_NATIVE = pytest.mark.skipif(not _available(), reason="requires exact SM120, SM89, or RDNA4")
+
+
+def _qk_quantization(device="cuda"):
+    """Return the Q/K scale granularity that the device's quantized attention reads."""
+    target = AcceleratorTarget.from_device(torch.device(device))
+    return _quantized_dispatch.qk_quantization_granularity(target)
 
 
 def _operands(
@@ -53,7 +60,7 @@ def _operands(
     return input_qdata, input_scale, weight_qdata, weight_scale, norm, angles.cos(), angles.sin()
 
 
-def _reference(operands, bias, head_dim):
+def _reference(operands, bias, head_dim, granularity="per_warp"):
     x, xs, weight, ws, norm, cos, sin = operands
     batch, sequence, _ = x.shape
     heads = weight.shape[0] // head_dim
@@ -84,12 +91,20 @@ def _reference(operands, bias, head_dim):
     storage = (sequence + 63) // 64 * 64
     padded = rotated_query.new_zeros((batch, heads, storage, head_dim))
     padded[:, :, :sequence] = rotated_query
-    groups = padded.reshape(batch, heads, storage // 32, 32, head_dim)
-    scale = groups.abs().amax((-1, -2)) / 127 + 1e-7
-    normalized = groups / scale[..., None, None]
+    if granularity == "per_thread":
+        # Rows 32b + 8i + t (i = 0..3) share a scale that every row stores.
+        groups = padded.reshape(batch, heads, storage // 32, 4, 8, head_dim)
+        scale = groups.abs().amax((-1, -3), keepdim=True) / 127 + 1e-7
+        normalized = groups / scale
+        scale = scale.expand(-1, -1, -1, 4, -1, 1).reshape(batch, heads, storage).clone()
+        scale[:, :, sequence:] = 0
+    else:
+        groups = padded.reshape(batch, heads, storage // 32, 32, head_dim)
+        scale = groups.abs().amax((-1, -2)) / 127 + 1e-7
+        normalized = groups / scale[..., None, None]
+        scale[:, :, (sequence + 31) // 32 :] = 0
     codes = torch.trunc(normalized + 0.5 * normalized.sign()).clamp(-127, 127).to(torch.int8)
     scale *= head_dim**-0.5 * math.log2(math.e)
-    scale[:, :, (sequence + 31) // 32 :] = 0
     return codes.reshape_as(padded), scale
 
 
@@ -101,13 +116,15 @@ def _reference(operands, bias, head_dim):
 @pytest.mark.parametrize(
     ("sequence", "heads", "features"), [(1, 1, 64), (65, 3, 272), (193, 6, 256)]
 )
-def test_query_matches_independent_projection_norm_rope_and_q32_reference(
+@pytest.mark.parametrize("granularity", ["per_warp", "per_thread"])
+def test_query_matches_independent_projection_norm_rope_and_quantization_reference(
     head_dim,
     dtype,
     affine,
     sequence,
     heads,
     features,
+    granularity,
 ):
     operands = _operands(
         "cuda",
@@ -120,16 +137,17 @@ def test_query_matches_independent_projection_norm_rope_and_q32_reference(
     )
     bias = torch.randn(heads * head_dim, device="cuda", dtype=dtype) if affine else None
     codes, scales = query._project_query_op(
-        *operands, 1e-6, head_dim**-0.5, bias, head_dim=head_dim
+        *operands, 1e-6, head_dim**-0.5, bias, head_dim=head_dim, qk_quantization=granularity
     )
-    expected_codes, expected_scales = _reference(operands, bias, head_dim)
+    expected_codes, expected_scales = _reference(operands, bias, head_dim, granularity)
     assert codes.shape == expected_codes.shape
+    assert scales.shape == expected_scales.shape
     assert codes.dtype is torch.int8
     assert scales.dtype is torch.float32
     assert (codes.short() - expected_codes.short()).abs().max() <= 1
     torch.testing.assert_close(scales.double(), expected_scales, rtol=3e-5, atol=1e-7)
     assert torch.count_nonzero(codes[:, :, sequence:]) == 0
-    assert torch.count_nonzero(scales[:, :, (sequence + 31) // 32 :]) == 0
+    assert torch.equal(scales == 0, expected_scales == 0)
 
 
 @pytest.mark.gpu
@@ -171,15 +189,20 @@ def test_query_boundary_opcheck_compile_and_cuda_graph_replay():
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("affine", [False, True])
-def test_fake_query_validates_metadata_without_target_probes(monkeypatch, head_dim, affine):
+@pytest.mark.parametrize(("granularity", "scales_per_head"), [("per_warp", 4), ("per_thread", 128)])
+def test_fake_query_validates_metadata_without_target_probes(
+    monkeypatch, head_dim, affine, granularity, scales_per_head
+):
     def forbidden(*args, **kwargs):
         pytest.fail("fake query projection inspected hardware")
 
     monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
     operands = _operands("meta", head_dim=head_dim, affine=affine)
-    codes, scales = query._project_query_op(*operands, 1e-6, head_dim**-0.5, head_dim=head_dim)
+    codes, scales = query._project_query_op(
+        *operands, 1e-6, head_dim**-0.5, head_dim=head_dim, qk_quantization=granularity
+    )
     assert codes.shape == (2, 3, 128, head_dim)
-    assert scales.shape == (2, 3, 4)
+    assert scales.shape == (2, 3, scales_per_head)
     assert codes.dtype is torch.int8
     assert scales.dtype is torch.float32
     assert codes.device.type == "meta"
@@ -215,11 +238,12 @@ def test_empty_batch_skips_target_probe_and_accepts_learned_norm_under_no_grad(m
         "head_dim",
         "epsilon",
         "softmax",
+        "granularity",
     ],
 )
 def test_fake_query_rejects_invalid_metadata(invalid):
     operands = list(_operands("meta"))
-    epsilon, softmax, head_dim = 1e-6, 64**-0.5, 64
+    epsilon, softmax, head_dim, granularity = 1e-6, 64**-0.5, 64, "per_warp"
     if invalid == "input_scale":
         operands[1] = torch.empty((2, 66), device="meta")
     elif invalid == "weight_scale":
@@ -234,8 +258,12 @@ def test_fake_query_rejects_invalid_metadata(invalid):
         epsilon = 0.0
     elif invalid == "softmax":
         softmax = float("inf")
-    with pytest.raises(ValueError, match=r"projection|head_dim|RMSNorm"):
-        query._project_query_op(*operands, epsilon, softmax, head_dim=head_dim)
+    elif invalid == "granularity":
+        granularity = "per_row"
+    with pytest.raises(ValueError, match=r"projection|head_dim|RMSNorm|granularity"):
+        query._project_query_op(
+            *operands, epsilon, softmax, head_dim=head_dim, qk_quantization=granularity
+        )
 
 
 @pytest.mark.parametrize(
@@ -243,7 +271,8 @@ def test_fake_query_rejects_invalid_metadata(invalid):
     [
         (AcceleratorTarget("cuda", "sm120"), True),
         (AcceleratorTarget("cuda", "sm121"), False),
-        (AcceleratorTarget("cuda", "sm89"), False),
+        (AcceleratorTarget("cuda", "sm89"), True),
+        (AcceleratorTarget("cuda", "sm86"), False),
         (AcceleratorTarget("hip", "gfx1201"), True),
         (AcceleratorTarget("hip", "gfx1100"), False),
         (AcceleratorTarget("cpu"), False),

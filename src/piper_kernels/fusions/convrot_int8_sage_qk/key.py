@@ -8,6 +8,7 @@ import triton
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
+from piper_kernels.attention.piper_attention._validation import scale_granularity
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
@@ -32,7 +33,10 @@ def project_key(  # noqa: PLR0913
     routing_mode: int | None = None,
     block_lengths: torch.Tensor | None = None,
 ) -> None:
-    """Project once, reduce the represented K mean, then encode centered K64."""
+    """Project once, reduce the represented K mean, then encode centered K.
+
+    ``out`` holds K64 group scales, or per-key scales for per-thread encoding.
+    """
     batch, sequence_length, _ = input_qdata.shape
     if batch == 0:
         return
@@ -100,7 +104,7 @@ def project_key(  # noqa: PLR0913
         qk_quantization.prepare_key(
             transformed.narrow(2, 0, sequence_length),
             mean,
-            grouped=True,
+            grouped=scale_granularity(out[1], storage_length) == "per_warp",
             storage_key_length=storage_length,
             out=out,
         )

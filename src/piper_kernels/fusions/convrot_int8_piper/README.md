@@ -2,8 +2,8 @@
 
 For enabling the compiler integration, see
 [attention](../../../../docs/attention.md). The opt-in pass fuses ConvRot INT8
-projection, per-head RMSNorm, split-half RoPE, signed-Hadamard smoothing, and Q32
-INT8 quantization. Compatible normalized RoPE K and plain projected V also fuse;
+projection, per-head RMSNorm, split-half RoPE, signed-Hadamard smoothing, and INT8
+Q quantization. Compatible normalized RoPE K and plain projected V also fuse;
 unsupported K/V transforms or escaping operands retain the Q-only path.
 Projections sharing an input and static-scale setting reuse input preparation.
 
@@ -17,15 +17,16 @@ ConvRot optimizations and preserves caller-supplied options.
 
 Supported patterns cover FP16/BF16, D64/D128, MHA/GQA, ragged sequences, causal
 attention, and rectangular non-causal attention. Projection backends target
-SM120 and RDNA4. Unmatched patterns and unsupported targets keep the original
-operations. RMSNorm can be affine or non-affine; RoPE can cover part or all of a
-head; projections may have bias. Output preparation supports dynamic per-token
-or supplied static scales.
+SM120, SM89, and RDNA4. Unmatched patterns and unsupported targets keep the
+original operations. RMSNorm can be affine or non-affine; RoPE can cover part or
+all of a head; projections may have bias. Output preparation supports dynamic
+per-token or supplied static scales.
 
 Projection, RMSNorm, and RoPE use FP32 arithmetic. K then uses BF16 temporary
 storage and FP32 tile sums of those represented values. Global mean reduction
-and centering precede K64 quantization. Dense and sparse Piper share this K
-producer; sparse routing summaries retain the uncentered FP32 transform values.
+and centering precede K quantization with K64 group or per-key scales. Dense
+and sparse Piper share this K producer; sparse routing summaries retain the
+uncentered FP32 transform values.
 Q/V keep FP32 intermediates until quantization. These rounding boundaries differ
 from materializing every operation in FP16/BF16 or retaining full FP32 K storage.
 Transformed K must remain finite in BF16; execution does not scan for violations.
@@ -33,12 +34,19 @@ Transformed K must remain finite in BF16; execution does not scan for violations
 Non-causal V projects the represented input mean before per-token quantization;
 causal V remains uncentered. Prepared storage has these contracts:
 
-- Q: contiguous Q64-padded INT8 storage and FP32 Q32 scales incorporating the
+- Q: contiguous Q64-padded INT8 storage and FP32 scales incorporating the
   softmax scale and `log2(e)`.
-- K: K64-padded storage and FP32 K64 scales.
+- K: K64-padded storage and FP32 scales.
 - V: K64-padded storage with FP32 per-token multipliers/log scales; codes are
   transposed on NVIDIA and packed WMMA tiles on RDNA4. NVIDIA log scales retain
   their FP16 rounding.
+
+Q/K scales use the granularity the target's attention kernels read: Q32 and K64
+group scales on SM120 and RDNA4, and on SM89, as in its native dense attention,
+per-thread groups stored as one scale per Q row and K key. The compiler chooses
+the granularity for the device; the producer operators take it as
+`qk_quantization` (`per_warp` or `per_thread`), and the attention boundaries
+read it from the scale shapes.
 
 The producer operators are `convrot_int8_piper_project_query`,
 `convrot_int8_piper_project_key`, and `convrot_int8_piper_project_value` in the
@@ -54,11 +62,12 @@ Dense and sparse paths share projection storage validation, RMSNorm/RoPE tiles,
 projected-mean reduction, compiler tuple matching, output projection, and the
 attention-to-output pipeline. `convrot_int8_centered_projection` owns BF16
 projection storage and FP32 statistics. `convrot_int8_sage_qk.key` owns K
-transforms and centered K64 encoding, with optional sparse routing summaries.
+transforms and centered K encoding, with optional sparse routing summaries.
 Dense V's per-token quantization remains distinct from sparse V's tile scales.
 Typed backend methods operate on caller-owned buffers; target launch choices
-live in separate NVIDIA/RDNA4 modules. [_backend.py](_backend.py) provides
-optional selection for matching and required selection for validated execution.
+live in separate NVIDIA/RDNA4 modules, and SM89's Triton launchers use one-head
+64-row tiles. [_backend.py](_backend.py) provides optional selection for
+matching and required selection for validated execution.
 
 K/V remain global. Q uses one reusable buffer with global RoPE positions and
 causal coordinates. When output width is at least merged attention width,
