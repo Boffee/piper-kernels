@@ -5,6 +5,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._amd import policy as amd_policy
 from piper_kernels.fusions.convrot_int8_projection import _validation as projection_validation
+from piper_kernels.fusions.convrot_int8_projection._nvidia import _plan as nvidia_plan
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
 from piper_kernels.fusions.projected_qk import _validation as head_validation
 
@@ -14,15 +15,24 @@ from ._interfaces import ProjectionBackend
 from ._nvidia import policy as nvidia_projection_policy
 
 try:
+    from piper_kernels.fusions.convrot_int8_projection._nvidia import (
+        fragments as _nvidia_fragments,
+    )
+    from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as _linear_async_copy
+
     from . import triton as _projection
     from ._amd import triton as _amd_projection
     from ._nvidia import dispatch as _nvidia_projection
+    from ._nvidia import gluon_async_copy as _nvidia_async_copy_gluon
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _projection = None
     _amd_projection = None
     _nvidia_projection = None
+    _nvidia_async_copy_gluon = None
+    _nvidia_fragments = None
+    _linear_async_copy = None
 
 
 def select_projection_backend(
@@ -59,6 +69,7 @@ def source_files() -> tuple[str, ...]:
         amd_policy.__file__,
         amd_projection_policy.__file__,
         nvidia_projection_policy.__file__,
+        nvidia_plan.__file__,
         qk_validation.__file__,
         projection_validation.__file__,
         head_validation.__file__,
@@ -93,6 +104,9 @@ def source_files() -> tuple[str, ...]:
                 *key_projection.source_files(),
                 _amd_projection.__file__ if _amd_projection is not None else None,
                 _nvidia_projection.__file__ if _nvidia_projection is not None else None,
+                _nvidia_async_copy_gluon.__file__ if _nvidia_async_copy_gluon is not None else None,
+                _nvidia_fragments.__file__ if _nvidia_fragments is not None else None,
+                _linear_async_copy.__file__ if _linear_async_copy is not None else None,
                 shared_projection.__file__,
                 linear_backend.__file__,
                 mean.__file__,

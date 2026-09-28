@@ -26,6 +26,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   H3 attention block (Q/K/V projections, 25%-keep routing and attention, and the output
   projection) runs 1.04-1.20x faster than without the fusion at 8K-100K tokens and needs
   28-58% less peak memory. SM120's compiled kernels are unchanged.
+- ConvRot INT8 dense-Piper fusion (`convrot_int8_piper_compile_options`) on NVIDIA SM89.
+  The Q/K producers emit the per-thread scales that SM89's dense Gluon attention reads
+  (`qk_quantization="per_thread"`), and that kernel accepts producer-padded K/V metadata. D128
+  heads use Gluon Q/K/V projections built from fragments now shared with the sparse fusion
+  (1.24-1.35x the Triton launchers). On an RTX 4070 Ti SUPER, the compiled H3 attention block
+  runs 1.03-1.17x faster than without the fusion at 4K-100K tokens with 55-57% less peak
+  memory, and its attention error against FP64 is 3-10% lower. SM120's kernels are unchanged.
 
 ### Changed
 

@@ -3,12 +3,15 @@
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import (
+    NvidiaExecutionPlan,
+    ProjectionOperation,
+)
 from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from . import gluon_async_copy, policy
-from ._plan import NvidiaExecutionPlan, ProjectionOperation
 
 
 def default_execution_plan(
