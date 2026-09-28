@@ -91,12 +91,16 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("full_launch", [False, True])
-def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, causal, full_launch):
+@pytest.mark.parametrize("quantized_query", [False, True])
+def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
+    monkeypatch, head_dim, causal, full_launch, quantized_query
+):
     plan = select_execution_plan(
         AcceleratorTarget("cuda", "sm89"),
         head_dim=head_dim,
         is_causal=causal,
         query_length=129,
+        quantized_query=quantized_query,
     )
     assert plan.attention_kernel == "gluon_async_copy"
     constants = {
@@ -107,6 +111,8 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
         "quantize_query": plan.fuse_query_quantization,
         "full_query": full_launch,
         "contiguous_output": full_launch,
+        # Quantized producers supply K64-padded K/V metadata.
+        "padded_kv": quantized_query,
     }
     if plan.fuse_query_quantization:
         constants["query_scale_ptr"] = None

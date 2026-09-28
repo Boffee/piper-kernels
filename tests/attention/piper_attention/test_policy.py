@@ -7,7 +7,10 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
-from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
+from piper_kernels.attention.piper_attention._nvidia.policy import (
+    groups_qk_scales,
+    select_execution_plan,
+)
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _prepare_piper_attention,
     default_execution_plan,
@@ -24,12 +27,14 @@ def _select(
     *,
     head_dim: int = 128,
     is_causal: bool = False,
+    quantized_query: bool = False,
 ) -> PiperAttentionExecutionPlan:
     return select_execution_plan(
         target,
         head_dim=head_dim,
         is_causal=is_causal,
         query_length=128,
+        quantized_query=quantized_query,
     )
 
 
@@ -228,6 +233,52 @@ def test_sm89_runs_the_gluon_kernel_in_every_mode(
     assert not plan.split_pv_head_dim
     assert not plan.use_tensor_descriptors
     assert not plan.optimize_causal_traversal
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "is_causal", "block_m"),
+    [(64, False, 128), (64, True, 64), (128, False, 64), (128, True, 64)],
+)
+def test_sm89_quantized_query_skips_fused_quantization(
+    head_dim: int, is_causal: bool, block_m: int
+) -> None:
+    plan = _select(_SM89, head_dim=head_dim, is_causal=is_causal, quantized_query=True)
+
+    assert plan == replace(
+        _select(_SM89, head_dim=head_dim, is_causal=is_causal),
+        block_m=block_m,
+        fuse_query_quantization=False,
+    )
+
+
+@pytest.mark.parametrize("target", [_SM80, _SM120, _SM121])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_quantized_query_leaves_other_targets_unchanged(
+    target: AcceleratorTarget, is_causal: bool
+) -> None:
+    for head_dim in (64, 128):
+        assert _select(
+            target, head_dim=head_dim, is_causal=is_causal, quantized_query=True
+        ) == _select(target, head_dim=head_dim, is_causal=is_causal)
+
+
+@pytest.mark.parametrize(
+    "architecture", ["sm80", "sm86", "sm89", "sm90", "sm100", "sm120", "sm121"]
+)
+def test_qk_scale_grouping_depends_only_on_target(architecture: str) -> None:
+    target = AcceleratorTarget("cuda", architecture)
+    for head_dim in (64, 128):
+        for is_causal in (False, True):
+            for query_length in (1, 1023, 1024, 65537):
+                for quantized_query in (False, True):
+                    plan = select_execution_plan(
+                        target,
+                        head_dim=head_dim,
+                        is_causal=is_causal,
+                        query_length=query_length,
+                        quantized_query=quantized_query,
+                    )
+                    assert plan.grouped_qk is groups_qk_scales(target)
 
 
 @pytest.mark.parametrize(
