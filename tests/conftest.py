@@ -2,9 +2,43 @@
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 from filelock import FileLock
+
+_COMPILE_CACHE = pytest.StashKey[str]()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    """Own compilation caches for this run, with cleanup after workers exit."""
+    worker_input = getattr(config, "workerinput", None)
+    if worker_input is None:
+        ram = Path("/dev/shm")
+        cache = TemporaryDirectory(
+            prefix="piper-kernels-pytest-",
+            dir=ram if ram.is_dir() and os.access(ram, os.W_OK) else None,
+        )
+        config.add_cleanup(cache.cleanup)
+        root = cache.name
+    else:
+        root = worker_input["piper_compile_cache"]
+    config.stash[_COMPILE_CACHE] = root
+    environment = pytest.MonkeyPatch()
+    config.add_cleanup(environment.undo)
+    for variable, subdirectory in (
+        ("TRITON_CACHE_DIR", "triton"),
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+    ):
+        environment.setenv(variable, str(Path(root) / subdirectory))
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node) -> None:
+    """Share the controller's cache without giving workers cleanup ownership."""
+    node.workerinput["piper_compile_cache"] = node.config.stash[_COMPILE_CACHE]
 
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)

@@ -855,6 +855,13 @@ uv build
 GPU tests use the `gpu` pytest marker. The pre-commit test hook hides CUDA so commits run
 the portable suite; run `uv run pytest` directly to exercise installed GPU backends.
 
+Each pytest run owns a temporary Triton/Inductor compilation cache, shared by its workers.
+It uses RAM-backed `/dev/shm` where available and writable, otherwise the system temporary
+directory, and overrides inherited `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` for
+the run. The cache is removed at pytest shutdown, including test failures and Ctrl-C;
+SIGKILL or a controller crash can leave a `piper-kernels-pytest-*` directory behind.
+Separate runs compile afresh and do not remove other applications' caches.
+
 Tests run in parallel through `pytest-xdist`. CPU-only runs use up to 16 workers, beyond
 which start-up and memory outweigh the gain. GPU runs default to 8 workers because every
 worker allocates on the same device; set `PYTEST_XDIST_AUTO_NUM_WORKERS` to use more on a
