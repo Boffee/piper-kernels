@@ -4,25 +4,46 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
+from _compile_cache import ram_cache_directory
 
 
 @pytest.mark.parametrize(
-    ("workers", "outcome", "exit_code"),
-    [(0, "pass", 0), (2, "pass", 0), (2, "fail", 1), (0, "interrupt", 2)],
+    ("workers", "outcome", "exit_code", "noexec"),
+    [
+        (0, "pass", 0, False),
+        (2, "pass", 0, False),
+        (2, "fail", 1, False),
+        (0, "interrupt", 2, False),
+        (0, "pass", 0, True),
+    ],
 )
-def test_compile_cache_cleanup(tmp_path, workers, outcome, exit_code):
-    shutil.copyfile(Path(__file__).with_name("conftest.py"), tmp_path / "conftest.py")
+def test_compile_cache_cleanup(tmp_path, workers, outcome, exit_code, noexec):
+    for name in ("conftest.py", "_compile_cache.py"):
+        shutil.copyfile(Path(__file__).with_name(name), tmp_path / name)
+    if noexec:
+        with (tmp_path / "conftest.py").open("a") as conftest:
+            conftest.write(
+                "\nimport _compile_cache\n"
+                "def denied(*args, **kwargs):\n"
+                "    raise PermissionError('noexec shared memory')\n"
+                "_compile_cache.mmap.mmap = denied\n"
+            )
     inherited = tmp_path / "existing-cache"
     inherited.mkdir()
     sentinel = inherited / "keep"
     sentinel.write_text("another application's cache")
     (tmp_path / "test_probe.py").write_text(
         "import os\n"
+        "import ctypes\n"
+        "import shutil\n"
+        "import sys\n"
         "from pathlib import Path\n"
         "import pytest\n"
+        "libraries = []\n"
         "@pytest.mark.parametrize('index', range(2))\n"
         "def test_probe(index):\n"
         "    triton = Path(os.environ['TRITON_CACHE_DIR'])\n"
@@ -31,6 +52,10 @@ def test_compile_cache_cleanup(tmp_path, workers, outcome, exit_code):
         "    for cache in (triton, inductor):\n"
         "        cache.mkdir(exist_ok=True)\n"
         "        (cache / str(index)).write_text('compiled artifact')\n"
+        "    if sys.platform == 'win32':\n"
+        "        dll = inductor / f'version-{index}.dll'\n"
+        "        shutil.copyfile(Path(os.environ['SystemRoot']) / 'System32/version.dll', dll)\n"
+        "        libraries.append(ctypes.WinDLL(str(dll)))\n"
         "    Path(f'root-{index}').write_text(str(triton.parent))\n"
         "    if os.environ['PROBE_OUTCOME'] == 'fail':\n"
         "        pytest.fail('intentional failure')\n"
@@ -59,7 +84,23 @@ def test_compile_cache_cleanup(tmp_path, workers, outcome, exit_code):
     assert len(roots) == 1
     root = roots.pop()
     assert root != inherited
-    if Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK):
+    if noexec:
+        assert root.parent != Path("/dev/shm")
+    elif ram_cache_directory() is not None:
         assert root.parent == Path("/dev/shm")
+    if sys.platform == "win32":
+        deadline = time.monotonic() + 10
+        while root.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
     assert not root.exists()
     assert sentinel.read_text() == "another application's cache"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux shared-memory probe")
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError, OSError])
+def test_unusable_shared_memory_falls_back(monkeypatch, error):
+    def unavailable(*args, **kwargs):
+        raise error("shared memory unavailable")
+
+    monkeypatch.setattr("_compile_cache.TemporaryFile", unavailable)
+    assert ram_cache_directory() is None
