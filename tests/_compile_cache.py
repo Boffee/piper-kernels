@@ -9,13 +9,19 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryFile
 
+# The persistent development cache reached 22 GiB. Leave substantial headroom
+# before opting into a filesystem that is often only 64 MiB in containers.
+_MIN_RAM_CACHE_FREE_BYTES = 32 * 1024**3
+
 
 def ram_cache_directory() -> Path | None:
-    """Probe file-backed executable mappings, as used to load compiled libraries."""
+    """Require free space and executable file mappings for compiler libraries."""
     if sys.platform != "linux":
         return None
     ram = Path("/dev/shm")
     try:
+        if shutil.disk_usage(ram).free < _MIN_RAM_CACHE_FREE_BYTES:
+            return None
         with TemporaryFile(dir=ram) as probe:
             probe.truncate(mmap.PAGESIZE)
             with mmap.mmap(
