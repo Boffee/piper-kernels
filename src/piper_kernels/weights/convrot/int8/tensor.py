@@ -8,7 +8,7 @@ from torch.types import Number
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.weights._dispatch import _explicit_to_copy_args
+from piper_kernels.weights._dispatch import _explicit_to_copy_args, register_inference_mode_dispatch
 from piper_kernels.weights._matmul import register_matrix_ops
 from piper_kernels.weights._views import register_view_ops, require_untransposed
 from piper_kernels.weights.convrot.int8._quantization import (
@@ -346,6 +346,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         return copied
 
 
+register_inference_mode_dispatch(ConvRotInt8Tensor)
 register_view_ops(ConvRotInt8Tensor)
 register_matrix_ops(ConvRotInt8Tensor)
 

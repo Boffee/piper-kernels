@@ -146,6 +146,31 @@ def test_linear_rejects_autograd_inputs_but_allows_no_grad(
     assert result.shape == (3, 7)
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16])
+def test_autocast_linear_under_inference_mode_matches_no_grad(
+    compiled: bool,
+    autocast_dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(163)
+    # The BF16 weight covers both an unchanged and a changed logical dtype.
+    weight = _weight(dtype=torch.bfloat16)
+    activation = torch.randn(3, 32)  # FP32, as a LayerNorm produces under autocast.
+    bias = torch.randn(7)
+
+    def projection(value: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(value, weight, bias)
+
+    call = torch.compile(projection, fullgraph=True) if compiled else projection
+    results = []
+    for grad_mode in (torch.no_grad, torch.inference_mode):
+        with grad_mode(), torch.autocast("cpu", dtype=autocast_dtype):
+            results.append(call(activation))
+
+    assert results[1].dtype is autocast_dtype
+    assert torch.equal(results[1], results[0])
+
+
 @pytest.mark.parametrize("input_activation", [None, "gelu_tanh", "swiglu"])
 def test_linear_accepts_noncontiguous_vector_bias(input_activation: str | None) -> None:
     torch.manual_seed(121)
