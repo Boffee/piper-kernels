@@ -1,4 +1,4 @@
-"""NVIDIA sparse Q/K/V dispatch over Gluon and shared Triton projection kernels."""
+"""NVIDIA dense Q/K/V dispatch over Gluon and shared Triton projection kernels."""
 
 import torch
 
@@ -35,7 +35,7 @@ def default_execution_plan(
     )
 
 
-def project_query(  # noqa: PLR0913, PLR0917
+def project_query(  # noqa: PLR0913
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -45,13 +45,11 @@ def project_query(  # noqa: PLR0913, PLR0917
     sin: torch.Tensor,
     norm_epsilon: float,
     softmax_scale: float,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None,
-    *,
-    chunk_start: int,
-    chunk_rows: int,
-    out: QueryOutput,
     bias: torch.Tensor | None = None,
+    *,
+    chunk_start: int = 0,
+    chunk_rows: int | None = None,
+    out: QueryOutput,
     execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project a query window, with the Gluon kernel when it covers the operands."""
@@ -81,12 +79,10 @@ def project_query(  # noqa: PLR0913, PLR0917
         sin,
         norm_epsilon,
         softmax_scale,
-        routing_mode,
-        block_lengths,
+        bias,
         chunk_start=chunk_start,
         chunk_rows=chunk_rows,
         out=out,
-        bias=bias,
         execution_plan=plan,
     )
 
@@ -100,11 +96,9 @@ def project_key(  # noqa: PLR0913
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None,
+    bias: torch.Tensor | None = None,
     *,
     out: KeyOutput,
-    bias: torch.Tensor | None = None,
     execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project keys, with the Gluon kernel when it covers the operands."""
@@ -133,10 +127,8 @@ def project_key(  # noqa: PLR0913
         cos,
         sin,
         norm_epsilon,
-        routing_mode,
-        block_lengths,
+        bias,
         out=out,
-        bias=bias,
         execution_plan=plan,
     )
 
@@ -144,14 +136,12 @@ def project_key(  # noqa: PLR0913
 def project_value(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
-    block_lengths: torch.Tensor | None,
-    *,
-    emit_block_mean: bool,
-    out: ValueOutput,
     bias: torch.Tensor | None = None,
+    *,
+    is_causal: bool,
+    out: ValueOutput,
     execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project values, with the Gluon kernel when it covers the operands."""
@@ -162,20 +152,27 @@ def project_value(
             input_qdata, weight_qdata, operation="value", head_dim=out[0].shape[2]
         )
     )
-    launch = (
-        gluon_async_copy.project_value
-        if plan.kernel == "gluon_async_copy"
-        else projection.project_value
-    )
-    launch(
+    if plan.kernel == "gluon_async_copy":
+        gluon_async_copy.project_value(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            bias,
+            is_causal=is_causal,
+            out=out,
+            execution_plan=plan,
+        )
+        return
+    projection.project_value(
         input_qdata,
         input_scale,
-        input_mean,
         weight_qdata,
         weight_scale,
-        block_lengths,
-        emit_block_mean=emit_block_mean,
+        bias,
+        is_causal=is_causal,
+        packed_amd=policy.PACKED_VALUE,
+        mean_block_n=policy.VALUE_MEAN_BLOCK_N,
         out=out,
-        bias=bias,
         execution_plan=plan,
     )

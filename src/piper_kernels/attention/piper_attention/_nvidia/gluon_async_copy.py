@@ -137,13 +137,20 @@ def _quantize_query_rows(values, softmax_scale, head_dim: gl.constexpr, final_la
 
 
 @gluon.jit
-def _copy_rows(base_ptr, first_row, shared, copy_layout: gl.constexpr):
-    """Copy consecutive INT8 rows of one contiguous feature width into shared memory."""
+def _copy_rows(base_ptr, first_row, shared, copy_layout: gl.constexpr, row_limit=None):
+    """Copy consecutive INT8 rows of one contiguous feature width into shared memory.
+
+    Rows at or past ``row_limit``, when given, are zero-filled instead of read.
+    """
     rows: gl.constexpr = shared.shape[0]
     width: gl.constexpr = shared.shape[1]
     offsets_r = first_row + gl.arange(0, rows, gl.SliceLayout(1, copy_layout))
     offsets_c = gl.arange(0, width, gl.SliceLayout(0, copy_layout))
-    async_copy.async_load(shared, base_ptr + offsets_r[:, None] * width + offsets_c[None, :])
+    pointers = base_ptr + offsets_r[:, None] * width + offsets_c[None, :]
+    if row_limit is None:
+        async_copy.async_load(shared, pointers)
+    else:
+        async_copy.async_load(shared, pointers, mask=(offsets_r < row_limit)[:, None])
 
 
 @gluon.jit
@@ -300,6 +307,7 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     quantize_query: gl.constexpr,
     full_query: gl.constexpr,
     contiguous_output: gl.constexpr,
+    padded_kv: gl.constexpr,
 ):
     """Fused UINT8-P/INT8-V online attention for one query tile.
 
@@ -308,7 +316,9 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     launch covers ``query_rows`` rows of the ``query_length`` rows of Q from local
     row ``query_start``, whose global row is ``global_query_start``; output rows
     are local to the launch. ``full_query`` launches cover all of Q from row zero,
-    and ``contiguous_output`` launches store into a contiguous output.
+    and ``contiguous_output`` launches store into a contiguous output. Per-key K
+    scales and V multipliers span the K64-padded key storage with ``padded_kv``,
+    and the logical key length otherwise.
 
     Each warp owns ``block_q // 4`` rows: 128-row tiles reuse every K and V
     operand fragment for two 16-row MMA tiles and halve per-key work per row.
@@ -340,8 +350,17 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     query_base = query_ptr + batch.to(gl.int64) * stride_qb + head.to(gl.int64) * stride_qh
     key_base = key_ptr + kv_batch_head * key_storage * head_dim
     value_base = value_ptr + kv_batch_head * head_dim * key_storage
-    key_scale_base = key_scale_ptr + kv_batch_head * key_length
-    multiplier_base = multiplier_ptr + kv_batch_head * key_length
+    if padded_kv:
+        # Deriving the padded length from key_length rather than reusing
+        # key_storage keeps the unpadded D128 schedule; the latter costs ~2%.
+        metadata_base = kv_batch_head * (gl.cdiv(key_length, _GL_BLOCK) * _GL_BLOCK)
+    else:
+        metadata_base = kv_batch_head * key_length
+    key_scale_base = key_scale_ptr + metadata_base
+    multiplier_base = multiplier_ptr + metadata_base
+    # Prepared Q is padded to whole Q64 tiles, so a Q128 tile may extend 64 rows
+    # past its storage; those rows read as zero codes and scales.
+    mask_query_storage: gl.constexpr = not quantize_query and block_q > _GL_BLOCK
 
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0],
@@ -418,6 +437,8 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
             mask=(load_rows < query_length)[:, None],
             other=0.0,
         ).to(gl.float32)
+    elif mask_query_storage:
+        _copy_rows(query_base, query_row, query_shared, row_copy_layout, query_storage)
     else:
         _copy_rows(query_base, query_row, query_shared, row_copy_layout)
     _copy_rows(key_base, 0, key_shared, row_copy_layout)
@@ -442,6 +463,13 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     global_rows = global_query_start + output_rows
     if quantize_query:
         query_scale = gl.convert_layout(quantized_scale, row_layout)
+    elif mask_query_storage:
+        scale_rows = query_start + output_rows
+        query_scale = gl.load(
+            query_scale_ptr + batch_head * query_storage + scale_rows,
+            mask=scale_rows < query_storage,
+            other=0.0,
+        )
     else:
         # Padded query rows have zero scales and zero codes, so they stay finite.
         query_scale = gl.load(
@@ -592,16 +620,18 @@ def launch_attention(
     max_registers: int | None,
     query_start: int = 0,
     global_query_start: int = 0,
+    padded_kv: bool = False,
 ) -> torch.Tensor:
     """Launch the recurrence on INT8 K/V stored in whole K64 tiles.
 
     With ``quantize_query``, ``query`` is the FP16/BF16 ``[batch, heads,
     query_length, head_dim]`` input and ``query_scale`` is None. Otherwise it is
     prepared INT8 ``[batch, heads, query_storage, head_dim]`` storage with rows,
-    and Q scales, padded to a multiple of ``block_q``. ``key`` is ``[batch,
+    and per-row Q scales, padded to a multiple of 64. ``key`` is ``[batch,
     kv_heads, key_storage, head_dim]`` and ``value`` its transposed ``[batch,
-    kv_heads, head_dim, key_storage]``, padded to a multiple of 64 keys. K scales
-    and V multipliers cover the logical key length.
+    kv_heads, head_dim, key_storage]``, padded to a multiple of 64 keys. Per-key
+    K scales and V multipliers cover the logical key length, or the key storage
+    with ``padded_kv``.
 
     ``output`` is ``[batch, heads, rows, head_dim]`` with contiguous features. Its
     rows start at local Q row ``query_start`` and global row ``global_query_start``;
@@ -649,6 +679,7 @@ def launch_attention(
             quantize_query,
             full_query,
             output.is_contiguous(),
+            padded_kv,
             num_warps=_NUM_WARPS,
             num_stages=1,
             **compile_options,

@@ -37,9 +37,13 @@ def project_query(
     chunk_start: int = 0,
     chunk_rows: int | None = None,
 ) -> None:
-    """Emit Q32 INT8 directly from the shared FP32 Q/K projection."""
+    """Emit INT8 Q directly from the shared FP32 Q/K projection.
+
+    ``out`` holds Q32 scales, or per-row scales for per-thread quantization.
+    """
     query, query_scale = out
     batch, heads, storage_length, head_dim = query.shape
+    per_thread_scales = query_scale.shape[-1] == storage_length
     sequence_length = input_qdata.shape[1]
     chunk_rows = sequence_length if chunk_rows is None else chunk_rows
     if batch == 0:
@@ -82,6 +86,7 @@ def project_query(
                     and heads % execution_plan.heads_per_program == 0
                 ),
                 mask_ragged_tail=mask_ragged_tail,
+                per_thread_scales=per_thread_scales,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
             )

@@ -14,7 +14,7 @@ compiled = torch.compile(
 ```
 
 The pass fuses ConvRot INT8 projection, per-head RMSNorm, split-half RoPE,
-signed-Hadamard smoothing, and Q32 INT8 quantization. When K follows the same
+signed-Hadamard smoothing, and INT8 Q quantization. When K follows the same
 normalized RoPE pattern and V is a plain ConvRot projection, it also fuses their
 preparation. Projections sharing an input and static-scale setting reuse ConvRot
 input preparation. Unsupported K/V transforms or escaping operands retain the
@@ -31,7 +31,7 @@ ConvRot INT8 optimizations and preserves caller-supplied compiler options.
 
 The integration supports FP16/BF16, D64/D128, MHA/GQA, ragged sequences, and causal
 or rectangular non-causal attention. Projection backends target NVIDIA SM120 and
-AMD RDNA4. Unsupported targets and unmatched graph patterns retain the original
+SM89 and AMD RDNA4. Unsupported targets and unmatched graph patterns retain the original
 operations. RMSNorm may be affine or non-affine, RoPE may cover part or all of a
 head, and projections may have bias. Output preparation supports dynamic
 per-token scales and a supplied static scale.
@@ -53,8 +53,13 @@ The internal producer boundaries are
 `piper_attention_from_quantized_query` consumes quantized Q with floating K/V;
 `piper_attention_from_quantized` consumes all prepared operands.
 
-Q uses contiguous Q64-padded INT8 storage and FP32 Q32 scales including the
-softmax scale and `log2(e)`. K/V use K64-padded storage. K has FP32 K64 scales;
+Q uses contiguous Q64-padded INT8 storage and FP32 scales including the
+softmax scale and `log2(e)`. K/V use K64-padded storage. Q/K scales use the
+granularity that the target's attention kernels read: Q32 and K64 group scales on
+SM120 and RDNA4, and on SM89, as in its native dense attention, per-thread groups
+stored as one scale per Q row and K key. The compiler chooses the granularity for
+the device; the producer operators take it as `qk_quantization` (`per_warp` or
+`per_thread`), and the attention boundaries read it from the scale shapes.
 V has FP32 per-token multipliers and log scales. V codes use transposed storage
 on NVIDIA and packed WMMA tiles on RDNA4. NVIDIA log scales preserve the existing
 FP16 rounding. Numerical contents are producer preconditions. Validation reads
@@ -76,6 +81,12 @@ per-token V quantization remains separate from sparse V tile scales.
 Both producers use typed backend methods with caller-owned buffers; target
 configurations live in separate NVIDIA and RDNA4 modules. As in sparse Piper,
 `_kernels.py` contains device kernels and `triton.py` owns their launchers.
+On SM89, D128 dense and sparse projections run Gluon kernels built from the
+shared `convrot_int8_projection/_nvidia/fragments.py`: the SM8x ConvRot INT8
+GEMM pipeline, the register-layout RMSNorm/RoPE/Hadamard tile, and the centered-K
+stores. As in sparse Piper, the NVIDIA policy resolves each projection's plan;
+other SM89 shapes and unaligned operands use the Triton launchers with one-head
+64-row tiles.
 Compiler matching uses optional backend selection; validated execution requires
 a supported backend through `_backend.py`.
 
@@ -105,6 +116,20 @@ This halves the K temporary relative to FP32, though another stage may still
 determine peak allocation.
 
 ## Performance and limitations
+
+On an RTX 4070 Ti SUPER (SM89), the Gluon D128 projections reach 277 (Q), 236
+(K, including the centered encoder), and 289 (V) TOPS at 32K H3 tokens, 1.24-1.35x
+the Triton launchers with SM89 tiles. Synthetic H3 blocks (B1/H56/D128, width 5376,
+BF16, input preparation through output projection) compiled with Q/K/V fusion ran
+1.15x, 1.10x, 1.06x, and 1.03x faster than the ordinary ConvRot INT8 compile at
+4K, 16K, 32K, and 100K non-causal tokens, and 1.17x, 1.10x, and 1.05x at 4K-32K
+causal tokens, with 55-57% less peak extra allocation. Output fusion gave 1.16x,
+1.08x, 1.04x, and 0.99x non-causal and 1.20x, 1.13x, and 1.08x causal; there,
+overlapping a window's output projection with the next window's attention costs
+1.5-2.4% at 16K tokens and beyond. Against FP64 attention over the same INT8
+inputs, the fused attention output's relative error was 3-10% lower than the
+unfused compile's, which rounds Q and V to BF16. D64 heads use the Triton
+projections.
 
 With BF16 K storage, paired RTX 5090 H3 measurements at 32,769, 65,537, and
 100,001 rows put the 8192-row cap within 0.3-1.3% of the 16384-row cap. At

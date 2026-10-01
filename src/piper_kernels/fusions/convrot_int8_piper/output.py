@@ -3,6 +3,10 @@
 import torch
 
 from piper_kernels.attention.piper_attention import _quantized_dispatch as attention
+from piper_kernels.attention.piper_attention._validation import (
+    query_scale_length,
+    scale_granularity,
+)
 from piper_kernels.fusions.attention import _output as pipeline
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
@@ -176,9 +180,13 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         is_causal=is_causal,
     )
     capacity = (min(query_chunk_rows, sequence) + 63) // 64 * 64
+    # Q scales follow the granularity of the validated K scales.
+    granularity = scale_granularity(key_scale, key.shape[2])
     query_buffers = (
         input_qdata.new_empty((batch, heads, capacity, head_dim)),
-        input_qdata.new_empty((batch, heads, capacity // 32), dtype=torch.float32),
+        input_qdata.new_empty(
+            (batch, heads, query_scale_length(capacity, granularity)), dtype=torch.float32
+        ),
     )
     project_chunk, retained = projection_output.prepare_chunk_projector(
         sequence,

@@ -17,7 +17,15 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    QKQuantizationGranularity,
+)
 from piper_kernels.attention.piper_attention import _quantized_dispatch
+from piper_kernels.attention.piper_attention._validation import (
+    key_scale_length,
+    query_scale_length,
+)
 from piper_kernels.fusions.attention import _output as output_pipeline
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.projected_qk import _compile as projected_compile
@@ -33,7 +41,7 @@ from . import _backend, _output_compile, _schedule, _validation, output, query
 from . import key as key_projection
 from . import value as value_projection
 
-_COMPILE_PASS_VERSION = "convrot-int8-piper-output-compile-v7"
+_COMPILE_PASS_VERSION = "convrot-int8-piper-output-compile-v8"
 _ACTIVATION_DTYPES = (torch.float16, torch.bfloat16)
 
 
@@ -123,6 +131,11 @@ def _projection_pattern(
         KeywordArg("softmax_scale"),
         KeywordArg("is_causal"),
     )
+
+
+def _qk_quantization(device: torch.device) -> QKQuantizationGranularity:
+    """Emit Q/K scales in the granularity the device's quantized attention reads."""
+    return _quantized_dispatch.qk_quantization_granularity(AcceleratorTarget.from_device(device))
 
 
 def _same_shape(left: Sequence[int | torch.SymInt], right: Sequence[int | torch.SymInt]) -> bool:
@@ -291,6 +304,8 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     assert query_value is not None
     batch, heads, sequence_length, head_dim = query_value.shape
     storage_rows = (sequence_length + 63) // 64 * 64
+    qk_quantization = _qk_quantization(input_value.device)
+    scale_rows = query_scale_length(storage_rows, qk_quantization)
     with graph.inserting_before(original):
         query_length = graph.call_function(torch.ops.aten.sym_size.int, args=(projection_input, 1))
         query_length.meta["val"] = sequence_length
@@ -314,9 +329,9 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             ),
             (
                 input_value.new_empty((batch, heads, storage_rows, head_dim), dtype=torch.int8),
-                input_value.new_empty((batch, heads, storage_rows // 32), dtype=torch.float32),
+                input_value.new_empty((batch, heads, scale_rows), dtype=torch.float32),
             ),
-            kwargs={"head_dim": head_dim},
+            kwargs={"head_dim": head_dim, "qk_quantization": qk_quantization},
         )
         replacement = graph.call_function(
             torch.ops.piper_kernels.piper_attention_from_quantized_query.default,
@@ -414,6 +429,7 @@ def _emit_context_projection(
     prepared, scales = _prepared_context_input(graph, arguments, before)
     common_args = (prepared, scales, arguments["weight_qdata"], arguments["weight_scale"])
     if normalized:
+        qk_quantization = _qk_quantization(input_value.device)
         return linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_int8_piper_project_key.default,
@@ -427,9 +443,12 @@ def _emit_context_projection(
             ),
             (
                 input_value.new_empty((batch, heads, storage, head_dim), dtype=torch.int8),
-                input_value.new_empty((batch, heads, storage // 64), dtype=torch.float32),
+                input_value.new_empty(
+                    (batch, heads, key_scale_length(storage, qk_quantization)),
+                    dtype=torch.float32,
+                ),
             ),
-            kwargs={"head_dim": head_dim},
+            kwargs={"head_dim": head_dim, "qk_quantization": qk_quantization},
         )
     return linear_compile_fx.emit_tuple_result(
         graph,

@@ -7,6 +7,9 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.piper._amd import _wmma, fragments
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import _rotation as qk_rotation
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    QKQuantizationGranularity,
+)
 
 from . import _quantization, _validation
 from ._amd import gluon as amd_backend
@@ -15,6 +18,7 @@ from ._amd import triton as amd_preparation
 from ._nvidia import _plan as nvidia_plan
 from ._nvidia import policy as nvidia_policy
 from ._nvidia import triton as nvidia_backend
+from ._validation import key_scale_length, query_scale_length, scale_granularity
 
 
 def source_files() -> tuple[str, ...]:
@@ -41,8 +45,34 @@ def source_files() -> tuple[str, ...]:
 
 
 def supports_quantized_query(target: AcceleratorTarget) -> bool:
-    """Require native dense attention with Q32/K64 quantization groups."""
-    return target.is_cuda_capability(12) or amd_policy.supports_target(target)
+    """Require native dense attention: SM12x or RDNA4 Q32/K64 groups, or SM89 per-thread scales."""
+    return (
+        target.is_cuda_capability(12)
+        or target.is_cuda_capability(8, 9)
+        or amd_policy.supports_target(target)
+    )
+
+
+def qk_quantization_granularity(target: AcceleratorTarget) -> QKQuantizationGranularity:
+    """Return the Q/K scale granularity that quantized operands must use on target.
+
+    ``per_warp`` stores FP32 scales per Q32/K64 group; ``per_thread`` stores the
+    scale of each row's per-thread group for every Q row and K key.
+    """
+    if target.is_nvidia_cuda and not nvidia_policy.groups_qk_scales(target):
+        return "per_thread"
+    return "per_warp"
+
+
+def _require_granularity(
+    target: AcceleratorTarget, scales: torch.Tensor, rows: torch.Tensor
+) -> None:
+    """Reject Q/K scales whose layout the target's attention kernels do not read."""
+    granularity = scale_granularity(scales, rows.shape[2])
+    if qk_quantization_granularity(target) != granularity:
+        raise RuntimeError(
+            f"quantized Piper {granularity} Q/K scales are unavailable on {rows.device}"
+        )
 
 
 def _validate_query(
@@ -51,7 +81,7 @@ def _validate_query(
     query_length: int,
     is_causal: bool,
 ) -> tuple[int, int, int, int]:
-    """Check the shared Q64 storage/Q32 scale contract using host metadata."""
+    """Check the shared Q64 storage and Q32 or per-row scale contract using host metadata."""
     if isinstance(query_length, bool) or not isinstance(query_length, (int, torch.SymInt)):
         raise TypeError("quantized Piper query_length must be an integer")
     if query_length < 1:
@@ -67,13 +97,18 @@ def _validate_query(
         raise ValueError("quantized Piper query requires positive heads and head_dim 64 or 128")
     if storage_length != (query_length + 63) // 64 * 64:
         raise ValueError("quantized Piper query storage must pad its logical length to Q64")
+    scale_length = query_scale_length(
+        storage_length, scale_granularity(query_scale, storage_length)
+    )
     if (
-        query_scale.shape != (batch, heads, storage_length // 32)
+        query_scale.shape != (batch, heads, scale_length)
         or query_scale.dtype is not torch.float32
         or query_scale.layout is not torch.strided
         or not query_scale.is_contiguous()
     ):
-        raise ValueError("quantized Piper query_scale must be contiguous FP32 Q32 scales")
+        raise ValueError(
+            "quantized Piper query_scale must be contiguous FP32 Q32 or per-row scales"
+        )
     return batch, heads, query_length, head_dim
 
 
@@ -128,9 +163,10 @@ def _piper_attention_from_quantized_query_op(
 
     Q and its FP32 scale groups have Q64-padded contiguous storage. Scales
     already include the attention scale and log2(e); padded rows and scale
-    groups must be initialized by the producer. Numerical codes/scales are
-    caller preconditions. K is centered using its global post-transform mean;
-    V retains per-token scaling and causal centering rules.
+    groups must be initialized by the producer. The scale layout must match
+    ``qk_quantization_granularity`` for the target. Numerical codes/scales are
+    caller preconditions. K is centered using its global post-transform mean; V
+    retains per-token scaling and causal centering rules.
     """
     shape = _validate_quantized_query(query, query_scale, key, value, query_length, is_causal)
     if shape[0] == 0:
@@ -138,6 +174,7 @@ def _piper_attention_from_quantized_query_op(
     target = AcceleratorTarget.from_device(query.device)
     if not supports_quantized_query(target):
         raise RuntimeError(f"quantized-Q Piper Attention is unavailable on {query.device}")
+    _require_granularity(target, query_scale, query)
     if target.is_nvidia_cuda:
         plan = nvidia_policy.select_execution_plan(
             target,
@@ -145,6 +182,7 @@ def _piper_attention_from_quantized_query_op(
             is_causal=is_causal,
             query_length=query_length,
             key_length=key.shape[2],
+            quantized_query=True,
         )
         context = nvidia_backend._prepare_piper_context(
             key, value, is_causal=is_causal, execution_plan=plan
@@ -216,6 +254,8 @@ def _validate_quantized(  # noqa: PLR0913, PLR0917
         is_causal=is_causal,
         output_dtype=output_dtype,
     )
+    if scale_granularity(query_scale, query.shape[2]) != scale_granularity(key_scale, key.shape[2]):
+        raise ValueError("quantized Piper Q and K scales must share one granularity")
     return shape
 
 
@@ -233,7 +273,10 @@ def validate_quantized_context(  # noqa: PLR0913
     is_causal: bool,
     output_dtype: torch.dtype,
 ) -> None:
-    """Check native K/V metadata without allocating a query tensor."""
+    """Check native K/V metadata without allocating a query tensor.
+
+    K scales are per K64 group or, for per-thread quantization, per stored key.
+    """
     batch, heads, query_length, head_dim = query_shape
     if not isinstance(is_causal, bool):
         raise TypeError("quantized Piper is_causal must be a boolean")
@@ -247,9 +290,10 @@ def validate_quantized_context(  # noqa: PLR0913
     if key.ndim != 4 or key.shape[1] < 1 or heads % key.shape[1]:
         raise ValueError("quantized Piper key must have compatible GQA heads")
     kv_heads = key.shape[1]
+    key_scales = key_scale_length(storage, scale_granularity(key_scale, storage))
     expected = (
         (key, (batch, kv_heads, storage, head_dim), torch.int8),
-        (key_scale, (batch, kv_heads, storage // 64), torch.float32),
+        (key_scale, (batch, kv_heads, key_scales), torch.float32),
         (value, (batch, kv_heads, head_dim, storage), torch.int8),
         (multiplier, (batch, kv_heads, storage), torch.float32),
         (log_scale, (batch, kv_heads, storage), torch.float32),
@@ -282,11 +326,12 @@ def _piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     is_causal: bool,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Consume native Q32/K64 and dense per-token V without repeating preparation.
+    """Consume native Q/K and dense per-token V without repeating preparation.
 
-    K/V use K64-padded storage, including V metadata. V codes follow the
-    producer's target-native layout. Numerical codes, scales, and centering
-    are caller preconditions; all checks here inspect host metadata only.
+    K/V use K64-padded storage, including V metadata. Q/K scales follow
+    ``qk_quantization_granularity`` for the target, and V codes the producer's
+    target-native layout. Numerical codes, scales, and centering are caller
+    preconditions; all checks here inspect host metadata only.
     """
     shape = _validate_quantized(
         query,
@@ -339,6 +384,7 @@ def prepare_quantized_context(
     target = AcceleratorTarget.from_device(key.device)
     if not supports_quantized_query(target):
         raise RuntimeError(f"quantized Piper Attention is unavailable on {key.device}")
+    _require_granularity(target, key_scale, key)
     if target.is_nvidia_cuda:
         plan = nvidia_policy.select_execution_plan(
             target,
@@ -346,6 +392,7 @@ def prepare_quantized_context(
             is_causal=is_causal,
             query_length=query_length,
             key_length=key_length,
+            quantized_query=True,
         )
         with runtime.device_context(key.device):
             mixed_int8.install_uint8_int8_dot_hook()

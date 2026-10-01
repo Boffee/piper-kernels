@@ -7,7 +7,7 @@ from piper_kernels.attention.piper_attention import _quantized_dispatch as atten
 from piper_kernels.fusions.convrot_int8_piper import _backend, key, output, query, value
 from piper_kernels.linear.convrot.int8 import _ops
 
-from .test_query import _NATIVE, _operands
+from .test_query import _NATIVE, _operands, _qk_quantization
 
 
 def _arguments(
@@ -28,7 +28,9 @@ def _arguments(
         )
     else:
         context = (
-            *key._project_key_op(*k, 1e-6, head_dim=head_dim),
+            *key._project_key_op(
+                *k, 1e-6, head_dim=head_dim, qk_quantization=_qk_quantization(device)
+            ),
             *value._project_value_op(*k[:4], head_dim=head_dim, is_causal=causal),
         )
     weight = torch.randint(
@@ -54,7 +56,9 @@ def _arguments(
 
 
 def _reference(args, head_dim):
-    q, qs = query._project_query_op(*args[:10], head_dim=head_dim)
+    q, qs = query._project_query_op(
+        *args[:10], head_dim=head_dim, qk_quantization=_qk_quantization(args[0].device)
+    )
     attended = attention._piper_attention_from_quantized_op(
         q, qs, *args[10:16], args[0].shape[1], *args[16:19]
     )
@@ -89,21 +93,26 @@ def test_chunked_output_matches_materialized_fused_attention(
 @pytest.mark.gpu
 @_NATIVE
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_projected_query_windows_keep_global_rope_positions(head_dim):
+@pytest.mark.parametrize("granularity", ["per_warp", "per_thread"])
+def test_projected_query_windows_keep_global_rope_positions(head_dim, granularity):
     args = _operands("cuda", sequence=321, head_dim=head_dim)
-    full = query._project_query_op(*args, 1e-6, head_dim**-0.5, head_dim=head_dim)
+    full = query._project_query_op(
+        *args, 1e-6, head_dim**-0.5, head_dim=head_dim, qk_quantization=granularity
+    )
     backend = _backend.select_projection_backend(args[0], head_dim=head_dim)
+    group_rows = 1 if granularity == "per_thread" else 32
     for start, rows in ((64, 128), (192, 129)):
-        result = query._new_outputs(args[0], (2, rows, 3, head_dim))
+        result = query._new_outputs(args[0], (2, rows, 3, head_dim), granularity)
         backend.project_query(
             *args, 1e-6, head_dim**-0.5, chunk_start=start, chunk_rows=rows, out=result
         )
         torch.testing.assert_close(
             result[0][:, :, :rows], full[0][:, :, start : start + rows], atol=0, rtol=0
         )
+        groups = (rows + group_rows - 1) // group_rows
         torch.testing.assert_close(
-            result[1][:, :, : (rows + 31) // 32],
-            full[1][:, :, start // 32 : (start + rows + 31) // 32],
+            result[1][:, :, :groups],
+            full[1][:, :, start // group_rows : start // group_rows + groups],
             atol=0,
             rtol=0,
         )

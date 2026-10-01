@@ -5,16 +5,19 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.fusions.convrot_int8_projection import _validation as projection_validation
+from piper_kernels.fusions.convrot_int8_projection._nvidia import _plan as nvidia_plan
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 
 from . import _interfaces
 from ._amd import policy as amd_policy
 from ._interfaces import ProjectionBackend
-from ._nvidia import _plan as nvidia_plan
 from ._nvidia import policy as nvidia_policy
 
 try:
+    from piper_kernels.fusions.convrot_int8_projection._nvidia import (
+        fragments as _nvidia_fragments,
+    )
     from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as _linear_async_copy
 
     from ._nvidia import dispatch as _nvidia_projection
@@ -24,6 +27,7 @@ except ModuleNotFoundError as error:
         raise
     _nvidia_projection = None
     _nvidia_async_copy_gluon = None
+    _nvidia_fragments = None
     _linear_async_copy = None
 
 
@@ -63,6 +67,7 @@ def source_files() -> tuple[str, ...]:
             amd_policy.__file__,
             None if _nvidia_projection is None else _nvidia_projection.__file__,
             None if _nvidia_async_copy_gluon is None else _nvidia_async_copy_gluon.__file__,
+            None if _nvidia_fragments is None else _nvidia_fragments.__file__,
             None if _amd_projection is None else _amd_projection.__file__,
             linear_backend.__file__,
             attention_backend.__file__,

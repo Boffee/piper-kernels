@@ -16,6 +16,15 @@ def supports_target(target: AcceleratorTarget) -> bool:
     return target.supports_uint8_int8_mma
 
 
+def groups_qk_scales(target: AcceleratorTarget) -> bool:
+    """Return whether every plan for target reads Q32/K64 group scales.
+
+    Otherwise Q/K scales are per thread, stored per row and key. The choice
+    depends on the target alone, so external Q/K producers can match it.
+    """
+    return target.is_cuda_capability(12)
+
+
 def _generic_execution_plan(
     target: AcceleratorTarget,
     *,
@@ -36,20 +45,24 @@ def _generic_execution_plan(
     )
 
 
-def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
+def _sm89_execution_plan(
+    *, head_dim: int, is_causal: bool, quantized_query: bool
+) -> PiperAttentionExecutionPlan:
     """Build the exact-SM89 plan measured on an RTX 4070 Ti SUPER.
 
     Every mode runs the ``cp.async`` Gluon kernel with per-thread Q/K scales:
     SM120's grouped scales raise the error against exact attention by 7-12% here.
-    D64 gives each warp 32 query rows and quantizes Q in the kernel prologue. D128
-    gives each warp 16 rows under a register cap that fits two CTAs per SM; there
-    the prologue would cost more than the Q preparation pass it replaces. V
-    quantization leaves the V row stride unspecialized, which keeps SM89 within
-    SM120's compile count and is also 3-5x faster here.
+    D64 gives each warp 32 query rows and quantizes floating-point Q in the kernel
+    prologue. Already quantized causal D64 Q runs 16 rows per warp instead, which
+    trims diagonal work by 0.5-8%. D128 gives each warp 16 rows under a register
+    cap that fits two CTAs per SM; there the prologue would cost more than the Q
+    preparation pass it replaces. V quantization leaves the V row stride
+    unspecialized, which keeps SM89 within SM120's compile count and is also 3-5x
+    faster here.
     """
     wide = head_dim == 128
     return PiperAttentionExecutionPlan(
-        block_m=64 if wide else 128,
+        block_m=64 if wide or (is_causal and quantized_query) else 128,
         grouped_qk=False,
         split_pv_head_dim=False,
         use_tensor_descriptors=False,
@@ -59,7 +72,7 @@ def _sm89_execution_plan(*, head_dim: int) -> PiperAttentionExecutionPlan:
         unspecialized_value_stride=True,
         attention_kernel="gluon_async_copy",
         max_registers=232 if wide else None,
-        fuse_query_quantization=not wide,
+        fuse_query_quantization=not wide and not quantized_query,
     )
 
 
@@ -118,10 +131,16 @@ def select_execution_plan(
     is_causal: bool,
     query_length: int,
     key_length: int | None = None,
+    quantized_query: bool = False,
 ) -> PiperAttentionExecutionPlan:
-    """Combine capability defaults with measured policy; omitted K length means self-attention."""
+    """Combine capability defaults with measured policy; omitted K length means self-attention.
+
+    ``quantized_query`` selects a plan for Q that a producer already quantized.
+    """
     if target.is_cuda_capability(8, 9):
-        return _sm89_execution_plan(head_dim=head_dim)
+        return _sm89_execution_plan(
+            head_dim=head_dim, is_causal=is_causal, quantized_query=quantized_query
+        )
     if target.is_cuda_capability(12, 0):
         return _sm120_execution_plan(
             head_dim=head_dim,

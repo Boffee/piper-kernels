@@ -1,4 +1,4 @@
-"""Resolved NVIDIA sparse-projection implementation and launch choices."""
+"""Resolved NVIDIA fused-projection implementation and launch choices for dense and sparse Piper."""
 
 from dataclasses import dataclass
 from typing import Literal

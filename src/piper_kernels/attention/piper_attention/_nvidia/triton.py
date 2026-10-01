@@ -1126,6 +1126,7 @@ def _launch_piper_attention_into(
             max_registers=plan.max_registers,
             query_start=query_start,
             global_query_start=query.global_row_offset + query_start,
+            padded_kv=context.padded_kv,
         )
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = query.descriptor is not None

@@ -1,6 +1,34 @@
-"""Metadata checks for dense Piper query windows and output storage."""
+"""Metadata checks for dense Piper query windows, Q/K scales, and output storage."""
 
 import torch
+
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    QKQuantizationGranularity,
+)
+
+
+def validate_qk_quantization(granularity: str) -> QKQuantizationGranularity:
+    """Accept the Sage Q/K scale granularities that quantized Piper operands may use."""
+    if granularity == "per_thread":
+        return "per_thread"
+    if granularity == "per_warp":
+        return "per_warp"
+    raise ValueError(f"unknown Q/K quantization granularity: {granularity}")
+
+
+def query_scale_length(storage_length: int, granularity: QKQuantizationGranularity) -> int:
+    """Count FP32 scales per head of Q64-padded Q: one per Q32 group or per row."""
+    return storage_length if granularity == "per_thread" else storage_length // 32
+
+
+def key_scale_length(storage_length: int, granularity: QKQuantizationGranularity) -> int:
+    """Count FP32 scales per head of K64-padded K: one per K64 group or per key."""
+    return storage_length if granularity == "per_thread" else storage_length // 64
+
+
+def scale_granularity(scales: torch.Tensor, storage_length: int) -> QKQuantizationGranularity:
+    """Read Q/K granularity from scale metadata: one scale per stored row is per thread."""
+    return "per_thread" if scales.ndim == 3 and scales.shape[2] == storage_length else "per_warp"
 
 
 def validate_query_offset(offset: int, *, block_rows: int, name: str) -> None:

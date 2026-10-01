@@ -40,11 +40,16 @@ def test_context_launches_compile_for_rdna4(monkeypatch, arch, head_dim, operati
         monkeypatch.setattr(
             key_projection.qk_quantization,
             "prepare_key",
-            lambda *args, **kwargs: key._new_outputs(operands[0], (2, 193, 3, head_dim)),
+            lambda *args, **kwargs: key._new_outputs(
+                operands[0], (2, 193, 3, head_dim), "per_warp"
+            ),
         )
         backend = _backend.select_projection_backend(operands[0], head_dim=head_dim)
         backend.project_key(
-            *operands, 1e-6, bias, out=key._new_outputs(operands[0], (2, 193, 3, head_dim))
+            *operands,
+            1e-6,
+            bias,
+            out=key._new_outputs(operands[0], (2, 193, 3, head_dim), "per_warp"),
         )
         mean_kernel.__getitem__.return_value.assert_called_once()
         mean_call = mean_kernel.__getitem__.return_value.call_args

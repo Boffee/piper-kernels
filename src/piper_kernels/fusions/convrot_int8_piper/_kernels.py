@@ -4,6 +4,8 @@
 # ruff: noqa: ANN001, ANN202
 # pyright: reportArgumentType=false, reportGeneralTypeIssues=false
 # pyright: reportAssignmentType=false, reportAttributeAccessIssue=false
+# Q32 group offsets exist only in the constexpr branch that also stores them.
+# pyright: reportPossiblyUnboundVariable=false
 
 import triton
 import triton.language as tl
@@ -43,6 +45,7 @@ def _project_query_kernel(  # noqa: PLR0913, PLR0917
     round_rsqrt_to_nearest: tl.constexpr,
     aligned_projection: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
+    per_thread_scales: tl.constexpr,
     bias_ptr=None,
 ):
     block_m: tl.constexpr = 64
@@ -80,24 +83,45 @@ def _project_query_kernel(  # noqa: PLR0913, PLR0917
         round_rsqrt_to_nearest,
         bias_ptr=bias_ptr,
     )
-    group_offsets = tl.arange(0, 2)
-    group_valid = head_offsets[:, None] < heads
-    if mask_ragged_tail:
-        transformed = tl.where(
-            sequence_offsets[:, None, None] < chunk_rows,
+    if per_thread_scales:
+        # Each row stores the scale of its per-thread group.
+        row_valid = head_offsets[:, None] < heads
+        if mask_ragged_tail:
+            transformed = tl.where(
+                sequence_offsets[:, None, None] < chunk_rows,
+                transformed,
+                0.0,
+            )
+            row_valid = row_valid & (sequence_offsets[None, :] < chunk_rows)
+        quantized, scale = qk_quantization.quantize_query_per_thread_tile(
             transformed,
-            0.0,
+            row_valid,
+            softmax_scale,
+            heads_per_program,
+            head_dim,
+            block_m,
         )
-        group_valid = group_valid & (row_block * block_m + group_offsets[None, :] * 32 < chunk_rows)
-    quantized, scale = qk_quantization.quantize_query_tile(
-        transformed,
-        group_valid,
-        softmax_scale,
-        heads_per_program,
-        head_dim,
-        block_m,
-        32,
-    )
+    else:
+        group_offsets = tl.arange(0, 2)
+        group_valid = head_offsets[:, None] < heads
+        if mask_ragged_tail:
+            transformed = tl.where(
+                sequence_offsets[:, None, None] < chunk_rows,
+                transformed,
+                0.0,
+            )
+            group_valid = group_valid & (
+                row_block * block_m + group_offsets[None, :] * 32 < chunk_rows
+            )
+        quantized, scale = qk_quantization.quantize_query_tile(
+            transformed,
+            group_valid,
+            softmax_scale,
+            heads_per_program,
+            head_dim,
+            block_m,
+            32,
+        )
     batch_heads = batch * heads + head_offsets.to(tl.int64)
     query_offsets = (
         batch_heads[:, None, None] * storage_length * head_dim
@@ -105,9 +129,12 @@ def _project_query_kernel(  # noqa: PLR0913, PLR0917
         + tl.arange(0, head_dim)[None, None, :]
     )
     tl.store(query_ptr + query_offsets, quantized, mask=head_offsets[:, None, None] < heads)
-    scale_offsets = (
-        batch_heads[:, None] * (storage_length // 32) + row_block * 2 + group_offsets[None, :]
-    )
+    if per_thread_scales:
+        scale_offsets = batch_heads[:, None] * storage_length + sequence_offsets[None, :]
+    else:
+        scale_offsets = (
+            batch_heads[:, None] * (storage_length // 32) + row_block * 2 + group_offsets[None, :]
+        )
     tl.store(query_scale_ptr + scale_offsets, scale, mask=head_offsets[:, None] < heads)
 
 

@@ -58,7 +58,10 @@ and quantizes Q in the kernel prologue; D128 uses Q64 tiles under a 232-register
 two CTAs share an SM. Only the final K64 tile carries masks, plus the diagonal tile
 before it for causal Q128 tiles, so ragged lengths reuse one compiled kernel. Causal
 grids start with the longest query rows. Query windows and strided outputs follow the
-same contract as the Triton kernel.
+same contract as the Triton kernel. Q quantized by a fused producer skips the prologue;
+D64 then keeps Q128 tiles for non-causal attention but uses Q64 tiles for causal
+attention, 0.5-8% faster there. Q128 tiles zero-fill rows past Q64-padded storage, and
+producer K scales and V multipliers span K64-padded storage.
 
 The execution plan names the implementation with `attention_kernel` (`triton` or
 `gluon_async_copy`) and owns its capability checks. The offline tuner accepts
