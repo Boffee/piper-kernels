@@ -126,7 +126,7 @@ def _validate_conv3d_channels(channels: int) -> None:
 def validate_activation_scale(scale: torch.Tensor | None, device: torch.device) -> None:
     """Validate optional static activation storage without reading device values.
 
-    Finite-positive values are a caller precondition; see README.md#validation-contract.
+    Finite-positive values are a caller precondition; see docs/development.md#validation-contract.
     """
     if scale is None:
         return

@@ -1,8 +1,8 @@
 """CUDA-graph ConvRot INT8 schedule and BF16 comparisons across projection shapes.
 
-Includes input rotation/quantization in full-linear timings. Acquire the local
-model server's GPU gate before running on a shared GPU (see benchmarks/README.md).
+Includes input rotation/quantization in full-linear timings.
 JSON lines on stdout include environment, per-shape timings, and seven-call totals.
+See benchmarks/README.md for measurement and reproducibility guidance.
 """
 
 from __future__ import annotations

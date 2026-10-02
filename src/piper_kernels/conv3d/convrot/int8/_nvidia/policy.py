@@ -9,7 +9,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 
 from .._plan import ConvolutionExecutionPlan, ConvolutionSchedule, PreparationSchedule
 
-# Historical SM120 crossovers, retained along with their channel/output predicates.
 _SM120_C256_LARGE_MIN_ROWS = 200_000
 _SM120_C256_MEDIUM_MIN_ROWS = 30_000
 _SM120_C512_LARGE_MIN_ROWS = 5_000
@@ -49,7 +48,7 @@ def _sm120_use_weight_descriptor(
 
 
 def _sm120_convolution_schedule(channels: int, outputs: int, rows: int) -> ConvolutionSchedule:
-    """Select a complete historical SM120 convolution schedule."""
+    """Select the measured SM120 convolution schedule."""
     if channels == 128:
         return _SM120_K64
     if channels == 256:
