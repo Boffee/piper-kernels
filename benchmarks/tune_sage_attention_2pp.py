@@ -22,6 +22,7 @@ from lib.attention_tuning import (
     add_attention_tuning_arguments,
     validate_attention_tuning_arguments,
 )
+from lib.case_cli import apply_case
 from lib.environment import capture_environment
 from lib.providers import BenchmarkProvider
 from lib.quality import measure_quality
@@ -80,7 +81,7 @@ class _SageAttention2ppTuningChoice:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_attention_tuning_arguments(parser)
-    return parser.parse_args(argv)
+    return apply_case(parser.parse_args(argv), argv, attention=True)
 
 
 def _candidate_choices(
@@ -230,6 +231,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         args.sequence,
         key_value_length,
         args.head_dim,
+        args.kv_heads,
     )
     scale = args.head_dim**-0.5
     config = AttentionConfig(

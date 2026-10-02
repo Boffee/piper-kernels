@@ -1,248 +1,153 @@
 # Benchmarks
 
-Use these runners to compare operators, investigate regressions, or select an
-execution plan. They record shapes, configuration, quality where applicable,
-timings, and hardware/software metadata. Synthetic operator results do not
-establish full-model speed or checkpoint quality.
+Use the [shared suite](benchmark.py) to compare operators across accelerators or
+revisions. Cases have fixed shapes, input recipes, and mathematical options.
+Hardware chooses the implementation, never a smaller workload. Synthetic
+operator measurements do not establish full-model speed or checkpoint quality.
 
-Run from the repository root with the Python for the accelerator being tested.
-See [development setup](../docs/development.md#accelerator-environments) for CUDA
-and ROCm environments. With an external environment, replace `uv run python` below
-with `PYTHONPATH=src /path/to/env/bin/python`. Production runners are shared across
-CUDA and ROCm, subject to each operator's backend support.
+Run from the repository root using the environment for the accelerator under
+test; see [CUDA and ROCm setup](../docs/development.md#accelerator-environments).
+For an external environment, replace `uv run python` with
+`PYTHONPATH=src /path/to/env/bin/python`.
 
-## Choose a runner
-
-Start with an explicit shape and save the result:
+## Run the suite
 
 ```shell
-uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --heads 16 --head-dim 128 --dtype bfloat16 \
-  --json artifacts/attention.json
+# Inspect cases without initializing an accelerator.
+uv run python benchmarks/benchmark.py --list
+
+# Exercise every family with small diagnostic workloads.
+uv run python benchmarks/benchmark.py --case '*small*' --json artifacts/small.json
+
+# Compare fixed production-shaped attention workloads.
+uv run python benchmarks/benchmark.py --family attention --json artifacts/attention.json
+
+# Run the entire standard suite.
+uv run python benchmarks/benchmark.py --jsonl artifacts/operators.jsonl
 ```
 
-| Workload | Runner | Useful controls |
-|---|---|---|
-| Dense attention | [benchmark_attention.py](benchmark_attention.py) | `--providers`, `--sequence`, `--kv-sequence`, `--causal` |
-| ConvRot INT8 linear | [benchmark_convrot_int8.py](benchmark_convrot_int8.py) | `--rows`, `--in-features`, `--out-features`, `--phases` |
-| ConvRot INT8 Conv3D | [benchmark_convrot_int8_conv3d.py](benchmark_convrot_int8_conv3d.py) | Repeated `--shape N,C,T,H,W,O`, `--tune`, `--vendor-benchmark` |
-| NVFP4 / ConvRot NVFP4 FFN | [benchmark_nvfp4_ffn.py](benchmark_nvfp4_ffn.py) | `--format`, repeated `--shape M K N`, `--activation`, `--scaling` |
-| Dense projection/attention/output fusion | [benchmark_piper_fusion.py](benchmark_piper_fusion.py) | `--heads`, `--kv-heads`, `--width`, `--chunk-rows` |
-| Sparse attention | [benchmark_sparse_piper.py](benchmark_sparse_piper.py) | `--ratios`, `--routing`, `--sequence` |
-| Sparse routing and projections | [scores](benchmark_sparse_piper_scores.py), [projections](benchmark_sparse_piper_projection.py) | Query-block windows, routing mode, projection dimensions |
-| Complete sparse fusion | [benchmark_sparse_piper_fusion.py](benchmark_sparse_piper_fusion.py) | `--sequence`, `--query-chunk-rows` |
-| Integer probability/value dot | [benchmark_integer_pv_dot.py](benchmark_integer_pv_dot.py) | Arithmetic variants, compiler inspection, profiling |
+`--case` accepts an identity or a quoted shell-style pattern. Repeat `--case`,
+`--family`, or `--provider` to select a subset. The default suite includes both
+endpoints of each production workload. Small and ragged diagnostics require
+explicit selection; they are not substitutes for production measurements.
+Use `--help` for controls. CUDA and ROCm both use PyTorch's `cuda` device name;
+`--device cpu` is available for explicit reference checks.
 
-Use `--help` for the full argument list. The ConvRot `small_m`, `tail`,
-`realistic`, and `preparation` scripts are specialized NVIDIA ablations and
-compiler diagnostics. Use the ordinary linear runner for production comparisons
-on either accelerator. Add workloads to these runners and reuse the
-development-only support in [`lib`](lib).
+## Workloads
 
-### ConvRot INT8
+The [typed catalog](lib/cases.py) is the authoritative case definition. Shapes
+are rounded latent-space anchors informed by video, image, and decoder models:
 
-Include activation rotation, quantization, GEMM, and the scale epilogue when
-comparing the public linear operator. `--phases` adds separate preparation,
-prepared GEMM, and complete-call device measurements:
+| Workload | Approximate output range | Transformer tokens, low → high |
+|---|---|---:|
+| Video | 0.5 MP / 5 seconds → 1 MP / 15 seconds, at 24 FPS | 20,480 → 110,592 |
+| Image | 768×768 → 2048×2048 | 2,816 → 16,896 |
+| Decoder chunk | Chunk-sized work at the video spatial endpoints | 10,240 → 20,480 |
 
-```shell
-uv run python benchmarks/benchmark_convrot_int8.py \
-  --rows 8192 --in-features 6144 --out-features 4096 --no-bias --phases \
-  --json artifacts/convrot-int8.json
-```
+Video anchors use H3-like latent grids (32 output pixels per transformer token
+axis and chunked temporal mapping), rounded with conditioning overhead. Image
+anchors use a 16-pixel latent grid plus 512 conditioning tokens, informed by
+Krea2/Qwen Image-like workloads. These are approximate workloads, not model
+executions or exact prompt lengths. Longer videos increase decoder chunk count,
+not the size of every decoder invocation. No model checkout is required to run.
 
-The Conv3D runner compares native and portable quantized operations, plus vendor
-FP16 convolution in contiguous and channels-last layouts. FP16 is a performance
-baseline; the quantized reference is the correctness oracle. Both include
-matching padding and, for fused cases, GroupNorm/SiLU. Weight reconstruction and
-initial layout conversion are outside timing. `--skip-reference-timing` retains
-correctness checks. On ROCm, record `PYTORCH_MIOPEN_SUGGEST_NHWC` and
-`--vendor-benchmark`, which affect the baseline.
+Dense and sparse attention, linear, FFN, Conv3D, and projection/attention
+pipelines use the matching catalog dimensions. Sparse keep ratios, GQA head
+counts, GELU versus SwiGLU, and convolution normalization are explicit cases.
+An optimization must execute the same operation as its comparison baseline.
 
-### Attention and projection fusion
+Input tensors are generated on the CPU with a fixed recipe and transferred to
+the selected device, so a seed does not depend on vendor RNG behavior. Weight
+formats start from the same dense weights. Quantization formats are explicit
+provider variants, accompanied by quality measurements.
 
-By default, dense attention chooses supported providers for the device and
-includes PyTorch SDPA. Piper's prepared phase times the recurrence after Q/K/V preparation;
-SageAttention2++ and SDPA time their complete operator in that phase. Compare
-complete operator timings when judging integration cost. The ordinary dense
-runner uses equal Q/KV head counts; GQA needs separate coverage, such as the
-projection-fusion benchmark.
+Changing a case's meaning requires a catalog revision. Custom shape experiments
+belong in diagnostics or tuning; do not change a standard case for one device.
 
-The optional canonical SageAttention providers require the pinned benchmark
-dependency and an NVIDIA build for the target architecture:
+## Measurements and outcomes
 
-```shell
-TORCH_CUDA_ARCH_LIST=12.0 uv sync --group benchmark
-uv run python benchmarks/benchmark_attention.py --canonical
-```
+The primary measurement is the **complete warmed operator or pipeline** using
+synchronized wall time. It includes host dispatch, output allocation, and all
+required per-call activation preparation. Input creation, weight packing,
+compilation, and correctness checks are outside timing. The common protocol
+uses warm caches, a 100 ms warmup and a 500 ms measurement window; overrides are
+recorded. Reports contain the median, p20, p80, and sample count.
 
-Use `8.9` for SM89. The pinned revision is in [pyproject.toml](../pyproject.toml);
-production code does not import this benchmark dependency.
+Each requested implementation produces an outcome:
 
-Fusion runners compare complete projection/attention pipelines, verify the
-advertised graph rewrites, and exclude compilation and reference checks from
-timing. Dense fusion also reports CUDA-graph replay separately. Peak extra
-allocation includes outputs and workspace, excluding resident inputs/weights;
-dense graph pools are excluded too.
+- `ok`: full-output finiteness and numerical checks passed; latency is reported.
+- `unsupported`: the implementation cannot execute this case on this device.
+- `oom`: setup, validation, or measurement exceeded available memory; the stage
+  is recorded and the workload is unchanged.
+- `failed`: an unexpected error or failed correctness check. The command exits
+  unsuccessfully; this is not a skipped measurement.
 
-```shell
-uv run python benchmarks/benchmark_piper_fusion.py \
-  --sequence 8192 8193 --heads 4 --kv-heads 2 --head-dim 64 --width 1024 \
-  --chunk-rows 4096 --json artifacts/dense-fusion.json
-```
+Native support follows the library. For example, NVFP4 requires NVIDIA SM120,
+and SageAttention2++ has no native AMD implementation. Unsupported providers
+remain visible instead of being replaced by portable execution under their name.
 
-Keep model-shaped results explicit about what is represented. H3 fusion defaults
-use B1/H56/D128 and hidden width 5376, not captured checkpoint inputs. Krea2-shaped
-dense runs need Hq48/Hkv12/D128, width 6144, and `--rotary-dim 128`; they omit the
-model's text padding mask and sigmoid output gate. Sparse `--ratios 1.0` retains
-sparse quantization and is not identical to dense Piper.
+Quality checks cover complete outputs for nonfinite values and deterministic
+samples for numerical error. Attention samples retain the full key/value
+context. Records identify the reference, coverage, tolerance, and any additional
+comparison. Error against original floating weights includes quantization loss;
+agreement with a matching quantized reference measures implementation correctness.
+Pipeline comparisons verify the advertised compiler rewrites and compare the
+fused operation with the same materialized operation.
 
-### NVFP4 FFN
+Peak extra device allocation includes outputs and workspace, excluding resident
+inputs and weights; compilation and validation allocations are excluded. It is
+PyTorch allocator memory, not total process or device memory.
 
-The FFN runner measures the complete fused FFN on SM120. Shapes are input rows,
-input/output width, and intermediate width:
+Results use the `operator_suite` record type and carry schema/catalog versions,
+case identity, full workload, provider configuration, measurement protocol,
+quality, outcome, and hardware/software/Git metadata. `--json` and `--jsonl`
+save progress after every implementation. Nonfinite scalar metrics such as
+infinite SQNR serialize as `null`; inspect the associated error/count fields.
 
-```shell
-uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
-  --shape 1024 2048 8192 --shape 1797 2048 8192 \
-  --dtype bfloat16 --scaling dynamic --json artifacts/nvfp4-ffn.json
-```
+Compare matching case revisions, providers, scopes, and protocols. Confirm a
+promising result with repeated fresh-process runs on an otherwise idle device.
+Record clock/power settings and validate each architecture independently.
 
-Its `prepared_execution` is CUDA-graph device timing of the complete FFN.
-Compilation, capture, Python dispatch, and allocation are excluded. Shape,
-dtype, and finiteness checks run before timing; numerical accuracy belongs to
-the FFN correctness tests. The runner stops if another compute process occupies
-the GPU. Match activation, scales, seed, chunking, and sample settings across
-revisions. Recorded synthetic static down scales are not checkpoint calibration
-evidence.
+## Diagnostics and offline tuning
 
-## Interpret and reproduce results
+These tools answer narrower questions and retain their labeled phase/clock
+records. Use complete-call suite results for integration comparisons.
 
-The common provider model has `prepare()` and `run(prepared)` callables. A
-provider may prepare nothing and invoke the complete operator in `run`.
-Consequently, phase names alone do not establish equivalent work:
-
-| Phase | Measurement boundary |
+| Question | Tool |
 |---|---|
-| `first_call_ms` | Synchronized wall time of the first invocation, including lazy compilation; compiler caches may already be warm. |
-| `preparation` | Warmed synchronized wall time of preparation alone. |
-| `prepared_execution` | Warmed device-event time of `run(prepared)`, including preparation inside that callable. |
-| `operator_end_to_end` | Warmed synchronized wall time of `run(prepare())`. |
+| Attention preparation, compiler inspection, optional canonical Sage | [Dense attention diagnostic](benchmark_attention.py) |
+| Sparse stages and routing scores | [Sparse attention](benchmark_sparse_piper.py), [scores](benchmark_sparse_piper_scores.py) |
+| Q/K/V projection phases | [Sparse projections](benchmark_sparse_piper_projection.py) |
+| Linear preparation, compiler inspection, optional external comparison | [Linear](benchmark_convrot_int8.py), [preparation](benchmark_convrot_int8_preparation.py) |
+| Convolution layout and schedule investigation | [Conv3D](benchmark_convrot_int8_conv3d.py) |
+| Integer arithmetic/compiler behavior | [Integer PV dot](benchmark_integer_pv_dot.py) |
 
-Synchronized wall time includes host dispatch, allocation, and device work.
-Device events measure elapsed stream work. Graph replay removes per-call host
-work; compare it only with matching graph measurements. Records identify the
-`clock`, timing windows, and sample counts. Common summaries are `p50 [p20, p80]`;
-unsupported phases are `null`. Device-phase runners separately record
-cache-flushed `device_event` and `graph_device_event` samples. Fusion runners
-can use shuffled fixed-count wall samples instead of timed windows.
-
-Compare the same shapes, configuration, seed, reference, timing scope, and
-environment on baseline and candidate. Confirm a promising result with repeated
-fresh-process measurements, alternating their order on an otherwise idle accelerator.
-Use complete operator timing for production decisions, and inspect memory as
-well as latency. Validate architectures independently; a schedule measured on
-one GPU is evidence for that device, not its whole architecture family.
-
-Quality records include absolute/relative error, SQNR, cosine similarity, and
-actual/reference non-finite counts where supported. Check the reference and
-whether comparisons cover all elements or sampled queries. Synthetic inputs
-cannot replace representative model activations. Integer quality comparisons
-support values through 32 bits using FP64; full-width INT64/UINT64 require an
-exact domain-specific comparison.
-
-Save reports with `--json PATH` or `--jsonl PATH`. Common `BenchmarkRecord`
-metadata includes GPU/backend/architecture, Python/Torch/Triton/runtime and
-available driver versions, Git revision and dirty state, logical shape, provider
-configuration, timings, and quality. Preserve the command, model/shape source,
-and clock or power settings when sharing results. Non-finite metrics such as
-infinite SQNR serialize as `null`; inspect non-finite counts separately.
-Check `schema_version` before consuming artifacts.
-
-Nested configurations use `execution_plan` for complete invocation choices and
-`schedule` for an independently measured stage.
-
-## Offline tuning
+Operation diagnostics accept `--case` to use a parent workload from the shared
+catalog. Custom shapes, where supported, describe separate experiments.
+Device-event timing measures stream work; graph replay removes per-call host
+work. Neither should be compared directly with the suite's synchronized wall
+time. Compiler resource counts describe limits, not achieved occupancy.
 
 The [Piper Attention](tune_piper_attention.py),
 [SageAttention2++](tune_sage_attention_2pp.py), and
-[ConvRot linear](tune_convrot_int8_linear.py) tuners measure the immutable plans
-used by production. Omitted axes keep production values; explicit axes form a
-deduplicated, capped Cartesian search. Unsupported and out-of-resource
-candidates are recorded; unexpected failures propagate. Winners must pass
-quality checks. Nothing changes production policy or starts runtime autotuning.
-The attention tuners exercise NVIDIA implementations; they do not enable new
-backends.
+[INT8 linear](tune_convrot_int8_linear.py) tuners accept the same cases and search
+implementation-specific schedules offline:
 
 ```shell
-uv run python benchmarks/tune_piper_attention.py \
-  --sequence 8192 --head-dim 128 --block-m 64 128 --num-stages 2 3 \
-  --phase operator_end_to_end --json artifacts/attention-tuning.json
+uv run python benchmarks/tune_piper_attention.py --case attention-video-low \
+  --block-m 64 128 --num-stages 2 3 --phase operator_end_to_end \
+  --json artifacts/attention-tuning.json
 ```
 
-Use `--help` for target-specific axes and quality thresholds. Attention tuners
-default to a 20 dB SQNR gate plus non-finite checks. Piper's prepared phase is its
-recurrence; ConvRot and SageAttention2++ include public-operator preprocessing.
-State the phase when reporting a selected candidate.
+Candidate limits and quality gates keep searches explicit; unexpected failures
+propagate. Nothing modifies production policy or enables runtime autotuning.
+Attention schedule searches currently target NVIDIA. Use nearby shapes when
+judging a policy change; see [performance tuning](../docs/development.md#performance-tuning).
 
-### Attention tuning workload anchors
+The [ROCm workflow](../.github/workflows/rocm.yml) runs the same small cases and
+saves their records on a provisioned RDNA4 runner. It requires the environment
+described in the development guide; the workflow alone is not hardware evidence.
 
-Use B1/BF16 with H16/H48 and D64/D128 as representative regimes. Measure square
-Q=KV at 8192, 32768, and 131072, causal and non-causal. Include non-causal
-rectangles 8192×32768 and their reverse. These are equal-head benchmarks;
-GQA/MQA need separate coverage. FP16 provides secondary quality/code-generation
-coverage where supported.
-
-Use 2048 as a short-context guard, small boundaries such as 63/64/65 and
-127/128/129 for masking, and 8193 plus near-square rectangles for realistic tails.
-Confirm long behavior at 131072 and 131073 with H16/D64 and D128. Probe immediately
-around any proposed applicability boundary. Anchors sample a continuous workload;
-they are not model identities or dispatch keys.
-
-### Large-M dense forward-linear tuning workload anchors
-
-For `[M,K] × [N,K]`, use the eight combinations of M=8192/32768,
-N=4096/16384, and K=6144/14336, with BF16 and no bias. ConvRot uses group 256
-and includes rotation/quantization in the timed operator. Other formats retain
-their preparation contract. Confirm the winner at M=131073 for
-(N,K)=(16384,6144) and (4096,14336), when memory permits; the expansion also
-tests output indexing beyond `2^31` elements.
-
-If integration changes graph boundaries, also check SwiGLU, tanh-GELU, and
-shared-input projections at a representative large shape. Small-M decode,
-sparse/expert routing, backward, and fused pipelines need their own coverage.
-Follow the [development guidance](../docs/development.md) when selecting a
-general production policy from these measurements.
-
-## Compiler inspection and profiling
-
-Triton providers can report registers, spills, shared memory, warps, resource
-residency ceilings, and available PTX/SASS instruction counts:
-
-```shell
-uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --providers piper_attention --compiler-report --no-sass
-```
-
-Residency is a resource ceiling, not achieved occupancy; static instruction
-counts are not dynamic execution counts. Compiler comparisons use one
-provider/configuration per process so cached specializations cannot be
-misattributed. `--compiler-json` and `--compiler-jsonl` save versioned
-`triton_compiler` records with environment, configuration, and specialization
-fingerprints. NVIDIA SASS inspection requires `nvdisasm`; use `--nvdisasm`
-to locate it or `--no-sass` for portable metadata/available IR. AMDGCN
-disassembly is not integrated.
-
-```shell
-nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
-  uv run python benchmarks/benchmark_integer_pv_dot.py s8-s8 \
-  --profile --profile-phase prepared_execution
-```
-
-The default profile excludes compilation and warmup. `--profile-include-setup`
-adds them in a separate NVTX range. This capture controller is CUDA-only.
-When a runner has multiple providers, select the compiler/profile provider
-explicitly and keep both selections aligned. Shared implementations live in
-[`lib/timing.py`](lib/timing.py), [`lib/reporting.py`](lib/reporting.py),
-[`lib/triton_inspection.py`](lib/triton_inspection.py), and
-[`lib/profiling.py`](lib/profiling.py).
+Add a workload to the catalog and its operation adapter, reusing the common
+runner, timing, quality, and reporting utilities. Avoid another standalone
+performance runner for a model or accelerator.

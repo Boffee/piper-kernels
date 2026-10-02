@@ -75,7 +75,7 @@ cross-backend bitwise equality is not promised.
 
 `gfx1201` has hardware coverage on RX 9070 XT; `gfx1200` has offline compilation
 coverage. This does not establish exhaustive performance tuning. Use the shared
-[attention benchmark](../../../../benchmarks/README.md#attention-and-projection-fusion)
+[attention benchmark](../../../../benchmarks/README.md#run-the-suite)
 to compare complete operators and quality on the target device. Backend tests
 live under `tests/attention/piper_attention`, with GQA and shared-fragment tests
 alongside them. Follow the [validation contract](../../../../docs/development.md#validation-contract)

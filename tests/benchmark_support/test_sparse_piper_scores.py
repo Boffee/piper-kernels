@@ -36,10 +36,20 @@ def test_scoring_uses_actual_full_and_tail_chunk_sizes(sequence, chunks):
     assert benchmark._query_chunks(sequence) == chunks
 
 
-def test_defaults_cover_h3_through_150k():
+def test_defaults_use_the_shared_lower_video_case():
     args = benchmark._parse_args([])
-    assert args.sequence == [8192, 32768, 100000, 150000]
+    assert args.sequence == [20480]
+    assert args.case == "sparse-attention-video-low-half"
     assert args.samples == 7
+
+
+def test_catalog_case_preserves_image_gqa_and_rejects_shape_overrides():
+    args = benchmark._parse_args(["--case", "attention-image-high"])
+    assert (args.sequence, args.heads, args.kv_heads, args.head_dim) == ([16896], 48, 12, 128)
+    with pytest.raises(SystemExit):
+        benchmark._parse_args(["--case", "attention-image-high", "--sequence", "65"])
+    with pytest.raises(SystemExit):
+        benchmark._parse_args(["--case", "linear-small"])
 
 
 @pytest.mark.parametrize("format_name", ["json", "jsonl"])
@@ -67,6 +77,16 @@ def test_torch_baseline_matches_exact_integer_products_with_prefix_views():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+def test_torch_baseline_preserves_grouped_head_mapping():
+    query = torch.randn(2, 6, 3, 64)
+    primary, auxiliary = torch.randn(2, 2, 7, 64), torch.randn(2, 2, 7, 64)
+    expected = torch.maximum(
+        query @ primary.repeat_interleave(3, dim=1).transpose(-1, -2),
+        query @ auxiliary.repeat_interleave(3, dim=1).transpose(-1, -2),
+    )
+    torch.testing.assert_close(benchmark._torch_scores(query, primary, auxiliary), expected)
+
+
 def test_no_gpu_rejects_before_allocating_inputs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(SystemExit, match="requires a CUDA or ROCm GPU"):
@@ -74,10 +94,11 @@ def test_no_gpu_rejects_before_allocating_inputs(monkeypatch):
 
 
 def test_records_preserve_paired_panels_and_label_the_aggregate(monkeypatch, tmp_path):
-    generator, randn = torch.Generator, torch.randn
-    monkeypatch.setattr(torch, "Generator", lambda **kwargs: generator())
+    normal_tensor = benchmark.normal_tensor
     monkeypatch.setattr(
-        torch, "randn", lambda shape, **kwargs: randn(shape, generator=kwargs["generator"])
+        benchmark,
+        "normal_tensor",
+        lambda shape, **kwargs: normal_tensor(shape, **(kwargs | {"device": torch.device("cpu")})),
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(benchmark._backend, "select_minmax_scores", lambda *args: None)

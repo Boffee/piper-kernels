@@ -97,7 +97,7 @@ weight descriptors; SM8x uses its own tiles to avoid the register pressure of
 SM120 schedules. Moving checkpoints between supported targets needs no
 activation-scale conversion. Follow the
 [validation contract](../../../../../docs/development.md#validation-contract).
-Use the [shared Conv3D benchmark](../../../../../benchmarks/README.md#convrot-int8)
+Use the [shared Conv3D benchmark](../../../../../benchmarks/README.md#run-the-suite)
 for quantized correctness and matching FP16 performance comparisons.
 
 ## MiniMax-H3 integration

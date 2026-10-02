@@ -21,10 +21,12 @@ def add_attention_tuning_arguments(
     include_reverse_causal_blocks: bool = True,
 ) -> None:
     """Add workload and shared launch-plan axes for an attention tuner."""
+    parser.add_argument("--case", help="use an unchanged case from the shared benchmark catalog")
     parser.add_argument("--sequence", type=int, default=8192)
     parser.add_argument("--kv-sequence", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument("--kv-heads", type=int)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
     parser.add_argument("--causal", action="store_true")
@@ -70,6 +72,9 @@ def validate_attention_tuning_arguments(arguments: argparse.Namespace) -> None:
         raise SystemExit("attention sequence lengths must be positive")
     if arguments.batch_size <= 0 or arguments.heads <= 0:
         raise SystemExit("batch size and heads must be positive")
+    kv_heads = arguments.kv_heads or arguments.heads
+    if kv_heads <= 0 or arguments.heads % kv_heads:
+        raise SystemExit("query heads must be divisible by positive KV heads")
     if arguments.causal and lengths[0] != lengths[1]:
         raise SystemExit("causal attention requires equal query and key/value lengths")
     if not arguments.causal and getattr(arguments, "reverse_causal_blocks", None) is True:
