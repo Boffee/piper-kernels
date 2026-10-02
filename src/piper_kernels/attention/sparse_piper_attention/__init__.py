@@ -1,4 +1,4 @@
-"""Sparse Piper Attention for NVIDIA SM89 and SM120 inference."""
+"""Sparse Piper Attention with NVIDIA, AMD, and portable inference backends."""
 
 from . import _coarse_dispatch as _coarse_dispatch
 from .coarse import (

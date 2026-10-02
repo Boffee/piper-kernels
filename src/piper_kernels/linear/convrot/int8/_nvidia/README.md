@@ -1,48 +1,43 @@
 # NVIDIA ConvRot INT8 implementation
 
-The organization follows sparse Piper attention's separation of target policy, common
-orchestration, and implementation-owned launchers:
+For public operators and weight conversion, see
+[weights](../../../../../../docs/weights.md). Policy, orchestration, and launchers
+have separate ownership:
 
 | Module | Responsibility |
 |---|---|
-| `policy.py` | Independently select preparation and a measured SM8x/SM120 GEMM schedule. |
-| `_plan.py` | Define immutable schedule/plan values, validate configurations, and report effective choices. |
-| `dispatch.py` | Prepare shared operands, allocate or reuse outputs, and dispatch the selected GEMM. |
-| `triton.py` | Launch shared preparation kernels and the portable Triton GEMM. |
-| `gluon_async_copy.py` | Own the `cp.async`/MMAv2 GEMM, alignment requirements, and launch. |
-| `../_kernels/triton.py` | Shared NVIDIA/AMD INT8 arithmetic and reusable projection tile. |
+| [policy.py](policy.py) | Select preparation and SM8x/SM120 GEMM schedules from target/shape metadata. |
+| [_plan.py](_plan.py) | Immutable plans/schedules, configuration validation, effective-choice reporting. |
+| [dispatch.py](dispatch.py) | Prepare shared operands, allocate/reuse outputs, dispatch GEMM. |
+| [triton.py](triton.py) | Shared preparation and portable Triton GEMM launchers. |
+| [gluon_async_copy.py](gluon_async_copy.py) | `cp.async`/MMAv2 GEMM, alignment requirements, launch. |
+| [shared kernels](../_kernels/triton.py) | NVIDIA/AMD INT8 arithmetic and reusable projection tile. |
 
-Each architecture's GEMM selector returns a complete, named `MatmulSchedule`. Preparation
-selection depends only on the target family and input width. The two choices are combined
-into one `NvidiaExecutionPlan`; production selection does not build or rewrite intermediate
-plans. The grouped Triton alignment fallback reuses the same schedule as large narrow SM8x
-projections and retains the existing preparation choices. Benchmarks use
-`baseline_execution_plan` for comparisons against the historical fixed schedule.
+Preparation depends on target family and input width, independently of output
+width so projections can share it. GEMM selection returns a complete
+`MatmulSchedule`; both choices form one `NvidiaExecutionPlan`. Production does
+not construct and rewrite intermediate plans.
 
-Kernel selection remains explicit:
-`matmul_kernel="triton"` or `"gluon_async_copy"`. Changing a tile with `dataclasses.replace`
-never changes its implementation. Plan validation checks the selected kernel's supported
-tile geometry; unsupported tuning combinations are reported and skipped by the offline tuner.
+`matmul_kernel` explicitly selects `triton` or `gluon_async_copy`. Replacing a
+tile with `dataclasses.replace` never changes the implementation. Plans validate
+supported tile geometry; the offline tuner records unsupported combinations.
+Kernel compatibility alone does not select production policy: an implementation
+can be valid on a target without being the measured choice there.
 
-`matmul_group_m` controls cache grouping, with zero meaning ungrouped. The Triton-only
-`triton_specialize_m` option controls whether row alignment enters the JIT cache key.
-Dynamic-M launches branch per tile instead. `triton_explicit_bias_fma` preserves the
-scale/bias rounding when the compiler would otherwise separate those operations across a
-tail branch. It does not control tail scheduling. Gluon and its unaligned-operand Triton
-fallback always use dynamic M and explicit bias FMAs to retain the same output bits.
+`matmul_group_m` controls cache grouping, with zero meaning ungrouped.
+`triton_specialize_m` decides whether row alignment enters the JIT cache key;
+dynamic-M launches branch per tile. `triton_explicit_bias_fma` preserves
+scale/bias rounding, independently of tail scheduling. Gluon and its unaligned
+Triton fallback use dynamic M and explicit bias FMAs to retain output bits.
 
-The read-only `matmul_specialize_m` and `matmul_explicit_bias_fma` properties describe the
-selected implementation's effective behavior. `as_dict()` reports those effective values
-for benchmarks, rather than the stored Triton-only options. Changing implementations with
-`dataclasses.replace` retains the Triton options for an explicit switch back to Triton;
-the unaligned-operand fallback selects its own rounding-compatible Triton options.
+The read-only `matmul_specialize_m` and `matmul_explicit_bias_fma` properties,
+and `as_dict()`, report the selected implementation's effective behavior.
+Switching implementations retains stored Triton options; the alignment fallback
+selects its own rounding-compatible options.
 
-SM8x selects its measured five configurations, dynamic-M launches, and explicit FMAs.
-SM120 retains its three Triton schedules, grouping, row specialization, and preparation
-defaults. The async-copy implementation is reusable on both architectures; correctness tests
-exercise the SM8x schedules on SM120 as well. Tuning results, rather than kernel compatibility,
-determine production selection.
-
-An async-copy launch requires 16-byte-aligned INT8 rows. Dispatch checks pointer/stride metadata
-and selects the grouped 128x64 Triton fallback when necessary. Neither implementation performs
-tensor-content validation; both obey the library's [validation contract](../../../../../../README.md#validation-contract).
+Async-copy launches require 16-byte-aligned INT8 rows. Dispatch checks pointer
+and stride metadata and uses the grouped 128x64 Triton fallback when needed,
+retaining preparation choices. Neither implementation scans tensor contents;
+follow the [validation contract](../../../../../../docs/development.md#validation-contract).
+For candidate comparisons and workload coverage, see the
+[benchmark guide](../../../../../../benchmarks/README.md#large-m-dense-forward-linear-tuning-workload-anchors).

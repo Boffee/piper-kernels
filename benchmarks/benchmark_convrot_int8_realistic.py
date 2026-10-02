@@ -1,18 +1,12 @@
-"""Representative ConvRot INT8 linear benchmark that finishes in a few minutes.
+"""Compare ConvRot INT8 plans and BF16 on synthetic H3 and projection workloads.
 
-Cases follow MiniMax H3. Transformer blocks use hidden width 5376, 56x128 attention, and a
-tanh-GELU FFN of width 14336 at 8K-131K rows, with Q/K/V sharing one prepared input and
-GELU fused into the down-projection preparation. The H3 VAE linears and short-M projection
-mixes cover the smaller tile configurations, and the eight primary M/N/K anchors keep
-continuity with the other ConvRot benchmarks.
+Each case interleaves CUDA graph replay over preallocated buffers for the production
+plan, the original fixed-128x256 plan, and BF16 cuBLAS. INT8 timings include shared
+input preparation and fused GELU where applicable; BF16 omits the GELU pass, favoring
+its down-projection baseline. INT8 outputs are compared bitwise with the original plan
+in row chunks. JSON lines go to stdout and a summary table to stderr.
 
-Each case captures one CUDA graph per variant over preallocated buffers: the production
-plan, the original plan (shared preparation and fixed 128x256 tiles), and BF16 cuBLAS. It
-then replays the graphs interleaved over several rounds in one process, so a large call
-runs once per round instead of once per estimation, warmup, and retry. BF16 multiplies the
-same inputs without a separate GELU pass, which favors BF16 for the down projection. INT8
-outputs are compared bitwise with the original plan in row chunks. JSON lines go to stdout
-and a summary table to stderr. Acquire the shared GPU gate first (see benchmarks/README.md).
+See benchmarks/README.md for measurement and reproducibility guidance.
 """
 
 from __future__ import annotations
