@@ -12,6 +12,7 @@ from types import ModuleType
 from typing import TypedDict
 
 import torch
+from lib.case_cli import apply_case
 from lib.convrot import (
     DENSE_LINEAR_ANCHOR_IN_FEATURES,
     DENSE_LINEAR_ANCHOR_ROWS,
@@ -28,6 +29,7 @@ from lib.reporting import (
     output_target,
     write_records,
 )
+from lib.suite_types import normal_tensor
 from lib.timing import PhaseTimings, Timing, triton_benchmark
 from lib.triton_inspection import (
     add_compiler_inspection_arguments,
@@ -41,6 +43,8 @@ from piper_kernels._input_activations import (
 from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels._triton import convrot_int8 as int8_kernels_weights
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._amd import policy as amd_policy
+from piper_kernels.linear.convrot.int8._amd import triton as amd_backend
 from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_policy
 from piper_kernels.linear.convrot.int8._nvidia import triton as triton_backend
 
@@ -119,6 +123,7 @@ def _effective_tbps(byte_count: int, latency_ms: float) -> float:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--case", help="derive preparation dimensions from a shared linear case")
     parser.add_argument(
         "--rows",
         type=int,
@@ -149,7 +154,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_output_arguments(parser, record_name="preparation phase")
     add_compiler_inspection_arguments(parser)
-    return parser.parse_args(argv)
+    return apply_case(parser.parse_args(argv), argv, preparation=True)
 
 
 def _load_comfy_kitchen_cuda() -> ComfyKitchenPreparationAdapter:
@@ -250,7 +255,8 @@ def _select_preparation_configuration(
     in_features: int,
 ) -> _PreparationConfiguration:
     """Project preparation choices from the production execution plan."""
-    plan = convrot_int8_policy.select_execution_plan(
+    policy = amd_policy if target.is_amd_hip else convrot_int8_policy
+    plan = policy.select_execution_plan(
         target,
         in_features=in_features,
     )
@@ -273,13 +279,14 @@ def _benchmark_width(
     input_activation: str | None,
     preparation_configuration: _PreparationConfiguration,
 ) -> tuple[PreparationPhaseResult, ...]:
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    raw_activation = torch.randn(
-        rows,
-        raw_input_features(in_features, input_activation),
-        device="cuda",
+    device = torch.device("cuda")
+    target = AcceleratorTarget.from_device(device)
+    backend = amd_backend if target.is_amd_hip else triton_backend
+    raw_activation = normal_tensor(
+        (rows, raw_input_features(in_features, input_activation)),
+        device=device,
         dtype=dtype,
-        generator=generator,
+        seed=seed,
     )
     activation = apply_input_activation(raw_activation, input_activation)
     rotated = torch.empty_like(activation)
@@ -297,7 +304,7 @@ def _benchmark_width(
         )
 
     def quantize() -> None:
-        triton_backend.quantize_input(
+        backend.quantize_input(
             rotated,
             split_qdata,
             split_scale,
@@ -309,7 +316,7 @@ def _benchmark_width(
         quantize()
 
     def fused() -> None:
-        triton_backend.fused_rotate_quantize_input(
+        backend.fused_rotate_quantize_input(
             raw_activation,
             fused_qdata,
             fused_scale,
@@ -394,7 +401,11 @@ def _benchmark_width(
             PreparationPhaseResult(
                 phase=phase,
                 provider="comfy-kitchen" if is_comfy_kitchen else PIPER_TRITON_PROVIDER,
-                operation_provenance=_PHASE_PROVENANCE[phase],
+                operation_provenance=(
+                    _PHASE_PROVENANCE[phase].replace("._nvidia.", "._amd.")
+                    if target.is_amd_hip
+                    else _PHASE_PROVENANCE[phase]
+                ),
                 timing=timing,
                 minimum_global_bytes=traffic,
                 effective_minimum_tbps=_effective_tbps(traffic, timing.median_ms),
@@ -539,7 +550,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     if _compiler_requested(args) and len(args.in_features) != 1:
         raise SystemExit("compiler inspection requires exactly one --in-features value")
     if not torch.cuda.is_available():
-        raise SystemExit("ConvRot INT8 preparation benchmarking requires a CUDA GPU")
+        raise SystemExit("ConvRot INT8 preparation benchmarking requires a CUDA or ROCm GPU")
 
 
 @torch.inference_mode()
@@ -549,6 +560,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_output, compiler_output = _output_targets(args)
     _validate_args(args)
     target = AcceleratorTarget.from_device(torch.device("cuda"))
+    if target.is_amd_hip and (args.compare_comfy_kitchen or _compiler_requested(args)):
+        raise SystemExit(
+            "This diagnostic's external CUDA adapter and compiler inspection require NVIDIA"
+        )
     dtype = convrot_dtype(args.dtype)
     comfy_kitchen = _load_comfy_kitchen_cuda() if args.compare_comfy_kitchen else None
     inspection_configuration = (

@@ -24,7 +24,12 @@ def assert_equal_finite(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 def reference_prepared_query(
-    prepared: _PreparedSparsePiperAttention, batch: int, head: int, query_block: int
+    prepared: _PreparedSparsePiperAttention,
+    batch: int,
+    head: int,
+    query_block: int,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Independent FP64 paired attention for one query block and one head.
 
@@ -34,6 +39,7 @@ def reference_prepared_query(
     Memory scales with one selected sequence, never the full attention matrix.
     """
     query, context = prepared.query, prepared.context
+    kv_head = head // (query.data.shape[1] // context.key.shape[1])
     device = query.data.device
     global_block = query.global_block_offset + query_block
     stored_blocks = context.key.shape[2] // 64
@@ -61,10 +67,10 @@ def reference_prepared_query(
     pairs = tiles.numel() // 2
     q = query.data[batch, head, query_block * 64 : query_block * 64 + rows].double()
     q_scale = query.scale[batch, head, query_block * 2 : query_block * 2 + 2].repeat_interleave(32)
-    k = context.key[batch, head].index_select(0, indices).double()
-    k_scale = context.key_scale[batch, head, tiles].repeat_interleave(64)
+    k = context.key[batch, kv_head].index_select(0, indices).double()
+    k_scale = context.key_scale[batch, kv_head, tiles].repeat_interleave(64)
     multiplier = (
-        context.value_scale_multiplier[batch, head, tiles, 0].repeat_interleave(64).double()
+        context.value_scale_multiplier[batch, kv_head, tiles, 0].repeat_interleave(64).double()
     )
     scores = (q @ k.T) * q_scale[:rows, None].double() * k_scale[None, :].double()
     scores = (
@@ -75,7 +81,7 @@ def reference_prepared_query(
     probabilities = torch.exp2(scores - pair_max[:, :, None])
     codes = (probabilities * multipliers + 0.5).floor().clamp(0, 255)
     values = (
-        context.value[batch, head]
+        context.value[batch, kv_head]
         .index_select(1, indices)
         .T.reshape(pairs, 128, query.data.shape[-1])
         .double()
@@ -85,7 +91,7 @@ def reference_prepared_query(
     numerator = (products * weights[:, :, None]).sum(dim=0)
     denominator = (probabilities.sum(dim=-1) * weights).sum(dim=0)
     output = numerator / (denominator.clamp_min(1e-30)[:, None] * 255)
-    return (output + context.value_mean[batch, head].double()).to(torch.bfloat16)
+    return (output + context.value_mean[batch, kv_head].double()).to(output_dtype)
 
 
 def check_query_samples(
@@ -98,7 +104,9 @@ def check_query_samples(
     for b in range(batch):
         for head in sorted({0, heads // 2, heads - 1}):
             for block in sorted({0, blocks // 2, blocks - 1}):
-                expected = reference_prepared_query(prepared, b, head, block)
+                expected = reference_prepared_query(
+                    prepared, b, head, block, output_dtype=output.dtype
+                )
                 actual = output[b, block * 64 : block * 64 + expected.shape[0], head]
                 error = float(
                     (actual.float() - expected.float()).norm()

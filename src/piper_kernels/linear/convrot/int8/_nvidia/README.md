@@ -40,4 +40,4 @@ and stride metadata and uses the grouped 128x64 Triton fallback when needed,
 retaining preparation choices. Neither implementation scans tensor contents;
 follow the [validation contract](../../../../../../docs/development.md#validation-contract).
 For candidate comparisons and workload coverage, see the
-[benchmark guide](../../../../../../benchmarks/README.md#large-m-dense-forward-linear-tuning-workload-anchors).
+[benchmark guide](../../../../../../benchmarks/README.md#workloads).

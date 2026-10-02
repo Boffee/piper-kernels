@@ -1,22 +1,24 @@
-"""Compare native INT8 Conv3D with its reference and standard FP16 Conv3D.
+"""Diagnose ConvRot INT8 convolution layouts and prepared convolution schedules.
 
-Synthetic N,C,T,H,W,O shapes exercise the H3-style encoder channel sizes. These
-are operator measurements, not checkpoint quality or end-to-end encoder results.
-CUDA and ROCm use the same workloads, correctness checks, and timing protocol.
+Use benchmark.py for stable cross-accelerator comparisons. This diagnostic can
+consume the same named case and add alternate layouts or an offline tile search.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import TypedDict, cast
 
 import torch
+from lib.cases import Conv3DCase, named_case
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
+from lib.suite_types import normal_tensor
 from lib.timing import DeviceTimings, measure_device
 from torch.nn import functional
 
@@ -54,6 +56,7 @@ def _shape(value: str) -> tuple[int, ...]:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--case", help="use an unchanged convolution case from the shared catalog")
     parser.add_argument("--shape", type=_shape, action="append", help="N,C,T,H,W,O; repeatable")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument(
@@ -74,6 +77,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_output_arguments(parser)
     args = parser.parse_args(argv)
+    args.group_norm_silu = None
+    if args.case is not None:
+        try:
+            case = named_case(args.case)
+        except ValueError as error:
+            parser.error(str(error))
+        if not isinstance(case, Conv3DCase):
+            parser.error("--case requires a convolution case")
+        supplied = {part.split("=", 1)[0] for part in (sys.argv[1:] if argv is None else argv)}
+        if supplied & {"--shape", "--dtype", "--seed"}:
+            parser.error("--case cannot be combined with workload overrides")
+        args.shape = [
+            (case.batch, case.channels, case.frames, case.height, case.width, case.out_channels)
+        ]
+        args.dtype, args.seed = case.dtype, case.seed
+        args.group_norm_silu = case.group_norm_silu
     if args.measurement_time_ms <= 0 or args.samples < 1 or args.warmup_ms < 0 or args.device < 0:
         parser.error("requires positive duration/samples and non-negative warmup/device")
     return args
@@ -151,19 +170,27 @@ def _benchmark_shape(
 ) -> list[BenchmarkRecord[DeviceTimings]]:
     batch, channels, frames, height, width, outputs = shape
     policy = _convolution_policy(target)
-    torch.manual_seed(args.seed)
-    activation = torch.randn(
-        batch, channels, frames, height, width, device="cuda", dtype=getattr(torch, args.dtype)
+    activation = normal_tensor(
+        (batch, channels, frames, height, width),
+        device=torch.device("cuda"),
+        dtype=getattr(torch, args.dtype),
+        seed=args.seed,
     )
     group_size = 64 if channels <= 128 else 256
-    input_scale = torch.tensor(0.02, device="cuda")
-    weight = ConvRotInt8Tensor.from_quantized(
-        torch.randint(-16, 16, (outputs, 3, 3, 3, channels), device="cuda", dtype=torch.int8),
-        torch.full((outputs,), 0.001, device="cuda"),
-        group_size=group_size,
-        logical_dtype=torch.float16,
-        act_per_tensor_scale=input_scale,
+    input_scale = torch.tensor(8 / 127)
+    dense = normal_tensor(
+        (outputs, channels, 3, 3, 3),
+        device=torch.device("cpu"),
+        dtype=getattr(torch, args.dtype),
+        seed=args.seed + 1,
+        scale=(27 * channels) ** -0.5,
     )
+    weight = ConvRotInt8Tensor.from_hp(
+        dense,
+        group_size=group_size,
+        act_per_tensor_scale=input_scale,
+    ).to(device="cuda")
+    input_scale = input_scale.to(device="cuda")
     norm_weight, norm_bias = (
         torch.ones(channels, device="cuda"),
         torch.zeros(channels, device="cuda"),
@@ -213,6 +240,9 @@ def _benchmark_shape(
             ),
         },
     }
+    if args.group_norm_silu is not None:
+        name = "group_norm_silu_conv3d" if args.group_norm_silu else "conv3d"
+        operations = {name: operations[name]}
     records = []
     shape_record: dict[str, int] = dict(
         zip(("batch", "channels", "frames", "height", "width", "out_channels"), shape, strict=True)
@@ -267,18 +297,31 @@ def _benchmark_shape(
         (1, 1, 1),
         policy=policy,
         target=target,
-        group_norm=False,
+        group_norm=bool(args.group_norm_silu),
         symmetric_spatial_padding=True,
         right_spatial_padding=False,
     )
     production_plan = execution_plan_for()
-    prepared = shared._prepare_input(
-        activation,
-        group_size,
-        weight.act_per_tensor_scale,
-        schedule=production_plan.preparation,
-        accelerator_backend=target.backend,
-    )
+    if args.group_norm_silu:
+        prepared = shared._prepare_group_norm_silu_input(
+            activation,
+            norm_weight,
+            norm_bias,
+            32,
+            1e-6,
+            group_size,
+            input_scale,
+            schedule=production_plan.preparation,
+            accelerator_backend=target.backend,
+        )
+    else:
+        prepared = shared._prepare_input(
+            activation,
+            group_size,
+            input_scale,
+            schedule=production_plan.preparation,
+            accelerator_backend=target.backend,
+        )
     candidates = (
         ConvolutionSchedule(m, n, k, warps, stages)
         for m, n, k, warps in (
@@ -335,7 +378,7 @@ def _benchmark_shape(
                 shape=shape_record,
                 configuration={
                     **configuration,
-                    "operation": "conv3d",
+                    "operation": "group_norm_silu_conv3d" if args.group_norm_silu else "conv3d",
                     "phase": "prepared_execution",
                     "schedule": schedule._asdict(),
                 },

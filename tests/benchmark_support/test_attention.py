@@ -1,6 +1,6 @@
 import pytest
 import torch
-from lib.attention import AttentionConfig, AttentionShape, make_attention_inputs
+from lib.attention import AttentionConfig, AttentionShape, make_attention_inputs, run_sdpa
 
 
 def test_attention_shape_expands_implicit_kv_heads() -> None:
@@ -79,3 +79,15 @@ def test_attention_inputs_follow_mha_and_gqa_shapes() -> None:
     assert query.dtype is key.dtype is value.dtype is torch.float16
     for actual, expected in zip((query, key, value), repeated, strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+def test_sdpa_reference_preserves_grouped_query_mapping() -> None:
+    shape = AttentionShape(1, 4, 7, 11, 64, num_key_value_heads=2)
+    config = AttentionConfig(torch.float16, seed=17)
+    query, key, value = make_attention_inputs(shape, config=config, device=torch.device("cpu"))
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query, key.repeat_interleave(2, dim=1), value.repeat_interleave(2, dim=1)
+    )
+    torch.testing.assert_close(
+        run_sdpa((query, key, value), config), expected, rtol=0.001, atol=0.001
+    )

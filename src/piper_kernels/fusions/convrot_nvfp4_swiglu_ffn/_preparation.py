@@ -28,8 +28,7 @@ from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
 from piper_kernels.weights.convrot._rotation import validate_group_size
 
 # RTX 5090 measurements favored reuse up to 32 MiB; larger buffers added enough
-# memory traffic to favor recomputation. Reproduce with benchmark_nvfp4_ffn.py
-# and its --rotated-workspace-mib override (benchmark-only, not a runtime option).
+# memory traffic to favor recomputation.
 _ROTATED_WORKSPACE_BYTES = 32 * 1024 * 1024
 
 

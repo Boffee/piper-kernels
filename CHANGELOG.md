@@ -32,7 +32,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
   dispatcher and flat plans selected from target, operation, and operand metadata. Dense
   and sparse projection settings live in policy modules.
-
+- Operator benchmarks use one versioned workload catalog and runner across
+  accelerators, with common complete-call timings, numerical checks, and explicit
+  unsupported/OOM outcomes. Six superseded runners are removed; focused diagnostics
+  and offline tuners can select the same cases.
 - Execution-plan and schedule types follow shared naming and module ownership conventions.
   Attention and AMD INT8 linear plan types live in `_plan.py`; sparse Piper uses a named
   `AttentionSchedule`. Benchmark records distinguish `execution_plan` from `schedule`;
