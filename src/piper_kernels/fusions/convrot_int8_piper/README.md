@@ -79,4 +79,4 @@ scratch are window-bounded; K preparation still requires a global BF16 temporary
 and compact FP32 statistics. Output fusion has no automatic profitability guard.
 Reduced scratch does not guarantee lower peak allocation or faster execution.
 Measure the complete pipeline, including output storage and workspace, with the
-[dense fusion benchmark](../../../../benchmarks/README.md#attention-and-projection-fusion).
+[dense fusion benchmark](../../../../benchmarks/README.md#run-the-suite).

@@ -140,6 +140,18 @@ def test_default_shapes_use_lower_width_linear_anchors() -> None:
     assert preparation_arguments.in_features == [6144]
 
 
+def test_named_case_matches_suite_shape_and_rejects_overrides() -> None:
+    args = _parse_args(["--case", "linear-small", "--phases"])
+    shapes = _benchmark_shapes(args)
+    assert [(shape.rows, shape.in_features, shape.out_features) for shape in shapes] == [
+        (64, 256, 256)
+    ]
+    assert args.dtype == "bfloat16"
+    assert args.phases
+    with pytest.raises(SystemExit, match="workload overrides"):
+        _parse_args(["--case", "linear-small", "--rows", "128"])
+
+
 def test_shape_can_include_swiglu_without_bias() -> None:
     arguments = _parse_args(
         [

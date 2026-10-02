@@ -22,6 +22,15 @@ def test_default_arguments():
     assert not args.skip_reference_timing
 
 
+def test_named_case_keeps_convolution_shape_and_fused_operation():
+    args = benchmark._parse_args(["--case", "conv3d-small-norm-silu"])
+    assert args.shape == [(1, 64, 3, 8, 8, 64)]
+    assert args.group_norm_silu
+    assert args.dtype == "float16"
+    with pytest.raises(SystemExit):
+        benchmark._parse_args(["--case", "conv3d-small", "--shape", "1,64,3,8,8,64"])
+
+
 def test_shape_and_dtype_arguments():
     args = benchmark._parse_args(
         [

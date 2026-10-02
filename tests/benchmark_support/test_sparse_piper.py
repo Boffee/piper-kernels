@@ -40,21 +40,35 @@ def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
     assert args.samples == 3
 
 
+def test_catalog_case_preserves_sparse_workload_and_rejects_overrides():
+    args = _parse_args(["--case", "sparse-attention-video-high-eighth"])
+    assert args.sequence == [110592]
+    assert (args.heads, args.kv_heads, args.head_dim) == (56, 56, 128)
+    assert args.ratios == [0.125]
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "sparse-attention-video-high-eighth", "--ratios", "1"])
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "attention-small"])
+
+
 @pytest.mark.parametrize("internal_padding", [False, True])
 @pytest.mark.parametrize("global_offset", [0, 1])
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("kv_heads", [1, 2])
 def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
-    internal_padding, global_offset, head_dim
+    internal_padding, global_offset, head_dim, kv_heads
 ):
     generator = torch.Generator().manual_seed(713)
     lengths = [3, 64, 7, 41] if internal_padding else [64, 64, 64, 1]
-    value = torch.randint(-127, 128, (2, 2, head_dim, 256), dtype=torch.int8, generator=generator)
-    mean = torch.randn((2, 2, head_dim), generator=generator)
+    value = torch.randint(
+        -127, 128, (2, kv_heads, head_dim, 256), dtype=torch.int8, generator=generator
+    )
+    mean = torch.randn((2, kv_heads, head_dim), generator=generator)
     context = _PreparedSparsePiperContext(
-        key=torch.zeros((2, 2, 256, head_dim), dtype=torch.int8),
+        key=torch.zeros((2, kv_heads, 256, head_dim), dtype=torch.int8),
         value=value,
-        key_scale=torch.ones((2, 2, 4)),
-        value_scale_multiplier=torch.full((2, 2, 4, 1), 255.0),
+        key_scale=torch.ones((2, kv_heads, 4)),
+        value_scale_multiplier=torch.full((2, kv_heads, 4, 1), 255.0),
         value_mean=mean,
         route_head_offsets=torch.tensor([0, 1, 3], dtype=torch.int32),
         head_keep_blocks=torch.tensor([1, 2], dtype=torch.int32),
@@ -73,6 +87,7 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
     prepared = _PreparedSparsePiperAttention(context, query)
     for batch in range(2):
         for head in range(2):
+            kv_head = head // (2 // kv_heads)
             for block in range(4 - global_offset):
                 global_block = block + global_offset
                 prefix = [1] if head == 0 and global_block < 2 else [0, 1]
@@ -80,7 +95,8 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
                     tile * 64 + row for tile in [*prefix, 2, 3] for row in range(lengths[tile])
                 ]
                 expected = (
-                    value[batch, head, :, indices].double().mean(dim=1) + mean[batch, head].double()
+                    value[batch, kv_head, :, indices].double().mean(dim=1)
+                    + mean[batch, kv_head].double()
                 )
                 rows = 64 if internal_padding else min(64, 193 - global_block * 64)
                 expected = expected.to(torch.bfloat16).expand(rows, head_dim)

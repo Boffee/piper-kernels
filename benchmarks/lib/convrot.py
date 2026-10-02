@@ -12,6 +12,8 @@ from piper_kernels._input_activations import (
 )
 from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
+from .suite_types import normal_tensor
+
 type ConvRotInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 
 _DTYPES = {
@@ -124,38 +126,31 @@ def make_convrot_inputs(
             f"ConvRot in_features {shape.in_features} is not divisible by "
             f"group size {config.group_size}"
         )
-    generator = torch.Generator(device=device).manual_seed(config.seed)
-    qdata = torch.randint(
-        -127,
-        128,
+    from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor  # noqa: PLC0415
+
+    dense = normal_tensor(
         (shape.out_features, shape.in_features),
-        device=device,
-        dtype=torch.int8,
-        generator=generator,
+        device=torch.device("cpu"),
+        dtype=config.dtype,
+        seed=config.seed + 1,
+        scale=shape.in_features**-0.5,
     )
-    scale = (
-        torch.rand(
-            (shape.out_features, 1),
-            device=device,
-            dtype=torch.float32,
-            generator=generator,
-        )
-        * 0.01
-    )
-    activation = torch.randn(
+    weight = ConvRotInt8Tensor.from_hp(dense, group_size=config.group_size).to(device)
+    activation = normal_tensor(
         (shape.rows, raw_input_features(shape.in_features, shape.input_activation)),
         device=device,
         dtype=config.dtype,
-        generator=generator,
+        seed=config.seed,
     )
     bias = (
-        torch.randn(
-            shape.out_features,
+        normal_tensor(
+            (shape.out_features,),
             device=device,
             dtype=config.dtype,
-            generator=generator,
+            seed=config.seed + 2,
+            scale=0.1,
         )
         if shape.has_bias
         else None
     )
-    return activation, qdata, scale, bias
+    return activation, weight.qdata, weight.scale, bias

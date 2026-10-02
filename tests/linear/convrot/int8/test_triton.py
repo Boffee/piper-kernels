@@ -6,7 +6,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from lib.convrot_int8_legacy import legacy_matmul
 from torch import nn
 
 from piper_kernels._triton import convrot as convrot_backend
@@ -22,6 +21,8 @@ from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.int8 import _ops as int8_update_ops
 from piper_kernels.weights.convrot.int8._update_reference import add_ as reference_add_
 from piper_kernels.weights.convrot.int8._update_reference import addmm_
+
+from ._legacy_matmul import legacy_matmul
 
 
 @triton.jit

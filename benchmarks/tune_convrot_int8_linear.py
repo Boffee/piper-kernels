@@ -10,6 +10,7 @@ from itertools import product
 from pathlib import Path
 
 import torch
+from lib.case_cli import apply_case
 from lib.convrot import (
     CONVROT_DTYPE_NAMES,
     DENSE_LINEAR_ANCHOR_IN_FEATURES,
@@ -49,6 +50,7 @@ from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--case", help="use an unchanged linear case from the shared catalog")
     parser.add_argument(
         "--rows",
         type=int,
@@ -152,7 +154,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="NVIDIA GEMM row-tile grouping; zero disables grouping",
     )
     add_tuning_arguments(parser)
-    return parser.parse_args(argv)
+    return apply_case(parser.parse_args(argv), argv)
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -275,7 +277,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     device = torch.device("cuda")
 
     shape = ConvRotShape(
-        "custom",
+        args.case or "custom",
         args.rows,
         args.out_features,
         args.in_features,
