@@ -1,1436 +1,237 @@
 # Benchmarks
 
-Operator benchmarks live here rather than in the correctness test suite. Each benchmark
-reports hardware, software, Git state, shapes, kernel configuration, numerical quality where
-applicable, and consistently named timing phases. The support code in `lib/` is development-only;
-it is not part of the installed `piper_kernels` API.
-
-## Execution-plan and schedule metadata
-
-An execution plan records all choices for an operator invocation. A schedule records
-work organization, such as tile sizes, warps, pipeline stages, or chunk sizes. A plan
-may contain schedules or store their fields directly. The naming and ownership rules
-are documented in [contributor guidance](../AGENTS.md#execution-plans-and-schedules).
-
-Nested benchmark configurations use `execution_plan` for a complete plan and `schedule`
-for a separately measured schedule. Existing providers that report flat execution-plan
-fields continue to do so.
-
-The convention update renames the following JSON/JSONL fields; readers of older artifacts
-should use the historical names for those artifacts:
-
-| Runner | Previous field | Current field |
-| --- | --- | --- |
-| `benchmark_convrot_int8_conv3d.py` tuning candidates | `configuration.plan` | `configuration.schedule` |
-| `benchmark_convrot_int8_tail.py` | `plan` | `execution_plan` |
-| `benchmark_convrot_int8_small_m.py` | `plan`, `selected_plan`, `previous_plan`, `medium_plan` | `execution_plan`, `selected_execution_plan`, `previous_execution_plan`, `medium_execution_plan` |
-| `benchmark_convrot_int8_realistic.py` | `production_plan` | `production_execution_plan` |
-
-## Common provider and timing model
-
-Use the same operator benchmark on CUDA and ROCm. Production dispatch selects the
-backend; shapes, correctness checks, timing scopes, and output formats stay shared.
-Run with the Python from the matching accelerator environment. In particular, use
-the provisioned ROCm Python without running the CUDA-oriented `uv sync` there.
-
-| Workload | Entry point | Phase or workload selection |
-| --- | --- | --- |
-| ConvRot INT8 linear | `benchmark_convrot_int8.py` | `--phases` adds preparation, prepared GEMM, and full-call device timings |
-| ConvRot INT8 Conv3D | `benchmark_convrot_int8_conv3d.py` | `--shape` selects dimensions; includes ordinary and group-norm/SiLU fusion |
-| Dense attention | `benchmark_attention.py` | Providers select supported implementations on the active accelerator |
-| Sparse attention | `benchmark_sparse_piper.py` | Shared public/prepared/routing/preparation measurements |
-| Sparse routing scores | `benchmark_sparse_piper_scores.py` | `--query-blocks` selects standalone or fused-window score shapes |
-| Sparse QKV projections | `benchmark_sparse_piper_projection.py` | Reports Q, K, V, mean, and combined phases |
-| Complete H3 sparse fusion | `benchmark_sparse_piper_fusion.py` | `--query-chunk-rows` sweeps windows through 150K tokens |
-
-Add workloads or backend adapters to these runners instead of creating accelerator-specific
-copies. Reuse `lib` for input generation, timing, quality, and records. Distinct pipeline
-boundaries remain explicit so kernel-only measurements are not confused with full operators.
-The `small_m`, `tail`, and `preparation` ConvRot scripts are explicit NVIDIA kernel/legacy
-ablations and compiler diagnostics; ordinary production preparation/GEMM measurements use
-`benchmark_convrot_int8.py --phases` on either accelerator. NVFP4 and SageAttention2++ runners
-retain their actual backend support limits.
-
-A provider has two explicit callables:
-
-- `prepare()` performs per-invocation preprocessing such as quantization, packing, or
-  scale construction and returns the prepared inputs.
-- `run(prepared)` executes the operator using already-prepared inputs. It may launch
-  one or more kernels.
-
-“Prepared” describes the benchmark boundary, not an operator's internals. Work performed
-inside a public operator—including ConvRot activation rotation and quantization—remains part
-of `run(prepared)`. A provider may use a no-op `prepare()` when it repeatedly invokes the
-complete operator on fixed source tensors.
-
-The common runner reports these phases:
-
-- `first_call_ms`: synchronized wall time for the first operator invocation, including
-  any lazy compilation. It is not compiler CPU time in isolation and does not claim
-  that compiler caches were initially empty.
-- `preparation`: warmed, synchronized wall latency of preparation-only work.
-- `prepared_execution`: warmed device-event latency of `run(prepared)` on fixed source
-  objects, including any preparation internal to the timed operator.
-- `operator_end_to_end`: warmed, synchronized wall latency of `run(prepare())`.
-
-Synchronized wall timing captures host dispatch, allocation, packing, and device work.
-Device-event timing isolates elapsed work on the accelerator stream. Every latency
-distribution serializes its `clock`, and `first_call_clock` describes the scalar first call.
-
-Warmed latencies are displayed as `p50 [p20, p80]`. A phase is `null` in machine output
-when it does not apply to a provider. The configured warmup and measurement-time windows
-are stored alongside every phase result. Benchmark code can use the shared model directly:
-
-```python
-provider = BenchmarkProvider(
-    name="my-kernel",
-    prepare=prepare_inputs,
-    run=launch_kernel,
-    synchronize=torch.cuda.synchronize,
-    configuration={"block_m": 64, "num_warps": 4},
-)
-measurement = measure_provider(provider, warmup_ms=100, measurement_time_ms=500)
-```
-
-`measure_device()` is the shared protocol for device-phase comparisons. It records repeated
-median samples separately for Triton's cache-flushed events (`device_event`) and graph replay
-(`graph_device_event`), including timing windows and sample counts. These are `DeviceTimings`
-inside the same versioned `BenchmarkRecord`; graph timing is never labeled synchronized wall
-time. Complete H3 fusion uses `SampleTimings` for shuffled, fixed-count synchronized calls.
-Compare matching timing modes and scopes across devices.
-
-`AttentionShape` records batch size, Q/KV head counts, Q/KV sequence lengths, and head
-dimension without assuming self-attention or MHA. `AttentionConfig` records dtype,
-causality, scale, and seed. Generated benchmark inputs always use the recorded `BHSD` QKV
-layout and are independently reproducible from their shape and configuration.
-
-## Dense Piper projection and output fusion
-
-`benchmark_piper_fusion.py` compares compiled Q/K/V fusion with the optional
-bounded output pipeline. Defaults use synthetic H3 transformer dimensions:
-B1/H56/D128, width 5376, BF16, noncausal self-attention, and sequences through
-100000 tokens. Both paths include input preparation, Q/K/V projections,
-norm/RoPE, attention, and output projection. Compilation and tensor construction
-are excluded. This is not a checkpoint-level benchmark.
-
-```shell
-uv run python benchmarks/benchmark_piper_fusion.py --json artifacts/piper-fusion-h3.json
-uv run python benchmarks/benchmark_piper_fusion.py --sequence 32768 100000 \
-  --chunk-rows 4096 --json artifacts/piper-fusion-cap4k.json
-uv run python benchmarks/benchmark_piper_fusion.py --sequence 1024 4097 8192 \
-  --heads 4 --kv-heads 2 --head-dim 64 --width 1024 --causal
-uv run python benchmarks/benchmark_piper_fusion.py \
-  --heads 48 --kv-heads 12 --head-dim 128 --width 6144 --rotary-dim 128 \
-  --sequence 4096 4097 16384 16385 32768 32769 65536 65537 100000 100001 \
-  --json artifacts/piper-fusion-krea2-shapes.json
-```
-
-The last command uses Krea2's main transformer GQA dimensions and full-head
-RoPE. It measures the synthetic unmasked projection/attention pipeline; Krea2's
-text padding mask and sigmoid output gate are outside this benchmark. Use
-`--rotary-dim` to override the default three-quarter-head rotary width.
-
-The benchmark requires one dynamic graph per provider and verifies that the
-advertised Q/K/V and output fusions actually occurred. It checks exact output
-agreement on ordinary calls and CUDA graph replay, including ragged tails.
-Samples use shuffled paired order. Standard `timings` records contain synchronized
-wall samples; `extra.cuda_graph` contains separate device-event samples of the
-whole captured operation. `--no-cuda-graph` disables replay measurements.
-Peak extra allocated bytes include output and execution workspace, excluding
-resident inputs/weights and graph pools. The chunk cap, selected aligned window,
-and any explicit override are recorded alongside the shape and environment.
-`--chunk-rows` overrides the cap only on the output operator in the benchmark's
-captured graph. Windows are balanced under that cap, with SM120 non-causal windows
-adjusted when the device's SM count and kernel occupancy predict fewer scheduling
-waves. The final window covers the remaining rows.
-
-## Offline configuration tuning
-
-`tune_candidates()` provides a small offline search loop for development. Kernel-specific
-adapters define named configurations and construct `BenchmarkProvider` instances; the shared
-runner compiles each candidate, applies an optional quality gate, measures either prepared
-execution or the complete operator, and selects the fastest passing candidate. Unsupported and
-out-of-resource candidates are recorded rather than aborting the search. Unexpected failures
-still propagate so implementation and compiler bugs remain visible.
-
-This tooling never changes production dispatch or autotunes in a user's hot path. Every candidate
-is available as a versioned record accepted by the common JSON/JSONL writer, and the winner is
-marked with `selected: true`.
-
-### Attention tuning workload anchors
-
-Use these shared shapes when selecting attention execution plans. They are sampling anchors for
-the surrounding workload, not exact production shapes or dispatch keys.
-
-| Axis | Anchors | Scope |
-|:---|:---|:---|
-| Batch and dtype | `B1`, BF16 | Use FP16 as a secondary check when the path supports it. |
-| Local heads | `H16`, `H48` | `H` is the local query/output head count presented to one device after at most two-way attention sharding. `H16` samples the lower-parallelism/sharded regime and `H48` the high-parallelism/unsharded regime. Do not dispatch on these sampled head counts. |
-| Head dimension | `D64`, `D128` | Measure both unless an implementation has a structural dimension restriction. |
-| Short square guard | `Q=KV=2048` | Check affected dimensions and causal modes for compilation, quality, occupancy, or major latency cliffs. This is a sanity guard, not a performance anchor or dispatch key. |
-| Square sequence | `Q=KV=8192`, `32768`, `131072` | Measure causal and non-causal execution. Causal attention is square-only in the current API. |
-| Rectangular sequence | `Q=8192, KV=32768` and the reverse | Measure non-causal execution when query and key/value work may behave differently. |
-
-The current benchmark requires `Hq=Hkv=H`. For GQA or MQA, these anchors describe query-head
-parallelism only; they do not reproduce the reduced KV-head memory and preparation costs, which
-need separate coverage.
-
-The exact SM120 SageAttention2++ production plan uses 128-row query tiles at every supported
-sequence length, matching the pinned canonical CUDA implementation. D64 and D128 use the
-standalone query quantizer so the fixed signed-Hadamard Q/K smoother does not inflate the
-register-heavy attention recurrence. Grouped-Q/K tiles reduce raw score
-maxima before applying their positive grouped scale regardless of where Q is quantized; causal
-diagonal/tail tiles and portable per-thread-scale paths retain scale-before-max. K and V use
-separate quantization launches on every target. These choices have no sequence-length crossover,
-while smaller query tiles remain available as explicit M64 tuning candidates. Stock probability
-conversion is uniform across SM120 shapes. The D64 paths were confirmed at H16/H48 across all
-three performance anchors, with 2K and 8193 as short and ragged guards. A fixed-plan H16 screen
-rejected uniform tensor descriptors: D64 descriptors were 2–14% slower than pointer loads from 2K
-through 128K, with identical quality, so the D64-pointer/D128-descriptor distinction remains
-explicit.
-
-Dense Piper's [NVIDIA scheduling policy](../src/piper_kernels/attention/piper_attention/README.md#nvidia-scheduling)
-uses FP32 accumulators; scaled FP16 was rejected after quality regressions on captured H3
-activations. Query tile size depends on target, head dimension, and causal mode, without a
-separate CTA-count heuristic. Alternate schedules remain available to the offline tuners.
-
-On RTX 5090, Torch 2.14.0+cu130, and Triton 3.8.0, the causal D128 descriptor schedule
-reduced complete attention latency at Harrier 0.6B dimensions (`B1/Hq16/Hkv8/D128`, BF16).
-These are medians across three fresh processes against the single-launch pointer baseline:
-
-| Query tokens | CUDA-graph latency reduction | Eager wall latency reduction |
-|---:|---:|---:|
-| 1,024 | 24% | 4% |
-| 2,048 | 33% | 18% |
-| 4,096 | 36% | 31% |
-
-Graph timings include preparation kernels and exclude per-call host setup. The loading
-boundary was checked at 1,023/1,024/1,025 tokens, with GQA/MQA, batch, dtype, and long-context
-guards. This evaluation measured scheduling only. Full-model speedup was not measured.
-
-The earlier single-launch change reduced complete eager latency by 13.8–22.0% at 1,025
-tokens, 6.2–22.4% at 8,193, and 1.9–15.3% at 32,769 versus split launcher `e086641`.
-Aligned 8,192-token cases stayed within 1.1%. These three-process medians used the same
-hardware/software stack, BF16 B1/H16 or H48, D64/D128, and both causal modes.
-The descriptor results above already include this change; the gains are not additive.
-
-Treat 8K, 32K, and 128K as evidence for one continuous plan rather than dispatch keys. Prefer a
-length-invariant policy whenever the algorithm is valid across the range; sampled anchors alone do
-not justify a threshold or a square-only specialization. If a future implementation has an
-unavoidable applicability or material performance boundary, probe immediately below and above it
-plus an irregular interior length. For long-context work, performance selection starts at 8K;
-use the 2K guard to reject pathological short-context behavior. The causal D128 text-workload
-schedule above separately measures short contexts and its loading boundary.
-
-Tail correctness and long-context performance need different coverage. Exercise tile boundaries
-cheaply with small square lengths such as `63`, `64`, `65`, `127`, `128`, `129`, and `193`.
-For realistic ragged performance guards, use `Q=KV=8193` and, for non-causal attention,
-`Q=8193, KV=8192` plus the reverse. The directional 8K/32K pair remains an aspect-ratio stress
-test; it is not a substitute for these near-square tail guards.
-
-Small ragged tests establish the tile-local masking contract, but they do not replace the aligned
-128K performance and quality anchor. Add one long ragged smoke at `Q=KV=131073`, using H16 with
-D64 and D128; it need not repeat the full H16/H48 matrix unless its result is unexpected. Test both
-`131072` and `131073` explicitly even though current production plans have no 128K transition:
-numerator precision, tile size, loading strategy, and score-reduction choices remain uniform across
-that 128K boundary.
-
-Screen against the current production plan, then confirm a proposed winner in at least three fresh
-processes with alternating candidate/baseline order and an otherwise idle accelerator. Record
-quality and both `prepared_execution` and `operator_end_to_end`; use end-to-end timing for the
-production decision. Freeze only the smallest explainable boundary, and validate each accelerator
-architecture independently.
-
-The executable Piper Attention tuner consumes the same immutable execution plan as production.
-Omitted axes retain their production values, so the default invocation measures exactly the
-production plan:
-
-```shell
-uv run python benchmarks/tune_piper_attention.py \
-  --sequence 8192 \
-  --json artifacts/piper_attention_tuning.json
-```
-
-Use `--phase operator_end_to_end` to include preprocessing in the ranking. The default
-`prepared_execution` phase compares only the prepared fused recurrence. On targets where a
-candidate is unsupported, it remains in the report with `status: skipped`. Candidates with
-non-finite output mismatches or less than 20 dB SQNR are rejected by default; use
-`--minimum-sqnr-db` to change the finite threshold.
-
-Explicit Piper axes form a deduplicated Cartesian search, capped at 256 candidates. This makes
-Triton's native loop-pipeline and loop-invariant-code-motion controls measurable without
-silently applying a SageAttention2++ schedule to Piper Attention:
-
-Boolean options use `argparse`'s standard optional-boolean form and match the execution-plan field
-names. `--option` selects true, `--no-option` selects false, and omitting the option retains the
-production value. For `--loop-num-stages`, zero selects Triton's compiler-default loop staging;
-values one through four request an explicit stage count.
-
-```shell
-uv run python benchmarks/tune_piper_attention.py \
-  --sequence 8192 --head-dim 128 --causal \
-  --use-tensor-descriptors \
-  --block-m 64 128 \
-  --num-stages 2 3 \
-  --optimize-causal-traversal \
-  --loop-num-stages 0 3 \
-  --loop-licm \
-  --use-packed-probability-conversion \
-  --json artifacts/piper_attention_execution_plan.json
-```
-
-The SageAttention2++ adapter searches the same immutable execution-plan fields used by
-production dispatch. Omitted axes retain the production value; values supplied for multiple
-axes form a Cartesian search, capped at 256 candidates by default:
-
-```shell
-uv run python benchmarks/tune_sage_attention_2pp.py \
-  --sequence 8192 --head-dim 128 \
-  --block-m 64 128 \
-  --num-stages 2 3 \
-  --use-tensor-descriptors \
-  --json artifacts/sage_attention_2pp_sm120_tuning.json
-```
-
-As in `benchmark_attention.py`, SageAttention2++'s `prepared_execution` phase is the
-complete public operator—including statistics and Q/K/V quantization—not only the final
-recurrence kernel.
-Use `operator_end_to_end` when synchronized host and allocation overhead should participate in
-the ranking. Every candidate must also clear the configurable SQNR and non-finite quality gate.
-
-The SageAttention2++ tuner currently runs on the optimized NVIDIA SM89+ backend, including
-SM120. It can search a future CUDA target once that target is supported by the kernel, but it
-does not enable a new backend. In particular, AMD `gfx1200`/`gfx1201` remain unsupported until
-the inline PTX FP8 conversion and NVIDIA FP8-MMA path have HIP equivalents.
-
-### Large-M dense forward-linear tuning workload anchors
-
-Use these shared model-neutral shapes when selecting execution plans for large-M dense
-forward-linear implementations. They sample large transformer and diffusion-model projections;
-they are not exact production shapes or dispatch keys. For a flattened linear, the input is
-`[M, K]`, the weight is `[N, K]`, and the output is `[M, N]`. Small-M decode/GEMV, sparse,
-expert-routed, backward, and fused graph operations require separate workload coverage.
-
-| Axis | Anchors | Scope |
-|:---|:---|:---|
-| Accelerator and activation dtype | One accelerator architecture at a time, BF16 | Use FP16 as a secondary quality and code-generation check. Do not transfer a measured schedule between architectures without validating it there. |
-| Base operator | Bias-free ordinary linear | Keep the primary matrix comparable across implementations. Bias and fused activations remain correctness or integration checks. |
-| Activation rows `M` | `8192`, `32768` | These are the primary performance anchors. They sample two already-parallel large-row regimes without making routine searches pay the memory and runtime cost of 128K rows. |
-| Output features `N` | `4096`, `16384` | The Cartesian pair samples narrower and wider output grids, including contraction and expansion workloads. |
-| Input features `K` | `6144`, `14336` | Neither is a power of two, while both preserve regular 256-wide grouping and common GEMM K-tile alignment. This avoids using power-of-two widths as the only evidence. |
-| Final long/ragged guard | `M=131073` | Run only after selecting a winner and only on an accelerator with sufficient memory. This checks 128K-scale behavior, a partial final M tile, and—at `N=16384`—64-bit output indexing beyond `2^31` elements. It is not a routine performance anchor or dispatch key. |
-
-For ConvRot INT8, hold group size 256 and include rotation, row quantization, GEMM, and scale
-epilogue in the measured operator. Rowwise preparation uses power-of-two program extents, so the
-two K anchors exercise masked extents of 8192 and 16384. Other linear implementations should
-retain their native storage and quantization contract and report any implementation-specific
-packing or padding; ConvRot's group size and preparation extent are not general linear rules.
-
-The primary matrix is the Cartesian product of the two `M`, `N`, and `K` values: eight cells.
-Run ordinary dense linears throughout that matrix. At `M=32768`, separately check graph forms
-that change the operator boundary when an integration uses them:
-
-- raw `[up | gate]` SwiGLU with `N=4096`, linear `K=14336`, and raw input width 28672;
-- tanh-approximate GELU with `N=4096` and `K=14336` as a one-input activation-folding guard;
-- three projections with `K=6144` and `N=4096` each: compare separate public linear calls,
-  the compiled preparation-sharing rewrite, and—when the integration can retain a packed
-  weight—one fused `N=12288` projection. This graph-level reuse is distinct from fusing ConvRot
-  rotation and quantization inside one preparation kernel.
-
-These integration guards use concrete dimensions to make the comparison exact; they are not
-production policy predicates.
-
-Compiled inference integrations can pass `convrot_int8_compile_options()` to
-`torch.compile`. Its post-AOT graph rewrites fold an exclusive tanh-approximate GELU or packed
-`[up | gate]` SwiGLU chain into activated input preparation followed by a prepared linear, so the
-source input can die before the linear output allocation. They also recognize two or more
-compatible ordinary ConvRot linears fed by the exact same FX value. The latter emits one explicit
-preparation node and leaves every prepared GEMM at the corresponding original node position. Both
-are automatic across architectures within each compiled graph and require no attention-specific
-code.
-
-Treat 8K and 32K as evidence for one continuous large-M plan. Screen against the current
-production plan, then confirm a proposed winner in at least three fresh processes with alternating
-candidate/baseline order and an otherwise idle accelerator. Record quality and both
-`prepared_execution` and `operator_end_to_end`; use end-to-end timing for the production decision.
-Validate the selected plan at `M=131073` on `(N, K)=(16384, 6144)` for expansion and 64-bit
-indexing, and `(N, K)=(4096, 14336)` for contraction. Expand to the full N/K matrix only if those
-results are unexpected.
-
-The large-M schedule uses `128x256x128` GEMM tiles, eight warps, three stages, and fixed
-`GROUP_M=16` ordering (groups of up to 16 M tiles). SM120 chooses among three configurations
-from the output tile count, as documented below; other targets keep their existing schedules.
-NVIDIA and AMD use one GEMM launch, including all M/N/K tails. With aligned N/K, complete
-large M tiles take an unmasked branch and boundary tiles use masks. Unaligned N or K uses
-the existing masked loop in the same launch. Tail handling requires no padding or temporary
-buffers and is independent of tile selection. M, N, and K remain runtime values.
-
-On an RTX 5090 (SM120) with Torch 2.13.0+cu130 and Triton 3.7.1, three fresh processes per variant
-confirmed median per-cell end-to-end speedups of 2.20-2.61x at M=8192 and 4.55-5.56x at M=32768
-across the full eight-cell matrix. Every same-seed candidate quality record exactly matched the
-former schedule's record. The two M=131073 expansion and contraction guards also passed,
-including the ragged M tail and the expansion output beyond 2^31 elements.
-
-The ConvRot INT8 forward-linear tuner searches the immutable production execution plan shared
-by ordinary and activation-aware linears. Its default `prepared_execution` boundary deliberately
-keeps dynamic activation rotation, rowwise quantization, and GEMM in the timed operator because
-all are paid on every public invocation. It ranks their device-stream work on fixed source
-tensors; `operator_end_to_end` selects synchronized wall timing when host dispatch and allocation
-overhead should also participate. Quality compares every low-precision output element and uses
-fused FP32 norm reductions without materializing full promoted copies. The public benchmark and
-tuner construct the same deterministic ConvRot workload, full portable reference, common
-metadata, and provider adapters; the benchmark uses normal public dispatch while the tuner
-substitutes explicit execution-plan candidates. Its default workload is the lower ordinary-linear
-anchor: BF16, group 256, no bias, `M=8192`, `N=4096`, and `K=6144`.
-
-```shell
-uv run python benchmarks/tune_convrot_int8_linear.py \
-  --rows 8192 --out-features 4096 --in-features 6144 --no-bias \
-  --fuse-rotation-quantization --fused-num-warps 4 8 \
-  --matmul-block-m 64 128 --matmul-block-n 128 256 \
-  --matmul-block-k 32 64 128 --matmul-num-warps 4 8 \
-  --phase operator_end_to_end \
-  --json artifacts/convrot_int8_linear_sm120_tuning.json
-```
-
-Omitted axes retain the production values, explicit numeric axes form a deduplicated Cartesian
-search, and `--max-candidates` limits compilation. Fused preparation is a candidate choice rather
-than a claim of production eligibility, allowing development measurements outside the selected
-power-of-two preparation extent. Forced split candidates can independently search
-`--rotation-num-warps` and `--quantization-num-warps`; forced fused candidates search
-`--fused-num-warps`. The first tuner intentionally excludes the mutating ConvRot `addmm_` path,
-which requires a separate workload and quality protocol.
-
-Selected records are evidence, not runtime policy: review the result across representative
-shapes and repeated processes, then deliberately freeze an accepted winner in the production
-execution-plan selector. The project does not use `triton.autotune` in the public operator path;
-doing so would add first-use compilation/search latency, multiply cache entries across dynamic
-shapes, and cannot apply the tuner's full-operator quality gate. Triton autotuning remains useful
-for narrow, opt-in single-kernel experiments, but offline search is the production-policy tool.
-
-## Quality and reproducibility
-
-`measure_quality()` centralizes mean/max absolute error, relative L1 and L2 error,
-SQNR, cosine similarity, and actual/reference non-finite counts. Providers can attach
-endpoint saturation counts for quantized tensors with `measure_saturation()`.
-Integer quality inputs through 32 bits are promoted to FP64. Full-width INT64 and UINT64
-inputs are rejected because no floating comparison dtype preserves every possible value;
-providers needing them should use a domain-specific exact comparison.
-
-Every `BenchmarkRecord` includes:
-
-- GPU name, accelerator backend, and architecture;
-- Python, Torch, Triton, CUDA or ROCm runtime, and available driver versions;
-- Git revision and dirty-worktree state;
-- logical shape, provider configuration, phase timings, quality, and optional extras.
-
-All benchmark CLIs retain their Markdown or terminal summaries. Add `--json PATH` to
-write a versioned JSON array or `--jsonl PATH` to write one compact record per line.
-Serialization is strict JSON; non-finite floating-point metrics such as infinite SQNR
-for an exact result are represented as `null`.
-
-The schema starts at version 1. Consumers should check `schema_version` before relying
-on field names. A shortened record looks like:
-
-```json
-{
-  "schema_version": 1,
-  "benchmark": "integer-pv-dot",
-  "provider": "triton-native",
-  "shape": {"tiles": 2048, "key_tile": 64},
-  "configuration": {
-    "lhs_dtype": "int8",
-    "rhs_dtype": "int8",
-    "accumulator_dtype": "int32",
-    "implementation": "native",
-    "block_m": 64,
-    "block_n": 128,
-    "num_warps": 4,
-    "seed": 0
-  },
-  "timings": {
-    "warmup_ms": 500,
-    "measurement_time_ms": 2000,
-    "first_call_ms": 310.2,
-    "first_call_clock": "synchronized_wall",
-    "preparation": {
-      "median_ms": 0.004,
-      "p20_ms": 0.004,
-      "p80_ms": 0.005,
-      "clock": "synchronized_wall"
-    },
-    "prepared_execution": {
-      "median_ms": 0.031,
-      "p20_ms": 0.030,
-      "p80_ms": 0.032,
-      "clock": "device_event"
-    },
-    "operator_end_to_end": {
-      "median_ms": 0.036,
-      "p20_ms": 0.035,
-      "p80_ms": 0.037,
-      "clock": "synchronized_wall"
-    }
-  }
-}
-```
-
-## Included benchmarks
-
-### NVFP4 FFN
-
-Measure the current complete fused FFN on NVIDIA SM120:
-
-```shell
-uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
-  --shape 1024 2048 8192 --shape 1797 2048 8192 --shape 4096 5376 14336 \
-  --json artifacts/convrot-nvfp4-ffn.json
-uv run python benchmarks/benchmark_nvfp4_ffn.py --format nvfp4 \
-  --shape 127 256 512 --shape 1024 2048 8192 --shape 1797 2048 8192 \
-  --shape 4096 2048 8192 --json artifacts/nvfp4-ffn.json
-uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
-  --activation gelu_tanh --shape 127 2048 8192 --shape 100000 2048 8192 \
-  --json artifacts/convrot-nvfp4-gelu-ffn.json
-```
-
-Each shape is `M K N`: input rows, input/output width, and intermediate FFN width.
-Both FP16/BF16 and static/dynamic scales run by default; select a subset with `--dtype`
-and `--scaling`. `--activation` selects `swiglu` or `gelu_tanh`. `--group-size` selects
-ConvRot groups 16, 64, or 256; `--high-first` checks the other nibble order. The recorded seed
-deterministically generates the input, projection weights, and biases. Static source scales are
-measured from the input; the synthetic static down scale is fixed at 0.01 and recorded in the
-output.
-
-The benchmark uses the production FFN runner and the selected format's current preparation.
-SwiGLU uses 1,536-row chunks by default; GELU uses its feature-width-aware production policy.
-`--chunk-rows` overrides either policy. The benchmark writes one record per configuration. To
-evaluate future changes, run the same command on each Git revision using the same GPU and compare
-the saved results. Match shapes, dtype, activation, scales, chunking, seeds, and timing settings
-between runs.
-
-The reported `prepared_execution` is CUDA graph replay of the **complete FFN**, measured
-with device events. Each graph contains 16 FFN calls; six unmeasured warmup rounds
-precede 11 samples targeting 80 ms each. Capture, compilation,
-allocation, Python dispatch, and output checks are excluded from the timing. These are
-GPU execution measurements, not engine end-to-end latency. JSON/JSONL includes raw samples,
-calls per sample, timing settings, output finiteness, and environment and Git metadata.
-Unexpected output shapes/dtypes or non-finite values stop the benchmark before timing;
-numerical accuracy is covered by the FFN correctness tests. The script uses `nvidia-smi` to check
-for other compute processes on the selected GPU before and after each timed case; a conflict
-stops the run, preserving earlier completed records.
-
-ConvRot's **32 MiB** production limit bounds the additional FP32 rotated scratch for each
-FFN chunk. It was selected from RTX 5090 measurements: reuse avoided repeated rotation for
-smaller working sets, while larger buffers added enough traffic that recomputation was faster.
-It is a measured tradeoff, not an NVFP4 format requirement or a universal optimum for all
-SM120 GPUs. Reproduce the decision around the cutoff with the benchmark-only override:
-
-```shell
-uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
-  --shape 1023 2048 8192 --shape 1024 2048 8192 --shape 1025 2048 8192 \
-  --dtype bfloat16 --scaling dynamic --rotated-workspace-mib 0 \
-  --json artifacts/convrot-recompute.json
-uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
-  --shape 1023 2048 8192 --shape 1024 2048 8192 --shape 1025 2048 8192 \
-  --dtype bfloat16 --scaling dynamic --rotated-workspace-mib 64 \
-  --json artifacts/convrot-reuse.json
-```
-
-The 0 MiB run forces recomputation; 64 MiB permits reuse for all three shapes. Omit the
-override to measure the production cutoff. The option affects only this benchmark process;
-it is not an engine or compiler option. Larger-scale sweeps and additional devices are needed
-before changing the production policy.
-
-### ConvRot INT8
-
-SM120 uses three GEMM configurations, selected from host shape metadata:
-
-| Configuration | BLOCK_M | BLOCK_N | BLOCK_K | Warps | Stages |
-|---|---:|---:|---:|---:|---:|
-| Small | 32 | 64 | 128 | 8 | 4 |
-| Medium | 64 | 64 | 128 | 4 | 3 |
-| Large | 128 | 256 | 128 | 8 | 3 |
-
-For input `[M,K]` and weight `[N,K]`, M is the flattened row count and N is the output
-width of each projection. Single and paired projections use the same selection rules.
-Apply these rules in order:
-
-1. Use small tiles when `M <= 32` or `ceil(M/32) * ceil(N/64) <= 128`.
-2. Otherwise use medium tiles when `N <= 64` or `M * ceil(N/256) < 128 * 72`.
-3. Otherwise use large tiles.
-
-The thresholds count 128 small output tiles and 72 useful large output tiles. The large
-count uses actual M so a one-row tail does not count as a full 128-row tile. Narrow outputs
-stay within the existing small/medium configurations because wider tiles add no input reuse.
-Selection is monotonic in M for fixed N. K affects preparation but not GEMM tile selection;
-preparation remains independent of N so inputs can be shared across projections.
-Paired gate/up projections still share one GEMM launch; their combined width does not
-change the tile choice.
-
-These fixed heuristics were measured on an RTX 5090. Performance on other SM120 devices
-has not been established. SM8x uses its own policy, described below; other architectures
-retain their existing schedules. Selection uses no device-property query, runtime autotuning,
-or model-specific table. M/N/K remain runtime values; alignment, dtype, bias, and paired
-operation can still create compiled variants of each configuration.
-
-Compare the full ConvRot operator with fixed large tiles and BF16 cuBLAS using CUDA graphs:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_small_m.py > convrot-small-m.jsonl
-```
-
-The default uses the original reported seven-projection mix at
-`M=128,256,384,512,1024,3072`: `(K,N)=(1024,2048), (1024,1024), (2048,1024),
-(1024,3072), (3072,1024)`, counting the second and fourth shapes twice. These are benchmark
-inputs, not policy keys. Checks require bitwise agreement with the fixed large-tile schedule
-and an independent INT32 matmul reference. Full-linear timing includes rotation/quantization;
-preparation and prepared GEMM are also reported separately. JSONL records the environment,
-shapes, selected plans, timestamps, and timing samples. Acquire the shared GPU gate as
-outlined below before benchmarking.
-
-Repeated `--shape K N` arguments select other dimensions. For example, compare all three
-configurations and production dispatch across narrow outputs and wider transformer layers:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_small_m.py --compare-schedules --skip-bf16 \
-  --rows 128 512 1024 3072 \
-  --shape 2048 16 --shape 4096 1024 --shape 4096 12288 \
-  --shape 12288 4096 --shape 5120 25600 --shape 5376 14336 --rep-ms 30
-```
-
-In this mode, `linear` forces small tiles, `medium_linear` medium tiles,
-`previous_linear` large tiles, and `policy_linear` measures production. All include
-preparation. `--paired` compares two projections sharing one preparation. Timing order
-alternates between repeats; `--order-offset 0/1` also alternates order between processes.
-
-RTX 5090, Torch 2.14.0+cu130, Triton 3.8.0, driver 615.71.09, 2026-09-24: median of three
-30 ms CUDA-graph measurements for the default seven-projection mix, including preparation:
-
-| M | Fixed large-tile INT8 (us) | M/N policy (us) | BF16 cuBLAS (us) |
-|---:|---:|---:|---:|
-| 128 | 165.4 | 37.1 | 54.5 |
-| 256 | 167.2 | 48.5 | 74.8 |
-| 384 | 170.4 | 58.9 | 88.5 |
-| 512 | 173.0 | 70.0 | 117.6 |
-| 1024 | 182.8 | 117.2 | 218.6 |
-| 3072 | 274.6 | 274.0 | 541.1 |
-
-Each default shape at M<=512 beat BF16 in this run. These are isolated synthetic operator
-measurements, not complete-model speedups. Additional measurements cover wider projection
-mixes, paired projections, irregular M/N/K, and narrow outputs through M=100000. The local
-records are in `artifacts/convrot-mn-policy-commit-20260924/`,
-`artifacts/convrot-simple-policy-20260924/`, and `artifacts/convrot-m-only-20260924/`.
-The latter compares fixed M-only cutoffs with the M/N
-policy across projection mixes derived from 0.6B-, 2B-, 8B-, and 32B-scale models.
-Earlier paired measurements used projection count in selection. The full-FFN ablation in
-`artifacts/convrot-ffn-projection-count-20260924/` records the tradeoff behind removing that
-factor: it improved some short FFNs but regressed the tested K5120/N25600 FFN at M64 by
-about 15%. Ordinary single-projection selection is unchanged.
-
-SM8x (SM80, SM86, SM87, SM89) uses its own five GEMM configurations, at most three per output
-width. The fixed 128x256 tile needs 255 registers with 176 spilled values and 96 KiB of shared
-memory on SM89, and reaches about 50 TOPS. Short and narrow projections use 64-column tiles of
-the shared Triton kernel. Wider projections use the NVIDIA async-copy Gluon GEMM,
-`linear/convrot/int8/_nvidia/gluon_async_copy.py`:
-
-| Configuration | Kernel | BLOCK_M | BLOCK_N | BLOCK_K | Warps | Stages | GROUP_M |
-|---|---|---:|---:|---:|---:|---:|---:|
-| Small | Triton | 16 | 64 | 128 | 4 | 4 | none |
-| Medium | Triton | 64 | 64 | 128 | 4 | 4 | none |
-| Large | Triton | 128 | 64 | 128 | 4 | 3 | 16 |
-| Gluon medium | Gluon | 128 | 128 | 64 | 4 | 3 | 8 |
-| Gluon large | Gluon | 256 | 128 | 64 | 8 | 4 | 8 |
-
-Apply these rules in order:
-
-1. Use small tiles when `M <= 16` or `ceil(M/16) * ceil(N/64) <= 96`.
-2. When `128 < N <= 1024`, use Gluon medium tiles when `M >= 256` and
-   `M * ceil(N/128) >= 128 * 48`.
-3. When `N > 1024`, use Gluon large tiles when `M >= 256` and `M * ceil(N/128) >= 256 * 48`.
-4. When `N <= 128`, use Triton large tiles when `M * ceil(N/64) >= 128 * 64`.
-5. Otherwise use medium tiles.
-
-Without shape metadata the plan is the Gluon large tile. The counts use actual M, so a one-row
-tail is not a full tile. Selection is monotonic in M for fixed N, and K affects preparation but
-not tile selection. As M grows, each output width steps through small, medium, and one larger
-tile: Gluon large above 1,024 columns, Gluon medium for 129-1,024 columns, and Triton large up
-to 128 columns. SM8x launches do not specialize on M either: both GEMM kernels leave M out of
-their JIT keys, and the Triton tiles branch per tile at run time instead of compiling an
-`aligned_m` variant. A layer therefore compiles at most three GEMMs, plus one preparation
-kernel, as its row count changes. Across 26 row counts from 1 to 131073, an H3 layer compiled
-three GEMMs on SM8x and nine with the SM120 plan. Policy selects preparation independently
-from a complete GEMM schedule, then constructs one `NvidiaExecutionPlan` with explicit
-`matmul_kernel` and `matmul_group_m` fields. `triton_specialize_m` and
-`triton_explicit_bias_fma` configure the Triton implementation only. Benchmark metadata reports
-the effective `matmul_specialize_m` and `matmul_explicit_bias_fma` values; for Gluon these are
-always false and true, respectively, even when a candidate inherits SM120's Triton options.
-Replacing tile dimensions preserves the selected implementation;
-unsupported configurations fail plan validation. The async-copy implementation accepts
-128x128x64 tiles with four warps and 256x128x64 tiles with eight warps.
-The launcher falls back to the grouped Triton tile when an INT8 input or weight row is not
-16-byte aligned, which the Gluon copies require; that tile then takes the Gluon tile's place
-among the three.
-
-The Gluon GEMM follows the CUTLASS SM80 INT8 schedule that cuBLAS selects on this GPU
-(`256x128_64x3`): 16-byte `cp.async` copies into swizzled shared memory, `ldmatrix` operands,
-and m16n8k32 INT8 MMAs with 64x64 warp tiles, one CTA of eight warps per SM. Each pipeline
-stage has its own shared-memory allocation and the K loop is unrolled by the stage count. With
-static stage indices, Gluon's barrier analysis can see that the stage being refilled differs
-from the one being read, so each K tile needs one barrier instead of two. That raised the GEMM
-from about 290 to 303 TOPS on four large shapes. Interior tiles whose K tiles are whole skip
-per-element copy masks, which keeps the unrolled loop within 255 registers without spills. Edge
-tiles zero-fill rows and K columns. The epilogue matches the SM8x Triton tiles bitwise: exact
-INT32 accumulation, then `(acc * input_scale) * weight_scale` with bias added through explicit
-FMAs. Sustained GEMM-only throughput at H3 shapes was 297-310 TOPS, against 222-230 for the
-grouped Triton tile and 304-319 for cuBLAS `torch._int_mm`, which writes INT32 without the
-ConvRot epilogue.
-
-Preparation follows the shared NVIDIA plan with one SM8x exception. Rows of at most 1,024
-columns use one warp, which avoids cross-warp reductions. Plain inputs keep identical bits, but
-GELU and SwiGLU codes may differ from wider launches by one INT8 code, with scales within a few
-FP32 ulps. This is the same bound the optimized path already allows against the portable path.
-One warp cut 2-6% from the default seven-projection mix. The Triton large tile groups sixteen
-row blocks and the Gluon tiles eight. Without grouping, the 128x64 tile was up to 1.5x slower
-at `M=8192, K>=12288`, where the input does not fit in L2. Grouping is explicit in every NVIDIA
-plan, including SM120's production tiles and the H3 VAE's ungrouped 128x128 schedules.
-
-The async-copy kernel and one-warp preparation also run on SM120. GPU correctness tests force
-the SM8x schedules on either architecture; production SM120 selection remains unchanged.
-The [NVIDIA implementation layout](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md)
-separates policy, dispatch, and implementation launchers as sparse Piper attention does.
-For NVIDIA plans, the tuner accepts `--matmul-kernel triton gluon_async_copy` and
-`--matmul-group-m 0 8 16`; those two axes are rejected for AMD plans. Shared tile and warp
-axes retain CUDA/ROCm support, including 256-row tiles and AMD's 32-warp preparation.
-The tuner reports unsupported combinations to stderr, measures supported candidates, and
-errors clearly if none remain. For example, on SM80 or newer:
-
-```shell
-uv run python benchmarks/tune_convrot_int8_linear.py \
-  --matmul-kernel triton gluon_async_copy --matmul-group-m 0 8 \
-  --matmul-block-m 128 256 --matmul-block-n 128 --matmul-block-k 64 \
-  --matmul-num-warps 4 8 --matmul-num-stages 2 3 4
-```
-
-The Triton tiles were chosen from a 210-shape GEMM sweep on SM89 with 13 tiles, with and
-without grouping. The Gluon thresholds come from a second, 247-shape sweep. It crossed 13 row
-counts from 64 to 32768 with 19 K/N pairs: the projection mix, H3 transformer and VAE widths,
-anchors, and narrow outputs down to N=16. Against the fastest of the five configurations per
-shape, the policy averaged 1.047x (geometric mean) and 1.006x of total time. Stepping through
-both Gluon tiles at every width averaged 1.016x and 1.002x, but would compile a fourth GEMM per
-layer. Using only the large Gluon tile averaged 1.055x and 1.006x. Up to 1,024 columns, 256-row
-tiles leave SMs idle at a few thousand rows: whole N=1024 linears with 768-1024 rows ran 16-33%
-faster on the medium Gluon tile than on the medium Triton tile, and at most 7% slower than on
-the large Gluon tile from 2048 rows up. Wider outputs keep the large Gluon tile, which was 2-8%
-faster at 4096 rows and more; moving N=2048-3072 to the medium tile also slowed the H3 VAE's
-2048-column layers by 4-6%. The Triton-only policy averaged 1.15x and 1.27x. Gluon tiles need
-more than one 128-column tile, because narrow outputs are bound by input reads and the Triton
-tile's larger grid pulls more bandwidth. They also need at least 256 rows. Only SM89 was
-measured. SM80, SM86 and SM87 share the INT8 MMA path, and every configuration compiles for
-them within the 99 KiB per-block shared-memory limit of SM86/SM89, but their best thresholds
-may differ.
-
-Measure representative workloads in about three minutes:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_realistic.py > convrot-realistic.jsonl
-```
-
-The cases follow MiniMax H3. Transformer blocks use hidden width 5376, 56x128 attention, and
-a tanh-GELU FFN of width 14336 at 8K, 32K, 131072, and 131073 rows. Q/K/V share one
-preparation, and GELU is fused into the down-projection preparation. The H3 VAE linears run
-at 1797 and 7188 rows. The short-M cases use the projection mix at M=1-1024 and H3 widths
-at M=1-512. The eight primary anchors are also included. Each case captures one CUDA graph
-per variant over preallocated buffers:
-
-- the production plan;
-- the original plan, with shared preparation and fixed 128x256 tiles;
-- BF16 cuBLAS, multiplying the same inputs without a separate GELU pass. This favors BF16
-  in the down projection.
-
-The graphs are replayed interleaved for three rounds in one process. Each sample lasts at least
-250 ms, or 1,000 calls for the shortest cases, after a 10 s warmup. Shorter bursts ran up to 7%
-above sustained, power-limited clocks. With these settings, the H3 block and VAE totals were
-within 1-2% of three-process Triton `do_bench_cudagraph` measurements. Those took about an hour
-for the same coverage. The benchmark checks production outputs bitwise against the original
-plan in row chunks. JSON lines include per-sample times and TOPS, and stderr prints the group
-table. Select rows with `--h3-rows`, `--vae-rows`, `--mix-rows`, `--h3-short-rows`, and
-`--anchor-rows`.
-
-RTX 4070 Ti SUPER (SM89, 66 SMs), Torch 2.14.0+cu130, Triton 3.8.0, driver 596.49, Windows,
-2026-09-26, BF16, no bias. Totals sum each group's linears, including preparation. Every
-output agreed bitwise with the original plan:
-
-| Group | Rows | SM8x policy (TOPS) | Original plan (TOPS) | BF16 cuBLAS (TFLOPS) | vs original | vs BF16 |
-|---|---:|---:|---:|---:|---:|---:|
-| H3 block | 8192 | 18.12 ms (279) | 99.79 ms (51) | 56.53 ms (89) | 5.51x | 3.12x |
-| H3 block | 32768 | 71.43 ms (283) | 393.11 ms (51) | 221.39 ms (91) | 5.50x | 3.10x |
-| H3 block | 131072 | 285.47 ms (283) | 1561.91 ms (52) | 881.94 ms (92) | 5.47x | 3.09x |
-| H3 block | 131073 | 286.62 ms (282) | 1550.10 ms (52) | 884.07 ms (91) | 5.41x | 3.08x |
-| H3 VAE | 1797 | 0.87 ms (226) | 4.40 ms (45) | 2.46 ms (80) | 5.09x | 2.84x |
-| H3 VAE | 7188 | 3.30 ms (238) | 16.24 ms (48) | 9.03 ms (87) | 4.93x | 2.74x |
-| Projection mix | 1 | 26.7 us | 577.8 us | 29.5 us | 21.66x | 1.11x |
-| Projection mix | 16 | 26.2 us (14) | 584.4 us (1) | 39.3 us (9) | 22.27x | 1.50x |
-| Projection mix | 128 | 43.4 us (68) | 602.6 us (5) | 69.4 us (43) | 13.89x | 1.60x |
-| Projection mix | 1024 | 137.4 us (172) | 773.8 us (31) | 281.5 us (84) | 5.63x | 2.05x |
-| H3 widths | 1 | 276.0 us | 1773.0 us | 600.3 us | 6.42x | 2.18x |
-| H3 widths | 64 | 307.7 us (80) | 1807.6 us (14) | 688.1 us (36) | 5.87x | 2.24x |
-| H3 widths | 512 | 921.6 us (214) | 4923.0 us (40) | 2456.4 us (80) | 5.34x | 2.67x |
-| Anchors | 8192 | 24.23 ms (284) | 134.19 ms (51) | 76.08 ms (90) | 5.54x | 3.14x |
-| Anchors | 32768 | 95.98 ms (286) | 532.82 ms (52) | 300.49 ms (91) | 5.55x | 3.13x |
-
-Single-row cases are bound by weight reads, so their throughput is omitted. At 131072 rows, the
-H3 stages ran at 295 TOPS for Q/K/V, 272 for the output projection, 291 for the FFN up
-projection, and 265 for the GELU-fused down projection. The original plan ran at 51-52 TOPS.
-The N=16384 anchors ran at 291-296 TOPS. The N=4096 anchors ran at 251-260 TOPS, because
-preparation takes a larger share of those calls. The projection mix at 1024 rows is bound by
-its small grids and by preparation, which takes about a fifth of its time; its layers ran at
-149-197 TOPS, and cuBLAS INT8 alone, without preparation or the epilogue, reached 187 TOPS on
-the mix. A four-step ladder with both Gluon tiles at every width, which compiles a fourth GEMM
-per layer, ran the whole benchmark within 0.1% of this policy. With Triton tiles only, the H3
-blocks ran at 220-221 TOPS, the VAE at 191-199, and the anchors at 223. Bias and paired
-projections with ragged M agreed bitwise.
-
-On SM8x, `benchmark_convrot_int8_small_m.py --compare-schedules` forces the SM8x small and
-medium configurations, and `previous_linear` is the original plan on every target. The local
-records are in `artifacts/convrot-sm8x-policy-20260925/`.
-
-Compare the original split-tail GEMM with a fully masked single launch and the production
-single launch, all using the fixed `128x256x128` tile configuration:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_tail.py > convrot-tail.jsonl
-```
-
-The default dimensions `(K,N)=(1024,1024), (3072,1024), (5376,14336), (272,257)` cover
-contractions, expansions, and unaligned widths. `M` is the flattened input row count,
-`K` the input width, and `N` the output width. Use `--rows` and repeated `--shape K N`
-arguments to select other cases:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_tail.py \
-  --rows 513 4096 100000 \
-  --shape 512 257 --shape 272 256 --shape 272 257 \
-  --shape 96 5376 --shape 5376 2688 --shape 5376 96
-```
-
-All providers use preallocated buffers and CUDA graph replay, check bitwise agreement with
-the original kernel, and report GEMM-only and full-linear timings separately. Full-linear
-measurements include rotation/quantization. JSONL records the environment, shapes, tile
-configuration, and individual timing samples. The old kernel is retained only in the
-benchmark/correctness helper `lib/convrot_int8_legacy.py`.
-
-For aligned N/K, production branches around the entire projection: full M tiles use unmasked
-loads/stores and tail tiles use masks. Scaling and bias stay inside the branch to preserve
-floating-point rounding. Some grouped tile shapes, including 128x64 and 64x64, still let the
-compiler move an identical paired bias add below the branch, where it rounds separately from
-the scale multiply. SM8x launches therefore write bias adds as explicit FMAs. That path is
-selected explicitly by the SM8x policy; SM120 and AMD defaults are unchanged. Tail branching
-has its own kernel flag, independent of bias rounding. Unaligned N/K uses
-the original masked loop in one launch. Neither NVIDIA nor AMD retains a separate tail launch;
-tail handling is independent of tile selection.
-
-On the shared local GPU, first POST `{"id":"<unique-lease-id>"}` to
-`http://127.0.0.1:8080/piper/engine/register`, then `/piper/engine/acquire`; wait for acquire
-to return before running. POST the same ID to `/piper/engine/release` when finished,
-including after benchmark failures.
-
-RTX 5090 (SM120), Torch 2.14.0+cu130 and Triton 3.8.0, 2026-09-24: the six custom shapes
-above agreed bitwise at all three M values. Across three 60 ms graph measurements per case,
-the single launch reduced full-linear time by 35.4–48.1% at M=513 and 0.9–4.5% at M=100000;
-the aligned M=4096 control ranged from 0.15% faster to 1.22% slower. Long guards at
-`(M,K,N)=(131073,6144,16384)` and `(131073,14336,4096)` also passed, including output
-addressing beyond 2^31 elements. These operator measurements isolate the launch change.
-AMD is covered by offline compilation checks; performance was measured only on SM120.
-
-Run the ConvRot provider comparison with:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8.py
-```
-
-The same entry point now replaces the separate `benchmark_convrot_int8_rocm.py` runner.
-For production phases on either accelerator, use:
-
-```shell
-python benchmarks/benchmark_convrot_int8.py \
-  --rows 8192 --in-features 6144 --out-features 4096 \
-  --phases --samples 3 --measurement-time-ms 200 \
-  --jsonl artifacts/convrot-phases.jsonl
-```
-
-Phase checks compare GEMM/full outputs against independent INT32 products and the matching
-FP32 scale/bias epilogue. Preparation and GEMM reuse caller-owned buffers; the full public call
-includes its allocations. Records identify the phase, clock, and dense integer-operation count.
-The production plan and the offline linear tuner's default now come from the active backend.
-`--device` selects the GPU. The optional Comfy Kitchen provider still requires NVIDIA CUDA.
-
-Conv3D likewise uses `benchmark_convrot_int8_conv3d.py` on SM120 and RDNA4, replacing its
-ROCm-suffixed entry point:
-
-```shell
-python benchmarks/benchmark_convrot_int8_conv3d.py \
-  --shape 1,128,5,64,64,128 --samples 3 --measurement-time-ms 100 \
-  --jsonl artifacts/convrot-conv3d.jsonl
-```
-
-`--vendor-benchmark` enables the active vendor's convolution search. `--tune` measures
-explicit prepared-convolution candidates using that accelerator's preparation/descriptor policy.
-Native/reference correctness checks still run when `--skip-reference-timing` is selected.
-Sparse QKV projection also uses `measure_device()` and supports the standard `--json`/`--jsonl`
-outputs. Existing `--rep-ms` arguments remain aliases for `--measurement-time-ms` there and in
-Conv3D.
-
-The default comparison samples both primary M anchors at the lower-width corner: BF16, group 256,
-no bias, `M=8192/32768`, `N=4096`, and `K=6144`. The three dimension options accept lists and form
-a Cartesian product. Run the complete eight-cell primary matrix with:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8.py \
-  --rows 8192 32768 \
-  --out-features 4096 16384 \
-  --in-features 6144 14336 \
-  --no-bias
-```
-
-Use explicit smaller rows for a cheap correctness or launch-latency smoke; they are not tuning
-evidence for the large-M production plan.
-
-Use `--help` to select activation rows, weight dimensions, group size, dtype,
-deterministic input seed, and timing windows. `--in-features` is linear and weight width `K`;
-omit `--input-activation` for an ordinary linear, pass `gelu_tanh` for a `K`-wide input, or pass
-`swiglu` for a raw `[up | gate]` input with `2K` features. The script validates the complete
-low-precision output against the portable reference. Fused FP32 norm reductions avoid
-low-precision overflow without materializing full promoted copies; the Piper provider must clear
-the declared SQNR and non-finite gate.
-
-The Piper provider times the complete public entrypoint on fixed source tensors, so its
-`prepared_execution` includes ConvRot's internal activation preparation and GEMM. Provider
-configuration records the public entrypoint and whether the production execution plan selected
-fused or materialized activation preparation, plus its exact preparation and GEMM fields. Record
-shapes contain only the case name and logical dimensions;
-provider configuration distinguishes the logical input layout from the layout passed to that
-provider. The optional provider is recorded as provider-managed when its internal choice is not
-observable.
-
-The benchmark runs the portable reference once per explicit shape and reuses its complete output
-for quality. Only production providers are timed.
-
-Compare against the optional Comfy Kitchen CUDA provider with:
-
-```shell
-uv run --with comfy-kitchen==0.2.28 \
-  python benchmarks/benchmark_convrot_int8.py \
-  --rows 8192 --out-features 4096 --in-features 6144 \
-  --compare-comfy-kitchen
-```
-
-Comfy Kitchen is a benchmark-only dependency and is loaded only when requested. Its 0.2.x
-SwiGLU API consumes `[gate | up]`, so the benchmark prepares that provider's reordered input
-once outside the timed operator while keeping Piper's public `[up | gate]` contract. Provider
-metadata records the adapter and the installed package version under `installed_version`.
-
-Diagnose activation preparation independently, using preallocated outputs, with:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_preparation.py
-
-uv run python benchmarks/benchmark_convrot_int8_preparation.py \
-  --rows 32768 --in-features 6144 --input-activation swiglu
-
-uv run python benchmarks/benchmark_convrot_int8_preparation.py \
-  --rows 32768 --in-features 6144 --input-activation gelu_tanh
-
-uv run --with comfy-kitchen==0.2.28 \
-  python benchmarks/benchmark_convrot_int8_preparation.py \
-  --rows 32768 --in-features 6144 --compare-comfy-kitchen
-```
-
-The preparation benchmark reports rotation, rowwise quantization, their two-launch split,
-and the one-pass fused candidate for the requested widths. The traffic column is an algorithmic
-minimum, not a measured DRAM-transaction count. Unlike the permissive public comparison above,
-the preparation adapter calls a private native entrypoint and accepts exactly
-`comfy-kitchen==0.2.28`. Its records include both the installed package version and the private
-adapter-contract version. The final column names its Piper baseline explicitly: split
-preparation without an input activation and fused preparation for activated inputs.
-
-Add `--json PATH` or `--jsonl PATH` to serialize one common `BenchmarkRecord` per width and
-phase. Each record distinguishes linear `K` from raw input width and includes the phase,
-operation provenance, baseline, device timing, minimum traffic, and effective bandwidth. Piper
-records additionally include the selected fusion mode and fused and split-path warp counts.
-Piper timing and compiler records use the same `piper-triton` provider identifier and plan
-configuration.
-Compiler output remains independently selectable with `--compiler-json` or
-`--compiler-jsonl`, so both record types can be written by one invocation. Benchmark and
-compiler records must use different output paths.
-
-The common compiler-report adapter can inspect one width per fresh process:
-
-```shell
-uv run python benchmarks/benchmark_convrot_int8_preparation.py \
-  --rows 32768 --in-features 6144 \
-  --compiler-report --no-sass \
-  --compiler-json artifacts/convrot-preparation-6144.json
-```
-
-Compiler records include specialization fingerprints, registers, spills, shared memory,
-warps, stages, and resource-based residency ceilings. Repeat in separate processes for each
-width so process-wide Triton specialization caches remain unambiguous.
-
-Run the stock-Triton integer P x V microbenchmark with:
-
-```shell
-uv run python benchmarks/benchmark_integer_pv_dot.py s8-s8
-uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-native
-uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-affine-proxy
-```
-
-The `u8-s8-native` variant uses Piper Attention's stock-Triton compiler extension to emit native
-`UINT8 x INT8 -> INT32` MMAv2. The extension is packaged in the normal Python wheel and
-requires no patched Triton, CUDA extension, native build, or executable inline PTX. It is tested
-with Triton 3.7.1 and validates its compiler hook and generated MMA fail-closed, allowing newer
-Triton versions only while the same lowering remains compatible.
-
-Native mixed-sign lowering currently requires NVIDIA SM8x or consumer Blackwell SM12x and the
-`m16n8k32` MMAv2 path. Turing, Hopper WGMMA, datacenter Blackwell, and ROCm mixed-sign lowering
-are not supported by this extension. The native benchmark installs the hook automatically before
-JIT compilation; production native-UINT8 launchers use the same selection-time installation.
-On unsupported targets, use the exact affine signed-INT8 proxy as a benchmark control; the
-production operator uses its portable quantized reference. The benchmark records the LHS, RHS,
-and accumulator dtypes explicitly, checks exact INT32 output including UINT8 values above 127,
-and records operand saturation.
-
-Inspect the generated mixed-sign MMA while verifying exact output with:
-
-```shell
-uv run python benchmarks/benchmark_integer_pv_dot.py u8-s8-native \
-  --compiler-report --no-sass
-```
-
-The PTX report contains `mma.sync.aligned.m16n8k32...s32.u8.s8.s32`. Add SASS inspection when
-`nvdisasm` is available to verify the corresponding native `U8.S8` machine instruction.
-Backend-specific PTX, SASS, and AMDGCN inspection belongs to compiler/profiling tooling
-rather than this portable benchmark runner.
-
-Run full-attention comparisons with:
-
-```shell
-uv run python benchmarks/benchmark_attention.py
-```
-
-The hardware-aware default always includes PyTorch SDPA, adds Piper Attention where its
-mixed-sign MMA is supported, and adds pure-Triton SageAttention2++ where FP8 tensor cores
-are supported. Choose any subset with `--providers`; `--help` lists the stable provider
-names. For example:
+Use these runners to compare operators, investigate regressions, or select an
+execution plan. They record shapes, configuration, quality where applicable,
+timings, and hardware/software metadata. Synthetic operator results do not
+establish full-model speed or checkpoint quality.
+
+Run from the repository root with the Python for the accelerator being tested.
+See [development setup](../docs/development.md#accelerator-environments) for CUDA
+and ROCm environments. With an external environment, replace `uv run python` below
+with `PYTHONPATH=src /path/to/env/bin/python`. Production runners are shared across
+CUDA and ROCm, subject to each operator's backend support.
+
+## Choose a runner
+
+Start with an explicit shape and save the result:
 
 ```shell
 uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 \
-  --providers piper_attention sage_attention_2pp pytorch-sdpa
+  --sequence 8192 --heads 16 --head-dim 128 --dtype bfloat16 \
+  --json artifacts/attention.json
 ```
 
-Add the revision-pinned official CUDA SageAttention2++ and SageAttention2 providers
-with:
+| Workload | Runner | Useful controls |
+|---|---|---|
+| Dense attention | [benchmark_attention.py](benchmark_attention.py) | `--providers`, `--sequence`, `--kv-sequence`, `--causal` |
+| ConvRot INT8 linear | [benchmark_convrot_int8.py](benchmark_convrot_int8.py) | `--rows`, `--in-features`, `--out-features`, `--phases` |
+| ConvRot INT8 Conv3D | [benchmark_convrot_int8_conv3d.py](benchmark_convrot_int8_conv3d.py) | Repeated `--shape N,C,T,H,W,O`, `--tune`, `--vendor-benchmark` |
+| NVFP4 / ConvRot NVFP4 FFN | [benchmark_nvfp4_ffn.py](benchmark_nvfp4_ffn.py) | `--format`, repeated `--shape M K N`, `--activation`, `--scaling` |
+| Dense projection/attention/output fusion | [benchmark_piper_fusion.py](benchmark_piper_fusion.py) | `--heads`, `--kv-heads`, `--width`, `--chunk-rows` |
+| Sparse attention | [benchmark_sparse_piper.py](benchmark_sparse_piper.py) | `--ratios`, `--routing`, `--sequence` |
+| Sparse routing and projections | [scores](benchmark_sparse_piper_scores.py), [projections](benchmark_sparse_piper_projection.py) | Query-block windows, routing mode, projection dimensions |
+| Complete sparse fusion | [benchmark_sparse_piper_fusion.py](benchmark_sparse_piper_fusion.py) | `--sequence`, `--query-chunk-rows` |
+| Integer probability/value dot | [benchmark_integer_pv_dot.py](benchmark_integer_pv_dot.py) | Arithmetic variants, compiler inspection, profiling |
+
+Use `--help` for the full argument list. The ConvRot `small_m`, `tail`,
+`realistic`, and `preparation` scripts are specialized NVIDIA ablations and
+compiler diagnostics. Use the ordinary linear runner for production comparisons
+on either accelerator. Add workloads to these runners and reuse the
+development-only support in [`lib`](lib).
+
+### ConvRot INT8
+
+Include activation rotation, quantization, GEMM, and the scale epilogue when
+comparing the public linear operator. `--phases` adds separate preparation,
+prepared GEMM, and complete-call device measurements:
+
+```shell
+uv run python benchmarks/benchmark_convrot_int8.py \
+  --rows 8192 --in-features 6144 --out-features 4096 --no-bias --phases \
+  --json artifacts/convrot-int8.json
+```
+
+The Conv3D runner compares native and portable quantized operations, plus vendor
+FP16 convolution in contiguous and channels-last layouts. FP16 is a performance
+baseline; the quantized reference is the correctness oracle. Both include
+matching padding and, for fused cases, GroupNorm/SiLU. Weight reconstruction and
+initial layout conversion are outside timing. `--skip-reference-timing` retains
+correctness checks. On ROCm, record `PYTORCH_MIOPEN_SUGGEST_NHWC` and
+`--vendor-benchmark`, which affect the baseline.
+
+### Attention and projection fusion
+
+By default, dense attention chooses supported providers for the device and
+includes PyTorch SDPA. Piper's prepared phase times the recurrence after Q/K/V preparation;
+SageAttention2++ and SDPA time their complete operator in that phase. Compare
+complete operator timings when judging integration cost. The ordinary dense
+runner uses equal Q/KV head counts; GQA needs separate coverage, such as the
+projection-fusion benchmark.
+
+The optional canonical SageAttention providers require the pinned benchmark
+dependency and an NVIDIA build for the target architecture:
 
 ```shell
 TORCH_CUDA_ARCH_LIST=12.0 uv sync --group benchmark
 uv run python benchmarks/benchmark_attention.py --canonical
 ```
 
-Replace `12.0` with `8.9` on RTX 40-series GPUs. The benchmark dependency is
-SageAttention 2.2.0 at commit `d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5` and is never
-imported by package production code. SM89 comparisons use canonical per-thread Q/K
-quantization; SM12x comparisons use canonical per-warp Q/K quantization. Both canonical
-providers enable K smoothing and differ only in their P x V accumulator strategy.
+Use `8.9` for SM89. The pinned revision is in [pyproject.toml](../pyproject.toml);
+production code does not import this benchmark dependency.
 
-Each row uses the common provider lifecycle and records first-call synchronized wall time,
-preparation, warmed device-event execution, complete operator latency, quality against SDPA,
-and effective TFLOP/s. Use `--sequence`, `--kv-sequence`, `--head-dim`, `--dtype`, and
-`--causal` to build a shape matrix. JSON and JSONL output use the shared versioned benchmark
-schema and identify the algorithm and implementation in each provider's configuration.
-Pure-Triton SageAttention2++ records also serialize their selected launch, fusion, loop, and
-packed-probability-conversion choices.
-
-Piper Attention exposes a more granular lifecycle than SageAttention2++ and SDPA operators:
-
-- `preparation` includes compact K mean reduction, non-causal V mean reduction, Q/K/V
-  quantization, and scale metadata;
-- `prepared_execution` is the hot fused QK, FP32 online-softmax, integer PV recurrence,
-  plus the centered-mean epilogue for non-causal calls;
-- `operator_end_to_end` runs preparation and the fused kernel as one complete call.
-
-Machine records also identify Q/K granularity.
-Historical fixed-INT8, block-INT8, sorted-group, and key-scaled research controls remain
-reproducible from the `wip/sage-integer-attention` checkpoint at `b75f3ee`; they are not copied
-into the installed package.
-
-For sparse Piper, measure the prepared kernel separately from routing, preparation, and the
-complete public call:
+Fusion runners compare complete projection/attention pipelines, verify the
+advertised graph rewrites, and exclude compilation and reference checks from
+timing. Dense fusion also reports CUDA-graph replay separately. Peak extra
+allocation includes outputs and workspace, excluding resident inputs/weights;
+dense graph pools are excluded too.
 
 ```shell
-uv run python benchmarks/benchmark_sparse_piper.py \
-  --head-dim 64 --sequence 1797 4096 --heads 32 --ratios 0.25 1.0 --samples 7
+uv run python benchmarks/benchmark_piper_fusion.py \
+  --sequence 8192 8193 --heads 4 --kv-heads 2 --head-dim 64 --width 1024 \
+  --chunk-rows 4096 --json artifacts/dense-fusion.json
 ```
 
-`--head-dim` accepts 64 or 128 and defaults to 128. A keep ratio of 1.0 includes every key
-block while retaining Piper's quantized arithmetic. The benchmark checks sampled query blocks
-against an independent FP64 reference and counts useful operations using the selected head width.
+Keep model-shaped results explicit about what is represented. H3 fusion defaults
+use B1/H56/D128 and hidden width 5376, not captured checkpoint inputs. Krea2-shaped
+dense runs need Hq48/Hkv12/D128, width 6144, and `--rotary-dim 128`; they omit the
+model's text padding mask and sigmoid output gate. Sparse `--ratios 1.0` retains
+sparse quantization and is not identical to dense Piper.
 
-Sparse Piper uses a separate routing-aware schedule from dense Piper Attention. Full physical
-head budgets skip score/top-k selection. On SM120, D128 retains its Q64/four-warp kernel and a
-canonical route list; D64 traverses all key blocks directly without a list. The internal
-`skip_dense_routing` flag selects this behavior, and the benchmark reports whether it was used.
-Direct D64 uses Q128 when both the prepared query range and K/V storage contain at least 32,768
-rows, except when a coarse residual requires the Q64 epilogue. Other direct D64 calls retain
-Q64/four warps.
-Routed D64 uses Q64/two warps when both ranges contain at least 8,192 rows and the average selected
-key work, including the dense suffix, reaches 1,024 rows per head. Smaller budgets retain four
-warps. The length crossovers were checked at 32 and 56 heads over 8k/16k/32k and 50k/100k rows;
-the budget guard excludes the 1%-keep regression found in the broader sparse-budget screen.
-These choices retain the same quantization and FP32 recurrence. Coarse attention still computes
-its own scores even when fine-route selection is unnecessary.
+### NVFP4 FFN
 
-RDNA4 D128 min/max routing uses the same tiled FP32 scorer for fused projection windows
-and standalone chunks of up to 384 query blocks. To compare it with two Torch GEMMs plus
-the maximum epilogue, run with the Python from a provisioned ROCm environment:
+The FFN runner measures the complete fused FFN on SM120. Shapes are input rows,
+input/output width, and intermediate width:
 
 ```shell
-python benchmarks/benchmark_sparse_piper_scores.py \
-  --sequence 8192 32768 100000 150000 --query-blocks 64 128 384 --samples 5 --rep-ms 100
+uv run python benchmarks/benchmark_nvfp4_ffn.py --format convrot-nvfp4 \
+  --shape 1024 2048 8192 --shape 1797 2048 8192 \
+  --dtype bfloat16 --scaling dynamic --json artifacts/nvfp4-ffn.json
 ```
 
-Omitting `--query-blocks` retains the full and final chunks of the 8192-token fused pipeline.
-The benchmark checks scores against FP64 and includes score allocation. On an RX 9070 XT,
-Torch `2.14.0+rocm10.1.0a20260908` and matching Triton `3.8.0+git675c5987`, synthetic
-B1/H56/D128 summaries gave these device-event medians across five paired panels:
+Its `prepared_execution` is CUDA-graph device timing of the complete FFN.
+Compilation, capture, Python dispatch, and allocation are excluded. Shape,
+dtype, and finiteness checks run before timing; numerical accuracy belongs to
+the FFN correctness tests. The runner stops if another compute process occupies
+the GPU. Match activation, scales, seed, chunking, and sample settings across
+revisions. Recorded synthetic static down scales are not checkpoint calibration
+evidence.
 
-| Query blocks | Key blocks | Torch scoring (ms) | Tiled scoring (ms) |
-|---:|---:|---:|---:|
-| 128 | 128 | 0.174 | 0.062 |
-| 384 | 512 | 2.154 | 0.494 |
-| 384 | 1562 | 6.649 | 1.659 |
-| 384 | 2343 | 9.915 | 2.485 |
+## Interpret and reproduce results
 
-These are cache-flushed scoring measurements, not complete attention speedups. H3-shaped
-BF16 public calls at B1/H56/D128 and 25% keep were compared with the old 64-query-block
-dispatch limit using seven shuffled pairs per process:
+The common provider model has `prepare()` and `run(prepared)` callables. A
+provider may prepare nothing and invoke the complete operator in `run`.
+Consequently, phase names alone do not establish equivalent work:
 
-| Tokens | Initial old / new (ms) | Confirmation old / new (ms) |
-|---:|---:|---:|
-| 100,000 | 538.18 / 519.26 | 522.21 / 521.13 |
-| 150,000 | 1203.05 / 1160.58 | 1161.15 / 1159.92 |
+| Phase | Measurement boundary |
+|---|---|
+| `first_call_ms` | Synchronized wall time of the first invocation, including lazy compilation; compiler caches may already be warm. |
+| `preparation` | Warmed synchronized wall time of preparation alone. |
+| `prepared_execution` | Warmed device-event time of `run(prepared)`, including preparation inside that callable. |
+| `operator_end_to_end` | Warmed synchronized wall time of `run(prepare())`. |
 
-The initial 3.5% complete-call gain did not reproduce; the confirmation gain was only
-0.1-0.2%. Routes and outputs matched exactly in both runs, and peak allocation was unchanged.
-At 150K, the tiled scorer removes one 192 MiB auxiliary score matrix per full standalone
-chunk, but other attention buffers dominate the full-call peak. The then-default fused 4096-row
-projection windows already used native scoring. Both 4096- and 8192-row windows fit the
-native scorer's query-block limit. General FP32 scores can
-differ from Torch in their rounding; exact-score ties retain lower-index selection. Mean
-routing and D64 retain their existing scoring paths.
+Synchronized wall time includes host dispatch, allocation, and device work.
+Device events measure elapsed stream work. Graph replay removes per-call host
+work; compare it only with matching graph measurements. Records identify the
+`clock`, timing windows, and sample counts. Common summaries are `p50 [p20, p80]`;
+unsupported phases are `null`. Device-phase runners separately record
+cache-flushed `device_event` and `graph_device_event` samples. Fusion runners
+can use shuffled fixed-count wall samples instead of timed windows.
 
-The complete ConvRot INT8 fusion benchmark can compare query windows at the H3
-B1/H56/D128 shape, with hidden/output width 5376, BF16 activations, min/max routing,
-and 25% keep:
+Compare the same shapes, configuration, seed, reference, timing scope, and
+environment on baseline and candidate. Confirm a promising result with repeated
+fresh-process measurements, alternating their order on an otherwise idle accelerator.
+Use complete operator timing for production decisions, and inspect memory as
+well as latency. Validate architectures independently; a schedule measured on
+one GPU is evidence for that device, not its whole architecture family.
+
+Quality records include absolute/relative error, SQNR, cosine similarity, and
+actual/reference non-finite counts where supported. Check the reference and
+whether comparisons cover all elements or sampled queries. Synthetic inputs
+cannot replace representative model activations. Integer quality comparisons
+support values through 32 bits using FP64; full-width INT64/UINT64 require an
+exact domain-specific comparison.
+
+Save reports with `--json PATH` or `--jsonl PATH`. Common `BenchmarkRecord`
+metadata includes GPU/backend/architecture, Python/Torch/Triton/runtime and
+available driver versions, Git revision and dirty state, logical shape, provider
+configuration, timings, and quality. Preserve the command, model/shape source,
+and clock or power settings when sharing results. Non-finite metrics such as
+infinite SQNR serialize as `null`; inspect non-finite counts separately.
+Check `schema_version` before consuming artifacts.
+
+Nested configurations use `execution_plan` for complete invocation choices and
+`schedule` for an independently measured stage.
+
+## Offline tuning
+
+The [Piper Attention](tune_piper_attention.py),
+[SageAttention2++](tune_sage_attention_2pp.py), and
+[ConvRot linear](tune_convrot_int8_linear.py) tuners measure the immutable plans
+used by production. Omitted axes keep production values; explicit axes form a
+deduplicated, capped Cartesian search. Unsupported and out-of-resource
+candidates are recorded; unexpected failures propagate. Winners must pass
+quality checks. Nothing changes production policy or starts runtime autotuning.
+The attention tuners exercise NVIDIA implementations; they do not enable new
+backends.
 
 ```shell
-python benchmarks/benchmark_sparse_piper_fusion.py \
-  --sequence 100000 150000 --query-chunk-rows 4096 8192 16384 --samples 7 \
-  --json artifacts/sparse_piper_fusion_windows.json
+uv run python benchmarks/tune_piper_attention.py \
+  --sequence 8192 --head-dim 128 --block-m 64 128 --num-stages 2 3 \
+  --phase operator_end_to_end --json artifacts/attention-tuning.json
 ```
 
-Each variant uses the same seeded inputs and weights. A benchmark-only graph pass
-sets and checks the actual fused operator's query-window argument, and each variant
-must reuse one dynamic graph across sequence lengths. Complete outputs are compared
-with the quantized materialized baseline using a CPU reference and bounded slices;
-compilation and these comparisons are outside the shuffled timing samples. Peak extra
-allocation includes the returned output and execution workspace. The benchmark defaults
-to an 8192-row window, shared with the production default, and sequences
-8192, 32768, 100000, and 150000.
+Use `--help` for target-specific axes and quality thresholds. Attention tuners
+default to a 20 dB SQNR gate plus non-finite checks. Piper's prepared phase is its
+recurrence; ConvRot and SageAttention2++ include public-operator preprocessing.
+State the phase when reporting a selected candidate.
 
-Before BF16 K temporary storage and the 8192-row default, seven paired samples
-on the same RX 9070 XT/software stack above gave these
-synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`):
+### Attention tuning workload anchors
 
-| Tokens | Materialized | Fused 4096 | Fused 8192 | Fused 16384 |
-|---:|---:|---:|---:|---:|
-| 100,000 | 654.11 | 661.56 | 656.22 | 653.29 |
-| 150,000 | 1349.31 | 1369.85 | 1362.52 | 1367.09 |
+Use B1/BF16 with H16/H48 and D64/D128 as representative regimes. Measure square
+Q=KV at 8192, 32768, and 131072, causal and non-causal. Include non-causal
+rectangles 8192×32768 and their reverse. These are equal-head benchmarks;
+GQA/MQA need separate coverage. FP16 provides secondary quality/code-generation
+coverage where supported.
 
-Every fused output matched the materialized result exactly, including an 8193-token
-tail control, and each window reused one graph across all three lengths. At 150K,
-peak extra allocation was 6882 MiB materialized versus 5722, 5928, and 6340 MiB for
-the three fused windows. The materialized baseline releases prepared input after V
-projection and Q/K/V after attention, before output projection.
+Use 2048 as a short-context guard, small boundaries such as 63/64/65 and
+127/128/129 for masking, and 8193 plus near-square rectangles for realistic tails.
+Confirm long behavior at 131072 and 131073 with H16/D64 and D128. Probe immediately
+around any proposed applicability boundary. Anchors sample a continuous workload;
+they are not model identities or dispatch keys.
 
-Two earlier independent window sweeps also found only 0.4-0.6% lower latency with
-8192 rows at 150K. A separate projected-coarse-gate control found a 0.6% gain while
-adding 354 MiB; 16384 rows added about 1060 MiB without beating 8192. At 100K,
-16384 rows also reduce the gate pipeline to seven chunks, below its eight-chunk
-overlap threshold. These earlier measurements used the then-default 4096-row
-windows. Dense and sparse ConvRot INT8 fusion now share an 8192-row default;
-the sparse windows remain fixed and dense schedules under the cap. Larger
-windows still trade additional workspace for workload-dependent latency gains.
+### Large-M dense forward-linear tuning workload anchors
 
-On an RTX 4070 Ti SUPER (SM89, Windows 11, Torch 2.14.0+cu130, Triton 3.8.0),
-`--sequence 8192 32768 100000 150000 --query-chunk-rows 4096 8192 --samples 7` gave these
-synchronized wall medians in milliseconds (`OMP_NUM_THREADS=8`) and peak extra allocations
-in MiB:
+For `[M,K] × [N,K]`, use the eight combinations of M=8192/32768,
+N=4096/16384, and K=6144/14336, with BF16 and no bias. ConvRot uses group 256
+and includes rotation/quantization in the timed operator. Other formats retain
+their preparation contract. Confirm the winner at M=131073 for
+(N,K)=(16384,6144) and (4096,14336), when memory permits; the expansion also
+tests output indexing beyond `2^31` elements.
 
-| Tokens | Materialized | Fused 4096 | Fused 8192 | Peak: materialized / 4096 / 8192 |
-|---:|---:|---:|---:|---:|
-| 8,192 | 12.38 | 12.66 | 12.49 | 298 / 419 / 480 |
-| 32,768 | 74.16 | 75.59 | 74.53 | 1253 / 1165 / 1350 |
-| 100,000 | 451.94 | 472.55 | 459.11 | 3999 / 3208 / 3423 |
-| 150,000 | 937.02 | 982.83 | 952.86 | 6045 / 4726 / 4964 |
+If integration changes graph boundaries, also check SwiGLU, tanh-GELU, and
+shared-input projections at a representative large shape. Small-M decode,
+sparse/expert routing, backward, and fused pipelines need their own coverage.
+Follow the [development guidance](../docs/development.md) when selecting a
+general production policy from these measurements.
 
-On SM89, the shared 8192-row windows are 1.4-3.0% faster than 4096-row windows, for
-61-238 MiB of extra workspace, and still allocate 14-18% less than the materialized path
-from 100K tokens.
+## Compiler inspection and profiling
 
-On the same SM89 stack, the stages of the H3 block's materialized path took these CUDA-event
-medians in milliseconds (seven iterations after two warm-ups). The fused path runs the same
-input preparation and projections; its output operator chunks Q projection, attention, and
-output projection by query window:
-
-| Tokens | Input preparation | Q | K | Mean + V | Sparse attention | Output projection | Total |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8,192 | 0.36 | 2.32 | 2.68 | 2.24 | 2.45 | 2.39 | 12.43 |
-| 32,768 | 1.14 | 9.07 | 10.58 | 8.63 | 35.04 | 9.44 | 73.90 |
-| 100,000 | 2.86 | 27.42 | 34.04 | 26.45 | 332.37 | 28.85 | 451.98 |
-
-Sparse attention grows with the square of the sequence, from 20% of the block at 8K tokens
-to 74% at 100K, while the Q/K/V projections fall from 58% to 19%. K includes the shared
-centered encoder that quantizes its BF16 rows. With
-`benchmark_sparse_piper_projection.py --sequence 8192 32768 100000`, the SM89 Gluon
-projections reached 274-276 TOPS for Q, 229-236 TOPS for K, and 286-292 TOPS for V in CUDA
-graphs. `benchmark_sparse_piper.py --head-dim 128 --heads 56 --sequence 8192 32768 100000
---ratios 0.25 1.0 --routing minmax --samples 7` measured sparse attention alone:
-
-| Tokens | 25% keep kernel | Routing | Full-keep kernel | BF16 Q/K/V preparation |
-|---:|---:|---:|---:|---:|
-| 8,192 | 2.30 ms, 209 TOPS | 0.67 ms | 8.61 ms, 224 TOPS | 1.37 ms |
-| 32,768 | 34.35 ms, 224 TOPS | 2.78 ms | 134.72 ms, 228 TOPS | 5.13 ms |
-| 100,000 | 324.70 ms, 221 TOPS | 13.69 ms | 1285.21 ms, 223 TOPS | 16.48 ms |
-
-Kernel TOPS count only the selected QK and PV work. The standalone call quantizes BF16 Q/K/V
-before attention; the fused projections emit those INT8 operands and routing summaries
-directly, so that preparation does not appear in the block.
-
-Compiler inspection and external profiling are available for one shape at a time:
+Triton providers can report registers, spills, shared memory, warps, resource
+residency ceilings, and available PTX/SASS instruction counts:
 
 ```shell
-uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --providers sage_attention_2pp \
-  --compiler-report --compiler-json artifacts/sage_attention_2pp_compiler.json
-
 uv run python benchmarks/benchmark_attention.py \
   --sequence 8192 --providers piper_attention --compiler-report --no-sass
-
-nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
-  uv run python benchmarks/benchmark_attention.py \
-  --sequence 8192 --profile --profile-provider sage_attention_2pp
 ```
 
-When more than one Triton provider is selected, use `--compiler-provider` to choose which
-one to inspect. Combined profiling and compiler inspection must target the same provider.
-
-### SageAttention2++ regression baseline
-
-The issue #8 productionization was validated on an RTX 5090 (SM120) with Torch
-2.12.1+cu130 and Triton 3.7.1. For FP16 B1/H8/D128 non-causal self-attention at
-N=8192, a one-second warmed sample measured:
-
-| provider | device p50 [p20, p80] (ms) | synchronized wall p50 [p20, p80] (ms) | mean absolute error vs SDPA |
-|:---|---:|---:|---:|
-| pure Triton SageAttention2++ | 0.637 [0.635, 0.641] | 0.666 [0.665, 0.668] | 0.000563 |
-| canonical CUDA SageAttention2++ | 0.610 [0.608, 0.611] | 0.618 [0.612, 0.620] | 0.000563 |
-| canonical CUDA SageAttention2 | 0.707 [0.705, 0.708] | 0.707 [0.706, 0.709] | 0.000561 |
-| PyTorch SDPA | 1.692 [1.689, 1.695] | 1.702 [1.699, 1.717] | 0 |
-
-The pure-Triton attention specialization used 255 registers per thread, 8 compiler-reported
-spills, 49,704 bytes of shared memory per workgroup, and four warps. Its SASS contained the
-expected 64 signed INT8 QK MMA instructions and 64 E4M3 x E4M3 to FP16 PV MMA instructions.
-The complete GPU suite passed 155 tests. These measurements are a regression reference for
-this hardware/software stack, not a portable performance guarantee.
-
-### PyTorch 2.13 migration checkpoint
-
-The minimum-version upgrade was benchmarked on an RTX 5090 (SM120), driver 595.71.05,
-Python 3.14.6, CUDA 13.0, and Triton 3.7.1. Each result is the median of three process-level
-medians using BF16 B1/H8/D128 non-causal self-attention, a 300 ms warmup window, and a
-1.5 second measurement window. Positive deltas mean Torch 2.13 was slower.
-
-| sequence | Torch 2.12.1 hot (ms) | Torch 2.13.0 hot (ms) | hot delta | Torch 2.12.1 complete (ms) | Torch 2.13.0 complete (ms) | complete delta |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1,024 | 0.0366 | 0.0372 | +1.57% | 0.0931 | 0.0927 | -0.46% |
-| 2,048 | 0.0822 | 0.0825 | +0.31% | 0.1352 | 0.1349 | -0.24% |
-| 4,096 | 0.1741 | 0.1741 | +0.00% | 0.2238 | 0.2231 | -0.30% |
-| 8,192 | 0.6124 | 0.6124 | +0.00% | 0.6479 | 0.6471 | -0.13% |
-| 16,384 | 2.2415 | 2.2395 | -0.09% | 2.2600 | 2.2558 | -0.18% |
-
-The 1K hot result differs by one device-timer quantum (about 0.0006 ms). At larger shapes,
-Torch 2.13 changed hot latency by at most 0.31% and slightly improved every complete-operator
-median. All reported quality metrics were identical between versions.
-
-### SageAttention2++ SM89 tuning checkpoint
-
-The pure-Triton SageAttention2++ path was tuned on an RTX 4070 Ti SUPER (SM89)
-under Windows 11, driver 596.49, Python 3.14.7, Torch 2.12.1+cu130, CUDA 13.0,
-and Triton 3.7.1.post27. BF16 B1/H8/D128 warmed device-event medians measured:
-
-| sequence | execution | pure Triton (ms) | canonical CUDA (ms) | gap |
-|---:|:---|---:|---:|---:|
-| 8,192 | non-causal | 1.320 | 1.326 | -0.5% |
-| 8,192 | causal | 0.914 | 0.924 | -1.1% |
-| 32,768 | non-causal | 20.241 | 19.987 | +1.3% |
-| 32,768 | causal | 11.060 | 11.130 | -0.6% |
-| 131,072 | non-causal | 310.977 | 302.304 | +2.9% |
-| 131,072 | causal | 164.773 | 157.340 | +4.7% |
-
-Negative gaps mean Triton was faster. The retained D128 causal schedule uses 128
-query rows, four warps, two launch stages, and reverse CTA ordering. The non-causal D128 path uses
-128 query rows, four warps, 64-key tiles, loop-invariant-code motion, and a three-stage loop
-pipeline. Current production applies these measured schedules uniformly rather than retaining an
-8K dispatch boundary. Packed native
-`cvt.rn.satfinite.e4m3x2.f32` replaces stock Triton's software E4M3 conversion
-on the SM89 probability and V paths. These imported measurements establish a 5%
-non-inferiority checkpoint at 8K and above; sub-8K performance was not reproduced locally without
-SM89 hardware.
-
-### Packed E4M3 conversion SM120 portability check
-
-The packed conversion was separately A/B tested on an RTX 5090 (SM120), driver
-595.71.05, Python 3.14.6, Torch 2.12.1+cu130, and Triton 3.7.1. Each result below is
-the median process result from three rounds with BF16 B1/H8 inputs, 300 ms warmup
-windows, and 1.5 second measurement windows. The 8K/32K runs alternated baseline and
-packed worktrees; the 128K runs rotated clean, ungated, and selective worktrees:
-
-| execution | head dim | sequence | ungated packed hot-latency change |
-|:---|---:|---:|---:|
-| non-causal | 64 | 8,192 / 32,768 | +0.27% / -0.12% |
-| causal | 64 | 8,192 / 32,768 | -0.88% / -0.40% |
-| non-causal | 128 | 8,192 / 32,768 | -0.51% / -0.38% |
-| causal | 128 | 8,192 / 32,768 | +1.50% / +1.61% |
-| non-causal | 128 | 131,072 | -0.94% |
-| causal | 128 | 131,072 | +1.40% |
-
-Compiler inspection showed the packed D128 causal attention kernel increasing from
-22 to 24 spills, while the packed fused-V quantizer added eight SASS instructions.
-The earlier selective policy kept stock conversion for that path: a final three-round
-comparison measured +0.02% / -0.05% hot deltas at causal D128 8K / 32K. At 128K, it
-retained a -1.19% non-causal gain and measured -0.07% causal versus clean; the
-corresponding ungated attention kernel raised causal spills from 18 to 20. A later H16/H48
-screen found stock conversion faster in five of six causal D128 anchor cells: packed
-conversion was about 1.5–2.8% slower except for a 0.6% H16/32K win. The current cleanup
-therefore uses stock conversion uniformly on exact SM120 rather than retaining a
-shape-specific branch. Quality metrics were unchanged.
-
-### Piper Attention regression baseline
-
-Issue #6 was validated on an RTX 5090 (SM120) with Torch 2.12.1+cu130 and
-Triton 3.7.1. BF16 non-causal self-attention measured the following warmed
-latencies; Piper Attention's hot column is its prepared fused recurrence, while the complete
-column includes all preprocessing. The uncentered rows are historical development controls;
-the production operator centers non-causal V and leaves causal V uncentered.
-
-| shape | provider | hot device p50 [p20, p80] (ms) | complete wall p50 [p20, p80] (ms) | SQNR vs SDPA (dB) |
-|:---|:---|---:|---:|---:|
-| B1/H8/N8192/D128 | Piper Attention centered | 0.674 [0.672, 0.676] | 0.775 [0.772, 0.779] | 36.08 |
-| B1/H8/N8192/D128 | Piper Attention uncentered | 0.675 [0.674, 0.677] | 0.776 [0.774, 0.778] | 36.05 |
-| B1/H8/N8192/D128 | Piper Attention affine fallback | 0.706 [0.703, 0.710] | 0.785 [0.784, 0.787] | 36.08 |
-| B1/H8/N8192/D128 | pure Triton SageAttention2++ | 0.637 [0.636, 0.639] | 0.669 [0.668, 0.671] | 28.12 |
-| B1/H8/N8192/D128 | canonical CUDA SageAttention2++ | 0.609 [0.607, 0.610] | 0.614 [0.607, 0.617] | 28.13 |
-| B1/H1/N131072/D128 | Piper Attention uncentered | 19.579 [19.371, 19.600] | 19.824 [19.806, 19.845] | 35.48 |
-| B1/H1/N131072/D128 | pure Triton SageAttention2++ | 17.647 [17.611, 17.708] | 17.823 [17.777, 17.926] | 28.33 |
-| B1/H1/N131072/D128 | canonical CUDA SageAttention2++ | 17.155 [16.992, 17.171] | 17.177 [17.023, 17.195] | 28.33 |
-
-At N=8192 the fused Piper Attention specialization used 254 registers per thread, 12
-compiler-reported spills, 33,588 bytes of shared memory, and four warps. Its PTX
-contained 64 signed INT8 QK MMA instructions and 64 native `U8.S8` PV MMA
-instructions. Preprocessing kernels reported no spills. These measurements are a
-regression checkpoint, not a cross-device performance guarantee.
-
-The production implementation was also replayed on the cached Diffusers BF16
-LTX-2.3 attention call used during development (`B1/H32/N6144/D128`). The table
-reports global quality and the lowest per-head SQNR; the ignored local capture is
-not a repository fixture because the versioned capture/replay format belongs to
-issue #11.
-
-| provider | global SQNR (dB) | relative L1 | mean absolute error | max absolute error | worst-head SQNR (dB) |
-|:---|---:|---:|---:|---:|---:|
-| Piper Attention centered | 38.96 | 0.960% | 0.000907 | 0.0703 | 33.72 |
-| Piper Attention uncentered | 38.96 | 0.962% | 0.000909 | 0.0781 | 33.70 |
-| pure Triton SageAttention2++ | 32.43 | 2.292% | 0.002166 | 0.1250 | 28.18 |
-
-This ordinary call has little V bias, so centering is nearly neutral. The committed
-adversarial biased-V regression covers the centered path, and the constant-V regression
-requires exact restoration.
-
-## Triton compiler inspection
-
-Providers register the Triton JIT functions they launch through
-`triton_jit_functions`. After the provider has run at least once, the shared inspector
-discovers its compiled specialization and reports:
-
-- registers per thread, compiler-reported spills, shared memory and warps per workgroup,
-  stages, and CUDA CTAs per cluster;
-- a resource-only workgroup and warp residency ceiling per compute unit from the device
-  limits exposed by PyTorch, including the limiting resource;
-- static PTX instruction-family and MMA-opcode counts when PTX is available;
-- static SASS instruction-family and MMA-opcode counts for NVIDIA CUDA kernels.
-
-The residency value is a ceiling, not achieved occupancy. It does not model every
-architecture's allocation granularity or replace hardware profiling. For CUDA
-specializations with more than one CTA per cluster, resources and residency remain
-workgroup/CTA-level values; they do not claim to predict active cluster residency.
-Static instruction counts describe one compiled program, not dynamic execution counts.
-
-The integer P x V benchmark is the executable reference integration:
-
-```shell
-uv run python benchmarks/benchmark_integer_pv_dot.py s8-s8 \
-  --compiler-report \
-  --compiler-json artifacts/s8-s8-compiler.json
-```
-
-SASS inspection invokes `nvdisasm` from the NVIDIA CUDA Toolkit. It is enabled
-automatically for CUDA compiler reports and disabled for other Triton backends. If the
-tool is absent, the inspector gives an actionable error; use `--no-sass` when only the
-portable resource report and available compiler IR are needed, or use
-`--nvdisasm /path/to/nvdisasm` when the toolkit binary is not on `PATH`. ROCm resource
-reporting uses the same provider and specialization model, while AMDGCN disassembly
-remains a separate future backend adapter.
-
-All Triton-cache and compiled-metadata access lives in `lib/triton_inspection.py`.
-Specialized diagnostics can read an artifact without depending on Triton internals:
-
-```python
-from lib.triton_inspection import compiled_artifact
-
-ttgir = compiled_artifact(jit_kernel, "ttgir")
-```
-
-Compiler JSON has its own versioned `triton_compiler` record type and includes provider
-configuration, environment and Git metadata, specialization fingerprints, resources,
-and instruction summaries for comparison across commits. `--compiler-json` writes an
-array and `--compiler-jsonl` writes one compiler record per line through the same output
-machinery as benchmark records.
-
-Compiler reporting requires each registered JIT function to have one specialization in
-the current process by default. This prevents one provider from silently claiming
-specializations compiled earlier by another provider. Run compiler comparisons as one
-provider/configuration per process; advanced diagnostics that intentionally inspect an
-entire process-wide cache must opt out explicitly.
-
-## External profiler captures
-
-`profile_provider()` launches either `prepared_execution` or `operator_end_to_end` for
-any `BenchmarkProvider`. By default, its initial compilation call and warmup iterations
-finish and synchronize before the CUDA profiler starts. Passing
-`--profile-include-setup` explicitly includes them in a separate `profile/setup` NVTX
-range.
-
-For example, capture the integer P x V provider with Nsight Systems:
+Residency is a resource ceiling, not achieved occupancy; static instruction
+counts are not dynamic execution counts. Compiler comparisons use one
+provider/configuration per process so cached specializations cannot be
+misattributed. `--compiler-json` and `--compiler-jsonl` save versioned
+`triton_compiler` records with environment, configuration, and specialization
+fingerprints. NVIDIA SASS inspection requires `nvdisasm`; use `--nvdisasm`
+to locate it or `--no-sass` for portable metadata/available IR. AMDGCN
+disassembly is not integrated.
 
 ```shell
 nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
@@ -1438,7 +239,10 @@ nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
   --profile --profile-phase prepared_execution
 ```
 
-The launch loop accepts an injected capture controller so a future ROCTracer/ROCTx
-adapter can reuse its provider-phase and setup-exclusion behavior. The built-in
-controller intentionally reports a clear unsupported-backend error on ROCm rather than
-presenting CUDA profiler APIs as portable.
+The default profile excludes compilation and warmup. `--profile-include-setup`
+adds them in a separate NVTX range. This capture controller is CUDA-only.
+When a runner has multiple providers, select the compiler/profile provider
+explicitly and keep both selections aligned. Shared implementations live in
+[`lib/timing.py`](lib/timing.py), [`lib/reporting.py`](lib/reporting.py),
+[`lib/triton_inspection.py`](lib/triton_inspection.py), and
+[`lib/profiling.py`](lib/profiling.py).

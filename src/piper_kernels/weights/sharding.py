@@ -99,7 +99,8 @@ def shard_quantized_weight[Weight: QuantizedWeight](
 
     For DTensor integration, install the result with ``DTensor.from_local``
     before applying a matching ``ColwiseParallel`` or ``RowwiseParallel``
-    plan. See the README example for device movement and global shape metadata.
+    plan. See docs/weights.md#shard-a-quantized-weight for device movement
+    and global shape metadata.
     """
     dim = _validate_partition(weight, dim, start, length)
     if isinstance(weight, ConvRotInt8Tensor):

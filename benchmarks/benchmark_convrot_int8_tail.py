@@ -2,7 +2,8 @@
 
 The original split and fully masked launchers are benchmark-only controls for
 the production single-launch kernel. All three use caller-owned buffers and CUDA graph replay.
-Full-linear timings include rotation/quantization. Acquire the shared GPU gate first.
+Full-linear timings include rotation/quantization.
+See benchmarks/README.md for measurement and reproducibility guidance.
 """
 
 # Triton's launch options are not part of the kernel's Python signature.

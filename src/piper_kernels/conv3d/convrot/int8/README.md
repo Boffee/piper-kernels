@@ -1,186 +1,52 @@
-# Static-scale ConvRot INT8 Conv3D
+# ConvRot INT8 Conv3D integration
 
-`ConvRotInt8Tensor` represents both linear and convolution weights.
-`ConvRotInt8Conv3d` is a thin inference layer consuming a convolution weight,
-plus bias, stride, and spatial padding. Quantization state belongs to the weight.
+For a first conversion and inference example, see
+[weights](../../../../../docs/weights.md). `ConvRotInt8Tensor` represents both
+linear and convolution weights. `ConvRotInt8Conv3d` owns the inference layer's
+bias, stride, and padding; quantization state belongs to the weight.
 
-- Input: FP16 or FP32 NCTHW, including noncontiguous inputs. Output and residual: FP16.
-  FP32 inputs retain normalization precision through INT8 preparation.
-- Logical weight: `[out, in, 3, 3, 3]`, with FP16, BF16, or FP32 logical dtype.
-- Packed `qdata`: contiguous INT8 `[out, 3, 3, 3, in]`.
-- Weight `scale`: contiguous FP32 `[out, 1]`, one per output channel.
-- `act_per_tensor_scale`: one finite positive FP32 scalar tensor on the weight
-  device, shared across all channels, positions, frames, and calls. Conversion
-  and dequantization can omit it; convolution execution requires it.
-- Input channels: powers of two from 64 through 4096, divisible by rotation
-  group size (16, 64, or 256). This bounds the full `27 * channels` INT32 sum.
-- Optional bias: FP16, one per output channel, including noncontiguous storage.
-- Temporal padding: two zero frames before the input. Spatial padding:
-  `reflect`, `reflect_right` (bottom/right only), or `none`. Reflection requires
-  height and width greater than one. Strides are three positive integers;
-  dilation and convolution groups are not supported.
+## Data and execution contract
 
-Optimized backends target NVIDIA SM120, NVIDIA SM8x (SM80, SM86, SM87, SM89), and ROCm
-RDNA4 (`gfx1200`/`gfx1201`); other devices use the portable reference. RX 9070 XT
-(`gfx1201`) and RTX 4070 Ti SUPER (SM89) have hardware correctness/performance coverage;
-`gfx1200` also has offline compilation coverage.
+| Value | Contract |
+|---|---|
+| Input | FP16 or FP32 NCTHW, including noncontiguous inputs. |
+| Output / optional residual | FP16. |
+| Logical weight | `[out, in, 3, 3, 3]`, FP16/BF16/FP32 logical dtype. |
+| Packed `qdata` | Contiguous INT8 `[out, 3, 3, 3, in]`. |
+| Weight `scale` | Contiguous FP32 `[out, 1]`, one per output channel. |
+| `act_per_tensor_scale` | One finite positive FP32 scalar tensor on the weight device, shared across positions, frames, and calls. Execution requires it; conversion/dequantization can omit it. |
+| Input channels | Powers of two from 64 through 4096, divisible by rotation group size 16, 64, or 256. This bounds the full `27 * channels` INT32 sum. |
+| Bias | Optional FP16 vector, one value per output channel; noncontiguous storage is supported. |
+
+Temporal padding adds two zero frames before the input. Spatial padding is
+`reflect`, `reflect_right` (bottom/right only), or `none`; reflection requires
+height and width greater than one. Strides are three positive integers.
+Dilation and convolution groups are unsupported.
+
 GroupNorm statistics, affine transforms, SiLU, rotation, rescaling, bias, and
-residual addition use FP32 intermediates. The convolution accumulates INT8
-products in INT32. Eliminated FP16 intermediate rounding is not reproduced.
+residual addition use FP32 intermediates; INT8 products accumulate in INT32.
+The fused path does not reproduce eliminated FP16 intermediate rounding. FP32
+inputs retain normalization precision through preparation.
 
-The public operations and weight format are shared. `_backend.py` selects a
-vendor implementation; `_nvidia/` and `_amd/` own target support and launch policy.
+Quantization rotates input-channel groups independently at each kernel position
+and derives one scale over each output channel's complete filter. Dequantization
+applies scales and inverse rotation in FP32, restores logical layout, and casts
+to the requested dtype. It is lossy. Transpose, linear execution, GGUF conversion,
+matrix updates, and weight sharding remain 2-D operations.
 
-| Module | Responsibility |
-| --- | --- |
-| Vendor `policy.py` | Select preparation, convolution, and weight-load choices from target and shape metadata. |
-| `_plan.py` | Define immutable schedule values and the concrete `ConvolutionExecutionPlan`. |
-| `_dispatch.py` | Resolve input/output dimensions and weight alignment for production and tuning. |
-| Vendor `dispatch.py` | Select a plan through typed backend entry points and invoke shared execution. |
-| `triton.py` | Run shared preparation and convolution kernels using the selected plan. |
+## Checkpoints and offloading
 
-Preparation uses input rows; convolution uses output rows after padding and stride.
-`PreparationSchedule` and `ConvolutionSchedule` describe individual kernel launches;
-`ConvolutionExecutionPlan` combines those schedules with the weight-load choice.
-Plans contain concrete choices and carry no architecture flags or policy callbacks.
-The tuner supplies an explicit convolution tile to the same selector, retaining
-production preparation and recomputing descriptor eligibility for that tile.
+Quantize offline with `from_hp()`, which allocates storage. Save `qdata`, `scale`,
+`act_per_tensor_scale`, `group_size`, and logical dtype. The engine manifest owns
+source-model fingerprints and calibration provenance; architecture supplies
+stride, padding, and bias placement. The tensor flatten/unflatten protocol
+exposes the storage and metadata to checkpoint and offload integrations.
 
-AMD uses HIP quantization rounding and pointer-based weight loads. NVIDIA selects
-SM120 or SM8x tiles; only SM120 uses weight descriptors, since SM8x has no TMA. SM120's 128x128
-four-warp tile spills registers on SM8x, so SM8x uses 64x128 tiles, 64x64 tiles below
-2,048 output rows, and 32x32 tiles for at most 64 outputs. No activation-scale conversion
-or checkpoint migration is needed when moving between supported devices.
-
-## ROCm validation and benchmarks
-
-Use an existing ROCm environment; the repository's default `uv` sources select CUDA:
-
-```shell
-PYTHONPATH=src /path/to/rocm-env/bin/python -m pytest -o addopts='' tests/conv3d/convrot/int8
-PYTHONPATH=src /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d.py
-```
-
-The hardware regressions also run through `scripts/run_rocm_regressions.py`.
-They cover FP16/FP32 and noncontiguous inputs, all padding modes, channel counts
-through 4096, exact INT32 accumulation, fused normalization, dynamic compilation,
-and graph capture with live activation-scale changes. Offline tests check integer
-matrix instructions on SM120, SM89, and both RDNA4 targets.
-
-The shared CUDA/ROCm benchmark reports plain and fused convolution timings against the portable
-reference and standard PyTorch ROCm FP16 convolution, with cache-flushed and
-graph-replay measurements. The FP16 baselines use both contiguous and
-`channels_last_3d` inputs/weights. They include matching causal/reflection padding
-and, for the fused comparison, eager framewise GroupNorm and SiLU. Logical FP16
-weight reconstruction and initial layout conversions happen outside timing;
-normalization, activation, padding, and any internal layout copies remain timed.
-FP16 omits activation quantization and retains FP16 intermediate rounding, so it
-is a performance baseline rather than the INT8 correctness oracle.
-
-Repeat `--shape N,C,T,H,W,O` to select synthetic cases; `--dtype float32` selects
-FP32 input for INT8/reference (the FP16 baseline still uses FP16), and `--tune`
-sweeps prepared convolution tiles without changing production policy.
-`--vendor-benchmark` enables vendor algorithm search before timing. The report
-records that setting and `PYTORCH_MIOPEN_SUGGEST_NHWC`, which gates native
-channels-last MIOpen execution in the tested PyTorch build.
-`--skip-reference-timing` skips only the portable reference's timings, retaining
-the correctness comparison. These measurements do not establish performance or
-quality for an entire encoder or a real checkpoint.
-
-Initial RX 9070 XT measurements (2026-09-19, FP16 inputs, graph replay, milliseconds):
-
-These tables were measured with the former ROCm-only runner. The shared runner uses
-the same workloads and correctness checks; `--samples 1` reproduces the original
-single measurement per mode, with results now written through `--json`/`--jsonl`.
-
-| N,C,T,H,W,O | Native plain | Reference plain | Native fused | Reference fused |
-| --- | ---: | ---: | ---: | ---: |
-| 1,128,5,64,64,128 | 0.106 | 3.399 | 0.121 | 4.544 |
-| 1,256,3,32,32,256 | 0.064 | 1.606 | 0.070 | 1.667 |
-| 1,512,3,16,16,512 | 0.078 | 1.450 | 0.084 | 1.947 |
-
-These compare with the portable quantized reference, not a vendor-tuned FP16
-convolution. They use the benchmark's seeded synthetic weights and default
-reflection padding, stride, and scales. Environment: Python 3.13.13,
-PyTorch `2.14.0+rocm10.1.0a20260908`, HIP `7.16.26354`, Triton 3.8.0;
-command: `PYTHONPATH=src /path/to/rocm-env/bin/python
-benchmarks/benchmark_convrot_int8_conv3d.py --rep-ms 100 --samples 1`.
-
-Standard FP16 comparison on the same RX 9070 XT/software stack (2026-09-19):
-median of three separate process runs, graph replay, milliseconds, with
-`--rep-ms 100 --vendor-benchmark` and `PYTORCH_MIOPEN_SUGGEST_NHWC=1`. The table
-selects the faster FP16 layout per operation/shape: contiguous for C=128 and
-plain C=256; native channels-last for fused C=256 and both C=512 operations.
-
-To reproduce the FP16 comparison, run the following command in three separate
-processes and take the median for each reported timing:
-
-```shell
-PYTORCH_MIOPEN_SUGGEST_NHWC=1 PYTHONPATH=src \
-  /path/to/rocm-env/bin/python benchmarks/benchmark_convrot_int8_conv3d.py \
-  --rep-ms 100 --samples 1 --vendor-benchmark --skip-reference-timing
-```
-
-| N,C,T,H,W,O | INT8 plain | FP16 plain | Plain speedup | INT8 fused | FP16 GN/SiLU/conv | Fused speedup |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,128,5,64,64,128 | 0.107 | 0.317 | 2.97x | 0.122 | 0.405 | 3.31x |
-| 1,256,3,32,32,256 | 0.065 | 0.190 | 2.90x | 0.071 | 0.237 | 3.34x |
-| 1,512,3,16,16,512 | 0.079 | 0.191 | 2.43x | 0.085 | 0.219 | 2.57x |
-
-Ratios use unrounded timings. Both paths include padding; the INT8 path includes
-rotation/quantization. FP16 uses the dequantized logical filter, with no runtime
-weight conversion. Three additional runs with the default MIOpen layout setting
-favored contiguous FP16 for every case (plain: 0.317/0.190/0.209 ms;
-GN/SiLU/conv: 0.404/0.238/0.234 ms).
-
-MIOpen's first algorithm search logged unavailable candidate kernels in this
-nightly build, but execution and correctness checks completed;
-the repeat runs had no MIOpen search errors. With native channels-last enabled,
-the portable FP32 reference became very slow (about 700 ms); the two repeat runs
-therefore used `--skip-reference-timing`, while still checking correctness against
-it. Results characterize this installed stack, not an exhaustive search over
-ROCm versions or convolution implementations.
-
-## Quantize and dequantize weights
-
-Use the same weight conversion API as linear ConvRot INT8 and ConvRot NVFP4:
+Reconstruct a prequantized convolution from loaded checkpoint tensors:
 
 ```python
 import torch
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-
-weight = ConvRotInt8Tensor.from_hp(
-    dense_weight,  # [out, in, 3, 3, 3]
-    group_size=64,
-    act_per_tensor_scale=torch.tensor(
-        calibrated_input_scale,
-        dtype=torch.float32,
-        device=dense_weight.device,
-    ),
-)
-reconstructed = weight.dequantize(output_dtype=torch.float32)
-```
-
-Quantization rotates input-channel groups independently at each kernel position
-and derives one weight scale over the complete filter for each output channel.
-Dequantization applies the scales and inverse rotation in FP32, restores the
-logical layout, and casts to the requested dtype (default: the logical dtype).
-The result approximates the original weight; quantization is lossy.
-
-Linear execution uses the stored static input scale when present and dynamic
-per-row scaling otherwise. Matrix transpose, linear execution, GGUF conversion,
-matrix updates, and weight sharding remain 2-D operations.
-
-## Save offline and load without copying
-
-Run `from_hp()` when producing the checkpoint: it allocates new storage.
-Store `qdata`, `scale`, and `act_per_tensor_scale`, plus the weight's `group_size`
-and logical dtype. TorchAO's `__tensor_flatten__` / `__tensor_unflatten__`
-protocol exposes these tensors and metadata for checkpoint/offload integrations.
-Keep source-model fingerprints and calibration provenance in the engine manifest.
-Stride, padding, and bias placement come from the model architecture.
-
-```python
 from piper_kernels.conv3d.convrot.int8 import ConvRotInt8Conv3d
 
 weight = ConvRotInt8Tensor.from_quantized(
@@ -191,41 +57,58 @@ weight = ConvRotInt8Tensor.from_quantized(
     act_per_tensor_scale=loaded_input_scale,
 )
 conv = ConvRotInt8Conv3d(weight, loaded_bias, stride=(1, 1, 1), padding="reflect")
-output = conv(activation)
 ```
 
-Contiguous checkpoint storage is reused, including mmap storage from safetensors
-or `torch.load(..., mmap=True)`. A flat weight scale is reshaped without copying.
-Noncontiguous storage is canonicalized by `from_quantized()`; converters should
-write the packed layout directly to retain mmap backing during loading.
+Contiguous storage is reused, including checkpoint mappings; a flat scale can
+be reshaped without copying. `from_quantized()` canonicalizes noncontiguous
+storage, so converters should write the packed layout directly to preserve
+mapped backing. The layer registers inference parameters `weight` and optional
+`bias`. Follow the shared [checkpoint-loading guidance](../../../../../docs/weights.md#storage-and-checkpoint-compatibility)
+to preserve storage. `weights_only=True` loading needs `ConvRotInt8Tensor` in
+`torch.serialization.safe_globals`.
 
-The layer registers ordinary inference parameters `weight` and optional `bias`.
-PyTorch state dictionaries serialize the tensor subclass; load with
-`load_state_dict(..., assign=True)` to preserve checkpoint storage. For
-`weights_only=True`, allowlist `ConvRotInt8Tensor` with
-`torch.serialization.safe_globals`. Logical dtype changes preserve INT8 weight
-data and FP32 weight/activation scales. Device moves include every inner tensor.
-The logical weight uses contiguous layout; channels-last memory-format requests
-are unsupported. Packing and output dtype conversion are combined into one copy
-when quantizing or dequantizing convolution weights.
+Logical dtype changes preserve INT8 data and FP32 weight/activation scales.
+Device moves include every inner tensor. The logical weight is contiguous;
+channels-last memory-format requests are unsupported. Convolution quantization
+and dequantization combine packing and output dtype conversion into one copy.
 
-Offload's ConvRot INT8 adapter must capture and reconstruct all three storage
-fields, including optional `act_per_tensor_scale`, as its NVFP4 adapter does.
-Offload validation requires canonical contiguous storage and never repacks it.
-There is no separate prepared-weight cache. Compiled calls read the current
-weight tensors and observe weight and activation-scale replacement.
+Offload adapters must preserve all three storage fields, including the optional
+activation scale. Offload validation requires canonical contiguous storage and
+never repacks it. There is no prepared-weight cache: compiled calls read current
+weight tensors and observe weight or activation-scale replacement.
+
+## Backend ownership
+
+Optimized execution targets NVIDIA SM120/SM8x and RDNA4 (`gfx1200`/`gfx1201`);
+other targets use the portable reference. RX 9070 XT and RTX 4070 Ti SUPER have
+hardware coverage; `gfx1200` has offline compilation coverage.
+
+[_backend.py](_backend.py) selects typed vendor entry points. Vendor policy
+selects preparation, convolution, and weight loading from target/shape metadata.
+[_plan.py](_plan.py) combines `PreparationSchedule` and `ConvolutionSchedule`
+into a concrete `ConvolutionExecutionPlan`; [_dispatch.py](_dispatch.py) resolves
+dimensions/alignment and [triton.py](triton.py) runs shared kernels.
+Preparation schedules use input rows; convolution schedules use output rows
+after padding and stride. The tuner substitutes a convolution tile while
+retaining production preparation and recomputing descriptor eligibility.
+
+AMD uses HIP quantization rounding and pointer weight loads. Only SM120 uses
+weight descriptors; SM8x uses its own tiles to avoid the register pressure of
+SM120 schedules. Moving checkpoints between supported targets needs no
+activation-scale conversion. Follow the
+[validation contract](../../../../../docs/development.md#validation-contract).
+Use the [shared Conv3D benchmark](../../../../../benchmarks/README.md#convrot-int8)
+for quantized correctness and matching FP16 performance comparisons.
 
 ## MiniMax-H3 integration
 
-`piper_kernels.specializations.minimax_h3_vae.conv3d.P995_INPUT_SCALES`
-contains candidate input scales for 29 encoder convolutions. Existing H3
-selection uses rotation groups of 64 for 128 input channels and 256 otherwise.
-RGB input convolutions and 1x1 shortcuts are excluded. These constants are
-candidate calibration data; the engine owns checkpoint compatibility and quality
-validation. Weight conversion uses `ConvRotInt8Tensor.from_hp()` directly.
+`piper_kernels.specializations.minimax_h3_vae.conv3d.P995_INPUT_SCALES` contains
+candidate scales for 29 encoder convolutions. Existing selection uses group 64
+for 128 input channels and 256 otherwise, excluding RGB input convolutions and
+1x1 shortcuts. The engine owns layer eligibility, checkpoint compatibility,
+installation, and quality validation; these constants are candidate calibration.
 
-Install `ConvRotInt8Conv3d` layers from the prequantized checkpoint, then compile
-the encoder under `torch.no_grad()` or inference mode:
+Install prequantized layers and compile the encoder for inference:
 
 ```python
 from piper_kernels.specializations.minimax_h3_vae import (
@@ -239,23 +122,17 @@ encoder.compile(
 )
 ```
 
-The pre-grad rewrite recognizes H3's framewise GroupNorm, SiLU, reflection
-padding, and optional residual around an explicit ConvRot convolution. It needs
-static shapes and leaves unsupported or shared patterns unfused. It does not
-quantize arbitrary floating-point Conv3D nodes.
+Run under `torch.no_grad()` or inference mode. The pre-grad rewrite matches
+framewise GroupNorm, SiLU, reflection padding, and optional residual around an
+explicit ConvRot convolution. It requires static shapes and leaves unsupported
+or shared patterns unfused. It does not quantize floating-point Conv3D nodes.
 
-Keep the original model forwards. For downsamplers, leave the caller's
-bottom/right reflection and install the convolution with `padding="none"`;
-the compiler absorbs the pad. Use `reflect_right` directly only if the caller's
-padding has been removed. Encoder options remain independent of the INT8 and
-NVFP4 decoder options and can be composed with them.
+Keep original forwards. For downsamplers, retain the caller's bottom/right
+reflection and set the convolution to `padding="none"` so the compiler absorbs
+the pad. Use `reflect_right` only when caller-side padding has been removed.
+Encoder options are independent of, and composable with, decoder options.
 
-The earlier experimental engine's private convolution/block/encoder wrappers
-and runtime weight quantization should be replaced by this shared weight API,
-the thin convolution layer, and the graph pass. Engine still owns layer
-eligibility, checkpoint selection, and installation.
-
-The fused boundary uses separate statistics, preparation, and convolution
-launches, allocating a full INT8 activation and small FP32 statistics buffers.
-Full-encoder quality, peak memory, and end-to-end performance still need
-validation with the actual checkpoint and engine.
+The fused boundary has separate statistics, preparation, and convolution
+launches, with a full INT8 activation and small FP32 statistics buffers.
+Operator validation does not establish full-encoder quality, memory, or speed;
+those require the actual checkpoint and engine.
