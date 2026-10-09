@@ -12,7 +12,7 @@ from piper_kernels._input_activations import (
 )
 from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
-from .suite_types import normal_tensor
+from .inputs import normal_tensor
 
 type ConvRotInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 

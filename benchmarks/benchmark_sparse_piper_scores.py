@@ -14,10 +14,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
-from lib.cases import AttentionCase, PipelineCase, named_case
+from lib.case_cli import require_case, set_case_arguments
+from lib.cases import AttentionCase, PipelineCase
 from lib.environment import EnvironmentInfo, capture_environment
+from lib.inputs import normal_tensor
 from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
-from lib.suite_types import normal_tensor
 from lib.timing import ClockDomain, PhaseTimings, Timing, triton_benchmark
 
 from piper_kernels._triton.runtime import device_context
@@ -30,7 +31,7 @@ _WARMUP_MS = 20
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="shared attention or pipeline case")
     parser.add_argument("--sequence", type=int, nargs="+")
     parser.add_argument("--batch", type=int)
@@ -46,16 +47,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     workload = ("sequence", "batch", "heads", "kv_heads", "head_dim", "seed")
     custom = any(getattr(args, key) is not None for key in workload)
-    if args.case is not None and custom:
-        parser.error("--case cannot be combined with custom workload flags")
     if args.case is None and not custom:
         args.case = "sparse-attention-video-low-half"
-    try:
-        case = named_case(args.case or "sparse-attention-video-low-half")
-    except ValueError as error:
-        parser.error(str(error))
-    if not isinstance(case, (AttentionCase, PipelineCase)):
-        parser.error("--case requires an attention or pipeline case")
+    case = require_case(
+        args.case or "sparse-attention-video-low-half", (AttentionCase, PipelineCase)
+    )
     defaults = {
         "sequence": [case.sequence],
         "batch": case.batch,
@@ -64,6 +60,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "head_dim": case.head_dim,
         "seed": case.seed,
     }
+    if args.case is not None:
+        set_case_arguments(args, argv, defaults)
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
@@ -146,6 +144,7 @@ def _benchmark(
             medians[name].append(timing.median_ms)
     return [
         BenchmarkRecord(
+            case_id=args.case,
             benchmark="sparse_piper_scores",
             provider=name,
             shape={
@@ -157,7 +156,6 @@ def _benchmark(
             },
             configuration={
                 "seed": args.seed,
-                "case_id": args.case,
                 "diagnostic": True,
                 "query_stride": query.stride(),
                 "key_stride": primary.stride(),

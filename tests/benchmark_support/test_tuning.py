@@ -1,13 +1,12 @@
 from collections.abc import Callable
 
 import pytest
-from lib.environment import EnvironmentInfo
-from lib.providers import BenchmarkProvider, ProviderPhase
+from lib.cases import CATALOG_VERSION
+from lib.providers import BenchmarkProvider, Implementation, ProviderPhase
 from lib.quality import QualityMetrics
 from lib.reporting import OutputFormat, OutputTarget
 from lib.timing import ClockDomain, Timing
 from lib.tuning import (
-    TuningCandidate,
     TuningStatus,
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
@@ -19,24 +18,6 @@ from lib.tuning import (
     validate_tuning_candidate_count,
 )
 from triton.runtime.errors import OutOfResources
-
-
-def _environment() -> EnvironmentInfo:
-    return EnvironmentInfo(
-        captured_at_utc="2026-08-08T00:00:00+00:00",
-        python_version="3.14.0",
-        platform="test",
-        torch_version="2.12.0",
-        triton_version="3.7.1",
-        accelerator_backend="cuda",
-        accelerator_runtime_version="13.0",
-        accelerator_driver_version="580.0",
-        gpu_name="test GPU",
-        gpu_architecture="SM120",
-        gpu_index=0,
-        git_revision="a" * 40,
-        git_dirty=False,
-    )
 
 
 def _quality(sqnr_db: float, *, nonfinite_mismatch_count: int = 0) -> QualityMetrics:
@@ -64,11 +45,11 @@ def _timer(
     return Timing(latency, latency, latency, ClockDomain.DEVICE_EVENT)
 
 
-def _candidate(name: str, latency: int) -> TuningCandidate[int, int]:
-    return TuningCandidate(
+def _candidate(name: str, latency: int) -> Implementation[BenchmarkProvider[int, int]]:
+    return Implementation(
         name=name,
         configuration={"block_m": latency * 64},
-        make_provider=lambda: BenchmarkProvider(
+        build=lambda: BenchmarkProvider(
             name=name,
             prepare=lambda: latency,
             run=lambda prepared: prepared,
@@ -94,17 +75,20 @@ def test_shared_sqnr_gate_rejects_nonfinite_mismatches() -> None:
     assert not meets_minimum_sqnr(_quality(100.0, nonfinite_mismatch_count=1), 20.0)
 
 
-def test_tuning_selects_fastest_candidate_and_records_every_result() -> None:
+def test_tuning_selects_fastest_candidate_and_records_every_result(environment) -> None:
     run = tune_candidates(
         (_candidate("slow", 2), _candidate("fast", 1)),
         tuning="attention",
         shape={"sequence": 128},
-        environment=_environment(),
+        case_id="attention-small",
+        environment=environment,
         warmup_ms=2,
         measurement_time_ms=5,
         device_timer=_timer,
     )
 
+    assert all(record.as_dict()["case_id"] == "attention-small" for record in run.records)
+    assert all(record.as_dict()["catalog_version"] == CATALOG_VERSION for record in run.records)
     assert [record.candidate for record in run.records] == ["slow", "fast"]
     assert run.winner is not None
     assert run.winner.candidate == "fast"
@@ -117,7 +101,7 @@ def test_tuning_selects_fastest_candidate_and_records_every_result() -> None:
     assert value["environment"]["gpu_architecture"] == "SM120"
 
 
-def test_tuning_rejects_quality_before_spending_measurement_time() -> None:
+def test_tuning_rejects_quality_before_spending_measurement_time(environment) -> None:
     timer_calls = 0
 
     def timer(
@@ -134,7 +118,7 @@ def test_tuning_rejects_quality_before_spending_measurement_time() -> None:
         (_candidate("bad", 1), _candidate("good", 2)),
         tuning="attention",
         shape={},
-        environment=_environment(),
+        environment=environment,
         measure_candidate_quality=lambda output: _quality(float(output) * 10),
         quality_gate=lambda quality: quality.sqnr_db >= 20,
         device_timer=timer,
@@ -152,38 +136,40 @@ def test_tuning_rejects_quality_before_spending_measurement_time() -> None:
     [
         UnsupportedTuningCandidateError("unsupported schedule"),
         OutOfResources(256, 128, "registers"),
+        None,
     ],
 )
-def test_tuning_records_expected_candidate_failures(error: Exception) -> None:
+def test_tuning_records_expected_candidate_failures(environment, error: Exception | None) -> None:
     def make_provider() -> BenchmarkProvider[None, None]:
+        assert error is not None, "unsupported factory must not run"
         raise error
 
     run = tune_candidates(
-        (TuningCandidate("unsupported", {}, make_provider),),
+        (Implementation("unsupported", make_provider, "unavailable" if error is None else None),),
         tuning="attention",
         shape={},
-        environment=_environment(),
+        environment=environment,
     )
 
     assert run.winner is None
     assert run.records[0].status is TuningStatus.SKIPPED
-    assert type(error).__name__ in (run.records[0].reason or "")
+    assert (type(error).__name__ if error is not None else "unavailable") in run.records[0].reason
 
 
-def test_tuning_propagates_unexpected_failures() -> None:
+def test_tuning_propagates_unexpected_failures(environment) -> None:
     def make_provider() -> BenchmarkProvider[None, None]:
         raise RuntimeError("implementation bug")
 
     with pytest.raises(RuntimeError, match="implementation bug"):
         tune_candidates(
-            (TuningCandidate("broken", {}, make_provider),),
+            (Implementation("broken", make_provider),),
             tuning="attention",
             shape={},
-            environment=_environment(),
+            environment=environment,
         )
 
 
-def test_end_to_end_phase_uses_wall_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_end_to_end_phase_uses_wall_timer(environment, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
     def wall_timer(
@@ -208,10 +194,10 @@ def test_end_to_end_phase_uses_wall_timer(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr("lib.tuning.synchronized_wall_benchmark", wall_timer)
     run = tune_candidates(
-        (TuningCandidate("end-to-end", {}, make_provider),),
+        (Implementation("end-to-end", make_provider),),
         tuning="attention",
         shape={},
-        environment=_environment(),
+        environment=environment,
         phase=ProviderPhase.OPERATOR_END_TO_END,
         warmup_ms=2,
         measurement_time_ms=5,
@@ -231,7 +217,8 @@ def test_end_to_end_phase_uses_wall_timer(monkeypatch: pytest.MonkeyPatch) -> No
     ],
 )
 def test_tuning_validates_candidate_lists(
-    candidates: tuple[TuningCandidate[int, int], ...],
+    environment,
+    candidates: tuple[Implementation[BenchmarkProvider[int, int]], ...],
     error: str,
 ) -> None:
     with pytest.raises(ValueError, match=error):
@@ -239,11 +226,12 @@ def test_tuning_validates_candidate_lists(
             candidates,
             tuning="attention",
             shape={},
-            environment=_environment(),
+            environment=environment,
         )
 
 
 def test_report_tuning_run_prints_and_writes_selected_candidate(
+    environment,
     tmp_path,
     capsys,
 ) -> None:
@@ -251,7 +239,7 @@ def test_report_tuning_run_prints_and_writes_selected_candidate(
         (_candidate("winner", 1),),
         tuning="attention",
         shape={},
-        environment=_environment(),
+        environment=environment,
         warmup_ms=2,
         measurement_time_ms=5,
         device_timer=_timer,

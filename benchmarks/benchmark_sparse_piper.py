@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import cast
 
 import torch
-from lib.cases import AttentionCase, named_case
+from lib.case_cli import require_case, set_case_arguments
+from lib.cases import AttentionCase, catalog_metadata
 from lib.environment import capture_environment
 from lib.sparse_piper import assert_equal_finite, check_query_samples, useful_integer_operations
 from lib.suite_attention import make_inputs
@@ -53,7 +54,7 @@ def _positive_int(value: str) -> int:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="shared sparse attention case")
     parser.add_argument("--sequence", type=_positive_int, nargs="+")
     parser.add_argument("--head-dim", type=int, choices=[64, 128])
@@ -81,13 +82,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "seed": 931,
     }
     if args.case is not None:
-        if any(getattr(args, key) is not None for key in defaults):
-            parser.error("--case cannot be combined with custom workload flags")
-        try:
-            case = named_case(args.case)
-        except ValueError as error:
-            parser.error(str(error))
-        if not isinstance(case, AttentionCase) or case.keep_ratio is None:
+        case = require_case(args.case, AttentionCase)
+        if case.keep_ratio is None:
             parser.error("--case requires a sparse attention case")
         defaults.update(
             sequence=[case.sequence],
@@ -99,6 +95,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             dtype=case.dtype,
             seed=case.seed,
         )
+        set_case_arguments(args, argv, defaults)
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
@@ -222,7 +219,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
                 "shape_bnhd": shape,
                 "kv_heads": args.kv_heads,
                 "dtype": args.dtype,
-                "case_id": args.case,
+                **catalog_metadata(args.case),
                 "diagnostic": True,
                 "input_source": "cpu_seeded_normal_cast_to_input_dtype",
                 "ratio": ratio,

@@ -104,7 +104,7 @@ def test_gluon_candidate_with_triton_tiling_is_unsupported() -> None:
 
     assert candidate.name.startswith("gluon-regs232-")
     with pytest.raises(UnsupportedTuningCandidateError, match="Gluon kernel requires"):
-        candidate.make_provider()
+        candidate.build()
 
 
 def test_uncapped_gluon_candidate_name_has_no_register_field() -> None:

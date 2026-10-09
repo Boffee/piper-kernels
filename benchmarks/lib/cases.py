@@ -251,6 +251,11 @@ def select_cases(
     return result
 
 
+def catalog_metadata(case_id: str | None) -> dict[str, str | int | None]:
+    """Identify the selected catalog revision; custom workloads have no catalog identity."""
+    return {"case_id": case_id, "catalog_version": CATALOG_VERSION if case_id is not None else None}
+
+
 def named_case(identity: str) -> BenchmarkCase:
     """Look up an exact case for a tuner or stage diagnostic."""
     for case in standard_cases() + diagnostic_cases():

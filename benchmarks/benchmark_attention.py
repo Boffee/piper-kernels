@@ -25,7 +25,7 @@ from lib.attention_providers import (
     resolve_provider_names,
     validate_provider_support,
 )
-from lib.cases import AttentionCase, named_case
+from lib.case_cli import apply_case
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.profiling import add_profile_arguments, profile_provider
 from lib.providers import measure_provider
@@ -37,7 +37,6 @@ from lib.reporting import (
     output_target,
     write_records,
 )
-from lib.suite_attention import make_inputs
 from lib.triton_inspection import (
     TritonCompilerRecord,
     add_compiler_inspection_arguments,
@@ -50,7 +49,7 @@ from piper_kernels.attention.piper_attention import _backend as piper_backend
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "--case", help="shared dense-attention case; excludes custom workload flags"
     )
@@ -106,11 +105,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_profile_arguments(parser)
     add_output_arguments(parser)
     args = parser.parse_args(argv)
-    _resolve_workload(parser, args)
+    _resolve_workload(args, argv)
     return args
 
 
-def _resolve_workload(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def _resolve_workload(args: argparse.Namespace, argv: Sequence[str] | None) -> None:
     defaults = {
         "sequence": [1024, 2048, 4096, 8192, 16384],
         "kv_sequence": None,
@@ -123,28 +122,9 @@ def _resolve_workload(parser: argparse.ArgumentParser, args: argparse.Namespace)
         "scale": None,
         "seed": 0,
     }
-    args.catalog_case = None
     if args.case is not None:
-        if any(getattr(args, key) is not None for key in defaults):
-            parser.error("--case cannot be combined with custom workload flags")
-        try:
-            case = named_case(args.case)
-        except ValueError as error:
-            parser.error(str(error))
-        if not isinstance(case, AttentionCase) or case.keep_ratio is not None:
-            parser.error("--case requires a dense attention case")
-        defaults.update(
-            sequence=[case.sequence],
-            kv_sequence=case.sequence,
-            batch_size=case.batch,
-            heads=case.heads,
-            kv_heads=case.kv_heads,
-            head_dim=case.head_dim,
-            dtype=case.dtype,
-            causal=case.causal,
-            seed=case.seed,
-        )
-        args.catalog_case = case
+        apply_case(args, argv, attention=True)
+        args.sequence = [args.sequence]
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
@@ -385,11 +365,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             key_value_length=key_value_length,
             head_dim=args.head_dim,
         )
-        inputs = (
-            make_inputs(args.catalog_case, device)
-            if args.catalog_case is not None
-            else make_attention_inputs(shape, config=config, device=device)
-        )
+        inputs = make_attention_inputs(shape, config=config, device=device)
         providers = make_attention_providers(
             inputs,
             provider_names=provider_names,
@@ -433,6 +409,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 measurement.timings.prepared_execution.median_ms,
             )
             record = BenchmarkRecord(
+                case_id=args.case,
                 benchmark="attention",
                 provider=measurement.provider,
                 shape=shape.as_dict(),
@@ -440,7 +417,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 timings=measurement.timings,
                 quality=measure_quality(measurement.output, expected),
                 environment=environment,
-                extra={"effective_tflops": tflops, "case_id": args.case, "diagnostic": True},
+                extra={"effective_tflops": tflops, "diagnostic": True},
             )
             records.append(record)
             _print_measurement(record)

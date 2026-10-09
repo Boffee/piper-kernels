@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import cast
 
 import torch
-from lib.cases import CATALOG_VERSION, PipelineCase, named_case
+from lib.case_cli import require_case
+from lib.cases import PipelineCase, named_case
 from lib.environment import EnvironmentInfo, capture_environment
+from lib.inputs import normal_tensor
 from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
 from lib.suite_pipeline import _GROUP_SIZE, _projection
-from lib.suite_types import normal_tensor
 from lib.timing import DeviceTimings, measure_device, synchronized_wall_benchmark
 
 from piper_kernels._triton.runtime import device_context
@@ -41,7 +42,7 @@ def _positive_int(value: str) -> int:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "--case", default="sparse-pipeline-small", help="parent pipeline case identity"
     )
@@ -54,12 +55,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0)
     add_output_arguments(parser)
     args = parser.parse_args(argv)
-    try:
-        case = named_case(args.case)
-    except ValueError as error:
-        parser.error(str(error))
-    if not isinstance(case, PipelineCase):
-        parser.error("--case must identify a pipeline workload")
+    case = require_case(args.case, PipelineCase)
     if case.sequence < 64 or case.width % _GROUP_SIZE:
         parser.error("requires at least 64 tokens and input width divisible by 64")
     if args.device < 0 or args.warmup_ms < 0:
@@ -209,12 +205,11 @@ def _benchmark(
         timing, extra = _measure(operation, integer_operations, args)
         records.append(
             BenchmarkRecord(
+                case_id=case.id,
                 benchmark="sparse_piper_projection",
                 provider="piper-convrot",
                 shape=case.as_dict(),
                 configuration={
-                    "catalog_version": CATALOG_VERSION,
-                    "parent_case": case.id,
                     "input_source": "cpu_seeded_synthetic_activations_and_packed_weights",
                     "routing": args.routing,
                     "emit_value_block_means": True,

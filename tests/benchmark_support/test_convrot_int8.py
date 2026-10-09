@@ -49,7 +49,6 @@ from lib.convrot_int8_providers import (
     make_planned_convrot_int8_provider,
     make_public_convrot_int8_provider,
 )
-from lib.environment import EnvironmentInfo
 from lib.providers import ProviderMeasurement
 from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
@@ -57,24 +56,6 @@ from lib.timing import ClockDomain, DeviceTimings, PhaseTimings, Timing
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton.targets import AcceleratorTarget
-
-
-def _environment() -> EnvironmentInfo:
-    return EnvironmentInfo(
-        captured_at_utc="2026-08-08T00:00:00+00:00",
-        python_version="3.14.0",
-        platform="test",
-        torch_version="2.12.0",
-        triton_version="3.7.1",
-        accelerator_backend="cuda",
-        accelerator_runtime_version="13.0",
-        accelerator_driver_version="580.0",
-        gpu_name="test GPU",
-        gpu_architecture="SM120",
-        gpu_index=0,
-        git_revision="a" * 40,
-        git_dirty=False,
-    )
 
 
 def _preparation_configuration() -> _PreparationConfiguration:
@@ -153,6 +134,8 @@ def test_named_case_matches_suite_shape_and_rejects_overrides() -> None:
     assert args.phases
     with pytest.raises(SystemExit, match="workload overrides"):
         _parse_args(["--case", "linear-small", "--rows", "128"])
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "linear-small", "--ro", "128"])
 
 
 def test_shape_can_include_swiglu_without_bias() -> None:
@@ -307,7 +290,7 @@ def test_production_phase_buffers_and_integer_reference(dtype, activation, bias)
         torch.testing.assert_close(output, operations["linear"](), rtol=0, atol=0)
 
 
-def test_phase_records_distinguish_clocks_and_phase_scope():
+def test_phase_records_distinguish_clocks_and_phase_scope(environment):
     shape = ConvRotShape("test", 3, 17, 256)
     output = torch.ones(1)
     result = Result(
@@ -319,7 +302,7 @@ def test_phase_records_distinguish_clocks_and_phase_scope():
             for name in ("prepare", "prepared_gemm", "linear")
         },
     )
-    records = _records_for_result(shape, result, _environment())
+    records = _records_for_result(shape, result, environment, case_id=None)
     assert len(records) == 4
     for record in records[1:]:
         value = record.as_dict()
@@ -398,7 +381,7 @@ def test_main_provider_configuration_distinguishes_logical_and_provider_layouts(
     assert "version" not in comfy
 
 
-def test_main_record_shape_contains_only_case_and_dimensions() -> None:
+def test_main_record_shape_contains_only_case_and_dimensions(environment) -> None:
     shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     output = torch.ones((1, 1))
     quality = measure_quality(output, output)
@@ -425,7 +408,7 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
         quality=quality,
     )
 
-    (record,) = _records_for_result(shape, result, _environment())
+    (record,) = _records_for_result(shape, result, environment, case_id=None)
     value = record.as_dict()
 
     assert value["shape"] == {
@@ -441,7 +424,7 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
     assert value["configuration"]["provider_input_layout"] == "up_gate"
 
 
-def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
+def test_main_comfy_record_uses_installed_version_and_provider_layout(environment) -> None:
     shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     output = torch.ones((1, 1))
     quality = measure_quality(output, output)
@@ -476,7 +459,7 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
         comfy_kitchen_quality=quality,
     )
 
-    records = _records_for_result(shape, result, _environment())
+    records = _records_for_result(shape, result, environment, case_id=None)
     comfy_record = next(record for record in records if record.provider == "comfy-kitchen")
     configuration = comfy_record.as_dict()["configuration"]
 
@@ -649,7 +632,7 @@ def test_private_comfy_preparation_adapter_rejects_other_versions(monkeypatch) -
     ids=["custom-swiglu", "image-kv-projection", "image-ffn-projection"],
 )
 def test_preparation_cli_and_records_expose_phase_timings(
-    tmp_path, argv, case_id, rows, in_features, activation
+    environment, tmp_path, argv, case_id, rows, in_features, activation
 ) -> None:
     output_path = tmp_path / "preparation.jsonl"
     arguments = _parse_preparation_args([*argv, "--jsonl", str(output_path)])
@@ -682,7 +665,7 @@ def test_preparation_cli_and_records_expose_phase_timings(
         warmup_ms=arguments.warmup_ms,
         measurement_time_ms=arguments.measurement_time_ms,
         results=[phase],
-        environment=_environment(),
+        environment=environment,
     )
     value = record.as_dict()
 
@@ -714,10 +697,10 @@ def test_preparation_cli_and_records_expose_phase_timings(
     written = json.loads(output_path.read_text())
     assert written["benchmark"] == "convrot-preparation"
     assert written["shape"]["raw_input_features"] == raw_features
-    assert written["configuration"]["case_id"] == case_id
+    assert written["case_id"] == case_id
 
 
-def test_comfy_preparation_record_includes_installed_and_contract_versions() -> None:
+def test_comfy_preparation_record_includes_installed_and_contract_versions(environment) -> None:
     phase = PreparationPhaseResult(
         phase="comfy-kitchen",
         provider="comfy-kitchen",
@@ -743,7 +726,7 @@ def test_comfy_preparation_record_includes_installed_and_contract_versions() -> 
         warmup_ms=100,
         measurement_time_ms=300,
         results=[phase],
-        environment=_environment(),
+        environment=environment,
     )
 
     configuration = record.as_dict()["configuration"]

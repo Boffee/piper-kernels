@@ -21,6 +21,7 @@ from lib.convrot import (
     raw_input_features,
 )
 from lib.environment import EnvironmentInfo, capture_environment
+from lib.inputs import normal_tensor
 from lib.providers import BenchmarkProvider
 from lib.reporting import (
     BenchmarkRecord,
@@ -29,7 +30,6 @@ from lib.reporting import (
     output_target,
     write_records,
 )
-from lib.suite_types import normal_tensor
 from lib.timing import PhaseTimings, Timing, triton_benchmark
 from lib.triton_inspection import (
     add_compiler_inspection_arguments,
@@ -122,7 +122,7 @@ def _effective_tbps(byte_count: int, latency_ms: float) -> float:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="derive preparation dimensions from a shared linear case")
     parser.add_argument(
         "--rows",
@@ -462,11 +462,11 @@ def _preparation_records(
         )
         records.append(
             BenchmarkRecord(
+                case_id=case_id,
                 benchmark="convrot-preparation",
                 provider=result.provider,
                 shape=shape,
                 configuration={
-                    "case_id": case_id,
                     "dtype": dtype_name,
                     "group_size": 256,
                     "input_activation": input_activation_name,

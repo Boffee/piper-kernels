@@ -24,11 +24,10 @@ from lib.attention_tuning import (
 )
 from lib.case_cli import apply_case
 from lib.environment import capture_environment
-from lib.providers import BenchmarkProvider
+from lib.providers import BenchmarkProvider, Implementation
 from lib.quality import measure_quality
 from lib.reporting import output_target
 from lib.tuning import (
-    TuningCandidate,
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
     meets_minimum_sqnr,
@@ -54,7 +53,7 @@ def _validate_args(arguments: argparse.Namespace) -> None:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_attention_tuning_arguments(parser, include_reverse_causal_blocks=False)
     parser.add_argument(
         "--derive-value-log-bound",
@@ -167,7 +166,7 @@ def _make_candidate(
     *,
     config: AttentionConfig,
     target: AcceleratorTarget,
-) -> TuningCandidate[object, torch.Tensor]:
+) -> Implementation[BenchmarkProvider[object, torch.Tensor]]:
     name = _plan_name(plan)
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
@@ -204,14 +203,14 @@ def _make_candidate(
             synchronize=torch.cuda.synchronize,
         )
 
-    return TuningCandidate(
+    return Implementation(
         name=name,
         configuration={
             **config.as_dict(),
             "algorithm": "piper_attention",
             **plan.as_dict(),
         },
-        make_provider=make_provider,
+        build=make_provider,
     )
 
 
@@ -262,8 +261,9 @@ def _main(argv: Sequence[str] | None = None) -> None:
     expected = run_sdpa(inputs, config)
     run = tune_candidates(
         candidates,
+        case_id=args.case,
         tuning="piper_attention_execution_plan",
-        shape={"case": args.case, **shape.as_dict()},
+        shape=shape.as_dict(),
         environment=capture_environment(Path(__file__).resolve().parents[1]),
         phase=args.phase,
         warmup_ms=args.warmup_ms,

@@ -13,8 +13,9 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from .cases import Conv3DCase, FFNCase, LinearCase
-from .quality import QualityMetrics, measure_quality
-from .suite_types import Implementation, Operation, QualityCheck, normal_tensor, sample_indices
+from .inputs import normal_tensor, sample_indices
+from .providers import Implementation, Operation
+from .quality import QualityCheck, QualityMetrics, measure_quality
 
 # Optional format and kernel imports stay inside the selected implementation.
 # ruff: noqa: PLC0415
@@ -101,12 +102,7 @@ def _pack_weight(
 def _quantized_comparison(actual: torch.Tensor, expected: torch.Tensor) -> QualityMetrics:
     """Check implementation agreement separately from quantization's FP error."""
     metrics = measure_quality(actual, expected)
-    if (
-        metrics.actual_nonfinite_count
-        or metrics.reference_nonfinite_count
-        or metrics.relative_l2_error > 0.02
-    ):
-        raise ValueError("native output differs from the portable quantized reference")
+    metrics.validate(0.02, "portable quantized reference")
     return metrics
 
 

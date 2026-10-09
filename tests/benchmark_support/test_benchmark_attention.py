@@ -68,7 +68,7 @@ def test_catalog_case_preserves_gqa_and_rejects_workload_overrides() -> None:
     arguments = _parse_args(["--case", "attention-image-low"])
     assert arguments.sequence == [2816]
     assert (arguments.heads, arguments.kv_heads, arguments.head_dim) == (48, 12, 128)
-    assert arguments.catalog_case.id == "attention-image-low"
+    assert arguments.case == "attention-image-low"
     _validate_args(arguments, (PYTORCH_SDPA, PIPER_ATTENTION))
     with pytest.raises(SystemExit, match="equal query and key/value"):
         _validate_args(arguments, (SAGE_ATTENTION_2PP,))

@@ -8,17 +8,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import TypedDict, cast
 
 import torch
-from lib.cases import Conv3DCase, named_case
+from lib.case_cli import require_case, set_case_arguments
+from lib.cases import Conv3DCase
 from lib.environment import EnvironmentInfo, capture_environment
+from lib.inputs import normal_tensor
 from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
-from lib.suite_types import normal_tensor
 from lib.timing import DeviceTimings, measure_device
 from torch.nn import functional
 
@@ -55,7 +55,7 @@ def _shape(value: str) -> tuple[int, ...]:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="use an unchanged convolution case from the shared catalog")
     parser.add_argument("--shape", type=_shape, action="append", help="N,C,T,H,W,O; repeatable")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
@@ -79,19 +79,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.group_norm_silu = None
     if args.case is not None:
-        try:
-            case = named_case(args.case)
-        except ValueError as error:
-            parser.error(str(error))
-        if not isinstance(case, Conv3DCase):
-            parser.error("--case requires a convolution case")
-        supplied = {part.split("=", 1)[0] for part in (sys.argv[1:] if argv is None else argv)}
-        if supplied & {"--shape", "--dtype", "--seed"}:
-            parser.error("--case cannot be combined with workload overrides")
-        args.shape = [
-            (case.batch, case.channels, case.frames, case.height, case.width, case.out_channels)
-        ]
-        args.dtype, args.seed = case.dtype, case.seed
+        case = require_case(args.case, Conv3DCase)
+        shape = (case.batch, case.channels, case.frames, case.height, case.width, case.out_channels)
+        set_case_arguments(
+            args,
+            argv,
+            {"shape": [shape], "dtype": case.dtype, "seed": case.seed},
+        )
         args.group_norm_silu = case.group_norm_silu
     if args.measurement_time_ms <= 0 or args.samples < 1 or args.warmup_ms < 0 or args.device < 0:
         parser.error("requires positive duration/samples and non-negative warmup/device")
@@ -248,7 +242,6 @@ def _benchmark_shape(
         zip(("batch", "channels", "frames", "height", "width", "out_channels"), shape, strict=True)
     )
     configuration = {
-        "case_id": args.case,
         "dtype": args.dtype,
         "group_size": group_size,
         "seed": args.seed,
@@ -272,6 +265,7 @@ def _benchmark_shape(
         for provider, timing in timings.items():
             records.append(
                 BenchmarkRecord(
+                    case_id=args.case,
                     benchmark="convrot-conv3d",
                     provider=provider,
                     shape=shape_record,
@@ -374,6 +368,7 @@ def _benchmark_shape(
         )
         records.append(
             BenchmarkRecord(
+                case_id=args.case,
                 benchmark="convrot-conv3d",
                 provider="candidate",
                 shape=shape_record,

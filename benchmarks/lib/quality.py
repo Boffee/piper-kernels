@@ -56,6 +56,16 @@ class QualityMetrics:
     nonfinite_mismatch_count: int
     saturation: Mapping[str, QuantizerSaturation] = field(default_factory=dict)
 
+    def validate(self, relative_l2_limit: float, reference: str) -> None:
+        """Reject nonfinite comparisons and errors above an explicit benchmark bound."""
+        if self.actual_nonfinite_count or self.reference_nonfinite_count:
+            raise ValueError(f"quality comparison against {reference} contains nonfinite values")
+        if not math.isfinite(self.relative_l2_error) or self.relative_l2_error > relative_l2_limit:
+            raise ValueError(
+                f"relative L2 error {self.relative_l2_error:.6g} exceeds "
+                f"{relative_l2_limit:.6g} against {reference}"
+            )
+
     def as_dict(self) -> dict[str, float | int | dict[str, dict[str, int | float]]]:
         """Return stable machine-readable field names."""
         return {
@@ -69,6 +79,30 @@ class QualityMetrics:
             "reference_nonfinite_count": self.reference_nonfinite_count,
             "nonfinite_mismatch_count": self.nonfinite_mismatch_count,
             "saturation": {name: value.as_dict() for name, value in self.saturation.items()},
+        }
+
+
+@dataclass(frozen=True)
+class QualityCheck:
+    """Sampled reference coverage and error bound for an output checked for finiteness."""
+
+    metrics: QualityMetrics
+    reference: str
+    sample_count: int
+    total_count: int
+    relative_l2_limit: float
+    comparisons: Mapping[str, QualityMetrics] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, object]:
+        """Describe numerical error together with its reference and coverage."""
+        return {
+            "reference": self.reference,
+            "sample_count": self.sample_count,
+            "total_count": self.total_count,
+            "relative_l2_limit": self.relative_l2_limit,
+            "full_output_finite": True,
+            "metrics": self.metrics.as_dict(),
+            "comparisons": {name: value.as_dict() for name, value in self.comparisons.items()},
         }
 
 

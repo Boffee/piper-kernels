@@ -123,7 +123,9 @@ records. Use complete-call suite results for integration comparisons.
 | Integer arithmetic/compiler behavior | [Integer PV dot](benchmark_integer_pv_dot.py) |
 
 Operation diagnostics accept `--case` to use a parent workload from the shared
-catalog. Custom shapes, where supported, describe separate experiments.
+catalog. Use full option names; `--case` rejects workload overrides. Saved records
+store `case_id` and `catalog_version` at the top level, with workload dimensions
+in `shape`. Custom experiments have null catalog metadata.
 Device-event timing measures stream work; graph replay removes per-call host
 work. Neither should be compared directly with the suite's synchronized wall
 time. Compiler resource counts describe limits, not achieved occupancy.
@@ -149,5 +151,7 @@ saves their records on a provisioned RDNA4 runner. It requires the environment
 described in the development guide; the workflow alone is not hardware evidence.
 
 Add a workload to the catalog and its operation adapter, reusing the common
-runner, timing, quality, and reporting utilities. Avoid another standalone
-performance runner for a model or accelerator.
+input, provider, quality, and reporting utilities in `lib/`. Suite operations
+measure complete calls; diagnostic providers expose preparation and execution
+phases. Both use the same deferred implementation factories and result metadata.
+Avoid another standalone performance runner for a model or accelerator.

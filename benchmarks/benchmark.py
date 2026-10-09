@@ -14,7 +14,7 @@ from lib.suite import Measurement, SuiteRecord, implementations, run_implementat
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--list", action="store_true", help="list cases without initializing a GPU")
     parser.add_argument(
         "--case", action="append", default=[], help="case identity or shell-style pattern"
@@ -99,7 +99,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             records.append(record)
             write_records(records, destination)
-            detail = f"{record.timing.median_ms:.3f} ms" if record.timing else record.reason
+            timing = record.timings
+            detail = f"{timing.median_ms:.3f} ms" if timing else record.reason
             print(f"{case.id} / {provider.name}: {record.status} {detail}", flush=True)
     return int(any(record.status == "failed" for record in records))
 

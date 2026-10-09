@@ -28,11 +28,10 @@ from lib.convrot_int8_providers import (
     planned_convrot_int8_configuration,
 )
 from lib.environment import capture_environment
-from lib.providers import BenchmarkProvider
+from lib.providers import BenchmarkProvider, Implementation
 from lib.quality import measure_quality
 from lib.reporting import output_target
 from lib.tuning import (
-    TuningCandidate,
     add_tuning_arguments,
     boolean_tuning_axis,
     meets_minimum_sqnr,
@@ -49,7 +48,7 @@ from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="use an unchanged linear case from the shared catalog")
     parser.add_argument(
         "--rows",
@@ -249,7 +248,7 @@ def _plan_name(plan: LinearExecutionPlan) -> str:
 def _make_candidate(
     plan: LinearExecutionPlan,
     workload: ConvRotInt8Workload,
-) -> TuningCandidate[ConvRotInputs, torch.Tensor]:
+) -> Implementation[BenchmarkProvider[ConvRotInputs, torch.Tensor]]:
     """Wrap one plan around the complete production-paid ConvRot device path."""
     name = _plan_name(plan)
     configuration = planned_convrot_int8_configuration(workload, plan)
@@ -261,10 +260,10 @@ def _make_candidate(
             name=f"convrot_int8_linear_{name.replace('-', '_')}",
         )
 
-    return TuningCandidate(
+    return Implementation(
         name=name,
         configuration=configuration,
-        make_provider=make_provider,
+        build=make_provider,
     )
 
 
@@ -301,6 +300,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     expected = workload.reference()
     run = tune_candidates(
         candidates,
+        case_id=args.case,
         tuning="convrot_int8_linear_execution_plan",
         shape=shape.as_dict(),
         environment=capture_environment(Path(__file__).resolve().parents[1]),

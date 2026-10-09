@@ -2,8 +2,8 @@ import pytest
 import torch
 from lib import suite_attention
 from lib.cases import AttentionCase
+from lib.inputs import sample_indices
 from lib.suite_attention import implementations, make_inputs, sampled_dense_reference
-from lib.suite_types import sample_indices
 
 from piper_kernels._triton.targets import AcceleratorTarget
 

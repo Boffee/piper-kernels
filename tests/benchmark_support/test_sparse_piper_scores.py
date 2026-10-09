@@ -120,7 +120,7 @@ def test_records_preserve_paired_panels_and_label_the_aggregate(monkeypatch, tmp
         return Timing(value, value - 0.5, value + 0.5, ClockDomain.DEVICE_EVENT)
 
     monkeypatch.setattr(benchmark, "triton_benchmark", measure)
-    args = benchmark._parse_args(["--samples", "3", "--rep-ms", "7"])
+    args = benchmark._parse_args(["--sequence", "65", "--samples", "3", "--rep-ms", "7"])
     environment = benchmark.capture_environment(tmp_path)
     records = benchmark._benchmark(args, 65, 2, environment)
     assert len(records) == 2
@@ -129,6 +129,7 @@ def test_records_preserve_paired_panels_and_label_the_aggregate(monkeypatch, tmp
     for record in records:
         value = record.as_dict()
         assert value["schema_version"] == 1
+        assert value["case_id"] is None
         assert value["environment"] == environment.as_dict()
         assert value["shape"]["score_shape_bhqk"] == [1, 56, 2, 1]
         assert value["shape"]["key_storage_blocks"] == 2

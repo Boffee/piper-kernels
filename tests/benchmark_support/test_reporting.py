@@ -5,7 +5,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import lib.environment as environment_module
-from lib.environment import EnvironmentInfo, capture_environment
+import pytest
+from lib.cases import CATALOG_VERSION
+from lib.environment import capture_environment
 from lib.quality import QualityMetrics
 from lib.reporting import (
     BenchmarkRecord,
@@ -18,25 +20,7 @@ from lib.reporting import (
 from lib.timing import ClockDomain, PhaseTimings, SampleTimings, Timing
 
 
-def _environment() -> EnvironmentInfo:
-    return EnvironmentInfo(
-        captured_at_utc="2026-08-06T00:00:00+00:00",
-        python_version="3.14.0",
-        platform="test",
-        torch_version="2.12.0",
-        triton_version="3.7.1",
-        accelerator_backend="cuda",
-        accelerator_runtime_version="13.0",
-        accelerator_driver_version="580.0",
-        gpu_name="test GPU",
-        gpu_architecture="SM120",
-        gpu_index=0,
-        git_revision="a" * 40,
-        git_dirty=False,
-    )
-
-
-def _record() -> BenchmarkRecord:
+def _record(environment) -> BenchmarkRecord:
     wall_timing = Timing(1.0, 0.8, 1.2, ClockDomain.SYNCHRONIZED_WALL)
     device_timing = Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT)
     quality = QualityMetrics(
@@ -64,40 +48,47 @@ def _record() -> BenchmarkRecord:
             operator_end_to_end=wall_timing,
         ),
         quality=quality,
-        environment=_environment(),
+        environment=environment,
     )
 
 
-def test_json_output_is_versioned_and_strict(tmp_path: Path) -> None:
-    path = tmp_path / "results.json"
+@pytest.mark.parametrize("output_format", [OutputFormat.JSON, OutputFormat.JSONL])
+def test_output_is_versioned_strict_and_preserves_catalog_identity(
+    environment, tmp_path, output_format
+):
+    path = tmp_path / f"results.{output_format.value}"
+    custom = _record(environment)
+    named = replace(custom, case_id="attention-small")
+    write_records([named, custom], OutputTarget(path, output_format))
+    content = path.read_text()
+    values = (
+        json.loads(content)
+        if output_format is OutputFormat.JSON
+        else [json.loads(line) for line in content.splitlines()]
+    )
+    assert len(values) == 2
+    assert [(value["case_id"], value["catalog_version"]) for value in values] == [
+        ("attention-small", CATALOG_VERSION),
+        (None, None),
+    ]
+    for value in values:
+        assert value["schema_version"] == 1
+        assert value["provider"] == "test"
+        assert value["timings"]["warmup_ms"] == 100
+        assert value["timings"]["measurement_time_ms"] == 500
+        assert value["timings"]["first_call_clock"] == "synchronized_wall"
+        assert value["timings"]["prepared_execution"]["median_ms"] == 1.0
+        assert value["timings"]["prepared_execution"]["clock"] == "device_event"
+        assert value["timings"]["operator_end_to_end"]["clock"] == "synchronized_wall"
+        assert value["quality"]["sqnr_db"] is None
+        assert value["environment"]["gpu_architecture"] == "SM120"
 
-    write_records([_record()], OutputTarget(path, OutputFormat.JSON))
 
-    values = json.loads(path.read_text())
-    assert values[0]["schema_version"] == 1
-    assert values[0]["timings"]["warmup_ms"] == 100
-    assert values[0]["timings"]["measurement_time_ms"] == 500
-    assert values[0]["timings"]["first_call_clock"] == "synchronized_wall"
-    assert values[0]["timings"]["prepared_execution"]["median_ms"] == 1.0
-    assert values[0]["timings"]["prepared_execution"]["clock"] == "device_event"
-    assert values[0]["timings"]["operator_end_to_end"]["clock"] == "synchronized_wall"
-    assert values[0]["quality"]["sqnr_db"] is None
-    assert values[0]["environment"]["gpu_architecture"] == "SM120"
-
-
-def test_jsonl_output_has_one_record_per_line(tmp_path: Path) -> None:
-    path = tmp_path / "results.jsonl"
-
-    write_records([_record(), _record()], OutputTarget(path, OutputFormat.JSONL))
-
-    lines = path.read_text().splitlines()
-    assert len(lines) == 2
-    assert all(json.loads(line)["provider"] == "test" for line in lines)
-
-
-def test_fixed_count_records_use_the_shared_schema_without_fake_phases(tmp_path):
+def test_fixed_count_records_use_the_shared_schema_without_fake_phases(environment, tmp_path):
     path = tmp_path / "samples.jsonl"
-    record = replace(_record(), timings=SampleTimings(warmup_calls=1, samples_ms=(3.0, 1.0, 2.0)))
+    record = replace(
+        _record(environment), timings=SampleTimings(warmup_calls=1, samples_ms=(3.0, 1.0, 2.0))
+    )
     write_records([record], OutputTarget(path, OutputFormat.JSONL))
     value = json.loads(path.read_text())
     assert value["schema_version"] == 1

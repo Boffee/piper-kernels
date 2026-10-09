@@ -7,18 +7,11 @@ import pytest
 import torch
 from lib import suite
 from lib.case_cli import apply_case
-from lib.cases import diagnostic_cases, named_case, select_cases, standard_cases
-from lib.environment import capture_environment
-from lib.quality import measure_quality
+from lib.cases import CATALOG_VERSION, diagnostic_cases, named_case, select_cases, standard_cases
+from lib.providers import Implementation, Operation
+from lib.quality import QualityCheck, measure_quality
 from lib.suite import Measurement, run_implementation
-from lib.suite_types import Implementation, Operation, QualityCheck
 from lib.timing import ClockDomain, Timing
-
-
-@pytest.fixture
-def environment(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    return capture_environment()
 
 
 def _quality(output):
@@ -87,8 +80,10 @@ def test_complete_call_timing_excludes_setup_and_reference(monkeypatch, environm
         measurement=Measurement(2, 3),
     )
     assert record.status == "ok"
+    assert record.as_dict()["case_id"] == "linear-small"
+    assert record.as_dict()["catalog_version"] == CATALOG_VERSION
     assert record.as_dict()["measurement"]["scope"] == "operator_end_to_end"
-    assert record.as_dict()["quality"]["full_output_finite"]
+    assert record.as_dict()["quality"]["metrics"]["actual_nonfinite_count"] == 0
     assert record.as_dict()["timings"]["operator_end_to_end"]["sample_count"] == 3
     assert record.configuration["execution_device"] == "cpu"
 
@@ -114,8 +109,9 @@ def test_failures_preserve_original_workload(environment, exception, status):
         measurement=Measurement(0, 1),
     )
     assert record.status == status
-    assert record.case is case
-    assert record.timing is None
+    assert record.case_id == case.id
+    assert record.shape == case.as_dict()
+    assert record.timings is None
     assert record.stage == "setup"
 
 
@@ -134,35 +130,30 @@ def test_unsupported_does_not_allocate(environment):
     assert record.reason == "requires another architecture"
 
 
-@pytest.mark.parametrize("bad_output", [torch.tensor([1.0, float("nan")]), torch.zeros(4)])
-def test_numerical_failure_is_not_a_benchmark_result(environment, bad_output):
+@pytest.mark.parametrize(
+    ("index", "value", "reason"),
+    [(0, float("nan"), "nonfinite"), (100, float("inf"), "nonfinite"), (0, 0.0, "relative L2")],
+    ids=["nonfinite-sample", "nonfinite-outside-sample", "inaccurate-sample"],
+)
+def test_numerical_failure_prevents_measurement(environment, monkeypatch, index, value, reason):
+    output = torch.ones(128)
+    output[index] = value
+    monkeypatch.setattr(
+        suite, "synchronized_wall_benchmark", lambda *a, **k: pytest.fail("timed invalid output")
+    )
     record = run_implementation(
         named_case("linear-small"),
-        Implementation("test", lambda: Operation(lambda: bad_output, _quality)),
+        Implementation(
+            "test", lambda: Operation(lambda: output, lambda value: _quality(value[:4]))
+        ),
         device=torch.device("cpu"),
         environment=environment,
         measurement=Measurement(0, 1),
     )
     assert record.status == "failed"
     assert record.stage == "validation"
-    assert record.timing is None
-
-
-def test_full_output_finiteness_is_checked_outside_sample(environment):
-    def run():
-        output = torch.ones(128)
-        output[100] = float("inf")
-        return output
-
-    record = run_implementation(
-        named_case("linear-small"),
-        Implementation("test", lambda: Operation(run, lambda output: _quality(output[:4]))),
-        device=torch.device("cpu"),
-        environment=environment,
-        measurement=Measurement(0, 1),
-    )
-    assert record.status == "failed"
-    assert "nonfinite" in record.reason
+    assert record.timings is None
+    assert reason in record.reason
 
 
 def test_finiteness_validation_bounds_temporary_memory_for_strided_output(monkeypatch):

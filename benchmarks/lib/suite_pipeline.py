@@ -29,8 +29,9 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 
 from .cases import PipelineCase
-from .quality import measure_quality
-from .suite_types import Implementation, Operation, QualityCheck, normal_tensor, sample_indices
+from .inputs import normal_tensor, sample_indices
+from .providers import Implementation, Operation
+from .quality import QualityCheck, measure_quality
 
 # Projection imports transitively require optional TorchAO; resolve them after support checks.
 # ruff: noqa: PLC0415

@@ -22,22 +22,29 @@ from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
 
-from .attention import AttentionConfig, AttentionInputs, attention_dtype, run_sdpa
+from .attention import (
+    AttentionConfig,
+    AttentionInputs,
+    AttentionShape,
+    attention_dtype,
+    make_attention_inputs,
+    run_sdpa,
+)
 from .cases import AttentionCase
-from .quality import measure_quality
+from .inputs import sample_indices
+from .providers import Implementation, Operation
+from .quality import QualityCheck, measure_quality
 from .sparse_piper import reference_prepared_query
-from .suite_types import Implementation, Operation, QualityCheck, normal_tensor, sample_indices
 
 
 def make_inputs(case: AttentionCase, device: torch.device) -> AttentionInputs:
     """Generate the same head-major Q/K/V values for every provider and device."""
-    q_shape = (case.batch, case.heads, case.sequence, case.head_dim)
-    kv_shape = (case.batch, case.kv_heads, case.sequence, case.head_dim)
-    dtype = attention_dtype(case.dtype)
-    return (
-        normal_tensor(q_shape, dtype=dtype, device=device, seed=case.seed),
-        normal_tensor(kv_shape, dtype=dtype, device=device, seed=case.seed + 1),
-        normal_tensor(kv_shape, dtype=dtype, device=device, seed=case.seed + 2),
+    return make_attention_inputs(
+        AttentionShape(
+            case.batch, case.heads, case.sequence, case.sequence, case.head_dim, case.kv_heads
+        ),
+        config=AttentionConfig(attention_dtype(case.dtype), seed=case.seed),
+        device=device,
     )
 
 

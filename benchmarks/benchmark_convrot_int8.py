@@ -254,7 +254,7 @@ def _run_shape(
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="use an unchanged linear case from the shared catalog")
     parser.add_argument(
         "--rows",
@@ -412,6 +412,8 @@ def _records_for_result(
     shape: ConvRotShape,
     result: Result,
     environment: EnvironmentInfo,
+    *,
+    case_id: str | None,
 ) -> list[BenchmarkRecord | BenchmarkRecord[DeviceTimings]]:
     shape_record = shape.as_dict()
     measurements = [
@@ -424,6 +426,7 @@ def _records_for_result(
             continue
         records.append(
             BenchmarkRecord(
+                case_id=case_id,
                 benchmark="convrot-linear",
                 provider=measurement.provider,
                 shape=shape_record,
@@ -439,6 +442,7 @@ def _records_for_result(
         )
         records.append(
             BenchmarkRecord(
+                case_id=case_id,
                 benchmark="convrot-linear",
                 provider="piper-convrot",
                 shape=shape_record,
@@ -514,7 +518,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"  {phase}: cache-flushed {timings.cache_flushed.display()} ms; "
                 f"graph {timings.graph.display()} ms"
             )
-        records.extend(_records_for_result(shape, result, environment))
+        records.extend(_records_for_result(shape, result, environment, case_id=args.case))
         del result
         torch.cuda.empty_cache()
     write_records(records, output_target(args))

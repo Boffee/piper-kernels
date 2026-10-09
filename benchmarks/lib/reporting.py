@@ -11,9 +11,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from .cases import catalog_metadata
 from .environment import EnvironmentInfo
-from .quality import QualityMetrics
-from .timing import DeviceTimings, PhaseTimings, SampleTimings
+from .quality import QualityCheck, QualityMetrics
+from .timing import PhaseTimings
 
 SCHEMA_VERSION = 1
 type JSONValue = str | int | float | bool | list[JSONValue] | dict[str, JSONValue] | None
@@ -41,7 +42,10 @@ class OutputTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkRecord[TimingsT: (PhaseTimings, SampleTimings, DeviceTimings) = PhaseTimings]:
+class BenchmarkRecord[
+    TimingsT: SerializableRecord | None = PhaseTimings,
+    QualityT: QualityMetrics | QualityCheck = QualityMetrics,
+]:
     """One provider, shape, configuration, timing, and quality observation."""
 
     benchmark: str
@@ -50,7 +54,8 @@ class BenchmarkRecord[TimingsT: (PhaseTimings, SampleTimings, DeviceTimings) = P
     configuration: Mapping[str, Any]
     timings: TimingsT
     environment: EnvironmentInfo
-    quality: QualityMetrics | None = None
+    quality: QualityT | None = None
+    case_id: str | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
 
@@ -60,9 +65,10 @@ class BenchmarkRecord[TimingsT: (PhaseTimings, SampleTimings, DeviceTimings) = P
             "schema_version": self.schema_version,
             "benchmark": self.benchmark,
             "provider": self.provider,
+            **catalog_metadata(self.case_id),
             "shape": dict(self.shape),
             "configuration": dict(self.configuration),
-            "timings": self.timings.as_dict(),
+            "timings": None if self.timings is None else self.timings.as_dict(),
             "quality": None if self.quality is None else self.quality.as_dict(),
             "environment": self.environment.as_dict(),
             "extra": dict(self.extra),

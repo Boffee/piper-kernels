@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .suite_types import normal_tensor
+from .inputs import normal_tensor
 
 type AttentionInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
