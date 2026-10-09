@@ -223,7 +223,9 @@ def _assert_fused_quality(
     dtype: torch.dtype,
     input_activation: str | None,
 ) -> None:
-    if input_activation is None:
+    # A materialized FP16/BF16 rotation rounds before quantization; the fused
+    # path retains FP32 intermediates and may select a neighboring INT8 code.
+    if input_activation is None and dtype == torch.float32:
         torch.testing.assert_close(fused_qdata, split_qdata, rtol=0, atol=0)
         torch.testing.assert_close(fused_scale, split_scale, rtol=0, atol=0)
         return
@@ -231,7 +233,8 @@ def _assert_fused_quality(
     qdata_error = (split_qdata.to(torch.int16) - fused_qdata.to(torch.int16)).abs().max().item()
     if qdata_error > 1:
         raise AssertionError(
-            f"fused {input_activation} qdata differs from split path by {qdata_error}"
+            f"fused {input_activation or 'preparation'} qdata "
+            f"differs from split path by {qdata_error}"
         )
     torch.testing.assert_close(
         fused_scale,
@@ -431,6 +434,7 @@ def _print_phase_result(
 
 
 def _preparation_records(
+    case_id: str | None,
     rows: int,
     in_features: int,
     dtype_name: str,
@@ -462,6 +466,7 @@ def _preparation_records(
                 provider=result.provider,
                 shape=shape,
                 configuration={
+                    "case_id": case_id,
                     "dtype": dtype_name,
                     "group_size": 256,
                     "input_activation": input_activation_name,
@@ -611,6 +616,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             _print_phase_result(in_features, args.input_activation, result)
         records.extend(
             _preparation_records(
+                args.case,
                 args.rows,
                 in_features,
                 args.dtype,

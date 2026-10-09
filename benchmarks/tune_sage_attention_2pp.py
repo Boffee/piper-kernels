@@ -266,7 +266,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     run = tune_candidates(
         candidates,
         tuning="sage_attention_2pp_execution_plan",
-        shape=shape.as_dict(),
+        shape={"case": args.case, **shape.as_dict()},
         environment=capture_environment(Path(__file__).resolve().parents[1]),
         phase=args.phase,
         warmup_ms=args.warmup_ms,

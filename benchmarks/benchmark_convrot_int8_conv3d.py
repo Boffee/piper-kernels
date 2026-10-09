@@ -248,6 +248,7 @@ def _benchmark_shape(
         zip(("batch", "channels", "frames", "height", "width", "out_channels"), shape, strict=True)
     )
     configuration = {
+        "case_id": args.case,
         "dtype": args.dtype,
         "group_size": group_size,
         "seed": args.seed,
