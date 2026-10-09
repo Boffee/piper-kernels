@@ -136,7 +136,7 @@ def _benchmark(
     del reference
     order = list(functions)
     rng = random.Random(args.seed)
-    samples: dict[str, list[dict[str, float | str]]] = {name: [] for name in order}
+    samples: dict[str, list[dict[str, float | str | None]]] = {name: [] for name in order}
     medians: dict[str, list[float]] = {name: [] for name in order}
     for _ in range(args.samples):
         rng.shuffle(order)

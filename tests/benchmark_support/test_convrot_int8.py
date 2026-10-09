@@ -146,6 +146,8 @@ def test_named_case_matches_suite_shape_and_rejects_overrides() -> None:
     assert [(shape.rows, shape.in_features, shape.out_features) for shape in shapes] == [
         (64, 256, 256)
     ]
+    assert shapes[0].name == args.case
+    assert shapes[0].as_dict()["case"] == "linear-small"
     assert args.dtype == "bfloat16"
     assert args.phases
     with pytest.raises(SystemExit, match="workload overrides"):

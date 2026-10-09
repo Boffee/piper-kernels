@@ -326,7 +326,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
     return tuple(
         ConvRotShape(
-            "linear",
+            args.case or "linear",
             rows,
             out_features,
             in_features,

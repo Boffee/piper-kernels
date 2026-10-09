@@ -42,8 +42,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 
-_validate_args = validate_attention_tuning_arguments
-
 
 @dataclass(frozen=True, slots=True)
 class _SageAttention2ppTuningChoice:
@@ -82,6 +80,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_attention_tuning_arguments(parser)
     return apply_case(parser.parse_args(argv), argv, attention=True)
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    validate_attention_tuning_arguments(args)
+    if args.kv_heads is not None and args.kv_heads != args.heads:
+        raise SystemExit("SageAttention2++ requires equal query and key/value head counts")
 
 
 def _candidate_choices(

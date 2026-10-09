@@ -76,7 +76,7 @@ def test_complete_call_timing_excludes_setup_and_reference(monkeypatch, environm
         assert (warmup, measurement) == (2, 3)
         run()
         assert events[-2:] == ["prepare", "execute"]
-        return Timing(1, 1, 1, ClockDomain.SYNCHRONIZED_WALL)
+        return Timing.from_samples([1, 1, 1], ClockDomain.SYNCHRONIZED_WALL)
 
     monkeypatch.setattr(suite, "synchronized_wall_benchmark", timer)
     record = run_implementation(
@@ -89,6 +89,7 @@ def test_complete_call_timing_excludes_setup_and_reference(monkeypatch, environm
     assert record.status == "ok"
     assert record.as_dict()["measurement"]["scope"] == "operator_end_to_end"
     assert record.as_dict()["quality"]["full_output_finite"]
+    assert record.as_dict()["timings"]["operator_end_to_end"]["sample_count"] == 3
     assert record.configuration["execution_device"] == "cpu"
 
 

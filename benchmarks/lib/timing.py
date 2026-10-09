@@ -36,12 +36,16 @@ class ClockDomain(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Timing:
-    """Median latency with a central 60% interval, in milliseconds."""
+    """Median latency with a central 60% interval, in milliseconds.
+
+    ``sample_count`` is unknown when an external timer exposes only quantiles.
+    """
 
     median_ms: float
     p20_ms: float
     p80_ms: float
     clock: ClockDomain
+    sample_count: int | None = None
 
     def __post_init__(self) -> None:
         if min(self.median_ms, self.p20_ms, self.p80_ms) < 0:
@@ -60,6 +64,7 @@ class Timing:
             p20_ms=_linear_quantile(ordered, 0.2),
             p80_ms=_linear_quantile(ordered, 0.8),
             clock=clock,
+            sample_count=len(samples_ms),
         )
 
     def display(self, precision: int = 3) -> str:
@@ -69,13 +74,14 @@ class Timing:
             f"[{self.p20_ms:.{precision}f}, {self.p80_ms:.{precision}f}]"
         )
 
-    def as_dict(self) -> dict[str, float | str]:
+    def as_dict(self) -> dict[str, float | str | None]:
         """Return stable machine-readable field names."""
         return {
             "median_ms": self.median_ms,
             "p20_ms": self.p20_ms,
             "p80_ms": self.p80_ms,
             "clock": self.clock.value,
+            "sample_count": self.sample_count,
         }
 
 
@@ -100,7 +106,7 @@ class PhaseTimings:
         if self.warmup_ms < 0 or self.measurement_time_ms <= 0:
             raise ValueError("warmup must be non-negative and measurement time must be positive")
 
-    def as_dict(self) -> dict[str, float | str | dict[str, float | str] | None]:
+    def as_dict(self) -> dict[str, float | str | dict[str, float | str | None] | None]:
         """Return stable machine-readable field names."""
         return {
             "warmup_ms": self.warmup_ms,

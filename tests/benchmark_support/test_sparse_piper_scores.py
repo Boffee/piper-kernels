@@ -143,7 +143,9 @@ def test_records_preserve_paired_panels_and_label_the_aggregate(monkeypatch, tmp
             "p20_ms": 1.8,
             "p80_ms": 4.2,
             "clock": "device_event",
+            "sample_count": 3,
         }
         assert [panel["median_ms"] for panel in value["extra"]["panels"]] == [1.0, 3.0, 5.0]
         assert all(panel["clock"] == "device_event" for panel in value["extra"]["panels"])
+        assert all(panel["sample_count"] is None for panel in value["extra"]["panels"])
         assert value["extra"]["relative_l2_vs_fp64"] < 2e-5

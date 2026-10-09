@@ -66,6 +66,7 @@ def test_sample_quantiles_preserve_the_clock_and_input_order(clock):
         "p20_ms": 1.8,
         "p80_ms": 4.2,
         "clock": clock.value,
+        "sample_count": 3,
     }
 
 
@@ -87,6 +88,7 @@ def test_fixed_count_timings_report_only_measured_phases():
             "p20_ms": 2.0,
             "p80_ms": 2.0,
             "clock": "synchronized_wall",
+            "sample_count": 1,
         },
         "samples_ms": [2.0],
     }
@@ -118,6 +120,7 @@ def test_synchronized_wall_benchmark_captures_host_work() -> None:
     assert timing.p20_ms >= 0.8
     assert timing.p20_ms <= timing.median_ms <= timing.p80_ms
     assert synchronizations == calls + 1
+    assert timing.sample_count == calls
 
 
 @pytest.mark.parametrize(
