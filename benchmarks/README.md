@@ -75,7 +75,7 @@ recorded. Reports contain the median, p20, p80, and sample count.
 
 Each requested implementation produces an outcome:
 
-- `ok`: full-output finiteness and numerical checks passed; latency is reported.
+- `ok`: output shape, dtype, finiteness, and numerical checks passed; latency is reported.
 - `unsupported`: the implementation cannot execute this case on this device.
 - `oom`: setup, validation, or measurement exceeded available memory; the stage
   is recorded and the workload is unchanged.

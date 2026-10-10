@@ -13,6 +13,7 @@ import torch
 from lib import suite_pipeline as pipeline
 from lib.cases import PipelineCase
 
+from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch as sparse_dispatch
 from piper_kernels.fusions.convrot_int8_piper import output as dense_output
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
@@ -71,25 +72,37 @@ def test_unsupported_device_does_not_allocate_inputs_or_models(monkeypatch):
     unexpected.assert_not_called()
 
 
-def test_all_family_discovery_reports_missing_torchao_without_importing_it():
+@pytest.mark.parametrize("dependency", ["torchao", "triton"])
+def test_all_family_discovery_reports_missing_optional_dependencies(dependency):
     script = """
 import sys
 sys.path.insert(0, sys.argv[1])
 # A None module entry blocks imports and makes find_spec report the missing package.
-sys.modules["torchao"] = None
+dependency = sys.argv[2]
+sys.modules[dependency] = None
 import torch
-from lib.cases import PipelineCase, diagnostic_cases
+from lib.cases import PipelineCase, diagnostic_cases, named_case
 from lib.suite import implementations
 
 for case in diagnostic_cases():
     providers = implementations(case, torch.device("cpu"))
     assert providers
     if isinstance(case, PipelineCase):
-        assert all("TorchAO" in provider.unsupported_reason for provider in providers)
-assert sys.modules["torchao"] is None
+        assert all(provider.unsupported_reason for provider in providers)
+# A visible accelerator must still reject a missing dependency before native imports/allocation.
+torch.cuda.is_available = lambda: True
+providers = implementations(named_case("pipeline-small"), torch.device("cuda"))
+assert all(dependency in provider.unsupported_reason.lower() for provider in providers)
+assert sys.modules[dependency] is None
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, str(Path(__file__).resolve().parents[2] / "benchmarks")],
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(Path(__file__).resolve().parents[2] / "benchmarks"),
+            dependency,
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -137,7 +150,7 @@ def test_materialized_releases_preparation_and_projections_before_next_stage(mon
         assert kwargs["output_dtype"] == torch.float16
         return torch.empty(1, 64, 2, 64)
 
-    monkeypatch.setattr(pipeline, "_sparse_piper_attention_from_quantized_op", attention)
+    monkeypatch.setattr(sparse_dispatch, "_sparse_piper_attention_from_quantized_op", attention)
 
     def linear(*args):
         assert all(reference() is None for reference in (*prepared, *projections))

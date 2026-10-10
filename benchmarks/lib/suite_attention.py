@@ -33,7 +33,7 @@ from .attention import (
 from .cases import AttentionCase
 from .inputs import sample_indices
 from .providers import Implementation, Operation
-from .quality import QualityCheck, measure_quality
+from .quality import QualityCheck, measure_quality, validate_output_metadata
 from .sparse_piper import reference_prepared_query
 
 
@@ -84,6 +84,7 @@ def _dense_operation(case: AttentionCase, device: torch.device, name: str) -> Op
         limit = 0.06
 
     def check(output: torch.Tensor) -> QualityCheck:
+        validate_output_metadata(output, inputs[0].shape, inputs[0].dtype)
         rows = sample_indices(case.sequence, device=device)
         expected = sampled_dense_reference(inputs, rows, causal=case.causal)
         actual = output.index_select(2, rows).float()
@@ -125,6 +126,7 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
         return attention(*sequence_major, sparse_key_blocks=blocks)
 
     def check(output: torch.Tensor) -> QualityCheck:
+        validate_output_metadata(output, sequence_major[0].shape, query.dtype)
         backend = require_attention_backend(query)
         layout = _resolve_route_layout(_normalize_head_keep_ratios(ratios), blocks, device)
         routes = packed_routes_from_sequences(

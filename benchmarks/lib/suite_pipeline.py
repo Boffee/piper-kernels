@@ -20,20 +20,14 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels import SparsePiperAttention, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend as dense_attention_backend
-from piper_kernels.attention.piper_attention._quantized_dispatch import (
-    _piper_attention_from_quantized_op,
-)
-from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
-    _sparse_piper_attention_from_quantized_op,
-)
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 
 from .cases import PipelineCase
 from .inputs import normal_tensor, sample_indices
 from .providers import Implementation, Operation
-from .quality import QualityCheck, measure_quality
+from .quality import QualityCheck, measure_quality, validate_output_metadata
 
-# Projection imports transitively require optional TorchAO; resolve them after support checks.
+# Native imports require optional TorchAO/Triton; resolve them after support checks.
 # ruff: noqa: PLC0415
 
 if TYPE_CHECKING:
@@ -153,6 +147,12 @@ class Pipeline(torch.nn.Module):
         self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
         """Use the fused projection arithmetic, retaining a complete attention output."""
+        from piper_kernels.attention.piper_attention._quantized_dispatch import (
+            _piper_attention_from_quantized_op,
+        )
+        from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
+            _sparse_piper_attention_from_quantized_op,
+        )
         from piper_kernels.linear.convrot.int8 import _backend as linear_backend
         from piper_kernels.linear.convrot.int8 import _ops
 
@@ -328,6 +328,8 @@ def _unsupported_reason(case: PipelineCase, device: torch.device) -> str | None:
         return "quantized pipeline weight construction requires TorchAO"
     if device.type != "cuda" or not torch.cuda.is_available():
         return "requires native projection and attention backends on a supported accelerator"
+    if importlib.util.find_spec("triton") is None:
+        return "native pipeline requires Triton"
     if case.dtype not in ("float16", "bfloat16"):
         return "pipeline projections require FP16 or BF16"
     if case.head_dim not in (64, 128) or case.width % _GROUP_SIZE:
@@ -418,10 +420,9 @@ def _build(case: PipelineCase, device: torch.device, *, fused: bool) -> Operatio
         run = partial(model.materialized, hidden, cos, sin)
 
     def check(actual: torch.Tensor) -> QualityCheck:
+        validate_output_metadata(actual, hidden.shape, model.dtype)
         if capture is not None:
             capture.check()
-        assert actual.shape == (case.batch, case.sequence, case.width)
-        assert actual.dtype == model.dtype
         return QualityCheck(
             metrics=measure_quality(actual.index_select(1, rows).cpu(), reference),
             reference="materialized ConvRot INT8 pipeline with identical projection arithmetic",

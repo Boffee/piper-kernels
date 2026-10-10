@@ -156,6 +156,36 @@ def test_numerical_failure_prevents_measurement(environment, monkeypatch, index,
     assert reason in record.reason
 
 
+@pytest.mark.parametrize(
+    ("case_id", "axis"),
+    [("attention-small", 2), ("linear-small", 0), ("ffn-small-gelu", 0), ("conv3d-small", 0)],
+)
+def test_invalid_output_metadata_prevents_measurement(environment, monkeypatch, case_id, axis):
+    case = named_case(case_id)
+    device = torch.device("cpu")
+    operation = suite.implementations(case, device)[0].build()
+    with torch.inference_mode():
+        output = operation.run()
+    monkeypatch.setattr(
+        suite, "synchronized_wall_benchmark", lambda *a, **k: pytest.fail("timed invalid output")
+    )
+    # Preserve the correct sampled values while changing the complete output contract.
+    for invalid in (output.float(), torch.cat((output, output.narrow(axis, 0, 1)), dim=axis)):
+        record = run_implementation(
+            case,
+            Implementation(
+                "test", lambda invalid=invalid: Operation(lambda: invalid, operation.check)
+            ),
+            device=device,
+            environment=environment,
+            measurement=Measurement(0, 1),
+        )
+        assert record.status == "failed"
+        assert record.stage == "validation"
+        assert record.timings is None
+        assert "expected shape" in record.reason
+
+
 def test_finiteness_validation_bounds_temporary_memory_for_strided_output(monkeypatch):
     original = torch.isfinite
     sizes = []

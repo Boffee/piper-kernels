@@ -15,7 +15,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from .cases import Conv3DCase, FFNCase, LinearCase
 from .inputs import normal_tensor, sample_indices
 from .providers import Implementation, Operation
-from .quality import QualityCheck, QualityMetrics, measure_quality
+from .quality import QualityCheck, QualityMetrics, measure_quality, validate_output_metadata
 
 # Optional format and kernel imports stay inside the selected implementation.
 # ruff: noqa: PLC0415
@@ -133,6 +133,7 @@ def _linear(case: LinearCase, device: torch.device, format_name: WeightFormat) -
     device_bias = None if bias is None else bias.to(device)
 
     def check(actual: torch.Tensor) -> QualityCheck:
+        validate_output_metadata(actual, (case.rows, case.out_features), dtype)
         sampled = actual[selected.to(device)].cpu().double()
         comparisons = {}
         if quantized_expected is not None:
@@ -171,6 +172,31 @@ def _ffn_reference(
     else:
         activated = projected * F.silu(F.linear(source.double(), weights[1].double()))
     return F.linear(activated, weights[-1].double())
+
+
+def _int8_ffn_reference(
+    source: torch.Tensor, weights: list[torch.Tensor], activation: str
+) -> torch.Tensor:
+    """Chain portable W8A8 projections with the fused FFN's FP32 activation boundary."""
+    from piper_kernels.linear.convrot.int8 import reference
+    from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+    packed = [cast(ConvRotInt8Tensor, weight) for weight in weights]
+    projections = torch.cat(
+        [
+            reference.linear(source, weight.qdata.cpu(), weight.scale.cpu(), weight.group_size)
+            for weight in packed[:-1]
+        ],
+        dim=-1,
+    )
+    down = packed[-1]
+    return reference.linear(
+        projections,
+        down.qdata.cpu(),
+        down.scale.cpu(),
+        down.group_size,
+        activation_fn="gelu_tanh" if activation == "gelu" else "swiglu",
+    )
 
 
 def _ffn_launch(
@@ -260,16 +286,32 @@ def _ffn(case: FFNCase, device: torch.device, format_name: WeightFormat) -> Oper
     selected = sample_indices(case.rows, device=_CPU)
     expected = _ffn_reference(source[selected], dense, case.activation)
     weights = [_pack_weight(weight, format_name, device) for weight in dense]
+    quantized_expected = (
+        _int8_ffn_reference(source[selected], weights, case.activation)
+        if format_name == "convrot_int8"
+        else None
+    )
     run, chunk_rows = _ffn_launch(source.to(device), weights, case, format_name)
 
     def check(actual: torch.Tensor) -> QualityCheck:
+        validate_output_metadata(actual, (case.rows, case.width), dtype)
         sampled = actual[selected.to(device)].cpu().double()
+        comparisons = (
+            {}
+            if quantized_expected is None
+            else {
+                "portable_quantized_ffn": _quantized_comparison(
+                    sampled, quantized_expected.double()
+                )
+            }
+        )
         return QualityCheck(
             measure_quality(sampled, expected),
             "fp64_ffn_from_original_weights",
             sampled.numel(),
             actual.numel(),
             0.35 if "nvfp4" in format_name else 0.1,
+            comparisons,
         )
 
     return Operation(
@@ -371,6 +413,11 @@ def _conv3d(case: Conv3DCase, device: torch.device, format_name: WeightFormat) -
             return conv3d(activation, weight, padding="reflect")
 
     def check(actual: torch.Tensor) -> QualityCheck:
+        validate_output_metadata(
+            actual,
+            (case.batch, case.out_channels, case.frames, case.height, case.width),
+            dtype,
+        )
         b = positions // (case.frames * case.height * case.width)
         t = positions // (case.height * case.width) % case.frames
         h, w = positions // case.width % case.height, positions % case.width

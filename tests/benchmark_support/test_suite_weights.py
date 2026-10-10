@@ -141,4 +141,10 @@ def test_native_weight_families_use_the_shared_workload_and_quality_checks(case_
         assert torch.isfinite(output).all()
         assert quality.metrics.relative_l2_error < quality.relative_l2_limit
         assert all(metric.relative_l2_error < 0.02 for metric in quality.comparisons.values())
+        if isinstance(case, FFNCase) and implementation.name == "convrot_int8":
+            assert "portable_quantized_ffn" in quality.comparisons
+            # An 8% scale error fits the floating-weight allowance but must fail
+            # agreement with the quantized algorithm, for both GELU and SwiGLU.
+            with pytest.raises(ValueError, match="quantized reference"):
+                operation.check(output * 1.08)
         del output, operation

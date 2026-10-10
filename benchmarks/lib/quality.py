@@ -12,6 +12,17 @@ _FULL_WIDTH_INTEGER_DTYPES = (torch.int64, torch.uint64)
 _NONFINITE_COUNT_CHUNK_ELEMENTS = 1 << 26
 
 
+def validate_output_metadata(
+    output: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype
+) -> None:
+    """Check the full output contract before sampling or casting hides differences."""
+    if output.shape != shape or output.dtype != dtype:
+        raise ValueError(
+            f"operator returned shape {tuple(output.shape)} and dtype {output.dtype}; "
+            f"expected shape {shape} and dtype {dtype}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class QuantizerSaturation:
     """Counts at the minimum and maximum values of a quantized representation."""
