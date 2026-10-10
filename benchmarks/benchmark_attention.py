@@ -1,4 +1,4 @@
-"""Benchmark full-attention providers with shared shapes, timing, and quality metrics."""
+"""Attention profiling and compiler diagnostics; use benchmark.py for comparable suite results."""
 
 from __future__ import annotations
 
@@ -16,13 +16,16 @@ from lib.attention import (
     run_sdpa,
 )
 from lib.attention_providers import (
+    PIPER_ATTENTION,
     PROVIDER_NAMES,
+    PYTORCH_SDPA,
     TRITON_PROVIDERS,
     AttentionProvider,
     make_attention_providers,
     resolve_provider_names,
     validate_provider_support,
 )
+from lib.case_cli import apply_case
 from lib.environment import EnvironmentInfo, capture_environment
 from lib.profiling import add_profile_arguments, profile_provider
 from lib.providers import measure_provider
@@ -46,7 +49,10 @@ from piper_kernels.attention.piper_attention import _backend as piper_backend
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--case", help="shared dense-attention case; excludes custom workload flags"
+    )
     parser.add_argument(
         "--providers",
         choices=PROVIDER_NAMES,
@@ -66,23 +72,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--sequence",
         type=int,
         nargs="+",
-        default=[1024, 2048, 4096, 8192, 16384],
-        help="one or more query sequence lengths",
+        help="custom diagnostic query lengths",
     )
     parser.add_argument(
         "--kv-sequence",
         type=int,
         help="fixed key/value length; defaults to each query length",
     )
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--heads", type=int, default=16)
-    parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
-    parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
-    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--heads", type=int)
+    parser.add_argument("--kv-heads", type=int)
+    parser.add_argument("--head-dim", type=int, choices=(64, 128))
+    parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES)
+    parser.add_argument("--causal", action="store_true", default=None)
     parser.add_argument("--scale", type=float)
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measurement-time-ms", type=int, default=500)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--profile-provider",
         choices=PROVIDER_NAMES,
@@ -98,7 +104,30 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_compiler_inspection_arguments(parser)
     add_profile_arguments(parser)
     add_output_arguments(parser)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    _resolve_workload(args, argv)
+    return args
+
+
+def _resolve_workload(args: argparse.Namespace, argv: Sequence[str] | None) -> None:
+    defaults = {
+        "sequence": [1024, 2048, 4096, 8192, 16384],
+        "kv_sequence": None,
+        "batch_size": 1,
+        "heads": 16,
+        "kv_heads": None,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": False,
+        "scale": None,
+        "seed": 0,
+    }
+    if args.case is not None:
+        apply_case(args, argv, attention=True)
+        args.sequence = [args.sequence]
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
 
 def _compiler_requested(args: argparse.Namespace) -> bool:
@@ -112,6 +141,8 @@ def _validate_problem_args(args: argparse.Namespace) -> None:
         raise SystemExit("key/value sequence length must be positive")
     if args.batch_size <= 0 or args.heads <= 0:
         raise SystemExit("batch size and heads must be positive")
+    if args.kv_heads is not None and (args.kv_heads <= 0 or args.heads % args.kv_heads):
+        raise SystemExit("query heads must be divisible by positive key/value heads")
     if args.warmup_ms < 0 or args.measurement_time_ms <= 0:
         raise SystemExit("warmup must be non-negative and measurement time must be positive")
     if (
@@ -138,6 +169,12 @@ def _validate_mode_args(args: argparse.Namespace, provider_names: Sequence[str])
 def _validate_args(args: argparse.Namespace, provider_names: Sequence[str]) -> None:
     _validate_problem_args(args)
     _validate_mode_args(args, provider_names)
+    if (
+        args.kv_heads is not None
+        and args.kv_heads != args.heads
+        and any(name not in (PIPER_ATTENTION, PYTORCH_SDPA) for name in provider_names)
+    ):
+        raise SystemExit("Sage providers require equal query and key/value head counts")
 
 
 def _profile_provider_name(
@@ -294,7 +331,9 @@ def _main(argv: Sequence[str] | None = None) -> None:
         args.providers,
         include_canonical=args.canonical,
         piper_attention_supported=piper_backend.select_backend(target) is not None,
-        sage_attention_2pp_supported=target.supports_fp8_fp16_mma,
+        sage_attention_2pp_supported=(
+            target.supports_fp8_fp16_mma and args.kv_heads in (None, args.heads)
+        ),
     )
     _validate_args(args, provider_names)
     validate_provider_support(provider_names, target)
@@ -321,15 +360,12 @@ def _main(argv: Sequence[str] | None = None) -> None:
         shape = AttentionShape(
             batch_size=args.batch_size,
             num_query_heads=args.heads,
+            num_key_value_heads=args.kv_heads,
             query_length=query_length,
             key_value_length=key_value_length,
             head_dim=args.head_dim,
         )
-        inputs = make_attention_inputs(
-            shape,
-            config=config,
-            device=device,
-        )
+        inputs = make_attention_inputs(shape, config=config, device=device)
         providers = make_attention_providers(
             inputs,
             provider_names=provider_names,
@@ -373,6 +409,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 measurement.timings.prepared_execution.median_ms,
             )
             record = BenchmarkRecord(
+                case_id=args.case,
                 benchmark="attention",
                 provider=measurement.provider,
                 shape=shape.as_dict(),
@@ -380,7 +417,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
                 timings=measurement.timings,
                 quality=measure_quality(measurement.output, expected),
                 environment=environment,
-                extra={"effective_tflops": tflops},
+                extra={"effective_tflops": tflops, "diagnostic": True},
             )
             records.append(record)
             _print_measurement(record)

@@ -8,14 +8,16 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import partial
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from triton.runtime.errors import OutOfResources
 
+from .cases import catalog_metadata
 from .environment import EnvironmentInfo
 from .providers import (
     BenchmarkProvider,
     DistributionTimer,
+    Implementation,
     ProviderPhase,
     provider_phase_launch,
 )
@@ -45,15 +47,6 @@ class UnsupportedTuningCandidateError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class TuningCandidate(Generic[PreparedT, OutputT]):
-    """A named configuration and a factory for its benchmark provider."""
-
-    name: str
-    configuration: Mapping[str, Any]
-    make_provider: Callable[[], BenchmarkProvider[PreparedT, OutputT]]
-
-
-@dataclass(frozen=True, slots=True)
 class TuningRecord:
     """One measured, rejected, or skipped tuning candidate."""
 
@@ -70,6 +63,7 @@ class TuningRecord:
     timing: Timing | None = None
     quality: QualityMetrics | None = None
     reason: str | None = None
+    case_id: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     def as_dict(self) -> dict[str, Any]:
@@ -77,6 +71,7 @@ class TuningRecord:
         return {
             "schema_version": self.schema_version,
             "record_type": "tuning_candidate",
+            **catalog_metadata(self.case_id),
             "tuning": self.tuning,
             "candidate": self.candidate,
             "shape": dict(self.shape),
@@ -103,43 +98,6 @@ class TuningRun:
     def winner(self) -> TuningRecord | None:
         """Return the selected record, or ``None`` when no candidate passed."""
         return next((record for record in self.records if record.selected), None)
-
-
-@dataclass(frozen=True, slots=True)
-class _TuningRunContext:
-    tuning: str
-    shape: Mapping[str, Any]
-    phase: ProviderPhase
-    warmup_ms: int
-    measurement_time_ms: int
-    environment: EnvironmentInfo
-
-    def record(
-        self,
-        candidate_name: str,
-        configuration: Mapping[str, Any],
-        status: TuningStatus,
-        *,
-        timing: Timing | None = None,
-        quality: QualityMetrics | None = None,
-        reason: str | None = None,
-    ) -> TuningRecord:
-        """Create one result while keeping run-wide fields in one place."""
-        return TuningRecord(
-            tuning=self.tuning,
-            candidate=candidate_name,
-            shape=self.shape,
-            configuration=configuration,
-            phase=self.phase,
-            status=status,
-            selected=False,
-            warmup_ms=self.warmup_ms,
-            measurement_time_ms=self.measurement_time_ms,
-            timing=timing,
-            quality=quality,
-            reason=reason,
-            environment=self.environment,
-        )
 
 
 def add_tuning_arguments(parser: argparse.ArgumentParser) -> None:
@@ -243,7 +201,7 @@ def _phase_timer(
 
 
 def _validate_tuning_run[PreparedT, OutputT](
-    candidates: Sequence[TuningCandidate[PreparedT, OutputT]],
+    candidates: Sequence[Implementation[BenchmarkProvider[PreparedT, OutputT]]],
     *,
     tuning: str,
     warmup_ms: int,
@@ -267,8 +225,8 @@ def _validate_tuning_run[PreparedT, OutputT](
         raise ValueError("tuning candidate names must be unique")
 
 
-def tune_candidates(
-    candidates: Sequence[TuningCandidate[PreparedT, OutputT]],
+def tune_candidates(  # noqa: PLR0913 - independent protocol, timing, and quality controls
+    candidates: Sequence[Implementation[BenchmarkProvider[PreparedT, OutputT]]],
     *,
     tuning: str,
     shape: Mapping[str, Any],
@@ -278,6 +236,7 @@ def tune_candidates(
     measurement_time_ms: int = 200,
     measure_candidate_quality: Callable[[OutputT], QualityMetrics] | None = None,
     quality_gate: Callable[[QualityMetrics], bool] | None = None,
+    case_id: str | None = None,
     device_timer: DistributionTimer = triton_benchmark,
 ) -> TuningRun:
     """Measure candidates and select the fastest one that passes quality checks.
@@ -296,21 +255,29 @@ def tune_candidates(
         quality_gate=quality_gate,
     )
 
-    context = _TuningRunContext(
-        tuning=tuning,
-        shape=shape,
-        phase=phase,
-        warmup_ms=warmup_ms,
-        measurement_time_ms=measurement_time_ms,
-        environment=environment,
-    )
     skipped_errors = (UnsupportedTuningCandidateError, OutOfResources)
     records: list[TuningRecord] = []
     for candidate in candidates:
-        configuration = dict(candidate.configuration)
+        record = TuningRecord(
+            case_id=case_id,
+            tuning=tuning,
+            candidate=candidate.name,
+            shape=shape,
+            configuration=candidate.configuration,
+            phase=phase,
+            status=TuningStatus.SKIPPED,
+            selected=False,
+            warmup_ms=warmup_ms,
+            measurement_time_ms=measurement_time_ms,
+            environment=environment,
+        )
         try:
-            provider = candidate.make_provider()
-            configuration.update(provider.configuration)
+            if candidate.unsupported_reason is not None:
+                raise UnsupportedTuningCandidateError(candidate.unsupported_reason)
+            provider = candidate.build()
+            record = replace(
+                record, configuration={**candidate.configuration, **provider.configuration}
+            )
             launch = provider_phase_launch(provider, phase)
             output = launch()
             provider.synchronize()
@@ -321,10 +288,9 @@ def tune_candidates(
             )
             if quality is not None and quality_gate is not None and not quality_gate(quality):
                 records.append(
-                    context.record(
-                        candidate.name,
-                        configuration,
-                        TuningStatus.QUALITY_REJECTED,
+                    replace(
+                        record,
+                        status=TuningStatus.QUALITY_REJECTED,
                         quality=quality,
                         reason="quality gate rejected candidate",
                     )
@@ -333,23 +299,15 @@ def tune_candidates(
 
             timing = timer(launch, warmup_ms, measurement_time_ms)
             records.append(
-                context.record(
-                    candidate.name,
-                    configuration,
-                    TuningStatus.MEASURED,
+                replace(
+                    record,
+                    status=TuningStatus.MEASURED,
                     timing=timing,
                     quality=quality,
                 )
             )
         except skipped_errors as error:
-            records.append(
-                context.record(
-                    candidate.name,
-                    configuration,
-                    TuningStatus.SKIPPED,
-                    reason=_reason(error),
-                )
-            )
+            records.append(replace(record, reason=_reason(error)))
 
     measured = [record for record in records if record.status is TuningStatus.MEASURED]
     if measured:

@@ -1,4 +1,8 @@
-"""Benchmark Piper ConvRot INT8 entrypoints with portable-reference quality."""
+"""Diagnose ConvRot INT8 phases and optional external providers.
+
+Use benchmark.py for stable cross-accelerator comparisons. This runner isolates
+preparation/GEMM and compiler-provider differences for an explicit workload.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from types import ModuleType
 from typing import cast
 
 import torch
+from lib.case_cli import apply_case
 from lib.convrot import (
     CONVROT_DTYPE_NAMES,
     DENSE_LINEAR_ANCHOR_IN_FEATURES,
@@ -249,7 +254,8 @@ def _run_shape(
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--case", help="use an unchanged linear case from the shared catalog")
     parser.add_argument(
         "--rows",
         type=int,
@@ -307,13 +313,20 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="benchmark the optional comfy-kitchen CUDA ConvRot INT8 provider",
     )
     add_output_arguments(parser)
-    return parser.parse_args(argv)
+    args = apply_case(parser.parse_args(argv), argv)
+    if args.case is not None:
+        args.rows, args.in_features, args.out_features = (
+            [args.rows],
+            [args.in_features],
+            [args.out_features],
+        )
+    return args
 
 
 def _benchmark_shapes(args: argparse.Namespace) -> tuple[ConvRotShape, ...]:
     return tuple(
         ConvRotShape(
-            "linear",
+            args.case or "linear",
             rows,
             out_features,
             in_features,
@@ -399,6 +412,8 @@ def _records_for_result(
     shape: ConvRotShape,
     result: Result,
     environment: EnvironmentInfo,
+    *,
+    case_id: str | None,
 ) -> list[BenchmarkRecord | BenchmarkRecord[DeviceTimings]]:
     shape_record = shape.as_dict()
     measurements = [
@@ -411,6 +426,7 @@ def _records_for_result(
             continue
         records.append(
             BenchmarkRecord(
+                case_id=case_id,
                 benchmark="convrot-linear",
                 provider=measurement.provider,
                 shape=shape_record,
@@ -426,6 +442,7 @@ def _records_for_result(
         )
         records.append(
             BenchmarkRecord(
+                case_id=case_id,
                 benchmark="convrot-linear",
                 provider="piper-convrot",
                 shape=shape_record,
@@ -501,7 +518,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"  {phase}: cache-flushed {timings.cache_flushed.display()} ms; "
                 f"graph {timings.graph.display()} ms"
             )
-        records.extend(_records_for_result(shape, result, environment))
+        records.extend(_records_for_result(shape, result, environment, case_id=args.case))
         del result
         torch.cuda.empty_cache()
     write_records(records, output_target(args))

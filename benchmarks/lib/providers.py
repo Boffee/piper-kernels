@@ -8,6 +8,9 @@ from enum import StrEnum
 from functools import partial
 from typing import Any, Generic, Protocol, TypeVar
 
+import torch
+
+from .quality import QualityCheck
 from .timing import (
     PhaseTimings,
     Timing,
@@ -18,6 +21,25 @@ from .timing import (
 
 PreparedT = TypeVar("PreparedT")
 OutputT = TypeVar("OutputT")
+
+
+@dataclass
+class Operation:
+    """Resident inputs/weights; run includes all required per-call preparation."""
+
+    run: Callable[[], torch.Tensor]
+    check: Callable[[torch.Tensor], QualityCheck]
+    configuration: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Implementation[OperationT = Operation]:
+    """Defer allocation and compilation until this implementation is measured."""
+
+    name: str
+    build: Callable[[], OperationT]
+    unsupported_reason: str | None = None
+    configuration: Mapping[str, Any] = field(default_factory=dict)
 
 
 class ProviderPhase(StrEnum):

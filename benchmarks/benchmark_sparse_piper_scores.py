@@ -1,8 +1,8 @@
 """Compare selected FP32 minmax scoring with the two-GEMM Torch baseline.
 
-Uses synthetic summaries at H3's B1/H56/D128, with full and final query chunks
-from an 8192-token fused pipeline by default. --query-blocks also measures larger
-standalone routing chunks. K retains the sparse-prefix view of the padded
+Uses the shared lower video case by default. --case selects another attention
+or pipeline workload; custom shape flags are standalone diagnostics.
+--query-blocks measures explicit routing chunks. K retains the sparse-prefix view of the padded
 sequence allocation. Scores are checked against FP64 before timing. Timings
 include score allocation and the maximum epilogue, but not summary generation
 or route selection. These are FP32 operations, not INT8 TOPS.
@@ -14,7 +14,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
+from lib.case_cli import require_case, set_case_arguments
+from lib.cases import AttentionCase, PipelineCase
 from lib.environment import EnvironmentInfo, capture_environment
+from lib.inputs import normal_tensor
 from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, write_records
 from lib.timing import ClockDomain, PhaseTimings, Timing, triton_benchmark
 
@@ -28,19 +31,46 @@ _WARMUP_MS = 20
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequence", type=int, nargs="+", default=[8192, 32768, 100000, 150000])
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--case", help="shared attention or pipeline case")
+    parser.add_argument("--sequence", type=int, nargs="+")
+    parser.add_argument("--batch", type=int)
+    parser.add_argument("--heads", type=int)
+    parser.add_argument("--kv-heads", type=int)
+    parser.add_argument("--head-dim", type=int, choices=(64, 128))
     parser.add_argument("--query-blocks", type=int, nargs="+")
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--rep-ms", type=int, default=100)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=273)
+    parser.add_argument("--seed", type=int)
     add_output_arguments(parser)
     args = parser.parse_args(argv)
+    workload = ("sequence", "batch", "heads", "kv_heads", "head_dim", "seed")
+    custom = any(getattr(args, key) is not None for key in workload)
+    if args.case is None and not custom:
+        args.case = "sparse-attention-video-low-half"
+    case = require_case(
+        args.case or "sparse-attention-video-low-half", (AttentionCase, PipelineCase)
+    )
+    defaults = {
+        "sequence": [case.sequence],
+        "batch": case.batch,
+        "heads": case.heads,
+        "kv_heads": case.kv_heads,
+        "head_dim": case.head_dim,
+        "seed": case.seed,
+    }
+    if args.case is not None:
+        set_case_arguments(args, argv, defaults)
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
     if min(args.sequence) < 64 or args.samples < 1 or args.rep_ms < 1 or args.device < 0:
         parser.error("requires sequence >= 64, positive samples/rep-ms, and a nonnegative device")
     if args.query_blocks is not None and min(args.query_blocks) < 1:
         parser.error("query blocks must be positive")
+    if min(args.batch, args.heads, args.kv_heads) < 1 or args.heads % args.kv_heads:
+        parser.error("requires a positive batch and query heads divisible by positive KV heads")
     return args
 
 
@@ -56,9 +86,10 @@ def _torch_scores(
 ) -> torch.Tensor:
     batch, heads, rows, width = query.shape
     keys = primary.shape[2]
-    flat_query = query.reshape(batch * heads, rows, width)
-    scores = torch.bmm(flat_query, primary.reshape(batch * heads, keys, width).transpose(1, 2))
-    other = torch.bmm(flat_query, auxiliary.reshape(batch * heads, keys, width).transpose(1, 2))
+    kv_heads = primary.shape[1]
+    grouped_query = query.reshape(batch, kv_heads, heads // kv_heads, rows, width)
+    scores = grouped_query @ primary[:, :, None].transpose(-1, -2)
+    other = grouped_query @ auxiliary[:, :, None].transpose(-1, -2)
     return torch.maximum(scores, other, out=scores).reshape(batch, heads, rows, keys)
 
 
@@ -66,20 +97,33 @@ def _benchmark(
     args: argparse.Namespace, sequence: int, rows: int, environment: EnvironmentInfo
 ) -> list[BenchmarkRecord]:
     device = torch.device("cuda", args.device)
-    generator = torch.Generator(device=device).manual_seed(args.seed + sequence)
     keys, storage = sequence // 64, (sequence + 63) // 64
-    query = torch.randn((1, 56, rows, 128), device=device, generator=generator) * 0.5
-    primary = torch.randn((1, 56, storage, 128), device=device, generator=generator) * 0.5 + 2
-    auxiliary = torch.randn((1, 56, storage, 128), device=device, generator=generator) * 0.5 - 2
+    query = normal_tensor(
+        (args.batch, args.heads, rows, args.head_dim),
+        dtype=torch.float32,
+        device=device,
+        seed=args.seed,
+        scale=0.5,
+    )
+    key_shape = (args.batch, args.kv_heads, storage, args.head_dim)
+    primary = (
+        normal_tensor(key_shape, dtype=torch.float32, device=device, seed=args.seed + 1, scale=0.5)
+        + 2
+    )
+    auxiliary = (
+        normal_tensor(key_shape, dtype=torch.float32, device=device, seed=args.seed + 2, scale=0.5)
+        - 2
+    )
     primary, auxiliary = primary[:, :, :keys], auxiliary[:, :, :keys]
     selected = _backend.select_minmax_scores(query, primary, auxiliary)
     functions = {
         "torch": lambda: _torch_scores(query, primary, auxiliary),
         "selected": lambda: routing_scores(query, primary, auxiliary, _MINMAX_ROUTING),
     }
+    groups = args.heads // args.kv_heads
     reference = torch.maximum(
-        query.double() @ primary.double().transpose(-1, -2),
-        query.double() @ auxiliary.double().transpose(-1, -2),
+        query.double() @ primary.double().repeat_interleave(groups, dim=1).transpose(-1, -2),
+        query.double() @ auxiliary.double().repeat_interleave(groups, dim=1).transpose(-1, -2),
     )
     errors = {}
     for name, function in functions.items():
@@ -90,7 +134,7 @@ def _benchmark(
     del reference
     order = list(functions)
     rng = random.Random(args.seed)
-    samples: dict[str, list[dict[str, float | str]]] = {name: [] for name in order}
+    samples: dict[str, list[dict[str, float | str | None]]] = {name: [] for name in order}
     medians: dict[str, list[float]] = {name: [] for name in order}
     for _ in range(args.samples):
         rng.shuffle(order)
@@ -100,16 +144,19 @@ def _benchmark(
             medians[name].append(timing.median_ms)
     return [
         BenchmarkRecord(
+            case_id=args.case,
             benchmark="sparse_piper_scores",
             provider=name,
             shape={
                 "sequence": sequence,
-                "score_shape_bhqk": [1, 56, rows, keys],
-                "head_dim": 128,
+                "score_shape_bhqk": [args.batch, args.heads, rows, keys],
+                "kv_heads": args.kv_heads,
+                "head_dim": args.head_dim,
                 "key_storage_blocks": storage,
             },
             configuration={
                 "seed": args.seed,
+                "diagnostic": True,
                 "query_stride": query.stride(),
                 "key_stride": primary.stride(),
                 "implementation": (

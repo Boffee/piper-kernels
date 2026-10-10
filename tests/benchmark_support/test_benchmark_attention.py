@@ -64,6 +64,20 @@ def test_default_workload_uses_lower_head_anchor_and_short_sequence_guard() -> N
     assert 2 * 1024 in arguments.sequence
 
 
+def test_catalog_case_preserves_gqa_and_rejects_workload_overrides() -> None:
+    arguments = _parse_args(["--case", "attention-image-low"])
+    assert arguments.sequence == [2816]
+    assert (arguments.heads, arguments.kv_heads, arguments.head_dim) == (48, 12, 128)
+    assert arguments.case == "attention-image-low"
+    _validate_args(arguments, (PYTORCH_SDPA, PIPER_ATTENTION))
+    with pytest.raises(SystemExit, match="equal query and key/value"):
+        _validate_args(arguments, (SAGE_ATTENTION_2PP,))
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "attention-image-low", "--heads", "16"])
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "linear-small"])
+
+
 @pytest.mark.parametrize(
     ("capability", "expected"),
     [((8, 9), "per_thread"), ((12, 0), "per_warp"), ((12, 1), "per_warp")],

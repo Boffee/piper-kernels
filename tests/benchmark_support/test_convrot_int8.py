@@ -20,6 +20,7 @@ from benchmark_convrot_int8_preparation import (
     COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION,
     PIPER_TRITON_PROVIDER,
     PreparationPhaseResult,
+    _assert_fused_quality,
     _compiler_requested,
     _inspection_provider,
     _load_comfy_kitchen_cuda,
@@ -48,7 +49,6 @@ from lib.convrot_int8_providers import (
     make_planned_convrot_int8_provider,
     make_public_convrot_int8_provider,
 )
-from lib.environment import EnvironmentInfo
 from lib.providers import ProviderMeasurement
 from lib.quality import measure_quality
 from lib.reporting import output_target, write_records
@@ -56,24 +56,6 @@ from lib.timing import ClockDomain, DeviceTimings, PhaseTimings, Timing
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton.targets import AcceleratorTarget
-
-
-def _environment() -> EnvironmentInfo:
-    return EnvironmentInfo(
-        captured_at_utc="2026-08-08T00:00:00+00:00",
-        python_version="3.14.0",
-        platform="test",
-        torch_version="2.12.0",
-        triton_version="3.7.1",
-        accelerator_backend="cuda",
-        accelerator_runtime_version="13.0",
-        accelerator_driver_version="580.0",
-        gpu_name="test GPU",
-        gpu_architecture="SM120",
-        gpu_index=0,
-        git_revision="a" * 40,
-        git_dirty=False,
-    )
 
 
 def _preparation_configuration() -> _PreparationConfiguration:
@@ -138,6 +120,22 @@ def test_default_shapes_use_lower_width_linear_anchors() -> None:
     assert all(not shape.has_bias for shape in shapes)
     assert preparation_arguments.rows == 8192
     assert preparation_arguments.in_features == [6144]
+
+
+def test_named_case_matches_suite_shape_and_rejects_overrides() -> None:
+    args = _parse_args(["--case", "linear-small", "--phases"])
+    shapes = _benchmark_shapes(args)
+    assert [(shape.rows, shape.in_features, shape.out_features) for shape in shapes] == [
+        (64, 256, 256)
+    ]
+    assert shapes[0].name == args.case
+    assert shapes[0].as_dict()["case"] == "linear-small"
+    assert args.dtype == "bfloat16"
+    assert args.phases
+    with pytest.raises(SystemExit, match="workload overrides"):
+        _parse_args(["--case", "linear-small", "--rows", "128"])
+    with pytest.raises(SystemExit):
+        _parse_args(["--case", "linear-small", "--ro", "128"])
 
 
 def test_shape_can_include_swiglu_without_bias() -> None:
@@ -292,7 +290,7 @@ def test_production_phase_buffers_and_integer_reference(dtype, activation, bias)
         torch.testing.assert_close(output, operations["linear"](), rtol=0, atol=0)
 
 
-def test_phase_records_distinguish_clocks_and_phase_scope():
+def test_phase_records_distinguish_clocks_and_phase_scope(environment):
     shape = ConvRotShape("test", 3, 17, 256)
     output = torch.ones(1)
     result = Result(
@@ -304,7 +302,7 @@ def test_phase_records_distinguish_clocks_and_phase_scope():
             for name in ("prepare", "prepared_gemm", "linear")
         },
     )
-    records = _records_for_result(shape, result, _environment())
+    records = _records_for_result(shape, result, environment, case_id=None)
     assert len(records) == 4
     for record in records[1:]:
         value = record.as_dict()
@@ -383,7 +381,7 @@ def test_main_provider_configuration_distinguishes_logical_and_provider_layouts(
     assert "version" not in comfy
 
 
-def test_main_record_shape_contains_only_case_and_dimensions() -> None:
+def test_main_record_shape_contains_only_case_and_dimensions(environment) -> None:
     shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     output = torch.ones((1, 1))
     quality = measure_quality(output, output)
@@ -410,7 +408,7 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
         quality=quality,
     )
 
-    (record,) = _records_for_result(shape, result, _environment())
+    (record,) = _records_for_result(shape, result, environment, case_id=None)
     value = record.as_dict()
 
     assert value["shape"] == {
@@ -426,7 +424,7 @@ def test_main_record_shape_contains_only_case_and_dimensions() -> None:
     assert value["configuration"]["provider_input_layout"] == "up_gate"
 
 
-def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
+def test_main_comfy_record_uses_installed_version_and_provider_layout(environment) -> None:
     shape = ConvRotShape("mlp-fc2", 3, 96, 512, "swiglu", False)
     output = torch.ones((1, 1))
     quality = measure_quality(output, output)
@@ -461,7 +459,7 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
         comfy_kitchen_quality=quality,
     )
 
-    records = _records_for_result(shape, result, _environment())
+    records = _records_for_result(shape, result, environment, case_id=None)
     comfy_record = next(record for record in records if record.provider == "comfy-kitchen")
     configuration = comfy_record.as_dict()["configuration"]
 
@@ -469,6 +467,24 @@ def test_main_comfy_record_uses_installed_version_and_provider_layout() -> None:
     assert "version" not in configuration
     assert configuration["logical_input_layout"] == "up_gate"
     assert configuration["provider_input_layout"] == "gate_up"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_preparation_quality_allows_only_low_precision_rounding(dtype) -> None:
+    split_qdata = torch.tensor([[127, 42]], dtype=torch.int8)
+    neighboring_qdata = torch.tensor([[127, 43]], dtype=torch.int8)
+    scale = torch.ones(1)
+    rounded_scale = scale * (1 + torch.finfo(dtype).eps)
+    _assert_fused_quality(split_qdata, scale, split_qdata, scale, dtype, None)
+    if dtype == torch.float32:
+        with pytest.raises(AssertionError):
+            _assert_fused_quality(split_qdata, scale, neighboring_qdata, scale, dtype, None)
+    else:
+        _assert_fused_quality(split_qdata, scale, neighboring_qdata, rounded_scale, dtype, None)
+    with pytest.raises(AssertionError):
+        _assert_fused_quality(split_qdata, scale, split_qdata - 2, scale, dtype, None)
+    with pytest.raises(AssertionError):
+        _assert_fused_quality(split_qdata, scale, split_qdata, scale * 1.1, dtype, None)
 
 
 def test_preparation_minimum_global_traffic_accounts_for_split_intermediate() -> None:
@@ -594,9 +610,32 @@ def test_private_comfy_preparation_adapter_rejects_other_versions(monkeypatch) -
         _load_comfy_kitchen_cuda()
 
 
-def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("argv", "case_id", "rows", "in_features", "activation"),
+    [
+        (
+            ["--rows", "3", "--in-features", "512", "--input-activation", "swiglu"],
+            None,
+            3,
+            512,
+            "swiglu",
+        ),
+        (["--case", "linear-image-low-6144x1536"], "linear-image-low-6144x1536", 2816, 6144, None),
+        (
+            ["--case", "linear-image-low-6144x16384"],
+            "linear-image-low-6144x16384",
+            2816,
+            6144,
+            None,
+        ),
+    ],
+    ids=["custom-swiglu", "image-kv-projection", "image-ffn-projection"],
+)
+def test_preparation_cli_and_records_expose_phase_timings(
+    environment, tmp_path, argv, case_id, rows, in_features, activation
+) -> None:
     output_path = tmp_path / "preparation.jsonl"
-    arguments = _parse_preparation_args(["--jsonl", str(output_path)])
+    arguments = _parse_preparation_args([*argv, "--jsonl", str(output_path)])
     phase = PreparationPhaseResult(
         phase="fused",
         provider=PIPER_TRITON_PROVIDER,
@@ -617,28 +656,31 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     )
 
     (record,) = _preparation_records(
-        rows=3,
-        in_features=512,
-        dtype_name="bfloat16",
-        input_activation="swiglu",
-        seed=0,
-        warmup_ms=100,
-        measurement_time_ms=300,
+        case_id=arguments.case,
+        rows=arguments.rows,
+        in_features=arguments.in_features[0],
+        dtype_name=arguments.dtype,
+        input_activation=arguments.input_activation,
+        seed=arguments.seed,
+        warmup_ms=arguments.warmup_ms,
+        measurement_time_ms=arguments.measurement_time_ms,
         results=[phase],
-        environment=_environment(),
+        environment=environment,
     )
     value = record.as_dict()
 
     assert arguments.jsonl == output_path
     assert value["benchmark"] == "convrot-preparation"
+    raw_features = in_features * (2 if activation == "swiglu" else 1)
     assert value["shape"] == {
-        "rows": 3,
-        "in_features": 512,
-        "raw_input_features": 1024,
+        "rows": rows,
+        "in_features": in_features,
+        "raw_input_features": raw_features,
     }
-    assert value["configuration"]["input_activation"] == "swiglu"
-    assert value["configuration"]["logical_input_layout"] == "up_gate"
-    assert value["configuration"]["provider_input_layout"] == "up_gate"
+    assert value["configuration"]["input_activation"] == (activation or "none")
+    layout = "up_gate" if activation == "swiglu" else "plain"
+    assert value["configuration"]["logical_input_layout"] == layout
+    assert value["configuration"]["provider_input_layout"] == layout
     assert value["configuration"]["baseline_provider"] == PIPER_TRITON_PROVIDER
     assert value["configuration"]["baseline_phase"] == "fused"
     assert value["configuration"]["operation_provenance"] == phase.operation_provenance
@@ -654,10 +696,11 @@ def test_preparation_cli_and_records_expose_phase_timings(tmp_path) -> None:
     write_records([record], output_target(arguments))
     written = json.loads(output_path.read_text())
     assert written["benchmark"] == "convrot-preparation"
-    assert written["shape"]["raw_input_features"] == 1024
+    assert written["shape"]["raw_input_features"] == raw_features
+    assert written["case_id"] == case_id
 
 
-def test_comfy_preparation_record_includes_installed_and_contract_versions() -> None:
+def test_comfy_preparation_record_includes_installed_and_contract_versions(environment) -> None:
     phase = PreparationPhaseResult(
         phase="comfy-kitchen",
         provider="comfy-kitchen",
@@ -674,6 +717,7 @@ def test_comfy_preparation_record_includes_installed_and_contract_versions() -> 
     )
 
     (record,) = _preparation_records(
+        case_id=None,
         rows=3,
         in_features=512,
         dtype_name="bfloat16",
@@ -682,7 +726,7 @@ def test_comfy_preparation_record_includes_installed_and_contract_versions() -> 
         warmup_ms=100,
         measurement_time_ms=300,
         results=[phase],
-        environment=_environment(),
+        environment=environment,
     )
 
     configuration = record.as_dict()["configuration"]

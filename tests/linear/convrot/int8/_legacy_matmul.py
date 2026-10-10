@@ -1,7 +1,7 @@
-"""Original ConvRot INT8 GEMM retained only as a benchmark/correctness control."""
+"""Split-tail launch oracle for preserving GEMM output and storage behavior."""
 
 # pyright: reportCallIssue=false
-# ruff: noqa: ANN001, ANN201, PLR0913, PLR0917
+# ruff: noqa: PLR0913, PLR0917
 
 import math
 

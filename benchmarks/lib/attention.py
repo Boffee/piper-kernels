@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .inputs import normal_tensor
+
 type AttentionInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 _DTYPES = {
@@ -102,13 +104,12 @@ def make_attention_inputs(
     config: AttentionConfig,
     device: torch.device,
 ) -> AttentionInputs:
-    """Create reproducible random Q/K/V tensors for an attention shape."""
-    generator = torch.Generator(device=device).manual_seed(config.seed)
-    query = torch.randn(
+    """Create identical Q/K/V values across devices using the shared input recipe."""
+    query = normal_tensor(
         (shape.batch_size, shape.num_query_heads, shape.query_length, shape.head_dim),
         device=device,
         dtype=config.dtype,
-        generator=generator,
+        seed=config.seed,
     )
     key_shape = (
         shape.batch_size,
@@ -116,8 +117,8 @@ def make_attention_inputs(
         shape.key_value_length,
         shape.head_dim,
     )
-    key = torch.randn(key_shape, device=device, dtype=config.dtype, generator=generator)
-    value = torch.randn(key_shape, device=device, dtype=config.dtype, generator=generator)
+    key = normal_tensor(key_shape, device=device, dtype=config.dtype, seed=config.seed + 1)
+    value = normal_tensor(key_shape, device=device, dtype=config.dtype, seed=config.seed + 2)
     return query, key, value
 
 
@@ -130,4 +131,5 @@ def run_sdpa(inputs: AttentionInputs, config: AttentionConfig) -> torch.Tensor:
         value,
         scale=config.scale,
         is_causal=config.is_causal,
+        enable_gqa=query.shape[1] != key.shape[1],
     )

@@ -1,7 +1,10 @@
+from unittest.mock import Mock
+
 import pytest
 from lib.tuning import UnsupportedTuningCandidateError
 from tune_sage_attention_2pp import (
     _candidate_choices,
+    _main,
     _parse_args,
     _resolve_plan,
     _validate_args,
@@ -23,7 +26,9 @@ def _production_plan():
 
 
 def test_omitted_axes_measure_only_the_production_plan() -> None:
-    choices = _candidate_choices(_parse_args([]), _production_plan())
+    arguments = _parse_args([])
+    _validate_args(arguments)
+    choices = _candidate_choices(arguments, _production_plan())
 
     assert len(choices) == 1
     choice = choices[0]
@@ -48,9 +53,14 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
             "2",
             "3",
             "--use-packed-probability-conversion",
+            "--heads",
+            "16",
+            "--kv-heads",
+            "16",
         ]
     )
 
+    _validate_args(arguments)
     choices = _candidate_choices(arguments, _production_plan())
 
     assert len(choices) == 8
@@ -98,6 +108,24 @@ def test_noncausal_search_rejects_reverse_block_order() -> None:
 
     with pytest.raises(SystemExit, match="requires causal attention"):
         _validate_args(arguments)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--case", "attention-image-low"],
+        ["--heads", "48", "--kv-heads", "12"],
+    ],
+    ids=["catalog", "custom"],
+)
+def test_gqa_workloads_are_rejected_before_input_allocation(monkeypatch, argv):
+    make_inputs = Mock(side_effect=AssertionError("unsupported workload reached allocation"))
+    monkeypatch.setattr("tune_sage_attention_2pp.make_attention_inputs", make_inputs)
+
+    with pytest.raises(SystemExit, match="requires equal query and key/value head counts"):
+        _main(argv)
+
+    make_inputs.assert_not_called()
 
 
 def test_plan_resolution_records_unsupported_descriptor_shapes() -> None:

@@ -5,30 +5,31 @@ from unittest.mock import Mock
 import benchmark_sparse_piper_projection as benchmark
 import pytest
 import torch
+from lib.cases import PipelineCase, named_case
 from lib.timing import ClockDomain, DeviceTimings, Timing
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
-@pytest.mark.parametrize(
-    "option", ["--sequence", "--batch", "--heads", "--input-features", "--rep-ms", "--samples"]
-)
+@pytest.mark.parametrize("option", ["--rep-ms", "--samples"])
 def test_nonpositive_counts_are_rejected(option):
     with pytest.raises(SystemExit):
         benchmark._parse_args([option, "0"])
 
 
-@pytest.mark.parametrize("arguments", [["--sequence", "63"], ["--input-features", "272"]])
-def test_invalid_preparation_shapes_are_rejected(arguments):
+@pytest.mark.parametrize("identity", ["missing", "linear-small", "attention-small"])
+def test_requires_a_pipeline_case(identity):
     with pytest.raises(SystemExit):
-        benchmark._parse_args(arguments)
+        benchmark._parse_args(["--case", identity])
 
 
-def test_h3_defaults_and_long_ragged_sequence():
-    args = benchmark._parse_args(["--sequence", "100000"])
-    assert args.sequence == [100000]
-    assert args.input_features == 5376
-    assert args.heads == 56
-    assert args.batch == 1
+def test_projection_diagnostic_inherits_shared_gqa_workload():
+    args = benchmark._parse_args(["--case", "pipeline-small"])
+    case = named_case(args.case)
+    assert isinstance(case, PipelineCase)
+    assert case.sequence == 257
+    assert case.heads == 4
+    assert case.kv_heads == 2
+    assert case.head_dim == 64
     assert args.samples == 3
 
 
@@ -40,13 +41,15 @@ def test_unsupported_backend_rejects_before_large_allocations_or_input_preparati
     monkeypatch.setattr(
         benchmark, "select_preparation_backend", Mock(side_effect=AssertionError("prepared input"))
     )
-    args = benchmark._parse_args(["--device", "1", "--sequence", "100000"])
+    args = benchmark._parse_args(["--device", "1", "--case", "pipeline-small"])
+    case = named_case(args.case)
     with FakeTensorMode(), pytest.raises(ValueError, match="sparse projections are unavailable"):
-        benchmark._benchmark(args, args.sequence[0], Mock())
+        benchmark._benchmark(args, case, Mock())
     select.assert_called_once()
     probe = select.call_args.args[0]
     assert probe.device == torch.device("cuda:1")
     assert probe.numel() == 0
+    assert select.call_args.kwargs == {"head_dim": case.head_dim}
 
 
 @pytest.mark.parametrize("operations", [0, 6_000_000_000])

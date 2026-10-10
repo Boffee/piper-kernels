@@ -22,12 +22,12 @@ from lib.attention_tuning import (
     add_attention_tuning_arguments,
     validate_attention_tuning_arguments,
 )
+from lib.case_cli import apply_case
 from lib.environment import capture_environment
-from lib.providers import BenchmarkProvider
+from lib.providers import BenchmarkProvider, Implementation
 from lib.quality import measure_quality
 from lib.reporting import output_target
 from lib.tuning import (
-    TuningCandidate,
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
     meets_minimum_sqnr,
@@ -40,8 +40,6 @@ from lib.tuning import (
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
-
-_validate_args = validate_attention_tuning_arguments
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,9 +76,15 @@ class _SageAttention2ppTuningChoice:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_attention_tuning_arguments(parser)
-    return parser.parse_args(argv)
+    return apply_case(parser.parse_args(argv), argv, attention=True)
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    validate_attention_tuning_arguments(args)
+    if args.kv_heads is not None and args.kv_heads != args.heads:
+        raise SystemExit("SageAttention2++ requires equal query and key/value head counts")
 
 
 def _candidate_choices(
@@ -150,7 +154,7 @@ def _make_candidate(
     production_plan: SageAttention2ppExecutionPlan,
     config: AttentionConfig,
     target: AcceleratorTarget,
-) -> TuningCandidate[AttentionInputs, torch.Tensor]:
+) -> Implementation[BenchmarkProvider[AttentionInputs, torch.Tensor]]:
     query, _, _ = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
 
@@ -195,7 +199,7 @@ def _make_candidate(
             },
         )
 
-    return TuningCandidate(
+    return Implementation(
         name=choice.name,
         configuration={
             **config.as_dict(),
@@ -203,7 +207,7 @@ def _make_candidate(
             "implementation": "pure_triton",
             "algorithm": "sage_attention_2pp",
         },
-        make_provider=make_provider,
+        build=make_provider,
     )
 
 
@@ -230,6 +234,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
         args.sequence,
         key_value_length,
         args.head_dim,
+        args.kv_heads,
     )
     scale = args.head_dim**-0.5
     config = AttentionConfig(
@@ -259,6 +264,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
     expected = run_sdpa(inputs, config)
     run = tune_candidates(
         candidates,
+        case_id=args.case,
         tuning="sage_attention_2pp_execution_plan",
         shape=shape.as_dict(),
         environment=capture_environment(Path(__file__).resolve().parents[1]),

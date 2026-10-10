@@ -1,4 +1,7 @@
-"""Benchmark fused sparse Piper separately from routing and input preparation.
+"""Diagnose sparse Piper routing, preparation, and prepared execution separately.
+
+Use benchmark.py for the shared full-call suite. --case selects one shared
+sparse workload here; custom shape flags are standalone stage diagnostics.
 
 Kernel TOPS counts only the useful selected QK and PV multiply/add operations;
 it excludes softmax operations and does not count skipped blocks as work.
@@ -18,8 +21,11 @@ from pathlib import Path
 from typing import cast
 
 import torch
+from lib.case_cli import require_case, set_case_arguments
+from lib.cases import AttentionCase, catalog_metadata
 from lib.environment import capture_environment
 from lib.sparse_piper import assert_equal_finite, check_query_samples, useful_integer_operations
+from lib.suite_attention import make_inputs
 from lib.timing import synchronized_wall_benchmark
 from triton.testing import do_bench, do_bench_cudagraph
 
@@ -48,19 +54,55 @@ def _positive_int(value: str) -> int:
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequence", type=_positive_int, nargs="+", default=[1024, 4096])
-    parser.add_argument("--head-dim", type=int, choices=[64, 128], default=128)
-    parser.add_argument("--heads", type=_positive_int, default=8)
-    parser.add_argument("--batch", type=_positive_int, default=1)
-    parser.add_argument("--ratios", type=float, nargs="+", default=[0.25, 1.0])
-    parser.add_argument("--routing", choices=["minmax", "mean"], default="minmax")
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--case", help="shared sparse attention case")
+    parser.add_argument("--sequence", type=_positive_int, nargs="+")
+    parser.add_argument("--head-dim", type=int, choices=[64, 128])
+    parser.add_argument("--heads", type=_positive_int)
+    parser.add_argument("--kv-heads", type=_positive_int)
+    parser.add_argument("--batch", type=_positive_int)
+    parser.add_argument("--ratios", type=float, nargs="+")
+    parser.add_argument("--routing", choices=["minmax", "mean"])
+    parser.add_argument("--dtype", choices=["bfloat16", "float16"])
     parser.add_argument("--rep-ms", type=_positive_int, default=100)
     parser.add_argument("--samples", type=_positive_int, default=3)
     parser.add_argument("--reference-max-sequence", type=int, default=1024)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=931)
+    parser.add_argument("--seed", type=int)
     args = parser.parse_args(argv)
+    defaults = {
+        "sequence": [1024, 4096],
+        "head_dim": 128,
+        "heads": 8,
+        "kv_heads": None,
+        "batch": 1,
+        "ratios": [0.25, 1.0],
+        "routing": "minmax",
+        "dtype": "bfloat16",
+        "seed": 931,
+    }
+    if args.case is not None:
+        case = require_case(args.case, AttentionCase)
+        if case.keep_ratio is None:
+            parser.error("--case requires a sparse attention case")
+        defaults.update(
+            sequence=[case.sequence],
+            head_dim=case.head_dim,
+            heads=case.heads,
+            kv_heads=case.kv_heads,
+            batch=case.batch,
+            ratios=[case.keep_ratio],
+            dtype=case.dtype,
+            seed=case.seed,
+        )
+        set_case_arguments(args, argv, defaults)
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    if args.kv_heads is None:
+        args.kv_heads = args.heads
+    if args.heads % args.kv_heads:
+        parser.error("query heads must be divisible by key/value heads")
     if min(args.sequence) < 64:
         parser.error("benchmark sequence lengths must be at least 64")
     if any(not 0 < ratio <= 1 for ratio in args.ratios):
@@ -70,12 +112,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     device = torch.device("cuda", args.device)
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    shape = (args.batch, sequence, args.heads, args.head_dim)
-    query, key, value = [
-        torch.randn(shape, device=device, dtype=torch.bfloat16, generator=generator)
-        for _ in range(3)
-    ]
+    case = AttentionCase(
+        id=args.case or "custom",
+        sequence=sequence,
+        heads=args.heads,
+        kv_heads=args.kv_heads,
+        head_dim=args.head_dim,
+        batch=args.batch,
+        keep_ratio=ratio,
+        dtype=args.dtype,
+        seed=args.seed,
+    )
+    query, key, value = (tensor.transpose(1, 2) for tensor in make_inputs(case, device))
+    shape = tuple(query.shape)
     backend = require_attention_backend(query)
     attention = SparsePiperAttention([ratio] * args.heads, routing=args.routing)
     blocks = sequence // 64
@@ -168,7 +217,11 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
         json.dumps(
             {
                 "shape_bnhd": shape,
-                "input_source": "synthetic_bf16_normal",
+                "kv_heads": args.kv_heads,
+                "dtype": args.dtype,
+                **catalog_metadata(args.case),
+                "diagnostic": True,
+                "input_source": "cpu_seeded_normal_cast_to_input_dtype",
                 "ratio": ratio,
                 "routing": args.routing,
                 "skip_dense_routing": skip_dense_routing,

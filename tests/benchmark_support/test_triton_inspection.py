@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from lib.environment import EnvironmentInfo
 from lib.providers import BenchmarkProvider
 from lib.reporting import OutputFormat, OutputTarget, write_records
 from lib.triton_inspection import (
@@ -21,24 +20,6 @@ from lib.triton_inspection import (
     summarize_ptx,
     summarize_sass,
 )
-
-
-def _environment() -> EnvironmentInfo:
-    return EnvironmentInfo(
-        captured_at_utc="2026-08-06T00:00:00+00:00",
-        python_version="3.14.0",
-        platform="test",
-        torch_version="2.12.0",
-        triton_version="3.7.1",
-        accelerator_backend="cuda",
-        accelerator_runtime_version="13.0",
-        accelerator_driver_version="580.0",
-        gpu_name="test GPU",
-        gpu_architecture="SM120",
-        gpu_index=0,
-        git_revision="a" * 40,
-        git_dirty=False,
-    )
 
 
 def _jit_kernel(*, backend: str = "cuda", num_ctas: int = 1) -> SimpleNamespace:
@@ -126,14 +107,14 @@ def test_resource_ceiling_reports_each_constraint_and_limiter() -> None:
     assert ceiling.limiting_resources == ("shared_memory",)
 
 
-def test_provider_report_covers_resources_ptx_sass_and_json(tmp_path: Path) -> None:
+def test_provider_report_covers_resources_ptx_sass_and_json(environment, tmp_path: Path) -> None:
     sass = """
         /*0000*/ IMMA.16832.S8.S8.SAT R4, R12.ROW, R16.COL, RZ ;
         /*0010*/ I2FP.F32.S32 R8, R4 ;
     """
     report = inspect_provider(
         _provider(_jit_kernel()),
-        _environment(),
+        environment,
         limits=_limits(),
         sass_disassembler=lambda cubin: sass if cubin == b"fake-cubin" else "",
     )
@@ -165,10 +146,10 @@ def test_provider_report_covers_resources_ptx_sass_and_json(tmp_path: Path) -> N
     )
 
 
-def test_clustered_cuda_report_keeps_resources_and_residency_workgroup_scoped() -> None:
+def test_clustered_cuda_report_keeps_resources_and_residency_workgroup_scoped(environment) -> None:
     report = inspect_provider(
         _provider(_jit_kernel(num_ctas=2)),
-        _environment(),
+        environment,
         include_sass=False,
         limits=_limits(),
     )
@@ -181,7 +162,7 @@ def test_clustered_cuda_report_keeps_resources_and_residency_workgroup_scoped() 
     assert specialization.residency_ceiling.resident_warps_per_compute_unit == 24
 
 
-def test_compiler_json_normalizes_provider_configuration(tmp_path: Path) -> None:
+def test_compiler_json_normalizes_provider_configuration(environment, tmp_path: Path) -> None:
     class Choice(StrEnum):
         TEST = "test"
 
@@ -193,7 +174,7 @@ def test_compiler_json_normalizes_provider_configuration(tmp_path: Path) -> None
     }
     report = inspect_provider(
         provider,
-        _environment(),
+        environment,
         include_sass=False,
         limits=_limits(),
     )
@@ -231,7 +212,7 @@ def test_artifact_access_requires_selection_for_multiple_specializations() -> No
     assert "mma.sync" in compiled_artifact(kernel, "ptx", specialization_index=1)
 
 
-def test_provider_report_rejects_ambiguous_process_wide_jit_cache() -> None:
+def test_provider_report_rejects_ambiguous_process_wide_jit_cache(environment) -> None:
     kernel = _jit_kernel()
     compiled_cache = kernel.device_caches[0][0]
     compiled_cache["another"] = compiled_cache["specialization"]
@@ -239,14 +220,14 @@ def test_provider_report_rejects_ambiguous_process_wide_jit_cache() -> None:
     with pytest.raises(TritonInspectionError, match="isolated one-provider process"):
         inspect_provider(
             _provider(kernel),
-            _environment(),
+            environment,
             include_sass=False,
             limits=_limits(),
         )
 
     report = inspect_provider(
         _provider(kernel),
-        _environment(),
+        environment,
         include_sass=False,
         limits=_limits(),
         require_isolated_jit_cache=False,
@@ -254,10 +235,10 @@ def test_provider_report_rejects_ambiguous_process_wide_jit_cache() -> None:
     assert len(report.specializations) == 2
 
 
-def test_non_cuda_report_skips_sass_automatically() -> None:
+def test_non_cuda_report_skips_sass_automatically(environment) -> None:
     report = inspect_provider(
         _provider(_jit_kernel(backend="hip")),
-        _environment(),
+        environment,
         limits=_limits(),
     )
 
@@ -266,11 +247,11 @@ def test_non_cuda_report_skips_sass_automatically() -> None:
     assert report.specializations[0].sass is None
 
 
-def test_non_cuda_report_rejects_explicit_sass() -> None:
+def test_non_cuda_report_rejects_explicit_sass(environment) -> None:
     with pytest.raises(TritonArtifactUnavailableError, match="CUDA backend"):
         inspect_provider(
             _provider(_jit_kernel(backend="hip")),
-            _environment(),
+            environment,
             include_sass=True,
             limits=_limits(),
         )
@@ -283,12 +264,12 @@ def test_missing_nvdisasm_has_actionable_diagnostic(monkeypatch) -> None:
         find_nvdisasm()
 
 
-def test_uncompiled_and_incompatible_kernels_fail_at_boundary() -> None:
+def test_uncompiled_and_incompatible_kernels_fail_at_boundary(environment) -> None:
     with pytest.raises(TritonInspectionError, match="no compiled Triton"):
         inspect_provider(
             _provider(SimpleNamespace(device_caches={})),
-            _environment(),
+            environment,
             limits=_limits(),
         )
     with pytest.raises(TritonCompatibilityError, match="device_caches"):
-        inspect_provider(_provider(object()), _environment(), limits=_limits())
+        inspect_provider(_provider(object()), environment, limits=_limits())

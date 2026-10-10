@@ -295,7 +295,7 @@ def test_candidate_provider_injects_plan_into_complete_operator(
         return torch.empty((2, 96), device="meta")
 
     monkeypatch.setattr(workload.backend, "run_linear", fake_run)
-    provider = _make_candidate(plan, workload).make_provider()
+    provider = _make_candidate(plan, workload).build()
 
     prepared = provider.prepare()
     output = provider.run(prepared)
