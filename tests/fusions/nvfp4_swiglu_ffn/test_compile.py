@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
-from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
 from piper_kernels.fusions.nvfp4_sparse_piper._compile import (
@@ -23,7 +22,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import _chunked_swiglu_ffn_op
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
-from ._helpers import Linear, Operands, make_operands, materialized
+from ._helpers import Operands, SwiGluFfn, make_operands, materialized
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
@@ -32,55 +31,10 @@ def _exact_sm120_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
-class _SwiGluFfn(torch.nn.Module):
-    def __init__(
-        self,
-        operands: Operands,
-        *,
-        promote_gate: bool = False,
-        reverse_multiply: bool = False,
-        expose_gate: bool = False,
-    ) -> None:
-        super().__init__()
-        self.promote_gate = promote_gate
-        self.reverse_multiply = reverse_multiply
-        self.expose_gate = expose_gate
-        self.gate = self._linear(operands.gate)
-        self.value = self._linear(operands.value)
-        self.down = self._linear(operands.down)
-
-    @staticmethod
-    def _linear(operands: Linear) -> torch.nn.Linear:
-        out_features, in_features = operands.weight.shape
-        linear = torch.nn.Linear(
-            in_features,
-            out_features,
-            bias=operands.bias is not None,
-            device="cuda",
-            dtype=operands.weight.dtype,
-        )
-        linear.weight = torch.nn.Parameter(operands.weight, requires_grad=False)
-        if operands.bias is not None:
-            linear.bias = torch.nn.Parameter(operands.bias, requires_grad=False)
-        return linear
-
-    def forward(
-        self,
-        input: torch.Tensor,  # noqa: A002
-        value_input: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        gate = self.gate(input)
-        value = self.value(input if value_input is None else value_input)
-        activated_gate = F.silu(gate.float()).to(gate.dtype) if self.promote_gate else F.silu(gate)
-        activated = activated_gate * value if self.reverse_multiply else value * activated_gate
-        output = self.down(activated)
-        return (output, gate) if self.expose_gate else output
-
-
 class _GatedUpdates(torch.nn.Module):
     def __init__(self, operands: Operands) -> None:
         super().__init__()
-        self.ffn = _SwiGluFfn(operands, promote_gate=True, reverse_multiply=True)
+        self.ffn = SwiGluFfn(operands, promote_gate=True, reverse_multiply=True)
         output_features = operands.down.weight.shape[0]
         self.input_features = operands.gate.weight.shape[1]
         self.update = torch.nn.Linear(
@@ -107,18 +61,8 @@ class _GatedUpdates(torch.nn.Module):
         return hidden + ffn_gate.index_select(0, gate_indices) * ffn
 
 
-def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
-    options = nvfp4_swiglu_ffn_compile_options()
-    passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
-    return options
-
-
-@pytest.mark.parametrize("register_convrot", [False, True])
-def test_projection_matching_in_fresh_process(register_convrot: bool) -> None:
+def test_projection_matching_before_and_after_convrot_registration() -> None:
     script = """
-import sys
 from types import SimpleNamespace
 import torch
 from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
@@ -126,11 +70,6 @@ from piper_kernels.fusions.nvfp4_ffn._compile import projection_call_matches
 
 nvfp4_swiglu_ffn_compile_options()
 assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
-register_convrot = sys.argv[1] == "True"
-if register_convrot:
-    from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
-    convrot_nvfp4_compile_options()
-
 graph = torch.fx.Graph()
 input = graph.placeholder("input")
 operands = {
@@ -143,9 +82,14 @@ node = graph.call_function(torch.ops.piper_kernels.nvfp4_linear.default,
                            (input, *operands.values()))
 match = SimpleNamespace(kwargs={f"gate_{name}": value for name, value in operands.items()})
 assert projection_call_matches(node, match, "gate")
-assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear") == register_convrot
+assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
+
+from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
+convrot_nvfp4_compile_options()
+assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
+assert projection_call_matches(node, match, "gate")
 """
-    subprocess.run([sys.executable, "-c", script, str(register_convrot)], check=True, timeout=60)
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
 
 
 @pytest.mark.gpu
@@ -157,9 +101,10 @@ import sys
 # Pytest puts tests/ on sys.path for shared test helpers; a fresh interpreter does not.
 sys.path.insert(0, sys.argv[2])
 import torch
-from tests.fusions.nvfp4_swiglu_ffn.test_compile import (
-    _SwiGluFfn, TargetCapturePass, _capturing_options, _chunked_swiglu_ffn_op, make_operands,
-)
+from _compile_capture import TargetCapturePass
+from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
+from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import _chunked_swiglu_ffn_op
+from tests.fusions.nvfp4_swiglu_ffn._helpers import SwiGluFfn, make_operands
 
 assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
 register_convrot = sys.argv[1] == "True"
@@ -169,9 +114,9 @@ if register_convrot:
 
 torch.set_num_threads(1)
 operands = make_operands(rows=256, output_features=256, dynamic=True)
-model = _SwiGluFfn(operands).eval()
+model = SwiGluFfn(operands).eval()
 capture = TargetCapturePass()
-options = _capturing_options(capture)
+options = capture.wrap_options(nvfp4_swiglu_ffn_compile_options())
 options.update({"triton.cudagraphs": False, "compile_threads": 1})
 with torch.no_grad():
     expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
@@ -205,14 +150,16 @@ def test_shared_projection_weights_preserve_distinct_biases(
         value=replace(operands.value, weight=operands.gate.weight),
     )
     assert operands.gate.bias is not operands.value.bias
-    model = _SwiGluFfn(operands).eval()
+    model = SwiGluFfn(operands).eval()
     # Explicitly tie the module parameter too, so tracing sees one shared weight.
     model.value.weight = model.gate.weight
     capture = TargetCapturePass()
     with torch.no_grad():
         expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+        actual = torch.compile(
+            model, fullgraph=True, options=capture.wrap_options(nvfp4_swiglu_ffn_compile_options())
+        )(
             operands.input,
         )
     assert torch.ops.piper_kernels.nvfp4_swiglu_ffn.default in capture.targets
@@ -285,7 +232,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
         dtype=dtype,
     )
     activation = operands.input.reshape(2, 129, -1)
-    model = _SwiGluFfn(
+    model = SwiGluFfn(
         operands,
         promote_gate=promote_gate,
         reverse_multiply=reverse_multiply,
@@ -295,9 +242,9 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=nvfp4_compile_options())(activation)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model, fullgraph=True, options=capture.wrap_options(nvfp4_swiglu_ffn_compile_options())
+        )(activation)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
@@ -316,14 +263,16 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     operands = make_operands(rows=257, dynamic=False, seed=915)
-    model = _SwiGluFfn(operands).eval()
+    model = SwiGluFfn(operands).eval()
     capture = TargetCapturePass()
     first = operands.input
     second = torch.randn(385, first.shape[-1], device="cuda", dtype=torch.bfloat16)
     torch._dynamo.mark_dynamic(first, 0)
     torch._dynamo.mark_dynamic(second, 0)
     torch._dynamo.reset()
-    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
+    compiled = torch.compile(
+        model, fullgraph=True, options=capture.wrap_options(nvfp4_swiglu_ffn_compile_options())
+    )
 
     with torch.no_grad():
         first_output = compiled(first)
@@ -340,7 +289,7 @@ def test_cuda_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
 @pytest.mark.parametrize("failure", ["projection-escapes", "different-input"])
 def test_cuda_compile_options_fail_closed(failure: str) -> None:
     operands = make_operands(rows=129, dynamic=False, seed=913)
-    model = _SwiGluFfn(operands, expose_gate=failure == "projection-escapes").eval()
+    model = SwiGluFfn(operands, expose_gate=failure == "projection-escapes").eval()
     arguments = (
         (operands.input, torch.randn_like(operands.input))
         if failure == "different-input"
@@ -354,7 +303,7 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_capturing_options(capture),
+            options=capture.wrap_options(nvfp4_swiglu_ffn_compile_options()),
         )(*arguments)
 
     expected_values = expected if isinstance(expected, tuple) else (expected,)
@@ -395,7 +344,7 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) ->
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_capturing_options(capture),
+            options=capture.wrap_options(nvfp4_swiglu_ffn_compile_options()),
         )(*arguments)
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()

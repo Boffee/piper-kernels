@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import (
@@ -23,10 +24,9 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
-from ..nvfp4_gelu_ffn.test_compile import (
+from ..nvfp4_gelu_ffn._helpers import (
     GatedUpdates,
-    TargetCapturePass,
-    gated_update_arguments,
+    make_gated_update_arguments,
     relative_l2,
 )
 from ._helpers import Linear, Operands, make_operands
@@ -68,14 +68,6 @@ class GeluFfn(torch.nn.Module):
         activated = F.gelu(up, approximate="tanh")
         output = self.down(activated)
         return (output, up) if self.expose_up else output
-
-
-def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
-    options = convrot_nvfp4_gelu_ffn_compile_options(nvfp4_gelu_ffn_compile_options())
-    passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
-    return options
 
 
 def _ordinary_options() -> dict[str, object]:
@@ -148,9 +140,11 @@ def test_compile_options_fold_semantic_gelu_ffn(
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=_ordinary_options())(activation)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_gelu_ffn_compile_options()),
+        )(activation)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
@@ -171,9 +165,11 @@ def test_compile_options_fail_closed_when_projection_escapes() -> None:
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=_ordinary_options())(operands.input)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            operands.input
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_gelu_ffn_compile_options()),
+        )(operands.input)
 
     assert isinstance(expected, tuple)
     assert isinstance(actual, tuple)
@@ -192,7 +188,7 @@ def test_compile_options_fold_indexed_gated_updates() -> None:
         seed=1039,
     )
     model = GatedUpdates(operands).eval()  # type: ignore[arg-type]
-    arguments = gated_update_arguments(257, operands.down.weight.shape[0])
+    arguments = make_gated_update_arguments(257, operands.down.weight.shape[0])
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
@@ -201,7 +197,7 @@ def test_compile_options_fold_indexed_gated_updates() -> None:
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_capturing_options(capture),
+            options=capture.wrap_options(convrot_nvfp4_gelu_ffn_compile_options()),
         )(*arguments)
 
     assert relative_l2(actual, expected) < 0.07

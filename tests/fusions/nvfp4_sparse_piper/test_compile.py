@@ -856,14 +856,6 @@ def _run_explicit_attention_output(
     return result.view(model.batch, model.sequence_length, model.output_features)
 
 
-def _options_with_capture(capture: TargetCapturePass) -> dict[str, object]:
-    options = nvfp4_sparse_piper_compile_options()
-    passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
-    return options
-
-
 def test_compile_options_install_versioned_idempotent_passes() -> None:
     options = nvfp4_sparse_piper_compile_options({"max_autotune": True})
 
@@ -1144,7 +1136,7 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_options_with_capture(capture),
+            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(hidden_states)
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
@@ -1174,9 +1166,20 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("affine", [True, False])
+# test_projection.py::test_chunked_qkv_epilogues_match_materialized_fp32_contract
+# covers the full head-size/affine arithmetic. Retain every pair
+# of dtype, head size, and affine mode here, across all input/output scale modes.
+@pytest.mark.parametrize(
+    ("dtype", "head_dim", "affine"),
+    [
+        (torch.float16, 64, True),
+        (torch.float16, 128, False),
+        (torch.bfloat16, 64, False),
+        (torch.bfloat16, 128, True),
+        (torch.float32, 64, True),
+        (torch.float32, 128, False),
+    ],
+)
 @pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_fuses_nvfp4_attention_output(
     output_dynamic: bool,
@@ -1209,7 +1212,7 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_options_with_capture(capture),
+            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(hidden_states)
 
     assert actual.dtype is dtype
@@ -1285,7 +1288,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_options_with_capture(capture),
+            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(
             hidden_states,
             coarse_gate,
@@ -1320,15 +1323,30 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("key_affine", [True, False])
+# test_prepared_projection_family_fuses_without_materializing_linears covers Q/K norms;
+# test_cuda_compile_fuses_nvfp4_attention_output covers their dtype/head-size pairs.
+# Retain both gate layouts, all dtypes, routing, preparation sharing, and chunk boundaries.
+@pytest.mark.parametrize(
+    ("dtype", "key_affine", "query_chunk_rows"),
+    [
+        (torch.float16, False, 128),
+        (torch.bfloat16, True, 128),
+        (torch.float32, False, 128),
+        (torch.bfloat16, True, 8_192),
+    ],
+)
 def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
+    monkeypatch: pytest.MonkeyPatch,
     key_affine: bool,
     dtype: torch.dtype,
     dynamic: bool,
     routing: str,
     preparation_count: int,
+    query_chunk_rows: int,
 ) -> None:
+    # Exercise eight windows with a short tail and the single-window path.
+    monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 960)
     torch.manual_seed(839)
     model = _ProjectedGateCoarseSparseAttentionOutput(
         dynamic=dynamic,
@@ -1342,8 +1360,16 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         device="cuda",
         dtype=dtype,
     )
-    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    block_lengths = torch.tensor([64, 17, 51] * 5, device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    gate_chunks = []
+    project_gate = _output.PreparedGateProjection.project
+
+    def record_gate_chunk(projection, out, start, rows):
+        gate_chunks.append((start, rows, out.data_ptr()))
+        project_gate(projection, out, start, rows)
+
+    monkeypatch.setattr(_output.PreparedGateProjection, "project", record_gate_chunk)
     capture = TargetCapturePass()
     with torch.no_grad():
         gate_input = _prepare_nvfp4_input(hidden_states, model.gate.weight)
@@ -1369,10 +1395,16 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=_options_with_capture(capture),
+            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(hidden_states, block_lengths, 2)
 
+    assert actual.dtype is dtype
     assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
+    assert [(start, rows) for start, rows, _ in gate_chunks] == [
+        (start, min(query_chunk_rows, model.sequence_length - start))
+        for start in range(0, model.sequence_length, query_chunk_rows)
+    ]
+    assert len({pointer for _, _, pointer in gate_chunks}) == min(2, len(gate_chunks))
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
         == preparation_count
@@ -1403,7 +1435,7 @@ def test_cuda_compile_fails_closed_for_batch_two() -> None:
         torch.compile(
             model,
             fullgraph=True,
-            options=_options_with_capture(capture),
+            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(hidden_states)
 
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets

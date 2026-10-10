@@ -326,8 +326,7 @@ def _explicit_fused(model, arguments):
 def _compiled_model(model, *, dynamic=False, fuse_output=False):
     torch._dynamo.reset()
     capture = TargetCapturePass()
-    options = convrot_int8_piper_compile_options(fuse_output=fuse_output)
-    options["post_grad_custom_pre_pass"] = (*options["post_grad_custom_pre_pass"], capture)
+    options = capture.wrap_options(convrot_int8_piper_compile_options(fuse_output=fuse_output))
     return torch.compile(model, fullgraph=True, dynamic=dynamic, options=options), capture
 
 

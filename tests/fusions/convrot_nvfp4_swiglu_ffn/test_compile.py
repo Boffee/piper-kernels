@@ -110,14 +110,6 @@ class _GatedUpdates(torch.nn.Module):
         return hidden + ffn_gate.index_select(0, gate_indices) * ffn
 
 
-def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
-    options = convrot_nvfp4_swiglu_ffn_compile_options(nvfp4_swiglu_ffn_compile_options())
-    passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
-    return options
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
@@ -139,7 +131,11 @@ def test_shared_projection_weights_preserve_distinct_biases(
     with torch.no_grad():
         expected = _chunked_swiglu_ffn_op(*operands.arguments(1536))
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_swiglu_ffn_compile_options()),
+        )(
             operands.input,
         )
     assert torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn.default in capture.targets
@@ -228,9 +224,11 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
             options=convrot_nvfp4_compile_options(),
         )(activation)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_swiglu_ffn_compile_options()),
+        )(activation)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
@@ -260,9 +258,11 @@ def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=ordinary_options)(source.input)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            source.input
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_swiglu_ffn_compile_options()),
+        )(source.input)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
@@ -294,9 +294,11 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
             options=convrot_nvfp4_compile_options(),
         )(*arguments)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_swiglu_ffn_compile_options()),
+        )(*arguments)
 
     expected_values = expected if isinstance(expected, tuple) else (expected,)
     actual_values = actual if isinstance(actual, tuple) else (actual,)
@@ -337,9 +339,11 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) ->
             options=convrot_nvfp4_compile_options(),
         )(*arguments)
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_nvfp4_swiglu_ffn_compile_options()),
+        )(*arguments)
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative_l2 < 0.04

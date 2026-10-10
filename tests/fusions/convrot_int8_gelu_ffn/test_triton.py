@@ -11,6 +11,8 @@ from piper_kernels.fusions.convrot_int8_gelu_ffn.triton import (
 )
 from piper_kernels.linear.convrot.int8 import _ops
 
+from .._convrot_int8 import Linear, make_linear
+
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm"),
@@ -18,21 +20,10 @@ pytestmark = [
 
 
 @dataclass(frozen=True, slots=True)
-class _Linear:
-    qdata: torch.Tensor
-    scale: torch.Tensor
-    bias: torch.Tensor | None
-    group_size: int
-
-    def arguments(self) -> tuple[object, ...]:
-        return self.qdata, self.scale, self.bias, self.group_size
-
-
-@dataclass(frozen=True, slots=True)
 class _Operands:
     input: torch.Tensor
-    up: _Linear
-    down: _Linear
+    up: Linear
+    down: Linear
 
     def arguments(
         self,
@@ -50,28 +41,6 @@ class _Operands:
         )
 
 
-def _linear(
-    out_features: int,
-    in_features: int,
-    bias_dtype: torch.dtype | None,
-    group_size: int,
-) -> _Linear:
-    qdata = torch.randint(
-        -127,
-        128,
-        (out_features, in_features),
-        dtype=torch.int8,
-        device="cuda",
-    )
-    scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
-    bias = (
-        torch.randn(out_features, dtype=bias_dtype, device="cuda")
-        if bias_dtype is not None
-        else None
-    )
-    return _Linear(qdata, scale, bias, group_size)
-
-
 def _operands(
     *,
     rows: int = 385,
@@ -86,8 +55,8 @@ def _operands(
     input = torch.randn(rows, input_features, dtype=dtype, device="cuda")  # noqa: A001
     return _Operands(
         input,
-        _linear(intermediate_features, input_features, bias_dtype, group_size),
-        _linear(output_features, intermediate_features, bias_dtype, down_group_size),
+        make_linear(intermediate_features, input_features, bias_dtype, group_size),
+        make_linear(output_features, intermediate_features, bias_dtype, down_group_size),
     )
 
 

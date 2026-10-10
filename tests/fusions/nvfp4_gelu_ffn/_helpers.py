@@ -1,39 +1,16 @@
-"""Shared operands and references for standard NVFP4 GELU FFN tests."""
+"""Shared operands, models, and references for standard NVFP4 GELU FFN tests."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
+from torch.nn import functional as F  # noqa: N812
+from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
-from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-
-@dataclass(frozen=True, slots=True)
-class Linear:
-    weight: PiperNVFP4Tensor
-    activation_scale: torch.Tensor | None
-    bias: torch.Tensor | None
-    dynamic: bool
-
-    def arguments(self) -> tuple[object, ...]:
-        return (
-            self.weight.qdata,
-            self.weight.scale,
-            self.weight.per_tensor_scale,
-            self.activation_scale,
-            self.bias,
-            self.dynamic,
-            self.weight.high_first,
-        )
+from .._nvfp4 import Linear, make_weight, precise_linear
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,49 +21,6 @@ class Operands:
 
     def arguments(self, chunk_rows: int) -> tuple[object, ...]:
         return self.input, *self.up.arguments(), *self.down.arguments(), chunk_rows
-
-
-def _weight(
-    dense: torch.Tensor,
-    activation_scale: torch.Tensor | None,
-    dynamic: bool,
-    high_first: bool,
-) -> PiperNVFP4Tensor:
-    quantization = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=dynamic,
-    )
-    quantization_input = dense.float() if dense.dtype is torch.float16 else dense
-    weight = PiperNVFP4Tensor.from_torchao(
-        TorchAONVFP4Tensor.to_nvfp4(
-            quantization_input,
-            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
-            act_per_tensor_scale=activation_scale,
-            is_swizzled_scales=True,
-            act_quant_kwargs=quantization,
-        )
-    ).to(dtype=dense.dtype)
-    if not high_first:
-        return weight
-    return PiperNVFP4Tensor(
-        ((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4),
-        weight.scale,
-        weight.block_size,
-        weight.orig_dtype,
-        weight.per_tensor_scale,
-        weight.act_per_tensor_scale,
-        weight.is_swizzled_scales,
-        weight.use_triton_kernel,
-        weight.act_quant_kwargs,
-        high_first=True,
-    )
-
-
-def precise_linear(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
-    """Run one represented standard NVFP4 affine projection."""
-    return nvfp4_reference.linear(input, *linear.arguments())
 
 
 def activated_down(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
@@ -154,7 +88,7 @@ def make_operands(  # noqa: PLR0913
             else None
         )
         return Linear(
-            _weight(dense, activation_scale, dynamic, high_first),
+            make_weight(dense, activation_scale, dynamic, high_first),
             activation_scale,
             bias,
             dynamic,
@@ -162,11 +96,112 @@ def make_operands(  # noqa: PLR0913
 
     up_scale = None if up_dynamic else per_tensor_amax_to_scale(input.abs().amax())
     up = make_linear(up_dense, up_scale, up_dynamic, up_high_first)
-    projected = precise_linear(input, up)
-    activated = torch.nn.functional.gelu(projected.float(), approximate="tanh")
-    down_scale = None if down_dynamic else per_tensor_amax_to_scale(activated.abs().amax())
+    down_scale = None
+    if not down_dynamic:
+        projected = precise_linear(input, up)
+        activated = torch.nn.functional.gelu(projected.float(), approximate="tanh")
+        down_scale = per_tensor_amax_to_scale(activated.abs().amax())
     down = make_linear(down_dense, down_scale, down_dynamic, down_high_first)
     return Operands(input, up, down)
 
 
-__all__ = ["Linear", "Operands", "make_operands", "materialized"]
+class GeluFfn(torch.nn.Module):
+    """Two semantic linears around promoted tanh-GELU."""
+
+    def __init__(
+        self,
+        operands: Operands,
+        *,
+        expose_up: bool = False,
+        explicit_promotion: bool = False,
+    ) -> None:
+        super().__init__()
+        self.expose_up = expose_up
+        self.explicit_promotion = explicit_promotion
+        self.up = self._linear(operands.up)
+        self.down = self._linear(operands.down)
+
+    @staticmethod
+    def _linear(operands: Linear) -> torch.nn.Linear:
+        out_features, in_features = operands.weight.shape
+        linear = torch.nn.Linear(
+            in_features,
+            out_features,
+            bias=operands.bias is not None,
+            device="cuda",
+            dtype=operands.weight.dtype,
+        )
+        linear.weight = torch.nn.Parameter(operands.weight, requires_grad=False)
+        if operands.bias is not None:
+            linear.bias = torch.nn.Parameter(operands.bias, requires_grad=False)
+        return linear
+
+    def forward(
+        self,
+        activation: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        up = self.up(activation)
+        activated = F.gelu(
+            up.float() if self.explicit_promotion else up,
+            approximate="tanh",
+        )
+        if self.explicit_promotion:
+            activated = activated.to(up.dtype)
+        output = self.down(activated)
+        return (output, up) if self.expose_up else output
+
+
+class GatedUpdates(torch.nn.Module):
+    """H3-style indexed updates containing the GELU FFN."""
+
+    def __init__(self, operands: Operands, *, python_indexing: bool = False) -> None:
+        super().__init__()
+        self.ffn = GeluFfn(operands)
+        self.python_indexing = python_indexing
+        self.input_features = operands.up.weight.shape[1]
+        output_features = operands.down.weight.shape[0]
+        self.update = torch.nn.Linear(
+            output_features,
+            output_features,
+            bias=False,
+            device="cuda",
+            dtype=operands.input.dtype,
+        )
+        self.update.weight.requires_grad_(False)
+
+    def forward(
+        self,
+        base: torch.Tensor,
+        update_source: torch.Tensor,
+        update_gate: torch.Tensor,
+        ffn_gate: torch.Tensor,
+        gate_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        reusable_update = self.update(update_source)
+        if self.python_indexing:
+            selected_update_gate = update_gate[gate_indices]
+            selected_ffn_gate = ffn_gate[gate_indices]
+        else:
+            selected_update_gate = update_gate.index_select(0, gate_indices)
+            selected_ffn_gate = ffn_gate.index_select(0, gate_indices)
+        hidden = base + selected_update_gate * reusable_update
+        ffn = self.ffn(hidden[..., : self.input_features].contiguous())
+        assert isinstance(ffn, torch.Tensor)
+        return hidden + selected_ffn_gate * ffn
+
+
+def relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    return (actual.float() - expected.float()).norm() / expected.float().norm()
+
+
+def make_gated_update_arguments(
+    rows: int,
+    features: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, ...]:
+    base = torch.randn(rows, features, dtype=dtype, device="cuda")
+    update_source = torch.randn_like(base)
+    update_gate = torch.randn(7, features, dtype=dtype, device="cuda")
+    ffn_gate = torch.randn(7, features, dtype=dtype, device="cuda")
+    gate_indices = torch.randint(0, 7, (rows,), dtype=torch.int64, device="cuda")
+    return base, update_source, update_gate, ffn_gate, gate_indices

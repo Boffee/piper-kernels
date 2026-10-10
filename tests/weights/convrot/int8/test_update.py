@@ -11,16 +11,11 @@ from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
 
-_DEVICES = [
-    "cpu",
-    pytest.param(
-        "cuda",
-        marks=[
-            pytest.mark.gpu,
-            pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU"),
-        ],
-    ),
+_GPU_MARKS = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU"),
 ]
+_DEVICES = ["cpu", pytest.param("cuda", marks=_GPU_MARKS)]
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
@@ -115,37 +110,22 @@ def test_aten_add_tensor_dispatches_to_convrot_update() -> None:
     assert torch.equal(wrapped.scale, expected.scale)
 
 
-def test_addmm_no_op_does_not_requantize_storage() -> None:
+@pytest.mark.parametrize("operation", ["add_", "addmm_"])
+def test_no_op_does_not_requantize_storage(operation: str) -> None:
     wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
-    mat1 = torch.randn(7, 5)
-    mat2 = torch.randn(5, 32)
-    qdata_before = wrapped.qdata.clone()
-    scale_before = wrapped.scale.clone()
-    qdata_version = wrapped.qdata._version
-    scale_version = wrapped.scale._version
+    operands = (
+        (torch.randn(7, 32),) if operation == "add_" else (torch.randn(7, 5), torch.randn(5, 32))
+    )
+    storage = (wrapped.qdata, wrapped.scale)
+    before = [(tensor.clone(), tensor._version) for tensor in storage]
 
-    wrapped.addmm_(mat1, mat2, alpha=0)
+    assert getattr(wrapped, operation)(*operands, alpha=0) is wrapped
 
-    assert torch.equal(wrapped.qdata, qdata_before)
-    assert torch.equal(wrapped.scale, scale_before)
-    assert wrapped.qdata._version == qdata_version
-    assert wrapped.scale._version == scale_version
-
-
-def test_add_no_op_does_not_requantize_storage() -> None:
-    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
-    update = torch.randn(7, 32)
-    qdata_before = wrapped.qdata.clone()
-    scale_before = wrapped.scale.clone()
-    qdata_version = wrapped.qdata._version
-    scale_version = wrapped.scale._version
-
-    wrapped.add_(update, alpha=0)
-
-    assert torch.equal(wrapped.qdata, qdata_before)
-    assert torch.equal(wrapped.scale, scale_before)
-    assert wrapped.qdata._version == qdata_version
-    assert wrapped.scale._version == scale_version
+    assert wrapped.qdata is storage[0]
+    assert wrapped.scale is storage[1]
+    for tensor, (original, version) in zip(storage, before, strict=True):
+        assert torch.equal(tensor, original)
+        assert tensor._version == version
 
 
 def _stochastic_update_fixture(
@@ -174,41 +154,22 @@ def _stochastic_addmm_fixture(
     return weight, torch.eye(rows, dtype=torch.bfloat16), update
 
 
-def test_add_stochastic_rounding_replays_without_consuming_global_rng() -> None:
+@pytest.mark.parametrize("operation", ["add_", "addmm_"])
+def test_stochastic_rounding_replays_without_consuming_global_rng(operation: str) -> None:
     seed = (1 << 64) - 1
-    first, update = _stochastic_update_fixture()
-    replay = first.clone()
-    other = first.clone()
-    deterministic = first.clone()
-    torch.manual_seed(1702)
-    rng_before = torch.random.get_rng_state()
-
-    first.add_(update, rounding_seed=seed)
-    replay.add_(update, rounding_seed=seed)
-    other.add_(update, rounding_seed=seed - 1)
-    deterministic.add_(update)
-
-    assert torch.equal(torch.random.get_rng_state(), rng_before)
-    assert torch.equal(first.qdata, replay.qdata)
-    assert torch.equal(first.scale, replay.scale)
-    assert not torch.equal(first.qdata, other.qdata)
-    assert torch.equal(first.scale, other.scale)
-    assert torch.equal(first.scale, deterministic.scale)
-
-
-def test_addmm_stochastic_rounding_replays_without_consuming_global_rng() -> None:
-    seed = (1 << 64) - 1
-    first, mat1, mat2 = _stochastic_addmm_fixture()
+    make_case = _stochastic_update_fixture if operation == "add_" else _stochastic_addmm_fixture
+    first, *operands = make_case()
+    options = {} if operation == "add_" else {"beta": 0}
     replay = first.clone()
     other = first.clone()
     deterministic = first.clone()
     torch.manual_seed(1701)
     rng_before = torch.random.get_rng_state()
 
-    first.addmm_(mat1, mat2, beta=0, rounding_seed=seed)
-    replay.addmm_(mat1, mat2, beta=0, rounding_seed=seed)
-    other.addmm_(mat1, mat2, beta=0, rounding_seed=seed - 1)
-    deterministic.addmm_(mat1, mat2, beta=0)
+    getattr(first, operation)(*operands, rounding_seed=seed, **options)
+    getattr(replay, operation)(*operands, rounding_seed=seed, **options)
+    getattr(other, operation)(*operands, rounding_seed=seed - 1, **options)
+    getattr(deterministic, operation)(*operands, **options)
 
     assert torch.equal(torch.random.get_rng_state(), rng_before)
     assert torch.equal(first.qdata, replay.qdata)
@@ -295,35 +256,36 @@ def test_add_rejects_invalid_update(update: torch.Tensor, message: str) -> None:
         wrapped.add_(update)
 
 
-def test_addmm_rejects_autograd_inputs() -> None:
+@pytest.mark.parametrize("operation", ["add_", "addmm_"])
+def test_updates_reject_autograd_inputs(operation: str) -> None:
     wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
-    mat1 = torch.randn(7, 5, requires_grad=True)
-    mat2 = torch.randn(5, 32)
+    operands = (
+        (torch.randn(7, 32, requires_grad=True),)
+        if operation == "add_"
+        else (torch.randn(7, 5, requires_grad=True), torch.randn(5, 32))
+    )
+    update = getattr(wrapped, operation)
 
     with pytest.raises(RuntimeError, match="does not support autograd"):
-        wrapped.addmm_(mat1, mat2)
+        update(*operands)
 
     with torch.no_grad():
-        assert wrapped.addmm_(mat1, mat2) is wrapped
+        assert update(*operands) is wrapped
 
 
-def test_add_rejects_autograd_inputs() -> None:
-    wrapped = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
-    update = torch.randn(7, 32, requires_grad=True)
-
-    with pytest.raises(RuntimeError, match="does not support autograd"):
-        wrapped.add_(update)
-
-    with torch.no_grad():
-        assert wrapped.add_(update) is wrapped
-
-
-@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize(
+    ("device", "fallback"),
+    [
+        pytest.param("cpu", False, id="cpu-reference"),
+        pytest.param("cuda", False, marks=_GPU_MARKS, id="gpu"),
+        pytest.param("cuda", True, marks=_GPU_MARKS, id="gpu-fallback"),
+    ],
+)
 @pytest.mark.parametrize("operation", ["add", "addmm"])
-@pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("seed", [None, 123])
 def test_updates_preserve_storage_and_replay(monkeypatch, device, operation, fallback, dtype, seed):
+    # CPU updates always use the reference, regardless of backend availability.
     if fallback:
         monkeypatch.setattr(int8_updates, "_triton_backend", None)
     reference_update = Mock(wraps=getattr(int8_update_reference, operation + "_"))

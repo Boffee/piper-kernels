@@ -13,8 +13,8 @@ from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-from ..convrot_nvfp4_swiglu_ffn._helpers import _weight as _convrot_weight
-from ..nvfp4_gelu_ffn._helpers import _weight as _standard_weight
+from .._convrot_nvfp4 import make_weight as make_convrot_weight
+from .._nvfp4 import make_weight as make_standard_weight
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +64,8 @@ def _weight(
     high_first: bool,
 ) -> PiperNVFP4Tensor | ConvRotNVFP4Tensor:
     if group_size is None:
-        return _standard_weight(dense, activation_scale, dynamic, high_first)
-    return _convrot_weight(dense, activation_scale, dynamic, group_size, high_first)
+        return make_standard_weight(dense, activation_scale, dynamic, high_first)
+    return make_convrot_weight(dense, activation_scale, dynamic, group_size, high_first)
 
 
 def precise_linear(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
@@ -160,8 +160,10 @@ def make_operands(  # noqa: PLR0913
 
     up_scale = None if up_dynamic else _activation_scale(input, up_group_size)
     up = make_linear(up_dense, up_scale, up_dynamic, up_group_size, up_high_first)
-    activated = F.gelu(precise_linear(input, up).float(), approximate="tanh")
-    down_scale = None if down_dynamic else _activation_scale(activated, down_group_size)
+    down_scale = None
+    if not down_dynamic:
+        activated = F.gelu(precise_linear(input, up).float(), approximate="tanh")
+        down_scale = _activation_scale(activated, down_group_size)
     down = make_linear(
         down_dense,
         down_scale,

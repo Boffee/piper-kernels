@@ -844,6 +844,8 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
             rows=class_rows,
             out_features=class_n,
         )
+        if plan == selected:  # Already checked with caller-owned, strided output.
+            continue
         forced = int8_nvidia.execute_prepared_linear(*args, plan, second_projection=second)
         assert torch.equal(forced, expected), plan
 

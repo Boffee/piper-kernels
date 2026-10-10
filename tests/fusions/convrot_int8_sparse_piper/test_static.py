@@ -12,7 +12,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fus
 from .._accuracy import assert_fusion_output_close
 from ._helpers import output_available
 from .test_compile import (
-    _POST_GRAD_PRE_PASS,
     _CoarseSparseProjectionAttention,
     _ProjectedGateCoarseSparseAttentionOutput,
     _run_explicit_attention_output,
@@ -49,12 +48,6 @@ def _set_scales(model, mode):
     return preparations
 
 
-def _options(capture):
-    options = convrot_int8_sparse_piper_compile_options()
-    options[_POST_GRAD_PRE_PASS] = (*options[_POST_GRAD_PRE_PASS], capture)
-    return options
-
-
 @pytest.mark.parametrize("mode", ["shared", "distinct", "mixed", "static-output"])
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
 @pytest.mark.parametrize("chunk_rows", [64, 4096])
@@ -85,9 +78,11 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
             block_lengths=block_lengths,
             sparse_query_blocks=2,
         )
-        actual = torch.compile(model, fullgraph=True, options=_options(capture))(
-            hidden_states, block_lengths, 2
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        )(hidden_states, block_lengths, 2)
     assert_fusion_output_close(actual, expected)
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default)
@@ -130,7 +125,11 @@ def test_static_sparse_scales_can_change_without_recompilation(monkeypatch, proj
         1, model.sequence_length, model.input_features, device="cuda", dtype=torch.bfloat16
     )
     capture = TargetCapturePass()
-    compiled = torch.compile(model, fullgraph=True, options=_options(capture))
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+    )
     with torch.inference_mode():
         first = compiled(hidden_states)
         getattr(model, projection).weight.act_per_tensor_scale.mul_(0.5)
@@ -170,7 +169,11 @@ def test_static_coarse_gate_keeps_valid_metadata_when_attention_escapes():
             coarse_scale=model.coarse_scale,
             coarse_key_blocks=model.coarse_key_blocks,
         )
-        actual = torch.compile(model, fullgraph=True, options=_options(capture))(hidden)
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        )(hidden)
     for result, reference in zip(actual, expected, strict=True):
         assert_fusion_output_close(result, reference)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 4
@@ -200,7 +203,11 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
         else None
     )
     capture = TargetCapturePass()
-    compiled = torch.compile(model, fullgraph=True, options=_options(capture))
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+    )
     with torch.inference_mode():
         for iteration in range(2):
             if iteration:
@@ -262,7 +269,11 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
             coarse_scale=model.coarse_scale,
             coarse_key_blocks=model.coarse_key_blocks,
         )
-        compiled = torch.compile(model, fullgraph=True, options=_options(capture))
+        compiled = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        )
         for _ in range(3):
             actual = compiled(hidden)
             if escape:

@@ -1,4 +1,4 @@
-"""Shared operands and references for semantic NVFP4 SwiGLU FFN tests."""
+"""Shared operands, models, and references for semantic NVFP4 SwiGLU FFN tests."""
 
 from __future__ import annotations
 
@@ -6,35 +6,9 @@ from dataclasses import dataclass
 
 import torch
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
+from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
-from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class Linear:
-    weight: PiperNVFP4Tensor
-    activation_scale: torch.Tensor | None
-    bias: torch.Tensor | None
-    dynamic: bool
-
-    def arguments(self) -> tuple[object, ...]:
-        return (
-            self.weight.qdata,
-            self.weight.scale,
-            self.weight.per_tensor_scale,
-            self.activation_scale,
-            self.bias,
-            self.dynamic,
-            self.weight.high_first,
-        )
+from .._nvfp4 import Linear, make_weight, precise_linear
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,55 +28,11 @@ class Operands:
         )
 
 
-def _weight(
-    dense: torch.Tensor,
-    activation_scale: torch.Tensor | None,
-    dynamic: bool,
-    high_first: bool,
-) -> PiperNVFP4Tensor:
-    quantization = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=dynamic,
-    )
-    # TorchAO's reference quantizer accepts BF16/FP32; retain the logical input dtype.
-    quantization_input = dense.float() if dense.dtype is torch.float16 else dense
-    weight = PiperNVFP4Tensor.from_torchao(
-        TorchAONVFP4Tensor.to_nvfp4(
-            quantization_input,
-            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
-            act_per_tensor_scale=activation_scale,
-            is_swizzled_scales=True,
-            act_quant_kwargs=quantization,
-        )
-    ).to(dtype=dense.dtype)
-    if not high_first:
-        return weight
-    return PiperNVFP4Tensor(
-        ((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4),
-        weight.scale,
-        weight.block_size,
-        weight.orig_dtype,
-        weight.per_tensor_scale,
-        weight.act_per_tensor_scale,
-        weight.is_swizzled_scales,
-        weight.use_triton_kernel,
-        weight.act_quant_kwargs,
-        high_first=True,
-    )
-
-
 def materialized(operands: Operands) -> torch.Tensor:
     """Run the three projections using independent portable PyTorch operations."""
     gate = precise_linear(operands.input, operands.gate)
     value = precise_linear(operands.input, operands.value)
     return precise_linear(value * F.silu(gate), operands.down)
-
-
-def precise_linear(input: torch.Tensor, linear: Linear) -> torch.Tensor:  # noqa: A002
-    """Reference affine accumulation in FP32 using the represented NVFP4 operands."""
-    return nvfp4_reference.linear(input, *linear.arguments())
 
 
 def make_operands(
@@ -144,13 +74,57 @@ def make_operands(
             if bias_dtype is not None
             else None
         )
-        return Linear(_weight(dense, scale, dynamic, high_first), scale, bias, dynamic)
+        return Linear(make_weight(dense, scale, dynamic, high_first), scale, bias, dynamic)
 
     gate = make_linear(gate_dense, input_scale)
     value = make_linear(value_dense, value_scale)
-    activated = precise_linear(input, value) * F.silu(precise_linear(input, gate))
-    down_scale = None if dynamic else per_tensor_amax_to_scale(activated.abs().amax())
+    down_scale = None
+    if not dynamic:
+        activated = precise_linear(input, value) * F.silu(precise_linear(input, gate))
+        down_scale = per_tensor_amax_to_scale(activated.abs().amax())
     return Operands(input, gate, value, make_linear(down_dense, down_scale))
 
 
-__all__ = ["Linear", "Operands", "make_operands", "materialized"]
+class SwiGluFfn(torch.nn.Module):
+    def __init__(
+        self,
+        operands: Operands,
+        *,
+        promote_gate: bool = False,
+        reverse_multiply: bool = False,
+        expose_gate: bool = False,
+    ) -> None:
+        super().__init__()
+        self.promote_gate = promote_gate
+        self.reverse_multiply = reverse_multiply
+        self.expose_gate = expose_gate
+        self.gate = self._linear(operands.gate)
+        self.value = self._linear(operands.value)
+        self.down = self._linear(operands.down)
+
+    @staticmethod
+    def _linear(operands: Linear) -> torch.nn.Linear:
+        out_features, in_features = operands.weight.shape
+        linear = torch.nn.Linear(
+            in_features,
+            out_features,
+            bias=operands.bias is not None,
+            device="cuda",
+            dtype=operands.weight.dtype,
+        )
+        linear.weight = torch.nn.Parameter(operands.weight, requires_grad=False)
+        if operands.bias is not None:
+            linear.bias = torch.nn.Parameter(operands.bias, requires_grad=False)
+        return linear
+
+    def forward(
+        self,
+        input: torch.Tensor,  # noqa: A002
+        value_input: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        gate = self.gate(input)
+        value = self.value(input if value_input is None else value_input)
+        activated_gate = F.silu(gate.float()).to(gate.dtype) if self.promote_gate else F.silu(gate)
+        activated = activated_gate * value if self.reverse_multiply else value * activated_gate
+        output = self.down(activated)
+        return (output, gate) if self.expose_gate else output

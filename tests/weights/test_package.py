@@ -12,8 +12,7 @@ from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 
-@pytest.mark.parametrize("format_name", ["int8", "nvfp4", "convrot_nvfp4"])
-def test_quantization_and_updates_do_not_import_linear(format_name):
+def test_quantization_and_updates_do_not_import_linear():
     script = """
 import importlib.abc
 import sys
@@ -30,23 +29,24 @@ from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.weights.sharding import shard_quantized_weight
 
-source = torch.randn(8, 64)
-format_name = sys.argv[1]
-if format_name == "int8":
-    weight = ConvRotInt8Tensor.from_hp(source, group_size=16)
-elif format_name == "nvfp4":
-    weight = PiperNVFP4Tensor.from_hp(source, compute_per_tensor_scale=True)
-else:
-    weight = ConvRotNVFP4Tensor.from_hp(source, group_size=16, compute_per_tensor_scale=True)
-assert weight.dequantize().shape == source.shape
-assert weight.clone().float().shape == source.shape
-assert shard_quantized_weight(weight, dim=0, start=0, length=4).shape == (4, 64)
-weight.add_(torch.ones_like(source), alpha=0.25)
-weight.addmm_(torch.ones(8, 2), torch.ones(2, 64), alpha=0.125)
-assert torch.isfinite(weight.dequantize()).all()
-assert not any(name.startswith("piper_kernels.linear") for name in sys.modules)
+# All formats share the same import barrier, with fresh weights for each case.
+for weight_type, kwargs in (
+    (ConvRotInt8Tensor, {"group_size": 16}),
+    (PiperNVFP4Tensor, {"compute_per_tensor_scale": True}),
+    (ConvRotNVFP4Tensor, {"group_size": 16, "compute_per_tensor_scale": True}),
+):
+    print(f"checking {weight_type.__name__}", flush=True)
+    source = torch.randn(8, 64)
+    weight = weight_type.from_hp(source, **kwargs)
+    assert weight.dequantize().shape == source.shape
+    assert weight.clone().float().shape == source.shape
+    assert shard_quantized_weight(weight, dim=0, start=0, length=4).shape == (4, 64)
+    weight.add_(torch.ones_like(source), alpha=0.25)
+    weight.addmm_(torch.ones(8, 2), torch.ones(2, 64), alpha=0.125)
+    assert torch.isfinite(weight.dequantize()).all()
+    assert not any(name.startswith("piper_kernels.linear") for name in sys.modules)
 """
-    subprocess.run([sys.executable, "-c", script, format_name], check=True)
+    subprocess.run([sys.executable, "-c", script], check=True)
 
 
 @pytest.mark.parametrize("weight_type", [ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor])
