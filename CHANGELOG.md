@@ -7,8 +7,6 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
-- H3 ConvRot INT8 sparse-attention fusion benchmarks can sweep query-window sizes through
-  150,000 tokens, checking the emitted fusion, complete outputs, latency, and peak allocation.
 - Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.
@@ -32,8 +30,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
   dispatcher and flat plans selected from target, operation, and operand metadata. Dense
   and sparse projection settings live in policy modules.
-- Operator benchmarks use one versioned workload catalog and runner across
-  accelerators, with common complete-call timings, numerical checks, and explicit
+- Operator benchmarks use a [shared runner](benchmarks/benchmark.py) and versioned
+  workload catalog across accelerators, with common complete-call timings, numerical checks, and explicit
   unsupported/OOM outcomes. Six superseded runners are removed; focused diagnostics
   and offline tuners can select the same cases.
 - Execution-plan and schedule types follow shared naming and module ownership conventions.
@@ -58,10 +56,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   outputs are bitwise identical to the previous schedule. SM8x prepares rows of at most 1,024
   columns with one warp: plain inputs keep identical bits, and GELU/SwiGLU codes may differ from
   other NVIDIA targets by one INT8 code. SM120 and AMD schedules and compiled code are
-  unchanged. The new `benchmark_convrot_int8_realistic.py` measures H3, VAE, short-M, and anchor
-  linears against the original plan and BF16 in about three minutes.
-  `benchmark_convrot_int8_small_m.py` measures the original plan as `previous_linear` on every
-  target, and `--compare-schedules` forces the SM8x configurations on SM8x.
+  unchanged.
   NVIDIA policy, dispatch, and implementation launchers are separated; one plan type names
   the kernel, grouping, row specialization, and bias rounding explicitly. The async-copy
   kernel is also covered on SM120. The tuner supports explicit implementation/grouping axes
