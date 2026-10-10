@@ -27,6 +27,12 @@ class TargetCapturePass(CustomInferenceAwareGraphPass):
         self.calls += 1
         self.targets = [node.target for node in graph.nodes if node.op == "call_function"]
 
+    def wrap_options(self, options: dict[str, object]) -> dict[str, object]:
+        """Copy fusion options and append this capture after their post-grad passes."""
+        passes = options["post_grad_custom_pre_pass"]
+        assert isinstance(passes, tuple)
+        return {**options, "post_grad_custom_pre_pass": (*passes, self)}
+
     @property
     def target_names(self) -> list[str]:
         """Qualified names of the recorded targets, for string matching."""

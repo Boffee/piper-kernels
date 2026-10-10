@@ -264,29 +264,18 @@ def test_stable_hash_distinguishes_rotation_groups() -> None:
     assert source._stable_hash_for_caching() != other._stable_hash_for_caching()
 
 
-def test_dequantize_returns_the_unrotated_logical_weight() -> None:
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_dequantize_returns_the_unrotated_logical_weight(output_dtype: torch.dtype | None) -> None:
     torch.manual_seed(611)
     logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
     rotated_weight = rotate_groups(logical_weight, 16)
     source = TorchAONVFP4Tensor.to_nvfp4(rotated_weight)
     weight = ConvRotNVFP4Tensor.from_torchao(source, group_size=16)
 
-    expected = rotate_groups(source.dequantize(), 16)
+    actual = weight.dequantize() if output_dtype is None else weight.dequantize(output_dtype)
+    expected = rotate_groups(source.dequantize(output_dtype), 16)
 
-    assert torch.equal(weight.dequantize(), expected)
-
-
-def test_dequantize_accepts_an_output_dtype() -> None:
-    torch.manual_seed(612)
-    logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
-    rotated_weight = rotate_groups(logical_weight, 16)
-    source = TorchAONVFP4Tensor.to_nvfp4(rotated_weight)
-    weight = ConvRotNVFP4Tensor.from_torchao(source, group_size=16)
-
-    actual = weight.dequantize(torch.float32)
-    expected = rotate_groups(source.dequantize(torch.float32), 16)
-
-    assert actual.dtype is torch.float32
+    assert actual.dtype is (output_dtype or logical_weight.dtype)
     assert torch.equal(actual, expected)
 
 
@@ -447,50 +436,21 @@ def test_addmm_preserves_one_level_weight_scaling() -> None:
     assert weight.per_tensor_scale is None
 
 
-def test_addmm_no_op_does_not_requantize_storage() -> None:
-    weight, mat1, mat2 = _cpu_addmm_case()
-    qdata_before = weight.qdata.clone()
-    scale_before = weight.scale.clone()
-    per_tensor_scale_before = weight.per_tensor_scale.clone()
-    versions = (
-        weight.qdata._version,
-        weight.scale._version,
-        weight.per_tensor_scale._version,
-    )
+@pytest.mark.parametrize("operation", ["add_", "addmm_"])
+def test_no_op_does_not_requantize_storage(operation: str) -> None:
+    make_case = _cpu_add_case if operation == "add_" else _cpu_addmm_case
+    weight, *operands = make_case()
+    storage = (weight.qdata, weight.scale, weight.per_tensor_scale)
+    before = [(tensor.clone(), tensor._version) for tensor in storage]
 
-    weight.addmm_(mat1, mat2, alpha=0)
+    assert getattr(weight, operation)(*operands, alpha=0) is weight
 
-    assert torch.equal(weight.qdata, qdata_before)
-    assert torch.equal(weight.scale, scale_before)
-    assert torch.equal(weight.per_tensor_scale, per_tensor_scale_before)
-    assert versions == (
-        weight.qdata._version,
-        weight.scale._version,
-        weight.per_tensor_scale._version,
-    )
-
-
-def test_add_no_op_does_not_requantize_storage() -> None:
-    weight, update = _cpu_add_case()
-    qdata_before = weight.qdata.clone()
-    scale_before = weight.scale.clone()
-    per_tensor_scale_before = weight.per_tensor_scale.clone()
-    versions = (
-        weight.qdata._version,
-        weight.scale._version,
-        weight.per_tensor_scale._version,
-    )
-
-    weight.add_(update, alpha=0)
-
-    assert torch.equal(weight.qdata, qdata_before)
-    assert torch.equal(weight.scale, scale_before)
-    assert torch.equal(weight.per_tensor_scale, per_tensor_scale_before)
-    assert versions == (
-        weight.qdata._version,
-        weight.scale._version,
-        weight.per_tensor_scale._version,
-    )
+    assert weight.qdata is storage[0]
+    assert weight.scale is storage[1]
+    assert weight.per_tensor_scale is storage[2]
+    for tensor, (original, version) in zip(storage, before, strict=True):
+        assert torch.equal(tensor, original)
+        assert tensor._version == version
 
 
 def test_addmm_encodes_an_all_zero_result_without_invalid_scales() -> None:
@@ -504,41 +464,20 @@ def test_addmm_encodes_an_all_zero_result_without_invalid_scales() -> None:
     assert bool((weight.per_tensor_scale > 0).all())
 
 
-def test_addmm_stochastic_rounding_replays_without_consuming_global_rng() -> None:
+@pytest.mark.parametrize("operation", ["add_", "addmm_"])
+def test_stochastic_rounding_replays_without_consuming_global_rng(operation: str) -> None:
     seed = (1 << 64) - 1
-    first, mat1, mat2 = _cpu_addmm_case(seed=621)
+    first, *operands = _cpu_add_case(seed=624) if operation == "add_" else _cpu_addmm_case(seed=621)
     replay = first.clone()
     other = first.clone()
     deterministic = first.clone()
     torch.manual_seed(1701)
     rng_before = torch.random.get_rng_state()
 
-    first.addmm_(mat1, mat2, rounding_seed=seed)
-    replay.addmm_(mat1, mat2, rounding_seed=seed)
-    other.addmm_(mat1, mat2, rounding_seed=seed - 1)
-    deterministic.addmm_(mat1, mat2)
-
-    assert torch.equal(torch.random.get_rng_state(), rng_before)
-    assert torch.equal(first.qdata, replay.qdata)
-    assert torch.equal(first.scale.view(torch.uint8), replay.scale.view(torch.uint8))
-    assert not torch.equal(first.qdata, other.qdata)
-    assert torch.equal(first.scale.view(torch.uint8), other.scale.view(torch.uint8))
-    assert not torch.equal(first.qdata, deterministic.qdata)
-
-
-def test_add_stochastic_rounding_replays_without_consuming_global_rng() -> None:
-    seed = (1 << 64) - 1
-    first, update = _cpu_add_case(seed=624)
-    replay = first.clone()
-    other = first.clone()
-    deterministic = first.clone()
-    torch.manual_seed(1703)
-    rng_before = torch.random.get_rng_state()
-
-    first.add_(update, rounding_seed=seed)
-    replay.add_(update, rounding_seed=seed)
-    other.add_(update, rounding_seed=seed - 1)
-    deterministic.add_(update)
+    getattr(first, operation)(*operands, rounding_seed=seed)
+    getattr(replay, operation)(*operands, rounding_seed=seed)
+    getattr(other, operation)(*operands, rounding_seed=seed - 1)
+    getattr(deterministic, operation)(*operands)
 
     assert torch.equal(torch.random.get_rng_state(), rng_before)
     assert torch.equal(first.qdata, replay.qdata)
@@ -637,26 +576,18 @@ def test_add_rejects_invalid_update(update: torch.Tensor, message: str) -> None:
         weight.add_(update)
 
 
-def test_addmm_rejects_autograd_inputs() -> None:
-    weight, mat1, mat2 = _cpu_addmm_case()
-    mat1.requires_grad_(True)
+@pytest.mark.parametrize("operation", ["add_", "addmm_"])
+def test_updates_reject_autograd_inputs(operation: str) -> None:
+    make_case = _cpu_add_case if operation == "add_" else _cpu_addmm_case
+    weight, *operands = make_case()
+    operands[0].requires_grad_(True)
+    update = getattr(weight, operation)
 
     with pytest.raises(RuntimeError, match="does not support autograd"):
-        weight.addmm_(mat1, mat2)
+        update(*operands)
 
     with torch.no_grad():
-        assert weight.addmm_(mat1, mat2) is weight
-
-
-def test_add_rejects_autograd_inputs() -> None:
-    weight = _cpu_weight_case()
-    update = torch.randn(weight.shape, dtype=weight.orig_dtype, requires_grad=True)
-
-    with pytest.raises(RuntimeError, match="does not support autograd"):
-        weight.add_(update)
-
-    with torch.no_grad():
-        assert weight.add_(update) is weight
+        assert update(*operands) is weight
 
 
 def test_meta_linear_supports_functional_and_keyword_forms() -> None:

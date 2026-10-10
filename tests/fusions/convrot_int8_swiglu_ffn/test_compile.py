@@ -5,7 +5,6 @@ from typing import Literal
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
-from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
@@ -19,163 +18,10 @@ from piper_kernels.fusions.convrot_int8_swiglu_ffn._compile import (
 )
 from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
-from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+from ._helpers import GatedUpdates, SwiGluFfn, make_gated_update_arguments, relative_l2
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
-
-
-class _SwiGluFfn(torch.nn.Module):
-    input_features = 256
-    intermediate_features = 512
-    output_features = 384
-
-    def __init__(
-        self,
-        *,
-        promote_gate: bool = False,
-        reverse_multiply: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
-        bias_dtype: torch.dtype | None = torch.bfloat16,
-        expose_gate: bool = False,
-    ) -> None:
-        super().__init__()
-        self.promote_gate = promote_gate
-        self.reverse_multiply = reverse_multiply
-        self.expose_gate = expose_gate
-        self.gate = self._linear(self.intermediate_features, self.input_features, bias_dtype, dtype)
-        self.value = self._linear(
-            self.intermediate_features, self.input_features, bias_dtype, dtype
-        )
-        self.down = self._linear(
-            self.output_features, self.intermediate_features, bias_dtype, dtype
-        )
-
-    @staticmethod
-    def _linear(
-        out_features: int,
-        in_features: int,
-        bias_dtype: torch.dtype | None,
-        dtype: torch.dtype,
-    ) -> torch.nn.Linear:
-        qdata = torch.randint(
-            -127,
-            128,
-            (out_features, in_features),
-            dtype=torch.int8,
-            device="cuda",
-        )
-        scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
-        weight = ConvRotInt8Tensor.from_quantized(qdata, scale, group_size=256, logical_dtype=dtype)
-        linear = torch.nn.Linear(
-            in_features,
-            out_features,
-            bias=bias_dtype is not None,
-            dtype=dtype,
-            device="cuda",
-        )
-        linear.weight = torch.nn.Parameter(weight, requires_grad=False)
-        if bias_dtype is not None:
-            assert linear.bias is not None
-            linear.bias = torch.nn.Parameter(linear.bias.to(bias_dtype), requires_grad=False)
-        return linear
-
-    def forward(
-        self,
-        activation: torch.Tensor,
-        value_input: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        gate = self.gate(activation)
-        value = self.value(activation if value_input is None else value_input)
-        activated_gate = F.silu(gate.float()).to(gate.dtype) if self.promote_gate else F.silu(gate)
-        activated = activated_gate * value if self.reverse_multiply else value * activated_gate
-        output = self.down(activated)
-        return (output, gate) if self.expose_gate else output
-
-
-class _GatedUpdates(torch.nn.Module):
-    def __init__(
-        self,
-        *,
-        expose: Literal["none", "ffn", "hidden"] = "none",
-        update_mode: Literal["materialized", "direct", "alias"] = "materialized",
-        python_indexing: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
-    ) -> None:
-        super().__init__()
-        self.ffn = _SwiGluFfn(promote_gate=True, reverse_multiply=True, dtype=dtype)
-        self.dtype = dtype
-        self.expose = expose
-        self.update_mode = update_mode
-        self.python_indexing = python_indexing
-        self.update = torch.nn.Linear(
-            self.ffn.output_features,
-            self.ffn.output_features,
-            bias=False,
-            dtype=dtype,
-            device="cuda",
-        )
-        self.update.weight.requires_grad_(False)
-
-    def forward(
-        self,
-        base: torch.Tensor,
-        update_source: torch.Tensor,
-        update_gate: torch.Tensor,
-        ffn_gate: torch.Tensor,
-        gate_indices: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self.update_mode == "materialized":
-            reusable_update = self.update(update_source)
-        elif self.update_mode == "alias":
-            reusable_update = update_source[1:]
-        else:
-            reusable_update = update_source
-        if self.python_indexing:
-            selected_update_gate = update_gate[gate_indices]
-            selected_ffn_gate = ffn_gate[gate_indices]
-        else:
-            selected_update_gate = update_gate.index_select(0, gate_indices)
-            selected_ffn_gate = ffn_gate.index_select(0, gate_indices)
-        hidden = base + selected_update_gate * reusable_update
-        ffn = self.ffn(hidden[..., : self.ffn.input_features].contiguous())
-        assert isinstance(ffn, torch.Tensor)
-        output = hidden + selected_ffn_gate * ffn
-        if self.expose == "ffn":
-            return output, ffn
-        if self.expose == "hidden":
-            return output, hidden
-        return output
-
-
-def _gated_update_arguments(
-    model: _GatedUpdates,
-    rows: int,
-) -> tuple[torch.Tensor, ...]:
-    features = model.ffn.output_features
-    base = torch.randn(rows, features, dtype=model.dtype, device="cuda")
-    update_source = torch.randn(
-        rows + int(model.update_mode == "alias"),
-        features,
-        dtype=model.dtype,
-        device="cuda",
-    )
-    gate_storage = torch.randn(7, 6 * features, dtype=model.dtype, device="cuda")
-    update_gate = gate_storage[:, 2 * features : 3 * features]
-    ffn_gate = gate_storage[:, 5 * features :]
-    gate_indices = torch.randint(0, 7, (rows,), dtype=torch.int64, device="cuda")
-    return base, update_source, update_gate, ffn_gate, gate_indices
-
-
-def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
-    options = convrot_int8_swiglu_ffn_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
-    return options
-
-
-def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
-    return (actual.float() - expected.float()).norm() / expected.float().norm()
 
 
 def test_compile_options_install_fusion_before_convrot() -> None:
@@ -249,7 +95,7 @@ def test_compile_options_fold_semantic_swiglu_ffn(
     dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(220 + promote_gate + 10 * reverse_multiply)
-    model = _SwiGluFfn(
+    model = SwiGluFfn(
         promote_gate=promote_gate,
         reverse_multiply=reverse_multiply,
         bias_dtype=bias_dtype,
@@ -269,14 +115,16 @@ def test_compile_options_fold_semantic_swiglu_ffn(
             activation
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(activation)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
     assert actual.dtype is dtype
-    assert _relative_l2(actual, expected) < 0.01
+    assert relative_l2(actual, expected) < 0.01
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default) == 1
     assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets
 
@@ -286,7 +134,7 @@ def test_compile_options_fold_semantic_swiglu_ffn(
 @pytest.mark.parametrize("failure", ["projection-escapes", "different-input", "noncontiguous"])
 def test_compile_options_fail_closed(failure: str) -> None:
     torch.manual_seed(225)
-    model = _SwiGluFfn(expose_gate=failure == "projection-escapes").eval()
+    model = SwiGluFfn(expose_gate=failure == "projection-escapes").eval()
     activation = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
     if failure == "different-input":
         arguments = activation, torch.randn_like(activation)
@@ -307,9 +155,11 @@ def test_compile_options_fail_closed(failure: str) -> None:
             *arguments
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(*arguments)
 
     expected_values = expected if isinstance(expected, tuple) else (expected,)
     actual_values = actual if isinstance(actual, tuple) else (actual,)
@@ -323,14 +173,18 @@ def test_compile_options_fail_closed(failure: str) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     torch.manual_seed(227)
-    model = _SwiGluFfn().eval()
+    model = SwiGluFfn().eval()
     first = torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda")
     second = torch.randn(385, model.input_features, dtype=torch.bfloat16, device="cuda")
     torch._dynamo.mark_dynamic(first, 0)
     torch._dynamo.mark_dynamic(second, 0)
     capture = TargetCapturePass()
     torch._dynamo.reset()
-    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+    )
 
     with torch.no_grad():
         first_output = compiled(first)
@@ -350,8 +204,8 @@ def test_compile_options_fold_h3_style_gated_updates(
     python_indexing: bool, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(224)
-    model = _GatedUpdates(python_indexing=python_indexing, dtype=dtype).eval()
-    arguments = _gated_update_arguments(model, 257)
+    model = GatedUpdates(python_indexing=python_indexing, dtype=dtype).eval()
+    arguments = make_gated_update_arguments(model, 257)
     capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
@@ -359,12 +213,14 @@ def test_compile_options_fold_h3_style_gated_updates(
             *arguments
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(*arguments)
 
     assert actual.dtype is dtype
-    assert _relative_l2(actual, expected) < 0.01
+    assert relative_l2(actual, expected) < 0.01
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_int8_swiglu_ffn_gated_updates_.default
@@ -381,8 +237,8 @@ def test_gated_updates_fail_closed_when_intermediate_escapes(
     expose: Literal["ffn", "hidden"],
 ) -> None:
     torch.manual_seed(216)
-    model = _GatedUpdates(expose=expose).eval()
-    arguments = _gated_update_arguments(model, 257)
+    model = GatedUpdates(expose=expose).eval()
+    arguments = make_gated_update_arguments(model, 257)
     capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
@@ -390,14 +246,16 @@ def test_gated_updates_fail_closed_when_intermediate_escapes(
             *arguments
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(*arguments)
 
     assert isinstance(expected, tuple)
     assert isinstance(actual, tuple)
     assert all(
-        _relative_l2(left, right) < 0.01 for left, right in zip(actual, expected, strict=True)
+        relative_l2(left, right) < 0.01 for left, right in zip(actual, expected, strict=True)
     )
     assert (
         torch.ops.piper_kernels.convrot_int8_swiglu_ffn_gated_updates_.default
@@ -413,8 +271,8 @@ def test_gated_updates_do_not_mutate_caller_input(
     update_mode: Literal["direct", "alias"],
 ) -> None:
     torch.manual_seed(217)
-    model = _GatedUpdates(update_mode=update_mode).eval()
-    arguments = _gated_update_arguments(model, 257)
+    model = GatedUpdates(update_mode=update_mode).eval()
+    arguments = make_gated_update_arguments(model, 257)
     capture = TargetCapturePass()
     with torch.no_grad():
         torch._dynamo.reset()
@@ -422,11 +280,13 @@ def test_gated_updates_do_not_mutate_caller_input(
             *arguments
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(*arguments)
 
-    assert _relative_l2(actual, expected) < 0.01
+    assert relative_l2(actual, expected) < 0.01
     assert (
         torch.ops.piper_kernels.convrot_int8_swiglu_ffn_gated_updates_.default
         not in capture.targets

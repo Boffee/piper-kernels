@@ -119,14 +119,6 @@ class _GatedUpdates(torch.nn.Module):
         return (output, ffn) if self.expose_ffn else output
 
 
-def _capturing_options(capture: TargetCapturePass) -> dict[str, object]:
-    options = convrot_int8_gelu_ffn_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
-    return options
-
-
 def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
     return (actual.float() - expected.float()).norm() / expected.float().norm()
 
@@ -190,9 +182,11 @@ def test_compile_options_fold_semantic_gelu_ffn(bias_dtype, dtype, scale_mode) -
             activation
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_gelu_ffn_compile_options()),
+        )(activation)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
@@ -227,9 +221,11 @@ def test_compile_options_fail_closed(failure: str) -> None:
             activation
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_gelu_ffn_compile_options()),
+        )(activation)
 
     expected_values = expected if isinstance(expected, tuple) else (expected,)
     actual_values = actual if isinstance(actual, tuple) else (actual,)
@@ -250,7 +246,9 @@ def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     torch._dynamo.mark_dynamic(second, 0)
     capture = TargetCapturePass()
     torch._dynamo.reset()
-    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
+    compiled = torch.compile(
+        model, fullgraph=True, options=capture.wrap_options(convrot_int8_gelu_ffn_compile_options())
+    )
 
     with torch.inference_mode():
         assert compiled(first).shape == (257, model.output_features)
@@ -274,9 +272,11 @@ def test_compile_options_fold_indexed_gated_updates(python_indexing: bool) -> No
             *arguments
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_gelu_ffn_compile_options()),
+        )(*arguments)
 
     assert _relative_l2(actual, expected) < 0.01
     assert (
@@ -299,9 +299,11 @@ def test_gated_updates_fail_closed_when_ffn_escapes() -> None:
             *arguments
         )
         torch._dynamo.reset()
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_gelu_ffn_compile_options()),
+        )(*arguments)
 
     assert isinstance(expected, tuple)
     assert isinstance(actual, tuple)
@@ -323,7 +325,9 @@ def test_compiled_static_scales_are_runtime_values() -> None:
     model.down.weight.act_per_tensor_scale = torch.tensor(0.04, device="cuda")
     activation = torch.randn(129, model.input_features, dtype=torch.bfloat16, device="cuda")
     capture = TargetCapturePass()
-    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
+    compiled = torch.compile(
+        model, fullgraph=True, options=capture.wrap_options(convrot_int8_gelu_ffn_compile_options())
+    )
     ordinary = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())
 
     with torch.inference_mode():

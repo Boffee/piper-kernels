@@ -6,6 +6,12 @@ from collections.abc import Iterator
 import pytest
 from filelock import FileLock
 
+# Small CPU references benefit from process parallelism, not a full thread pool
+# per xdist worker. Set defaults before importing torch and inherit them in child
+# processes; explicit caller settings still take precedence.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+
 
 @pytest.hookimpl(tryfirst=True, optionalhook=True)
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:

@@ -131,6 +131,9 @@ accelerator use at most 8. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to adjust for dev
 memory, or pass `-n0` to debug serially (`--pdb` does so automatically).
 Tests that allocate gigabytes of device memory or spawn extra GPU processes
 use `@pytest.mark.usefixtures("large_device_memory")` to serialize that work.
+CPU operations default to one thread per process to avoid competing thread pools
+across workers. Set `OMP_NUM_THREADS` or `MKL_NUM_THREADS` before pytest to override;
+child processes inherit these settings.
 
 GPU tests use the `gpu` marker and require a compatible accelerator. The
 pre-commit hook hides CUDA and runs portable tests; the launcher exercises
@@ -147,6 +150,15 @@ Managed roots must support executable mappings (DLL loading on Windows) and have
 enough capacity. Unsuitable roots fail before testing; forcefully terminating
 the launcher may leave its directories behind. Plain `uv run pytest` retains
 normal compiler-cache behavior.
+
+Extend existing cases while preserving numerical oracles, storage invariants, and
+distinct failure checks. Keep helpers focused on shared mechanics. Parametrize
+meaningful format, layout, and device boundaries without multiplying cases that
+execute the same path. Related checks may share a process when their isolation
+requirements still hold. When reducing a matrix, name the retained numerical or
+failure tests that cover the omitted combinations. Compare repeated launcher runs
+with matching workers, threads, hardware, and caches; fewer cases alone do not
+establish a speedup.
 
 ## Accelerator environments
 

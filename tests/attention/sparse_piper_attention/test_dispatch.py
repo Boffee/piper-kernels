@@ -21,12 +21,6 @@ def _inputs(
     return query, key, value
 
 
-def _attention(
-    ratios: tuple[float, ...],
-) -> SparsePiperAttention:
-    return SparsePiperAttention(ratios)
-
-
 def test_public_api_exports_sparse_attention_backend() -> None:
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
 
@@ -44,13 +38,14 @@ def test_attention_preserves_dtype_and_accuracy(device, head_dim, ratio, dtype):
     operands = tuple(tensor.to(dtype) for tensor in _inputs(device, 193, head_dim))
     attention = SparsePiperAttention((ratio, ratio))
     actual = attention(*operands, sparse_key_blocks=3)
-    # The CPU path computes attention from unquantized inputs using the same routing.
-    expected = attention(*(tensor.cpu() for tensor in operands), sparse_key_blocks=3)
     assert actual.dtype is dtype
     assert actual.shape == operands[0].shape
     assert torch.isfinite(actual).all()
-    relative_error = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
-    assert relative_error < 0.03
+    if device == "cuda":
+        # Compare native quantized attention with the portable unquantized path.
+        expected = attention(*(tensor.cpu() for tensor in operands), sparse_key_blocks=3)
+        relative_error = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
+        assert relative_error < 0.03
 
     # An intermediate store in a narrower dtype would round this value to 1.
     increment = 2**-10 if dtype is torch.float16 else 2**-20
@@ -66,35 +61,6 @@ def test_sparse_attention_rejects_mixed_activation_dtypes():
         SparsePiperAttention((1.0, 1.0))(query.half(), key, value, sparse_key_blocks=3)
 
 
-def test_mean_pool_backend_runs_through_the_common_attention_path() -> None:
-    query, key, value = _inputs()
-    attention = SparsePiperAttention((0.5, 1.0), routing="mean")
-
-    with torch.no_grad():
-        output = attention(query, key, value, sparse_key_blocks=2)
-
-    assert output.shape == query.shape
-    assert output.dtype is torch.bfloat16
-    assert torch.isfinite(output).all()
-
-
-def test_every_query_uses_sparse_prefix_plus_dense_suffix_on_cpu() -> None:
-    query, key, value = _inputs()
-    attention = _attention((0.5, 1.0))
-
-    with torch.no_grad():
-        output = attention(
-            query,
-            key,
-            value,
-            sparse_key_blocks=2,
-        )
-
-    assert output.shape == query.shape
-    assert output.dtype is torch.bfloat16
-    assert torch.isfinite(output).all()
-
-
 def test_backend_owns_only_an_immutable_semantic_ratio_profile() -> None:
     attention = SparsePiperAttention((0.75, 0.25, 1.0, 0.5))
 
@@ -108,7 +74,8 @@ def test_routing_policy_is_validated_at_construction() -> None:
         SparsePiperAttention((1.0,), routing="unknown")
 
 
-def test_dense_suffix_is_included_for_prefix_and_suffix_queries() -> None:
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+def test_dense_suffix_is_included_for_prefix_and_suffix_queries(routing: str) -> None:
     shape = (1, 3 * 64, 2, 128)
     query = torch.zeros(shape, dtype=torch.bfloat16)
     key = torch.zeros_like(query)
@@ -116,14 +83,14 @@ def test_dense_suffix_is_included_for_prefix_and_suffix_queries() -> None:
     value[:, :64] = 1
     value[:, 64:128] = 2
     value[:, 128:] = 10
-    attention = _attention((0.5, 1.0))
+    attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
     with torch.no_grad():
         output = attention(query, key, value, sparse_key_blocks=2)
 
     expected_by_head = torch.tensor([5.5, 13 / 3], dtype=torch.bfloat16)
-    torch.testing.assert_close(output[0, 0, :, 0], expected_by_head)
-    torch.testing.assert_close(output[0, -1, :, 0], expected_by_head)
+    assert output.shape == query.shape
+    torch.testing.assert_close(output, expected_by_head[None, None, :, None].expand_as(output))
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -146,7 +113,7 @@ def test_dense_query_suffix_bypasses_sparse_routes(
     value[:, :64] = 1
     value[:, 64:128] = 3
     value[:, 128:] = 10
-    attention = _attention((0.5,))
+    attention = SparsePiperAttention((0.5,))
 
     with torch.no_grad():
         output = attention(
@@ -165,7 +132,7 @@ def test_dense_query_suffix_bypasses_sparse_routes(
 @pytest.mark.parametrize("sparse_query_blocks", [-1, 4, True, 1.5])
 def test_sparse_query_block_boundary_is_validated(sparse_query_blocks: object) -> None:
     query, key, value = _inputs()
-    attention = _attention((0.5, 1.0))
+    attention = SparsePiperAttention((0.5, 1.0))
 
     with pytest.raises((TypeError, ValueError), match="sparse_query_blocks"):
         attention(
@@ -179,7 +146,7 @@ def test_sparse_query_block_boundary_is_validated(sparse_query_blocks: object) -
 
 def test_backend_accepts_sparse_prefix_length_changes_without_derived_state() -> None:
     query, key, value = _inputs()
-    attention = _attention((0.5, 0.5))
+    attention = SparsePiperAttention((0.5, 0.5))
 
     with torch.no_grad():
         one_block = attention(query, key, value, sparse_key_blocks=1)
@@ -194,7 +161,7 @@ def test_public_contract_accepts_ragged_logical_lengths(
     sequence_length: int, head_dim: int
 ) -> None:
     query, key, value = _inputs(sequence_length=sequence_length, head_dim=head_dim)
-    attention = _attention((0.5, 1.0))
+    attention = SparsePiperAttention((0.5, 1.0))
 
     with torch.no_grad():
         output = attention(
@@ -216,7 +183,7 @@ def test_partial_dense_suffix_attends_only_valid_rows() -> None:
     key = torch.zeros_like(query)
     value = torch.ones_like(query)
     value[:, -1] = 10
-    attention = _attention((1.0, 1.0))
+    attention = SparsePiperAttention((1.0, 1.0))
 
     with torch.no_grad():
         output = attention(query, key, value, sparse_key_blocks=1)
@@ -288,28 +255,10 @@ def test_internal_block_lengths_reject_invalid_metadata(block_lengths: torch.Ten
 
 def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
     query, key, value = _inputs()
-    attention = _attention((0.5, 0.5))
+    attention = SparsePiperAttention((0.5, 0.5))
 
     with pytest.raises(ValueError, match="sparse_key_blocks"):
         attention(query, key, value, sparse_key_blocks=4)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or select_attention_backend(torch.empty((), device="cuda")) is None,
-    reason="requires a native sparse-attention backend",
-)
-def test_native_path_runs_and_writes_engine_layout() -> None:
-    query, key, value = _inputs("cuda")
-    attention = _attention((0.5, 1.0))
-
-    with torch.no_grad():
-        output = attention(query, key, value, sparse_key_blocks=2)
-
-    assert output.shape == query.shape
-    assert output.is_contiguous()
-    assert torch.isfinite(output).all()
 
 
 @pytest.mark.gpu
@@ -323,7 +272,7 @@ def test_native_path_returns_contiguous_output_for_noncontiguous_inputs() -> Non
         tensor.transpose(1, 2).contiguous().transpose(1, 2)
         for tensor in _inputs("cuda", sequence_length=193)
     )
-    attention = _attention((0.5, 1.0))
+    attention = SparsePiperAttention((0.5, 1.0))
 
     with torch.no_grad():
         output = attention(query, key, value, sparse_key_blocks=3)
@@ -347,7 +296,7 @@ def test_native_custom_op_passes_opcheck(sequence_length: int, head_dim: int) ->
     )
 
     query, key, value = _inputs("cuda", sequence_length, head_dim)
-    attention = _attention((0.5, 1.0))
+    attention = SparsePiperAttention((0.5, 1.0))
     result = torch.library.opcheck(
         _sparse_piper_attention_op,
         (
@@ -381,8 +330,8 @@ def test_native_matches_the_portable_quantized_reference(
     ratios: tuple[float, float],
 ) -> None:
     query, key, value = _inputs(head_dim=head_dim)
-    cpu_attention = _attention(ratios)
-    cuda_attention = _attention(ratios)
+    cpu_attention = SparsePiperAttention(ratios)
+    cuda_attention = SparsePiperAttention(ratios)
 
     with torch.no_grad():
         reference = cpu_attention(
@@ -396,9 +345,12 @@ def test_native_matches_the_portable_quantized_reference(
             key.cuda(),
             value.cuda(),
             sparse_key_blocks=sparse_key_blocks,
-        ).cpu()
+        )
 
-    relative_l2 = (actual.float() - reference.float()).norm() / reference.float().norm()
+    assert actual.shape == query.shape
+    assert actual.is_contiguous()
+    assert torch.isfinite(actual).all()
+    relative_l2 = (actual.cpu().float() - reference.float()).norm() / reference.float().norm()
     assert relative_l2 < 0.015
 
 
@@ -414,7 +366,7 @@ def test_native_ragged_lengths_match_the_portable_reference(
     sequence_length: int, head_dim: int
 ) -> None:
     query, key, value = _inputs(sequence_length=sequence_length, head_dim=head_dim)
-    attention = _attention((0.5, 1.0))
+    attention = SparsePiperAttention((0.5, 1.0))
     sparse_key_blocks = sequence_length // 64
 
     with torch.no_grad():
@@ -444,30 +396,10 @@ def test_native_ragged_lengths_match_the_portable_reference(
     or select_attention_backend(torch.empty((), device="cuda")) is None,
     reason="requires a native sparse-attention backend",
 )
-def test_operator_is_opaque_to_a_full_compile_graph() -> None:
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+def test_operator_is_opaque_to_a_full_compile_graph(routing: str) -> None:
     query, key, value = _inputs("cuda", sequence_length=193)
-    attention = _attention((0.5, 1.0))
-
-    def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        return attention(query, key, value, sparse_key_blocks=3)
-
-    compiled = torch.compile(run, fullgraph=True)
-    with torch.no_grad():
-        expected = run(query, key, value)
-        actual = compiled(query, key, value)
-
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or select_attention_backend(torch.empty((), device="cuda")) is None,
-    reason="requires a native sparse-attention backend",
-)
-def test_mean_pool_operator_is_opaque_to_a_full_compile_graph() -> None:
-    query, key, value = _inputs("cuda", sequence_length=193)
-    attention = SparsePiperAttention((0.5, 1.0), routing="mean")
+    attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
     def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         return attention(query, key, value, sparse_key_blocks=3)

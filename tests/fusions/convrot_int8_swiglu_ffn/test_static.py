@@ -6,18 +6,18 @@ import pytest
 import torch
 from _compile_capture import TargetCapturePass
 
+from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
 from piper_kernels.fusions.convrot_int8_swiglu_ffn.triton import _chunked_swiglu_ffn_op
 from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend, _ops
 
-from .test_compile import (
-    _capturing_options,
-    _gated_update_arguments,
-    _GatedUpdates,
-    _relative_l2,
-    _SwiGluFfn,
+from ._helpers import (
+    GatedUpdates,
+    SwiGluFfn,
+    make_gated_update_arguments,
+    make_operands,
+    relative_l2,
 )
-from .test_triton import _operands
 
 pytestmark = [
     pytest.mark.gpu,
@@ -49,7 +49,7 @@ def _scales(mode):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_static_ffn_preserves_math_and_shares_only_compatible_inputs(monkeypatch, mode, dtype):
     torch.manual_seed(1071)
-    operands = _operands(rows=129, dtype=dtype)
+    operands = make_operands(rows=129, dtype=dtype)
     scales = _scales(mode)
     gate = _ops.linear(operands.input, *operands.gate.arguments(), None, scales[0])
     value = _ops.linear(operands.input, *operands.value.arguments(), None, scales[1])
@@ -73,7 +73,7 @@ def test_static_ffn_preserves_math_and_shares_only_compatible_inputs(monkeypatch
 
 @pytest.mark.parametrize("mode", ["shared", "mixed"])
 def test_static_ffn_custom_op_passes_opcheck(mode):
-    operands = _operands(rows=65)
+    operands = make_operands(rows=65)
     with torch.inference_mode():
         results = torch.library.opcheck(
             _chunked_swiglu_ffn_op, (*operands.arguments(64), *_scales(mode))
@@ -85,20 +85,24 @@ def test_static_ffn_custom_op_passes_opcheck(mode):
 def test_compiled_static_ffn_observes_scale_changes_without_recompilation(mode):
     torch._dynamo.reset()
     torch.manual_seed(1072)
-    model = _SwiGluFfn().eval()
+    model = SwiGluFfn().eval()
     scales = _scales(mode)
     for projection, scale in zip((model.gate, model.value, model.down), scales, strict=True):
         projection.weight.act_per_tensor_scale = scale
     activation = torch.randn(129, model.input_features, device="cuda", dtype=torch.bfloat16)
     capture = TargetCapturePass()
-    compiled = torch.compile(model, fullgraph=True, options=_capturing_options(capture))
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+    )
     ordinary = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())
     with torch.inference_mode():
         first = compiled(activation)
-        assert _relative_l2(first, ordinary(activation)) < 0.01
+        assert relative_l2(first, ordinary(activation)) < 0.01
         next(scale for scale in scales if scale is not None).mul_(0.5)
         second = compiled(activation)
-        assert _relative_l2(second, ordinary(activation)) < 0.01
+        assert relative_l2(second, ordinary(activation)) < 0.01
     assert not torch.equal(first, second)
     assert capture.calls == 1
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default) == 1
@@ -108,22 +112,24 @@ def test_compiled_static_ffn_observes_scale_changes_without_recompilation(mode):
 def test_static_ffn_gated_updates_remain_fused():
     torch._dynamo.reset()
     torch.manual_seed(1073)
-    model = _GatedUpdates().eval()
+    model = GatedUpdates().eval()
     scales = _scales("distinct")
     for projection, scale in zip(
         (model.ffn.gate, model.ffn.value, model.ffn.down), scales, strict=True
     ):
         projection.weight.act_per_tensor_scale = scale
-    arguments = _gated_update_arguments(model, 129)
+    arguments = make_gated_update_arguments(model, 129)
     capture = TargetCapturePass()
     with torch.inference_mode():
         expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
             *arguments
         )
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            *arguments
-        )
-    assert _relative_l2(actual, expected) < 0.01
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(*arguments)
+    assert relative_l2(actual, expected) < 0.01
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_int8_swiglu_ffn_gated_updates_.default
@@ -133,7 +139,7 @@ def test_static_ffn_gated_updates_remain_fused():
 
 
 def test_static_ffn_can_feed_an_unfused_projection():
-    class FfnWithTail(_SwiGluFfn):
+    class FfnWithTail(SwiGluFfn):
         output_features = 512
 
         def __init__(self):
@@ -167,9 +173,11 @@ def test_static_ffn_can_feed_an_unfused_projection():
             weight.act_per_tensor_scale,
         )
         expected = model.tail(down)
-        actual = torch.compile(model, fullgraph=True, options=_capturing_options(capture))(
-            activation
-        )
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(convrot_int8_swiglu_ffn_compile_options()),
+        )(activation)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default) == 1
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == 1
@@ -181,11 +189,15 @@ def test_compiler_cache_does_not_confuse_shared_and_independent_scales(fused):
     # A cache-bypassing or per-model capture UUID would hide AOT cache collisions
     # involving aliases inside weight wrappers.
     capture = TargetCapturePass(cache_key=b"convrot-int8-swiglu-scale-cache-collisions")
-    options = _capturing_options(capture) if fused else convrot_int8_compile_options()
+    options = (
+        capture.wrap_options(convrot_int8_swiglu_ffn_compile_options())
+        if fused
+        else convrot_int8_compile_options()
+    )
     for mode in ("shared", "distinct", "mixed", "shared"):
         torch._dynamo.reset()
         torch.manual_seed(1074)
-        model = _SwiGluFfn().eval()
+        model = SwiGluFfn().eval()
         scales = _scales(mode)
         for projection, scale in zip((model.gate, model.value, model.down), scales, strict=True):
             projection.weight.act_per_tensor_scale = scale
@@ -193,4 +205,4 @@ def test_compiler_cache_does_not_confuse_shared_and_independent_scales(fused):
         with torch.inference_mode():
             expected = model(activation)
             actual = torch.compile(model, fullgraph=True, options=options)(activation)
-        assert _relative_l2(actual, expected) < 0.01
+        assert relative_l2(actual, expected) < 0.01

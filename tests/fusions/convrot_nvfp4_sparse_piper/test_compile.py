@@ -550,12 +550,22 @@ def _run_explicit_projected_gate_output(
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
-    ("dynamic", "routing"),
-    [(False, "minmax"), (True, "minmax"), (False, "mean")],
+    ("dynamic", "routing", "preparation_count"),
+    [(False, "minmax", 3), (True, "minmax", 1), (False, "mean", 3)],
 )
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("affine", [True, False])
+# nvfp4_sparse_piper/test_projection.py covers the shared head-size/affine math.
+# Keep every dtype/head-size/affine pair across all ConvRot scale and routing modes.
+@pytest.mark.parametrize(
+    ("dtype", "head_dim", "affine"),
+    [
+        (torch.float16, 64, True),
+        (torch.float16, 128, False),
+        (torch.bfloat16, 64, False),
+        (torch.bfloat16, 128, True),
+        (torch.float32, 64, True),
+        (torch.float32, 128, False),
+    ],
+)
 @pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     output_dynamic: bool,
@@ -565,6 +575,7 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     head_dim: int,
     dynamic: bool,
     routing: str,
+    preparation_count: int,
 ) -> None:
     monkeypatch.setattr(_SparseProjectionAttentionOutput, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttentionOutput, "rotary_dim", head_dim * 3 // 4)
@@ -584,10 +595,7 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
         dtype=dtype,
     )
     capture = TargetCapturePass()
-    options = convrot_nvfp4_sparse_piper_compile_options()
-    passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
+    options = capture.wrap_options(convrot_nvfp4_sparse_piper_compile_options())
     with torch.no_grad():
         expected = _run_explicit_attention_output(model, input)
         torch._dynamo.reset()
@@ -595,6 +603,10 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
 
     assert actual.dtype is dtype
     assert_fusion_output_close(actual, expected)
+    assert (
+        capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default)
+        == preparation_count
+    )
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_projected_query_attention_output.default
@@ -618,12 +630,10 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("key_affine", [True, False])
 @pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
     output_dynamic: bool,
     monkeypatch,
-    key_affine: bool,
     dtype: torch.dtype,
     dynamic: bool,
     routing: str,
@@ -638,8 +648,9 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
     if output_dynamic:
         monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", 128)
     model.set_activation_dtype(dtype)
-    if not key_affine:
-        model.key_norm = None
+    # nvfp4_sparse_piper/test_compile.py::test_cuda_compile_lifetime_chunks_a_projected_coarse_gate
+    # covers both affine variants; retain asymmetric Q/K norms with ConvRot preparation here.
+    model.key_norm = None
     input = torch.randn(  # noqa: A001
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -648,10 +659,7 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
     capture = TargetCapturePass()
-    options = convrot_nvfp4_sparse_piper_compile_options()
-    passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*passes, capture)
+    options = capture.wrap_options(convrot_nvfp4_sparse_piper_compile_options())
     with torch.no_grad():
         expected = _run_explicit_projected_gate_output(model, input, block_lengths, 2)
         torch._dynamo.reset()
@@ -661,6 +669,7 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
             2,
         )
 
+    assert actual.dtype is dtype
     assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default)

@@ -748,10 +748,7 @@ def test_compile_options_fuse_sparse_piper_projection_region(monkeypatch, head_d
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True)(hidden_states)
@@ -812,10 +809,7 @@ def test_projection_fusion_respects_internal_block_lengths(routing: str) -> None
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         expected = _run_explicit_fused_projection(
@@ -866,10 +860,7 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         semantic = model(hidden_states, coarse_gate)
@@ -944,10 +935,7 @@ def test_coarse_projection_fusion_respects_internal_block_lengths(routing: str) 
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         semantic = model(hidden_states, coarse_gate, block_lengths)
@@ -1008,10 +996,7 @@ def test_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     compiled = torch.compile(model, fullgraph=True, options=options)
 
     with torch.no_grad():
@@ -1061,10 +1046,7 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         torch._dynamo.reset()
@@ -1102,12 +1084,22 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
         128,
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("affine", [True, False])
-@pytest.mark.parametrize("qkv_bias", [False, True])
+@pytest.mark.parametrize(
+    ("dtype", "affine", "qkv_bias"),
+    [
+        (torch.float16, True, True),
+        (torch.float16, False, False),
+        (torch.bfloat16, True, False),
+        (torch.bfloat16, False, True),
+        (torch.float32, True, True),
+        (torch.float32, False, False),
+    ],
+)
 def test_compile_options_fuse_attention_output_boundary(
     qkv_bias: bool, affine: bool, monkeypatch, head_dim: int, dtype: torch.dtype
 ) -> None:
+    # Keep every parameter pair; test_query/test_key/test_value cover the full
+    # bias/norm numerical matrix without repeating whole-graph compilation.
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(719)
@@ -1126,10 +1118,7 @@ def test_compile_options_fuse_attention_output_boundary(
         dtype=dtype,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         expected, _attention = _run_explicit_attention_output(
@@ -1177,10 +1166,7 @@ def test_compile_fuses_padded_mixed_query_attention_output() -> None:
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         expected, _attention = _run_explicit_attention_output(
@@ -1228,10 +1214,7 @@ def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         expected, _attention = _run_explicit_attention_output(
@@ -1310,10 +1293,7 @@ def test_compile_fuses_every_bounded_attention_feature(
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     torch._dynamo.reset()
     compiled = torch.compile(model, fullgraph=True, options=options)
 
@@ -1355,9 +1335,17 @@ def test_compile_fuses_every_bounded_attention_feature(
     reason="requires fused sparse output support",
 )
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
-@pytest.mark.parametrize("query_chunk_rows", [64, 4096])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("query_affine", [True, False])
+@pytest.mark.parametrize(
+    ("dtype", "query_affine", "query_chunk_rows"),
+    [
+        (torch.float16, True, 64),
+        (torch.float16, False, 4096),
+        (torch.bfloat16, True, 4096),
+        (torch.bfloat16, False, 64),
+        (torch.float32, True, 64),
+        (torch.float32, False, 4096),
+    ],
+)
 def test_compile_lifetime_chunks_a_projected_coarse_gate(
     query_affine: bool,
     dtype: torch.dtype,
@@ -1365,6 +1353,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
     routing: str,
     query_chunk_rows: int,
 ) -> None:
+    # Keep every parameter pair, including both norm and chunk paths per dtype.
     torch.manual_seed(725)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
     # Eight chunks exercise gate production while Q/attention/output reuse slots.
@@ -1398,10 +1387,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
         coarse_key_blocks=model.coarse_key_blocks,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         torch._dynamo.reset()
@@ -1411,6 +1397,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
             options=options,
         )(hidden_states)
 
+    assert actual.dtype is dtype
     assert_fusion_output_close(actual, expected)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
     assert (
@@ -1443,10 +1430,7 @@ def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         expected_projected, expected_attention = _run_explicit_attention_output(
@@ -1485,10 +1469,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
     attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicSparseProjectionAttention().eval()
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -1558,10 +1539,7 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicCoarseSparseProjectionAttention().eval()
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -1658,10 +1636,7 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
     cos = angles.cos().contiguous()
     sin = angles.sin().contiguous()
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
     with torch.no_grad():
         expected_narrow = model(
@@ -1709,10 +1684,7 @@ def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(733)
     model = _DynamicSparseProjectionAttentionOutput().eval()
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -1774,10 +1746,7 @@ def test_sparse_piper_projection_fails_closed_for_strided_rope() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options()
-    compiler_passes = options[_POST_GRAD_PRE_PASS]
-    assert isinstance(compiler_passes, tuple)
-    options[_POST_GRAD_PRE_PASS] = (*compiler_passes, capture)
+    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True)(hidden_states)
