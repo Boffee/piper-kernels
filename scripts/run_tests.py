@@ -1,14 +1,17 @@
-"""Run pytest with compilation caches owned by this parent process."""
+"""Run pytest with persistent compiler caches, optionally resetting them first."""
 
 import argparse
+import getpass
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, gettempdir
 
 _CACHE_VARIABLES = {"TRITON_CACHE_DIR": "triton", "TORCHINDUCTOR_CACHE_DIR": "inductor"}
 _LOAD_PROBE = """
@@ -34,7 +37,7 @@ else:
 """
 
 
-def _probe_cache(directory: str) -> None:
+def _probe_cache(directory: Path) -> None:
     """Check native-library loading, then unload before deleting probe files."""
     with TemporaryDirectory(prefix="probe-", dir=directory) as probe:
         result = subprocess.run(
@@ -52,7 +55,7 @@ def _probe_cache(directory: str) -> None:
 @contextmanager
 def _supervise_console() -> Iterator[None]:
     # Ctrl-C reaches the entire console/process group. A Python handler keeps the
-    # owner alive through child exit and cleanup without inheriting SIG_IGN into
+    # launcher alive through child exit without inheriting SIG_IGN into
     # the child (which must retain pytest's normal interrupt behavior).
     previous = signal.signal(signal.SIGINT, lambda _signum, _frame: None)
     try:
@@ -67,45 +70,61 @@ def _run_pytest(arguments: Sequence[str], environment: dict[str, str]) -> int:
     return returncode if returncode >= 0 else 128 - returncode
 
 
+def _persistent_cache_dir() -> Path:
+    """Keep both compiler caches in one stable per-user temporary directory."""
+    username = re.sub(r'[\\/:*?"<>|]', "_", getpass.getuser())
+    return Path(gettempdir()) / f"piper-kernels-tests-{username}"
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--cache-root",
+        "--reset-cache",
+        action="store_true",
+        help="clear both compiler caches before running tests; requires no other cache users",
+    )
+    parser.add_argument(
+        "--cache-dir",
         type=Path,
-        help="existing directory for fresh owned caches; use /dev/shm to explicitly request RAM",
+        help="persistent cache directory "
+        "(default: system temporary directory/piper-kernels-tests-<user>)",
     )
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER, help="pytest arguments after --")
     options = parser.parse_args(arguments)
     pytest_args = options.pytest_args
     if pytest_args[:1] == ["--"]:
         pytest_args = pytest_args[1:]
-    environment = os.environ.copy()
-    # Explicit --cache-root opts into managing both caches. Otherwise externally
-    # supplied cache paths keep their normal ownership, contents, and lifetime.
-    owned = [
-        variable
-        for variable in _CACHE_VARIABLES
-        if options.cache_root is not None or variable not in environment
-    ]
     with _supervise_console():
-        return _run_with_cache(pytest_args, environment, owned, options.cache_root)
+        return _run_with_cache(
+            pytest_args,
+            cache_dir=options.cache_dir
+            if options.cache_dir is not None
+            else _persistent_cache_dir(),
+            reset=options.reset_cache,
+        )
 
 
 def _run_with_cache(
-    arguments: Sequence[str], environment: dict[str, str], owned: list[str], cache_root: Path | None
+    arguments: Sequence[str],
+    *,
+    cache_dir: Path,
+    reset: bool,
 ) -> int:
+    """Own both child cache paths; reset only their subdirectories before pytest."""
+    environment = os.environ.copy()
     try:
-        if not owned:
-            return _run_pytest(arguments, environment)
-        with TemporaryDirectory(prefix="piper-kernels-tests-", dir=cache_root) as root:
-            _probe_cache(root)
-            for variable in owned:
-                environment[variable] = str(Path(root, _CACHE_VARIABLES[variable]).resolve())
-            return _run_pytest(arguments, environment)
+        cache_dir = cache_dir.expanduser().resolve()
+        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _probe_cache(cache_dir)
+        for variable, name in _CACHE_VARIABLES.items():
+            cache = cache_dir / name
+            if reset and cache.exists():
+                shutil.rmtree(cache)
+            environment[variable] = str(cache)
+        return _run_pytest(arguments, environment)
     except OSError as error:
         print(  # noqa: T201
-            f"Test launcher: {error}\n"
-            "Choose an executable filesystem with --cache-root, or supply compiler cache paths.",
+            f"Test launcher: {error}\nUse a writable, executable filesystem for --cache-dir.",
             file=sys.stderr,
         )
         return 2

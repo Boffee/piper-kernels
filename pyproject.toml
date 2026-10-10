@@ -58,8 +58,9 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Parallel by default; tests/conftest.py bounds GPU runs. Debug serially with -n0.
-addopts = ["-n", "auto"]
+# Larger batches reuse compiled kernels; work stealing rebalances idle workers.
+# tests/conftest.py bounds GPU runs. Debug serially with -n0.
+addopts = ["-n", "auto", "--dist", "worksteal"]
 markers = [
     "gpu: requires a compatible accelerator (CUDA or ROCm, depending on the test)",
 ]
