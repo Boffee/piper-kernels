@@ -1,4 +1,4 @@
-"""Test cache ownership at the launcher/process boundary, including native loads."""
+"""Test persistent cache selection, reset, and native loads across pytest exits."""
 
 import importlib.util
 import json
@@ -32,11 +32,11 @@ def test_probe(index):
     for cache in paths:
         cache.mkdir(parents=True, exist_ok=True)
         if os.name == 'nt':
-            library = cache / f'native-{index}.dll'
+            library = cache / f'native-{os.getpid()}-{index}.dll'
             shutil.copyfile(Path(os.environ['SystemRoot']) / 'System32/version.dll', library)
             libraries.append(ctypes.WinDLL(str(library)))
         else:
-            with (cache / f'native-{index}').open('w+b') as library:
+            with (cache / f'native-{os.getpid()}-{index}').open('w+b') as library:
                 library.write(bytes(mmap.PAGESIZE))
                 library.flush()
                 libraries.append(mmap.mmap(library.fileno(), mmap.PAGESIZE,
@@ -70,14 +70,24 @@ def probe_suite(tmp_path):
     return tmp_path
 
 
-def _environment(**overrides):
+def _environment(temp_root: Path, **overrides: str) -> dict[str, str]:
     environment = os.environ.copy()
     for variable in (*_VARIABLES, "PYTEST_ADDOPTS"):
         environment.pop(variable, None)
+    environment.update({variable: str(temp_root) for variable in ("TMPDIR", "TEMP", "TMP")})
     return {**environment, "CUDA_VISIBLE_DEVICES": "", **overrides}
 
 
-def _reported_paths(directory):
+@pytest.fixture(params=["default", "custom"])
+def cache_location(request, runner, monkeypatch, tmp_path):
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+    if request.param == "custom":
+        root = tmp_path / "custom" / "cache"
+        return root, ["--cache-dir", str(root)]
+    return runner._persistent_cache_dir(), []
+
+
+def _reported_paths(directory: Path) -> list[list[Path]]:
     return [
         [Path(path) for path in json.loads(report.read_text())]
         for report in directory.glob("report-*.json")
@@ -88,17 +98,22 @@ def _reported_paths(directory):
     ("workers", "outcome", "exit_code"),
     [(0, "pass", 0), (2, "pass", 0), (2, "fail", 1), (0, "interrupt", 2), (0, "crash", 3)],
 )
-def test_owned_caches_outlive_native_loads_and_are_removed(
-    probe_suite, workers, outcome, exit_code
+def test_caches_survive_native_loads_and_pytest_exit(
+    probe_suite, cache_location, workers, outcome, exit_code
 ):
-    storage = probe_suite / "storage"
-    storage.mkdir()
-    sentinel = storage / "keep"
-    sentinel.write_text("unrelated data")
+    root, options = cache_location
     result = subprocess.run(
-        [sys.executable, str(_RUNNER), "--cache-root", str(storage), "--", "-n", str(workers)],
+        [
+            sys.executable,
+            str(_RUNNER),
+            *options,
+            "--",
+            "-n",
+            str(workers),
+            f"--basetemp={probe_suite / 'pytest'}",
+        ],
         cwd=probe_suite,
-        env=_environment(PROBE_OUTCOME=outcome),
+        env=_environment(probe_suite, PROBE_OUTCOME=outcome),
         capture_output=True,
         text=True,
         timeout=60,
@@ -107,83 +122,68 @@ def test_owned_caches_outlive_native_loads_and_are_removed(
     assert result.returncode == exit_code, result.stdout + result.stderr
     reports = _reported_paths(probe_suite)
     assert len(reports) == (1 if outcome in ("interrupt", "crash") else 2)
-    roots = {path.parent for paths in reports for path in paths}
-    assert len(roots) == 1
-    assert roots.pop().parent == storage
-    assert list(storage.iterdir()) == [sentinel]
-    assert sentinel.read_text() == "unrelated data"
+    assert {path.parent for paths in reports for path in paths} == {root}
+    assert all(path.is_dir() for paths in reports for path in paths)
 
 
-@pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("inherited", [0, 1, 2])
-def test_cache_ownership_and_parent_environment(runner, monkeypatch, tmp_path, explicit, inherited):
+@pytest.mark.parametrize("reset", [False, True])
+def test_cache_selection_and_reset(runner, monkeypatch, tmp_path, cache_location, reset):
+    root, options = cache_location
+    root.mkdir(parents=True)
+    sentinel = root / "keep"
+    sentinel.write_text("unrelated data")
+    caches = [root / name for name in ("triton", "inductor")]
+    for cache in caches:
+        cache.mkdir()
+        (cache / "old-artifact").touch()
     supplied = tmp_path / "supplied"
     supplied.mkdir()
-    sentinel = supplied / "keep"
-    sentinel.touch()
-    for index, variable in enumerate(_VARIABLES):
-        if index < inherited:
-            monkeypatch.setenv(variable, str(supplied))
-        else:
-            monkeypatch.delenv(variable, raising=False)
+    (supplied / "keep").touch()
+    for variable in _VARIABLES:
+        monkeypatch.setenv(variable, str(supplied))
     before = os.environ.copy()
-    environments = []
 
     def run(arguments, environment):
         assert arguments == ["-n0", "-k", "example"]
-        environments.append(environment)
-        for variable in _VARIABLES:
-            if not explicit and variable in before:
-                assert environment[variable] == before[variable]
-            else:
-                path = Path(environment[variable])
-                assert path.parent.is_dir()
-                assert path.parent != supplied
+        for variable, cache in zip(_VARIABLES, caches, strict=True):
+            assert environment[variable] == str(cache)
+            assert (cache / "old-artifact").exists() is not reset
+            cache.mkdir(exist_ok=True)
+            (cache / "new-artifact").touch()
         return 5
 
     monkeypatch.setattr(runner, "_run_pytest", run)
-    options = ["--cache-root", str(tmp_path)] if explicit else []
+    if reset:
+        options = [*options, "--reset-cache"]
     assert runner.main([*options, "--", "-n0", "-k", "example"]) == 5
     assert os.environ == before
-    for variable, path in environments[0].items():
-        if variable in _VARIABLES and (explicit or variable not in before):
-            assert not Path(path).parent.exists()
-    assert sentinel.exists()
+    assert sentinel.read_text() == "unrelated data"
+    assert (supplied / "keep").exists()
+    assert all((cache / "new-artifact").exists() for cache in caches)
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("failure", ["executable mappings denied", "No space left on device"])
-def test_every_managed_location_must_load_libraries(
-    runner, monkeypatch, tmp_path, capsys, explicit, failure
+def test_cache_must_load_libraries_before_reset_or_pytest(
+    runner, monkeypatch, capsys, cache_location, failure
 ):
-    for variable in _VARIABLES:
-        monkeypatch.delenv(variable, raising=False)
-    # Exercise a failing native loader in a real subprocess for both kinds of root.
+    root, options = cache_location
+    cache = root / "triton"
+    cache.mkdir(parents=True)
+    sentinel = cache / "keep"
+    sentinel.touch()
+    # Exercise a failing native loader in a real subprocess.
     monkeypatch.setattr(runner, "_LOAD_PROBE", f"raise OSError({failure!r})")
-    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
 
     def unexpected(*args):
         pytest.fail("pytest must not start with an unsuitable cache")
 
     monkeypatch.setattr(runner, "_run_pytest", unexpected)
-    options = ["--cache-root", str(tmp_path)] if explicit else []
-    assert runner.main(options) == 2
-    assert not list(tmp_path.iterdir())
+    assert runner.main([*options, "--reset-cache"]) == 2
+    assert list(root.iterdir()) == [cache]
+    assert sentinel.exists()
     error = capsys.readouterr().err
     assert failure in error
-    assert "--cache-root" in error
-
-
-def test_supplied_caches_bypass_unsuitable_default_location(runner, monkeypatch, tmp_path):
-    for variable in _VARIABLES:
-        monkeypatch.setenv(variable, str(tmp_path))
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("must not create or probe a managed root for supplied caches")
-
-    monkeypatch.setattr(runner, "TemporaryDirectory", unexpected)
-    monkeypatch.setattr(runner, "_run_pytest", lambda *args: 0)
-    assert runner.main([]) == 0
+    assert "--cache-dir" in error
 
 
 def test_invalid_explicit_root_fails_before_pytest(runner, monkeypatch, tmp_path, capsys):
@@ -191,19 +191,28 @@ def test_invalid_explicit_root_fails_before_pytest(runner, monkeypatch, tmp_path
         pytest.fail("pytest must not start when its cache could not be created")
 
     monkeypatch.setattr(runner, "_run_pytest", unexpected)
-    assert runner.main(["--cache-root", str(tmp_path / "missing")]) == 2
-    assert "missing" in capsys.readouterr().err
+    root = tmp_path / "file"
+    root.touch()
+    assert runner.main(["--cache-dir", str(root)]) == 2
+    assert str(root) in capsys.readouterr().err
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX console process-group interruption")
 @pytest.mark.parametrize("workers", [0, 2])
-def test_console_interrupt_waits_for_pytest_before_cleanup(probe_suite, workers):
-    storage = probe_suite / "storage"
-    storage.mkdir()
+def test_console_interrupt_preserves_cache_lifetime(probe_suite, cache_location, workers):
+    root, options = cache_location
     with subprocess.Popen(
-        [sys.executable, str(_RUNNER), "--cache-root", str(storage), "--", "-n", str(workers)],
+        [
+            sys.executable,
+            str(_RUNNER),
+            *options,
+            "--",
+            "-n",
+            str(workers),
+            f"--basetemp={probe_suite / 'pytest'}",
+        ],
         cwd=probe_suite,
-        env=_environment(PROBE_OUTCOME="wait"),
+        env=_environment(probe_suite, PROBE_OUTCOME="wait"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -222,8 +231,9 @@ def test_console_interrupt_waits_for_pytest_before_cleanup(probe_suite, workers)
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate(timeout=10)
-    assert _reported_paths(probe_suite)
-    assert not list(storage.iterdir())
+    reports = _reported_paths(probe_suite)
+    assert reports
+    assert all(path.is_dir() and path.parent == root for paths in reports for path in paths)
 
 
 @pytest.fixture
@@ -241,12 +251,10 @@ def noexec_root():
         yield Path(directory)
 
 
-@pytest.mark.parametrize("selection", ["default", "explicit", "supplied"])
-def test_real_noexec_filesystem(probe_suite, noexec_root, selection):
-    environment = _environment(TMPDIR=str(noexec_root))
-    if selection == "supplied":
-        environment.update({variable: str(probe_suite / variable) for variable in _VARIABLES})
-    options = ["--cache-root", str(noexec_root)] if selection == "explicit" else []
+@pytest.mark.parametrize("explicit_root", [False, True])
+def test_real_noexec_filesystem(probe_suite, noexec_root, explicit_root):
+    environment = _environment(noexec_root)
+    options = ["--cache-dir", str(noexec_root)] if explicit_root else []
     result = subprocess.run(
         [sys.executable, str(_RUNNER), *options, "--", "-n0"],
         cwd=probe_suite,
@@ -256,19 +264,19 @@ def test_real_noexec_filesystem(probe_suite, noexec_root, selection):
         timeout=30,
         check=False,
     )
-    assert result.returncode == (0 if selection == "supplied" else 2), result.stdout + result.stderr
-    if selection == "supplied":
-        assert _reported_paths(probe_suite)
-        assert all(Path(environment[variable]).is_dir() for variable in _VARIABLES)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "cannot load native libraries" in result.stderr
+    assert not _reported_paths(probe_suite)
+    if not explicit_root:
+        directories = list(noexec_root.iterdir())
+        assert len(directories) == 1
+        assert not list(directories[0].iterdir())
     else:
-        assert "cannot load native libraries" in result.stderr
-        assert not _reported_paths(probe_suite)
-    assert not list(noexec_root.iterdir())
+        assert not list(noexec_root.iterdir())
 
 
-def test_concurrent_launchers_have_independent_cache_roots(tmp_path):
-    storage = tmp_path / "storage"
-    storage.mkdir()
+def test_concurrent_launchers_share_the_cache(tmp_path, cache_location):
+    root, options = cache_location
     directories = [tmp_path / "first", tmp_path / "second"]
     for directory in directories:
         directory.mkdir()
@@ -279,9 +287,9 @@ def test_concurrent_launchers_have_independent_cache_roots(tmp_path):
         for directory in directories:
             processes.append(
                 subprocess.Popen(
-                    [sys.executable, str(_RUNNER), "--cache-root", str(storage), "--", "-n0"],
+                    [sys.executable, str(_RUNNER), *options, "--", "-n0"],
                     cwd=directory,
-                    env=_environment(),
+                    env=_environment(tmp_path),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -296,5 +304,64 @@ def test_concurrent_launchers_have_independent_cache_roots(tmp_path):
                 process.kill()
                 process.communicate(timeout=10)
     roots = {paths[0].parent for directory in directories for paths in _reported_paths(directory)}
-    assert len(roots) == 2
-    assert not list(storage.iterdir())
+    assert roots == {root}
+    assert all((root / name).is_dir() for name in ("triton", "inductor"))
+
+
+def test_reuse_and_reset_rebuild_the_same_cache(probe_suite, cache_location):
+    root, options = cache_location
+    paths = {root / name for name in ("triton", "inductor")}
+    # Reset must work both on a missing cache and on a populated one.
+    for reset in (True, False, True):
+        reset_options = ["--reset-cache"] if reset else []
+        result = subprocess.run(
+            [sys.executable, str(_RUNNER), *options, *reset_options, "--", "-n0"],
+            cwd=probe_suite,
+            env=_environment(probe_suite),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert {path for report in _reported_paths(probe_suite) for path in report} == paths
+        for path in paths:
+            assert (path / "retained-artifact").exists() is not reset
+            assert any(path.glob("native-*"))
+            (path / "retained-artifact").write_text("reuse this")
+        for report in probe_suite.glob("report-*.json"):
+            report.unlink()
+
+
+def test_reset_failure_prevents_pytest(runner, monkeypatch, tmp_path, capsys):
+    cache = tmp_path / "triton"
+    cache.mkdir()
+
+    def fail_reset(path):
+        raise PermissionError("cache is in use")
+
+    def unexpected(*args):
+        pytest.fail("pytest must not start after an incomplete reset")
+
+    monkeypatch.setattr(runner.shutil, "rmtree", fail_reset)
+    monkeypatch.setattr(runner, "_probe_cache", lambda root: None)
+    monkeypatch.setattr(runner, "_run_pytest", unexpected)
+    assert runner.main(["--cache-dir", str(tmp_path), "--reset-cache"]) == 2
+    assert "cache is in use" in capsys.readouterr().err
+    assert cache.is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink creation requires no special privileges")
+def test_reset_does_not_follow_cache_symlinks(runner, monkeypatch, tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    sentinel = target / "keep"
+    sentinel.touch()
+    (tmp_path / "triton").symlink_to(target, target_is_directory=True)
+
+    def unexpected(*args):
+        pytest.fail("pytest must not start after an incomplete reset")
+
+    monkeypatch.setattr(runner, "_run_pytest", unexpected)
+    assert runner.main(["--cache-dir", str(tmp_path), "--reset-cache"]) == 2
+    assert sentinel.exists()

@@ -126,9 +126,11 @@ uv run pyright
 uv build
 ```
 
-Tests use `pytest-xdist`: CPU runs use at most 16 workers and runs with a visible
-accelerator use at most 8. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to adjust for device
-memory, or pass `-n0` to debug serially (`--pdb` does so automatically).
+Tests use `pytest-xdist` with work stealing: larger initial batches reuse compiled
+kernels within each worker, and idle workers take pending tests from busier workers.
+CPU runs use at most 16 workers and runs with a visible accelerator use at most 8.
+Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to adjust for device memory, or pass `-n0`
+to debug serially (`--pdb` does so automatically).
 Tests that allocate gigabytes of device memory or spawn extra GPU processes
 use `@pytest.mark.usefixtures("large_device_memory")` to serialize that work.
 CPU operations default to one thread per process to avoid competing thread pools
@@ -141,15 +143,34 @@ installed GPU backends when CUDA is visible. [CI](../.github/workflows/ci.yml) c
 portable suite, tooling, and distributions on Linux, plus portable attention and
 Triton selection on Windows. A passing portable run does not validate GPU code.
 
-The test launcher owns temporary compilation caches in its child process and
-removes them after pytest exits, including failures and Ctrl-C. Inherited
-`TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` remain caller-owned. To manage
-both under a provisioned root, use `--cache-root`; pass pytest arguments after
-`--`, for example `uv run python scripts/run_tests.py --cache-root=/dev/shm -- -n8`.
-Managed roots must support executable mappings (DLL loading on Windows) and have
-enough capacity. Unsuitable roots fail before testing; forcefully terminating
-the launcher may leave its directories behind. Plain `uv run pytest` retains
-normal compiler-cache behavior.
+The test launcher reuses Triton and Inductor caches across runs. By default,
+both live under `piper-kernels-tests-<user>` in the system temporary directory
+(typically `/tmp` on Linux). All pytest workers share these caches, which remain
+after success, test failure, or Ctrl-C cancellation. Use `--cache-dir=PATH` to
+choose another persistent directory; the launcher creates it if needed. Both
+compiler cache paths are set by the launcher, overriding `TRITON_CACHE_DIR` and
+`TORCHINDUCTOR_CACHE_DIR` in the pytest child process.
+
+To clear the selected cache before testing:
+
+```shell
+uv run python scripts/run_tests.py --reset-cache
+uv run python scripts/run_tests.py --cache-dir=/path/to/cache --reset-cache
+```
+
+Reset removes only the selected directory's `triton` and `inductor` subdirectories.
+It starts a cold run with caching enabled and retains the rebuilt artifacts.
+Reset only when no other processes are using that cache. To use RAM-backed storage
+on Linux, choose a dedicated directory such as `--cache-dir=/dev/shm/piper-kernels-tests`.
+Pass pytest arguments after `--`, such as `-- -n8`.
+
+Launcher-selected cache directories must support executable mappings (DLL loading
+on Windows); the launcher checks native-library loading before starting pytest.
+Retained caches grow as code and compiler versions change; remove them when no
+tests are running to reclaim space. System temporary-directory cleanup may also
+remove them, including at reboot on systems configured to do so. The next run
+recompiles missing artifacts.
+Plain `uv run pytest` retains the compilers' normal cache locations and behavior.
 
 Extend existing cases while preserving numerical oracles, storage invariants, and
 distinct failure checks. Keep helpers focused on shared mechanics. Parametrize
