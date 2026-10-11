@@ -119,16 +119,18 @@ For the repository's default CUDA development environment:
 
 ```shell
 uv sync --dev
-uv run python scripts/run_tests.py
+uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 uv build
 ```
 
-Tests use `pytest-xdist`: CPU runs use at most 16 workers and runs with a visible
-accelerator use at most 8. Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to adjust for device
-memory, or pass `-n0` to debug serially (`--pdb` does so automatically).
+Tests use `pytest-xdist` with work stealing: larger initial batches reuse compiled
+kernels within each worker, and idle workers take pending tests from busier workers.
+CPU runs use at most 16 workers and runs with a visible accelerator use at most 8.
+Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to adjust for device memory, or pass `-n0`
+to debug serially (`--pdb` does so automatically).
 Tests that allocate gigabytes of device memory or spawn extra GPU processes
 use `@pytest.mark.usefixtures("large_device_memory")` to serialize that work.
 CPU operations default to one thread per process to avoid competing thread pools
@@ -136,27 +138,34 @@ across workers. Set `OMP_NUM_THREADS` or `MKL_NUM_THREADS` before pytest to over
 child processes inherit these settings.
 
 GPU tests use the `gpu` marker and require a compatible accelerator. The
-pre-commit hook hides CUDA and runs portable tests; the launcher exercises
+pre-commit hook hides CUDA and runs portable tests; pytest exercises
 installed GPU backends when CUDA is visible. [CI](../.github/workflows/ci.yml) checks the
 portable suite, tooling, and distributions on Linux, plus portable attention and
 Triton selection on Windows. A passing portable run does not validate GPU code.
 
-The test launcher owns temporary compilation caches in its child process and
-removes them after pytest exits, including failures and Ctrl-C. Inherited
-`TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` remain caller-owned. To manage
-both under a provisioned root, use `--cache-root`; pass pytest arguments after
-`--`, for example `uv run python scripts/run_tests.py --cache-root=/dev/shm -- -n8`.
-Managed roots must support executable mappings (DLL loading on Windows) and have
-enough capacity. Unsuitable roots fail before testing; forcefully terminating
-the launcher may leave its directories behind. Plain `uv run pytest` retains
-normal compiler-cache behavior.
+Triton and PyTorch Inductor manage their own persistent compiler caches. Pytest
+uses their default locations or honors `TRITON_CACHE_DIR` and
+`TORCHINDUCTOR_CACHE_DIR` from the environment. The suite does not create a
+separate cache or clear compiled artifacts on exit, so later runs can reuse them.
+
+Configure cache directories on a local filesystem that supports executable
+mappings (DLL loading on Windows), with enough free space and access restricted
+to the current user. These caches contain native code that the test process
+loads. Concurrent compilation on network/distributed filesystems can fail even
+when executable mappings work; see [the upstream Triton report](https://github.com/triton-lang/triton/issues/11512).
+
+For a cold compilation run, point both cache variables at new, empty directories.
+To reset existing caches or reclaim space, remove the selected directories only
+when no processes are using them. The next run rebuilds missing artifacts.
+Temporary-directory cleanup and reboot retention depend on the chosen filesystem
+and operating-system configuration.
 
 Extend existing cases while preserving numerical oracles, storage invariants, and
 distinct failure checks. Keep helpers focused on shared mechanics. Parametrize
 meaningful format, layout, and device boundaries without multiplying cases that
 execute the same path. Related checks may share a process when their isolation
 requirements still hold. When reducing a matrix, name the retained numerical or
-failure tests that cover the omitted combinations. Compare repeated launcher runs
+failure tests that cover the omitted combinations. Compare repeated pytest runs
 with matching workers, threads, hardware, and caches; fewer cases alone do not
 establish a speedup.
 
