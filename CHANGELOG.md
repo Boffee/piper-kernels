@@ -27,11 +27,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- The test launcher retains per-user compiler caches in the system temporary directory
-  for reuse across runs. `--cache-dir` selects another persistent directory and
-  `--reset-cache` clears both compiler caches before testing. The launcher sets both
-  child cache paths, overriding inherited compiler cache variables. Pytest uses work
-  stealing to balance work across its bounded worker pool.
+- Tests run directly through pytest, using Triton and Inductor's persistent compiler
+  caches and honoring their environment overrides. The test cache supervisor and
+  its automatic cleanup are removed. Pytest uses work stealing to balance work
+  across its bounded worker pool.
 - Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
   dispatcher and flat plans selected from target, operation, and operand metadata. Dense
   and sparse projection settings live in policy modules.
