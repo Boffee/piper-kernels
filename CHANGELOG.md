@@ -27,6 +27,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Tests run directly through pytest, using Triton and Inductor's persistent compiler
+  caches and honoring their environment overrides. The test cache supervisor and
+  its automatic cleanup are removed. Pytest uses work stealing to balance work
+  across its bounded worker pool.
 - Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
   dispatcher and flat plans selected from target, operation, and operand metadata. Dense
   and sparse projection settings live in policy modules.
