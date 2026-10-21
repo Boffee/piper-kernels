@@ -9,7 +9,6 @@ from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 from piper_kernels.weights.nvfp4._backend import triton_backend
-from piper_kernels.weights.nvfp4.tensor import _MIN_PER_TENSOR_SCALE
 
 _CUDA_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 gpu = [pytest.mark.gpu, pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires Blackwell CUDA")]
@@ -109,6 +108,32 @@ def test_merge_retains_update_smaller_than_bfloat16_ulp(device):
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
+def test_update_retains_subnormal_block_scales_and_handles_underflow(device):
+    source = torch.tensor([0.0, 0.001, 6 / 512, 1 / 32, 3 / 32, 2688.0], device=device)
+    source = source.unsqueeze(1).expand(-1, 64).contiguous()
+    weight = PiperNVFP4Tensor.from_hp(
+        torch.zeros_like(source),
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+    )
+
+    weight.add_(source)
+
+    # The largest block fixes the global scale at one, while smaller blocks
+    # exercise zero, underflow, subnormal, and smallest-normal E4M3 scales.
+    torch.testing.assert_close(weight.per_tensor_scale, source.new_tensor(1.0), rtol=0, atol=0)
+    scales = source.new_tensor([0.0, 0.0, 1 / 512, 3 / 512, 1 / 64, 448.0])
+    torch.testing.assert_close(
+        weight.get_hp_scales(), scales.unsqueeze(1).expand(-1, 4), rtol=0, atol=0
+    )
+    assert not weight.qdata[0].count_nonzero()
+    assert (weight.qdata[1:] == 0x77).all()
+    torch.testing.assert_close(
+        weight.dequantize(), (6 * scales).unsqueeze(1).expand_as(source), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
 @pytest.mark.parametrize("operation", ["add", "addmm"])
 @pytest.mark.parametrize(
     ("group_size", "dtype"),
@@ -120,7 +145,7 @@ def test_update_matches_quantized_dense_reference(device, operation, group_size,
     operands = _operands(weight, operation, strided=True)
     merged = _merged(weight, operands, operation, 0.375, 0.25)
     global_scale = per_tensor_amax_to_scale(merged.float().abs().amax()).clamp_min(
-        _MIN_PER_TENSOR_SCALE
+        _layout.MIN_WEIGHT_GLOBAL_SCALE
     )
     expected = TorchAONVFP4Tensor.to_nvfp4(
         merged.float(),

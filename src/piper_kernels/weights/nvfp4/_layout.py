@@ -10,6 +10,8 @@ BLOCK_SIZE = 16
 QDATA_BLOCK_SIZE = BLOCK_SIZE // 2
 SCALE_ROW_TILE = 128
 SCALE_COLUMN_TILE = 64
+# Keep reciprocal(global) / smallest_nonzero_E4M3 finite when computing weight scales.
+MIN_WEIGHT_GLOBAL_SCALE = torch.finfo(torch.float32).tiny / (2.0**-9)
 
 
 def swap_packed_pairs(qdata: torch.Tensor) -> torch.Tensor:

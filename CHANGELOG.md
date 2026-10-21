@@ -27,6 +27,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- NVFP4 activation preparation, portable weight construction, and weight updates
+  retain E4M3 subnormal block scales, matching FlashInfer's scale handling instead
+  of clamping to `1/64`. Blocks whose scales underflow reconstruct to zero, and
+  all-zero dynamic activations remain finite. This changes quantized outputs for
+  small blocks, including checkpoints with unit global activation scales.
 - Shared ConvRot projection plans live in `_plan.py`. NVIDIA sparse projections use one
   dispatcher and flat plans selected from target, operation, and operand metadata. Dense
   and sparse projection settings live in policy modules.

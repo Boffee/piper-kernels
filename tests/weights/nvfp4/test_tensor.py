@@ -143,25 +143,21 @@ def test_from_hp_matches_torchao_quantization_with_computed_global_scale() -> No
     assert torch.equal(weight.per_tensor_scale, per_tensor_scale)
 
 
-def test_from_hp_clamps_a_tiny_computed_global_scale() -> None:
-    source = torch.tensor(
-        [[1e-37, 5e-38, 0.0, -2.5e-38] * 4],
-        dtype=torch.float32,
-    )
-    minimum_scale = torch.finfo(torch.float32).tiny / torch.finfo(torch.float8_e4m3fn).tiny
-    expected = TorchAONVFP4Tensor.to_nvfp4(
-        source,
-        per_tensor_scale=per_tensor_amax_to_scale(source.abs().amax()).clamp_min(minimum_scale),
-    )
-
+@pytest.mark.parametrize("magnitude", [1e-37, 1e-38, 0.0])
+def test_from_hp_clamps_a_tiny_computed_global_scale(magnitude: float) -> None:
+    source = torch.tensor([[magnitude, magnitude / 2, 0.0, -magnitude / 4] * 4])
     weight = PiperNVFP4Tensor.from_hp(
         source,
         compute_per_tensor_scale=True,
     )
-
-    assert torch.equal(weight.qdata, expected.qdata)
-    assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
-    assert torch.equal(weight.per_tensor_scale, expected.per_tensor_scale)
+    assert weight.per_tensor_scale is not None
+    assert weight.per_tensor_scale > 0
+    smallest_block_scale = 2.0**-9
+    assert (weight.per_tensor_scale.reciprocal() / smallest_block_scale).isfinite()
+    actual = weight.dequantize()
+    assert actual.isfinite().all()
+    # In particular, reciprocal overflow must not turn exact zeros into NaN-derived codes.
+    assert not actual[:, 2::4].count_nonzero()
 
 
 def test_device_copy_preserves_piper_wrapper() -> None:

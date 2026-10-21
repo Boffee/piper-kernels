@@ -20,6 +20,33 @@ def _exact_sm120_available() -> bool:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_preparation_handles_subnormal_scales_and_zero_blocks(dynamic):
+    torch.manual_seed(508)
+    source = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+    source *= torch.logspace(-5, 1, 128, device="cuda").unsqueeze(1)
+    source[0].zero_()
+    source[0, ::2] = -0.0
+    source[1].fill_(0.001)
+    source[1, 0] = 0
+    source[1, 1] = -0.0
+    source[2].fill_(0.01171875)
+    # An exact power-of-two global scale isolates block-scale handling from
+    # reciprocal approximation at FP4 rounding boundaries.
+    source.clamp_(-10, 10)
+    source[-1, -1] = 10.5
+    scale = None if dynamic else torch.ones((), device="cuda")
+    expected = nvfp4_reference.prepare_input(source, scale, dynamic)
+    actual = nvfp4_ops.prepare_input(source, scale, dynamic)
+    for left, right in zip(actual, expected, strict=True):
+        assert torch.equal(left.reshape(-1).view(torch.uint8), right.reshape(-1).view(torch.uint8))
+    zero = nvfp4_ops.prepare_input(torch.zeros_like(source), scale, dynamic)
+    assert not zero[0].count_nonzero()
+    assert not zero[1].view(torch.uint8).count_nonzero()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(("rows", "features"), [(127, 80), (1_025, 5_376)])
 def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> None:
     torch.manual_seed(500 + rows)

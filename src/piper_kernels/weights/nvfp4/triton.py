@@ -23,6 +23,7 @@ from piper_kernels.weights.nvfp4 import _layout
 
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
 _NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE
+_MIN_WEIGHT_GLOBAL_SCALE = tl.constexpr(_layout.MIN_WEIGHT_GLOBAL_SCALE)
 
 
 @triton.jit
@@ -185,8 +186,7 @@ def _global_scale_kernel(partial_ptr, output_ptr, count, block_size: tl.constexp
     offsets = tl.arange(0, block_size)
     values = tl.load(partial_ptr + offsets, mask=offsets < count, other=0.0)
     scale = tl.max(values, axis=0) * (1.0 / (448.0 * 6.0))  # pyright: ignore[reportOperatorIssue]
-    # Keep the global reciprocal / smallest normal FP8 scale finite for zero weights.
-    tl.store(output_ptr, tl.maximum(scale, 2.0**-120))
+    tl.store(output_ptr, tl.maximum(scale, _MIN_WEIGHT_GLOBAL_SCALE))
 
 
 def _update_(
