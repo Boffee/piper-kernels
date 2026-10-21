@@ -9,8 +9,6 @@ block uses zero codes. Both cases avoid NaNs during packing.
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torchao.prototype.mx_formats.kernels import f32_to_f4_unpacked, pack_uint4
 from torchao.prototype.mx_formats.utils import to_blocked
@@ -49,8 +47,11 @@ def quantize_nvfp4(
     )
     if swizzled:
         rows, features = source.shape[-2:]
-        scales = to_blocked(
-            scales.reshape(math.prod(source.shape[:-1]), features // _layout.BLOCK_SIZE)
+        # Each expert owns complete 128-row tiles, including its own padding.
+        scales = (
+            to_blocked(scales)
+            if source.ndim == 2
+            else torch.stack([to_blocked(expert) for expert in scales])
         )
         scales = scales.reshape(*source.shape[:-2], *_layout.scale_shape(rows, features))
     return qdata, scales

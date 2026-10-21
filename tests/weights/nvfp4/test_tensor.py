@@ -160,6 +160,63 @@ def test_from_hp_clamps_a_tiny_computed_global_scale(magnitude: float) -> None:
     assert not actual[:, 2::4].count_nonzero()
 
 
+@pytest.mark.parametrize("rows", [32, 96, 128, 129])
+@pytest.mark.parametrize("features", [80, 128])
+@pytest.mark.parametrize("scale_kind", ["unit", "scalar", "per-expert"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+            ],
+        ),
+    ],
+)
+def test_from_hp_swizzles_experts_independently(rows, features, scale_kind, device):
+    source = torch.randn(2, rows, features, generator=torch.Generator().manual_seed(419))
+    source = source.to(device) * 0.03
+    global_scale = {
+        "unit": None,
+        "scalar": torch.tensor(0.5, device=device),
+        "per-expert": torch.tensor([0.25, 2.0], device=device).reshape(2, 1, 1),
+    }[scale_kind]
+    weight = PiperNVFP4Tensor.from_hp(
+        source, per_tensor_scale=global_scale, is_swizzled_scales=True
+    )
+    expected = [
+        PiperNVFP4Tensor.from_hp(
+            expert,
+            per_tensor_scale=(
+                global_scale[i].reshape(()) if scale_kind == "per-expert" else global_scale
+            ),
+            is_swizzled_scales=True,
+        )
+        for i, expert in enumerate(source)
+    ]
+
+    torch.testing.assert_close(weight.qdata, torch.stack([expert.qdata for expert in expected]))
+    torch.testing.assert_close(
+        weight.scale.view(torch.uint8),
+        torch.stack([expert.scale.view(torch.uint8) for expert in expected]),
+    )
+    torch.testing.assert_close(
+        weight.get_hp_scales(),
+        torch.stack([expert.get_hp_scales() for expert in expected]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weight.dequantize(),
+        torch.stack([expert.dequantize() for expert in expected]),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_device_copy_preserves_piper_wrapper() -> None:
     source = PiperNVFP4Tensor(
         torch.empty(128, 128, dtype=torch.uint8),

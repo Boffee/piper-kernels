@@ -15,6 +15,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     QuantizeTensorToNVFP4Kwargs,
     per_tensor_amax_to_scale,
 )
+from torchao.prototype.mx_formats.utils import from_blocked
 from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.weights._dispatch import _explicit_to_copy_args, register_inference_mode_dispatch
@@ -166,7 +167,9 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
 
         The arguments otherwise match TorchAO's :meth:`NVFP4Tensor.to_nvfp4`
         builder, but Piper's portable encoding retains E4M3 subnormal scales
-        instead of imposing TorchAO's smallest-normal floor. Selecting
+        instead of imposing TorchAO's smallest-normal floor. For a 3-D expert
+        batch, each matrix has independently padded swizzled scales; an optional
+        per-expert global scale has shape ``[experts, 1, 1]``. Selecting
         ``use_triton_kernel=True`` delegates quantization to TorchAO's optional
         backend and retains its encoding behavior.
         ``compute_per_tensor_scale=True`` derives the optional global
@@ -256,9 +259,17 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         return pairs.flip(-1).reshape(result.shape)
 
     def get_hp_scales(self) -> torch.Tensor:
-        """Recover canonical scales, including flat scales on transposed views."""
+        """Recover canonical scales, with each expert's tile padding removed separately."""
         if self.transposed:
             return self._transpose().get_hp_scales()
+        if self.ndim == 3 and self.is_swizzled_scales:
+            scales = torch.stack(
+                [
+                    from_blocked(expert, self.shape[-2], self.shape[-1] // self.block_size)
+                    for expert in self.scale
+                ]
+            ).float()
+            return scales if self.per_tensor_scale is None else scales * self.per_tensor_scale
         return super().get_hp_scales()
 
     def _update_group_size(self) -> int:
