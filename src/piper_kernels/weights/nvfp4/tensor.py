@@ -15,16 +15,15 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     QuantizeTensorToNVFP4Kwargs,
     per_tensor_amax_to_scale,
 )
+from torchao.prototype.mx_formats.utils import from_blocked
 from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.weights._dispatch import _explicit_to_copy_args, register_inference_mode_dispatch
 from piper_kernels.weights._matmul import register_matrix_ops
 from piper_kernels.weights._views import register_view_ops, require_untransposed
+from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4._quantization import quantize_nvfp4
 from piper_kernels.weights.nvfp4._typing import NVFP4Storage
-
-# TorchAO divides the global reciprocal by the FP8 block scale. Keep that
-# intermediate finite even when the weight is zero or extremely small.
-_MIN_PER_TENSOR_SCALE = torch.finfo(torch.float32).tiny / torch.finfo(torch.float8_e4m3fn).tiny
 
 
 def _quantize_hp(
@@ -46,15 +45,30 @@ def _quantize_hp(
         amax = source.float().abs().amax()
         if not bool(torch.isfinite(amax)):
             raise ValueError("cannot quantize an NVFP4 weight with non-finite values")
-        per_tensor_scale = per_tensor_amax_to_scale(amax).clamp_min(_MIN_PER_TENSOR_SCALE)
-    return TorchAONVFP4Tensor.to_nvfp4(
-        source,
-        block_size=block_size,
-        per_tensor_scale=per_tensor_scale,
-        act_per_tensor_scale=act_per_tensor_scale,
-        is_swizzled_scales=is_swizzled_scales,
-        use_triton_kernel=use_triton_kernel,
-        act_quant_kwargs=act_quant_kwargs,
+        per_tensor_scale = per_tensor_amax_to_scale(amax).clamp_min(_layout.MIN_WEIGHT_GLOBAL_SCALE)
+    if use_triton_kernel:
+        return TorchAONVFP4Tensor.to_nvfp4(
+            source,
+            block_size=block_size,
+            per_tensor_scale=per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            use_triton_kernel=True,
+            act_quant_kwargs=act_quant_kwargs,
+        )
+    if block_size != _layout.BLOCK_SIZE:
+        raise ValueError("NVFP4 requires block_size=16")
+    qdata, scales = quantize_nvfp4(source, per_tensor_scale, swizzled=is_swizzled_scales)
+    return TorchAONVFP4Tensor(
+        qdata,
+        scales,
+        block_size,
+        source.dtype,
+        per_tensor_scale,
+        act_per_tensor_scale,
+        is_swizzled_scales,
+        False,
+        act_quant_kwargs,
     )
 
 
@@ -152,7 +166,13 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """Quantize a detached high-precision weight into Piper NVFP4 storage.
 
         The arguments otherwise match TorchAO's :meth:`NVFP4Tensor.to_nvfp4`
-        builder. ``compute_per_tensor_scale=True`` derives the optional global
+        builder, but Piper's portable encoding retains E4M3 subnormal scales
+        instead of imposing TorchAO's smallest-normal floor. For a 3-D expert
+        batch, each matrix has independently padded swizzled scales; an optional
+        per-expert global scale has shape ``[experts, 1, 1]``. Selecting
+        ``use_triton_kernel=True`` delegates quantization to TorchAO's optional
+        backend and retains its encoding behavior.
+        ``compute_per_tensor_scale=True`` derives the optional global
         weight scale from ``hp_tensor`` and handles an all-zero weight without
         producing a zero global scale.
         """
@@ -239,9 +259,17 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         return pairs.flip(-1).reshape(result.shape)
 
     def get_hp_scales(self) -> torch.Tensor:
-        """Recover canonical scales, including flat scales on transposed views."""
+        """Recover canonical scales, with each expert's tile padding removed separately."""
         if self.transposed:
             return self._transpose().get_hp_scales()
+        if self.ndim == 3 and self.is_swizzled_scales:
+            scales = torch.stack(
+                [
+                    from_blocked(expert, self.shape[-2], self.shape[-1] // self.block_size)
+                    for expert in self.scale
+                ]
+            ).float()
+            return scales if self.per_tensor_scale is None else scales * self.per_tensor_scale
         return super().get_hp_scales()
 
     def _update_group_size(self) -> int:

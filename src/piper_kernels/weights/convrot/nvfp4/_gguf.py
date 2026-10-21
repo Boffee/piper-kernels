@@ -8,7 +8,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf._tensor import prepare_packed_matrix
 from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
-from piper_kernels.weights.nvfp4.tensor import _MIN_PER_TENSOR_SCALE
 
 type _Conversion = tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
 
@@ -86,7 +85,7 @@ def convert(
             features,
             out=per_tensor_scale_out,
         )
-        computed_scale.clamp_min_(_MIN_PER_TENSOR_SCALE)
+        computed_scale.clamp_min_(nvfp4_layout.MIN_WEIGHT_GLOBAL_SCALE)
         per_tensor_scale = computed_scale
     elif per_tensor_scale is not None and (
         per_tensor_scale.shape != ()

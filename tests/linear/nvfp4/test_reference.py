@@ -8,6 +8,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels.linear.nvfp4 import reference
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 
 def test_reference_and_tensor_imports_do_not_load_nvfp4_backends():
@@ -100,3 +101,61 @@ def test_reference_zero_dynamic_input_returns_bias():
         weight = reference.prepare_input(torch.ones((2, 32)), None, True)
         actual = reference.linear(input, *weight, None, bias, True)
     assert torch.equal(actual, bias.to(input.dtype).expand(3, -1))
+
+
+@pytest.mark.parametrize("weight_builder", [False, True], ids=["activation", "weight"])
+def test_unit_scale_uses_e4m3_subnormals_and_handles_underflow(weight_builder):
+    # Each row is one block. These bytes were checked against FlashInfer 0.7.1rc4.
+    source = torch.tensor(
+        [
+            [0.0] * 16,
+            [0.0, 0.001, -0.001, 0.00001] * 4,
+            [0.01171875] * 16,
+            [0.03125] * 16,
+            [0.09375] * 16,
+        ]
+    )
+    if weight_builder:
+        weight = PiperNVFP4Tensor.from_hp(
+            source, per_tensor_scale=torch.tensor(1.0), is_swizzled_scales=True
+        )
+    else:
+        qdata, scales, global_scale = reference.prepare_input(source, torch.tensor(1.0), False)
+        weight = PiperNVFP4Tensor(
+            qdata, scales, 16, torch.float32, global_scale, is_swizzled_scales=True
+        )
+    expected_scales = torch.tensor([0.0, 0.0, 1 / 512, 3 / 512, 1 / 64])
+    torch.testing.assert_close(weight.get_hp_scales().flatten(), expected_scales, rtol=0, atol=0)
+    expected_codes = torch.tensor(
+        [
+            [0x00] * 8,
+            [0x77, 0x7F] * 4,
+            [0x77] * 8,
+            [0x77] * 8,
+            [0x77] * 8,
+        ],
+        dtype=torch.uint8,
+    )
+    assert torch.equal(weight.qdata, expected_codes)
+    expected = torch.tensor([0.0, 0.0, 6 / 512, 18 / 512, 6 / 64]).unsqueeze(1).expand(-1, 16)
+    torch.testing.assert_close(weight.dequantize(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("weight_builder", [False, True], ids=["activation", "weight"])
+@pytest.mark.parametrize("strided", [False, True])
+def test_quantization_preserves_fp32_input_with_zero_and_saturated_blocks(weight_builder, strided):
+    source = torch.randn(4, 64)
+    if strided:
+        source = source[:, :32]
+    source[0].fill_(-0.0)
+    source[1].fill_(0.001)
+    source[1, ::2] = -0.0
+    source[2].fill_(1e20)
+    original = source.clone()
+    if weight_builder:
+        qdata = PiperNVFP4Tensor.from_hp(source, per_tensor_scale=torch.tensor(1.0)).qdata
+    else:
+        qdata = reference.prepare_input(source, torch.tensor(1.0), False)[0]
+    assert torch.equal(source.contiguous().view(torch.uint8), original.view(torch.uint8))
+    assert not qdata[0].count_nonzero()
+    assert (qdata[1:3] == 0x77).all()

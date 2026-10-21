@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import torch
 from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, pack_uint4, unpack_uint4
-from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.stochastic_quantization import stochastic_codebook_indices
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout
-from piper_kernels.weights.nvfp4.tensor import _MIN_PER_TENSOR_SCALE, PiperNVFP4Tensor
+from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor
 
 
 def addmm_(
@@ -73,18 +72,16 @@ def _refill_(
     per_tensor_scale = None
     if weight.per_tensor_scale is not None:
         per_tensor_scale = per_tensor_amax_to_scale(merged.detach().abs().amax()).clamp_min(
-            _MIN_PER_TENSOR_SCALE
+            _layout.MIN_WEIGHT_GLOBAL_SCALE
         )
-    encoded = PiperNVFP4Tensor.from_torchao(
-        TorchAONVFP4Tensor.to_nvfp4(
-            merged,
-            block_size=weight.block_size,
-            per_tensor_scale=per_tensor_scale,
-            act_per_tensor_scale=weight.act_per_tensor_scale,
-            is_swizzled_scales=weight.is_swizzled_scales,
-            use_triton_kernel=False,
-            act_quant_kwargs=weight.act_quant_kwargs,
-        )
+    encoded = PiperNVFP4Tensor.from_hp(
+        merged,
+        block_size=weight.block_size,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=weight.act_per_tensor_scale,
+        is_swizzled_scales=weight.is_swizzled_scales,
+        use_triton_kernel=False,
+        act_quant_kwargs=weight.act_quant_kwargs,
     )
     if rounding_seed is not None:
         _stochastic_recode_(

@@ -143,25 +143,78 @@ def test_from_hp_matches_torchao_quantization_with_computed_global_scale() -> No
     assert torch.equal(weight.per_tensor_scale, per_tensor_scale)
 
 
-def test_from_hp_clamps_a_tiny_computed_global_scale() -> None:
-    source = torch.tensor(
-        [[1e-37, 5e-38, 0.0, -2.5e-38] * 4],
-        dtype=torch.float32,
-    )
-    minimum_scale = torch.finfo(torch.float32).tiny / torch.finfo(torch.float8_e4m3fn).tiny
-    expected = TorchAONVFP4Tensor.to_nvfp4(
-        source,
-        per_tensor_scale=per_tensor_amax_to_scale(source.abs().amax()).clamp_min(minimum_scale),
-    )
-
+@pytest.mark.parametrize("magnitude", [1e-37, 1e-38, 0.0])
+def test_from_hp_clamps_a_tiny_computed_global_scale(magnitude: float) -> None:
+    source = torch.tensor([[magnitude, magnitude / 2, 0.0, -magnitude / 4] * 4])
     weight = PiperNVFP4Tensor.from_hp(
         source,
         compute_per_tensor_scale=True,
     )
+    assert weight.per_tensor_scale is not None
+    assert weight.per_tensor_scale > 0
+    smallest_block_scale = 2.0**-9
+    assert (weight.per_tensor_scale.reciprocal() / smallest_block_scale).isfinite()
+    actual = weight.dequantize()
+    assert actual.isfinite().all()
+    # In particular, reciprocal overflow must not turn exact zeros into NaN-derived codes.
+    assert not actual[:, 2::4].count_nonzero()
 
-    assert torch.equal(weight.qdata, expected.qdata)
-    assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
-    assert torch.equal(weight.per_tensor_scale, expected.per_tensor_scale)
+
+@pytest.mark.parametrize("rows", [32, 96, 128, 129])
+@pytest.mark.parametrize("features", [80, 128])
+@pytest.mark.parametrize("scale_kind", ["unit", "scalar", "per-expert"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+            ],
+        ),
+    ],
+)
+def test_from_hp_swizzles_experts_independently(rows, features, scale_kind, device):
+    source = torch.randn(2, rows, features, generator=torch.Generator().manual_seed(419))
+    source = source.to(device) * 0.03
+    global_scale = {
+        "unit": None,
+        "scalar": torch.tensor(0.5, device=device),
+        "per-expert": torch.tensor([0.25, 2.0], device=device).reshape(2, 1, 1),
+    }[scale_kind]
+    weight = PiperNVFP4Tensor.from_hp(
+        source, per_tensor_scale=global_scale, is_swizzled_scales=True
+    )
+    expected = [
+        PiperNVFP4Tensor.from_hp(
+            expert,
+            per_tensor_scale=(
+                global_scale[i].reshape(()) if scale_kind == "per-expert" else global_scale
+            ),
+            is_swizzled_scales=True,
+        )
+        for i, expert in enumerate(source)
+    ]
+
+    torch.testing.assert_close(weight.qdata, torch.stack([expert.qdata for expert in expected]))
+    torch.testing.assert_close(
+        weight.scale.view(torch.uint8),
+        torch.stack([expert.scale.view(torch.uint8) for expert in expected]),
+    )
+    torch.testing.assert_close(
+        weight.get_hp_scales(),
+        torch.stack([expert.get_hp_scales() for expert in expected]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weight.dequantize(),
+        torch.stack([expert.dequantize() for expert in expected]),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_device_copy_preserves_piper_wrapper() -> None:

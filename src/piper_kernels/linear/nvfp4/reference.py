@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import torch
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -13,7 +11,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout
-from piper_kernels.weights.nvfp4._typing import NVFP4Storage
+from piper_kernels.weights.nvfp4._quantization import quantize_nvfp4
 
 
 def prepare_input(
@@ -49,19 +47,10 @@ def prepare_input(
     )
     if global_scale is None:
         raise ValueError("static NVFP4 preparation requires a per-tensor scale")
-    encoding_scale = torch.where(global_scale == 0, torch.ones_like(global_scale), global_scale)
-    encoded = cast(
-        NVFP4Storage,
-        TorchAONVFP4Tensor.to_nvfp4(
-            flattened.float(),
-            block_size=_layout.BLOCK_SIZE,
-            per_tensor_scale=encoding_scale,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-        ),
-    )
-    qdata = _layout.swap_packed_pairs(encoded.qdata) if high_first else encoded.qdata
-    return qdata, encoded.scale, global_scale
+    qdata, scale = quantize_nvfp4(flattened, global_scale, swizzled=True)
+    if high_first:
+        qdata = _layout.swap_packed_pairs(qdata)
+    return qdata, scale, global_scale
 
 
 def linear_prepared(

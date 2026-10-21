@@ -121,6 +121,17 @@ set `use_dynamic_per_tensor_scale=False` and supply `act_per_tensor_scale` to th
 weight constructor: a finite positive FP32 scalar on the weight device, calibrated
 in the stored basis.
 
+Piper's portable NVFP4 weight builder, activation preparation, and weight updates
+round block scales directly to E4M3, including subnormals down to `1/512`, following
+FlashInfer's scale handling. They do not impose TorchAO's `1/64` smallest-normal
+floor. A scale that rounds to zero reconstructs its whole block as zero; zero
+inputs are handled without NaNs. A static activation global scale of `1.0` still
+computes a scale for every 16-value block. Selecting `use_triton_kernel=True` in
+`from_hp` delegates weight quantization to TorchAO's optional backend and retains
+its encoding behavior.
+Independent reciprocal and fused activation rounding can still differ between
+backends; matching scale semantics does not promise bitwise-identical model outputs.
+
 `PiperNVFP4Tensor.from_torchao(existing)` wraps existing TorchAO NVFP4 storage
 without copying. `ConvRotNVFP4Tensor.from_torchao(existing, group_size=...)` only
 attaches rotation metadata: the stored values must already be in that basis.
