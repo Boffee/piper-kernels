@@ -5,6 +5,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import _backend, conv3d, group_norm_silu_conv3d, reference
+from piper_kernels.conv3d.convrot.int8._padding import causal_padding
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
@@ -93,8 +94,8 @@ def test_conv3d_rejects_unsupported_input_dtype() -> None:
     ("shape", "padding", "message"),
     [
         ((1, 128, 0, 4, 4), "reflect", "dimensions must be positive"),
-        ((1, 128, 1, 1, 4), "reflect", "height and width > 1"),
-        ((1, 128, 1, 4, 1), "reflect_right", "height and width > 1"),
+        ((1, 128, 1, 1, 4), "reflect", "smaller than height and width"),
+        ((1, 128, 1, 4, 1), "reflect_right", "smaller than height and width"),
         ((1, 128, 1, 2, 2), "none", "does not fit"),
         ((1, 768, 1, 4, 4), "reflect", "power-of-two"),
         ((1, 8192, 1, 4, 4), "reflect", "power-of-two"),
@@ -117,7 +118,17 @@ def test_custom_ops_schema_fake_and_dynamic_compile_contracts(dtype):
     input = torch.randn(1, 64, 2, 3, 3, dtype=dtype)  # noqa: A001
     qdata = torch.zeros(4, 3, 3, 3, 64, dtype=torch.int8)
     scale = torch.ones(4, 1)
-    conv_args = (qdata, scale, None, 64, torch.tensor(0.02), [1, 1, 1], True, False, None)
+    conv_args = (
+        qdata,
+        scale,
+        None,
+        64,
+        torch.tensor(0.02),
+        [1, 1, 1],
+        [1, 1, 1, 1, 2, 0],
+        True,
+        None,
+    )
     torch.library.opcheck(torch.ops.piper_kernels.convrot_int8_conv3d.default, (input, *conv_args))
     torch.library.opcheck(
         torch.ops.piper_kernels.convrot_int8_group_norm_silu_conv3d.default,
@@ -242,8 +253,8 @@ def test_triton_conv3d_matches_reference(
             group_size,
             weight.act_per_tensor_scale,
             stride,
-            symmetric_spatial_padding=symmetric,
-            right_spatial_padding=right,
+            padding=causal_padding(padding)[0],
+            spatial_reflection=symmetric or right,
             residual=residual,
         )
 
@@ -290,8 +301,8 @@ def test_triton_group_norm_silu_conv3d_matches_reference(channels, height, width
             group_size,
             weight.act_per_tensor_scale,
             (1, 1, 1),
-            symmetric_spatial_padding=True,
-            right_spatial_padding=False,
+            padding=(1, 1, 1, 1, 2, 0),
+            spatial_reflection=True,
             residual=None,
         )
 
@@ -343,7 +354,7 @@ def test_unaligned_contiguous_weight_uses_pointer_loads():
     args = (activation, unaligned, scale, None, 64, weight.act_per_tensor_scale, (1, 1, 1))
     actual = conv3d(activation, _packed(unaligned, scale), padding="reflect")
     expected = reference.conv3d(
-        *args, symmetric_spatial_padding=True, right_spatial_padding=False, residual=None
+        *args, padding=(1, 1, 1, 1, 2, 0), spatial_reflection=True, residual=None
     )
     torch.testing.assert_close(actual, expected, atol=4e-3, rtol=4e-3)
 
@@ -384,7 +395,7 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
     group_size = 64 if channels <= 128 else 256
     symmetric, right = padding == "reflect", padding == "reflect_right"
     operands = (weight.qdata, weight.scale, bias, group_size, weight.act_per_tensor_scale, stride)
-    flags = {"symmetric_spatial_padding": symmetric, "right_spatial_padding": right}
+    flags = {"padding": causal_padding(padding)[0], "spatial_reflection": symmetric or right}
     norm = (activation, norm_weight, norm_bias, 32, 1e-6)
     sm8x = default_execution_plan(
         activation,
@@ -393,7 +404,7 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
         policy=nvidia_policy,
         target=AcceleratorTarget("cuda", "sm89"),
         group_norm=fused,
-        **flags,
+        padding=flags["padding"],
     )
     assert sm8x.convolution == tile
 

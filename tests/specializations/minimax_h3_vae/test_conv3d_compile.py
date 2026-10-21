@@ -17,7 +17,7 @@ _FUSED = torch.ops.piper_kernels.convrot_int8_group_norm_silu_conv3d.default
 
 
 class _Block(torch.nn.Module):
-    def __init__(self, *, framewise=True, shared=False, padding="reflect_right"):
+    def __init__(self, *, framewise=True, shared=False, padding="reflect_right", standard=False):
         super().__init__()
         self.norm = torch.nn.GroupNorm(8, 64, eps=1e-6).half().requires_grad_(False)
         self.conv = ConvRotInt8Conv3d(
@@ -31,6 +31,11 @@ class _Block(torch.nn.Module):
             stride=(1, 2, 2) if padding == "reflect_right" else (1, 1, 1),
             padding="none" if padding == "reflect_right" else padding,
         )
+        self.standard = standard
+        if standard:
+            weight, stride = self.conv.weight, self.conv.stride
+            self.conv = torch.nn.Conv3d(64, 64, 3, stride=stride, bias=False, device="meta")
+            self.conv.weight = torch.nn.Parameter(weight, requires_grad=False)
         self.framewise = framewise
         self.shared = shared
         self.padding = padding
@@ -48,6 +53,10 @@ class _Block(torch.nn.Module):
         x = activated
         if self.padding == "reflect_right":
             x = functional.pad(x, (0, 1, 0, 1, 0, 0), mode="reflect")
+        if self.standard:
+            if self.padding == "reflect":
+                x = functional.pad(x, (1, 1, 1, 1, 0, 0), mode="reflect")
+            x = functional.pad(x, (0, 0, 0, 0, 2, 0))
         output = self.conv(x) + residual
         return (output, activated) if self.shared else output
 
@@ -61,8 +70,9 @@ def _args(padding="reflect_right", device="cpu"):
 
 
 @pytest.mark.parametrize("padding", ["reflect", "reflect_right"])
-def test_export_fuses_framewise_norm_silu_padding_and_residual(padding):
-    block = _Block(padding=padding)
+@pytest.mark.parametrize("standard", [False, True])
+def test_export_fuses_framewise_norm_silu_padding_and_residual(padding, standard):
+    block = _Block(padding=padding, standard=standard)
     args = _args(padding)
     with torch.no_grad():
         graph_module = torch._dynamo.export(block, assume_static_by_default=True)(
@@ -128,13 +138,16 @@ def test_pass_does_not_rewrite_with_gradients_enabled():
     ],
 )
 @pytest.mark.parametrize("autocast", [False, True])
-def test_fullgraph_compiled_module_uses_live_weight_and_activation_scale(device, autocast):
-    block = _Block().to(device=device)
+@pytest.mark.parametrize("standard", [False, True])
+def test_fullgraph_compiled_module_uses_live_weight_and_activation_scale(
+    device, autocast, standard
+):
+    block = _Block(standard=standard).to(device=device)
     if autocast:
         block.norm.float()
     args = _args(device=device)
     options = minimax_h3_vae_convrot_int8_conv3d_compile_options()
-    compiled = torch.compile(block, fullgraph=True, options=options)
+    compiled = torch.compile(block, fullgraph=True, dynamic=False, options=options)
     with torch.no_grad(), torch.autocast(device, dtype=torch.float16, enabled=autocast):
         actual = compiled(*args)
         expected = group_norm_silu_conv3d(

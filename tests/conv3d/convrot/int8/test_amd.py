@@ -10,6 +10,7 @@ from piper_kernels.conv3d.convrot.int8 import triton as shared
 from piper_kernels.conv3d.convrot.int8._amd import dispatch as amd
 from piper_kernels.conv3d.convrot.int8._amd import policy
 from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
+from piper_kernels.conv3d.convrot.int8._padding import causal_padding
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 pytestmark = [
@@ -83,11 +84,10 @@ def test_prepared_convolution_matches_exact_integer_accumulation(channels, paddi
             stride,
             policy=policy,
             group_norm=False,
-            symmetric_spatial_padding=padding == "reflect",
-            right_spatial_padding=padding == "reflect_right",
+            padding=causal_padding(padding)[0],
         ),
-        symmetric_spatial_padding=padding == "reflect",
-        right_spatial_padding=padding == "reflect_right",
+        padding=causal_padding(padding)[0],
+        spatial_reflection=padding != "none",
         residual=None,
     )
     padded = prepared.permute(0, 4, 1, 2, 3).float()
@@ -131,7 +131,7 @@ def test_native_dispatch_and_graph_capture_use_live_scale(monkeypatch, fused, ch
         return conv3d(activation, weight, padding="reflect")
 
     operands = (weight.qdata, weight.scale, None, 64, weight.act_per_tensor_scale, (1, 1, 1))
-    flags = {"symmetric_spatial_padding": True, "right_spatial_padding": False, "residual": None}
+    flags = {"padding": (1, 1, 1, 1, 2, 0), "spatial_reflection": True, "residual": None}
     expected = (
         reference.group_norm_silu_conv3d(
             activation, norm_weight, norm_bias, 8, 1e-6, *operands, **flags

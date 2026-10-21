@@ -437,3 +437,19 @@ def _linear_dispatch(
     from piper_kernels.linear.convrot.int8._functional import linear_dispatch  # noqa: PLC0415
 
     return linear_dispatch(func, types, args, kwargs)
+
+
+@ConvRotInt8Tensor.implements(torch.ops.aten.conv3d.default)
+@ConvRotInt8Tensor.implements(torch.ops.aten.conv3d.padding)
+@ConvRotInt8Tensor.implements(torch.ops.aten.convolution.default)
+@ConvRotInt8Tensor.implements(torch.ops.aten._convolution.default)
+@ConvRotInt8Tensor.implements_torch_function(torch.nn.functional.conv3d)
+def _conv3d_dispatch(
+    func: Callable[..., torch.Tensor],
+    types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> torch.Tensor:
+    from piper_kernels.conv3d.convrot.int8._functional import conv3d_dispatch  # noqa: PLC0415
+
+    return conv3d_dispatch(func, types, args, kwargs)

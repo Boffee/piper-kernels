@@ -11,7 +11,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Any, TypedDict, cast
 
 import torch
 from lib.case_cli import require_case, set_case_arguments
@@ -23,19 +23,27 @@ from lib.timing import DeviceTimings, measure_device
 from torch.nn import functional
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.conv3d.convrot.int8 import conv3d, group_norm_silu_conv3d, reference
+from piper_kernels.conv3d.convrot.int8 import (
+    conv3d,
+    convrot_int8_conv3d_compile_options,
+    group_norm_silu_conv3d,
+    reference,
+)
 from piper_kernels.conv3d.convrot.int8 import triton as shared
 from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
 from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
 from piper_kernels.conv3d.convrot.int8._interfaces import ConvolutionPolicy
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
 from piper_kernels.conv3d.convrot.int8._plan import ConvolutionExecutionPlan, ConvolutionSchedule
+from piper_kernels.specializations.minimax_h3_vae import (
+    minimax_h3_vae_convrot_int8_conv3d_compile_options,
+)
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
 class ConvolutionFlags(TypedDict):
-    symmetric_spatial_padding: bool
-    right_spatial_padding: bool
+    padding: tuple[int, int, int, int, int, int]
+    spatial_reflection: bool
     residual: torch.Tensor | None
 
 
@@ -66,6 +74,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=871)
+    parser.add_argument(
+        "--standard-calls",
+        action="store_true",
+        help="also compare ordinary quantized Conv3D calls and compiler fusion",
+    )
     parser.add_argument("--tune", action="store_true", help="sweep prepared convolution tiles")
     parser.add_argument(
         "--vendor-benchmark", action="store_true", help="enable vendor convolution algorithm search"
@@ -127,6 +140,22 @@ def _standard_group_norm_silu_conv3d(
     return _standard_conv3d(functional.silu(normalized), weight)
 
 
+def _quantized_h3_block(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+) -> torch.Tensor:
+    """Keep H3's original framewise view sequence for compiler pattern coverage."""
+    batch, channels, frames, height, width = activation.shape
+    folded = activation.permute(0, 2, 1, 3, 4).contiguous()
+    folded = folded.view(batch * frames, channels, 1, height, width)
+    normalized = functional.group_norm(folded, 32, norm_weight, norm_bias, 1e-6)
+    normalized = normalized.view(batch, frames, channels, height, width)
+    normalized = normalized.permute(0, 2, 1, 3, 4).contiguous()
+    return _standard_conv3d(functional.silu(normalized), weight)
+
+
 def _measure_implementations(
     implementations: Mapping[str, Callable[[], torch.Tensor]],
     *,
@@ -143,6 +172,10 @@ def _measure_implementations(
     torch.testing.assert_close(
         implementations["fp16"](), implementations["fp16_channels_last"](), atol=2e-3, rtol=2e-3
     )
+    if "standard_compiled" in implementations:
+        torch.testing.assert_close(
+            implementations["standard_compiled"](), implementations["native"](), atol=0, rtol=0
+        )
     timings = {}
     for name, operation in implementations.items():
         if name == "reference" and skip_reference_timing:
@@ -198,8 +231,8 @@ def _benchmark_shape(
         (1, 1, 1),
     )
     flags: ConvolutionFlags = {
-        "symmetric_spatial_padding": True,
-        "right_spatial_padding": False,
+        "padding": (1, 1, 1, 1, 2, 0),
+        "spatial_reflection": True,
         "residual": None,
     }
     # Reconstruct the logical (inverse-rotated) filter once, not inside timing.
@@ -234,6 +267,38 @@ def _benchmark_shape(
             ),
         },
     }
+    if args.standard_calls:
+        # PyTorch types omit CustomGraphPass tuples from the supported options.
+        standard_norm_weight = norm_weight.to(dtype=activation.dtype)
+        standard_norm_bias = norm_bias.to(dtype=activation.dtype)
+        compiled_conv = torch.compile(
+            _standard_conv3d,
+            fullgraph=True,
+            dynamic=False,
+            options=cast(Any, convrot_int8_conv3d_compile_options()),
+        )
+        compiled_h3 = torch.compile(
+            _quantized_h3_block,
+            fullgraph=True,
+            dynamic=False,
+            options=cast(Any, minimax_h3_vae_convrot_int8_conv3d_compile_options()),
+        )
+        operations["conv3d"].update(
+            {
+                "standard_eager": lambda: _standard_conv3d(activation, weight),
+                "standard_compiled": lambda: compiled_conv(activation, weight),
+            }
+        )
+        operations["group_norm_silu_conv3d"].update(
+            {
+                "standard_eager": lambda: _quantized_h3_block(
+                    activation, weight, standard_norm_weight, standard_norm_bias
+                ),
+                "standard_compiled": lambda: compiled_h3(
+                    activation, weight, standard_norm_weight, standard_norm_bias
+                ),
+            }
+        )
     if args.group_norm_silu is not None:
         name = "group_norm_silu_conv3d" if args.group_norm_silu else "conv3d"
         operations = {name: operations[name]}
@@ -293,8 +358,7 @@ def _benchmark_shape(
         policy=policy,
         target=target,
         group_norm=bool(args.group_norm_silu),
-        symmetric_spatial_padding=True,
-        right_spatial_padding=False,
+        padding=(1, 1, 1, 1, 2, 0),
     )
     production_plan = execution_plan_for()
     if args.group_norm_silu:

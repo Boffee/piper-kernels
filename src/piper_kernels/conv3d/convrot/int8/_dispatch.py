@@ -7,6 +7,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._interfaces import ConvolutionPolicy
+from ._padding import Padding
 from ._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 from ._validation import _output_shape
 
@@ -18,8 +19,7 @@ def default_execution_plan(
     *,
     policy: ConvolutionPolicy,
     group_norm: bool,
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
     target: AcceleratorTarget | None = None,
     convolution_schedule: ConvolutionSchedule | None = None,
 ) -> ConvolutionExecutionPlan:
@@ -27,9 +27,7 @@ def default_execution_plan(
     target = AcceleratorTarget.from_device(input.device) if target is None else target
     batch, channels, frames, height, width = input.shape
     outputs = weight_qdata.shape[0]
-    output_shape = _output_shape(
-        input.shape, outputs, stride, symmetric_spatial_padding, right_spatial_padding
-    )
+    output_shape = _output_shape(input.shape, outputs, stride, padding)
     return policy.select_execution_plan(
         target,
         channels=channels,

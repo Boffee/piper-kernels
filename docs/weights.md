@@ -2,12 +2,12 @@
 
 Piper weight tensors hold packed values and quantization metadata while exposing
 a logical floating-point shape and dtype. Construct them offline from dense
-weights, or wrap checkpoint storage, then use them with `F.linear` or an inference
+weights, or wrap checkpoint storage, then use them with `F.linear`, supported `F.conv3d` calls, or an inference
 module. The application owns checkpoint loading, calibration, and model quality.
 
 | Format | Stored representation | Execution |
 |---|---|---|
-| `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and causal Conv3D, with optimized NVIDIA/AMD kernels and portable fallback. |
+| `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback. |
 | `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Piper's native linear path targets exact NVIDIA SM120. |
 | `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same native NVFP4 target. |
 
@@ -131,35 +131,57 @@ Piper's [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py) suppor
 independent correctness comparisons. ConvRot NVFP4 linear requires the supported
 native path and raises when its execution requirements are not met.
 
-## Run a causal Conv3D
+## Run a Conv3D
 
-ConvRot INT8 also represents logical `[out, in, 3, 3, 3]` weights. Execution requires
-a static input scale and FP16 or FP32 `[batch, channels, time, height, width]`
-activations; output is FP16. Input channels must be a power of two from 64 to 4096.
+ConvRot INT8 represents logical `[out, in, 3, 3, 3]` weights usable with ordinary
+`F.conv3d` and `nn.Conv3d`. Execution is inference-only, requires a static input
+scale, and accepts FP16 or FP32 NCTHW activations and optional FP16/FP32 bias;
+output is FP16. Input channels must be a power of two from 64 to 4096 and divisible
+by the rotation group size. Groups must be 1 and dilation must be 1.
 
 ```python
 import torch
+from torch.nn import functional as F
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.conv3d.convrot.int8 import ConvRotInt8Conv3d
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 kernel = torch.randn(16, 64, 3, 3, 3, device=device, dtype=torch.float16)
 # Illustrative scale; use a calibrated value for a real checkpoint.
 input_scale = torch.tensor(0.05, device=device, dtype=torch.float32)
 conv_weight = ConvRotInt8Tensor.from_hp(kernel, group_size=64, act_per_tensor_scale=input_scale)
-conv = ConvRotInt8Conv3d(conv_weight, stride=(1, 1, 1), padding="reflect")
 video = torch.randn(1, 64, 2, 4, 4, device=device, dtype=torch.float16)
 with torch.inference_mode():
-    output = conv(video)
+    output = F.conv3d(video, conv_weight, padding=1)
 assert output.shape == (1, 16, 2, 4, 4)
+
+layer = torch.nn.Conv3d(64, 16, 3, padding=1, bias=False, device="meta")
+layer.weight = torch.nn.Parameter(conv_weight, requires_grad=False)
 ```
 
-Temporal padding adds two zero frames before the input. Spatial padding comes
-from the model architecture; do not add it twice when replacing an existing
-layer. See the [Conv3D guide](../src/piper_kernels/conv3d/convrot/int8/README.md)
-for padding modes, packed checkpoint layout, offload integration, and H3 compiler
-integration. Matrix updates, GGUF conversion, transpose, and sharding below apply
-to 2-D weights only.
+Stride accepts a positive integer or three integers. Padding accepts nonnegative
+symmetric zero-padding amounts (an integer or three integers), `"valid"`, or
+`"same"` (stride 1). These follow PyTorch output-shape semantics: `padding=0`
+adds nothing, including no hidden temporal padding. Already padded inputs can
+be passed directly. Unbatched inputs, transposed convolution, and other kernel
+sizes are unsupported. FP16 autocast casts eligible FP32 input/bias while retaining
+packed weight storage and FP32 scales; BF16 autocast is unsupported. The logical
+weight dtype does not change the fixed FP16 output contract. Numerical results
+approximate floating-point convolution through weight and activation quantization.
+
+For causal video convolution, pad two zero frames before the input, then use
+`F.conv3d(..., padding=0)`. Spatial reflection, if needed, is a separate caller
+operation. The existing `ConvRotInt8Conv3d` layer and `conv3d` function in
+`piper_kernels.conv3d.convrot.int8` remain causal convenience APIs: they always
+request two preceding zero frames, with `padding="none"`, `"reflect"`, or
+`"reflect_right"` selecting spatial padding only. They share the same underlying
+convolution implementation.
+
+Both standard and causal calls support `torch.compile` without extra options.
+For optional fusion of explicit zero/spatial-reflection padding, use
+`convrot_int8_conv3d_compile_options` from that package. The
+[Conv3D guide](../src/piper_kernels/conv3d/convrot/int8/README.md) covers packed
+storage, offload integration, fusion limits, and H3 normalization fusion.
+Matrix updates, GGUF conversion, transpose, and sharding below apply to 2-D weights only.
 
 ## Compile a model
 

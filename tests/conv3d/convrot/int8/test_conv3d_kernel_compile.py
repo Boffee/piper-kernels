@@ -42,6 +42,9 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
         weight_aligned=True,
         group_norm=False,
     ).convolution
+    # Cover ordinary valid convolution as well as causal spatial reflection
+    # on every accepted compiler target without multiplying the tile matrix.
+    causal = rows == 16384
     source = ASTSource(
         kernels._conv3d_kernel,
         {
@@ -70,9 +73,9 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
             "input_frames": 3,
             "input_height": 17,
             "input_width": 19,
-            "output_frames": 3,
-            "output_height": 17,
-            "output_width": 19,
+            "output_frames": 3 if causal else 1,
+            "output_height": 17 if causal else 15,
+            "output_width": 19 if causal else 17,
             "stride_frames": 1,
             "stride_height": 1,
             "stride_width": 1,
@@ -82,8 +85,10 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
             "bias_stride": 2,
             "has_bias": True,
             "has_residual": True,
-            "symmetric_spatial_padding": True,
-            "right_spatial_padding": False,
+            "padding_front": 2 if causal else 0,
+            "padding_top": 1 if causal else 0,
+            "padding_left": 1 if causal else 0,
+            "spatial_reflection": causal,
             "use_weight_descriptor": False,
             "loop_num_stages": schedule.num_stages,
         },

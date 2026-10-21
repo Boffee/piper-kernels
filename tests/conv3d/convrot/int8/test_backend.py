@@ -87,8 +87,8 @@ def test_custom_op_uses_selected_backend_or_reference(monkeypatch, fused):
         64,
         torch.tensor(0.02),
         [1, 1, 1],
+        [1, 1, 1, 1, 2, 0],
         True,
-        False,
         None,
     )
     args = (
@@ -213,8 +213,7 @@ def test_strided_execution_selects_preparation_from_input_rows(fused):
         policy=nvidia,
         target=AcceleratorTarget("cuda", "sm120"),
         group_norm=fused,
-        symmetric_spatial_padding=True,
-        right_spatial_padding=False,
+        padding=(1, 1, 1, 1, 2, 0),
     )
     assert plan.preparation == ((32, 4) if fused else (64, 4))
     assert plan.convolution == (64, 128, 128, 4, 3)
@@ -235,8 +234,7 @@ def test_tuning_tile_recomputes_descriptor_eligibility(architecture, aligned, bl
         policy=nvidia,
         target=AcceleratorTarget("cuda", architecture),
         group_norm=False,
-        symmetric_spatial_padding=True,
-        right_spatial_padding=False,
+        padding=(1, 1, 1, 1, 2, 0),
     )
     production = select()
     tile = ConvolutionSchedule(64, block_n, 128, 4, 3)
