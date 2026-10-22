@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-10-21
+
 ### Added
 
 - Standard `F.conv3d` and `nn.Conv3d` dispatch for ConvRot INT8 3×3×3 weights,
