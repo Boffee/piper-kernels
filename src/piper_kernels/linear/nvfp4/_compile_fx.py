@@ -1,4 +1,4 @@
-"""FX emission helpers shared by NVFP4 compiler passes."""
+"""FX normalization and emission shared by NVFP4 compiler passes."""
 
 from __future__ import annotations
 
@@ -13,6 +13,42 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.weights.nvfp4 import _layout
 
 from . import _validation
+
+
+def coalesce_input_casts(graph: torch.fx.Graph) -> None:
+    """Share identical autocasts consumed exclusively by ordinary NVFP4 linears.
+
+    Post-AOT graphs represent input mutations as distinct values. Match exact
+    source/dtype identity and keep casts with external consumers independent,
+    so this does not change externally visible storage aliasing.
+    """
+    casts: dict[tuple[torch.fx.Node, torch.dtype], torch.fx.Node] = {}
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.prims.convert_element_type.default
+            or node.kwargs
+            or len(node.args) != 2
+            or not isinstance(node.args[0], torch.fx.Node)
+            or not isinstance(node.args[1], torch.dtype)
+            or not node.users
+            or any(
+                user.op != "call_function"
+                or user.target != torch.ops.piper_kernels.nvfp4_linear.default
+                or not user.args
+                or user.args[0] is not node
+                for user in node.users
+            )
+        ):
+            continue
+        key = (node.args[0], node.args[1])
+        previous = casts.get(key)
+        if previous is None:
+            casts[key] = node
+        else:
+            node.replace_all_uses_with(previous)
+            graph.erase_node(node)
+
 
 type PreparedInputNodes = tuple[
     torch.fx.Node,

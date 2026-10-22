@@ -14,6 +14,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass
+from piper_kernels.linear.nvfp4._compile_fx import coalesce_input_casts
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 
@@ -29,7 +30,7 @@ def _linear(
     qdata: torch.fx.Node,
     scale: torch.fx.Node,
     global_scale: torch.fx.Node,
-    activation_scale: torch.fx.Node,
+    activation_scale: torch.fx.Node | None,
 ) -> torch.fx.Node:
     node = graph.call_function(
         torch.ops.piper_kernels.nvfp4_linear.default,
@@ -168,15 +169,50 @@ def test_compile_options_install_versioned_idempotent_pass() -> None:
     assert compile_pass.uuid()
 
 
+@pytest.mark.parametrize("difference", [None, "source", "dtype", "external-consumer"])
+def test_input_cast_sharing_preserves_source_dtype_and_external_storage(difference):
+    graph = torch.fx.Graph()
+    source = _placeholder(graph, "source", torch.empty(17, 256, device="meta"))
+    other_source = (
+        _placeholder(graph, "other", torch.empty(17, 256, device="meta"))
+        if difference == "source"
+        else source
+    )
+    qdata = _placeholder(graph, "qdata", torch.empty(128, 128, dtype=torch.uint8, device="meta"))
+    scale = _placeholder(
+        graph, "scale", torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
+    )
+    global_scale = _placeholder(graph, "global_scale", torch.empty((), device="meta"))
+    casts, outputs = [], []
+    for index, input_source in enumerate((source, other_source)):
+        dtype = torch.float16 if index and difference == "dtype" else torch.bfloat16
+        cast = graph.call_function(
+            torch.ops.prims.convert_element_type.default, (input_source, dtype)
+        )
+        cast.meta["val"] = input_source.meta["val"].to(dtype)
+        casts.append(cast)
+        outputs.append(_linear(graph, cast, qdata, scale, global_scale, None))
+    graph.output((*outputs, casts[0]) if difference == "external-consumer" else tuple(outputs))
+
+    coalesce_input_casts(graph)
+
+    assert (outputs[0].args[0] is outputs[1].args[0]) == (difference is None)
+    graph.lint()
+
+
 @pytest.mark.gpu
+@pytest.mark.parametrize("unit_scale", [False, True])
+@pytest.mark.parametrize("autocast", [False, True])
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires exact NVIDIA SM120",
 )
-def test_cuda_compile_shares_three_static_projections() -> None:
+def test_cuda_compile_shares_three_static_projections(unit_scale: bool, autocast: bool) -> None:
     torch.manual_seed(423)
-    input = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
-    activation_scale = per_tensor_amax_to_scale(input.abs().amax())
+    input = torch.randn(  # noqa: A001
+        256, 256, device="cuda", dtype=torch.float32 if autocast else torch.bfloat16
+    )
+    activation_scale = None if unit_scale else per_tensor_amax_to_scale(input.abs().amax())
     weights = []
     biases = []
     quantization = QuantizeTensorToNVFP4Kwargs(
@@ -194,7 +230,9 @@ def test_cuda_compile_shares_three_static_projections() -> None:
             is_swizzled_scales=True,
             act_quant_kwargs=quantization,
         )
-        weights.append(PiperNVFP4Tensor.from_torchao(torchao_weight))
+        wrapped = PiperNVFP4Tensor.from_torchao(torchao_weight)
+        # Unit metadata survives independent transfers of Q/K/V weights.
+        weights.append(wrapped.to("cpu").to("cuda") if unit_scale else wrapped)
         biases.append(torch.randn(128, device="cuda", dtype=torch.bfloat16))
 
     def projections(value: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -202,14 +240,16 @@ def test_cuda_compile_shares_three_static_projections() -> None:
             F.linear(value, weight, bias) for weight, bias in zip(weights, biases, strict=True)
         )
 
-    expected = projections(input)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+        expected = projections(input)
     capture = TargetCapturePass()
     options = nvfp4_compile_options()
     options["post_grad_custom_pre_pass"] = (
         options["post_grad_custom_pre_pass"],
         capture,
     )
-    actual = torch.compile(projections, fullgraph=True, options=options)(input)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+        actual = torch.compile(projections, fullgraph=True, options=options)(input)
 
     for reference, result in zip(expected, actual, strict=True):
         relative_l2 = (reference.float() - result.float()).norm() / reference.float().norm()

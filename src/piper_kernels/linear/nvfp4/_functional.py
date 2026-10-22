@@ -30,7 +30,6 @@ def supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  
         and quantization.block_size == _layout.BLOCK_SIZE
         and quantization.is_swizzled_scales
         and not quantization.use_triton_kernel
-        and (quantization.use_dynamic_per_tensor_scale or weight.act_per_tensor_scale is not None)
         and (weight.per_tensor_scale is None or weight.per_tensor_scale.ndim == 0)
     )
 

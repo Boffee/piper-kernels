@@ -66,12 +66,14 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
 @pytest.mark.gpu
 @pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 128, 129])
-@pytest.mark.parametrize("activation_fn", ["gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("high_first", [False, True])
+@pytest.mark.parametrize("unit_scale", [False, True])
 def test_static_activation_preparation_matches_portable_reference(
     rows: int,
     activation_fn: str | None,
     high_first: bool,
+    unit_scale: bool,
 ) -> None:
     torch.manual_seed(501)
     output_features = 80
@@ -82,7 +84,12 @@ def test_static_activation_preparation_matches_portable_reference(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)
+    # Plain BF16 inputs can land on FP4 ties with an approximate reciprocal.
+    # Use a power-of-two global scale to compare their packed bytes exactly.
+    value = 2**-8 if activation_fn is None else 1.0 / 448.0
+    per_tensor_scale = (
+        None if unit_scale else torch.tensor(value, device="cuda", dtype=torch.float32)
+    )
 
     expected = nvfp4_reference.prepare_input(
         input,

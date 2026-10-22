@@ -39,7 +39,7 @@ def _prepare_input(
             high_first=high_first,
         )
     if activation_per_tensor_scale is None:
-        raise ValueError("static ConvRot NVFP4 preparation requires a per-tensor scale")
+        activation_per_tensor_scale = input.new_ones((), dtype=torch.float32)
     return convrot_nvfp4.prepare_static(
         input,
         activation_per_tensor_scale,

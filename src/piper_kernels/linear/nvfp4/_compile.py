@@ -195,6 +195,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
+        _compile_fx.coalesce_input_casts(graph)
         projection_views.normalize_projection_views(graph)
         _fold_gelu_tanh_inputs(graph)
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)

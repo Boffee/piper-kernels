@@ -42,7 +42,9 @@ def _prepare_static_kernel(
     per_tensor_scale_ptr,
     qdata_ptr,
     scale_ptr,
+    global_scale_out_ptr,
     block_count,
+    row_count,
     input_features: tl.constexpr,
     output_features: tl.constexpr,
     scale_column_blocks: tl.constexpr,
@@ -52,53 +54,63 @@ def _prepare_static_kernel(
 ):
     """Quantize static-scale activations directly into both hardware layouts."""
     block_offsets = tl.program_id(0) * blocks_per_program + tl.arange(0, blocks_per_program)
-    valid_blocks = block_offsets < block_count
-    scale_columns = block_offsets % (output_features // _NVFP4_BLOCK_SIZE_TL)
-    rows = block_offsets // (output_features // _NVFP4_BLOCK_SIZE_TL)
-    element_offsets = tl.arange(0, _NVFP4_BLOCK_SIZE_TL)
-    input_offsets = (
-        rows[:, None] * input_features
-        + scale_columns[:, None] * _NVFP4_BLOCK_SIZE_TL
-        + element_offsets[None, :]
-    )
-    values = tl.load(
-        input_ptr + input_offsets,
-        mask=valid_blocks[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    if activation_fn == "swiglu":
-        gate = tl.load(
-            input_ptr + input_offsets + output_features,
+    scale_columns = block_offsets % (scale_column_blocks * 4)
+    rows = block_offsets // (scale_column_blocks * 4)
+    valid_blocks = (rows < row_count) & (scale_columns < output_features // _NVFP4_BLOCK_SIZE_TL)
+    encoded_scale = tl.full((blocks_per_program,), 0, tl.float8e4nv)
+    # Whole padding programs only write zeros, especially for short wide inputs.
+    if tl.sum(valid_blocks.to(tl.int32), 0) > 0:  # pyright: ignore[reportOperatorIssue]
+        element_offsets = tl.arange(0, _NVFP4_BLOCK_SIZE_TL)
+        input_offsets = (
+            rows[:, None] * input_features
+            + scale_columns[:, None] * _NVFP4_BLOCK_SIZE_TL
+            + element_offsets[None, :]
+        )
+        values = tl.load(
+            input_ptr + input_offsets,
             mask=valid_blocks[:, None],
             other=0.0,
-            eviction_policy="evict_first",
         ).to(tl.float32)
-        values = triton_input_activations.swiglu(values, gate)
-    elif activation_fn == "gelu_tanh":
-        values = triton_input_activations.gelu_tanh(
-            values,
-            "cuda",  # pyright: ignore[reportArgumentType]
-        )
+        if activation_fn == "swiglu":
+            gate = tl.load(
+                input_ptr + input_offsets + output_features,
+                mask=valid_blocks[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            values = triton_input_activations.swiglu(values, gate)
+        elif activation_fn == "gelu_tanh":
+            values = triton_input_activations.gelu_tanh(
+                values,
+                "cuda",  # pyright: ignore[reportArgumentType]
+            )
 
-    per_tensor_scale = tl.load(per_tensor_scale_ptr).to(tl.float32)
-    packed, encoded_scale = encode_nvfp4_blocks(  # pyright: ignore[reportGeneralTypeIssues]
-        values,
-        per_tensor_scale,
-        blocks_per_program,
-        high_first,
-    )
-    qdata_offsets = (
-        rows[:, None] * (output_features // 2)
-        + scale_columns[:, None] * _NVFP4_QDATA_BLOCK_SIZE_TL
-        + tl.arange(0, _NVFP4_QDATA_BLOCK_SIZE_TL)[None, :]
-    )
-    tl.store(qdata_ptr + qdata_offsets, packed, mask=valid_blocks[:, None])
+        per_tensor_scale = 1.0
+        if per_tensor_scale_ptr is not None:
+            per_tensor_scale = tl.load(per_tensor_scale_ptr).to(tl.float32)
+        if global_scale_out_ptr is not None:  # noqa: SIM102 - specialize the optional output pointer
+            if tl.program_id(0) == 0:
+                tl.store(global_scale_out_ptr, per_tensor_scale)
+        packed, encoded_scale = encode_nvfp4_blocks(  # pyright: ignore[reportGeneralTypeIssues]
+            values,
+            per_tensor_scale,
+            blocks_per_program,
+            high_first,
+        )
+        qdata_offsets = (
+            rows[:, None] * (output_features // 2)
+            + scale_columns[:, None] * _NVFP4_QDATA_BLOCK_SIZE_TL
+            + tl.arange(0, _NVFP4_QDATA_BLOCK_SIZE_TL)[None, :]
+        )
+        tl.store(qdata_ptr + qdata_offsets, packed, mask=valid_blocks[:, None])
     scale_offsets = swizzled_scale_offsets(
         rows,
         scale_columns,
         scale_column_blocks,
     )
-    tl.store(scale_ptr + scale_offsets, encoded_scale, mask=valid_blocks)
+    # The launch covers complete scale tiles, so masked input lanes also
+    # initialize row/column padding without a separate zero-fill kernel.
+    tl.store(scale_ptr + scale_offsets, encoded_scale, mask=block_offsets < block_count)
 
 
 @triton.jit
@@ -128,25 +140,30 @@ def _add_bias_kernel(
 
 def _prepare_static_storage(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    per_tensor_scale: torch.Tensor,
+    per_tensor_scale: torch.Tensor | None,
     *,
     activation_fn: str | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
     high_first: bool = False,
+    global_scale_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     contiguous_input = input.contiguous()
     input_features = int(contiguous_input.shape[-1])
     output_features = input_features // input_activations.input_activation_width(activation_fn)
     rows = int(contiguous_input.numel() // input_features)
-    qdata, scale = prepare_activation_storage(input, rows, output_features, out)
-    block_count = rows * (output_features // _NVFP4_BLOCK_SIZE)
+    qdata, scale = prepare_activation_storage(
+        input, rows, output_features, out, initialize_padding=False
+    )
+    block_count = scale.numel()
     with device_context(input.device):
         _prepare_static_kernel[(triton.cdiv(block_count, _PREPARE_BLOCKS),)](
             contiguous_input,
             per_tensor_scale,
             qdata,
             scale,
+            global_scale_out,
             block_count,
+            rows,
             input_features=input_features,
             output_features=output_features,
             scale_column_blocks=(output_features + _layout.SCALE_COLUMN_TILE - 1)
@@ -161,18 +178,20 @@ def _prepare_static_storage(
 
 def prepare_static(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    per_tensor_scale: torch.Tensor,
+    per_tensor_scale: torch.Tensor | None,
     activation_fn: str | None = None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare a static-scale NVFP4 activation without intermediate tensors."""
+    """Prepare nonempty static NVFP4 storage and an owned global scale; None means unit."""
+    global_scale = torch.empty((), device=input.device, dtype=torch.float32)
     qdata, scale = _prepare_static_storage(
         input,
         per_tensor_scale,
         activation_fn=activation_fn,
         high_first=high_first,
+        global_scale_out=global_scale,
     )
-    return qdata, scale, per_tensor_scale.clone()
+    return qdata, scale, global_scale
 
 
 def prepare_static_out(
