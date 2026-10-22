@@ -7,6 +7,8 @@ from torch.nn import functional
 
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
+from ._padding import Padding
+
 
 def _prepare_input(
     input: torch.Tensor,  # noqa: A002
@@ -72,16 +74,19 @@ def _convolution(
     input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     activation = prepared.permute(0, 4, 1, 2, 3).float().mul(input_scale)
-    if symmetric_spatial_padding:
-        activation = functional.pad(activation, (1, 1, 1, 1, 0, 0), mode="reflect")
-    elif right_spatial_padding:
-        activation = functional.pad(activation, (0, 1, 0, 1, 0, 0), mode="reflect")
-    activation = functional.pad(activation, (0, 0, 0, 0, 2, 0))
+    if any(padding[:4]):
+        activation = functional.pad(
+            activation,
+            (*padding[:4], 0, 0),
+            mode="reflect" if spatial_reflection else "constant",
+        )
+    if any(padding[4:]):
+        activation = functional.pad(activation, (0, 0, 0, 0, *padding[4:]))
 
     weight = weight_qdata.float().mul(weight_scale.view(-1, 1, 1, 1, 1)).permute(0, 4, 1, 2, 3)
     # The portable INT8 reference accumulates in FP32 even inside caller autocast.
@@ -106,8 +111,8 @@ def conv3d(
     input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     """Execute the specialized quantized convolution with portable PyTorch."""
@@ -119,8 +124,8 @@ def conv3d(
         bias,
         input_scale,
         stride,
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 
@@ -138,8 +143,8 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
     input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     """Fuse isolated GroupNorm and SiLU into portable ConvRot preparation."""
@@ -159,8 +164,8 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
         bias,
         input_scale,
         stride,
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 

@@ -6,6 +6,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from ._padding import Padding
 from ._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 
 
@@ -40,8 +41,8 @@ class ConvolutionBackend(Protocol):
         input_scale: torch.Tensor,
         stride: tuple[int, int, int],
         *,
-        symmetric_spatial_padding: bool,
-        right_spatial_padding: bool,
+        padding: Padding,
+        spatial_reflection: bool,
         residual: torch.Tensor | None,
     ) -> torch.Tensor: ...
 
@@ -59,7 +60,7 @@ class ConvolutionBackend(Protocol):
         input_scale: torch.Tensor,
         stride: tuple[int, int, int],
         *,
-        symmetric_spatial_padding: bool,
-        right_spatial_padding: bool,
+        padding: Padding,
+        spatial_reflection: bool,
         residual: torch.Tensor | None,
     ) -> torch.Tensor: ...

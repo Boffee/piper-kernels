@@ -7,6 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Standard `F.conv3d` and `nn.Conv3d` dispatch for ConvRot INT8 3×3×3 weights,
+  with PyTorch stride/padding geometry and no implicit causal padding. Shared
+  kernels accept explicit padding; the existing causal APIs preserve their
+  behavior. Optional `convrot_int8_conv3d_compile_options` folds explicit padding,
+  and H3 compiler options retain normalization/SiLU/residual fusion around original
+  convolution modules. Convolution bias now also accepts FP32.
+
 - Native NVIDIA SM89 (Ada) sparse Piper attention, using asynchronous operand copies and
   the shared NVIDIA recurrence. D64 and D128 support ragged/padded inputs, GQA/MQA, dense
   suffixes, and coarse residuals. SM89 reuses the shared operand preparation and routing.

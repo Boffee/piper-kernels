@@ -10,22 +10,22 @@ from piper_kernels.weights.convrot.int8._quantization import (
     validate_storage,
 )
 
+from ._padding import Padding
+
 
 def _output_shape(
     input_shape: Sequence[int],
     output_channels: int,
     stride: Sequence[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
 ) -> tuple[int, int, int, int, int]:
     batch, _, frames, height, width = input_shape
-    spatial_padding = 2 if symmetric_spatial_padding else int(right_spatial_padding)
     return (
         batch,
         output_channels,
-        (frames - 1) // stride[0] + 1,
-        (height + spatial_padding - 3) // stride[1] + 1,
-        (width + spatial_padding - 3) // stride[2] + 1,
+        (frames + padding[4] + padding[5] - 3) // stride[0] + 1,
+        (height + padding[2] + padding[3] - 3) // stride[1] + 1,
+        (width + padding[0] + padding[1] - 3) // stride[2] + 1,
     )
 
 
@@ -41,9 +41,12 @@ def _validate_weight(
     if bias is not None:
         if bias.layout is not torch.strided:
             raise ValueError("ConvRot INT8 Conv3D bias must use strided layout")
-        if tuple(bias.shape) != (weight_qdata.shape[0],) or bias.dtype is not torch.float16:
+        if tuple(bias.shape) != (weight_qdata.shape[0],) or bias.dtype not in (
+            torch.float16,
+            torch.float32,
+        ):
             raise ValueError(
-                "ConvRot INT8 Conv3D bias must be float16 with one value per output channel"
+                "ConvRot INT8 Conv3D bias must be float16/float32 with one value per output channel"
             )
         if bias.device != weight_qdata.device:
             raise ValueError("ConvRot INT8 Conv3D bias must share the weight device")
@@ -51,15 +54,14 @@ def _validate_weight(
 
 def _validate_config(
     stride: list[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
 ) -> None:
     if len(stride) != 3 or any(type(value) is not int or value <= 0 for value in stride):
         raise ValueError(
             f"ConvRot INT8 Conv3D stride must contain three positive integers, got {stride}"
         )
-    if symmetric_spatial_padding and right_spatial_padding:
-        raise ValueError("ConvRot INT8 Conv3D spatial padding modes are mutually exclusive")
+    if len(padding) != 6 or any(type(value) is not int or value < 0 for value in padding):
+        raise ValueError("ConvRot INT8 Conv3D padding must contain six nonnegative integers")
 
 
 def _validate_common(
@@ -70,8 +72,8 @@ def _validate_common(
     group_size: int,
     input_scale: torch.Tensor,
     stride: list[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> tuple[int, int, int, int, int]:
     if input.ndim != 5:
@@ -89,9 +91,13 @@ def _validate_common(
             f"but the weight expects {weight_qdata.shape[4]}"
         )
     validate_activation_scale(input_scale, weight_qdata.device)
-    _validate_config(stride, symmetric_spatial_padding, right_spatial_padding)
-    if (symmetric_spatial_padding or right_spatial_padding) and min(input.shape[3:]) <= 1:
-        raise ValueError("ConvRot INT8 Conv3D reflection padding requires height and width > 1")
+    _validate_config(stride, padding)
+    if spatial_reflection and (
+        max(padding[:2]) >= input.shape[4] or max(padding[2:4]) >= input.shape[3]
+    ):
+        raise ValueError(
+            "ConvRot INT8 Conv3D reflection padding must be smaller than height and width"
+        )
     if weight_qdata.device != input.device:
         raise ValueError("ConvRot INT8 Conv3D inputs and weight storage must share a device")
 
@@ -99,8 +105,7 @@ def _validate_common(
         input.shape,
         weight_qdata.shape[0],
         stride,
-        symmetric_spatial_padding,
-        right_spatial_padding,
+        padding,
     )
     if any(size <= 0 for size in expected_shape):
         raise ValueError("ConvRot INT8 Conv3D kernel does not fit the padded input")

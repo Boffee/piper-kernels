@@ -241,8 +241,10 @@ def _conv3d_kernel(  # noqa: PLR0915
     bias_stride: tl.constexpr,
     has_bias: tl.constexpr,
     has_residual: tl.constexpr,
-    symmetric_spatial_padding: tl.constexpr,
-    right_spatial_padding: tl.constexpr,
+    padding_front: tl.constexpr,
+    padding_top: tl.constexpr,
+    padding_left: tl.constexpr,
+    spatial_reflection: tl.constexpr,
     use_weight_descriptor: tl.constexpr,
     residual_stride_batch,
     residual_stride_channel,
@@ -251,7 +253,7 @@ def _conv3d_kernel(  # noqa: PLR0915
     residual_stride_width,
     loop_num_stages: tl.constexpr,
 ):
-    """Apply causal 3x3x3 ConvRot with one flattened INT32 reduction."""
+    """Apply 3x3x3 ConvRot with explicit padding and one INT32 reduction."""
     row_offsets = tl.program_id(0) * block_m + tl.arange(0, block_m)
     channel_offsets = tl.program_id(1) * block_n + tl.arange(0, block_n)
     valid_rows = row_offsets < output_rows
@@ -280,13 +282,11 @@ def _conv3d_kernel(  # noqa: PLR0915
         kernel_spatial = kernel_position % 9
         kernel_y = kernel_spatial // 3
         kernel_x = kernel_spatial % 3
-        input_frame = output_frame[:, None] * stride_frames + kernel_frame[None, :] - 2
-        input_y = output_y[:, None] * stride_height + kernel_y[None, :]
-        input_x = output_x[:, None] * stride_width + kernel_x[None, :]
+        input_frame = output_frame[:, None] * stride_frames + kernel_frame[None, :] - padding_front
+        input_y = output_y[:, None] * stride_height + kernel_y[None, :] - padding_top
+        input_x = output_x[:, None] * stride_width + kernel_x[None, :] - padding_left
         valid_input = (input_frame >= 0) & (input_frame < input_frames)
-        if symmetric_spatial_padding:
-            input_y -= 1
-            input_x -= 1
+        if spatial_reflection:
             input_y = tl.where(
                 input_y < 0,
                 -input_y,
@@ -296,17 +296,6 @@ def _conv3d_kernel(  # noqa: PLR0915
                 input_x < 0,
                 -input_x,
                 tl.where(input_x >= input_width, 2 * input_width - 2 - input_x, input_x),
-            )
-        elif right_spatial_padding:
-            input_y = tl.where(
-                input_y >= input_height,
-                2 * input_height - 2 - input_y,
-                input_y,
-            )
-            input_x = tl.where(
-                input_x >= input_width,
-                2 * input_width - 2 - input_x,
-                input_x,
             )
         else:
             valid_input &= (input_y >= 0) & (input_y < input_height)
@@ -512,8 +501,8 @@ def _conv3d_prepared(
     stride,
     *,
     execution_plan: ConvolutionExecutionPlan,
-    symmetric_spatial_padding,
-    right_spatial_padding,
+    padding,
+    spatial_reflection,
     residual,
 ):
     batch, input_frames, input_height, input_width, input_channels = input_qdata.shape
@@ -522,8 +511,7 @@ def _conv3d_prepared(
         (batch, input_channels, input_frames, input_height, input_width),
         output_channels,
         stride,
-        symmetric_spatial_padding,
-        right_spatial_padding,
+        padding,
     )
     _, _, output_frames, output_height, output_width = output_shape
     output = torch.empty(output_shape, device=input_qdata.device, dtype=torch.float16)
@@ -572,8 +560,10 @@ def _conv3d_prepared(
             bias_stride=bias.stride(0) if bias is not None else 1,
             has_bias=bias is not None,
             has_residual=residual is not None,
-            symmetric_spatial_padding=symmetric_spatial_padding,
-            right_spatial_padding=right_spatial_padding,
+            padding_front=padding[4],
+            padding_top=padding[2],
+            padding_left=padding[0],
+            spatial_reflection=spatial_reflection,
             use_weight_descriptor=use_weight_descriptor,
             residual_stride_batch=residual_strides[0],
             residual_stride_channel=residual_strides[1],
@@ -598,8 +588,8 @@ def conv3d(
     *,
     execution_plan: ConvolutionExecutionPlan,
     accelerator_backend: str,
-    symmetric_spatial_padding,
-    right_spatial_padding,
+    padding,
+    spatial_reflection,
     residual,
 ):
     prepared = _prepare_input(
@@ -617,8 +607,8 @@ def conv3d(
         input_scale,
         stride,
         execution_plan=execution_plan,
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 
@@ -638,8 +628,8 @@ def group_norm_silu_conv3d(
     *,
     execution_plan: ConvolutionExecutionPlan,
     accelerator_backend: str,
-    symmetric_spatial_padding,
-    right_spatial_padding,
+    padding,
+    spatial_reflection,
     residual,
 ):
     prepared = _prepare_group_norm_silu_input(
@@ -661,8 +651,8 @@ def group_norm_silu_conv3d(
         input_scale,
         stride,
         execution_plan=execution_plan,
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 

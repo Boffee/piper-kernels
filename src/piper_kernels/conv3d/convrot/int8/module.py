@@ -4,7 +4,8 @@ import torch
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
-from ._ops import SpatialPadding, _padding_flags, _weight_storage, conv3d
+from ._functional import _weight_storage, conv3d
+from ._padding import SpatialPadding, causal_padding
 from ._validation import _validate_config, _validate_weight
 
 
@@ -36,8 +37,8 @@ class ConvRotInt8Conv3d(torch.nn.Module):
         super().__init__()
         qdata, scale, group_size, _ = _weight_storage(weight)
         _validate_weight(qdata, scale, bias, group_size)
-        symmetric, right = _padding_flags(padding)
-        _validate_config(list(stride), symmetric, right)
+        pads, _ = causal_padding(padding)
+        _validate_config(list(stride), pads)
         self.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
         self.register_parameter(
             "bias", None if bias is None else torch.nn.Parameter(bias, requires_grad=False)

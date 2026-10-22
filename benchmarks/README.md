@@ -119,7 +119,7 @@ records. Use complete-call suite results for integration comparisons.
 | Sparse stages and routing scores | [Sparse attention](benchmark_sparse_piper.py), [scores](benchmark_sparse_piper_scores.py) |
 | Q/K/V projection phases | [Sparse projections](benchmark_sparse_piper_projection.py) |
 | Linear preparation, compiler inspection, optional external comparison | [Linear](benchmark_convrot_int8.py), [preparation](benchmark_convrot_int8_preparation.py) |
-| Convolution layout and schedule investigation | [Conv3D](benchmark_convrot_int8_conv3d.py) |
+| Convolution layouts, schedules, and standard-call fusion (`--standard-calls`) | [Conv3D](benchmark_convrot_int8_conv3d.py) |
 | Integer arithmetic/compiler behavior | [Integer PV dot](benchmark_integer_pv_dot.py) |
 
 Operation diagnostics accept `--case` to use a parent workload from the shared

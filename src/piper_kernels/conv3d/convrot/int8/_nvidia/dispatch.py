@@ -4,6 +4,7 @@ import torch
 
 from .. import triton as convolution
 from .._dispatch import default_execution_plan
+from .._padding import Padding
 from . import policy
 
 
@@ -16,8 +17,8 @@ def conv3d(
     input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     """Launch with the SM8x or SM120 execution plan of the input's device."""
@@ -27,8 +28,7 @@ def conv3d(
         stride,
         policy=policy,
         group_norm=False,
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
     )
     return convolution.conv3d(
         input,
@@ -40,8 +40,8 @@ def conv3d(
         stride,
         execution_plan=plan,
         accelerator_backend="cuda",
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 
@@ -59,8 +59,8 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
     input_scale: torch.Tensor,
     stride: tuple[int, int, int],
     *,
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: Padding,
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     """Launch with the SM8x or SM120 execution plan of the input's device."""
@@ -70,8 +70,7 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
         stride,
         policy=policy,
         group_norm=True,
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
     )
     return convolution.group_norm_silu_conv3d(
         input,
@@ -87,7 +86,7 @@ def group_norm_silu_conv3d(  # noqa: PLR0913, PLR0917
         stride,
         execution_plan=plan,
         accelerator_backend="cuda",
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=padding,
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )

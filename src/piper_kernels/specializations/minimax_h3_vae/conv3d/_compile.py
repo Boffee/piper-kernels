@@ -1,14 +1,14 @@
-"""Fold H3 framewise normalization and padding into explicit quantized convolutions."""
+"""Fuse H3 framewise normalization around standard or explicit quantized convolutions."""
 
 import operator
 from collections.abc import Mapping
 
 import torch
-from torch._C._nn import pad as torch_pad
 from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
 from torch.nn import functional
 
-from piper_kernels.conv3d.convrot.int8 import _backend, _ops, _validation, reference
+from piper_kernels.conv3d.convrot.int8 import _compile as convolution_compile
+from piper_kernels.conv3d.convrot.int8 import _validation
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
 _FUSED = torch.ops.piper_kernels.convrot_int8_group_norm_silu_conv3d.default
@@ -47,6 +47,11 @@ def _unpermute(node: object) -> torch.fx.Node | None:
 
 
 def _framewise_norm_silu(node: object) -> _NormSiluInput | None:  # noqa: PLR0911
+    # The fused normalization contract removes intermediate FP16 rounding,
+    # including the cast introduced by ordinary Conv3D autocast.
+    cast_source = convolution_compile.fp16_cast_source(node)
+    if cast_source is not None:
+        node = cast_source
     if (
         not isinstance(node, torch.fx.Node)
         or node.target is not functional.silu
@@ -107,26 +112,6 @@ def _framewise_norm_silu(node: object) -> _NormSiluInput | None:  # noqa: PLR091
     return source, weight, bias, groups, epsilon
 
 
-def _padding(node: object) -> tuple[torch.fx.Node, bool, bool] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.target not in (functional.pad, torch_pad)
-        or len(node.users) != 1
-        or len(node.args) != 4
-        or node.kwargs
-        or node.args[2] != "reflect"
-        or node.args[3] is not None
-        or not isinstance(node.args[0], torch.fx.Node)
-    ):
-        return None
-    pads = node.args[1]
-    if pads in ((1, 1, 1, 1, 0, 0), (1, 1, 1, 1)):
-        return node.args[0], True, False
-    if pads in ((0, 1, 0, 1, 0, 0), (0, 1, 0, 1)):
-        return node.args[0], False, True
-    return None
-
-
 def _residual(node: torch.fx.Node) -> tuple[torch.fx.Node, torch.fx.Node] | None:
     if len(node.users) != 1:
         return None
@@ -155,18 +140,15 @@ def _residual(node: torch.fx.Node) -> tuple[torch.fx.Node, torch.fx.Node] | None
 
 
 def fuse_conv3d(graph: torch.fx.Graph) -> None:
-    """Rewrite only explicit ConvRot operators with recognized inference boundaries."""
+    """Fuse recognized H3 inference boundaries after lowering quantized convolutions."""
     if torch.is_grad_enabled():
         return
+    convolution_compile.fuse_padding(graph)
     changed = False
     for node in list(graph.nodes):
         if node.target != _CONV or node.kwargs or len(node.args) != 10:
             continue
         args = list(node.args)
-        symmetric, right = args[7:9]
-        padding = _padding(args[0]) if symmetric is False and right is False else None
-        if padding is not None:
-            args[0], args[7], args[8] = padding
         norm = _framewise_norm_silu(args[0])
         target = _CONV
         if norm is not None:
@@ -176,7 +158,7 @@ def fuse_conv3d(graph: torch.fx.Graph) -> None:
         output = node
         if residual is not None:
             output, args[-1] = residual
-        if padding is None and target == _CONV and residual is None:
+        if target == _CONV and residual is None:
             continue
         # A residual may have been produced after the convolution in graph order.
         with graph.inserting_before(output):
@@ -198,16 +180,10 @@ class _CompilePass(CustomGraphPass):
         fuse_conv3d(graph)
 
     def uuid(self) -> bytes:
-        files = [
-            __file__,
-            _ops.__file__,
-            _validation.__file__,
-            reference.__file__,
-            *_backend.source_files(),
-        ]
+        files = [__file__, *convolution_compile.source_files()]
         return get_hash_for_files(
             tuple(files),
-            extra="minimax-h3-convrot-int8-conv3d-v1",
+            extra="minimax-h3-convrot-int8-conv3d-v2",
         )
 
 

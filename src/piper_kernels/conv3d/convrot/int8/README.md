@@ -2,8 +2,25 @@
 
 For a first conversion and inference example, see
 [weights](../../../../../docs/weights.md). `ConvRotInt8Tensor` represents both
-linear and convolution weights. `ConvRotInt8Conv3d` owns the inference layer's
-bias, stride, and padding; quantization state belongs to the weight.
+linear and convolution weights, including ordinary `F.conv3d`/`nn.Conv3d` calls.
+Layers own bias, stride, and padding; quantization state belongs to the weight.
+
+## Implementation boundaries
+
+The functional and storage boundaries follow ConvRot INT8 linear's conventions:
+
+- `_arguments.py` binds Python/ATen calls for eager execution and compiler
+  rewrites, then resolves supported stride and padding geometry.
+- `_functional.py` adapts tensor-subclass dispatch to typed execution, applies
+  standard-call autocast, and implements the causal convenience functions.
+- `dispatch.py` owns inference and storage validation before custom-op dispatch.
+- `_ops.py` defines stable custom-op schemas, fake implementations, and runtime
+  backend selection. `_validation.py` supplies the shared metadata checks.
+
+Convolution custom operators retain a portable reference runtime because the
+pre-grad padding pass emits them on CPU as well as GPU. Compiler integration is
+loaded only when compile options are requested. Its cache keys track each of
+these boundaries and the backend implementations.
 
 ## Data and execution contract
 
@@ -16,12 +33,20 @@ bias, stride, and padding; quantization state belongs to the weight.
 | Weight `scale` | Contiguous FP32 `[out, 1]`, one per output channel. |
 | `act_per_tensor_scale` | One finite positive FP32 scalar tensor on the weight device, shared across positions, frames, and calls. Execution requires it; conversion/dequantization can omit it. |
 | Input channels | Powers of two from 64 through 4096, divisible by rotation group size 16, 64, or 256. This bounds the full `27 * channels` INT32 sum. |
-| Bias | Optional FP16 vector, one value per output channel; noncontiguous storage is supported. |
+| Bias | Optional FP16/FP32 vector, one value per output channel; noncontiguous storage is supported. |
 
-Temporal padding adds two zero frames before the input. Spatial padding is
-`reflect`, `reflect_right` (bottom/right only), or `none`; reflection requires
-height and width greater than one. Strides are three positive integers.
-Dilation and convolution groups are unsupported.
+Standard calls use PyTorch stride and padding geometry: nonnegative symmetric
+zero padding, `"valid"`, or `"same"` with stride 1. `padding=0` adds nothing.
+Activations are batched NCTHW; groups=1 and dilation=1 are required. FP16 autocast
+casts eligible FP32 activations/bias; BF16 autocast is unsupported. Output is
+always FP16, independent of logical weight dtype.
+
+The explicit `ConvRotInt8Conv3d`, `conv3d`, and `group_norm_silu_conv3d` APIs retain
+their causal contract: two zero frames before the input, with spatial padding
+`reflect`, `reflect_right` (bottom/right only), or `none`. Reflection requires
+height and width greater than one. These APIs resolve that geometry into the
+same kernel's explicit padding configuration; they do not define another
+convolution implementation. Their FP32 inputs retain precision under autocast.
 
 GroupNorm statistics, affine transforms, SiLU, rotation, rescaling, bias, and
 residual addition use FP32 intermediates; INT8 products accumulate in INT32.
@@ -77,6 +102,32 @@ activation scale. Offload validation requires canonical contiguous storage and
 never repacks it. There is no prepared-weight cache: compiled calls read current
 weight tensors and observe weight or activation-scale replacement.
 
+## Padding and compilation
+
+The internal convolution accepts six nonnegative padding amounts in `F.pad`
+order (width, height, time; before/after per axis). Time boundaries supply zeros;
+spatial boundaries supply zeros or reflection. Reflection amounts must be
+smaller than the corresponding input dimension. Output shapes, execution-plan
+selection, the portable reference, and GPU indexing use this same geometry.
+GPU loads supply boundary values directly, so fused execution prepares only
+original pixels and avoids materializing padded activations.
+
+```python
+from piper_kernels.conv3d.convrot.int8 import convrot_int8_conv3d_compile_options
+
+compiled = torch.compile(model, fullgraph=True, options=convrot_int8_conv3d_compile_options())
+```
+
+The optional pre-grad pass lowers standard quantized convolution calls and
+absorbs exclusive chains of zero padding and spatial reflection. It reads live
+weight storage through the graph, including activation-scale replacement.
+Padding fusion preserves autocast rounding. Shared pads, nonzero constant pads,
+cropping, temporal reflection, and combinations of spatial zero/reflection
+borders not represented by the kernel remain separate operations. Fusion uses
+static shapes; ordinary compiled execution also supports dynamic shapes.
+Correctness never depends on matching a padding pattern. Original floating-point
+convolutions are left unchanged.
+
 ## Backend ownership
 
 Optimized execution targets NVIDIA SM120/SM8x and RDNA4 (`gfx1200`/`gfx1201`);
@@ -122,14 +173,18 @@ encoder.compile(
 )
 ```
 
-Run under `torch.no_grad()` or inference mode. The pre-grad rewrite matches
-framewise GroupNorm, SiLU, reflection padding, and optional residual around an
-explicit ConvRot convolution. It requires static shapes and leaves unsupported
+Run under `torch.no_grad()` or inference mode. The pre-grad rewrite includes
+the generic padding pass and matches framewise GroupNorm, SiLU, and optional
+residual around standard or explicit ConvRot convolutions. It requires static shapes and leaves unsupported
 or shared patterns unfused. It does not quantize floating-point Conv3D nodes.
 
-Keep original forwards. For downsamplers, retain the caller's bottom/right
-reflection and set the convolution to `padding="none"` so the compiler absorbs
-the pad. Use `reflect_right` only when caller-side padding has been removed.
+Keep original forwards and ordinary convolution modules, installing prequantized
+weights without replacing the layers. H3's explicit temporal zero padding and
+spatial reflection are absorbed into the shared convolution when the graph
+matches. The specialization also removes intermediate FP16 rounding, including
+a Conv3D autocast conversion, when fusing normalization/SiLU. For existing causal
+wrappers, retain any caller-side bottom/right reflection and select spatial
+`padding="none"`; use `reflect_right` only if that caller-side pad is absent.
 Encoder options are independent of, and composable with, decoder options.
 
 The fused boundary has separate statistics, preparation, and convolution

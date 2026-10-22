@@ -1,21 +1,21 @@
-"""Validated static-scale ConvRot INT8 causal convolution operations."""
+"""Stable ConvRot INT8 convolution schemas with runtime backend selection.
+
+Storage dispatch validates eager calls; fake implementations share its metadata
+contracts during compilation. Runtime bodies also serve compiler rewrites.
+"""
 
 from __future__ import annotations
 
-from typing import Literal, cast
+from typing import cast
 
 import torch
 
-from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-
 from . import _backend, reference
+from ._padding import Padding
 from ._validation import (
     _validate_common,
-    _validate_inference,
     _validate_norm,
 )
-
-type SpatialPadding = Literal["none", "reflect", "reflect_right"]
 
 
 @torch.library.custom_op(
@@ -30,22 +30,10 @@ def _conv3d_op(
     group_size: int,
     input_scale: torch.Tensor,
     stride: list[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: list[int],
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
-    _validate_common(
-        input,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        input_scale,
-        stride,
-        symmetric_spatial_padding,
-        right_spatial_padding,
-        residual,
-    )
     backend = _backend.select_backend(input) or reference
     return backend.conv3d(
         input,
@@ -55,8 +43,8 @@ def _conv3d_op(
         group_size,
         input_scale,
         cast(tuple[int, int, int], tuple(stride)),
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=cast(Padding, tuple(padding)),
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 
@@ -70,8 +58,8 @@ def _conv3d_fake(
     group_size: int,
     input_scale: torch.Tensor,
     stride: list[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: list[int],
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     shape = _validate_common(
@@ -82,8 +70,8 @@ def _conv3d_fake(
         group_size,
         input_scale,
         stride,
-        symmetric_spatial_padding,
-        right_spatial_padding,
+        cast(Padding, tuple(padding)),
+        spatial_reflection,
         residual,
     )
     return input.new_empty(shape, dtype=torch.float16)
@@ -105,24 +93,10 @@ def _group_norm_silu_conv3d_op(  # noqa: PLR0913, PLR0917
     group_size: int,
     input_scale: torch.Tensor,
     stride: list[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: list[int],
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
-    _validate_common(
-        input,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        input_scale,
-        stride,
-        symmetric_spatial_padding,
-        right_spatial_padding,
-        residual,
-    )
-    _validate_norm(input, norm_weight, norm_bias, norm_groups, norm_epsilon)
-
     backend = _backend.select_backend(input) or reference
     return backend.group_norm_silu_conv3d(
         input,
@@ -136,8 +110,8 @@ def _group_norm_silu_conv3d_op(  # noqa: PLR0913, PLR0917
         group_size,
         input_scale,
         cast(tuple[int, int, int], tuple(stride)),
-        symmetric_spatial_padding=symmetric_spatial_padding,
-        right_spatial_padding=right_spatial_padding,
+        padding=cast(Padding, tuple(padding)),
+        spatial_reflection=spatial_reflection,
         residual=residual,
     )
 
@@ -155,8 +129,8 @@ def _group_norm_silu_conv3d_fake(  # noqa: PLR0913, PLR0917
     group_size: int,
     input_scale: torch.Tensor,
     stride: list[int],
-    symmetric_spatial_padding: bool,
-    right_spatial_padding: bool,
+    padding: list[int],
+    spatial_reflection: bool,
     residual: torch.Tensor | None,
 ) -> torch.Tensor:
     shape = _validate_common(
@@ -167,81 +141,9 @@ def _group_norm_silu_conv3d_fake(  # noqa: PLR0913, PLR0917
         group_size,
         input_scale,
         stride,
-        symmetric_spatial_padding,
-        right_spatial_padding,
+        cast(Padding, tuple(padding)),
+        spatial_reflection,
         residual,
     )
     _validate_norm(input, norm_weight, norm_bias, norm_groups, norm_epsilon)
     return input.new_empty(shape, dtype=torch.float16)
-
-
-def _padding_flags(padding: SpatialPadding) -> tuple[bool, bool]:
-    if padding not in ("none", "reflect", "reflect_right"):
-        raise ValueError(f"unsupported ConvRot INT8 Conv3D spatial padding mode {padding!r}")
-    return padding == "reflect", padding == "reflect_right"
-
-
-def _weight_storage(
-    weight: ConvRotInt8Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
-    if not isinstance(weight, ConvRotInt8Tensor) or weight.ndim != 5:
-        raise TypeError("ConvRot INT8 Conv3D requires a 5-D ConvRotInt8Tensor weight")
-    if weight.act_per_tensor_scale is None:
-        raise ValueError("ConvRot INT8 Conv3D requires a static activation scale on the weight")
-    return weight.qdata, weight.scale, weight.group_size, weight.act_per_tensor_scale
-
-
-def conv3d(
-    input: torch.Tensor,  # noqa: A002
-    weight: ConvRotInt8Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    stride: tuple[int, int, int] = (1, 1, 1),
-    padding: SpatialPadding,
-    residual: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Apply a causal 3-D convolution with a static-scale ConvRot INT8 weight."""
-    qdata, scale, group_size, input_scale = _weight_storage(weight)
-    _validate_inference((input, weight, scale, input_scale, bias, residual))
-    symmetric, right = _padding_flags(padding)
-    return _conv3d_op(
-        input, qdata, scale, bias, group_size, input_scale, list(stride), symmetric, right, residual
-    )
-
-
-def group_norm_silu_conv3d(
-    input: torch.Tensor,  # noqa: A002
-    norm_weight: torch.Tensor,
-    norm_bias: torch.Tensor,
-    norm_groups: int,
-    norm_epsilon: float,
-    weight: ConvRotInt8Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    stride: tuple[int, int, int] = (1, 1, 1),
-    padding: SpatialPadding,
-    residual: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Fuse framewise GroupNorm and SiLU into a causal convolution boundary."""
-    qdata, scale, group_size, input_scale = _weight_storage(weight)
-    _validate_inference((input, norm_weight, norm_bias, weight, scale, input_scale, bias, residual))
-    symmetric, right = _padding_flags(padding)
-    return _group_norm_silu_conv3d_op(
-        input,
-        norm_weight,
-        norm_bias,
-        norm_groups,
-        norm_epsilon,
-        qdata,
-        scale,
-        bias,
-        group_size,
-        input_scale,
-        list(stride),
-        symmetric,
-        right,
-        residual,
-    )
-
-
-__all__ = ["SpatialPadding", "conv3d", "group_norm_silu_conv3d"]
