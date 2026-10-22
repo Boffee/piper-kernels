@@ -41,7 +41,10 @@ class StandardGELUPreparation:
             if dynamic_activation_scale
             else activation_per_tensor_scale
         )
-        assert per_tensor_scale is not None
+        if per_tensor_scale is None:
+            return nvfp4_backend.prepare_static(
+                projections, None, activation_fn="gelu_tanh", high_first=self.high_first
+            )
         qdata, scale = nvfp4_backend._prepare_static_storage(
             projections,
             per_tensor_scale,

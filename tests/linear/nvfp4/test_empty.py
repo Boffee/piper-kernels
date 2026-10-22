@@ -89,6 +89,8 @@ def test_empty_cuda_linear_matches_dense(dtype, dynamic, group_size, compiled, p
                 torch.testing.assert_close(result, expected)
 
 
-def test_empty_static_preparation_still_requires_scale():
-    with pytest.raises(ValueError, match="per-tensor scale"):
-        reference.prepare_input(torch.empty(0, 32), None, False)
+def test_empty_static_preparation_uses_unit_scale_when_omitted():
+    qdata, scale, global_scale = reference.prepare_input(torch.empty(0, 32), None, False)
+    assert qdata.shape == (0, 16)
+    assert not scale.numel()
+    torch.testing.assert_close(global_scale, torch.tensor(1.0))

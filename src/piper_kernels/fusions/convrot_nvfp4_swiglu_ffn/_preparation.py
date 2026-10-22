@@ -118,6 +118,8 @@ def prepare(
     contiguous_input, rows, features, chunks, target = convrot_backend._validate_input(
         projections, group_size, "swiglu"
     )
+    if not dynamic_activation_scale and per_tensor_scale is None:
+        per_tensor_scale = projections.new_ones((), dtype=torch.float32)
     if not dynamic_activation_scale and (
         per_tensor_scale is None
         or per_tensor_scale.shape != ()

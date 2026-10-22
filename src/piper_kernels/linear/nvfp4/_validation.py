@@ -68,13 +68,12 @@ def validate_activation_scale(
 ) -> None:
     """Validate metadata for one NVFP4 activation's global-scale configuration.
 
-    Scale values are caller preconditions; see docs/development.md#validation-contract.
+    Static None means unit global scale. Supplied scale values are caller
+    preconditions; see docs/development.md#validation-contract.
     """
     if not isinstance(dynamic_activation_scale, bool):
         raise ValueError(f"{name} dynamic activation scale flag must be boolean")
-    if not _valid_scalar(activation_per_tensor_scale) or (
-        not dynamic_activation_scale and activation_per_tensor_scale is None
-    ):
+    if not _valid_scalar(activation_per_tensor_scale):
         raise ValueError(f"{name} static activation scale must be an FP32 scalar")
     if activation_per_tensor_scale is not None and activation_per_tensor_scale.device != device:
         raise ValueError(f"{name} activation scale must share the input device")

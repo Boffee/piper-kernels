@@ -23,7 +23,7 @@ def prepare_input(
     *,
     group_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare activations using only PyTorch rotation and quantization operations."""
+    """Prepare activations in PyTorch; static None means unit global scale."""
     activated = apply_input_activation(input, activation_fn)
     if group_size:
         activated = rotate_groups(activated.float(), group_size)
@@ -34,7 +34,7 @@ def prepare_input(
         elif activation_per_tensor_scale is not None:
             global_scale = activation_per_tensor_scale.clone()
         else:
-            raise ValueError("static NVFP4 preparation requires a per-tensor scale")
+            global_scale = input.new_ones((), dtype=torch.float32)
         return (
             input.new_empty(_layout.qdata_shape(0, flattened.shape[1]), dtype=torch.uint8),
             input.new_empty(_layout.scale_shape(0, flattened.shape[1]), dtype=torch.float8_e4m3fn),
@@ -46,7 +46,7 @@ def prepare_input(
         else activation_per_tensor_scale
     )
     if global_scale is None:
-        raise ValueError("static NVFP4 preparation requires a per-tensor scale")
+        global_scale = input.new_ones((), dtype=torch.float32)
     qdata, scale = quantize_nvfp4(flattened, global_scale, swizzled=True)
     if high_first:
         qdata = _layout.swap_packed_pairs(qdata)

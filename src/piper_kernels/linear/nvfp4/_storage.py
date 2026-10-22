@@ -12,8 +12,10 @@ def prepare_activation_storage(
     rows: int,
     features: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    initialize_padding: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate or view caller-owned canonical activation storage."""
+    """Allocate or view canonical storage; callers may initialize padding in their kernel."""
     qdata_dimensions = cast(tuple[int, int], qdata_shape(rows, features))
     scale_dimensions = cast(tuple[int, int], scale_shape(rows, features))
     scale_elements = scale_dimensions[0] * scale_dimensions[1]
@@ -37,6 +39,6 @@ def prepare_activation_storage(
             raise ValueError("NVFP4 activation storage is incompatible")
         qdata = qdata_storage[:rows]
         scale = scale_storage.flatten()[:scale_elements].view(scale_dimensions)
-    if has_scale_padding(rows, features):
+    if initialize_padding and has_scale_padding(rows, features):
         scale.zero_()
     return qdata, scale

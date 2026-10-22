@@ -67,8 +67,6 @@ def _prepare_compiled(
         )
     if dynamic_activation_scale:
         return _compiled_prepare_dynamic(input, activation_fn, high_first)
-    if activation_per_tensor_scale is None:
-        raise ValueError("static NVFP4 activation preparation requires a per-tensor scale")
     return nvfp4_triton.prepare_static(
         input,
         activation_per_tensor_scale,
@@ -119,7 +117,7 @@ def linear(
     dynamic_activation_scale: bool,
     high_first: bool = False,
 ) -> torch.Tensor:
-    """Quantize an activation and apply a standard swizzled NVFP4 W4A4 weight."""
+    """Apply a swizzled NVFP4 W4A4 weight; static None selects unit global input scale."""
     if input.numel() == 0:
         _validation.validate_semantic_linear(
             input,

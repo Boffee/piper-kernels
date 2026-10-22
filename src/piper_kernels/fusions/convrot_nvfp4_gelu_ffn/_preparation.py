@@ -40,7 +40,8 @@ class ConvRotGELUPreparation:
             if dynamic_activation_scale
             else activation_per_tensor_scale
         )
-        assert per_tensor_scale is not None
+        if per_tensor_scale is None:
+            per_tensor_scale = projections.new_ones((), dtype=torch.float32)
         qdata, scale = convrot_backend._prepare_static_storage(
             validated_input,
             per_tensor_scale,

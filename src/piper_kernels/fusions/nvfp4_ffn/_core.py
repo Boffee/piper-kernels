@@ -213,15 +213,19 @@ def _source_per_tensor_scales(
     preparation: SourcePreparationBackend,
 ) -> tuple[torch.Tensor, ...]:
     dynamic_scale: torch.Tensor | None = None
+    unit_scale: torch.Tensor | None = None
     scales = []
     for source in sources:
         if source.dynamic_activation_scale:
             if dynamic_scale is None:
                 dynamic_scale = preparation.dynamic_scale(input)
             scales.append(dynamic_scale)
-        else:
-            assert source.activation_per_tensor_scale is not None
+        elif source.activation_per_tensor_scale is not None:
             scales.append(source.activation_per_tensor_scale)
+        else:
+            if unit_scale is None:
+                unit_scale = input.new_ones((), dtype=torch.float32)
+            scales.append(unit_scale)
     return tuple(scales)
 
 
@@ -279,6 +283,7 @@ def run_chunked_ffn(
         input,
         workspace_rows,
         input_features,
+        initialize_padding=False,
     )
     projection_workspace = torch.empty(
         (workspace_rows, len(sources) * intermediate_features),
