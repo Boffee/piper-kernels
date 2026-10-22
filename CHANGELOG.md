@@ -31,8 +31,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   scale in its quantization kernel. Disabling dynamic scaling with no activation-scale
   tensor declares unit scaling, allowing compiled QKV and FFN projections to share
   quantization after independent weight transfers. Identical input autocasts used
-  only by NVFP4 linears are coalesced before preparation sharing. Ordinary and ConvRot FFNs accept
-  the same unit-scale metadata.
+  only by NVFP4 linears are coalesced before preparation sharing. Ordinary and ConvRot
+  FFNs and sparse-attention output projections accept the same unit-scale metadata.
 - NVFP4 activation preparation, portable weight construction, and weight updates
   retain E4M3 subnormal block scales, matching FlashInfer's scale handling instead
   of clamping to `1/64`. Blocks whose scales underflow reconstruct to zero, and

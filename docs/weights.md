@@ -121,9 +121,10 @@ set `use_dynamic_per_tensor_scale=False` and supply `act_per_tensor_scale` to th
 weight constructor: a finite positive FP32 scalar on the weight device, calibrated
 in the stored basis.
 With dynamic scaling disabled, omitting `act_per_tensor_scale` declares a unit
-global activation scale. This metadata survives independent weight transfers,
-so compiled projections of the same input (such as Q, K, and V) share one
-quantization. Supplied scalar tensors share preparation only when they share
+global activation scale. The same contract applies to ordinary and ConvRot FFN
+and sparse-attention output fusions. Unit-scale metadata survives independent
+weight transfers, so compiled projections of the same input (such as Q, K, and V)
+share one quantization. Supplied scalar tensors share preparation only when they share
 the same graph value; the compiler does not compare their contents.
 Repeated casts of the same source to the same dtype are shared before preparation
 when their outputs are consumed exclusively by NVFP4 linears.

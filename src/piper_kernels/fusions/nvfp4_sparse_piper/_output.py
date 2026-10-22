@@ -235,7 +235,11 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
     output_common.AttentionProjector | None,
     tuple[torch.Tensor, ...],
 ]:
-    """Build static chunk or global dynamic projection with reusable packing storage."""
+    """Build static chunk or global dynamic projection with reusable packing storage.
+
+    Static None materializes one unit scalar for all chunks. Returned tensors
+    retain both packing storage and the static scale on the consumer stream.
+    """
     input_features, output_features = _validate_output_projection(
         attention_storage,
         weight_qdata,
@@ -305,7 +309,12 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
 
         return output_features, None, project_attention, ()
 
-    assert activation_per_tensor_scale is not None
+    # Resolve unit metadata once; every chunk uses the same device scalar.
+    static_scale = (
+        attention_storage.new_ones((), dtype=torch.float32)
+        if activation_per_tensor_scale is None
+        else activation_per_tensor_scale
+    )
     storage = allocate_storage()
 
     def project_chunk(
@@ -318,11 +327,11 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
             project_rows(
                 attention_chunk[batch_index, :rows].reshape(rows, input_features),
                 output[batch_index, start : start + rows],
-                activation_per_tensor_scale,
+                static_scale,
                 storage,
             )
 
-    return output_features, project_chunk, None, storage
+    return output_features, project_chunk, None, (*storage, static_scale)
 
 
 def run_attention_output(  # noqa: PLR0913, PLR0917
@@ -358,7 +367,7 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
 ) -> torch.Tensor:
-    """Project bounded attention with a calibrated or global dynamic scale."""
+    """Project bounded attention with unit, calibrated, or global dynamic scaling."""
     if query_chunk_rows is None:
         query_chunk_rows = default_query_chunk_rows(dynamic_activation_scale)
     prepared = output_common.prepare_attention(
