@@ -5,6 +5,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Sage INT8 Q/K quantization and ConvRot INT8 prepared-input means use 64-bit
+  address arithmetic before multiplying row, head, and batch indices by strides.
+  Large tensors could otherwise overflow signed 32-bit offsets and cause illegal
+  memory accesses or corrupt results.
+
 ## [0.7.6] - 2026-10-21
 
 ### Added
