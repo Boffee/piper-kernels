@@ -126,3 +126,44 @@ def test_prepared_query_key_is_shared_quantization_contract(grouped: bool) -> No
     assert torch.equal(actual.key, expected_key)
     assert torch.equal(actual.query_scale, expected_query_scale)
     assert torch.equal(actual.key_scale, expected_key_scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("large_device_memory")
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("strided_axis", [0, 1, 2], ids=["batch", "head", "sequence"])
+def test_query_key_quantization_preserves_offsets_above_int32(
+    grouped: bool, strided_axis: int
+) -> None:
+    """Small logical tensors exercise addresses beyond 2**31 elements."""
+    if torch.cuda.mem_get_info()[0] < 7 * 2**30:
+        pytest.skip("requires 7 GiB free for strided input and output storage")
+    shape = [1, 1, 1, 128]
+    shape[strided_axis] = 3
+    torch.manual_seed(83)
+    compact = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    strides = list(compact.stride())
+    strides[strided_axis] = 2**30
+    value = torch.empty_strided(shape, strides, device="cuda", dtype=torch.bfloat16)
+    value.copy_(compact)
+    mean = compact.float().mean(dim=2)
+
+    expected_query, expected_query_scale = triton_qk_quantization.prepare_query(
+        compact, 128**-0.5, grouped=grouped
+    )
+    query, query_scale = triton_qk_quantization.prepare_query(value, 128**-0.5, grouped=grouped)
+    torch.testing.assert_close(query, expected_query, atol=0, rtol=0)
+    torch.testing.assert_close(query_scale, expected_query_scale, atol=0, rtol=0)
+
+    expected_key, expected_key_scale = triton_qk_quantization.prepare_key(
+        compact, mean, grouped=grouped, storage_key_length=shape[2]
+    )
+    # Exercise wide output offsets too; prepare_query owns compact output storage.
+    key = torch.empty_strided(shape, strides, device="cuda", dtype=torch.int8)
+    key_scale = torch.empty_like(expected_key_scale)
+    triton_qk_quantization.prepare_key(
+        value, mean, grouped=grouped, storage_key_length=shape[2], out=(key, key_scale)
+    )
+    torch.testing.assert_close(key, expected_key, atol=0, rtol=0)
+    torch.testing.assert_close(key_scale, expected_key_scale, atol=0, rtol=0)

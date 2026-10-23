@@ -187,6 +187,10 @@ def quantize_query_per_thread_group(
     head_dim: tl.constexpr,
 ):
     """Quantize one per-thread Q scale group for standalone or fused launchers."""
+    # A head or sequence stride can fit INT32 while its row offset does not.
+    scale_group = scale_group.to(tl.int64)
+    head = head.to(tl.int64)
+    batch = batch.to(tl.int64)
     query_block = scale_group // 8
     thread = scale_group % 8
     offsets_n = query_block * 32 + tl.arange(0, 4) * 8 + thread
@@ -279,9 +283,9 @@ def quantize_query_per_warp_kernel(
     stride_sh,
     head_dim: tl.constexpr,
 ):
-    scale_group = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
+    scale_group = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
     offsets_n = scale_group * 32 + tl.arange(0, 32)
     offsets_d = tl.arange(0, head_dim)
     mask = offsets_n[:, None] < query_length
@@ -335,6 +339,9 @@ def quantize_key_per_thread_group(
     head_dim: tl.constexpr,
 ):
     """Quantize one per-thread K scale group for standalone or fused launchers."""
+    scale_group = scale_group.to(tl.int64)
+    head = head.to(tl.int64)
+    batch = batch.to(tl.int64)
     key_block = scale_group // 4
     thread = scale_group % 4
     group_offsets = tl.arange(0, 16)
@@ -432,9 +439,9 @@ def quantize_key_per_block_kernel(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    scale_group = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
+    scale_group = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
     offsets_n = scale_group * block_n + tl.arange(0, block_n)
     offsets_d = tl.arange(0, head_dim)
     mask = offsets_n[:, None] < key_length

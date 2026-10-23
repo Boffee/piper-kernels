@@ -28,9 +28,9 @@ def _dequantized_input_mean_partial_kernel(
     block_k: tl.constexpr,
 ):
     """Sum one row block of the activation represented by prepared ConvRot storage."""
-    row_block = tl.program_id(0)
-    feature_block = tl.program_id(1)
-    batch = tl.program_id(2)
+    row_block = tl.program_id(0).to(tl.int64)
+    feature_block = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
     sequence_offsets = row_block * block_m + tl.arange(0, block_m)
     feature_offsets = feature_block * block_k + tl.arange(0, block_k)
     valid = (sequence_offsets[:, None] < sequence_length) & (
@@ -76,8 +76,8 @@ def _dequantized_input_mean_reduce_kernel(
     block_k: tl.constexpr,
 ):
     """Reduce prepared-input partial sums to one FP32 feature mean per batch."""
-    feature_block = tl.program_id(0)
-    batch = tl.program_id(1)
+    feature_block = tl.program_id(0).to(tl.int64)
+    batch = tl.program_id(1).to(tl.int64)
     row_offsets = tl.arange(0, reduction_rows)
     feature_offsets = feature_block * block_k + tl.arange(0, block_k)
     partial = tl.load(

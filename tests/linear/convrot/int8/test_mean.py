@@ -73,3 +73,25 @@ def test_prepared_mean_custom_op_and_compilation():
     torch.testing.assert_close(
         compiled(qdata, scale), torch.full((2, 272), 0.125, device="cuda"), rtol=2e-6, atol=2e-6
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+@pytest.mark.usefixtures("large_device_memory")
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("padded", [False, True])
+def test_prepared_mean_preserves_offsets_above_int32(batch: int, padded: bool) -> None:
+    if torch.cuda.mem_get_info()[0] < 3 * 2**30:
+        pytest.skip("requires 3 GiB free for more than 2**31 INT8 elements")
+    sequence = (2**18 + 128) // batch
+    features = 8192
+    qdata = torch.ones((batch, sequence, features), device="cuda", dtype=torch.int8)
+    scale = torch.full((batch, sequence), 0.125, device="cuda")
+    lengths = None
+    if padded:
+        lengths = torch.full((sequence // 64,), 64, device="cuda", dtype=torch.int32)
+        lengths[-1] = 32
+        qdata[:, -32:] = 99
+    actual = _ops.dequantized_input_mean(qdata, scale, lengths)
+    expected = torch.full((batch, features), 0.125, device="cuda")
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
