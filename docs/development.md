@@ -37,11 +37,72 @@ The source-local READMEs explain implementation details for
 [Conv3D](../src/piper_kernels/conv3d/convrot/int8/README.md).
 Tests follow the operator and format structure in [`tests/`](../tests).
 
+## Code conventions
+
+Target Python 3.13 and the Ruff and Pyright settings in
+[`pyproject.toml`](../pyproject.toml). Use typed interfaces between modules;
+structured values shared across stages should have types that express their
+fields and invariants. Contain `Any` at external or dynamic boundaries and
+explain why it is needed there.
+
+Keep one name for a concept in code and prose. Preserve documented public names,
+serialized fields, and external names required for compatibility; translate
+external terminology at its integration boundary. For new interfaces:
+
+- Functions start with a verb describing their operation. Use `build_` to
+  assemble a value, `resolve_` to settle a specification, `compute_` to derive a
+  value from data, and `validate_` to check a contract. `select_` chooses an
+  implementation or plan; `require_` raises when the requested support is
+  unavailable. Keep framework callbacks and alternate constructors consistent
+  with their established conventions.
+- Variables name the values they hold. Use plural nouns for collections and
+  predicates such as `has_padding` for booleans. Scalar counts use `num_<things>`,
+  individual indices use `<thing>_index`, and slice boundaries use `start_<unit>`
+  and exclusive `end_<unit>`.
+- Mathematical and kernel notation such as `q`, `k`, `v`, `M`, `N`, `K`, and
+  `BLOCK_M` is appropriate in numerical code. Make units explicit when a value
+  could mean bytes, elements, tokens, or blocks; ordinary orchestration uses
+  descriptive names.
+- Put shared internal helpers in the private module that owns them, with names
+  that callers can import without extending a public module's API. Prefer a
+  leading underscore on symbols used only within their module or class. A
+  module's `__all__`, when present, lists the names it intends callers to use.
+  Package compatibility follows [VERSIONING.md](../VERSIONING.md), including
+  its distinction between public APIs and private modules.
+
+## Documentation ownership
+
+Write for the reader's task. Lead with the behavior or decision they need, then
+explain the relevant constraints. Use plain language, concrete terms, short
+paragraphs, and small examples. Keep explanations concise while preserving the
+contract and important numerical distinctions. Remove repetition and details
+that do not help the reader use or maintain the code.
+
+Topic guides explain subsystem concepts, ownership, invariants, and how APIs
+work together. Public API docstrings state the behavior and constraints needed
+to make a valid call and interpret its result, including relevant tensor layouts,
+numerical behavior, mutation, and backend support. Reuse an existing contract
+when it already covers the requirement.
+
+Module docstrings and source-local READMEs explain algorithms, packed layouts,
+internal assumptions, and execution-plan rationale. Benchmark tools and their
+help own specialized experiments and measurement controls; the benchmark guide
+owns shared methodology. Preserve useful information with its owner and link
+to it, rather than maintaining the same explanation in several places.
+Implementation details belong in caller-facing documentation when they affect
+valid usage or observable behavior.
+
 ## Validation contract
 
 This is a library-wide API contract, including inference, dispatch, compiler
 rewrites, fake/meta implementations, and weight wrappers constructed or
 reconstructed from supplied storage, including views and device moves.
+
+Assign each metadata or configuration check to the boundary that owns the
+contract. Internal stages can rely on guarantees already established along
+their call path; independent entry points still need their required checks.
+Share validation when several entry points own the same contract. Do not repeat
+checks throughout a pipeline solely because values pass through another helper.
 
 Validation may inspect host metadata: shapes, dtypes, devices, layouts/strides,
 gradient flags, and Python configuration. Keep checks for supported storage and
@@ -160,14 +221,24 @@ when no processes are using them. The next run rebuilds missing artifacts.
 Temporary-directory cleanup and reboot retention depend on the chosen filesystem
 and operating-system configuration.
 
+### Writing tests
+
+Build only what a test exercises. Put tests beside the operator or subsystem they
+cover, prefer fixtures in local `conftest.py` files, and isolate filesystem state
+with temporary paths. Load optional backends and fixture dependencies when the
+test needs them. Test shared validation at its owning layer, with representative
+integration cases for each caller.
+
 Extend existing cases while preserving numerical oracles, storage invariants, and
 distinct failure checks. Keep helpers focused on shared mechanics. Parametrize
 meaningful format, layout, and device boundaries without multiplying cases that
 execute the same path. Related checks may share a process when their isolation
-requirements still hold. When reducing a matrix, name the retained numerical or
-failure tests that cover the omitted combinations. Compare repeated pytest runs
-with matching workers, threads, hardware, and caches; fewer cases alone do not
-establish a speedup.
+requirements still hold. Fresh-process import checks must preserve their cold
+import order and keep forbidden imports blocked throughout the check.
+When reducing a matrix, name the retained numerical or failure tests that cover
+the omitted combinations. Use `--durations=20` to distinguish fixture cost from
+test execution. Compare repeated pytest runs with matching workers, threads,
+hardware, and caches; fewer cases alone do not establish a speedup.
 
 ## Accelerator environments
 
