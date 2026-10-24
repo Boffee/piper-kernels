@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-23
+
 ### Fixed
 
 - Sage INT8 Q/K quantization and ConvRot INT8 prepared-input means use 64-bit
