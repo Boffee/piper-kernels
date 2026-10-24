@@ -109,6 +109,29 @@ Native sparse backends cover NVIDIA SM89/SM120 and AMD RDNA4. Other devices run 
 portable quantized reference. There is a separate exact sparse reference for
 quality comparisons; it is not the fallback used by this API.
 
+### Caller-forced tiles (experimental)
+
+The experimental fixed-budget forced-routing path additionally accepts
+`force_tile_ids` (contiguous device INT32 `[query_blocks, capacity]`) and
+`force_tile_counts` (contiguous device INT32 `[query_blocks]`). Active IDs in each
+row's counted prefix are shared across batches and heads. Every forced tile is
+included, and the remaining per-head budget is filled by ordinary score selection.
+Counts must lie in `[0, capacity]`; active IDs must be unique and lie in
+`[0, sparse_key_blocks)`, and each count must fit every affected head's resolved
+physical keep budget. These are caller preconditions, with metadata-only validation.
+Supply rows for every physical query block; dense query suffixes already include
+every key and ignore route selection. Unused ID slots are ignored.
+
+IDs and counts can change as tensor contents without recompiling; zero counts
+disable forcing without changing the compiled call. Graph replay uses updated
+contents in the captured input buffers. The prototype builds a compact membership
+bitset once per call and leaves routing scores, attention arithmetic, and route
+capacity unchanged. It uses a separate custom operator: existing projection/output
+fusion rewrites do not match forced calls yet. Calls without forced inputs retain
+their existing compiler boundary and fusions. See
+[`benchmark_sparse_piper_forced.py`](../benchmarks/benchmark_sparse_piper_forced.py)
+for the H3-sized overhead experiment.
+
 ### Coarse residual
 
 For models with a coarse branch, `sparse_piper_coarse_residual` returns a separate

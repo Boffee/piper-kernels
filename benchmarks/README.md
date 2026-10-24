@@ -117,6 +117,7 @@ records. Use complete-call suite results for integration comparisons.
 |---|---|
 | Attention preparation, compiler inspection, optional canonical Sage | [Dense attention diagnostic](benchmark_attention.py) |
 | Sparse stages and routing scores | [Sparse attention](benchmark_sparse_piper.py), [scores](benchmark_sparse_piper_scores.py) |
+| Fixed-budget caller-forced sparse tiles | [Forced-tile diagnostic](benchmark_sparse_piper_forced.py), [experiment notes](forced_tiles.md) |
 | Q/K/V projection phases | [Sparse projections](benchmark_sparse_piper_projection.py) |
 | Linear preparation, compiler inspection, optional external comparison | [Linear](benchmark_convrot_int8.py), [preparation](benchmark_convrot_int8_preparation.py) |
 | Convolution layouts, schedules, and standard-call fusion (`--standard-calls`) | [Conv3D](benchmark_convrot_int8_conv3d.py) |

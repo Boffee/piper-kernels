@@ -87,6 +87,7 @@ class SelectRoutes(Protocol):
         route_head_offsets: torch.Tensor,
         *,
         query_block_offset: int,
+        force_tile_mask: torch.Tensor | None = None,
     ) -> None: ...
 
 
