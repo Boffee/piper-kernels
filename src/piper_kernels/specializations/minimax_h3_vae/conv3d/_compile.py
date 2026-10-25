@@ -5,22 +5,17 @@ from collections.abc import Mapping
 
 import torch
 from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
+from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.nn import functional
 
 from piper_kernels.conv3d.convrot.int8 import _compile as convolution_compile
 from piper_kernels.conv3d.convrot.int8 import _validation
+from piper_kernels.conv3d.convrot.int8._compile import get_tensor_metadata
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
 _FUSED = torch.ops.piper_kernels.convrot_int8_group_norm_silu_conv3d.default
 
 type _NormSiluInput = tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node, int, float]
-
-
-def _value(node: object) -> torch.Tensor | None:
-    if not isinstance(node, torch.fx.Node):
-        return None
-    value = node.meta.get("example_value", node.meta.get("val"))
-    return value if isinstance(value, torch.Tensor) else None
 
 
 def _method(node: object, name: str) -> torch.fx.Node | None:
@@ -77,17 +72,23 @@ def _framewise_norm_silu(node: object) -> _NormSiluInput | None:  # noqa: PLR091
     contiguous = _method(folded, "view")
     permuted = _method(contiguous, "contiguous")
     source = _unpermute(permuted)
-    source_value = _value(source)
-    folded_value = _value(folded)
-    unfolded_value = _value(unfolded)
+    source_value = get_tensor_metadata(source)
+    folded_value = get_tensor_metadata(folded)
+    unfolded_value = get_tensor_metadata(unfolded)
     if source_value is None or folded_value is None or unfolded_value is None:
         return None
-    if source_value.ndim != 5 or any(type(size) is not int for size in source_value.shape):
+    if source_value.ndim != 5:
         return None
+    # Prove the framewise layout from existing shape relationships, without
+    # specializing activation dimensions to the tracing example.
     batch, channels, frames, height, width = source_value.shape
-    if tuple(folded_value.shape) != (batch * frames, channels, 1, height, width):
+    if not statically_known_true(
+        sym_eq(tuple(folded_value.shape), (batch * frames, channels, 1, height, width))
+    ):
         return None
-    if tuple(unfolded_value.shape) != (batch, frames, channels, height, width):
+    if not statically_known_true(
+        sym_eq(tuple(unfolded_value.shape), (batch, frames, channels, height, width))
+    ):
         return None
     assert source is not None
     norm_args = norm.args
@@ -102,7 +103,7 @@ def _framewise_norm_silu(node: object) -> _NormSiluInput | None:  # noqa: PLR091
         or type(epsilon) is not float
     ):
         return None
-    weight_value, bias_value = _value(weight), _value(bias)
+    weight_value, bias_value = get_tensor_metadata(weight), get_tensor_metadata(bias)
     if weight_value is None or bias_value is None:
         return None
     try:
@@ -124,14 +125,13 @@ def _residual(node: torch.fx.Node) -> tuple[torch.fx.Node, torch.fx.Node] | None
     ):
         return None
     other = consumer.args[1] if consumer.args[0] is node else consumer.args[0]
-    value, other_value = _value(node), _value(other)
+    value, other_value = get_tensor_metadata(node), get_tensor_metadata(other)
     if (
         not isinstance(other, torch.fx.Node)
         or other is node
         or value is None
         or other_value is None
-        or any(type(size) is not int for size in (*value.shape, *other_value.shape))
-        or value.shape != other_value.shape
+        or not statically_known_true(sym_eq(tuple(value.shape), tuple(other_value.shape)))
         or value.dtype != other_value.dtype
         or value.device != other_value.device
     ):

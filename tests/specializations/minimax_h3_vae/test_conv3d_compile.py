@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 from torch.nn import functional
 
 from piper_kernels.conv3d.convrot.int8 import ConvRotInt8Conv3d, group_norm_silu_conv3d
@@ -69,13 +70,14 @@ def _args(padding="reflect_right", device="cpu"):
     )
 
 
+@pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize("padding", ["reflect", "reflect_right"])
 @pytest.mark.parametrize("standard", [False, True])
-def test_export_fuses_framewise_norm_silu_padding_and_residual(padding, standard):
+def test_export_fuses_framewise_norm_silu_padding_and_residual(padding, standard, static):
     block = _Block(padding=padding, standard=standard)
     args = _args(padding)
     with torch.no_grad():
-        graph_module = torch._dynamo.export(block, assume_static_by_default=True)(
+        graph_module = torch._dynamo.export(block, assume_static_by_default=static)(
             *args
         ).graph_module
         fuse_conv3d(graph_module.graph)
@@ -101,12 +103,13 @@ def test_export_fuses_framewise_norm_silu_padding_and_residual(padding, standard
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize("options", [{"framewise": False}, {"shared": True}])
-def test_pass_preserves_temporal_group_norm_and_shared_activation(options):
+def test_pass_preserves_temporal_group_norm_and_shared_activation(options, static):
     block = _Block(**options)
     args = _args()
     with torch.no_grad():
-        graph_module = torch._dynamo.export(block, assume_static_by_default=True)(
+        graph_module = torch._dynamo.export(block, assume_static_by_default=static)(
             *args
         ).graph_module
         fuse_conv3d(graph_module.graph)
@@ -137,19 +140,31 @@ def test_pass_does_not_rewrite_with_gradients_enabled():
         ),
     ],
 )
-@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("autocast_input_dtype", [None, torch.float16, torch.float32])
 @pytest.mark.parametrize("standard", [False, True])
 def test_fullgraph_compiled_module_uses_live_weight_and_activation_scale(
-    device, autocast, standard
+    device, autocast_input_dtype, standard, dynamic
 ):
+    torch.compiler.reset()
     block = _Block(standard=standard).to(device=device)
-    if autocast:
+    if autocast_input_dtype is not None:
         block.norm.float()
     args = _args(device=device)
-    options = minimax_h3_vae_convrot_int8_conv3d_compile_options()
-    compiled = torch.compile(block, fullgraph=True, dynamic=False, options=options)
-    with torch.no_grad(), torch.autocast(device, dtype=torch.float16, enabled=autocast):
+    if autocast_input_dtype is not None:
+        args = (args[0].to(autocast_input_dtype), args[1])
+    capture = TargetCapturePass()
+    options = minimax_h3_vae_convrot_int8_conv3d_compile_options(
+        {"post_grad_custom_pre_pass": capture}
+    )
+    compiled = torch.compile(block, fullgraph=True, dynamic=dynamic, options=options)
+    with (
+        torch.no_grad(),
+        torch.autocast(device, dtype=torch.float16, enabled=autocast_input_dtype is not None),
+    ):
         actual = compiled(*args)
+        assert capture.targets.count(_FUSED) == 1
+        assert _CONV not in capture.targets
         expected = group_norm_silu_conv3d(
             args[0],
             block.norm.weight,
@@ -188,6 +203,7 @@ def test_fullgraph_compiled_module_uses_live_weight_and_activation_scale(
         )
         block.conv.weight = torch.nn.Parameter(replacement, requires_grad=False)
         torch.testing.assert_close(compiled(*args), args[1], atol=0, rtol=0)
+        assert capture.calls == 1
 
 
 def test_compile_options_preserve_existing_pre_grad_pass_and_are_idempotent():
@@ -210,3 +226,100 @@ def test_encoder_and_decoder_options_are_independent_and_composable():
     )
     assert decoder["post_grad_custom_pre_pass"]
     assert encoder["pre_grad_custom_pass"] == (compile_pass,)
+
+
+@pytest.mark.parametrize("standard", [False, True])
+@pytest.mark.parametrize("tile_view", [False, True])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+            ],
+        ),
+    ],
+)
+def test_dynamic_fusions_reuse_graphs_across_shapes_and_strides(device, tile_view, standard):
+    torch.compiler.reset()
+    block = _Block(standard=standard).to(device=device)
+    capture = TargetCapturePass()
+    options = minimax_h3_vae_convrot_int8_conv3d_compile_options(
+        {"post_grad_custom_pre_pass": capture}
+    )
+    compiled = torch.compile(block, fullgraph=True, dynamic=True, options=options)
+
+    # Export the established static rewrite once as the numerical oracle.
+    # Its single fused operator accepts every shape exercised below.
+    with torch.no_grad():
+        baseline = torch._dynamo.export(block, assume_static_by_default=True)(
+            *_args(device=device)
+        ).graph_module
+        fuse_conv3d(baseline.graph)
+        baseline.recompile()
+
+    def check(batch, frames, height, width, border):
+        canvas = torch.randn(
+            batch,
+            64,
+            frames,
+            height + border,
+            width + border,
+            device=device,
+            dtype=torch.float16,
+        )
+        x = canvas[:, :, :, :height, :width]
+        if not tile_view:
+            x = x.contiguous()
+        residual = torch.randn(
+            batch, 64, frames, height // 2, width // 2, device=device, dtype=torch.float16
+        )
+        expected = baseline(x, residual)
+        actual = compiled(x, residual)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert capture.targets.count(_FUSED) == 1
+        assert _CONV not in capture.targets
+        assert torch.ops.aten.add.Tensor not in capture.targets
+        assert torch.ops.aten.reflection_pad3d.default not in capture.targets
+
+    with torch.no_grad(), torch._dynamo.config.patch(recompile_limit=8):
+        # Singleton dimensions and independent tile strides have legitimate
+        # separate guards. Warm image/video and single/multiple batch families.
+        for batch, frames in [(2, 3), (1, 3), (2, 1), (1, 1)]:
+            check(batch, frames, 8, 10, 4)
+        warmed_calls = capture.calls
+        assert 1 <= warmed_calls <= 4
+        for index in range(1, 5):
+            for batch, frames in [(3, 5), (1, 7), (3, 1), (1, 1)]:
+                check(batch, frames, 8 + 2 * index, 10 + 4 * index, 4 + 2 * index)
+        assert capture.calls == warmed_calls
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_residual_broadcast_stays_outside_fused_convolution(static):
+    block = _Block()
+    x, residual = _args()
+    residual = residual[:, :, :, :1, :1]
+    with torch.no_grad():
+        gm = torch._dynamo.export(block, assume_static_by_default=static)(x, residual).graph_module
+        fuse_conv3d(gm.graph)
+        gm.recompile()
+        fused = next(node for node in gm.graph.nodes if node.target == _FUSED)
+        assert fused.args[-1] is None
+        expected = (
+            group_norm_silu_conv3d(
+                x,
+                block.norm.weight,
+                block.norm.bias,
+                8,
+                1e-6,
+                block.conv.weight,
+                stride=block.conv.stride,
+                padding="reflect_right",
+            )
+            + residual
+        )
+        torch.testing.assert_close(gm(x, residual), expected, atol=0, rtol=0)

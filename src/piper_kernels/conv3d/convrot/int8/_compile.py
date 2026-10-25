@@ -6,6 +6,7 @@ from typing import cast
 import torch
 from torch._C._nn import pad as torch_pad
 from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.nn import functional
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -17,7 +18,8 @@ from ._padding import Padding
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
 
 
-def _value(node: object) -> torch.Tensor | None:
+def get_tensor_metadata(node: object) -> torch.Tensor | None:
+    """Read tensor metadata from a Dynamo or FX node without evaluating it."""
     if not isinstance(node, torch.fx.Node):
         return None
     value = node.meta.get("example_value", node.meta.get("val"))
@@ -60,13 +62,13 @@ def lower_standard_convolutions(graph: torch.fx.Graph) -> None:
             continue
         bound = _arguments.bind_conv3d_arguments(functional.conv3d, node.args, dict(node.kwargs))
         weight = bound.weight
-        weight_value = _value(weight)
+        weight_value = get_tensor_metadata(weight)
         if not isinstance(weight_value, ConvRotInt8Tensor):
             continue
         stride, padding = _arguments.convolution_parameters(bound)
         _functional._weight_storage(weight_value)
         input_node, bias = bound.input, bound.bias
-        input_value = _value(input_node)
+        input_value = get_tensor_metadata(input_node)
         if (
             input_value is None
             or not isinstance(input_node, torch.fx.Node)
@@ -84,7 +86,7 @@ def lower_standard_convolutions(graph: torch.fx.Graph) -> None:
                 if input_value.dtype is torch.float32:
                     input_node = graph.call_method("to", (input_node,), {"dtype": dtype})
                     input_node.meta["example_value"] = input_value.to(dtype=dtype)
-                bias_value = _value(bias)
+                bias_value = get_tensor_metadata(bias)
                 if bias_value is not None and bias_value.dtype is torch.float32:
                     bias = graph.call_method("to", (bias,), {"dtype": dtype})
                     bias.meta["example_value"] = bias_value.to(dtype=dtype)
@@ -152,7 +154,7 @@ def fp16_cast_source(node: object) -> torch.fx.Node | None:
     ):
         return None
     source = node.args[0]
-    value = _value(source)
+    value = get_tensor_metadata(source)
     return (
         source
         if isinstance(source, torch.fx.Node) and value is not None and value.dtype is torch.float32
@@ -191,16 +193,12 @@ def fuse_padding(graph: torch.fx.Graph) -> None:
             use_reflection = (reflection and any(pads[:4])) or (
                 existing_reflection and any(existing[:4])
             )
-            source_value = source.meta.get("example_value", source.meta.get("val"))
-            if (
-                not isinstance(source_value, torch.Tensor)
-                or source_value.ndim != 5
-                or any(type(size) is not int for size in source_value.shape)
-            ):
+            source_value = get_tensor_metadata(source)
+            if source_value is None or source_value.ndim != 5:
                 break
             if use_reflection and (
-                max(merged[:2]) >= source_value.shape[4]
-                or max(merged[2:4]) >= source_value.shape[3]
+                not statically_known_true(max(merged[:2]) < source_value.shape[4])
+                or not statically_known_true(max(merged[2:4]) < source_value.shape[3])
             ):
                 break
             if cast_source is not None:

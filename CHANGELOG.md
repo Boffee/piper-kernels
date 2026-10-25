@@ -7,6 +7,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- H3 VAE ConvRot INT8 encoder compilation retains framewise GroupNorm/SiLU,
+  padding, and residual fusions with symbolic activation shapes, preserving the
+  static fused numerical path while reusing graphs across compatible sizes and
+  tile-view strides. Shared Conv3D padding fusion also supports symbolic shapes.
+
 - Changing sparse attention keep ratios reuses compiled graphs instead of creating
   a specialization for each profile and exhausting Dynamo's recompilation limit.
   ConvRot INT8, NVFP4, and ConvRot NVFP4 sparse projection/output fusions retain
