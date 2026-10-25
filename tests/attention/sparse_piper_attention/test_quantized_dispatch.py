@@ -18,6 +18,7 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
@@ -219,7 +220,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
         prepared.context.value,
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
-        list(ratio_units),
+        _SparsePiperRatioProfile(ratio_units),
         sparse_key_blocks,
         sequence_length,
         _MINMAX_ROUTING,
@@ -334,7 +335,7 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         prepared.context.value,
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
-        list(ratio_units),
+        _SparsePiperRatioProfile(ratio_units),
         sparse_key_blocks,
         shape[1],
         routing_mode,
@@ -541,7 +542,7 @@ def _block_length_case(routing_mode: int, head_dim: int):
         prepared.context.value,
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
-        list(ratio_units),
+        _SparsePiperRatioProfile(ratio_units),
         sparse_key_blocks,
         storage_sequence_length,
         routing_mode,
@@ -760,7 +761,7 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
         prepared.context.value,
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
-        list(ratio_units),
+        _SparsePiperRatioProfile(ratio_units),
         sparse_key_blocks,
         shape[1],
         _MEAN_ROUTING,

@@ -258,11 +258,12 @@ class Pipeline(torch.nn.Module):
                 self.dtype,
             ).transpose(1, 2)
         else:
+            assert self.sparse is not None
             attended = _sparse_piper_attention_from_quantized_op(
                 *q,
                 *k,
                 *v,
-                [round(self.keep_ratio * 1_000_000)] * self.heads,
+                self.sparse._ratio_profile,
                 hidden.shape[1] // 64,
                 hidden.shape[1],
                 _MINMAX_ROUTING,

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
@@ -43,6 +44,7 @@ class _ConvRotPreparation:
 @torch.library.custom_op(
     "piper_kernels::convrot_nvfp4_sparse_piper_projected_query_attention_output",
     mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     query_input_qdata: torch.Tensor,
@@ -64,7 +66,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -125,7 +127,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -169,7 +171,7 @@ def _projected_query_attention_output_op_fake(
     _value: torch.Tensor,
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
-    _head_keep_ratio_units: list[int],
+    _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,
@@ -218,6 +220,7 @@ def _projected_query_attention_output_op_fake(
 @torch.library.custom_op(
     "piper_kernels::convrot_nvfp4_sparse_piper_attention_output",
     mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 def _attention_output_op(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
@@ -230,7 +233,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -282,7 +285,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -317,7 +320,7 @@ def _attention_output_op_fake(
     _value: torch.Tensor,
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
-    _head_keep_ratio_units: list[int],
+    _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,

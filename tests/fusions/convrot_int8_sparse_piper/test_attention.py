@@ -160,7 +160,7 @@ def _run_sparse_piper_attention_from_quantized(
         *prepared_query,
         *prepared_key,
         *prepared_value,
-        list(attention._head_keep_ratio_units),
+        attention._ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         attention._routing_mode,

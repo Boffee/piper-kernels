@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+
 from . import _backend
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
 from ._dtype import validate_output_dtype
@@ -48,7 +50,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -61,7 +63,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     """Prepare global K/V and routing state without requiring materialized Q."""
     backend = _backend.require_attention_backend(key)
     layout = _resolve_route_layout(
-        tuple(head_keep_ratio_units),
+        ratio_profile.units,
         sparse_key_blocks,
         key.device,
     )
@@ -171,7 +173,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -187,7 +189,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -215,7 +217,7 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     block_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -233,7 +235,7 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -312,6 +314,7 @@ def _launch_quantized_sparse_piper_attention(
 @torch.library.custom_op(
     "piper_kernels::sparse_piper_attention_from_quantized",
     mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
@@ -324,7 +327,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -360,7 +363,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -374,6 +377,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
 @torch.library.custom_op(
     "piper_kernels::sparse_piper_attention_with_coarse_residual_from_quantized",
     mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
@@ -388,7 +392,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     value_mean: torch.Tensor,
     block_mean: torch.Tensor,
     coarse_gate: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -418,7 +422,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         value_scale_multiplier,
         value_mean,
         block_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -448,7 +452,7 @@ def _sparse_piper_attention_from_quantized_op_fake(
     _value: torch.Tensor,
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
-    _head_keep_ratio_units: list[int],
+    _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,
@@ -479,7 +483,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     _value_mean: torch.Tensor,
     _block_mean: torch.Tensor,
     _coarse_gate: torch.Tensor,
-    _head_keep_ratio_units: list[int],
+    _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,

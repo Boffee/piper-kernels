@@ -10,6 +10,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
@@ -381,7 +382,7 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         torch.empty((1, 2, 128, 192), device="meta", dtype=torch.int8),
         torch.empty((1, 2, 3, 1), device="meta", dtype=torch.float32),
         torch.empty((1, 2, 128), device="meta", dtype=torch.float32),
-        [500_000, 1_000_000],
+        _SparsePiperRatioProfile((500_000, 1_000_000)),
         2,
         191,
         0,

@@ -5,6 +5,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Changing sparse attention keep ratios reuses compiled graphs instead of creating
+  a specialization for each profile and exhausting Dynamo's recompilation limit.
+  ConvRot INT8, NVFP4, and ConvRot NVFP4 sparse projection/output fusions retain
+  their existing numerical paths and bounded workspaces. Automatic CUDA graph
+  capture excludes runtime-profile operations to avoid replaying stale ratios;
+  without graph partitioning, the containing compiled graph is excluded. Explicit
+  capture with a fixed profile remains supported.
+
 ## [0.7.7] - 2026-10-23
 
 ### Fixed

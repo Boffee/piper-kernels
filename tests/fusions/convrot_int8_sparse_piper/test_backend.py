@@ -19,6 +19,7 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -302,7 +303,7 @@ def _run_output_fusion(projected_query, operands, storage):
         "value": storage,
         "value_scale_multiplier": storage,
         "value_mean": storage,
-        "head_keep_ratio_units": [2, 2, 2],
+        "ratio_profile": _SparsePiperRatioProfile((2, 2, 2)),
         "sparse_key_blocks": 4,
         "logical_sequence_length": 193,
         "routing_mode": _MINMAX_ROUTING,

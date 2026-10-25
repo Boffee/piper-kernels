@@ -7,6 +7,7 @@ from typing import Protocol, cast
 
 import torch
 
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.nvfp4 import _projection, _validation
 from piper_kernels.weights.nvfp4 import _layout
@@ -345,7 +346,7 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -381,7 +382,7 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
@@ -440,7 +441,7 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
@@ -473,7 +474,7 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         value,
         value_scale_multiplier,
         value_mean,
-        head_keep_ratio_units,
+        ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,

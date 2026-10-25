@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 
 import piper_kernels
 from piper_kernels import SparsePiperAttention
@@ -65,7 +66,7 @@ def test_backend_owns_only_an_immutable_semantic_ratio_profile() -> None:
     attention = SparsePiperAttention((0.75, 0.25, 1.0, 0.5))
 
     assert attention.head_keep_ratios == (0.75, 0.25, 1.0, 0.5)
-    assert attention._head_keep_ratio_units == (750_000, 250_000, 1_000_000, 500_000)
+    assert attention._ratio_profile.units == (750_000, 250_000, 1_000_000, 500_000)
     assert attention.routing == "minmax"
 
 
@@ -303,7 +304,7 @@ def test_native_custom_op_passes_opcheck(sequence_length: int, head_dim: int) ->
             query,
             key,
             value,
-            list(attention._head_keep_ratio_units),
+            attention._ratio_profile,
             sequence_length // 64,
             head_dim**-0.5,
             attention._routing_mode,
@@ -410,3 +411,60 @@ def test_operator_is_opaque_to_a_full_compile_graph(routing: str) -> None:
         actual = compiled(query, key, value)
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_compiled_attention_reuses_ratio_profiles() -> None:
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attention = SparsePiperAttention((0.5, 0.5))
+
+        def forward(self, query, key, value):
+            return self.attention(query, key, value, sparse_key_blocks=3, scale=128**-0.5)
+
+    model = Model()
+    operands = _inputs()
+    captures = []
+
+    def capture(graph, _inputs):
+        captures.append(graph)
+        return graph.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(model, backend=capture, fullgraph=True, dynamic=True)
+    ratios = [index / 16 for index in range(1, 13)] + [1.0, 0.0625, 0.5]
+    with torch.no_grad():
+        for ratio in ratios:
+            model.attention = SparsePiperAttention((ratio, 1.0))
+            torch.testing.assert_close(compiled(*operands), model(*operands), atol=0, rtol=0)
+    assert len(captures) == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile() -> None:
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attention = SparsePiperAttention((0.125, 0.25))
+
+        def forward(self, query, key, value):
+            return self.attention(query, key, value, sparse_key_blocks=12, scale=128**-0.5)
+
+    model = Model().eval()
+    operands = _inputs("cuda", sequence_length=1024)
+    capture = TargetCapturePass()
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options={"triton.cudagraphs": True, "post_grad_custom_pre_pass": capture},
+    )
+    # Warm up and capture before changing profiles, then revisit the original.
+    profiles = [(0.125, 0.25)] * 4 + [(0.75, 0.875)] * 3 + [(0.125, 0.25)] * 2
+    with torch.no_grad():
+        for profile in profiles:
+            model.attention = SparsePiperAttention(profile)
+            torch.compiler.cudagraph_mark_step_begin()
+            actual = compiled(*operands).clone()
+            torch.testing.assert_close(actual, model(*operands), rtol=0, atol=0)
+    assert capture.calls == 1
