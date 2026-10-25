@@ -133,6 +133,16 @@ needed for standalone attention. For example, the dense setup above can use
 `compiled = torch.compile(piper_attention, fullgraph=True)` and then
 `compiled(q, k, v)` with its dense-layout inputs.
 
+To change sparse keep ratios, replace the `SparsePiperAttention` module with one
+containing the new profile. Profiles with the same head count and routing policy
+reuse a compiled graph, including compatible sparse projection and output fusions.
+Ratio values are runtime operator inputs; other model and shape changes can still
+require compilation. Operations that consume runtime profiles are excluded from
+automatic CUDA graph capture, since replay would retain the captured ratios.
+Without graph partitioning, this disables capture for the containing compiled
+graph. Explicit CUDA graphs remain supported for a fixed profile; capture a new
+graph when it changes.
+
 For quantized projections around attention, opt into the matching compiler helper:
 
 | Projection format and attention | Helper package under `piper_kernels.fusions` |

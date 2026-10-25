@@ -300,7 +300,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
     sparse_v_weight_scale: torch.fx.Node,
     sparse_cos: torch.fx.Node,
     sparse_sin: torch.fx.Node,
-    sparse_head_keep_ratio_units: list[int],
+    sparse_ratio_profile: torch.fx.Node,
     sparse_group_size: int,
     sparse_q_norm_epsilon: float,
     sparse_k_norm_epsilon: float,
@@ -523,7 +523,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
         replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
             graph,
             attention_arguments,
-            head_keep_ratio_units=sparse_head_keep_ratio_units,
+            ratio_profile=sparse_ratio_profile,
             sparse_key_blocks=sparse_key_blocks,
             logical_sequence_length=logical_sequence_length,
             routing_mode=sparse_routing_mode,

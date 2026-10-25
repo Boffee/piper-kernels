@@ -31,6 +31,7 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -504,7 +505,7 @@ def _quantized_context_arguments(head_dim=128):
         "value": torch.zeros(1, 1, head_dim, 128, dtype=torch.int8),
         "value_scale_multiplier": torch.ones(1, 1, 2, 1),
         "value_mean": torch.zeros(1, 1, head_dim),
-        "head_keep_ratio_units": list(_normalize_head_keep_ratios((0.5,))),
+        "ratio_profile": _SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
         "sparse_key_blocks": 2,
         "logical_sequence_length": 128,
         "routing_mode": _routing_modes._MINMAX_ROUTING,

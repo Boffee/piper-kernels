@@ -22,6 +22,7 @@ from piper_kernels import (
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -55,6 +56,12 @@ def _placeholder(
 ) -> torch.fx.Node:
     node = graph.placeholder(name)
     node.meta["val"] = value
+    return node
+
+
+def _profile_placeholder(graph: torch.fx.Graph) -> torch.fx.Node:
+    node = graph.placeholder("ratio_profile")
+    node.meta["val"] = _SparsePiperRatioProfile((5000, 10000))
     return node
 
 
@@ -258,7 +265,7 @@ def _semantic_attention_graph(
                 query,
                 key,
                 value,
-                [5000, 10000],
+                _profile_placeholder(graph),
                 2,
                 128**-0.5,
                 routing_mode,
@@ -799,7 +806,7 @@ def _run_explicit_attention_output(
         )
         attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
             *attention_arguments,
-            list(model.sparse_attention._head_keep_ratio_units),
+            model.sparse_attention._ratio_profile,
             model.sparse_key_blocks,
             model.sequence_length,
             model.sparse_attention._routing_mode,
@@ -815,7 +822,7 @@ def _run_explicit_attention_output(
             *attention_arguments,
             value[2],
             coarse_gate,
-            list(model.sparse_attention._head_keep_ratio_units),
+            model.sparse_attention._ratio_profile,
             model.sparse_key_blocks,
             model.sequence_length,
             model.sparse_attention._routing_mode,

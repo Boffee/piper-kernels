@@ -228,7 +228,7 @@ def _matched_node(match: Match, name: str) -> torch.fx.Node:
 def _replace_projection(  # noqa: PLR0913, PLR0917
     match: Match,
     sparse_attention_shape: list[Argument],
-    sparse_head_keep_ratio_units: list[int],
+    sparse_ratio_profile: torch.fx.Node,
     sparse_q_norm_epsilon: float,
     sparse_k_norm_epsilon: float,
     sparse_key_blocks: Argument,
@@ -387,7 +387,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
         replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
             graph,
             attention_arguments,
-            head_keep_ratio_units=sparse_head_keep_ratio_units,
+            ratio_profile=sparse_ratio_profile,
             sparse_key_blocks=sparse_key_blocks,
             logical_sequence_length=logical_sequence_length,
             routing_mode=sparse_routing_mode,

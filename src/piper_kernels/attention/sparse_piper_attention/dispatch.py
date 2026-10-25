@@ -9,6 +9,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 from . import _backend
 from ._block_layout import validate_block_lengths, validate_sparse_query_blocks
@@ -29,7 +30,12 @@ from .reference import reference_sparse_piper_attention
 
 
 class SparsePiperAttention(torch.nn.Module):
-    """Sparse attention with no derived state beyond its immutable ratio profile."""
+    """Sparse attention with an immutable per-query-head ratio profile.
+
+    Replacing this module with another profile of the same head count and routing
+    policy reuses compiled graphs, including compatible projection/output fusions.
+    Ratios are runtime operator inputs; other shape and model guards still apply.
+    """
 
     def __init__(
         self,
@@ -38,13 +44,15 @@ class SparsePiperAttention(torch.nn.Module):
         routing: str = "minmax",
     ) -> None:
         super().__init__()
-        self._head_keep_ratio_units = _normalize_head_keep_ratios(head_keep_ratios)
+        self._ratio_profile = _SparsePiperRatioProfile(
+            _normalize_head_keep_ratios(head_keep_ratios)
+        )
         self._routing_mode = routing_mode_from_name(routing)
 
     @property
     def head_keep_ratios(self) -> tuple[float, ...]:
         """Return the device-independent semantic ratio profile."""
-        return tuple(units / _RATIO_SCALE for units in self._head_keep_ratio_units)
+        return tuple(units / _RATIO_SCALE for units in self._ratio_profile.units)
 
     @property
     def routing(self) -> str:
@@ -77,7 +85,7 @@ class SparsePiperAttention(torch.nn.Module):
             query,
             key,
             value,
-            self._head_keep_ratio_units,
+            self._ratio_profile.num_heads,
             sparse_key_blocks=sparse_key_blocks,
             sparse_query_blocks=sparse_query_blocks,
             scale=scale,
@@ -87,7 +95,7 @@ class SparsePiperAttention(torch.nn.Module):
             query,
             key,
             value,
-            list(self._head_keep_ratio_units),
+            self._ratio_profile,
             sparse_key_blocks,
             converted_scale,
             self._routing_mode,
@@ -123,7 +131,7 @@ def _validate_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    head_keep_ratio_units: tuple[int, ...],
+    num_heads: int,
     *,
     sparse_key_blocks: int,
     sparse_query_blocks: int | None,
@@ -161,7 +169,7 @@ def _validate_inputs(
         raise ValueError("sparse Piper requires head_dim=64 or 128")
     if sequence < 64:
         raise ValueError("sparse Piper requires at least 64 sequence rows")
-    if len(head_keep_ratio_units) != heads:
+    if num_heads != heads:
         raise ValueError("sparse Piper ratio profile must contain one value per head")
     if block_lengths is not None:
         validate_block_lengths(
@@ -280,12 +288,16 @@ def _run_sparse_piper_attention(
     return output
 
 
-@torch.library.custom_op("piper_kernels::sparse_piper_attention", mutates_args=())
+@torch.library.custom_op(
+    "piper_kernels::sparse_piper_attention",
+    mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
 def _sparse_piper_attention_op(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     scale: float,
     routing_mode: int,
@@ -293,7 +305,7 @@ def _sparse_piper_attention_op(
     sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
     layout = _resolve_route_layout(
-        tuple(head_keep_ratio_units),
+        ratio_profile.units,
         sparse_key_blocks,
         query.device,
     )
@@ -315,7 +327,7 @@ def _sparse_piper_attention_op_fake(
     query: torch.Tensor,
     _key: torch.Tensor,
     _value: torch.Tensor,
-    _head_keep_ratio_units: list[int],
+    _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     _scale: float,
     _routing_mode: int,

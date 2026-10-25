@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import torch
 from torch._inductor.pattern_matcher import Match
+from torch._library.fake_class_registry import FakeScriptObject
 from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
-from piper_kernels.attention.sparse_piper_attention import _backend, _budget, _dtype
+from piper_kernels.attention.sparse_piper_attention import _backend, _budget, _dtype, _profile
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
 from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.projected_qk import _validation as projected_qk_validation
@@ -51,6 +53,7 @@ def source_files() -> tuple[str, ...]:
             linear_compile_fx.__file__,
             _dtype.__file__,
             _budget.__file__,
+            _profile.__file__,
             projected_qk_validation.__file__,
             projected_qk_compile.__file__,
             projected_qk_pattern.__file__,
@@ -97,7 +100,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     graph: torch.fx.Graph,
     attention_arguments: tuple[Argument, ...],
     *,
-    head_keep_ratio_units: Argument,
+    ratio_profile: Argument,
     sparse_key_blocks: Argument,
     logical_sequence_length: Argument,
     routing_mode: Argument,
@@ -121,7 +124,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
                 *attention_arguments,
                 block_mean,
                 coarse_gate,
-                head_keep_ratio_units,
+                ratio_profile,
                 sparse_key_blocks,
                 logical_sequence_length,
                 routing_mode,
@@ -136,7 +139,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         args=(
             *attention_arguments,
-            head_keep_ratio_units,
+            ratio_profile,
             sparse_key_blocks,
             logical_sequence_length,
             routing_mode,
@@ -267,17 +270,18 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
             )
         ):
             return False
-    head_keep_ratio_units = match.kwargs["sparse_head_keep_ratio_units"]
-    return bool(
-        isinstance(head_keep_ratio_units, (list, tuple))
-        and len(head_keep_ratio_units) == heads
-        and all(
-            isinstance(units, int)
-            and not isinstance(units, bool)
-            and 1 <= units <= _budget._RATIO_SCALE
-            for units in head_keep_ratio_units
-        )
-    )
+    return _valid_ratio_profile(match.kwargs["sparse_ratio_profile"], heads)
+
+
+def _valid_ratio_profile(profile_node: object, heads: int) -> bool:
+    if not isinstance(profile_node, torch.fx.Node):
+        return False
+    profile = profile_node.meta.get("val")
+    if isinstance(profile, FakeScriptObject):
+        profile = profile.real_obj
+    # The profile's custom-class guard fixes this metadata without specializing
+    # its values. Runtime and fake operators share the same opaque argument.
+    return isinstance(profile, _SparsePiperRatioProfile) and profile.num_heads == heads
 
 
 __all__ = [

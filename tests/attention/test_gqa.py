@@ -161,7 +161,7 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
         pytest.skip("requires a native sparse-attention backend")
     scale = head_dim**-0.5
     attention = SparsePiperAttention([0.5] * heads, routing=routing)
-    layout = _resolve_route_layout(attention._head_keep_ratio_units, 4, query.device)
+    layout = _resolve_route_layout(attention._ratio_profile.units, 4, query.device)
     routing_mode = _MEAN_ROUTING if routing == "mean" else _MINMAX_ROUTING
     routes = packed_routes_from_sequences(query, key, layout, routing_mode)
     prepared = backend.prepare(

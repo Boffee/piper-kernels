@@ -26,7 +26,7 @@ _QUANTIZED_ATTENTION_OPERAND_NAMES = (
     "output_value_mean",
 )
 _QUANTIZED_ATTENTION_POLICY_NAMES = (
-    "output_head_keep_ratio_units",
+    "output_ratio_profile",
     "output_sparse_key_blocks",
     "output_logical_sequence_length",
     "output_routing_mode",
@@ -114,7 +114,7 @@ def sparse_piper_projection_pattern(
         query,
         key,
         value,
-        KeywordArg("sparse_head_keep_ratio_units"),
+        KeywordArg("sparse_ratio_profile"),
         sparse_key_blocks,
         KeywordArg("sparse_softmax_scale"),
         KeywordArg("sparse_routing_mode"),

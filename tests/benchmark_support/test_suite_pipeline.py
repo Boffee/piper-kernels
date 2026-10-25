@@ -13,6 +13,7 @@ import torch
 from lib import suite_pipeline as pipeline
 from lib.cases import PipelineCase
 
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch as sparse_dispatch
 from piper_kernels.fusions.convrot_int8_piper import output as dense_output
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
@@ -146,7 +147,7 @@ def test_materialized_releases_preparation_and_projections_before_next_stage(mon
         assert all(reference() is None for reference in prepared)
         assert len(projections) == 10
         assert all(reference() is not None for reference in projections)
-        assert args[10] == [500_000, 500_000]
+        assert args[10].units == (500_000, 500_000)
         assert kwargs["output_dtype"] == torch.float16
         return torch.empty(1, 64, 2, 64)
 
@@ -170,6 +171,7 @@ def test_materialized_releases_preparation_and_projections_before_next_stage(mon
         query_norm=torch.empty(64),
         key_norm=torch.empty(64),
         keep_ratio=0.5,
+        sparse=SparsePiperAttention((0.5, 0.5)),
         heads=2,
         head_dim=64,
         dtype=torch.float16,
