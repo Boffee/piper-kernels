@@ -123,8 +123,9 @@ absorbs exclusive chains of zero padding and spatial reflection. It reads live
 weight storage through the graph, including activation-scale replacement.
 Padding fusion preserves autocast rounding. Shared pads, nonzero constant pads,
 cropping, temporal reflection, and combinations of spatial zero/reflection
-borders not represented by the kernel remain separate operations. Fusion uses
-static shapes; ordinary compiled execution also supports dynamic shapes.
+borders not represented by the kernel remain separate operations. Fusion supports
+static and symbolic activation shapes when the graph proves the required
+reflection bounds.
 Correctness never depends on matching a padding pattern. Original floating-point
 convolutions are left unchanged.
 
@@ -167,7 +168,7 @@ from piper_kernels.specializations.minimax_h3_vae import (
 )
 
 encoder.compile(
-    dynamic=False,
+    dynamic=True,
     fullgraph=True,
     options=minimax_h3_vae_convrot_int8_conv3d_compile_options(),
 )
@@ -175,8 +176,17 @@ encoder.compile(
 
 Run under `torch.no_grad()` or inference mode. The pre-grad rewrite includes
 the generic padding pass and matches framewise GroupNorm, SiLU, and optional
-residual around standard or explicit ConvRot convolutions. It requires static shapes and leaves unsupported
-or shared patterns unfused. It does not quantize floating-point Conv3D nodes.
+residual around standard or explicit ConvRot convolutions. Batch, time, and spatial
+dimensions may be symbolic; channels and model configuration remain fixed. The
+rewrite proves framewise reshape relationships, exact residual shapes, and
+reflection bounds without specializing dimensions to the tracing example.
+Unsupported, unproven, or shared patterns remain unfused. It does not quantize
+floating-point Conv3D nodes.
+
+Dynamic compilation reuses graphs across compatible activation sizes and tile-view
+strides. Singleton dimensions and different layout constraints can still require
+separate graphs. Native kernels retain their shape-specific schedules and may
+compile for new runtime shapes independently of Dynamo graph reuse.
 
 Keep original forwards and ordinary convolution modules, installing prequantized
 weights without replacing the layers. H3's explicit temporal zero padding and

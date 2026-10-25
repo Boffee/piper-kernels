@@ -2,6 +2,8 @@
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn import functional
 
 from piper_kernels.conv3d.convrot.int8 import convrot_int8_conv3d_compile_options
@@ -27,6 +29,7 @@ def _padded_conv(x, weight):
     return functional.conv3d(x, weight, stride=(2, 1, 2))
 
 
+@pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize(
     "pattern", ["causal", "zero", "reflection", "shared", "nonzero", "crop", "mixed"]
 )
@@ -43,7 +46,7 @@ def _padded_conv(x, weight):
         ),
     ],
 )
-def test_padding_rewrite_preserves_outputs_and_unmatched_operations(pattern, device):
+def test_padding_rewrite_preserves_outputs_and_unmatched_operations(pattern, device, static):
     def run(x, weight):
         if pattern == "causal":
             return _padded_conv(x, weight)
@@ -64,7 +67,7 @@ def test_padding_rewrite_preserves_outputs_and_unmatched_operations(pattern, dev
     x = torch.randn(1, 64, 4, 5, 6, device=device)
     weight = _weight(device)
     with torch.no_grad():
-        gm = torch._dynamo.export(run, assume_static_by_default=True)(x, weight).graph_module
+        gm = torch._dynamo.export(run, assume_static_by_default=static)(x, weight).graph_module
         expected = gm(x, weight)
         fuse_padding(gm.graph)
         gm.recompile()
@@ -146,3 +149,29 @@ def test_standard_conv3d_cuda_graph_capture():
             captured = _padded_conv(x, weight)
         graph.replay()
         torch.testing.assert_close(captured, _padded_conv(x, weight), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_padding_fusion_requires_proven_reflection_bounds(symbolic):
+    shape_env = ShapeEnv()
+    width = shape_env.create_unbacked_symint() if symbolic else 2
+    with FakeTensorMode(shape_env=shape_env):
+        value = torch.empty(1, 64, 3, 4, width)
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["example_value"] = value
+    weight = graph.placeholder("weight")
+    padded = graph.call_function(functional.pad, (source, (2, 0, 0, 0, 0, 0), "reflect"))
+    conv = graph.call_function(
+        _CONV, (padded, weight, weight, None, 64, weight, [1, 1, 1], [0] * 6, False, None)
+    )
+    graph.output(conv)
+    guards = list(shape_env.guards)
+    deferred_asserts = dict(shape_env.deferred_runtime_asserts)
+    with torch.no_grad():
+        fuse_padding(graph)
+    # An invalid or unknown bound cannot become valid just because the tracing
+    # example happens to fit. Matching must not introduce shape guards/asserts.
+    assert conv.args[0] is padded
+    assert shape_env.guards == guards
+    assert shape_env.deferred_runtime_asserts == deferred_asserts
