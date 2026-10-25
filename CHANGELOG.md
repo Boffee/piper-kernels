@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-10-24
+
 ### Fixed
 
 - H3 VAE ConvRot INT8 encoder compilation retains framewise GroupNorm/SiLU,
