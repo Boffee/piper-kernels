@@ -265,6 +265,24 @@ Triton, the relevant package extras, and the `test` group dependencies from
 [pyproject.toml](../pyproject.toml). Do not use the checkout's `uv sync` to
 provision that environment.
 
+For Linux RX 9070 XT development, use stable ROCm 10.1.0 with PyTorch 2.14
+and the matching Triton selected by its wheel. From this checkout, create a
+fresh environment and install the stack before the test dependencies:
+
+```shell
+uv --no-config venv --python 3.13 .venv-rocm
+uv --no-config pip install --python .venv-rocm/bin/python \
+  --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+  "torch[device-gfx1201]==2.14.0+rocm10.1.0"
+uv --no-config pip install --python .venv-rocm/bin/python --group test \
+  "torchao==0.18.0" "numpy>=2"
+```
+
+The device extra installs the matching ROCm libraries; torchvision and torchaudio
+are not required. Keep nightly experiments in a separate pinned environment.
+Run the regressions below and representative benchmarks before promoting a new
+stack to the development or CI default.
+
 AMD dispatch accepts Linux and Windows with the same architecture limits;
 existing on-device validation is Linux-only. The documented INT8 hardware
 validation is RX 9070 XT (`gfx1201`); compiler coverage for other accepted targets
