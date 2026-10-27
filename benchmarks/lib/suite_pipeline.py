@@ -20,6 +20,7 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels import SparsePiperAttention, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend as dense_attention_backend
+from piper_kernels.attention.sparse_piper_attention import _backend as sparse_attention_backend
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 
 from .cases import PipelineCase
@@ -243,6 +244,9 @@ class Pipeline(torch.nn.Module):
                 vw.qdata,
                 vw.scale,
                 head_dim=self.head_dim,
+                value_format=int(
+                    sparse_attention_backend.require_attention_backend(data).value_format
+                ),
             )
             del mean
         # Do not charge the materialized path for storage its next stage no longer uses.

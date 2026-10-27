@@ -160,6 +160,22 @@ Type and policy modules must import without Triton. Compiler passes include
 implementation source files in their cache keys; keep that tracking complete
 when definitions move, including plan and policy modules.
 
+Sparse Piper's backend specifies the final V storage through
+[`ValueFormat`](../src/piper_kernels/attention/kernels/sparse_piper/layout.py).
+Standalone preparation and fused projections write that format directly. The
+projection custom op carries its format as a static argument, shared by runtime
+allocation, fake tensors, and compiler metadata. Q/K storage, scale groups,
+logical K64 route indices, and prequantization routing/coarse summaries retain
+their common contracts.
+
+Every sparse-attention backend binds immutable sequence-global K/V once.
+The bound launch owns those tensors and its backend state: AMD's folded scale
+table or NVIDIA TMA's K/V descriptors. Each call supplies query-local Q, scales,
+routes, output, and optional coarse output/gate. Rebind after changing context
+tensors; there is no implicit tensor cache or second V representation. The
+[`prepared-state contracts`](../src/piper_kernels/attention/sparse_piper_attention/_prepared.py)
+define the ownership and query-window boundaries.
+
 ## Performance tuning
 
 Real model shapes are useful benchmark anchors. General dispatch decisions

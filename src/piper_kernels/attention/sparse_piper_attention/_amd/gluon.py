@@ -5,6 +5,8 @@
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import torch
@@ -26,15 +28,14 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
 from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
-from .._prepared import _PreparedSparsePiperAttention, _PreparedSparsePiperContext
-from ._packing import (
+from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
+from ._parameters import (
     INVERSE_MULTIPLIER,
     KEY_SCALE,
     LOG_MULTIPLIER,
     LOG_MULTIPLIER_OVER_255,
     PARAMETER_COUNT,
-    PackedContext,
-    pack_context,
+    prepare_parameters,
 )
 
 
@@ -305,13 +306,21 @@ def _sparse_piper_attention_kernel(
     )
 
 
+def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
+    """Own final K/V storage and folded scales for any number of local Q launches."""
+    if context.routes_per_query == 0:
+        raise ValueError("AMD sparse Piper does not implement skip_dense_routing")
+    return _ContextLauncher(context, prepare_parameters(context))
+
+
 @dataclass(frozen=True, slots=True)
 class _ContextLauncher:
-    packed: PackedContext
+    context: _PreparedSparsePiperContext
+    parameters: torch.Tensor
 
     def __call__(
         self,
-        prepared: _PreparedSparsePiperAttention,
+        query_state: _PreparedSparsePiperQuery,
         output: torch.Tensor,
         *,
         query_block_offset: int = 0,
@@ -319,97 +328,63 @@ class _ContextLauncher:
         coarse_output: torch.Tensor | None = None,
         coarse_gate: torch.Tensor | None = None,
     ) -> None:
-        _launch_sparse_piper_attention(
-            prepared,
+        """Execute a query window against the bound global context."""
+        context = self.context
+        launch = validate_attention_launch(
+            context,
+            query_state,
             output,
-            query_block_offset=query_block_offset,
-            query_block_count=query_block_count,
-            coarse_output=coarse_output,
-            coarse_gate=coarse_gate,
-            packed=self.packed,
+            query_block_offset,
+            query_block_count,
+            coarse_output,
+            coarse_gate,
         )
-
-
-def _validate_context(context: _PreparedSparsePiperContext) -> None:
-    """Reject unsupported execution modes before packing or launching."""
-    if context.key.shape[-1] not in (64, 128):
-        raise ValueError("AMD sparse Piper requires D64 or D128")
-    if context.routes_per_query == 0:
-        raise ValueError("AMD sparse Piper does not implement skip_dense_routing")
-
-
-def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
-    """Pack immutable global K/V state once for any number of local Q launches."""
-    _validate_context(context)
-    return _ContextLauncher(pack_context(context))
-
-
-def _launch_sparse_piper_attention(
-    prepared: _PreparedSparsePiperAttention,
-    output: torch.Tensor,
-    *,
-    query_block_offset: int = 0,
-    query_block_count: int | None = None,
-    coarse_output: torch.Tensor | None = None,
-    coarse_gate: torch.Tensor | None = None,
-    packed: PackedContext | None = None,
-) -> None:
-    """Validate once, then execute with fresh or explicitly bound K/V packing."""
-    if packed is not None and prepared.context is not packed.source:
-        raise ValueError("bound sparse Piper launcher requires its original context")
-    _validate_context(prepared.context)
-    launch = validate_attention_launch(
-        prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
-    )
-    if packed is None:
-        packed = pack_context(prepared.context)
-    query_state, context = prepared.query, prepared.context
-    use_64bit_query_offsets = _requires_64bit_query_offsets(
-        launch.query_storage_sequence_length,
-        launch.head_dim,
-    )
-    use_64bit_context_offsets = _requires_64bit_context_offsets(
-        launch.storage_sequence_length,
-        launch.head_dim,
-    )
-    with device_context(output.device):
-        grid = (launch.query_block_count, launch.heads, launch.batch)
-        _sparse_piper_attention_kernel[grid](
-            query_state.data,
-            context.key,
-            packed.value,
-            query_state.scale,
-            packed.parameters,
-            context.value_mean,
-            launch.coarse_output,
-            launch.coarse_gate,
-            launch.block_lengths,
-            query_state.routes,
-            context.head_keep_blocks,
-            context.route_head_offsets,
-            output,
-            launch.query_block_offset,
-            launch.global_query_block_offset,
+        use_64bit_query_offsets = _requires_64bit_query_offsets(
             launch.query_storage_sequence_length,
-            launch.storage_sequence_length,
-            launch.logical_sequence_length,
-            launch.sparse_key_blocks,
-            launch.sparse_query_blocks,
-            *launch.route_strides,
-            *launch.output_strides,
-            *launch.coarse_strides,
-            *launch.gate_strides,
-            launch.heads,
-            launch.heads // context.key.shape[1],
             launch.head_dim,
-            use_64bit_query_offsets,
-            use_64bit_context_offsets,
-            launch.mask_block_lengths,
-            launch.has_dense_query_suffix,
-            launch.apply_coarse_residual,
-            num_warps=4,
-            num_stages=1,
-            llvm_fn_attrs=(
-                ("target-features", "-cumode" if launch.head_dim == 128 else "+cumode"),
-            ),
         )
+        use_64bit_context_offsets = _requires_64bit_context_offsets(
+            launch.storage_sequence_length,
+            launch.head_dim,
+        )
+        with device_context(output.device):
+            grid = (launch.query_block_count, launch.heads, launch.batch)
+            _sparse_piper_attention_kernel[grid](
+                query_state.data,
+                context.key,
+                context.value,
+                query_state.scale,
+                self.parameters,
+                context.value_mean,
+                launch.coarse_output,
+                launch.coarse_gate,
+                launch.block_lengths,
+                query_state.routes,
+                context.head_keep_blocks,
+                context.route_head_offsets,
+                output,
+                launch.query_block_offset,
+                launch.global_query_block_offset,
+                launch.query_storage_sequence_length,
+                launch.storage_sequence_length,
+                launch.logical_sequence_length,
+                launch.sparse_key_blocks,
+                launch.sparse_query_blocks,
+                *launch.route_strides,
+                *launch.output_strides,
+                *launch.coarse_strides,
+                *launch.gate_strides,
+                launch.heads,
+                launch.heads // context.key.shape[1],
+                launch.head_dim,
+                use_64bit_query_offsets,
+                use_64bit_context_offsets,
+                launch.mask_block_lengths,
+                launch.has_dense_query_suffix,
+                launch.apply_coarse_residual,
+                num_warps=4,
+                num_stages=1,
+                llvm_fn_attrs=(
+                    ("target-features", "-cumode" if launch.head_dim == 128 else "+cumode"),
+                ),
+            )

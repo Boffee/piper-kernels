@@ -12,9 +12,13 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 
+from .layout import ValueFormat
+
 _P_UINT8_RANGE = tl.constexpr(255.0)
 _V_INT8_RANGE = tl.constexpr(127.0)
 _SCALE_EPSILON = tl.constexpr(1e-7)
+_AMD_VALUE_FORMAT = tl.constexpr(int(ValueFormat.AMD_WMMA))
+_TRANSPOSED_VALUE_FORMAT = tl.constexpr(int(ValueFormat.TRANSPOSED))
 
 
 @triton.jit
@@ -48,7 +52,7 @@ def quantize_value_tile(
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Center and encode one projected tile in sparse-Piper's transposed V format."""
+    """Center and encode a tile, returning logical head/row/feature codes."""
     centered = tl.where(
         valid_rows[:, None, None],
         values - value_mean[None, :, :],
@@ -257,6 +261,23 @@ def store_key_tile(
 
 
 @triton.jit
+def value_storage_offsets(
+    head, row, feature, storage_sequence_length, head_dim: tl.constexpr, value_format: tl.constexpr
+):
+    """Map logical coordinates to the final V buffer; format IDs come from ValueFormat."""
+    head = head.to(tl.int64)
+    row = row.to(tl.int64)
+    if value_format == _AMD_VALUE_FORMAT:
+        token = row % 64
+        token = (token & ~24) | ((token & 8) << 1) | ((token & 16) >> 1)
+        return (
+            (head * (storage_sequence_length // 64) + row // 64) * head_dim + feature
+        ) * 64 + token
+    else:
+        return (head * head_dim + feature) * storage_sequence_length + row
+
+
+@triton.jit
 def store_value_tile(
     values,
     value_mean_ptr,
@@ -277,6 +298,7 @@ def store_value_tile(
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
+    value_format: tl.constexpr = _TRANSPOSED_VALUE_FORMAT,
 ):
     """Center, quantize, and optionally mean-pool one sparse-Piper value tile."""
     head_offsets = head_offsets.to(tl.int64)
@@ -337,10 +359,13 @@ def store_value_tile(
         block_m,
         scale_rows,
     )
-    value_offsets = (
-        (batch * heads + head_offsets[:, None, None]) * head_dim * storage_sequence_length
-        + feature_offsets[None, None, :] * storage_sequence_length
-        + sequence_offsets[None, :, None]
+    value_offsets = value_storage_offsets(
+        batch * heads + head_offsets[:, None, None],
+        sequence_offsets[None, :, None],
+        feature_offsets[None, None, :],
+        storage_sequence_length,
+        head_dim,
+        value_format,
     )
     tl.store(
         value_ptr + value_offsets,

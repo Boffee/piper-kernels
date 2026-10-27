@@ -14,6 +14,7 @@ from lib import suite_pipeline as pipeline
 from lib.cases import PipelineCase
 
 from piper_kernels import SparsePiperAttention
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch as sparse_dispatch
 from piper_kernels.fusions.convrot_int8_piper import output as dense_output
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
@@ -120,6 +121,11 @@ def test_sparse_gqa_fusion_is_not_advertised_as_native(monkeypatch):
 
 def test_materialized_releases_preparation_and_projections_before_next_stage(monkeypatch):
     prepared, projections = [], []
+    monkeypatch.setattr(
+        pipeline.sparse_attention_backend,
+        "require_attention_backend",
+        lambda tensor: SimpleNamespace(value_format=ValueFormat.TRANSPOSED),
+    )
 
     def temporary(references):
         tensor = torch.empty(1)

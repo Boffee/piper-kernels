@@ -2,9 +2,13 @@
 
 import pytest
 import torch
+from lib.sparse_piper import reference_value_storage
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    QUERY_SCALE_ROWS,
+    TILE_ROWS,
+)
 from piper_kernels.attention.sparse_piper_attention._backend import (
     require_attention_backend,
     select_attention_backend,
@@ -40,7 +44,6 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     coarse_attention,
     mean_pool_block_values,
 )
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_operands
 
 
 @pytest.mark.gpu
@@ -58,10 +61,11 @@ def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_len
     key = torch.zeros_like(query)
     value = torch.full((1, 1, 128, storage_length), 64, device="cuda", dtype=torch.int8)
     value[..., sequence_length:] = 0
+    backend = require_attention_backend(key)
     context = _prepare_sparse_piper_context_from_quantized(
         key,
         torch.ones((1, 1, tiles), device="cuda"),
-        value,
+        reference_value_storage(value, backend.value_format),
         torch.ones((1, 1, tiles, 1), device="cuda"),
         torch.zeros((1, 1, 128), device="cuda"),
         torch.tensor([tiles], device="cuda", dtype=torch.int32),
@@ -69,6 +73,7 @@ def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_len
         sparse_key_blocks=tiles,
         routes_per_query=tiles,
         logical_sequence_length=sequence_length,
+        value_format=backend.value_format,
     )
     order = list(range(tiles - 1))
     order.insert(tiles - 1 if tail_position == -1 else tail_position, tiles - 1)
@@ -83,14 +88,16 @@ def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_len
         routes,
         context,
     )
-    prepared = _PreparedSparsePiperAttention(context, query_state)
+    prepared = _PreparedSparsePiperAttention(backend.bind_context(context), query_state)
     expected = torch.empty((1, 1, sequence_length, 128), device="cuda", dtype=torch.bfloat16)
     actual = torch.empty_like(expected)
-    require_attention_backend(prepared.query.data).launch(prepared, expected)
+    prepared.launch(prepared.query, expected)
     # Padding is not part of the attention sequence, even when its physical
     # block occurs in the middle of a caller-supplied sparse route.
     value[..., sequence_length:] = -128
-    require_attention_backend(prepared.query.data).launch(prepared, actual)
+    context.value.copy_(reference_value_storage(value, backend.value_format))
+    prepared = _PreparedSparsePiperAttention(backend.bind_context(context), query_state)
+    prepared.launch(prepared.query, actual)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -157,9 +164,15 @@ def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_
     blocks = sequence_length // 64
     layout = _resolve_route_layout(_normalize_head_keep_ratios((1.0,)), blocks, query.device)
     routes = packed_routes_from_sequences(query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING)
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query)
+    prepared = backend.prepare(
         query, 128**-0.5, sparse_key_blocks=blocks, combined_key=key, combined_value=value
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
     coarse = torch.full(
         (1, 1, (sequence_length + 63) // 64, 128),
         1.0 / 256,
@@ -169,9 +182,7 @@ def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_
     coarse[..., 64:] += 1.0
     gate = torch.ones((1, sequence_length, 1, 128), dtype=torch.bfloat16, device="cuda")
     actual = torch.empty_like(query)
-    require_attention_backend(prepared.query.data).launch(
-        prepared, actual, coarse_output=coarse, coarse_gate=gate
-    )
+    prepared.launch(prepared.query, actual, coarse_output=coarse, coarse_gate=gate)
     torch.testing.assert_close(actual, torch.full_like(actual, 1.0 + 1.0 / 128), atol=0, rtol=0)
 
 
@@ -201,13 +212,19 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
         query_head_major,
         sparse_key,
     )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query_head_major)
+    prepared = backend.prepare(
         query_head_major,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
 
     quantized_arguments = (
         prepared.query.data,
@@ -254,7 +271,7 @@ def _local_query_range(
     scale_start = storage_start // QUERY_SCALE_ROWS
     scale_stop = storage_stop // QUERY_SCALE_ROWS
     return _PreparedSparsePiperAttention(
-        context=prepared.context,
+        launch=prepared.launch,
         query=_prepare_sparse_piper_query_from_quantized(
             prepared.query.data[:, :, storage_start:storage_stop].contiguous(),
             prepared.query.scale[:, :, scale_start:scale_stop].contiguous(),
@@ -302,7 +319,8 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         sparse_key,
         layout,
     )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query_head_major)
+    prepared = backend.prepare(
         query_head_major,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
@@ -312,6 +330,7 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         placeholder_routes.indices,
         placeholder_routes.head_keep_blocks,
         placeholder_routes.route_head_offsets,
+        bind=backend.bind_context,
     )
     if routing_mode == _MEAN_ROUTING:
         query_summary = _sequence_block_means(query_head_major)
@@ -409,14 +428,20 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     )
     query_block_count = (sequence_length + 63) // 64
     sparse_query_blocks = query_block_count - 1 if mixed_query_scope else None
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query_head_major)
+    prepared = backend.prepare(
         query_head_major,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
         sparse_query_blocks=sparse_query_blocks,
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
 
     coarse_output = torch.randn(
         (shape[0], shape[2], query_block_count, shape[3]),
@@ -435,9 +460,9 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     chunks: list[torch.Tensor] = []
     query_block_offset = 0
     with torch.no_grad():
-        require_attention_backend(prepared.query.data).launch(prepared, fine_output.transpose(1, 2))
-        require_attention_backend(prepared.query.data).launch(
-            prepared,
+        prepared.launch(prepared.query, fine_output.transpose(1, 2))
+        prepared.launch(
+            prepared.query,
             full_output.transpose(1, 2),
             coarse_output=coarse_output,
             coarse_gate=coarse_gate,
@@ -456,8 +481,8 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 device=query.device,
             )
             output = guarded[:, 1 : range_rows + 1]
-            require_attention_backend(prepared.query.data).launch(
-                prepared,
+            prepared.launch(
+                prepared.query,
                 output.transpose(1, 2),
                 query_block_offset=query_block_offset,
                 query_block_count=range_block_count,
@@ -473,8 +498,8 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
                 range_block_count,
             )
             local_output = torch.empty_like(output)
-            require_attention_backend(local_prepared.query.data).launch(
-                local_prepared,
+            local_prepared.launch(
+                local_prepared.query,
                 local_output.transpose(1, 2),
                 coarse_output=coarse_output[
                     :,
@@ -524,13 +549,19 @@ def _block_length_case(routing_mode: int, head_dim: int):
             query_head_major,
             key_head_major,
         )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query_head_major)
+    prepared = backend.prepare(
         query_head_major,
         head_dim**-0.5,
         sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
     arguments = (
         prepared.query.data,
         prepared.query.scale,
@@ -577,7 +608,9 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int, head_dim: in
     corrupted_key = prepared.context.key.clone()
     corrupted_value = prepared.context.value.clone()
     corrupted_key[:, :, ~valid_rows] = 127
-    corrupted_value[..., ~valid_rows] = -127
+    batch, heads, rows, head_dim = corrupted_key.shape
+    padding = (~valid_rows).expand(batch, heads, head_dim, rows)
+    corrupted_value[reference_value_storage(padding, prepared.context.value_format)] = -127
     corrupted_arguments = list(arguments)
     corrupted_arguments[3] = corrupted_key
     corrupted_arguments[7] = corrupted_value
@@ -737,7 +770,8 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
         key_head_major[:, :, : sparse_key_blocks * 64],
         layout,
     )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query_head_major)
+    prepared = backend.prepare(
         query_head_major,
         128**-0.5,
         sparse_key_blocks=sparse_key_blocks,
@@ -747,6 +781,7 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
         placeholder_routes.indices,
         placeholder_routes.head_keep_blocks,
         placeholder_routes.route_head_offsets,
+        bind=backend.bind_context,
     )
     query_mean = _sequence_block_means(query_head_major)
     key_mean = _sequence_block_means(key_head_major)

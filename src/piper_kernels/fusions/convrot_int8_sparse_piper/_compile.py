@@ -334,6 +334,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
     assert head_dim is not None
     heads = q_weight_value.shape[0] // head_dim
     storage_sequence_length = _layout.padded_sequence_length(sequence_length)
+    value_format = attention_backend.require_attention_backend(input_value).value_format
     block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
     with graph.inserting_before(original):
         logical_sequence_length = graph.call_function(
@@ -470,7 +471,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
         )
         value_values = (
             input_value.new_empty(
-                (batch, heads, head_dim, storage_sequence_length),
+                value_format.shape(batch, heads, storage_sequence_length, head_dim),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
@@ -505,7 +506,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
                 head_dim,
             ),
             value_values,
-            kwargs={"bias": sparse_v_bias},
+            kwargs={"bias": sparse_v_bias, "value_format": int(value_format)},
         )
         value, value_scale_multiplier, value_mean = value_projection[:3]
         attention_arguments = (

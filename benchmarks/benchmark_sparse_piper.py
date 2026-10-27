@@ -36,7 +36,6 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._interfaces import LaunchAttention
 from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
@@ -144,7 +143,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
 
     def prepare_execution(
         selected_routes: PackedRoutes = routes,
-    ) -> tuple[_PreparedSparsePiperAttention, LaunchAttention]:
+    ) -> _PreparedSparsePiperAttention:
         state = backend.prepare(
             query.transpose(1, 2),
             args.head_dim**-0.5,
@@ -155,13 +154,14 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
             selected_routes.indices,
             selected_routes.head_keep_blocks,
             selected_routes.route_head_offsets,
+            bind=backend.bind_context,
         )
-        return state, backend.bind_context(state.context)
+        return state
 
-    prepared, bound_launch = prepare_execution()
+    prepared = prepare_execution()
     output = torch.empty_like(query)
 
-    launch = partial(bound_launch, prepared, output.transpose(1, 2))
+    launch = partial(prepared.launch, prepared.query, output.transpose(1, 2))
 
     def public_call() -> torch.Tensor:
         return attention(query, key, value, sparse_key_blocks=blocks)
@@ -207,7 +207,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     operations = useful_integer_operations(sequence, selected_blocks, args.batch, args.head_dim)
     # Measure real public-call memory with no extra prepared benchmark state or
     # output retained. This matters at 100k tokens on a 16-GB accelerator.
-    del launch, bound_launch, prepared, output, routes, route_call, prepare_execution
+    del launch, prepared, output, routes, route_call, prepare_execution
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     public = synchronized_wall_benchmark(

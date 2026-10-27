@@ -32,11 +32,9 @@ def test_fused_preparation_selection(monkeypatch, target, head_dim, rows, fused)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     query = torch.empty(1, 4, rows, head_dim, device="meta", dtype=torch.bfloat16)
     key = torch.empty(1, 2, rows, head_dim, device="meta", dtype=torch.bfloat16)
-    selected = _backend.select_fused_operand_preparation(query, key, _routing_modes._MINMAX_ROUTING)
-    assert selected is (_backend.preparation._prepare_sparse_piper_operands if fused else None)
-    assert (
-        _backend.select_fused_operand_preparation(query, key, _routing_modes._MEAN_ROUTING) is None
-    )
+    selected = _backend.use_fused_operand_preparation(query, key, _routing_modes._MINMAX_ROUTING)
+    assert selected is fused
+    assert _backend.use_fused_operand_preparation(query, key, _routing_modes._MEAN_ROUTING) is False
 
 
 def test_fused_preparation_rejects_unsupported_metadata_before_probing(monkeypatch):
@@ -44,8 +42,8 @@ def test_fused_preparation_rejects_unsupported_metadata_before_probing(monkeypat
     query = torch.empty(1, 2, 2048, 128, device="meta", dtype=torch.bfloat16)
     for key in (query.float(), query[..., ::2], torch.empty_like(query, device="cpu")):
         assert (
-            _backend.select_fused_operand_preparation(query, key, _routing_modes._MINMAX_ROUTING)
-            is None
+            _backend.use_fused_operand_preparation(query, key, _routing_modes._MINMAX_ROUTING)
+            is False
         )
 
 
@@ -171,10 +169,10 @@ def test_public_fused_preparation_matches_separate_and_graph(
     if _backend.select_attention_backend(query) is None:
         pytest.skip("requires native sparse attention")
     assert (
-        _backend.select_fused_operand_preparation(
+        _backend.use_fused_operand_preparation(
             query.transpose(1, 2), key.transpose(1, 2), _routing_modes._MINMAX_ROUTING
         )
-        is not None
+        is True
     )
     lengths = (
         torch.tensor([64, 17, 1, 64] * 8, device="cuda", dtype=torch.int32) if padded else None
@@ -193,7 +191,7 @@ def test_public_fused_preparation_matches_separate_and_graph(
         captured = attention(query, key, value, **options)
     graph.replay()
     torch.testing.assert_close(captured, fused, atol=0, rtol=0)
-    monkeypatch.setattr(_backend, "select_fused_operand_preparation", lambda *args: None)
+    monkeypatch.setattr(_backend, "use_fused_operand_preparation", lambda *args: False)
     separate = attention(query, key, value, **options)
     torch.testing.assert_close(fused, separate, atol=0, rtol=0)
 

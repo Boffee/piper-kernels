@@ -16,7 +16,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
-from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, ValueFormat
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
 from ._block_layout import valid_block_rows, validate_sparse_query_blocks
@@ -53,10 +53,7 @@ def _quantize_value_per_tile_kernel(
     stride_vb,
     stride_vh,
     stride_vn,
-    stride_ob,
-    stride_oh,
-    stride_od,
-    stride_ok,
+    value_format: tl.constexpr,
     heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
@@ -100,10 +97,14 @@ def _quantize_value_per_tile_kernel(
     )
     tl.store(
         output_ptr
-        + batch * stride_ob
-        + head * stride_oh
-        + offsets_d[None, :] * stride_od
-        + offsets_n[:, None] * stride_ok,
+        + sparse_piper_kernels.value_storage_offsets(
+            batch_head,
+            offsets_n[:, None],
+            offsets_d[None, :],
+            tile_count * block_n,
+            head_dim,
+            value_format,
+        ),
         quantized,
     )
 
@@ -399,6 +400,7 @@ def _prepare_sparse_piper_operands(
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
     emit_summaries: bool = False,
+    value_format: ValueFormat = ValueFormat.TRANSPOSED,
 ) -> _PreparedSparsePiperOperands:
     """Quantize Q/K/V, optionally emitting min/max summaries from the Q/K pass.
 
@@ -467,7 +469,7 @@ def _prepare_sparse_piper_operands(
             storage_query_length=storage_sequence_length,
         )
     value_int8 = torch.empty(
-        (batch, kv_heads, head_dim, storage_sequence_length),
+        value_format.shape(batch, kv_heads, storage_sequence_length, head_dim),
         device=combined_value.device,
         dtype=torch.int8,
     )
@@ -488,10 +490,7 @@ def _prepare_sparse_piper_operands(
             combined_value.stride(0),
             combined_value.stride(1),
             combined_value.stride(2),
-            value_int8.stride(0),
-            value_int8.stride(1),
-            value_int8.stride(2),
-            value_int8.stride(3),
+            value_format=int(value_format),
             heads=kv_heads,
             head_dim=head_dim,
             block_n=_BLOCK_N,
@@ -501,6 +500,7 @@ def _prepare_sparse_piper_operands(
     return _PreparedSparsePiperOperands(
         key=prepared_qk.key,
         value=value_int8,
+        value_format=value_format,
         key_scale=prepared_qk.key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,

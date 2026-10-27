@@ -170,7 +170,12 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
         sparse_key_blocks=4,
         combined_key=key,
         combined_value=value,
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
     assert prepared.query.data.shape[1] == heads
     assert prepared.context.head_keep_blocks.numel() == heads
     for tensor in (
@@ -182,7 +187,7 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
     ):
         assert tensor.shape[1] == kv_heads
     local_output = torch.empty((2, heads, 64, head_dim), device="cuda", dtype=query.dtype)
-    backend.launch(prepared, local_output, query_block_offset=1, query_block_count=1)
+    prepared.launch(prepared.query, local_output, query_block_offset=1, query_block_count=1)
     expected = attention(
         query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), sparse_key_blocks=4
     )

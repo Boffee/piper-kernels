@@ -2,7 +2,22 @@
 
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperAttention
+
+
+def reference_value_storage(value: torch.Tensor, value_format: ValueFormat) -> torch.Tensor:
+    """Encode canonical [B,H,D,S] codes for reference fixtures, outside measured paths."""
+    if value_format is ValueFormat.TRANSPOSED:
+        return value
+    batch, heads, head_dim, sequence = value.shape
+    return (
+        value.reshape(batch, heads, head_dim, sequence // 64, 2, 2, 2, 8)
+        .transpose(-3, -2)
+        .reshape(batch, heads, head_dim, sequence // 64, 64)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
 
 
 def useful_integer_operations(
@@ -80,12 +95,16 @@ def reference_prepared_query(
     pair_max = (scores + torch.log2(multipliers / 255)).amax(dim=-1)
     probabilities = torch.exp2(scores - pair_max[:, :, None])
     codes = (probabilities * multipliers + 0.5).floor().clamp(0, 255)
-    values = (
-        context.value[batch, kv_head]
-        .index_select(1, indices)
-        .T.reshape(pairs, 128, query.data.shape[-1])
-        .double()
-    )
+    if context.value_format is ValueFormat.AMD_WMMA:
+        # Decode with a reshape/transpose of token bit axes, independently of
+        # the producer's address arithmetic. Gather first to bound memory.
+        selected = context.value[batch, kv_head].index_select(0, tiles)
+        values = selected.reshape(-1, query.data.shape[-1], 2, 2, 2, 8)
+        values = values.transpose(-3, -2).reshape(-1, query.data.shape[-1], 64)
+        values = values.transpose(1, 2)
+    else:
+        values = context.value[batch, kv_head].index_select(1, indices).T
+    values = values.reshape(pairs, 128, query.data.shape[-1]).double()
     products = torch.bmm(codes, values)
     weights = torch.exp2(pair_max - pair_max.amax(dim=0))
     numerator = (products * weights[:, :, None]).sum(dim=0)

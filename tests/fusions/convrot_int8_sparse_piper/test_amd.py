@@ -7,15 +7,22 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._amd import gluon as amd_attention
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, output, query, value
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops
 
-from ._reference import assert_int8_codes_close, check_qk_sample_fp64, check_value_sample_fp64
+from ._reference import (
+    assert_int8_codes_close,
+    check_qk_sample_fp64,
+    check_value_sample_fp64,
+    key_mean_fp64,
+)
 
 
 def _available():
@@ -68,14 +75,20 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
             ),
             key._project_key_op(qdata, scale, weight, weight_scale, norm, cos, sin, 1e-5, 0),
             value._project_value_with_block_means_op(
-                qdata, scale, mean, weight, weight_scale, head_dim=head_dim
+                qdata,
+                scale,
+                mean,
+                weight,
+                weight_scale,
+                head_dim=head_dim,
+                value_format=int(ValueFormat.AMD_WMMA),
             ),
         )
 
     actual = run()
     for launch in (amd.project_query, amd.project_key, amd.project_value):
         monkeypatch.setitem(
-            launch.keywords, "config", replace(launch.keywords["config"], group_m=0)
+            launch.keywords, "execution_plan", replace(launch.keywords["execution_plan"], group_m=0)
         )
     expected = run()
     for left, right in zip(actual, expected, strict=True):
@@ -128,7 +141,13 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
             qdata, scale, weights[1], scales[1], norm, cos, sin, 1e-5, 0, head_dim=head_dim
         )
         v = value._project_value_with_block_means_op(
-            qdata, scale, mean, weights[2], scales[2], head_dim=head_dim
+            qdata,
+            scale,
+            mean,
+            weights[2],
+            scales[2],
+            head_dim=head_dim,
+            value_format=int(ValueFormat.AMD_WMMA),
         )
     stream.synchronize()
     assert _backend.select_output_backend(q[0]) is not None
@@ -144,6 +163,9 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
     storage = (sequence + 63) // 64 * 64
     for head in (0, heads // 2, heads - 1):
         columns = slice(head * head_dim, (head + 1) * head_dim)
+        mean_k = key_mean_fp64(
+            qdata[0], scale[0], weights[1][columns], scales[1][columns], norm, cos, sin
+        )
         mean_v = (expected_mean @ weights[2][columns].double().T) * scales[2][columns, 0].double()
         torch.testing.assert_close(v[2][:, head].double(), mean_v, rtol=2e-5, atol=2e-5)
         for start in sorted({0, (sequence // 2) // 64 * 64, (sequence - 1) // 64 * 64}):
@@ -165,6 +187,7 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
                         cos,
                         sin,
                         is_query=index == 0,
+                        key_mean=mean_k,
                     )
                 else:
                     check_value_sample_fp64(
@@ -172,7 +195,7 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
                     )
     assert q[0].shape == (1, heads, storage, head_dim)
     assert k[0].shape == (1, heads, storage, head_dim)
-    assert v[0].shape == (1, heads, head_dim, storage)
+    assert v[0].shape == ValueFormat.AMD_WMMA.shape(1, heads, storage, head_dim)
 
 
 @pytest.mark.gpu
@@ -199,8 +222,17 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
     q = query._project_query_op(*query_args, 0)
     k = key._project_key_op(qdata, scale, weights[1], scales[1], norm, cos, sin, 1e-5, 0)
     mean = _ops.dequantized_input_mean(qdata, scale)
-    v = value._project_value_op(qdata, scale, mean, weights[2], scales[2], head_dim=head_dim)
-    attention_tail = *k, *v, [250_000] * heads, sequence // 64, sequence, 0
+    v = value._project_value_op(
+        qdata,
+        scale,
+        mean,
+        weights[2],
+        scales[2],
+        head_dim=head_dim,
+        value_format=int(ValueFormat.AMD_WMMA),
+    )
+    profile = _SparsePiperRatioProfile((250_000,) * heads)
+    attention_tail = *k, *v, profile, sequence // 64, sequence, 0
     attention = _quantized_dispatch._sparse_piper_attention_from_quantized_op(*q, *attention_tail)
     out_weight = torch.randint(
         -128, 128, (width, heads * head_dim), device="cuda", dtype=torch.int8
@@ -214,21 +246,21 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
     del q, attention
     torch.cuda.synchronize()
 
-    windows, packing_calls = [], []
+    windows, parameter_calls = [], []
     project_query = query._launch_query_projection_range
-    pack_context = amd_attention.pack_context
+    prepare_parameters = amd_attention.prepare_parameters
 
     def track_query(*args, **kwargs):
         windows.append((kwargs["chunk_start"], kwargs["chunk_rows"]))
         assert kwargs["chunk_rows"] <= chunk_rows
         return project_query(*args, **kwargs)
 
-    def track_packing(context):
-        packing_calls.append(True)
-        return pack_context(context)
+    def track_parameters(context):
+        parameter_calls.append(True)
+        return prepare_parameters(context)
 
     monkeypatch.setattr(query, "_launch_query_projection_range", track_query)
-    monkeypatch.setattr(amd_attention, "pack_context", track_packing)
+    monkeypatch.setattr(amd_attention, "prepare_parameters", track_parameters)
     # Reuse each ping-pong slot many times, starting from a caller's side stream.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -243,7 +275,7 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
     assert windows == [
         (start, min(chunk_rows, sequence - start)) for start in range(0, sequence, chunk_rows)
     ]
-    assert len(packing_calls) == 1
+    assert len(parameter_calls) == 1
     assert actual.shape == expected.shape == (1, sequence, width)
     assert actual.is_contiguous()
     # Bound comparison workspace too; every output row participates in the check.
@@ -256,6 +288,5 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
         energy += float(right.square().sum())
     assert (error / max(energy, 1e-30)) ** 0.5 < 0.015
     if sequence == 100_000:
-        # Final output and existing AMD packed V scale with S. All additional
-        # working storage fits comfortably below even one full INT8 Q tensor.
-        assert peak < actual.numel() * actual.element_size() + v[0].numel() + 512 * 1024**2
+        # Only the final output grows with S; V is already in its final format.
+        assert peak < actual.numel() * actual.element_size() + 512 * 1024**2

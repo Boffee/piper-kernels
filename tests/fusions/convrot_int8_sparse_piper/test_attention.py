@@ -6,9 +6,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from lib.sparse_piper import reference_value_storage
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import SparsePiperAttention
+from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
 )
@@ -143,6 +145,7 @@ def _prepare(
         input_mean,
         operands.value_weight,
         operands.value_weight_scale,
+        value_format=int(require_attention_backend(operands.input_qdata).value_format),
     )
     return prepared_query, prepared_key, prepared_value
 
@@ -284,7 +287,13 @@ def test_ragged_fused_projection_matches_materialized_attention(
     prepared_query, prepared_key, prepared_value = _prepare(operands)
     assert not torch.count_nonzero(prepared_query[0][:, :, sequence_length:])
     assert not torch.count_nonzero(prepared_key[0][:, :, sequence_length:])
-    assert not torch.count_nonzero(prepared_value[0][..., sequence_length:])
+    storage = prepared_key[0].shape[2]
+    value_format = require_attention_backend(prepared_key[0]).value_format
+    padding = torch.arange(storage, device=prepared_key[0].device) >= sequence_length
+    padding = padding.expand(batch, _HEADS, _HEAD_DIM, storage)
+    assert not torch.count_nonzero(
+        prepared_value[0][reference_value_storage(padding, value_format)]
+    )
     assert all(
         bool(torch.isfinite(metadata).all())
         for metadata in (*prepared_query[1:], *prepared_key[1:], *prepared_value[1:])

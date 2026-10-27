@@ -32,7 +32,6 @@ from .coarse import _resolve_coarse_key_blocks
 class _PreparedQuantizedSparsePiperContext:
     """Global sparse-attention state used by independently produced Q chunks."""
 
-    kernel_context: _PreparedSparsePiperContext
     route_layout: _ResolvedRouteLayout
     key_summary: torch.Tensor
     key_aux: torch.Tensor
@@ -40,6 +39,10 @@ class _PreparedQuantizedSparsePiperContext:
     launch: LaunchAttention
     pooled_value: torch.Tensor | None = None
     coarse_scale: float | None = None
+
+    @property
+    def kernel_context(self) -> _PreparedSparsePiperContext:
+        return self.launch.context
 
 
 def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
@@ -90,6 +93,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         value_mean,
         layout.head_keep_blocks,
         layout.route_head_offsets,
+        value_format=backend.value_format,
         sparse_key_blocks=sparse_key_blocks,
         routes_per_query=(
             0
@@ -101,7 +105,6 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         sparse_query_blocks=sparse_query_blocks,
     )
     return _PreparedQuantizedSparsePiperContext(
-        kernel_context=kernel_context,
         route_layout=layout,
         key_summary=key_summary[:, :, :route_key_blocks],
         key_aux=key_aux[:, :, :route_key_blocks],
@@ -148,7 +151,6 @@ def _prepare_quantized_sparse_piper_query(
         coarse_output = routed_with_coarse.coarse_output
     return (
         _PreparedSparsePiperAttention(
-            context=context.kernel_context,
             launch=context.launch,
             query=_prepare_sparse_piper_query_from_quantized(
                 query,
@@ -298,11 +300,8 @@ def _launch_quantized_sparse_piper_attention(
     coarse_gate: torch.Tensor | None = None,
 ) -> None:
     """Launch a prepared quantized sparse-Piper query range."""
-    launch = prepared.launch
-    if launch is None:
-        launch = _backend.require_attention_backend(prepared.query.data).launch
-    launch(
-        prepared,
+    prepared.launch(
+        prepared.query,
         output,
         query_block_offset=query_block_offset,
         query_block_count=query_block_count,

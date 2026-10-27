@@ -5,6 +5,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Sparse Piper attention writes INT8 V directly in the selected backend's storage
+  format, removing AMD's extra V copy and repacking pass. Prepared contexts bind
+  backend state once, including NVIDIA K/V descriptors, for reuse across query
+  windows. Quantization and attention semantics are unchanged.
+
 ## [0.7.8] - 2026-10-24
 
 ### Fixed

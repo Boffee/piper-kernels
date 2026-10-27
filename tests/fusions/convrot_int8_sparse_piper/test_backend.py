@@ -18,6 +18,7 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
@@ -64,7 +65,14 @@ def _operands(sequence=193, heads=3, head_dim=128):
 
 
 def _call(
-    operation, operands, routing=_MINMAX_ROUTING, emit_block_mean=False, *, bias=None, mean=None
+    operation,
+    operands,
+    routing=_MINMAX_ROUTING,
+    emit_block_mean=False,
+    *,
+    bias=None,
+    mean=None,
+    value_format=ValueFormat.TRANSPOSED,
 ):
     head_dim = operands[4].shape[0]
     if operation == "query":
@@ -84,6 +92,7 @@ def _call(
         weight_scale,
         None,
         emit_block_mean=emit_block_mean,
+        value_format=int(value_format),
         head_dim=head_dim,
         bias=bias,
     )
@@ -190,7 +199,7 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
         == {
             "query": {"out", "chunk_start", "chunk_rows", "bias"},
             "key": {"out", "bias"},
-            "value": {"out", "emit_block_mean", "bias"},
+            "value": {"out", "emit_block_mean", "bias", "value_format"},
         }[operation]
     )
     if operation == "query":
@@ -647,7 +656,13 @@ def _capture_projection(
     with FakeTensorMode():
         operands = _operands(head_dim=head_dim)
         bias = operands[3].new_empty((3 * head_dim,)) if with_bias else None
-        _call(operation, operands, emit_block_mean=True, bias=bias)
+        _call(
+            operation,
+            operands,
+            emit_block_mean=True,
+            bias=bias,
+            value_format=ValueFormat.AMD_WMMA if target.is_amd_hip else ValueFormat.TRANSPOSED,
+        )
     guard.assert_called_once_with(torch.device("cuda:1"))
     if operation == "key":
         mean_guard.assert_called_once_with(torch.device("cuda:1"))

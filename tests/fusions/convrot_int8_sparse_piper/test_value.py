@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from lib.sparse_piper import reference_value_storage
 
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as value_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
@@ -88,8 +90,13 @@ def _random_operands(
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
 # SM89 projects 256 input features with Gluon and 272 with the shared Triton launchers.
 @pytest.mark.parametrize("input_features", [256, 272])
+@pytest.mark.parametrize("value_format", list(ValueFormat))
 def test_fused_value_projection_matches_the_fp32_composed_contract(
-    input_features: int, bias_dtype: torch.dtype | None, sequence_length: int, head_dim: int
+    input_features: int,
+    bias_dtype: torch.dtype | None,
+    sequence_length: int,
+    head_dim: int,
+    value_format: ValueFormat,
 ) -> None:
     operands = _random_operands(
         sequence_length=sequence_length, input_features=input_features, head_dim=head_dim
@@ -110,6 +117,7 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
         *operands.as_tuple()[2:],
         head_dim=head_dim,
         bias=bias,
+        value_format=int(value_format),
     )
     expected = composed_value_projection(
         *operands.as_tuple()[:2],
@@ -120,13 +128,20 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
     )
     storage_length = padded_sequence_length(sequence_length)
 
-    assert actual_value.shape == (1, 2, head_dim, storage_length)
+    assert actual_value.shape == value_format.shape(1, 2, storage_length, head_dim)
     assert actual_value.dtype is torch.int8
     assert actual_scale.shape == (1, 2, storage_length // 64, 1)
     assert actual_scale.dtype is torch.float32
     assert actual_mean.shape == (1, 2, head_dim)
     assert actual_mean.dtype is torch.float32
-    assert int((actual_value.to(torch.int16) - expected.value).abs().max()) <= 1
+    assert (
+        int(
+            (actual_value.to(torch.int16) - reference_value_storage(expected.value, value_format))
+            .abs()
+            .max()
+        )
+        <= 1
+    )
     torch.testing.assert_close(
         actual_scale,
         expected.value_scale_multiplier,
@@ -304,11 +319,13 @@ def test_value_projection_runs_under_fullgraph_compile() -> None:
     assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
 
 
-def test_value_projection_fake_kernels_propagate_shapes() -> None:
+@pytest.mark.parametrize("value_format", list(ValueFormat))
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_value_projection_fake_kernels_propagate_shapes(value_format, head_dim) -> None:
     input_qdata = torch.empty((2, 128, 272), device="meta", dtype=torch.int8)
     input_scale = torch.empty((2, 128), device="meta", dtype=torch.float32)
-    weight_qdata = torch.empty((3 * 128, 272), device="meta", dtype=torch.int8)
-    weight_scale = torch.empty((3 * 128, 1), device="meta", dtype=torch.float32)
+    weight_qdata = torch.empty((3 * head_dim, 272), device="meta", dtype=torch.int8)
+    weight_scale = torch.empty((3 * head_dim, 1), device="meta", dtype=torch.float32)
 
     input_mean = int8_ops.dequantized_input_mean(input_qdata, input_scale)
     value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
@@ -317,6 +334,8 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
         input_mean,
         weight_qdata,
         weight_scale,
+        head_dim=head_dim,
+        value_format=int(value_format),
     )
     summarized = value_fusion._project_value_with_block_means_op(
         input_qdata,
@@ -324,20 +343,22 @@ def test_value_projection_fake_kernels_propagate_shapes() -> None:
         input_mean,
         weight_qdata,
         weight_scale,
+        head_dim=head_dim,
+        value_format=int(value_format),
     )
 
     assert input_mean.shape == (2, 272)
     assert input_mean.dtype is torch.float32
-    assert value.shape == (2, 3, 128, 128)
+    assert value.shape == value_format.shape(2, 3, 128, head_dim)
     assert value.dtype is torch.int8
     assert value_scale_multiplier.shape == (2, 3, 2, 1)
     assert value_scale_multiplier.dtype is torch.float32
-    assert value_mean.shape == (2, 3, 128)
+    assert value_mean.shape == (2, 3, head_dim)
     assert value_mean.dtype is torch.float32
     assert [tensor.shape for tensor in summarized[:3]] == [
         value.shape,
         value_scale_multiplier.shape,
         value_mean.shape,
     ]
-    assert summarized[3].shape == (2, 3, 2, 128)
+    assert summarized[3].shape == (2, 3, 2, head_dim)
     assert summarized[3].dtype is torch.float32

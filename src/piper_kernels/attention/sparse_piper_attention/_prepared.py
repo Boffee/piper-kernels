@@ -11,26 +11,32 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     QUERY_SCALE_ROWS,
     SUPPORTED_HEAD_DIMS,
     TILE_ROWS,
+    ValueFormat,
 )
 
 from ._block_layout import validate_sparse_query_blocks
 
 if TYPE_CHECKING:
-    from ._interfaces import LaunchAttention
+    from ._interfaces import BindAttention, LaunchAttention
 
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperContext:
-    """Sequence-global K/V and policy metadata.
+    """Sequence-global K/V and policy metadata validated or produced by preparation.
 
     Zero routes per query denotes canonical full keep without a route list.
     Each backend validates whether it implements that execution mode.
     Caller-supplied route lists retain their ordering and semantics. K/V tensors
     carry KV heads; keep budgets and route offsets carry query heads.
+
+    K/V, scales, means, and policy tensors remain unchanged for the bound
+    launcher's lifetime. Producers write V in ``value_format`` directly;
+    binding never creates another V representation. Rebind after mutation.
     """
 
     key: torch.Tensor
     value: torch.Tensor
+    value_format: ValueFormat
     key_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
@@ -45,7 +51,7 @@ class _PreparedSparsePiperContext:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperQuery:
-    """Query-local quantized storage and routes at one global block offset."""
+    """Quantized storage and routes validated against one context and global offset."""
 
     data: torch.Tensor
     scale: torch.Tensor
@@ -57,11 +63,13 @@ class _PreparedSparsePiperQuery:
 class _PreparedSparsePiperAttention:
     """Sequence-global context paired with one full or local query range."""
 
-    context: _PreparedSparsePiperContext
+    launch: LaunchAttention
     query: _PreparedSparsePiperQuery
-    # Orchestration may bind backend-owned state once for a sequence of query
-    # chunks. Raw prepared tensors remain usable through one-shot launchers.
-    launch: LaunchAttention | None = None
+
+    @property
+    def context(self) -> _PreparedSparsePiperContext:
+        """The bound launch owns the immutable sequence-global operands."""
+        return self.launch.context
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +83,7 @@ class _PreparedSparsePiperOperands:
 
     key: torch.Tensor
     value: torch.Tensor
+    value_format: ValueFormat
     key_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
@@ -93,11 +102,14 @@ class _PreparedSparsePiperOperands:
         routes: torch.Tensor,
         head_keep_blocks: torch.Tensor,
         route_head_offsets: torch.Tensor,
+        *,
+        bind: BindAttention,
     ) -> _PreparedSparsePiperAttention:
         """Bind selected routes to these quantized operands."""
         context = _PreparedSparsePiperContext(
             key=self.key,
             value=self.value,
+            value_format=self.value_format,
             key_scale=self.key_scale,
             value_scale_multiplier=self.value_scale_multiplier,
             value_mean=self.value_mean,
@@ -109,15 +121,10 @@ class _PreparedSparsePiperOperands:
             sparse_query_blocks=self.sparse_query_blocks,
             logical_sequence_length=self.logical_sequence_length,
         )
-        return _PreparedSparsePiperAttention(
-            context=context,
-            query=_prepare_sparse_piper_query_from_quantized(
-                self.query,
-                self.query_scale,
-                routes,
-                context,
-            ),
+        query = _prepare_sparse_piper_query_from_quantized(
+            self.query, self.query_scale, routes, context
         )
+        return _PreparedSparsePiperAttention(launch=bind(context), query=query)
 
 
 def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
@@ -129,6 +136,7 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     head_keep_blocks: torch.Tensor,
     route_head_offsets: torch.Tensor,
     *,
+    value_format: ValueFormat,
     sparse_key_blocks: int,
     routes_per_query: int,
     logical_sequence_length: int,
@@ -164,12 +172,10 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     elif not 1 <= logical_sequence_length <= storage_sequence_length:
         raise ValueError("quantized sparse Piper logical length must fit block-length storage")
     if (
-        value.shape != (batch, heads, head_dim, storage_sequence_length)
+        value.shape != value_format.shape(batch, heads, storage_sequence_length, head_dim)
         or value.dtype is not torch.int8
     ):
-        raise ValueError(
-            "quantized sparse Piper V must be transposed INT8 [B,H,D,storage_sequence]"
-        )
+        raise ValueError(f"quantized sparse Piper V must use {value_format.name} INT8 storage")
     tile_count = storage_sequence_length // TILE_ROWS
     if key_scale.shape != (batch, heads, tile_count):
         raise ValueError("quantized sparse Piper K scales must contain one value per K64")
@@ -231,6 +237,7 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     return _PreparedSparsePiperContext(
         key=key,
         value=value,
+        value_format=value_format,
         key_scale=key_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,

@@ -2,10 +2,11 @@
 
 import pytest
 import torch
-from lib.sparse_piper import reference_prepared_query
+from lib.sparse_piper import reference_prepared_query, reference_value_storage
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._amd.gluon import _launch_sparse_piper_attention
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
@@ -23,7 +24,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_sparse_piper_attention,
 )
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_operands
 
 pytestmark = [
     pytest.mark.gpu,
@@ -53,19 +53,25 @@ def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
     routes = packed_routes_from_sequences(
         q.transpose(1, 2), k.transpose(1, 2)[:, :, : blocks * 64], layout, routing_mode
     )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(q.transpose(1, 2))
+    prepared = backend.prepare(
         q.transpose(1, 2),
         head_dim**-0.5,
         sparse_key_blocks=blocks,
         combined_key=k.transpose(1, 2),
         combined_value=v.transpose(1, 2),
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
     expected = reference_sparse_piper_attention(
         q, k, v, routes, sparse_key_blocks=blocks, scale=head_dim**-0.5
     )
     storage = torch.full((q.numel() + 16,), -123, device=q.device, dtype=q.dtype)
     actual = storage[8:-8].view(q.shape)
-    _launch_sparse_piper_attention(prepared, actual.transpose(1, 2))
+    prepared.launch(prepared.query, actual.transpose(1, 2))
     error = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert torch.isfinite(actual).all()
     assert error < 0.015, error.item()
@@ -100,7 +106,7 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
     context = _prepare_sparse_piper_context_from_quantized(
         key,
         torch.full((1, heads, padded // 64), 0.1, device="cuda"),
-        value,
+        reference_value_storage(value, ValueFormat.AMD_WMMA),
         multiplier,
         torch.randn((1, heads, head_dim), device="cuda", generator=generator),
         torch.tensor(keep, device="cuda", dtype=torch.int32),
@@ -108,6 +114,7 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
         sparse_key_blocks=sequence // 64,
         routes_per_query=sum(keep),
         logical_sequence_length=sequence,
+        value_format=ValueFormat.AMD_WMMA,
     )
     routes = torch.cat(
         [
@@ -124,11 +131,13 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
         context,
         global_block_offset=global_query_block,
     )
-    prepared = _PreparedSparsePiperAttention(context, query)
+    prepared = _PreparedSparsePiperAttention(
+        require_attention_backend(context.key).bind_context(context), query
+    )
     rows = min(64, sequence - global_query_block * 64)
     guarded = torch.full((heads * rows * head_dim + 16,), -123, device="cuda", dtype=torch.bfloat16)
     output = guarded[8:-8].view(1, heads, rows, head_dim)
-    _launch_sparse_piper_attention(prepared, output)
+    prepared.launch(prepared.query, output)
     for head in range(heads):
         expected = reference_prepared_query(prepared, 0, head, 0)
         actual = output[0, head]
