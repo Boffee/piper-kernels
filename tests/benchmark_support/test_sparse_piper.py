@@ -1,12 +1,16 @@
+from unittest.mock import Mock
+
 import pytest
 import torch
 from benchmark_sparse_piper import _parse_args
 from lib.sparse_piper import (
     assert_equal_finite,
     reference_prepared_query,
+    reference_value_storage,
     useful_integer_operations,
 )
 
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperAttention,
     _PreparedSparsePiperContext,
@@ -51,12 +55,13 @@ def test_catalog_case_preserves_sparse_workload_and_rejects_overrides():
         _parse_args(["--case", "attention-small"])
 
 
+@pytest.mark.parametrize("value_format", list(ValueFormat))
 @pytest.mark.parametrize("internal_padding", [False, True])
 @pytest.mark.parametrize("global_offset", [0, 1])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("kv_heads", [1, 2])
 def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
-    internal_padding, global_offset, head_dim, kv_heads
+    internal_padding, global_offset, head_dim, kv_heads, value_format
 ):
     generator = torch.Generator().manual_seed(713)
     lengths = [3, 64, 7, 41] if internal_padding else [64, 64, 64, 1]
@@ -66,7 +71,8 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
     mean = torch.randn((2, kv_heads, head_dim), generator=generator)
     context = _PreparedSparsePiperContext(
         key=torch.zeros((2, kv_heads, 256, head_dim), dtype=torch.int8),
-        value=value,
+        value=reference_value_storage(value, value_format),
+        value_format=value_format,
         key_scale=torch.ones((2, kv_heads, 4)),
         value_scale_multiplier=torch.full((2, kv_heads, 4, 1), 255.0),
         value_mean=mean,
@@ -84,7 +90,7 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         routes=torch.tensor([1, 1, 0], dtype=torch.uint16).repeat(2, 4 - global_offset, 1),
         global_block_offset=global_offset,
     )
-    prepared = _PreparedSparsePiperAttention(context, query)
+    prepared = _PreparedSparsePiperAttention(Mock(context=context), query)
     for batch in range(2):
         for head in range(2):
             kv_head = head // (2 // kv_heads)

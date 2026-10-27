@@ -7,6 +7,7 @@ import torch
 import triton
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat, padded_sequence_length
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 from piper_kernels.fusions.convrot_int8_sage_qk import key as key_projection
@@ -142,12 +143,14 @@ def project_value(
     *,
     execution_plan: ProjectionExecutionPlan,
     emit_block_mean: bool,
+    value_format: ValueFormat,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
 ) -> None:
     """Launch projected means and centered tile-scaled INT8 values."""
     value, value_scale_multiplier, value_mean, block_mean = out
-    batch, heads, head_dim, storage_sequence_length = value.shape
+    batch, heads, head_dim = value_mean.shape
+    storage_sequence_length = padded_sequence_length(input_qdata.shape[1])
     block_n = head_dim * execution_plan.heads_per_program
     sequence_length = input_qdata.shape[1]
     has_block_lengths = block_lengths is not None
@@ -201,6 +204,7 @@ def project_value(
                 ),
                 mask_block_lengths=has_block_lengths,
                 emit_block_mean=emit_block_mean,
+                value_format=int(value_format),
                 block_m=execution_plan.block_m,
                 block_n=block_n,
                 block_k=execution_plan.block_k,

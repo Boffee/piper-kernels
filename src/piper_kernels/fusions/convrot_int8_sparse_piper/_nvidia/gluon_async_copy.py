@@ -34,6 +34,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
 )
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
 from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
@@ -908,11 +909,14 @@ def project_value(
     block_lengths: torch.Tensor | None,
     *,
     emit_block_mean: bool,
+    value_format: ValueFormat,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
     execution_plan: NvidiaExecutionPlan,
 ) -> None:
     """Fill centered K64-scaled INT8 values, the projected mean, and block means."""
+    if value_format is not ValueFormat.TRANSPOSED:
+        raise ValueError("NVIDIA Gluon V projection requires transposed storage")
     value, value_scale_multiplier, value_mean, block_mean = out
     batch, heads, _head_dim, storage_sequence_length = value.shape
     mask_block_lengths = block_lengths is not None

@@ -3,15 +3,17 @@
 import ast
 import subprocess
 import sys
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import (
     _backend,
     _quantized_dispatch,
@@ -58,7 +60,7 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, kernel, he
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     backends = {}
     for name in ("tma", "async_copy"):
-        backend = AttentionBackend(prepare=Mock(), launch=Mock())
+        backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=Mock())
         backends[name] = (backend, replace(backend, skip_dense_routing=True))
     monkeypatch.setattr(_backend, "_nvidia_tma_attention", backends["tma"][0])
     monkeypatch.setattr(_backend, "_nvidia_tma_attention_skip_dense_routing", backends["tma"][1])
@@ -78,8 +80,8 @@ def test_sm89_attention_uses_its_own_launcher_and_shared_preparation():
     sm120 = _backend._nvidia_tma_attention
     assert sm89 is not None
     assert sm120 is not None
-    assert sm89.launch is _backend.nvidia_async_copy_gluon._launch_sparse_piper_attention
-    assert sm89.launch is not sm120.launch
+    assert sm89.bind is _backend.nvidia_async_copy_gluon.bind_context
+    assert sm89.bind is not sm120.bind
     assert sm89.prepare is sm120.prepare
 
 
@@ -105,7 +107,7 @@ def test_amd_attention_selection_is_independent_and_uses_tensor_device(
     monkeypatch.setattr(torch.cuda, "current_device", Mock(side_effect=AssertionError("wrong GPU")))
     monkeypatch.setattr(_backend, "_nvidia_tma_attention", None)
     monkeypatch.setattr(_backend, "_nvidia_async_copy_attention", None)
-    backend = AttentionBackend(prepare=Mock(), launch=Mock())
+    backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=Mock())
     monkeypatch.setattr(_backend, "_amd_attention", backend)
     query = SimpleNamespace(device=torch.device("cuda:1"), ndim=4, shape=(1, 1, 64, head_dim))
     assert _backend.select_attention_backend(query) is (
@@ -119,7 +121,7 @@ def test_amd_device_probes_and_projection_inputs_preserve_d128_support(monkeypat
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
-    backend = AttentionBackend(prepare=Mock(), launch=Mock())
+    backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=Mock())
     monkeypatch.setattr(_backend, "_amd_attention", backend)
     assert _backend.select_attention_backend(torch.empty(shape)) is backend
 
@@ -352,16 +354,14 @@ def test_fused_operand_preparation_follows_summary_support(monkeypatch):
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm89")
     )
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-    selected = _backend.select_fused_operand_preparation(
-        query, query, _routing_modes._MINMAX_ROUTING
-    )
-    assert (selected is not None) is (_backend.select_sequence_summaries(query, query) is not None)
+    selected = _backend.use_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
+    assert selected is (_backend.select_sequence_summaries(query, query) is not None)
     unsupported = torch.empty(1, 1, 128, 32, dtype=torch.bfloat16)
     assert (
-        _backend.select_fused_operand_preparation(
+        _backend.use_fused_operand_preparation(
             unsupported, unsupported, _routing_modes._MINMAX_ROUTING
         )
-        is None
+        is False
     )
 
 
@@ -372,12 +372,10 @@ def test_mean_pool_routing_keeps_the_separate_summary_pass(monkeypatch):
     )
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
     assert (
-        _backend.select_fused_operand_preparation(query, query, _routing_modes._MEAN_ROUTING)
-        is None
+        _backend.use_fused_operand_preparation(query, query, _routing_modes._MEAN_ROUTING) is False
     )
     assert (
-        _backend.select_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
-        is not None
+        _backend.use_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING) is True
     )
 
 
@@ -386,8 +384,8 @@ def test_fused_operand_preparation_requires_native_preparation(monkeypatch):
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
     assert (
-        _backend.select_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
-        is None
+        _backend.use_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
+        is False
     )
 
 
@@ -413,16 +411,40 @@ def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("keep_ratio", [0.5, 1.0])
-def test_dense_orchestration_uses_selected_operations(monkeypatch, head_dim, keep_ratio):
+@pytest.mark.parametrize("fuse_summaries", [False, True])
+def test_dense_orchestration_uses_selected_operations(
+    monkeypatch, head_dim, keep_ratio, fuse_summaries
+):
     query = torch.zeros(1, 128, 1, head_dim, dtype=torch.bfloat16)
     key, value = torch.zeros_like(query), torch.zeros_like(query)
-    state = object()
+    state = Mock()
     operands = Mock(with_routes=Mock(return_value=state))
     prepare = Mock(return_value=operands)
     launch = Mock(side_effect=lambda prepared, output: output.fill_(3))
-    backend = AttentionBackend(prepare=prepare, launch=launch, skip_dense_routing=head_dim == 64)
+    state.launch = launch
+    backend = AttentionBackend(
+        value_format=ValueFormat.TRANSPOSED,
+        prepare=prepare,
+        bind=Mock(),
+        skip_dense_routing=head_dim == 64,
+    )
     select = Mock(return_value=backend)
     monkeypatch.setattr(_backend, "select_attention_backend", select)
+    monkeypatch.setattr(_backend, "use_fused_operand_preparation", lambda *args: fuse_summaries)
+    # Both policy paths must use the backend already selected for this call.
+    monkeypatch.setattr(
+        dispatch,
+        "packed_routes_from_summaries",
+        Mock(
+            return_value=_routing.packed_routes_from_sequences(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                _resolve_route_layout(_normalize_head_keep_ratios((keep_ratio,)), 2, query.device),
+                _routing_modes._MINMAX_ROUTING,
+                skip_dense_routing=backend.skip_dense_routing,
+            )
+        ),
+    )
     result = dispatch.SparsePiperAttention((keep_ratio,))(query, key, value, sparse_key_blocks=2)
     assert result.shape == query.shape
     assert result.is_contiguous()
@@ -439,7 +461,10 @@ def test_dense_orchestration_uses_selected_operations(monkeypatch, head_dim, kee
     assert prepare.call_args.kwargs["combined_key"].data_ptr() == key.data_ptr()
     assert prepare.call_args.kwargs["combined_value"].data_ptr() == value.data_ptr()
     assert prepare.call_args.kwargs["sparse_key_blocks"] == 2
-    assert launch.call_args.args[0] is state
+    assert prepare.call_args.kwargs.get("emit_summaries", False) is (
+        fuse_summaries and keep_ratio < 1.0
+    )
+    assert launch.call_args.args[0] is state.query
     assert launch.call_args.args[1].data_ptr() == result.data_ptr()
 
 
@@ -496,6 +521,11 @@ def test_summaries_use_selected_operation_after_validation(monkeypatch):
     select.assert_called_once()
 
 
+def _bind_mock(context, launch):
+    launch.context = context
+    return launch
+
+
 def _quantized_context_arguments(head_dim=128):
     return {
         "key": torch.zeros(1, 1, 128, head_dim, dtype=torch.int8),
@@ -518,7 +548,13 @@ def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeyp
     if coarse:
         arguments.update(block_mean=torch.ones(1, 1, 2, 128), coarse_scale=0.1)
     launch = Mock()
-    select = Mock(return_value=AttentionBackend(prepare=Mock(), launch=launch))
+    select = Mock(
+        return_value=AttentionBackend(
+            value_format=ValueFormat.TRANSPOSED,
+            prepare=Mock(),
+            bind=lambda context: _bind_mock(context, launch),
+        )
+    )
     monkeypatch.setattr(_backend, "select_attention_backend", select)
     context = _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
     query = torch.zeros(1, 1, 64, 128, dtype=torch.int8)
@@ -535,7 +571,7 @@ def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeyp
         prepared, output, query_block_count=1, coarse_output=pooled, coarse_gate=gate
     )
     launch.assert_called_once_with(
-        prepared,
+        prepared.query,
         output,
         query_block_offset=0,
         query_block_count=1,
@@ -547,9 +583,8 @@ def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeyp
 
 def test_backend_context_binding_is_once_per_context_not_per_query(monkeypatch):
     launch = Mock()
-    bind = Mock(return_value=launch)
-    one_shot = Mock(side_effect=AssertionError("must reuse the bound context"))
-    backend = AttentionBackend(prepare=Mock(), launch=one_shot, bind=bind)
+    bind = Mock(side_effect=lambda context: _bind_mock(context, launch))
+    backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=bind)
     select = Mock(return_value=backend)
     monkeypatch.setattr(_backend, "select_attention_backend", select)
     arguments = _quantized_context_arguments()
@@ -568,7 +603,6 @@ def test_backend_context_binding_is_once_per_context_not_per_query(monkeypatch):
     bind.assert_called_once_with(context.kernel_context)
     select.assert_called_once_with(arguments["key"])
     assert launch.call_count == 2
-    one_shot.assert_not_called()
     next_context = _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
     assert bind.call_count == 2
     assert bind.call_args.args[0] is next_context.kernel_context
@@ -596,6 +630,7 @@ def test_shared_quantized_validation_rejects_cross_device_query():
         torch.ones(1, dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
         sparse_key_blocks=2,
+        value_format=ValueFormat.TRANSPOSED,
         routes_per_query=1,
         logical_sequence_length=128,
     )
@@ -619,6 +654,7 @@ def test_prepared_query_must_match_context_head_width():
         torch.ones(1, dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
         sparse_key_blocks=2,
+        value_format=ValueFormat.TRANSPOSED,
         routes_per_query=1,
         logical_sequence_length=128,
     )
@@ -629,6 +665,98 @@ def test_prepared_query_must_match_context_head_width():
             torch.zeros(1, 1, 1, dtype=torch.uint16),
             context,
         )
+
+
+@pytest.mark.parametrize("value_format", list(ValueFormat))
+@pytest.mark.parametrize("defect", [None, "shape", "dtype", "strides"])
+def test_context_requires_the_consumers_value_storage(monkeypatch, value_format, defect):
+    arguments = _quantized_context_arguments()
+    value = torch.empty(value_format.shape(1, 1, 128, 128), dtype=torch.int8)
+    if defect == "shape":
+        value = value.flatten()
+    elif defect == "dtype":
+        value = value.float()
+    elif defect == "strides":
+        value = value.transpose(-1, -2).contiguous().transpose(-1, -2)
+    arguments["value"] = value
+    bind = Mock(side_effect=lambda context: Mock(context=context))
+    backend = AttentionBackend(value_format=value_format, prepare=Mock(), bind=bind)
+    monkeypatch.setattr(_backend, "select_attention_backend", lambda query: backend)
+    if defect is not None:
+        with pytest.raises(ValueError, match=r"V must use|contiguous"):
+            _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
+        bind.assert_not_called()
+    else:
+        prepared = _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
+        assert prepared.kernel_context.value is value
+        assert prepared.kernel_context.value_format is value_format
+        bind.assert_called_once_with(prepared.kernel_context)
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("width", "K64-aligned D64/D128"),
+        ("rows", "K64-aligned D64/D128"),
+        ("logical_length", "padded logical sequence"),
+        ("scales", "one value per K64"),
+    ],
+)
+def test_context_rejects_invalid_storage_before_binding(monkeypatch, defect, message):
+    arguments = _quantized_context_arguments()
+    if defect == "width":
+        arguments["key"] = torch.zeros(1, 1, 128, 32, dtype=torch.int8)
+    elif defect == "rows":
+        arguments["key"] = torch.zeros(1, 1, 65, 128, dtype=torch.int8)
+    elif defect == "logical_length":
+        arguments["logical_sequence_length"] = 64
+    else:
+        arguments["value_scale_multiplier"] = torch.ones(1, 1, 2, 2)
+    bind = Mock(side_effect=AssertionError("invalid storage reached binding"))
+    backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=bind)
+    monkeypatch.setattr(_backend, "select_attention_backend", lambda query: backend)
+    with pytest.raises(ValueError, match=message):
+        _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
+    bind.assert_not_called()
+
+
+@pytest.mark.skipif(_backend.nvidia_tma_gluon is None, reason="requires Triton import")
+def test_tma_reuses_context_descriptors_across_query_windows(monkeypatch):
+    native = _backend.nvidia_tma_gluon
+    prepared = _prepared_attention(128, 2)
+    describe = Mock(side_effect=lambda *args: object())
+    kernel = MagicMock()
+    monkeypatch.setattr(native, "_descriptor", describe)
+    monkeypatch.setattr(native, "_sparse_piper_attention_kernel", kernel)
+    monkeypatch.setattr(native, "device_context", lambda device: nullcontext())
+    monkeypatch.setattr(native, "install_uint8_int8_dot_hook", lambda: None)
+    launch = native.bind_context(prepared.context)
+    assert describe.call_count == 2
+    assert describe.call_args_list[0].args[0] is prepared.context.key
+    assert describe.call_args_list[1].args[0] is prepared.context.value
+    key_descriptor, value_descriptor = launch.key_descriptor, launch.value_descriptor
+    for offset in (0, 1):
+        local = _prepare_sparse_piper_query_from_quantized(
+            prepared.query.data[:, :, offset * 64 : (offset + 1) * 64].contiguous(),
+            prepared.query.scale[:, :, offset * 2 : (offset + 1) * 2].contiguous(),
+            prepared.query.routes[:, offset : offset + 1].contiguous(),
+            prepared.context,
+            global_block_offset=offset,
+        )
+        launch(local, torch.empty(1, 1, 64, 128, dtype=torch.bfloat16))
+        assert describe.call_args.args[0] is local.data
+        assert kernel.__getitem__.return_value.call_args.args[1] is key_descriptor
+        assert kernel.__getitem__.return_value.call_args.args[2] is value_descriptor
+    assert describe.call_count == 4  # Two K/V descriptors and one per Q window.
+
+
+def test_backend_rejects_mismatched_producer_format_before_binding():
+    prepared = _prepared_attention(128, 1)
+    bind = Mock(side_effect=AssertionError("incompatible context reached backend"))
+    backend = AttentionBackend(value_format=ValueFormat.AMD_WMMA, prepare=Mock(), bind=bind)
+    with pytest.raises(ValueError, match="requires AMD_WMMA"):
+        backend.bind_context(prepared.context)
+    bind.assert_not_called()
 
 
 def _prepared_attention(head_dim, routes_per_query):
@@ -642,6 +770,7 @@ def _prepared_attention(head_dim, routes_per_query):
         torch.tensor([2], dtype=torch.int32),
         torch.tensor([0, 2], dtype=torch.int32),
         sparse_key_blocks=2,
+        value_format=ValueFormat.TRANSPOSED,
         routes_per_query=routes_per_query,
         logical_sequence_length=128,
     )
@@ -651,7 +780,7 @@ def _prepared_attention(head_dim, routes_per_query):
         torch.zeros(1, 2, routes_per_query, dtype=torch.uint16),
         context,
     )
-    return _PreparedSparsePiperAttention(context, query)
+    return _PreparedSparsePiperAttention(Mock(context=context), query)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -671,8 +800,8 @@ def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, m
     enter_device = Mock(side_effect=AssertionError("unsupported mode reached device execution"))
     monkeypatch.setattr(native, "device_context", enter_device)
     with pytest.raises(ValueError, match="skip_dense_routing requires NVIDIA D64"):
-        native._launch_sparse_piper_attention(
-            prepared, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+        native.bind_context(prepared.context)(
+            prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
         )
     enter_device.assert_not_called()
 
@@ -695,12 +824,14 @@ def test_sm89_rejects_uncopyable_storage_before_device_execution(monkeypatch, op
     if operand == "query":
         prepared = replace(prepared, query=replace(prepared.query, data=replacement))
     else:
-        prepared = replace(prepared, context=replace(prepared.context, **{operand: replacement}))
+        prepared = replace(
+            prepared, launch=Mock(context=replace(prepared.context, **{operand: replacement}))
+        )
     enter_device = Mock(side_effect=AssertionError("unsupported storage reached device execution"))
     monkeypatch.setattr(native, "device_context", enter_device)
     with pytest.raises(ValueError, match="16-byte-aligned"):
-        native._launch_sparse_piper_attention(
-            prepared, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+        native.bind_context(prepared.context)(
+            prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
         )
     enter_device.assert_not_called()
 
@@ -710,25 +841,20 @@ def test_sm89_rejects_uncopyable_storage_before_device_execution(monkeypatch, op
     ("head_dim", "route_count", "message"),
     [(64, 0, "skip_dense_routing"), (128, 0, "skip_dense_routing")],
 )
-def test_amd_rejects_unsupported_context_before_packing_or_launch(
+def test_amd_rejects_unsupported_context_before_parameters_or_launch(
     monkeypatch, head_dim, route_count, message
 ):
     native = _backend.amd_gluon
     prepared = _prepared_attention(head_dim, route_count)
-    pack = Mock(side_effect=AssertionError("unsupported context reached packing"))
+    parameters = Mock(
+        side_effect=AssertionError("unsupported context reached parameter preparation")
+    )
     enter_device = Mock(side_effect=AssertionError("unsupported context reached device execution"))
-    monkeypatch.setattr(native, "pack_context", pack)
+    monkeypatch.setattr(native, "prepare_parameters", parameters)
     monkeypatch.setattr(native, "device_context", enter_device)
     with pytest.raises(ValueError, match=message):
         native.bind_context(prepared.context)
-    for packed in (None, SimpleNamespace(source=prepared.context)):
-        with pytest.raises(ValueError, match=message):
-            native._launch_sparse_piper_attention(
-                prepared,
-                torch.empty(1, 1, 128, head_dim, dtype=torch.bfloat16),
-                packed=packed,
-            )
-    pack.assert_not_called()
+    parameters.assert_not_called()
     enter_device.assert_not_called()
 
 

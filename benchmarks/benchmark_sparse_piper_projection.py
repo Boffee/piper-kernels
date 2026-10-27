@@ -27,6 +27,7 @@ from lib.suite_pipeline import _GROUP_SIZE, _projection
 from lib.timing import DeviceTimings, measure_device, synchronized_wall_benchmark
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, query, value
 from piper_kernels.linear.convrot.int8 import _ops
@@ -153,6 +154,7 @@ def _benchmark(
     )
     q = query._launch_query_projection(*q_args)
     k = key._launch_key_projection(*k_args)
+    value_format = require_attention_backend(qdata).value_format
     v = value._launch_value_projection(
         qdata,
         scale,
@@ -161,6 +163,7 @@ def _benchmark(
         weights[2].scale,
         None,
         emit_block_mean=True,
+        value_format=value_format,
         head_dim=case.head_dim,
     )
     q_call = partial(
@@ -177,6 +180,7 @@ def _benchmark(
             weights[2].scale,
             None,
             emit_block_mean=True,
+            value_format=value_format,
             out=v,
         )
 

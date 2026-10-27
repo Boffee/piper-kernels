@@ -142,7 +142,12 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
             sparse_key_blocks=blocks,
             combined_key=key,
             combined_value=value,
-        ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+        ).with_routes(
+            routes.indices,
+            routes.head_keep_blocks,
+            routes.route_head_offsets,
+            bind=backend.bind_context,
+        )
         actual_samples, quantized_samples, floating_samples = [], [], []
         for b in range(case.batch):
             for head in sorted({0, case.heads // 2, case.heads - 1}):

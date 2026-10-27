@@ -7,18 +7,17 @@ import torch
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_tma as native
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_query_from_quantized,
 )
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
-from piper_kernels.attention.sparse_piper_attention.triton import _prepare_sparse_piper_operands
 
 requires_sm120 = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -39,7 +38,8 @@ def _prepared(sequence, ratios, *, block_lengths=None, sparse_query_blocks=None)
     routes = packed_routes_from_sequences(
         query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING, block_lengths
     )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(query)
+    prepared = backend.prepare(
         query,
         64**-0.5,
         sparse_key_blocks=blocks,
@@ -47,7 +47,12 @@ def _prepared(sequence, ratios, *, block_lengths=None, sparse_query_blocks=None)
         combined_value=value,
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
     return operands, prepared
 
 
@@ -59,19 +64,21 @@ def test_skip_dense_routing_matches_materialized_routes(monkeypatch, sequence):
     expected = torch.empty_like(operands[0])
     with monkeypatch.context() as patch:
         patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
-        native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2))
+        prepared.launch(prepared.query, expected.transpose(1, 2))
     actual = SparsePiperAttention([1.0, 1.0])(*operands, sparse_key_blocks=sequence // 64)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     graph = torch.cuda.CUDAGraph()
     # Prepared operands also exercise replay without rebuilding CPU metadata.
     direct = replace(
         prepared,
-        context=replace(prepared.context, routes_per_query=0),
+        launch=require_attention_backend(prepared.context.key).bind_context(
+            replace(prepared.context, routes_per_query=0)
+        ),
         query=replace(prepared.query, routes=prepared.query.routes[:, :, :0].contiguous()),
     )
-    native._launch_sparse_piper_attention(direct, actual.transpose(1, 2))
+    direct.launch(direct.query, actual.transpose(1, 2))
     with torch.cuda.graph(graph):
-        native._launch_sparse_piper_attention(direct, actual.transpose(1, 2))
+        direct.launch(direct.query, actual.transpose(1, 2))
     graph.replay()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -90,8 +97,8 @@ def test_two_warps_preserve_mixed_routes_dense_suffix_and_coarse(monkeypatch, co
         }
     with monkeypatch.context() as patch:
         patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
-        native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2), **kwargs)
-    native._launch_sparse_piper_attention(prepared, actual.transpose(1, 2), **kwargs)
+        prepared.launch(prepared.query, expected.transpose(1, 2), **kwargs)
+    prepared.launch(prepared.query, actual.transpose(1, 2), **kwargs)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -103,15 +110,17 @@ def test_large_tile_preserves_odd_query_ranges_and_output_guards(monkeypatch):
     expected = torch.empty_like(operands[0])
     with monkeypatch.context() as patch:
         patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
-        native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2))
+        prepared.launch(prepared.query, expected.transpose(1, 2))
     context = replace(prepared.context, routes_per_query=0)
     routes = prepared.query.routes[:, :, :0].contiguous()
-    direct = replace(prepared, context=context, query=replace(prepared.query, routes=routes))
+    direct = replace(
+        prepared,
+        launch=require_attention_backend(prepared.context.key).bind_context(context),
+        query=replace(prepared.query, routes=routes),
+    )
     rows = sequence - 64
     guarded = torch.full((1, rows + 2, 2, 64), 123.0, device="cuda", dtype=torch.bfloat16)
-    native._launch_sparse_piper_attention(
-        direct, guarded[:, 1:-1].transpose(1, 2), query_block_offset=1
-    )
+    direct.launch(direct.query, guarded[:, 1:-1].transpose(1, 2), query_block_offset=1)
     torch.testing.assert_close(guarded[:, 1:-1], expected[:, 64:], atol=0, rtol=0)
     assert torch.all(guarded[:, (0, -1)] == 123.0)
 
@@ -125,7 +134,7 @@ def test_large_tile_preserves_odd_query_ranges_and_output_guards(monkeypatch):
             global_block_offset=1,
         ),
     )
-    native._launch_sparse_piper_attention(local, guarded[:, 1:-1].transpose(1, 2))
+    local.launch(local.query, guarded[:, 1:-1].transpose(1, 2))
     torch.testing.assert_close(guarded[:, 1:-1], expected[:, 64:], atol=0, rtol=0)
     assert torch.all(guarded[:, (0, -1)] == 123.0)
 
@@ -141,7 +150,7 @@ def test_large_tile_preserves_internally_padded_blocks(monkeypatch):
     expected = torch.empty_like(operands[0])
     with monkeypatch.context() as patch:
         patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
-        native._launch_sparse_piper_attention(prepared, expected.transpose(1, 2))
+        prepared.launch(prepared.query, expected.transpose(1, 2))
     actual = SparsePiperAttention([1.0, 1.0])(
         *operands, sparse_key_blocks=sequence // 64, block_lengths=lengths
     )

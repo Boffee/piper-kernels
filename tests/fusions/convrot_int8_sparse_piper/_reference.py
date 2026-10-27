@@ -95,7 +95,11 @@ def check_value_sample_fp64(projected, output, head, start, rows, mean_v):
     centered = projected.new_zeros((_BLOCK_ROWS, projected.shape[-1]), dtype=torch.float64)
     centered[:rows] = projected - mean_v
     codes, expected_scale = _encode_fp64(centered, _BLOCK_ROWS)
-    assert_int8_codes_close(output[0][0, head, :, start : start + _BLOCK_ROWS].T, codes)
+    # AMD tests pass final [B,H,tiles,D,64] storage. Decode one selected tile
+    # with bit axes rather than repeating the device writer's offset formula.
+    stored = output[0][0, head, start // _BLOCK_ROWS]
+    actual = stored.reshape(-1, 2, 2, 2, 8).transpose(-3, -2).reshape(-1, 64).T
+    assert_int8_codes_close(actual, codes)
     torch.testing.assert_close(
         output[1][0, head, start // _BLOCK_ROWS, 0].double(),
         expected_scale[0] * 255,

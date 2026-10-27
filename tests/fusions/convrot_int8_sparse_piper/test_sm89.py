@@ -11,6 +11,7 @@ from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -149,6 +150,7 @@ def _launch(
             weight_scale,
             block_lengths,
             emit_block_mean=emit_block_mean,
+            value_format=ValueFormat.TRANSPOSED,
             out=out,
             bias=bias,
             **options,

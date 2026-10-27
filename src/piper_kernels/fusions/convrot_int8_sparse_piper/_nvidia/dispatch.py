@@ -3,6 +3,7 @@
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
 
 from .. import triton as projection
@@ -138,7 +139,7 @@ def project_key(  # noqa: PLR0913
     )
 
 
-def project_value(
+def project_value(  # noqa: PLR0913
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     input_mean: torch.Tensor,
@@ -147,6 +148,7 @@ def project_value(
     block_lengths: torch.Tensor | None,
     *,
     emit_block_mean: bool,
+    value_format: ValueFormat,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
     execution_plan: NvidiaExecutionPlan | None = None,
@@ -156,12 +158,12 @@ def project_value(
         execution_plan
         if execution_plan is not None
         else default_execution_plan(
-            input_qdata, weight_qdata, operation="value", head_dim=out[0].shape[2]
+            input_qdata, weight_qdata, operation="value", head_dim=out[2].shape[-1]
         )
     )
     launch = (
         gluon_async_copy.project_value
-        if plan.kernel == "gluon_async_copy"
+        if plan.kernel == "gluon_async_copy" and value_format is ValueFormat.TRANSPOSED
         else projection.project_value
     )
     launch(
@@ -172,6 +174,7 @@ def project_value(
         weight_scale,
         block_lengths,
         emit_block_mean=emit_block_mean,
+        value_format=value_format,
         out=out,
         bias=bias,
         execution_plan=plan,

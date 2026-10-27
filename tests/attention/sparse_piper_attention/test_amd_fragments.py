@@ -1,10 +1,10 @@
 """Exact dense/sparse RDNA4 fragments and sparse packed-context lifetime."""
 
-from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from lib.sparse_piper import reference_value_storage
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -17,8 +17,8 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     query_fragments,
     rescale_numerator,
 )
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._amd import gluon as backend
-from piper_kernels.attention.sparse_piper_attention._amd._packing import _pack_values
 from piper_kernels.attention.sparse_piper_attention._amd.gluon import bind_context
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -177,8 +177,9 @@ def test_pv_tiles_match_exact_reference(starts, values, recurrence, head_dim, tw
     expected = (expected.double() * weight[:, None].double() + numerator.double()).float()
     storage = torch.full((block_m * head_dim + 16,), -12345, dtype=torch.float32, device="cuda")
     output = storage[8:-8].view(block_m, head_dim)
-    packed_value = torch.empty((1, 1, 4, head_dim, 64), dtype=torch.int8, device="cuda")
-    _pack_values[(4, 1)](value.T.contiguous().cuda(), packed_value, 256, head_dim, num_warps=4)
+    packed_value = reference_value_storage(
+        value.T.contiguous()[None, None].cuda(), ValueFormat.AMD_WMMA
+    )
     _pv_tiles_probe[(1,)](
         probability.cuda(),
         packed_value,
@@ -273,9 +274,11 @@ def _constant_context(batch, heads, sequence, head_dim=128):
     storage = (sequence + 63) // 64 * 64
     # One allocation backs both INT8 K and V. Query=0 makes scores uniform;
     # distinct per-head V constants exercise global addressing independently.
-    value = torch.empty((batch, heads, head_dim, storage), dtype=torch.int8, device="cuda")
+    value = torch.empty(
+        ValueFormat.AMD_WMMA.shape(batch, heads, storage, head_dim), dtype=torch.int8, device="cuda"
+    )
     constants = torch.arange(batch * heads, device="cuda").remainder(127).to(torch.int8)
-    value.copy_(constants.view(batch, heads, 1, 1))
+    value.copy_(constants.view(batch, heads, 1, 1, 1))
     context = _prepare_sparse_piper_context_from_quantized(
         value.view(batch, heads, storage, head_dim),
         torch.ones((batch, heads, storage // 64), device="cuda"),
@@ -286,6 +289,7 @@ def _constant_context(batch, heads, sequence, head_dim=128):
         torch.arange(heads + 1, dtype=torch.int32, device="cuda"),
         sparse_key_blocks=storage // 64,
         routes_per_query=heads,
+        value_format=ValueFormat.AMD_WMMA,
         logical_sequence_length=sequence,
     )
     query = _prepare_sparse_piper_query_from_quantized(
@@ -294,34 +298,40 @@ def _constant_context(batch, heads, sequence, head_dim=128):
         torch.full((batch, 1, heads), storage // 64 - 1, dtype=torch.uint16, device="cuda"),
         context,
     )
-    return _PreparedSparsePiperAttention(context, query), constants.view(batch, heads, 1, 1)
+    return _PreparedSparsePiperAttention(bind_context(context), query), constants.view(
+        batch, heads, 1, 1
+    )
 
 
-@pytest.mark.parametrize("bound", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_launch_validates_once_and_only_packs_unbound_contexts(monkeypatch, bound, head_dim):
+def test_bound_context_owns_final_value_buffer_and_reuses_parameters(monkeypatch, head_dim):
     prepared, constants = _constant_context(2, 3, 193, head_dim)
-    launch = bind_context(prepared.context) if bound else backend._launch_sparse_piper_attention
-    validate = Mock(wraps=backend.validate_attention_launch)
-    pack = Mock(wraps=backend.pack_context)
-    monkeypatch.setattr(backend, "validate_attention_launch", validate)
-    monkeypatch.setattr(backend, "pack_context", pack)
+    # Warm binding above has compiled parameter preparation. Rebinding can
+    # allocate the small scale table, but must not allocate another V tensor.
+    before = torch.cuda.memory_allocated()
+    bound = bind_context(prepared.context)
+    torch.cuda.synchronize()
+    extra = torch.cuda.memory_allocated() - before
+    assert extra <= bound.parameters.numel() * bound.parameters.element_size() + 512
+    assert bound.context.value is prepared.context.value
+    parameters = Mock(side_effect=AssertionError("parameters rebuilt during a query launch"))
+    monkeypatch.setattr(backend, "prepare_parameters", parameters)
     output = torch.empty((2, 3, 64, head_dim), dtype=torch.bfloat16, device="cuda")
-    launch(prepared, output)
-    validate.assert_called_once_with(prepared, output, 0, None, None, None)
-    if bound:
-        pack.assert_not_called()
-    else:
-        pack.assert_called_once_with(prepared.context)
-    torch.testing.assert_close(output, constants.expand_as(output).to(output.dtype), rtol=0, atol=0)
+    for _ in range(2):
+        prepared.launch(prepared.query, output)
+        torch.testing.assert_close(
+            output, constants.expand_as(output).to(output.dtype), rtol=0, atol=0
+        )
+    parameters.assert_not_called()
+    monkeypatch.undo()
+    prepared.context.value.fill_(7)
+    bind_context(prepared.context)(prepared.query, output)
+    torch.testing.assert_close(output, torch.full_like(output, 7), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("bound", [False, True])
 @pytest.mark.parametrize("invalid", ["output", "range", "coarse"])
-def test_invalid_launch_is_rejected_before_packing_or_execution(monkeypatch, bound, invalid):
+def test_invalid_launch_is_rejected_before_execution(monkeypatch, invalid):
     prepared, _ = _constant_context(1, 1, 64)
-    launch = bind_context(prepared.context) if bound else backend._launch_sparse_piper_attention
-    monkeypatch.setattr(backend, "pack_context", Mock(side_effect=AssertionError("packed")))
     monkeypatch.setattr(
         backend,
         "_sparse_piper_attention_kernel",
@@ -330,32 +340,13 @@ def test_invalid_launch_is_rejected_before_packing_or_execution(monkeypatch, bou
     output = torch.empty((1, 1, 64, 128), dtype=torch.bfloat16, device="cuda")
     if invalid == "output":
         with pytest.raises(ValueError, match="output must match"):
-            launch(prepared, output.double())
+            prepared.launch(prepared.query, output.double())
     elif invalid == "range":
         with pytest.raises(ValueError, match="query block range"):
-            launch(prepared, output, query_block_count=2)
+            prepared.launch(prepared.query, output, query_block_count=2)
     else:
         with pytest.raises(ValueError, match="supplied together"):
-            launch(prepared, output, coarse_output=output.float())
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_bound_context_reuses_packing_and_rebinding_observes_writes(monkeypatch, head_dim):
-    prepared, constants = _constant_context(2, 3, 193, head_dim)
-    launch = bind_context(prepared.context)
-    output = torch.empty((2, 3, 64, head_dim), dtype=torch.bfloat16, device="cuda")
-    monkeypatch.setattr(backend, "pack_context", lambda _: pytest.fail("packed again"))
-    for _ in range(2):
-        launch(prepared, output)
-        torch.testing.assert_close(
-            output, constants.expand_as(output).to(output.dtype), rtol=0, atol=0
-        )
-    with pytest.raises(ValueError, match="original context"):
-        launch(replace(prepared, context=replace(prepared.context)), output)
-    monkeypatch.undo()
-    prepared.context.value.fill_(7)
-    bind_context(prepared.context)(prepared, output)
-    torch.testing.assert_close(output, torch.full_like(output, 7), rtol=0, atol=0)
+            prepared.launch(prepared.query, output, coarse_output=output.float())
 
 
 @pytest.mark.parametrize("operand", ["query_scale", "key_scale"])
@@ -369,7 +360,7 @@ def test_zero_scales_with_a_routed_partial_tile_are_finite(operand, mixed, head_
     else:
         scale.zero_()
     output = torch.empty((2, 3, 64, head_dim), dtype=torch.bfloat16, device="cuda")
-    bind_context(prepared.context)(prepared, output)
+    bind_context(prepared.context)(prepared.query, output)
     torch.testing.assert_close(output, constants.expand_as(output).to(output.dtype), rtol=0, atol=0)
 
 
@@ -380,9 +371,9 @@ def test_large_batch_local_query_uses_offsets_beyond_signed_int32(batch, head_di
     bytes_per_tensor = batch * heads * head_dim * 100032
     assert bytes_per_tensor > 2**31
     torch.cuda.empty_cache()
-    if torch.cuda.mem_get_info()[0] < 2 * bytes_per_tensor + (1 << 30):
-        pytest.skip("requires memory for original and packed >2-GiB INT8 tensors")
+    if torch.cuda.mem_get_info()[0] < bytes_per_tensor + (1 << 30):
+        pytest.skip("requires memory for a >2-GiB INT8 context tensor")
     prepared, constants = _constant_context(batch, heads, sequence, head_dim)
     output = torch.empty((batch, heads, 64, head_dim), dtype=torch.bfloat16, device="cuda")
-    bind_context(prepared.context)(prepared, output)
+    bind_context(prepared.context)(prepared.query, output)
     torch.testing.assert_close(output, constants.expand_as(output).to(output.dtype), rtol=0, atol=0)

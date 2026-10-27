@@ -12,6 +12,7 @@ from piper_kernels import (
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
+from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
@@ -592,7 +593,11 @@ def _run_explicit_fused_projection(
     )
     if coarse_gate is None:
         value = fused_value._project_value_op(
-            *projection_arguments, block_lengths, model.head_dim, bias=model.value.bias
+            *projection_arguments,
+            block_lengths,
+            model.head_dim,
+            bias=model.value.bias,
+            value_format=int(require_attention_backend(hidden_states).value_format),
         )
         return _sparse_piper_attention_from_quantized_op(
             *query,
@@ -613,6 +618,7 @@ def _run_explicit_fused_projection(
         block_lengths,
         model.head_dim,
         bias=model.value.bias,
+        value_format=int(require_attention_backend(hidden_states).value_format),
     )
     return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
         *query,

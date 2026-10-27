@@ -155,6 +155,7 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
     aligned_projection: tl.constexpr,
     mask_block_lengths: tl.constexpr,
     emit_block_mean: tl.constexpr,
+    value_format: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -212,4 +213,5 @@ def _convrot_project_quantize_sparse_value_kernel(  # noqa: PLR0913, PLR0917
         head_dim,
         block_m,
         _JIT_VALUE_TILE_ROWS,
+        value_format,
     )

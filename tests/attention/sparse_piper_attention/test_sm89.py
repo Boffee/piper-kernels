@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _backend
+from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
@@ -36,9 +38,6 @@ pytestmark = [
 if _backend.nvidia_async_copy_gluon is not None:
     from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_async_copy as native
     from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_tma as sm120
-    from piper_kernels.attention.sparse_piper_attention.triton import (
-        _prepare_sparse_piper_operands,
-    )
 
 
 def _prepare(
@@ -77,7 +76,8 @@ def _prepare(
         block_lengths,
         skip_dense_routing=skip_dense_routing,
     )
-    prepared = _prepare_sparse_piper_operands(
+    backend = require_attention_backend(head_major[0])
+    prepared = backend.prepare(
         head_major[0],
         head_dim**-0.5,
         sparse_key_blocks=blocks,
@@ -85,19 +85,24 @@ def _prepare(
         combined_value=head_major[2],
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
-    ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
     return (query, key, value), prepared
 
 
 def _launch(prepared, output, uncapped=False, **kwargs):
     """Launch the SM89 kernel, optionally without its D64 register cap."""
     if not uncapped:
-        native._launch_sparse_piper_attention(prepared, output, **kwargs)
+        prepared.launch(prepared.query, output, **kwargs)
         return
     original = policy.sm89_max_registers
     policy.sm89_max_registers = lambda head_dim: None
     try:
-        native._launch_sparse_piper_attention(prepared, output, **kwargs)
+        prepared.launch(prepared.query, output, **kwargs)
     finally:
         policy.sm89_max_registers = original
 
@@ -364,7 +369,7 @@ def _jit_arguments(module, prepared, output, **kwargs):
     kernel = module._sparse_piper_attention_kernel
     module._sparse_piper_attention_kernel = _Capture()
     try:
-        module._launch_sparse_piper_attention(prepared, output, **kwargs)
+        module.bind_context(prepared.context)(prepared.query, output, **kwargs)
     finally:
         module._sparse_piper_attention_kernel = kernel
     return captured
@@ -478,6 +483,7 @@ def test_last_head_addresses_beyond_signed_32_bit_offsets(head_dim):
         sparse_key_blocks=tiles,
         routes_per_query=kv_heads,
         logical_sequence_length=storage,
+        value_format=ValueFormat.TRANSPOSED,
     )
     query = _prepare_sparse_piper_query_from_quantized(
         torch.randint(
@@ -493,7 +499,9 @@ def test_last_head_addresses_beyond_signed_32_bit_offsets(head_dim):
         context,
         global_block_offset=tiles - 1,
     )
-    prepared = _PreparedSparsePiperAttention(context, query)
+    prepared = _PreparedSparsePiperAttention(
+        require_attention_backend(context.key).bind_context(context), query
+    )
     output = torch.empty(1, kv_heads, 64, head_dim, device="cuda", dtype=torch.bfloat16)
     _launch(prepared, output)
     expected = _fp64_query_block(prepared, kv_heads - 1, 0)

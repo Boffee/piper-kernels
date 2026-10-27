@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -19,7 +21,7 @@ from piper_kernels.attention.kernels.sparse_piper.gluon import pair_tile_offsets
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
-from .._prepared import _PreparedSparsePiperAttention
+from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
 from . import policy
 from ._recurrence import piper_probability_pair, piper_pv_pair, store_attention_output
 
@@ -390,143 +392,123 @@ def _sparse_piper_attention_kernel(
     mbarrier.invalidate(value_barrier)
 
 
-def _make_gluon_descriptors(
-    prepared: _PreparedSparsePiperAttention,
-    block_m: int = TILE_ROWS,
-) -> tuple[TensorDescriptor, TensorDescriptor, TensorDescriptor]:
-    query = prepared.query.data
-    key = prepared.context.key
-    value = prepared.context.value
-    head_dim = query.shape[-1]
-    query_layout = gl.NVMMASharedLayout.get_default_for([block_m, head_dim], gl.int8)
-    key_layout = gl.NVMMASharedLayout.get_default_for([_BLOCK_N, head_dim], gl.int8)
-    value_layout = gl.NVMMASharedLayout.get_default_for([head_dim, _BLOCK_N], gl.int8)
-    batch_heads = int(query.shape[0] * query.shape[1])
-    kv_batch_heads = int(key.shape[0] * key.shape[1])
-    query_storage_sequence_length = int(query.shape[2])
-    storage_sequence_length = int(key.shape[2])
-    if (
-        key.shape[0] != query.shape[0]
-        or key.shape[1] < 1
-        or query.shape[1] % key.shape[1]
-        or key.shape[3] != query.shape[3]
-        or value.shape
-        != (
-            query.shape[0],
-            key.shape[1],
-            query.shape[3],
-            storage_sequence_length,
-        )
-    ):
-        raise ValueError("paired Gluon routed Piper requires compatible Q and K/V storage")
-    with device_context(query.device):
-        return (
-            TensorDescriptor(
-                query,
-                [batch_heads * query_storage_sequence_length, head_dim],
-                [head_dim, 1],
-                [block_m, head_dim],
-                query_layout,
-            ),
-            TensorDescriptor(
-                key,
-                [kv_batch_heads * storage_sequence_length, head_dim],
-                [head_dim, 1],
-                [_BLOCK_N, head_dim],
-                key_layout,
-            ),
-            TensorDescriptor(
-                value,
-                [kv_batch_heads * head_dim, storage_sequence_length],
-                [storage_sequence_length, 1],
-                [head_dim, _BLOCK_N],
-                value_layout,
-            ),
-        )
-
-
-def _launch_sparse_piper_attention(
-    prepared: _PreparedSparsePiperAttention,
-    output: torch.Tensor,
-    *,
-    query_block_offset: int = 0,
-    query_block_count: int | None = None,
-    coarse_output: torch.Tensor | None = None,
-    coarse_gate: torch.Tensor | None = None,
-) -> None:
-    """Launch one caller-owned query-block range over the complete K/V sequence.
-
-    When present, ``coarse_gate`` contains exactly the local output rows
-    covered by this launch. ``coarse_output`` is indexed within the prepared
-    query storage, whose ``global_block_offset`` locates it in the sequence.
-    """
-    query_state = prepared.query
-    context = prepared.context
-    launch = validate_attention_launch(
-        prepared, output, query_block_offset, query_block_count, coarse_output, coarse_gate
+def _descriptor(data: torch.Tensor, shape: list[int], block_shape: list[int]) -> TensorDescriptor:
+    return TensorDescriptor(
+        data,
+        shape,
+        [shape[1], 1],
+        block_shape,
+        gl.NVMMASharedLayout.get_default_for(block_shape, gl.int8),
     )
-    if launch.skip_dense_routing and launch.head_dim != 64:
+
+
+def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
+    """Prepare K/V descriptors once; Q descriptors belong to each query window."""
+    if context.routes_per_query == 0 and context.key.shape[-1] != 64:
         raise ValueError("skip_dense_routing requires NVIDIA D64 attention")
-    block_m, num_warps = policy.select_sm120_attention_schedule(
-        launch.head_dim,
-        launch.query_rows,
-        launch.storage_sequence_length,
-        skip_dense_routing=launch.skip_dense_routing,
-        has_coarse_residual=launch.apply_coarse_residual,
-        selected_key_rows=(
-            context.routes_per_query // launch.heads * _BLOCK_N
-            + launch.storage_sequence_length
-            - launch.sparse_key_blocks * _BLOCK_N
-        ),
-    )
-    with device_context(output.device):
-        install_uint8_int8_dot_hook()
+    batch, heads, sequence, head_dim = context.key.shape
+    with device_context(context.key.device):
+        return _ContextLauncher(
+            context,
+            _descriptor(context.key, [batch * heads * sequence, head_dim], [_BLOCK_N, head_dim]),
+            _descriptor(context.value, [batch * heads * head_dim, sequence], [head_dim, _BLOCK_N]),
+        )
 
-        query_desc, key_desc, value_desc = _make_gluon_descriptors(prepared, block_m)
-        grid = (
-            (launch.query_rows + block_m - 1) // block_m,
-            launch.heads,
-            launch.batch,
-        )
-        _sparse_piper_attention_kernel[grid](
-            query_desc,
-            key_desc,
-            value_desc,
-            query_state.scale,
-            context.key_scale,
-            context.value_scale_multiplier,
-            context.value_mean,
-            launch.coarse_output,
-            launch.coarse_gate,
-            launch.block_lengths,
-            query_state.routes,
-            context.head_keep_blocks,
-            context.route_head_offsets,
+
+@dataclass(frozen=True, slots=True)
+class _ContextLauncher:
+    context: _PreparedSparsePiperContext
+    key_descriptor: TensorDescriptor
+    value_descriptor: TensorDescriptor
+
+    def __call__(
+        self,
+        query_state: _PreparedSparsePiperQuery,
+        output: torch.Tensor,
+        *,
+        query_block_offset: int = 0,
+        query_block_count: int | None = None,
+        coarse_output: torch.Tensor | None = None,
+        coarse_gate: torch.Tensor | None = None,
+    ) -> None:
+        """Execute a query window against the bound global context."""
+        context = self.context
+        launch = validate_attention_launch(
+            context,
+            query_state,
             output,
-            launch.query_block_offset,
-            launch.global_query_block_offset,
-            launch.query_storage_sequence_length,
-            launch.storage_sequence_length,
-            launch.logical_sequence_length,
-            launch.sparse_key_blocks,
-            launch.sparse_query_blocks,
-            *launch.route_strides,
-            *launch.output_strides,
-            *launch.coarse_strides,
-            *launch.gate_strides,
-            launch.heads,
-            launch.heads // context.key.shape[1],
-            launch.head_dim,
-            launch.mask_block_lengths,
-            launch.mask_ragged_tail,
-            launch.has_dense_query_suffix,
-            launch.apply_coarse_residual,
-            launch.ragged_tail_is_routed,
-            block_m,
-            num_warps,
-            launch.skip_dense_routing,
-            launch.output_sequence_length % block_m != 0,
-            launch.output_sequence_length,
-            num_warps=num_warps,
-            num_stages=1,
+            query_block_offset,
+            query_block_count,
+            coarse_output,
+            coarse_gate,
         )
+        block_m, num_warps = policy.select_sm120_attention_schedule(
+            launch.head_dim,
+            launch.query_rows,
+            launch.storage_sequence_length,
+            skip_dense_routing=launch.skip_dense_routing,
+            has_coarse_residual=launch.apply_coarse_residual,
+            selected_key_rows=(
+                context.routes_per_query // launch.heads * _BLOCK_N
+                + launch.storage_sequence_length
+                - launch.sparse_key_blocks * _BLOCK_N
+            ),
+        )
+        with device_context(output.device):
+            install_uint8_int8_dot_hook()
+
+            query_desc = _descriptor(
+                query_state.data,
+                [
+                    launch.batch * launch.heads * launch.query_storage_sequence_length,
+                    launch.head_dim,
+                ],
+                [block_m, launch.head_dim],
+            )
+            grid = (
+                (launch.query_rows + block_m - 1) // block_m,
+                launch.heads,
+                launch.batch,
+            )
+            _sparse_piper_attention_kernel[grid](
+                query_desc,
+                self.key_descriptor,
+                self.value_descriptor,
+                query_state.scale,
+                context.key_scale,
+                context.value_scale_multiplier,
+                context.value_mean,
+                launch.coarse_output,
+                launch.coarse_gate,
+                launch.block_lengths,
+                query_state.routes,
+                context.head_keep_blocks,
+                context.route_head_offsets,
+                output,
+                launch.query_block_offset,
+                launch.global_query_block_offset,
+                launch.query_storage_sequence_length,
+                launch.storage_sequence_length,
+                launch.logical_sequence_length,
+                launch.sparse_key_blocks,
+                launch.sparse_query_blocks,
+                *launch.route_strides,
+                *launch.output_strides,
+                *launch.coarse_strides,
+                *launch.gate_strides,
+                launch.heads,
+                launch.heads // context.key.shape[1],
+                launch.head_dim,
+                launch.mask_block_lengths,
+                launch.mask_ragged_tail,
+                launch.has_dense_query_suffix,
+                launch.apply_coarse_residual,
+                launch.ragged_tail_is_routed,
+                block_m,
+                num_warps,
+                launch.skip_dense_routing,
+                launch.output_sequence_length % block_m != 0,
+                launch.output_sequence_length,
+                num_warps=num_warps,
+                num_stages=1,
+            )

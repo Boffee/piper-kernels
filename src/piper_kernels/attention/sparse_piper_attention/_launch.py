@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
 from ._dtype import SUPPORTED_DTYPES
-from ._prepared import _PreparedSparsePiperAttention
+from ._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
 
 _DO_NOT_SPECIALIZE_ARGUMENTS = (
     "query_block_offset",
@@ -59,12 +59,11 @@ class _ValidatedAttentionLaunch:
 
 
 def _resolve_query_block_range(
-    prepared: _PreparedSparsePiperAttention,
+    query_state: _PreparedSparsePiperQuery,
     query_block_offset: int,
     query_block_count: int | None,
 ) -> tuple[int, int, int]:
     """Validate a local launch range and return its size and global offset."""
-    query_state = prepared.query
     stored_query_blocks = query_state.data.shape[2] // TILE_ROWS
     if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
         raise TypeError("sparse Piper query block offset must be an integer")
@@ -90,37 +89,27 @@ def _resolve_query_block_range(
 
 
 def validate_attention_launch(
-    prepared: _PreparedSparsePiperAttention,
+    context: _PreparedSparsePiperContext,
+    query_state: _PreparedSparsePiperQuery,
     output: torch.Tensor,
     query_block_offset: int,
     query_block_count: int | None,
     coarse_output: torch.Tensor | None,
     coarse_gate: torch.Tensor | None,
 ) -> _ValidatedAttentionLaunch:
-    """Validate tensors and resolve the common metadata consumed by native kernels."""
-    query_state = prepared.query
-    context = prepared.context
+    """Validate output, epilogue, and range metadata for prepared operands.
+
+    Context and query storage were validated or produced by preparation. Only
+    caller-supplied launch arguments need validation here.
+    """
     query = query_state.data
     batch, heads, query_storage_sequence_length, head_dim = query.shape
     logical_sequence_length = context.logical_sequence_length
     storage_sequence_length = context.key.shape[2]
     has_block_lengths = context.block_lengths is not None
-    if (
-        head_dim not in SUPPORTED_HEAD_DIMS
-        or query_storage_sequence_length < TILE_ROWS
-        or query_storage_sequence_length % TILE_ROWS
-        or storage_sequence_length < TILE_ROWS
-        or storage_sequence_length % TILE_ROWS
-        or (
-            not has_block_lengths
-            and (logical_sequence_length + TILE_ROWS - 1) // TILE_ROWS * TILE_ROWS
-            != storage_sequence_length
-        )
-    ):
-        raise ValueError("sparse Piper requires padded Q64/K64/D64/D128 storage")
     stored_query_blocks, resolved_query_block_count, global_query_block_offset = (
         _resolve_query_block_range(
-            prepared,
+            query_state,
             query_block_offset,
             query_block_count,
         )
@@ -140,8 +129,6 @@ def validate_attention_launch(
         or output.stride(-1) != 1
     ):
         raise ValueError("sparse Piper output must match the query block range")
-    if context.value_scale_multiplier.shape[-1] != 1:
-        raise ValueError("sparse Piper requires one folded scale per K64 tile")
     has_coarse_residual = coarse_output is not None or coarse_gate is not None
     if (coarse_output is None) != (coarse_gate is None):
         raise ValueError("coarse output and coarse gate must be supplied together")

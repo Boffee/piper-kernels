@@ -216,12 +216,12 @@ def _run_sparse_piper_attention(
     validate_routing_mode(routing_mode)
     # Take min/max routing summaries from the Q/K quantization pass
     # unless this call keeps every block, which needs no summaries at all.
-    prepare_operands = (
-        _backend.select_fused_operand_preparation(query_head_major, key_head_major, routing_mode)
-        if backend is not None and not layout.keeps_all_blocks(sparse_key_blocks)
-        else None
+    fuse_summaries = (
+        backend is not None
+        and not layout.keeps_all_blocks(sparse_key_blocks)
+        and _backend.use_fused_operand_preparation(query_head_major, key_head_major, routing_mode)
     )
-    if prepare_operands is None:
+    if not fuse_summaries:
         routes = packed_routes_from_sequences(
             query_head_major,
             sparse_key,
@@ -251,10 +251,15 @@ def _run_sparse_piper_attention(
             combined_value=value_head_major,
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
-        ).with_routes(routes.indices, routes.head_keep_blocks, routes.route_head_offsets)
+        ).with_routes(
+            routes.indices,
+            routes.head_keep_blocks,
+            routes.route_head_offsets,
+            bind=backend.bind_context,
+        )
     else:
         assert backend is not None
-        operands = prepare_operands(
+        operands = backend.prepare(
             query_head_major,
             scale,
             sparse_key_blocks=sparse_key_blocks,
@@ -279,12 +284,13 @@ def _run_sparse_piper_attention(
             routes.indices,
             routes.head_keep_blocks,
             routes.route_head_offsets,
+            bind=backend.bind_context,
         )
         # Release the routing summaries, then allocate the output, so neither
         # coexists with the other or with routing's scratch storage.
         del operands
         output = torch.empty_like(query, memory_format=torch.contiguous_format)
-    backend.launch(prepared, output.transpose(1, 2))
+    prepared.launch(prepared.query, output.transpose(1, 2))
     return output
 
 

@@ -4,6 +4,8 @@ from typing import Protocol
 
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+
 type QueryOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type KeyOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 type ValueOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -83,10 +85,13 @@ class ProjectionBackend(Protocol):
         block_lengths: torch.Tensor | None,
         *,
         emit_block_mean: bool,
+        value_format: ValueFormat,
         out: ValueOutput,
         bias: torch.Tensor | None = None,
     ) -> None:
-        """Fill (V[B,H,D,S], multipliers[B,H,S/64,1], mean, block_mean), D=64 or 128.
+        """Fill (V, multipliers[B,H,S/64,1], mean, block_mean), D=64 or 128.
+
+        V is allocated in value_format and written directly in that final format.
 
         The projected global mean is [B,H,D]. When emit_block_mean is true,
         block_mean is [B,H,S/64,D]; otherwise it aliases mean and must not
