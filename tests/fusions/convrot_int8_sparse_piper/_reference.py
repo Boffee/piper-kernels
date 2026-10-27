@@ -43,18 +43,39 @@ def _encode_fp64(values, rows):
     return codes.reshape_as(values), scale
 
 
-def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *, is_query):
-    """Check one minmax Q/K block with H3 normalization and softmax constants."""
-    head_dim = projected.shape[-1]
+def _transform_qk_fp64(projected, norm, cos, sin):
+    """Apply RMSNorm and RoPE independently in FP64, before storage rounding."""
     rotary = cos.shape[1]
     projected *= torch.rsqrt(projected.square().mean(-1, keepdim=True) + 1e-5)
     if norm is not None:
         projected *= norm.double()
     first, second = projected[:, :rotary].chunk(2, dim=-1)
     rotated = torch.cat((-second, first), -1)
-    projected[:, :rotary] = (
-        projected[:, :rotary] * cos[start : start + rows].double()
-        + rotated * sin[start : start + rows].double()
+    projected[:, :rotary] = projected[:, :rotary] * cos.double() + rotated * sin.double()
+    return projected
+
+
+def key_mean_fp64(qdata, scale, weight, weight_scale, norm, cos, sin):
+    """Reduce the represented BF16 K mean independently with bounded workspace."""
+    sequence = qdata.shape[0]
+    total = torch.zeros(weight.shape[0], device=qdata.device, dtype=torch.float64)
+    for start in range(0, sequence, 1024):
+        stop = min(start + 1024, sequence)
+        projected = qdata[start:stop].double() @ weight.double().T
+        projected *= scale[start:stop, None].double()
+        projected *= weight_scale[:, 0].double()
+        transformed = _transform_qk_fp64(projected, norm, cos[start:stop], sin[start:stop])
+        total += transformed.bfloat16().double().sum(0)
+    return total / sequence
+
+
+def check_qk_sample_fp64(
+    projected, output, head, start, rows, norm, cos, sin, *, is_query, key_mean=None
+):
+    """Check raw summaries and Q32 or centered represented-K64 encoding."""
+    head_dim = projected.shape[-1]
+    projected = _transform_qk_fp64(
+        projected, norm, cos[start : start + rows], sin[start : start + rows]
     )
     maximum, minimum = projected.amax(0), projected.amin(0)
     summary = maximum + minimum if is_query else maximum
@@ -65,6 +86,9 @@ def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *
         torch.testing.assert_close(
             output[3][0, head, start // _BLOCK_ROWS].double(), minimum, rtol=3e-5, atol=3e-5
         )
+    if not is_query:
+        assert key_mean is not None
+        projected = projected.bfloat16().double() - key_mean
     padded = projected.new_zeros((_BLOCK_ROWS, head_dim), dtype=torch.float64)
     padded[:rows] = _rotate_fp64(projected)
     scale_rows = 32 if is_query else _BLOCK_ROWS

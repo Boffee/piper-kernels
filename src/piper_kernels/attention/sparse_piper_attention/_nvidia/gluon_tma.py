@@ -393,13 +393,14 @@ def _sparse_piper_attention_kernel(
 
 
 def _descriptor(data: torch.Tensor, shape: list[int], block_shape: list[int]) -> TensorDescriptor:
-    return TensorDescriptor(
-        data,
-        shape,
-        [shape[1], 1],
-        block_shape,
-        gl.NVMMASharedLayout.get_default_for(block_shape, gl.int8),
-    )
+    with device_context(data.device):
+        return TensorDescriptor(
+            data,
+            shape,
+            [shape[1], 1],
+            block_shape,
+            gl.NVMMASharedLayout.get_default_for(block_shape, gl.int8),
+        )
 
 
 def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
@@ -407,12 +408,11 @@ def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
     if context.routes_per_query == 0 and context.key.shape[-1] != 64:
         raise ValueError("skip_dense_routing requires NVIDIA D64 attention")
     batch, heads, sequence, head_dim = context.key.shape
-    with device_context(context.key.device):
-        return _ContextLauncher(
-            context,
-            _descriptor(context.key, [batch * heads * sequence, head_dim], [_BLOCK_N, head_dim]),
-            _descriptor(context.value, [batch * heads * head_dim, sequence], [head_dim, _BLOCK_N]),
-        )
+    return _ContextLauncher(
+        context,
+        _descriptor(context.key, [batch * heads * sequence, head_dim], [_BLOCK_N, head_dim]),
+        _descriptor(context.value, [batch * heads * head_dim, sequence], [head_dim, _BLOCK_N]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,17 +454,13 @@ class _ContextLauncher:
                 - launch.sparse_key_blocks * _BLOCK_N
             ),
         )
+        query_desc = _descriptor(
+            query_state.data,
+            [launch.batch * launch.heads * launch.query_storage_sequence_length, launch.head_dim],
+            [block_m, launch.head_dim],
+        )
         with device_context(output.device):
             install_uint8_int8_dot_hook()
-
-            query_desc = _descriptor(
-                query_state.data,
-                [
-                    launch.batch * launch.heads * launch.query_storage_sequence_length,
-                    launch.head_dim,
-                ],
-                [block_m, launch.head_dim],
-            )
             grid = (
                 (launch.query_rows + block_m - 1) // block_m,
                 launch.heads,

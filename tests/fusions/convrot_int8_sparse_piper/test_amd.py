@@ -10,13 +10,19 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._amd import gluon as amd_attention
+from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, output, query, value
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops
 
-from ._reference import assert_int8_codes_close, check_qk_sample_fp64, check_value_sample_fp64
+from ._reference import (
+    assert_int8_codes_close,
+    check_qk_sample_fp64,
+    check_value_sample_fp64,
+    key_mean_fp64,
+)
 
 
 def _available():
@@ -157,6 +163,9 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
     storage = (sequence + 63) // 64 * 64
     for head in (0, heads // 2, heads - 1):
         columns = slice(head * head_dim, (head + 1) * head_dim)
+        mean_k = key_mean_fp64(
+            qdata[0], scale[0], weights[1][columns], scales[1][columns], norm, cos, sin
+        )
         mean_v = (expected_mean @ weights[2][columns].double().T) * scales[2][columns, 0].double()
         torch.testing.assert_close(v[2][:, head].double(), mean_v, rtol=2e-5, atol=2e-5)
         for start in sorted({0, (sequence // 2) // 64 * 64, (sequence - 1) // 64 * 64}):
@@ -178,6 +187,7 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
                         cos,
                         sin,
                         is_query=index == 0,
+                        key_mean=mean_k,
                     )
                 else:
                     check_value_sample_fp64(
@@ -185,7 +195,7 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
                     )
     assert q[0].shape == (1, heads, storage, head_dim)
     assert k[0].shape == (1, heads, storage, head_dim)
-    assert v[0].shape == (1, heads, head_dim, storage)
+    assert v[0].shape == ValueFormat.AMD_WMMA.shape(1, heads, storage, head_dim)
 
 
 @pytest.mark.gpu
@@ -221,7 +231,8 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
         head_dim=head_dim,
         value_format=int(ValueFormat.AMD_WMMA),
     )
-    attention_tail = *k, *v, [250_000] * heads, sequence // 64, sequence, 0
+    profile = _SparsePiperRatioProfile((250_000,) * heads)
+    attention_tail = *k, *v, profile, sequence // 64, sequence, 0
     attention = _quantized_dispatch._sparse_piper_attention_from_quantized_op(*q, *attention_tail)
     out_weight = torch.randint(
         -128, 128, (width, heads * head_dim), device="cuda", dtype=torch.int8
