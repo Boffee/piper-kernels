@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-10-30
+
 ### Added
 
 - ConvRot INT8, NVFP4, and ConvRot NVFP4 `add_` accept an optional `beta`
@@ -842,7 +844,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.5...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.9...HEAD
+[0.7.9]: https://github.com/Boffee/piper-kernels/compare/v0.7.8...v0.7.9
 [0.7.5]: https://github.com/Boffee/piper-kernels/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/Boffee/piper-kernels/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/Boffee/piper-kernels/compare/v0.7.2...v0.7.3
