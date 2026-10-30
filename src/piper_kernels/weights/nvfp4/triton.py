@@ -344,6 +344,9 @@ def add_(
     swizzled: bool,
     high_first: bool,
     rounding_seed: int | None = None,
+    *,
+    # Keep calls in existing compiled graphs valid.
+    beta: float = 1.0,
 ) -> None:
     """Fuse a dense update and optional rotation into in-place NVFP4 packing."""
     _update_(
@@ -353,7 +356,7 @@ def add_(
         update,
         None,
         group_size,
-        1.0,
+        beta,
         alpha,
         swizzled,
         high_first,
@@ -372,5 +375,7 @@ def _add_fake(
     _swizzled: bool,
     _high_first: bool,
     _rounding_seed: int | None = None,
+    *,
+    beta: float = 1.0,
 ) -> None:
-    return None
+    del beta

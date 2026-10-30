@@ -66,7 +66,7 @@ def test_operations_use_operand_device_and_its_current_stream(
                 if operation in ("add", "addmm"):
                     output, output_scale = qdata.clone(), scale.clone()
                     if operation == "add":
-                        int8_updates.add_(output, output_scale, update, 256, 0.5)
+                        int8_updates.add_(output, output_scale, update, 256, 1.0, 0.5)
                     else:
                         int8_updates.addmm_(output, output_scale, mat1, mat2, 256, 1.0, 0.5)
                     return output, output_scale

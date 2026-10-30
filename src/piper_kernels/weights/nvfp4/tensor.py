@@ -7,7 +7,6 @@ from typing import Any, ClassVar, Self, cast
 
 import torch
 from torch._prims_common import make_contiguous_strides_for
-from torch.types import Number
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.prototype.mx_formats.mx_tensor import tensor_size_fp4x2_to_hp
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
@@ -276,18 +275,19 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """Use the unrotated basis for ordinary NVFP4 updates."""
         return 0
 
-    # Quantized updates require concrete scalars; Tensor also types symbolic scalars.
+    # Quantized updates require real coefficients; Tensor also accepts complex/symbolic scalars.
     def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         mat1: torch.Tensor,
         mat2: torch.Tensor,
         *,
-        beta: int | float | complex = 1,
-        alpha: int | float | complex = 1,
+        beta: float = 1.0,
+        alpha: float = 1.0,
         rounding_seed: int | None = None,
     ) -> Self:
         """Update and requantize in place, optionally using stochastic rounding.
 
+        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
         ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
         makes terminal E2M1 code selection reproducible for a fixed device and
         backend without consuming the process-global random-number generator.
@@ -309,26 +309,32 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         )
         return self
 
-    def add_(
+    # Tensor.add_ also types complex and None, which quantized updates reject.
+    def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         other: object,
         *,
-        alpha: Number | complex | None = 1,
+        beta: float = 1.0,
+        alpha: float = 1.0,
         rounding_seed: int | None = None,
     ) -> Self:
-        """Add a dense logical update and requantize in place."""
+        """Requantize ``beta * weight + alpha * other`` in place.
+
+        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
+        ``beta`` is a Piper extension to Tensor.add_; its default preserves
+        ordinary addition. Rounding follows the ``addmm_`` seed contract.
+        """
         from piper_kernels.weights.nvfp4 import _update  # noqa: PLC0415
 
         require_untransposed(self, "add_")
         operation = _update._operation(self, "add_")
         if not isinstance(other, torch.Tensor):
             raise TypeError(f"{operation} update must be a tensor")
-        if alpha is None:
-            raise TypeError(f"{operation} alpha must be a real number, got None")
         _update.add_(
             self,
             self._update_group_size(),
             other,
+            beta=beta,
             alpha=alpha,
             rounding_seed=rounding_seed,
         )

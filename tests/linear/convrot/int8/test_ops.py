@@ -164,7 +164,9 @@ def test_fake_schemas_need_no_implementation(monkeypatch, static):
     result = _ops.linear(value, weight, scale, None, 16, "swiglu", input_scale)
     qdata, row_scale = _ops.prepare_input(value, 16, "swiglu", input_scale)
     projected = _ops.linear_prepared(qdata, row_scale, weight, scale, None, value.dtype)
-    int8_update_ops.add_(weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0)
+    int8_update_ops.add_(
+        weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0, beta=0.25
+    )
     int8_update_ops.addmm_(
         weight,
         scale,
@@ -193,7 +195,7 @@ def test_linear_only_implementation_preserves_weight_update_fallback(monkeypatch
     if operation == "add":
         assert int8_updates.select_add(weight) is None
         _update.add_(weight, scale, torch.float32, 16, delta)
-        int8_update_reference.add_(expected_weight, expected_scale, delta, 16, 1.0)
+        int8_update_reference.add_(expected_weight, expected_scale, delta, 16, 1.0, 1.0)
     else:
         assert int8_updates.select_addmm(weight) is None
         mat1, mat2 = torch.ones(7, 2), torch.ones(2, 32)

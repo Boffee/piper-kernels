@@ -51,12 +51,15 @@ def add_(
     group_size: int,
     alpha: float,
     rounding_seed: int | None = None,
+    *,
+    # Keep calls in existing compiled graphs valid.
+    beta: float = 1.0,
 ) -> None:
     """Dispatch the stable add_ operation to a supported implementation."""
     execute = _backend.select_add(qdata)
     if execute is None:
         raise ValueError(f"ConvRot INT8 optimized add_ is unavailable on {qdata.device}")
-    execute(qdata, scale, update, group_size, alpha, rounding_seed)
+    execute(qdata, scale, update, group_size, beta, alpha, rounding_seed)
 
 
 @add_.register_fake
@@ -67,5 +70,7 @@ def _add_fake(
     _group_size: int,
     _alpha: float,
     _rounding_seed: int | None = None,
+    *,
+    beta: float = 1.0,
 ) -> None:
-    return None
+    del beta

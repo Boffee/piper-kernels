@@ -8,13 +8,13 @@ from piper_kernels.stochastic_quantization import signed_seed
 
 
 def validate_real_scalar(
-    value: int | float | complex,
+    value: float,
     name: str,
     *,
     operation: str,
 ) -> float:
-    """Convert a finite real update scalar while preserving useful errors."""
-    if isinstance(value, complex):
+    """Normalize a real coefficient and reject invalid runtime inputs at the boundary."""
+    if value is None or isinstance(value, complex):
         raise TypeError(f"{operation} {name} must be a real number, got {value}")
     converted = float(value)
     if not math.isfinite(converted):

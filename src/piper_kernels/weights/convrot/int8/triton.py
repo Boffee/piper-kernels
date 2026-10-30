@@ -129,7 +129,7 @@ def _requantize_update_(qdata, scale, update, beta, alpha, rounding_seed, *, has
         )
 
 
-def add_(qdata, scale, update, group_size, alpha, rounding_seed=None):
+def add_(qdata, scale, update, group_size, beta, alpha, rounding_seed=None):
     """Rotate a dense update and merge it into existing rowwise storage."""
     has_update = alpha != 0
     if has_update:
@@ -142,7 +142,7 @@ def add_(qdata, scale, update, group_size, alpha, rounding_seed=None):
         qdata,
         scale,
         rotated_update,
-        1.0,
+        beta,
         alpha,
         rounding_seed,
         has_update=has_update,

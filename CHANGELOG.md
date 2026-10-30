@@ -5,12 +5,22 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- ConvRot INT8, NVFP4, and ConvRot NVFP4 `add_` accept an optional `beta`
+  coefficient, computing `beta * weight + alpha * update` with one final
+  requantization. The default `beta=1` preserves ordinary addition; CPU and
+  accelerator paths retain packed storage, calibration, and seeded rounding.
+
 ### Changed
 
 - Sparse Piper attention writes INT8 V directly in the selected backend's storage
   format, removing AMD's extra V copy and repacking pass. Prepared contexts bind
   backend state once, including NVIDIA K/V descriptors, for reuse across query
   windows. Quantization and attention semantics are unchanged.
+- Weight-update `alpha` and `beta` annotations consistently use `float`, which
+  also accepts integer arguments. Shared boundary validation still rejects
+  complex, `None`, and non-finite coefficients before mutating storage.
 
 ## [0.7.8] - 2026-10-24
 

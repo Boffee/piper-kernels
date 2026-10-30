@@ -1225,6 +1225,7 @@ def test_cuda_semantic_add_custom_op_passes_opcheck() -> None:
     result = torch.library.opcheck(
         int8_update_ops.add_,
         (qdata, scale, update, 64, 1.25, 123),
+        kwargs={"beta": 0.25},
     )
 
     assert set(result.values()) == {"SUCCESS"}
@@ -1405,16 +1406,16 @@ def test_triton_addmm_matches_gpu_reference(
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("alpha", [1.5, -0.25])
-def test_triton_add_matches_gpu_reference(dtype: torch.dtype, alpha: float) -> None:
+@pytest.mark.parametrize(("beta", "alpha"), [(1, 1.5), (0.25, -0.25), (-0.5, 1.5), (0, -0.25)])
+def test_triton_add_matches_gpu_reference(dtype: torch.dtype, beta: float, alpha: float) -> None:
     torch.manual_seed(19)
     weight = torch.randn(96, 64, dtype=dtype, device="cuda")
     update = torch.randn_like(weight)
     actual = ConvRotInt8Tensor.from_hp(weight, group_size=64)
     expected = actual.clone()
 
-    reference_add_(expected.qdata, expected.scale, update, 64, alpha)
-    result = actual.add_(update, alpha=alpha)
+    reference_add_(expected.qdata, expected.scale, update, 64, beta, alpha)
+    result = actual.add_(update, beta=beta, alpha=alpha)
 
     assert result is actual
     qdata_error = (actual.qdata.to(torch.int16) - expected.qdata.to(torch.int16)).abs()

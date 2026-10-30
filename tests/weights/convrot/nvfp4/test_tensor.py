@@ -377,12 +377,12 @@ def test_addmm_updates_rotated_storage_in_place(
 
 
 @pytest.mark.parametrize("group_size", [16, 64, 256])
-@pytest.mark.parametrize("alpha", [1, 0.25, -0.5])
-def test_add_updates_rotated_storage_in_place(group_size: int, alpha: float) -> None:
+@pytest.mark.parametrize(("beta", "alpha"), [(1, 1), (0.25, 0.25), (-1, -0.5), (0, 0.5)])
+def test_add_updates_rotated_storage_in_place(group_size: int, beta: float, alpha: float) -> None:
     weight, update = _cpu_add_case(group_size=group_size, seed=623)
     rotated_before = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
     expected_dense = torch.add(
-        rotated_before,
+        rotated_before * beta,
         rotate_groups(update.float(), group_size),
         alpha=alpha,
     )
@@ -402,7 +402,7 @@ def test_add_updates_rotated_storage_in_place(group_size: int, alpha: float) -> 
     per_tensor_scale = weight.per_tensor_scale
     act_per_tensor_scale = weight.act_per_tensor_scale
 
-    result = weight.add_(update, alpha=alpha)
+    result = weight.add_(update, beta=beta, alpha=alpha)
 
     assert result is weight
     assert weight.qdata is qdata

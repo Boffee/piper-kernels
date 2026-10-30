@@ -90,15 +90,17 @@ def add_(
     group_size: int,
     update: torch.Tensor,
     *,
-    alpha: int | float | complex = 1,
+    beta: float = 1.0,
+    alpha: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
-    """Apply the logical ``weight + alpha * update`` operation in place."""
+    """Apply the logical ``beta * weight + alpha * update`` operation in place."""
     _validate_add(qdata, scale, dtype, group_size, update)
     operation = "ConvRot INT8 add_"
+    beta_float = validate_real_scalar(beta, "beta", operation=operation)
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
     seed = narrow_rounding_seed(rounding_seed, operation=operation)
-    if alpha_float == 0:
+    if beta_float == 1 and alpha_float == 0:
         return
     if _backend.select_add(qdata) is not None:
         _ops.add_(
@@ -108,6 +110,7 @@ def add_(
             group_size,
             alpha_float,
             seed,
+            beta=beta_float,
         )
     else:
         reference.add_(
@@ -115,6 +118,7 @@ def add_(
             scale,
             update,
             group_size,
+            beta_float,
             alpha_float,
             seed,
         )
@@ -128,8 +132,8 @@ def addmm_(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     *,
-    beta: int | float | complex = 1,
-    alpha: int | float | complex = 1,
+    beta: float = 1.0,
+    alpha: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
     """Apply the logical ``beta * weight + alpha * mat1 @ mat2`` update in place."""

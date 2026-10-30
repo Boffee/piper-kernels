@@ -128,8 +128,8 @@ def addmm_(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     *,
-    beta: int | float | complex = 1,
-    alpha: int | float | complex = 1,
+    beta: float = 1.0,
+    alpha: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
     """Apply a logical addmm update and refill the existing packed storage."""
@@ -174,15 +174,17 @@ def add_(
     group_size: int,
     update: torch.Tensor,
     *,
-    alpha: int | float | complex = 1,
+    beta: float = 1.0,
+    alpha: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
     """Apply a logical dense update and refill the existing packed storage."""
     _validate_add(weight, update)
     operation = _operation(weight, "add_")
+    beta_float = validate_real_scalar(beta, "beta", operation=operation)
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
     seed = narrow_rounding_seed(rounding_seed, operation=operation)
-    if alpha_float == 0:
+    if beta_float == 1 and alpha_float == 0:
         return
 
     if supports_triton(weight.qdata):
@@ -197,6 +199,7 @@ def add_(
             weight.is_swizzled_scales,
             weight.high_first,
             seed,
+            beta=beta_float,
         )
         return
 
@@ -204,6 +207,7 @@ def add_(
         weight,
         group_size,
         update,
+        beta=beta_float,
         alpha=alpha_float,
         rounding_seed=rounding_seed,
     )
