@@ -4,7 +4,6 @@ from collections.abc import Callable
 from typing import Any, ClassVar, Self, cast
 
 import torch
-from torch.types import Number
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
 
@@ -212,18 +211,19 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             if memory_format is not torch.contiguous_format:
                 raise NotImplementedError("ConvRot INT8 only supports contiguous memory format")
 
-    # Quantized updates require concrete scalars; Tensor also types symbolic scalars.
+    # Quantized updates require real coefficients; Tensor also accepts complex/symbolic scalars.
     def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         mat1: torch.Tensor,
         mat2: torch.Tensor,
         *,
-        beta: int | float | complex = 1,
-        alpha: int | float | complex = 1,
+        beta: float = 1.0,
+        alpha: float = 1.0,
         rounding_seed: int | None = None,
     ) -> "ConvRotInt8Tensor":
         """Update and requantize in place, optionally using stochastic rounding.
 
+        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
         ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
         makes terminal INT8 code selection reproducible for a fixed device and
         backend without consuming the process-global random-number generator.
@@ -247,20 +247,25 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
         return self
 
-    def add_(
+    # Tensor.add_ also types complex and None, which quantized updates reject.
+    def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         other: object,
         *,
-        alpha: Number | complex | None = 1,
+        beta: float = 1.0,
+        alpha: float = 1.0,
         rounding_seed: int | None = None,
     ) -> "ConvRotInt8Tensor":
-        """Add a dense logical update and requantize in place."""
+        """Requantize ``beta * weight + alpha * other`` in place.
+
+        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
+        ``beta`` is a Piper extension to Tensor.add_; its default preserves
+        ordinary addition. Rounding follows the ``addmm_`` seed contract.
+        """
         self._require_matrix("add_")
         require_untransposed(self, "add_")
         if not isinstance(other, torch.Tensor):
             raise TypeError("ConvRot add_ update must be a tensor")
-        if alpha is None:
-            raise TypeError("ConvRot add_ alpha must be a real number, got None")
         from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
 
         _update.add_(
@@ -269,6 +274,7 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             self.dtype,
             self.group_size,
             other,
+            beta=beta,
             alpha=alpha,
             rounding_seed=rounding_seed,
         )

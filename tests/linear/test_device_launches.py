@@ -141,7 +141,7 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation):
         if operation == "prepare_input":
             _generic.prepare_input(value, 256)
         elif operation == "add_":
-            int8_updates.add_(qdata, scale, value, 256, 0.5)
+            int8_updates.add_(qdata, scale, value, 256, 1.0, 0.5)
         else:
             int8_updates.addmm_(
                 qdata,

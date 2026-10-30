@@ -388,8 +388,10 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
         execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu", None)
     elif operation == "add_":
         monkeypatch.setattr(int8_updates, "select_add", lambda value: execute)
-        _update.add_(qdata, scale, torch.float32, 16, update, alpha=2, rounding_seed=2**64 - 1)
-        execute.assert_called_once_with(qdata, scale, update, 16, 2.0, -1)
+        _update.add_(
+            qdata, scale, torch.float32, 16, update, beta=0.25, alpha=2, rounding_seed=2**64 - 1
+        )
+        execute.assert_called_once_with(qdata, scale, update, 16, 0.25, 2.0, -1)
     else:
         monkeypatch.setattr(int8_updates, "select_addmm", lambda value: execute)
         _update.addmm_(

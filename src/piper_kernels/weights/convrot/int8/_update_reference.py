@@ -31,13 +31,18 @@ def add_(
     scale: torch.Tensor,
     update: torch.Tensor,
     group_size: int,
+    beta: float,
     alpha: float,
     rounding_seed: int | None = None,
 ) -> None:
     """Add a dense logical update to a ConvRot weight and requantize it in place."""
-    rotated_weight = qdata.float() * scale
-    rotated_update = rotate_groups(update.float(), group_size)
-    merged = torch.add(rotated_weight, rotated_update, alpha=alpha)
+    if beta == 0:
+        merged = torch.zeros(qdata.shape, device=qdata.device, dtype=torch.float32)
+    else:
+        merged = (qdata.float() * scale).mul_(beta)
+    if alpha != 0:
+        rotated_update = rotate_groups(update.float(), group_size)
+        merged.add_(rotated_update, alpha=alpha)
     _requantize_(qdata, scale, merged, rounding_seed)
 
 

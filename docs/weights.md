@@ -249,19 +249,26 @@ with torch.no_grad():
 ```
 
 `addmm_` computes `beta * weight + alpha * (mat1 @ mat2)`; `add_` computes
-`weight + alpha * update` from an exact-shape dense update. Inputs must match the
-weight's logical dtype and device. Updates are inference-only, require an
-untransposed matrix, and requantize into the existing storage. They preserve the
-wrapper, packed-data/scales storage, and activation calibration.
+`beta * weight + alpha * update` from an exact-shape dense update. Both default
+`alpha` and `beta` to `1.0`. Both coefficients are typed as `float` and accept
+integers. The update boundary converts them to floats and rejects complex,
+`None`, and non-finite values. The `beta` keyword on `add_` is a Piper extension
+to PyTorch; standard ATen addition keeps `beta=1`. A zero coefficient ignores the
+corresponding values, and `alpha=0, beta=1` preserves storage without requantizing.
+Inputs must match the weight's logical dtype and device. Updates are
+inference-only, require an untransposed matrix, and requantize into the existing
+storage. They preserve the wrapper, packed-data/scales storage, and activation
+calibration.
 
 An optional unsigned 64-bit `rounding_seed` enables stochastic code selection
 without changing scale selection or consuming PyTorch's global RNG. Omitting it
 uses nearest rounding. Reproduction is specific to the backend/device; Torch and
 Triton need not choose identical codes. Standard update signatures support
-`torch.compile`, but the `add_` seed extension is for eager updates because of
-Dynamo's built-in signature. Repeated updates are lossy: restore pristine weights
-before replacing or removing a merged adapter. Callers must also respect ownership
-of the storage they update, including read-only checkpoint mappings.
+`torch.compile`, but the `add_` `beta` and `rounding_seed` extensions are for
+eager updates because of Dynamo's built-in signature. Repeated updates are lossy:
+restore pristine weights before replacing or removing a merged adapter. Callers
+must also respect ownership of the storage they update, including read-only
+checkpoint mappings.
 
 For custom quantizers, the [stochastic quantization package](../src/piper_kernels/stochastic_quantization/__init__.py)
 exposes integer and codebook rounding; its `triton` module supplies kernel primitives.

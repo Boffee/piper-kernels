@@ -68,7 +68,7 @@ def _merged(weight, operands, operation, alpha, beta):
         # Model that hardware boundary, but keep dequantization and merging FP32.
         update = update.to(operands[-1].dtype).float()
     if operation == "add":
-        return torch.add(base, update, alpha=alpha)
+        return torch.add(base * beta, update, alpha=alpha)
     # Use FP32 accumulation as the oracle instead of inheriting cuBLAS's
     # reduced-precision BF16 GEMM choices before the NVFP4 quantization boundary.
     return torch.addmm(
@@ -81,11 +81,9 @@ def _merged(weight, operands, operation, alpha, beta):
 
 
 def _apply(weight, operands, operation, *, alpha=0.375, beta=0.25, seed=None):
-    kwargs = {"alpha": alpha}
+    kwargs = {"alpha": alpha, "beta": beta}
     if seed is not None:
         kwargs["rounding_seed"] = seed
-    if operation == "addmm":
-        kwargs["beta"] = beta
     return getattr(weight, f"{operation}_")(*operands, **kwargs)
 
 
@@ -224,20 +222,25 @@ def test_seeded_updates_preserve_layout_scales_and_rng(
     assert (actual - merged).square().mean().sqrt() / merged.float().square().mean().sqrt() < 0.2
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
+@pytest.mark.parametrize("operation", ["add", "addmm"])
 @pytest.mark.parametrize("group_size", [0, 256])
-@pytest.mark.gpu
-@pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires Blackwell CUDA")
-def test_zero_coefficients_skip_nonfinite_inputs_and_no_op_preserves_versions(group_size):
-    weight = _weight(group_size)
-    operands = tuple(value.fill_(float("nan")) for value in _operands(weight, "addmm"))
+def test_zero_coefficients_skip_nonfinite_inputs_and_no_op_preserves_versions(
+    device, operation, group_size
+):
+    weight = _weight(group_size, device=device)
+    before = weight.dequantize(torch.float32)
+    operands = tuple(value.fill_(float("nan")) for value in _operands(weight, operation))
     versions = (weight.qdata._version, weight.scale._version, weight.per_tensor_scale._version)
-    weight.addmm_(*operands, alpha=0, beta=1, rounding_seed=1)
+    _apply(weight, operands, operation, alpha=0, beta=1, seed=1)
     assert versions == (
         weight.qdata._version,
         weight.scale._version,
         weight.per_tensor_scale._version,
     )
-    weight.addmm_(*operands, alpha=0, beta=0, rounding_seed=1)
+    _apply(weight, operands, operation, alpha=0, beta=-0.5, seed=1)
+    torch.testing.assert_close(weight.dequantize(torch.float32), -0.5 * before)
+    _apply(weight, operands, operation, alpha=0, beta=0, seed=1)
     assert torch.equal(weight.qdata, torch.zeros_like(weight.qdata))
     assert torch.isfinite(weight.per_tensor_scale).all()
     assert (weight.per_tensor_scale > 0).all()
@@ -353,11 +356,14 @@ def test_compiled_update_preserves_mutation(operation, group_size):
     weight = _weight(group_size)
     expected = weight.clone()
     operands = _operands(weight, operation)
-    _apply(expected, operands, operation)
 
     def update(value, *inputs):
+        # Dynamo recognizes Tensor.add_ with its standard PyTorch signature.
+        if operation == "add":
+            return value.add_(*inputs, alpha=0.375)
         return _apply(value, inputs, operation)
 
+    update(expected, *operands)
     result = torch.compile(update, fullgraph=True)(weight, *operands)
 
     assert result is weight
@@ -389,6 +395,7 @@ def test_update_custom_op_fake_and_aot_dispatch(operation, group_size, two_level
             weight.high_first,
             123,
         ),
+        kwargs={"beta": 0.25} if operation == "add" else {},
         # PyTorch's schema checker uses allclose, which lacks FP8 CUDA support.
         # The end-to-end update tests check storage mutation directly.
         test_utils=("test_faketensor", "test_aot_dispatch_dynamic"),
@@ -428,8 +435,45 @@ def test_updates_replay_for_seeds_above_the_signed_range(device, seed):
             device=device,
             generator=torch.Generator(device=device).manual_seed(21),
         )
-        weight.add_(update, alpha=0.5, rounding_seed=seed)
+        weight.add_(update, beta=-0.5, alpha=0.5, rounding_seed=seed)
         return weight.qdata.clone()
 
     first = updated()
     assert torch.equal(first, updated())
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
+@pytest.mark.parametrize("group_size", [0, 64])
+def test_add_zero_beta_ignores_base_values(device, group_size):
+    weight = _weight(group_size, device=device)
+    expected = weight.clone()
+    (update,) = _operands(weight, "add")
+    expected.add_(update, beta=0, rounding_seed=3)
+    weight.scale.fill_(float("nan"))
+    weight.per_tensor_scale.fill_(float("nan"))
+    weight.add_(update, beta=0, rounding_seed=3)
+    assert torch.equal(weight.qdata, expected.qdata)
+    # Swizzled padding is not part of the logical scale data and need not be overwritten.
+    torch.testing.assert_close(weight.get_hp_scales(), expected.get_hp_scales())
+    torch.testing.assert_close(weight.per_tensor_scale, expected.per_tensor_scale)
+
+
+@pytest.mark.parametrize("group_size", [0, 64])
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [(float("nan"), ValueError), (float("inf"), ValueError), (1j, TypeError), (None, TypeError)],
+)
+@pytest.mark.parametrize("coefficient", ["alpha", "beta"])
+@pytest.mark.parametrize("operation", ["add", "addmm"])
+def test_updates_reject_invalid_coefficients_before_mutation(
+    group_size, operation, coefficient, value, error
+):
+    weight = _weight(group_size, device="cpu")
+    versions = (weight.qdata._version, weight.scale._version, weight.per_tensor_scale._version)
+    with pytest.raises(error, match=f"{coefficient} must be"):
+        _apply(weight, _operands(weight, operation), operation, **{"alpha": 0, coefficient: value})
+    assert versions == (
+        weight.qdata._version,
+        weight.scale._version,
+        weight.per_tensor_scale._version,
+    )

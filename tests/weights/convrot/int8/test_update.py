@@ -70,9 +70,10 @@ def test_addmm_updates_logical_weight_and_requantizes_in_place(
 
 
 @pytest.mark.parametrize("group_size", [16, 64, 256])
-@pytest.mark.parametrize("alpha", [1, 0.25, -0.5])
+@pytest.mark.parametrize(("beta", "alpha"), [(1, 1), (0.25, 0.25), (-1, -0.5), (0, 0.5)])
 def test_add_updates_logical_weight_and_requantizes_in_place(
     group_size: int,
+    beta: float,
     alpha: float,
 ) -> None:
     torch.manual_seed(22 + group_size)
@@ -83,11 +84,11 @@ def test_add_updates_logical_weight_and_requantizes_in_place(
     scale = wrapped.scale
     logical_before = wrapped.dequantize()
     expected = ConvRotInt8Tensor.from_hp(
-        torch.add(logical_before, update, alpha=alpha),
+        torch.add(logical_before * beta, update, alpha=alpha),
         group_size=group_size,
     )
 
-    result = wrapped.add_(update, alpha=alpha)
+    result = wrapped.add_(update, beta=beta, alpha=alpha)
 
     assert result is wrapped
     assert wrapped.qdata is qdata
@@ -159,7 +160,7 @@ def test_stochastic_rounding_replays_without_consuming_global_rng(operation: str
     seed = (1 << 64) - 1
     make_case = _stochastic_update_fixture if operation == "add_" else _stochastic_addmm_fixture
     first, *operands = make_case()
-    options = {} if operation == "add_" else {"beta": 0}
+    options = {"beta": 0}
     replay = first.clone()
     other = first.clone()
     deterministic = first.clone()
@@ -300,9 +301,9 @@ def test_updates_preserve_storage_and_replay(monkeypatch, device, operation, fal
     left = torch.randn(17, 3, device=device, dtype=dtype)
     right = torch.randn(3, 512, device=device, dtype=dtype)[:, ::2]
     if operation == "add":
-        weight.add_(update, alpha=0.25, rounding_seed=seed)
-        replay.add_(update, alpha=0.25, rounding_seed=seed)
-        expected = before + 0.25 * update.float()
+        weight.add_(update, beta=0.5, alpha=0.25, rounding_seed=seed)
+        replay.add_(update, beta=0.5, alpha=0.25, rounding_seed=seed)
+        expected = 0.5 * before + 0.25 * update.float()
     else:
         weight.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
         replay.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
@@ -333,7 +334,7 @@ def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
     monkeypatch.setattr(int8_updates, "_triton_backend", SimpleNamespace(add_=partial_update))
     monkeypatch.setattr(int8_update_reference, "add_", fallback)
     with pytest.raises(RuntimeError, match="kernel execution failed"):
-        int8_updates.add_(qdata, scale, torch.ones(2, 32), 16, 1.0)
+        int8_updates.add_(qdata, scale, torch.ones(2, 32), 16, 1.0, 1.0)
     assert (qdata == 3).all()
     fallback.assert_not_called()
 
@@ -357,3 +358,42 @@ def test_updates_replay_for_seeds_above_the_signed_range(device, seed):
 
 def _seeded(device):
     return torch.Generator(device=device).manual_seed(21)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_add_zero_coefficients_ignore_values_and_preserve_no_op_versions(device):
+    weight = ConvRotInt8Tensor.from_hp(torch.randn(7, 64, device=device), group_size=16)
+    before = weight.dequantize(torch.float32)
+    unused = torch.full_like(before, float("nan"))
+    versions = (weight.qdata._version, weight.scale._version)
+
+    weight.add_(unused, alpha=0, beta=1, rounding_seed=1)
+    assert versions == (weight.qdata._version, weight.scale._version)
+
+    weight.add_(unused, alpha=0, beta=-0.5, rounding_seed=1)
+    torch.testing.assert_close(weight.dequantize(torch.float32), -0.5 * before)
+    weight.add_(unused, alpha=0, beta=0, rounding_seed=1)
+    assert not weight.qdata.any()
+    assert weight.scale.isfinite().all()
+
+    weight.scale.fill_(float("nan"))
+    update = torch.randn_like(before)
+    expected = ConvRotInt8Tensor.from_hp(update, group_size=16)
+    weight.add_(update, beta=0)
+    torch.testing.assert_close(weight.qdata, expected.qdata)
+    torch.testing.assert_close(weight.scale, expected.scale)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [(float("nan"), ValueError), (float("inf"), ValueError), (1j, TypeError), (None, TypeError)],
+)
+@pytest.mark.parametrize("coefficient", ["alpha", "beta"])
+@pytest.mark.parametrize("operation", ["add", "addmm"])
+def test_updates_reject_invalid_coefficients_before_mutation(operation, coefficient, value, error):
+    weight = ConvRotInt8Tensor.from_hp(torch.randn(7, 32), group_size=16)
+    versions = (weight.qdata._version, weight.scale._version)
+    operands = (torch.ones(7, 32),) if operation == "add" else (torch.ones(7, 1), torch.ones(1, 32))
+    with pytest.raises(error, match=f"{coefficient} must be"):
+        getattr(weight, f"{operation}_")(*operands, **{"alpha": 0, coefficient: value})
+    assert versions == (weight.qdata._version, weight.scale._version)

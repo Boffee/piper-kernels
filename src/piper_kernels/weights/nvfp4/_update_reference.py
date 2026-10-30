@@ -50,15 +50,20 @@ def add_(
     group_size: int,
     update: torch.Tensor,
     *,
+    beta: float,
     alpha: float,
     rounding_seed: int | None = None,
 ) -> None:
     """Merge a dense logical update in the stored basis and refill NVFP4 storage."""
     # Stay in the physical rotated basis used by the packed storage. Rotation
     # is linear, so this equals rotating the logical sum before requantization.
-    rotated_weight = PiperNVFP4Tensor.dequantize(weight, torch.float32)
-    rotated_update = rotate_groups(update.float(), group_size) if group_size else update.float()
-    merged = torch.add(rotated_weight, rotated_update, alpha=alpha)
+    if beta == 0:
+        merged = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
+    else:
+        merged = PiperNVFP4Tensor.dequantize(weight, torch.float32).mul_(beta)
+    if alpha != 0:
+        rotated_update = rotate_groups(update.float(), group_size) if group_size else update.float()
+        merged.add_(rotated_update, alpha=alpha)
     _refill_(weight, merged, rounding_seed)
 
 
