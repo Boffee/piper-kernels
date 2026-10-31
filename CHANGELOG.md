@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- ConvRot INT8 LoRA merges on NVIDIA SM80+ and HIP fuse rotation, multiplication,
+  merging, and packing in tiles using one shared conservative schedule,
+  retaining only tile maxima and row scales instead of a dense update.
+  Other supported Triton GPUs use bounded 32 MiB product batches with a shared
+  row-update schedule. Both preserve in-place storage, autocast, and seeded
+  rounding, and snapshot aliased factors before mutation.
+
 ## [0.7.9] - 2026-10-30
 
 ### Added

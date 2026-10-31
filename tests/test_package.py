@@ -72,6 +72,9 @@ importlib.util.find_spec = find_spec
 
 import torch
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8._plan import AddmmExecutionPlan
+from piper_kernels.weights.convrot.int8._policy import select_addmm_plan
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
@@ -86,6 +89,8 @@ assert _backend.select_linear_backend(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert generic_dispatch._triton_backend is None
+assert select_addmm_plan(AcceleratorTarget("cuda", "sm80"), 64) is not None
+assert AddmmExecutionPlan().block_n == 128
 from piper_kernels.fusions.convrot_int8_sage_qk._validation import validate_qk_projection_inputs
 assert validate_qk_projection_inputs(
     torch.ones(1, 64, 32, dtype=torch.int8),

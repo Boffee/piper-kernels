@@ -322,6 +322,237 @@ def test_updates_preserve_storage_and_replay(monkeypatch, device, operation, fal
         reference_update.assert_not_called()
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
+@pytest.mark.parametrize(
+    ("dtype", "autocast_dtype"),
+    [
+        (torch.float16, None),
+        (torch.bfloat16, None),
+        (torch.float32, None),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("seed", [None, (1 << 64) - 1])
+@pytest.mark.parametrize(
+    ("width", "group_size", "batched"),
+    [(256, 64, True), (12288, 64, True), (128, 16, False), (320, 64, False), (12288, 256, False)],
+)
+def test_addmm_matches_full_product(
+    monkeypatch, dtype, autocast_dtype, seed, width, group_size, batched
+):
+    from piper_kernels.weights.convrot.int8 import triton as int8_triton  # noqa: PLC0415
+
+    torch.manual_seed(674)
+    rows = 17
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.randint(-16, 16, (rows, width), device="cuda", dtype=torch.int8),
+        torch.full((rows, 1), 0.25, device="cuda"),
+        group_size=group_size,
+        logical_dtype=dtype,
+    )
+    # Binary fractions make the GEMM exact across tile/batch sizes. Strided
+    # factors and partial row/rank/column tiles exercise masked addressing.
+    left = (torch.randint(-4, 5, (rows, 6), device="cuda").to(dtype) / 8)[:, ::2]
+    right = (torch.randint(-4, 5, (3, width * 2), device="cuda").to(dtype) / 8)[:, ::2]
+    expected = weight.clone()
+    rotated_right = torch.empty_like(right.contiguous())
+    int8_triton.rotate_input(right.contiguous(), rotated_right, group_size, num_warps=4)
+    qdata, scale = weight.qdata, weight.scale
+    monkeypatch.setattr(int8_triton, "_UPDATE_WORKSPACE_BYTES", 7 * width * left.element_size())
+    if batched:
+        monkeypatch.setattr(int8_triton, "select_addmm_plan", lambda *args, **kwargs: None)
+
+    with torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None):
+        # The original full-product path is the oracle, including matmul autocast.
+        product = torch.mm(left, rotated_right)
+        int8_triton._requantize_update_(
+            expected.qdata,
+            expected.scale,
+            product,
+            0.5,
+            0.25,
+            -1 if seed is not None else None,
+            has_update=True,
+        )
+        weight.addmm_(left, right, beta=0.5, alpha=0.25, rounding_seed=seed)
+
+    assert weight.qdata is qdata
+    assert weight.scale is scale
+    torch.testing.assert_close(weight.qdata, expected.qdata, rtol=0, atol=0)
+    torch.testing.assert_close(weight.scale, expected.scale, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("operand", ["left", "right"])
+@pytest.mark.parametrize("storage", ["scale", "qdata"])
+def test_addmm_snapshots_factors_aliasing_weight_storage(monkeypatch, batched, operand, storage):
+    from piper_kernels.weights.convrot.int8 import triton as int8_triton  # noqa: PLC0415
+
+    # Enough row tiles to overwrite early rows while later tiles still read
+    # their factors. The right factor fits one column tile, whose scale is
+    # written directly; the broadcast left factor spans row batches too.
+    rows, width = 8192, 256
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.zeros(rows, width, device="cuda", dtype=torch.int8),
+        torch.linspace(0.01, 1, rows, device="cuda")[:, None],
+        group_size=256,
+        logical_dtype=torch.float32,
+    )
+    backing = weight.scale if storage == "scale" else weight.qdata.view(torch.float32)
+    values = backing.reshape(-1)[:width]
+    values.copy_(torch.linspace(0.01, 1, width, device="cuda"))
+    left = values[:1].expand(rows, 1) if operand == "left" else torch.ones(rows, 1, device="cuda")
+    right = values[None, :] if operand == "right" else torch.ones(1, width, device="cuda")
+    expected = weight.clone()
+    qdata, scale = weight.qdata, weight.scale
+    if batched:
+        monkeypatch.setattr(int8_triton, "select_addmm_plan", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            int8_triton, "_UPDATE_WORKSPACE_BYTES", 256 * width * left.element_size()
+        )
+
+    expected.addmm_(left.clone(), right.clone(), beta=0, alpha=2)
+    weight.addmm_(left, right, beta=0, alpha=2)
+
+    assert weight.qdata is qdata
+    assert weight.scale is scale
+    torch.testing.assert_close(weight.qdata, expected.qdata, rtol=0, atol=0)
+    torch.testing.assert_close(weight.scale, expected.scale, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
+def test_addmm_workspace_does_not_grow_with_full_product():
+    from piper_kernels._triton.targets import AcceleratorTarget  # noqa: PLC0415
+    from piper_kernels.weights.convrot.int8._policy import select_addmm_plan  # noqa: PLC0415
+
+    rows, width, rank = 4097, 8192, 16
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.zeros(rows, width, device="cuda", dtype=torch.int8),
+        torch.ones(rows, 1, device="cuda"),
+        group_size=64,
+        logical_dtype=torch.bfloat16,
+    )
+    left = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
+    right = torch.randn(rank, width, device="cuda", dtype=torch.bfloat16)
+    weight.addmm_(left, right, rounding_seed=123)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    weight.addmm_(left, right, rounding_seed=123)
+    torch.cuda.synchronize()
+
+    peak_scratch = torch.cuda.max_memory_allocated() - baseline
+    # The dense BF16 product is over 64 MiB. Fusion needs only tile maxima
+    # and row scales; the fallback retains a single 32 MiB product batch.
+    fused = select_addmm_plan(AcceleratorTarget.from_device(weight.device), 64) is not None
+    assert peak_scratch < (3 if fused else 40) * 1024 * 1024
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
+def test_addmm_scale_covers_all_column_tiles_and_seed_replays():
+    # A larger value in the last, partial tile must set the scale of every
+    # element in the row. The regular Hadamard is its own inverse.
+    rows, width = 37, 320
+    rotated = torch.ones(1, width, device="cuda")
+    rotated[:, -1] = 4
+    right = rotate_groups(rotated, 64)
+    left = torch.arange(1, rows + 1, device="cuda", dtype=torch.float32)[:, None]
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.zeros(rows, width, device="cuda", dtype=torch.int8),
+        torch.ones(rows, 1, device="cuda"),
+        group_size=64,
+        logical_dtype=torch.float32,
+    )
+    replay = weight.clone()
+    rng_before = torch.cuda.get_rng_state()
+    for value in (weight, replay):
+        value.addmm_(left, right, beta=0, rounding_seed=123)
+    torch.testing.assert_close(weight.scale, left * (4 / 127), rtol=1e-6, atol=0)
+    assert torch.all(weight.qdata[:, -1] == 127)
+    assert torch.all((weight.qdata[:, :-1] == 31) | (weight.qdata[:, :-1] == 32))
+    assert torch.equal(weight.qdata, replay.qdata)
+    assert torch.equal(torch.cuda.get_rng_state(), rng_before)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
+@pytest.mark.parametrize("mode", ["compile", "graph"])
+@pytest.mark.parametrize("alias_scale", [False, True])
+def test_addmm_compiled_and_captured_mutation(mode, alias_scale):
+    torch.manual_seed(675)
+    if alias_scale:
+        weight = ConvRotInt8Tensor.from_quantized(
+            torch.zeros(8192, 256, device="cuda", dtype=torch.int8),
+            torch.linspace(0.01, 1, 8192, device="cuda")[:, None],
+            group_size=256,
+            logical_dtype=torch.float32,
+        )
+        left = torch.ones(8192, 1, device="cuda")
+        right = weight.scale[:256].T
+    else:
+        weight = ConvRotInt8Tensor.from_hp(
+            torch.randn(37, 768, device="cuda", dtype=torch.bfloat16), group_size=256
+        )
+        left = torch.randn(37, 37, device="cuda", dtype=torch.bfloat16)
+        right = torch.randn(37, 768, device="cuda", dtype=torch.bfloat16)
+    initial_q, initial_scale = weight.qdata.clone(), weight.scale.clone()
+
+    def update(value, a, b):
+        return value.addmm_(a, b, beta=0.5, alpha=0.25)
+
+    expected = weight.clone()
+    update(expected, left, right.clone())
+    if mode == "compile":
+        result = torch.compile(update, fullgraph=True)(weight, left, right)
+        assert result is weight
+    else:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            update(weight, left, right)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            update(weight, left, right)
+        weight.qdata.copy_(initial_q)
+        weight.scale.copy_(initial_scale)
+        graph.replay()
+
+    torch.testing.assert_close(weight.qdata, expected.qdata, rtol=0, atol=0)
+    torch.testing.assert_close(weight.scale, expected.scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_addmm_zero_coefficients_and_rank(device):
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.full((3, 320), 12, device=device, dtype=torch.int8),
+        torch.full((3, 1), 0.25, device=device),
+        group_size=64,
+        logical_dtype=torch.float32,
+    )
+    weight.addmm_(torch.empty(3, 0, device=device), torch.empty(0, 320, device=device), beta=-1)
+    torch.testing.assert_close(
+        weight.qdata.float() * weight.scale, torch.full((3, 320), -3.0, device=device)
+    )
+    left = torch.full((3, 1), float("nan"), device=device)
+    right = torch.full((1, 320), float("nan"), device=device)
+    weight.addmm_(left, right, beta=0, alpha=0)
+    assert torch.count_nonzero(weight.qdata) == 0
+    torch.testing.assert_close(weight.scale, torch.full_like(weight.scale, 1e-30), rtol=0, atol=0)
+    left.fill_(1)
+    right.fill_(1)
+    # beta=0 ignores old values, including nonfinite old scales.
+    weight.scale.fill_(float("nan"))
+    weight.addmm_(left, right, beta=0)
+    torch.testing.assert_close(weight.dequantize(), torch.ones(3, 320, device=device))
+
+
 def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
     qdata, scale = torch.zeros(2, 32, dtype=torch.int8), torch.ones(2, 1)
 

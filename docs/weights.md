@@ -260,6 +260,23 @@ inference-only, require an untransposed matrix, and requantize into the existing
 storage. They preserve the wrapper, packed-data/scales storage, and activation
 calibration.
 
+With Triton and at most 16,384 input features, ConvRot INT8 `addmm_` on NVIDIA
+SM80+ and HIP fuses rotation, multiplication, merging, and packing within tiles.
+Both backends share one conservative schedule, with column tiles sized to hold
+complete rotation groups. With independent factors, the merge retains only
+FP32 tile maxima and row scales, recomputing tiles after reducing each complete
+row's maximum. A row that fits in one tile needs only one kernel.
+This avoids a dense update buffer; recomputation and launch overhead can make
+small weights, larger adapter ranks, or FP32 factors slower. Other supported
+Triton GPUs rotate the right factor once and merge row batches with a dense
+product buffer capped at 32 MiB. The PyTorch fallback still materializes full
+floating-point weights. INT8 factors sharing packed-data or scale storage are
+copied before merging to preserve their original values. Optimized NVFP4 updates
+also compute and pack tiles directly, using tile maxima when a global scale is needed.
+
+Fused merge validation currently covers NVIDIA hardware and CUDA/HIP compiler
+targets; HIP on-device correctness and latency have not yet been measured.
+
 An optional unsigned 64-bit `rounding_seed` enables stochastic code selection
 without changing scale selection or consuming PyTorch's global RNG. Omitting it
 uses nearest rounding. Reproduction is specific to the backend/device; Torch and

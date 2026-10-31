@@ -224,6 +224,9 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         """Update and requantize in place, optionally using stochastic rounding.
 
         ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
+        Factors may share storage with ``qdata`` or ``scale``; the update uses
+        their values from before the mutation.
+
         ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
         makes terminal INT8 code selection reproducible for a fixed device and
         backend without consuming the process-global random-number generator.
