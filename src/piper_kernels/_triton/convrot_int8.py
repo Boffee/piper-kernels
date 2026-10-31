@@ -298,14 +298,14 @@ def convert_gguf_tiles_kernel(
 
 
 @triton.jit
-def gguf_row_scales_kernel(
+def reduce_row_scales_kernel(
     maxima_ptr,
     scale_ptr,
     tiles_per_row,
     block_size: tl.constexpr,
     reciprocal_scale: tl.constexpr,
 ):
-    """Reduce decoded/rotated tile maxima to the weight's single scale per row."""
+    """Reduce tile maxima to the weight's single scale per row."""
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, block_size)
     maxima = tl.load(maxima_ptr + row * tiles_per_row + offsets, offsets < tiles_per_row, 0.0)
@@ -356,6 +356,7 @@ def requantize_update_rows_kernel(
     beta,
     alpha,
     rounding_seed,
+    start_row,
     block_size: tl.constexpr,
     has_base: tl.constexpr,
     has_update: tl.constexpr,
@@ -392,7 +393,7 @@ def requantize_update_rows_kernel(
     quantized = _quantize_int8(values, scale, accelerator_backend)
     if stochastic:
         stochastic_scaled = values.to(tl.float32) / scale
-        logical_offsets = row_i64 * row_width + offsets_i64
+        logical_offsets = (row_i64 + start_row) * row_width + offsets_i64
         quantized = stochastic_round_to_int(
             stochastic_scaled,
             quantized,
@@ -407,3 +408,102 @@ def requantize_update_rows_kernel(
         mask=mask,
     )
     tl.store(scale_ptr + row_i64 * stride_scale_row, scale)
+
+
+@triton.jit
+def merge_lora_tiles_kernel(
+    q_ptr,
+    scale_ptr,
+    new_scale_ptr,
+    mat1_ptr,
+    mat2_ptr,
+    maxima_ptr,
+    rows_count,
+    row_width: tl.constexpr,
+    rank: tl.constexpr,
+    stride_a_row: tl.constexpr,
+    stride_a_col: tl.constexpr,
+    stride_b_row: tl.constexpr,
+    stride_b_col: tl.constexpr,
+    beta,
+    alpha,
+    rounding_seed,
+    group_size: tl.constexpr,
+    matmul_dtype: tl.constexpr,
+    has_base: tl.constexpr,
+    stochastic: tl.constexpr,
+    write_maxima: tl.constexpr,
+    single_tile: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Rotate, multiply, and merge a tile; retain only maxima between passes."""
+    rows = (tl.program_id(0) * block_m + tl.arange(0, block_m)).to(tl.int64)
+    tile = tl.program_id(1)
+    columns = (tile * block_n + tl.arange(0, block_n)).to(tl.int64)
+    valid = (rows[:, None] < rows_count) & (columns[None, :] < row_width)
+    reduction = tl.arange(0, block_k)
+    product = tl.full((block_m, block_n), 0.0, tl.float32)
+    logical_dtype: tl.constexpr = mat2_ptr.dtype.element_ty
+    for start in range(tl.cdiv(rank, block_k)):
+        k = (start * block_k + reduction).to(tl.int64)
+        left = tl.load(
+            mat1_ptr + rows[:, None] * stride_a_row + k[None, :] * stride_a_col,
+            (rows[:, None] < rows_count) & (k[None, :] < rank),
+            0.0,
+        ).to(matmul_dtype)
+        right = tl.load(
+            mat2_ptr + k[:, None] * stride_b_row + columns[None, :] * stride_b_col,
+            (k[:, None] < rank) & (columns[None, :] < row_width),
+            0.0,
+        ).to(tl.float32)
+        rotated = convrot_backend.rotate_hadamard_groups(
+            tl.reshape(right, (block_k * block_n,)), block_k * block_n, group_size
+        )
+        right = tl.reshape(rotated * (group_size**-0.5), (block_k, block_n))
+        # Match materialized rotation, autocast, and GEMM-result rounding.
+        right = right.to(logical_dtype).to(matmul_dtype)
+        product = tl.dot(
+            left,
+            right,
+            product,
+            input_precision="tf32x3" if accelerator_backend == "cuda" else "ieee",
+        )
+    update = product.to(matmul_dtype).to(tl.float32)
+    values = tl.full((block_m, block_n), 0.0, tl.float32)
+    if has_base:
+        base = tl.load(q_ptr + rows[:, None] * row_width + columns[None, :], valid, 0)
+        old_scale = tl.load(scale_ptr + rows, rows < rows_count, 0.0)
+        values = beta * base.to(tl.float32) * old_scale[:, None]
+    values += alpha * update
+    values = tl.where(valid, values, 0.0)
+    if write_maxima:
+        maximum = tl.max(tl.abs(values), axis=1)
+        tl.store(
+            maxima_ptr + rows * tl.cdiv(row_width, block_n) + tile,
+            maximum,
+            rows < rows_count,
+        )
+    else:
+        if single_tile:
+            scale = tl.maximum(
+                int8_scale_from_max(tl.max(tl.abs(values), axis=1), accelerator_backend == "hip"),
+                1e-30,
+            )
+        else:
+            scale = tl.load(new_scale_ptr + rows, rows < rows_count, 1.0)
+        quantized = _quantize_int8(values, scale[:, None], accelerator_backend)
+        if stochastic:
+            quantized = stochastic_round_to_int(
+                values / scale[:, None],
+                quantized,
+                rounding_seed,
+                rows[:, None] * row_width + columns[None, :],
+                -128,
+                127,
+            ).to(tl.int8)
+        tl.store(q_ptr + rows[:, None] * row_width + columns[None, :], quantized, valid)
+        if single_tile:
+            tl.store(scale_ptr + rows, scale, rows < rows_count)

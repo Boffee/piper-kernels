@@ -97,7 +97,7 @@ def test_gguf_probes_and_launches_on_tensor_device_then_restores_caller(launches
     for name in (
         "rotate_quantize_rows_kernel",
         "convert_gguf_tiles_kernel",
-        "gguf_row_scales_kernel",
+        "reduce_row_scales_kernel",
     ):
         launches.watch(int8_weight_triton, name)
     with FakeTensorMode():
@@ -121,13 +121,15 @@ def test_gguf_probes_and_launches_on_tensor_device_then_restores_caller(launches
     elif tiled:
         assert launches.calls == [
             "convert_gguf_tiles_kernel",
-            "gguf_row_scales_kernel",
+            "reduce_row_scales_kernel",
             "convert_gguf_tiles_kernel",
         ]
 
 
 @pytest.mark.parametrize("operation", ["prepare_input", "add_", "addmm_"])
-def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation):
+def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation, monkeypatch):
+    # Exercise the bounded fallback independently of the current device's dot support.
+    monkeypatch.setattr(int8_weight_triton, "select_addmm_plan", lambda *args: None)
     for module, name in (
         (rotation, "rotate_groups_kernel"),
         (generic, "quantize_rows_kernel"),
@@ -153,6 +155,34 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation):
                 0.5,
             )
     assert len(launches.calls) == 2
+    assert launches.current == 1
+
+
+@pytest.mark.parametrize("width", [128, 768])
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("backend", ["cuda", "hip"])
+def test_fused_int8_merge_restores_device_after_all_passes(
+    launches, width, fail, backend, monkeypatch
+):
+    launches.fail = fail
+    launches.backend = backend
+    monkeypatch.setattr(torch.version, "hip", "test" if backend == "hip" else None)
+    for name in ("merge_lora_tiles_kernel", "reduce_row_scales_kernel"):
+        launches.watch(int8_weight_triton, name)
+    with FakeTensorMode():
+        qdata = torch.empty(37, width, device="cuda:0", dtype=torch.int8)
+        scale = torch.empty(37, 1, device=qdata.device)
+        left = torch.empty(37, 17, device=qdata.device)
+        right = torch.empty(17, width, device=qdata.device)
+        error_context = (
+            pytest.raises(RuntimeError, match="simulated kernel failure") if fail else nullcontext()
+        )
+        with error_context:
+            int8_updates.addmm_(qdata, scale, left, right, 64, 0.5, 0.25)
+    expected = ["merge_lora_tiles_kernel"]
+    if width > 128 and not fail:
+        expected += ["reduce_row_scales_kernel", "merge_lora_tiles_kernel"]
+    assert launches.calls == expected
     assert launches.current == 1
 
 
