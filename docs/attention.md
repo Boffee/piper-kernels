@@ -128,9 +128,7 @@ contents in the captured input buffers. The prototype builds a compact membershi
 bitset once per call and leaves routing scores, attention arithmetic, and route
 capacity unchanged. It uses a separate custom operator: existing projection/output
 fusion rewrites do not match forced calls yet. Calls without forced inputs retain
-their existing compiler boundary and fusions. See
-[`benchmark_sparse_piper_forced.py`](../benchmarks/benchmark_sparse_piper_forced.py)
-for the H3-sized overhead experiment.
+their existing compiler boundary and fusions.
 
 ### Coarse residual
 
