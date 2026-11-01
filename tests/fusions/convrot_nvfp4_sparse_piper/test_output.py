@@ -21,14 +21,11 @@ from piper_kernels.linear.nvfp4 import reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
 from .._accuracy import assert_fusion_output_close
+from ..nvfp4_sparse_piper._helpers import exact_sm120_available
 from ..nvfp4_sparse_piper.test_output import _arguments as standard_arguments
 
 _OUTPUT_FEATURES = 320
 _GROUP_SIZE = 16
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _arguments(
@@ -263,7 +260,7 @@ def _projected_gate_arguments(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("sequence_length", "chunk_rows", "group_size"),
     [(128, 128, 16), (193, 128, 64), (193, 128, 256)],
@@ -282,7 +279,7 @@ def test_attention_output_matches_materialized_convrot_linear(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
 def test_attention_output_supports_mixed_precision_bias(
     bias_dtype: torch.dtype,
@@ -297,7 +294,7 @@ def test_attention_output_supports_mixed_precision_bias(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_high_first_attention_output_matches_low_first() -> None:
     arguments, _reference = _arguments(193, 64)
     high_arguments = list(arguments)
@@ -317,7 +314,7 @@ def test_high_first_attention_output_matches_low_first() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("coarse", [False, True])
 @pytest.mark.parametrize("sparse_query_blocks", [None, 2])
 def test_attention_output_supports_bounded_attention_features(
@@ -339,7 +336,7 @@ def test_attention_output_supports_bounded_attention_features(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("sequence_length", [384, 1_024])
 def test_attention_output_projects_a_bounded_coarse_gate(sequence_length: int) -> None:
     arguments, expected = _projected_gate_arguments(sequence_length, _GROUP_SIZE)
@@ -351,7 +348,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(sequence_length: int) -
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_attention_output_custom_op_passes_opcheck() -> None:
     arguments, _expected = _arguments(128)
 

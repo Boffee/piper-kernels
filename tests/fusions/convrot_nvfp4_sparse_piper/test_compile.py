@@ -10,7 +10,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -42,57 +41,19 @@ from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
+from .._nvfp4_sparse_piper_graphs import (
+    build_convrot_attention_graph,
+    build_quantized_attention_output_graph,
+    run_convrot_passes,
+)
+from ..nvfp4_sparse_piper._helpers import exact_sm120_available
 from ..nvfp4_sparse_piper.test_compile import (
     _ProjectedGateCoarseSparseAttentionOutput,
-    _quantized_attention_output_graph,
-    _semantic_attention_graph,
     _SparseProjectionAttentionOutput,
 )
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _GROUP_SIZE = 16
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
-
-
-def _convrot_graph(
-    *,
-    dynamic: bool,
-    output_dynamic: bool | None = None,
-    routing_mode: int = _MINMAX_ROUTING,
-    with_block_lengths: bool = False,
-    with_coarse: bool = False,
-    with_sparse_query_blocks: bool = False,
-) -> torch.fx.Graph:
-    graph = _semantic_attention_graph(
-        dynamic=dynamic,
-        output_dynamic=output_dynamic,
-        routing_mode=routing_mode,
-        with_block_lengths=with_block_lengths,
-        with_coarse=with_coarse,
-        with_sparse_query_blocks=with_sparse_query_blocks,
-    )
-    for node in graph.nodes:
-        if (
-            node.op == "call_function"
-            and node.target == torch.ops.piper_kernels.nvfp4_linear.default
-        ):
-            node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
-            node.args = (*node.args[:-1], _GROUP_SIZE, node.args[-1])
-    graph.lint()
-    return graph
-
-
-def _run_passes(graph: torch.fx.Graph, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
-    convrot_nvfp4_compile_pass(graph, is_inference=True)
-    fusion_compile_pass(graph, is_inference=True)
 
 
 def test_compile_options_install_versioned_idempotent_passes() -> None:
@@ -137,9 +98,9 @@ def test_convrot_preparation_reuses_nvfp4_sparse_projection_kernels(
     preparation_count: int,
     routing_mode: int,
 ) -> None:
-    graph = _convrot_graph(dynamic=dynamic, routing_mode=routing_mode)
+    graph = build_convrot_attention_graph(dynamic=dynamic, routing_mode=routing_mode)
 
-    _run_passes(graph, monkeypatch)
+    run_convrot_passes(graph, monkeypatch)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert (
@@ -160,9 +121,9 @@ def test_convrot_preparation_reuses_nvfp4_sparse_projection_kernels(
 def test_static_convrot_output_fuses_after_sparse_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _convrot_graph(dynamic=True, output_dynamic=False)
+    graph = build_convrot_attention_graph(dynamic=True, output_dynamic=False)
 
-    _run_passes(graph, monkeypatch)
+    run_convrot_passes(graph, monkeypatch)
 
     call_nodes = [node for node in graph.nodes if node.op == "call_function"]
     targets = [node.target for node in call_nodes]
@@ -186,7 +147,7 @@ def test_complete_convrot_fold_supports_every_bounded_attention_variant(
     with_coarse: bool,
     with_sparse_query_blocks: bool,
 ) -> None:
-    graph = _convrot_graph(
+    graph = build_convrot_attention_graph(
         dynamic=False,
         output_dynamic=False,
         with_block_lengths=with_block_lengths,
@@ -194,7 +155,7 @@ def test_complete_convrot_fold_supports_every_bounded_attention_variant(
         with_sparse_query_blocks=with_sparse_query_blocks,
     )
 
-    _run_passes(graph, monkeypatch)
+    run_convrot_passes(graph, monkeypatch)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in targets
@@ -226,7 +187,7 @@ def test_convrot_output_fold_supports_every_bounded_attention_variant(
     with_coarse: bool,
     with_sparse_query_blocks: bool,
 ) -> None:
-    graph = _quantized_attention_output_graph(
+    graph = build_quantized_attention_output_graph(
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
         with_sparse_query_blocks=with_sparse_query_blocks,
@@ -239,7 +200,7 @@ def test_convrot_output_fold_supports_every_bounded_attention_variant(
             node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
             node.args = (*node.args[:-1], _GROUP_SIZE, node.args[-1])
 
-    _run_passes(graph, monkeypatch)
+    run_convrot_passes(graph, monkeypatch)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     fused = torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
@@ -256,7 +217,7 @@ def test_convrot_output_fold_supports_every_bounded_attention_variant(
 def test_high_first_convrot_output_fold_preserves_order_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _quantized_attention_output_graph(
+    graph = build_quantized_attention_output_graph(
         with_block_lengths=False,
         with_coarse=False,
         with_sparse_query_blocks=False,
@@ -270,7 +231,7 @@ def test_high_first_convrot_output_fold_preserves_order_metadata(
             node.target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
             node.args = (*node.args[:-1], _GROUP_SIZE, node.args[-1])
 
-    _run_passes(graph, monkeypatch)
+    run_convrot_passes(graph, monkeypatch)
 
     fused = torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_attention_output.default
     node = next(node for node in graph.nodes if node.target is fused)
@@ -283,8 +244,8 @@ def test_high_first_convrot_output_fold_preserves_order_metadata(
 
 
 def test_dynamic_convrot_output_fuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    graph = _convrot_graph(dynamic=False, output_dynamic=True)
-    _run_passes(graph, monkeypatch)
+    graph = build_convrot_attention_graph(dynamic=False, output_dynamic=True)
+    run_convrot_passes(graph, monkeypatch)
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     fused = (
         torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_projected_query_attention_output.default
@@ -377,6 +338,9 @@ def _project_materialized_attention(
 def _run_explicit_attention_output(
     model: _ConvRotSparseProjectionAttentionOutput,
     input: torch.Tensor,  # noqa: A002
+    *,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_input, k_input, v_input = (
         _prepared_input(input, projection) for projection in (model.query, model.key, model.value)
@@ -444,6 +408,8 @@ def _run_explicit_attention_output(
         model.sequence_length,
         model.sparse_attention._routing_mode,
         output_dtype=input.dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     return _project_materialized_attention(attention, model.output)
 
@@ -548,7 +514,7 @@ def _run_explicit_projected_gate_output(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 3), (True, "minmax", 1), (False, "mean", 3)],
@@ -624,7 +590,7 @@ def test_cuda_compile_fuses_complete_convrot_nvfp4_sparse_attention(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],

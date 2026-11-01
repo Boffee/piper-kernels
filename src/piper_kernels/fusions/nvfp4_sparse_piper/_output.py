@@ -367,6 +367,8 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     *,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project bounded attention with unit, calibrated, or global dynamic scaling."""
     if query_chunk_rows is None:
@@ -393,6 +395,8 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         has_projected_coarse_gate=gate_projection is not None,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     output_features, project_chunk, project_attention, projector_tensors = (
         _prepare_output_projector(
@@ -462,6 +466,8 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     *,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk NVFP4 Q through routing, attention, and output."""
     if query_chunk_rows is None:
@@ -485,6 +491,8 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         has_projected_coarse_gate=gate_projection is not None,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     if query_input_qdata.shape[0] != prepared.sequence_length:
         raise ValueError("fused NVFP4 Q input must match the global attention rows")

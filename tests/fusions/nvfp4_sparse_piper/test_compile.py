@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import operator
-
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -22,7 +19,6 @@ from piper_kernels import (
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -44,402 +40,15 @@ from piper_kernels.linear.nvfp4.triton import linear_mean
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
+from .._nvfp4_sparse_piper_graphs import (
+    build_attention_graph,
+    build_convrot_attention_graph,
+    build_quantized_attention_output_graph,
+    run_convrot_passes,
+)
 from ._helpers import exact_sm120_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
-
-
-def _placeholder(
-    graph: torch.fx.Graph,
-    name: str,
-    value: torch.Tensor,
-) -> torch.fx.Node:
-    node = graph.placeholder(name)
-    node.meta["val"] = value
-    return node
-
-
-def _profile_placeholder(graph: torch.fx.Graph) -> torch.fx.Node:
-    node = graph.placeholder("ratio_profile")
-    node.meta["val"] = _SparsePiperRatioProfile((5000, 10000))
-    return node
-
-
-def _semantic_linear(
-    graph: torch.fx.Graph,
-    input: torch.fx.Node,  # noqa: A002
-    prefix: str,
-    activation_scale: torch.fx.Node | None,
-    *,
-    dynamic: bool,
-    output_features: int = 256,
-    high_first: bool = False,
-) -> torch.fx.Node:
-    weight_qdata = _placeholder(
-        graph,
-        f"{prefix}_weight_qdata",
-        torch.empty((output_features, 128), device="cuda", dtype=torch.uint8),
-    )
-    weight_scale = _placeholder(
-        graph,
-        f"{prefix}_weight_scale",
-        torch.empty(
-            (((output_features + 127) // 128) * 32, 64),
-            device="cuda",
-            dtype=torch.float8_e4m3fn,
-        ),
-    )
-    weight_global_scale = _placeholder(
-        graph,
-        f"{prefix}_weight_global_scale",
-        torch.empty((), device="cuda", dtype=torch.float32),
-    )
-    projected = graph.call_function(
-        torch.ops.piper_kernels.nvfp4_linear.default,
-        args=(
-            input,
-            weight_qdata,
-            weight_scale,
-            weight_global_scale,
-            activation_scale,
-            None,
-            dynamic,
-            high_first,
-        ),
-    )
-    projected.meta["val"] = torch.empty(
-        (1, 192, output_features),
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    return projected
-
-
-def _normalized_rope(
-    graph: torch.fx.Graph,
-    projected: torch.fx.Node,
-    norm: torch.fx.Node | None,
-    cos: torch.fx.Node,
-    sin: torch.fx.Node,
-) -> torch.fx.Node:
-    reshaped = graph.call_function(
-        torch.ops.aten.reshape.default,
-        args=(projected, (1, 192, 2, 128)),
-    )
-    promoted = graph.call_function(
-        torch.ops.prims.convert_element_type.default,
-        args=(reshaped, torch.float32),
-    )
-    squared = graph.call_function(torch.ops.aten.pow.Tensor_Scalar, args=(promoted, 2))
-    mean = graph.call_function(torch.ops.aten.mean.dim, args=(squared, [3], True))
-    variance = graph.call_function(torch.ops.aten.add.Scalar, args=(mean, 1e-5))
-    inverse_rms = graph.call_function(torch.ops.aten.rsqrt.default, args=(variance,))
-    normalized = graph.call_function(torch.ops.aten.mul.Tensor, args=(promoted, inverse_rms))
-    scaled = (
-        graph.call_function(torch.ops.aten.mul.Tensor, args=(normalized, norm))
-        if norm is not None
-        else normalized
-    )
-    rounded = graph.call_function(
-        torch.ops.prims.convert_element_type.default,
-        args=(scaled, torch.bfloat16),
-    )
-    rotary = graph.call_function(
-        torch.ops.aten.slice.Tensor,
-        args=(rounded, 3, 0, 96),
-    )
-    split = graph.call_function(torch.ops.aten.split.Tensor, args=(rotary, 48, -1))
-    first = graph.call_function(operator.getitem, args=(split, 0))
-    second = graph.call_function(operator.getitem, args=(split, 1))
-    cos_bf16 = graph.call_function(
-        torch.ops.prims.convert_element_type.default,
-        args=(cos, torch.bfloat16),
-    )
-    cos_bf16 = graph.call_function(torch.ops.aten.unsqueeze.default, args=(cos_bf16, 0))
-    cos_bf16 = graph.call_function(torch.ops.aten.unsqueeze.default, args=(cos_bf16, 2))
-    direct = graph.call_function(torch.ops.aten.mul.Tensor, args=(rotary, cos_bf16))
-    negated = graph.call_function(torch.ops.aten.neg.default, args=(second,))
-    rotated = graph.call_function(torch.ops.aten.cat.default, args=([negated, first], -1))
-    sin_bf16 = graph.call_function(
-        torch.ops.prims.convert_element_type.default,
-        args=(sin, torch.bfloat16),
-    )
-    sin_bf16 = graph.call_function(torch.ops.aten.unsqueeze.default, args=(sin_bf16, 0))
-    sin_bf16 = graph.call_function(torch.ops.aten.unsqueeze.default, args=(sin_bf16, 2))
-    rotated = graph.call_function(torch.ops.aten.mul.Tensor, args=(rotated, sin_bf16))
-    rotary_output = graph.call_function(torch.ops.aten.add.Tensor, args=(direct, rotated))
-    passthrough = graph.call_function(
-        torch.ops.aten.slice.Tensor,
-        args=(rounded, 3, 96, torch.iinfo(torch.int64).max),
-    )
-    return graph.call_function(
-        torch.ops.aten.cat.default,
-        args=([rotary_output, passthrough], -1),
-    )
-
-
-def _semantic_attention_graph(
-    *,
-    dynamic: bool,
-    output_dynamic: bool | None = None,
-    escape_attention: bool = False,
-    routing_mode: int = _MINMAX_ROUTING,
-    with_block_lengths: bool = False,
-    with_coarse: bool = False,
-    with_sparse_query_blocks: bool = False,
-    high_first: bool = False,
-    q_affine: bool = True,
-    k_affine: bool = True,
-) -> torch.fx.Graph:
-    graph = torch.fx.Graph()
-    with FakeTensorMode():
-        input = _placeholder(  # noqa: A001
-            graph,
-            "input",
-            torch.empty((1, 192, 256), device="cuda", dtype=torch.bfloat16),
-        )
-        activation_scales = tuple(
-            None
-            if dynamic
-            else _placeholder(
-                graph,
-                f"{prefix}_activation_scale",
-                torch.empty((), device="cuda", dtype=torch.float32),
-            )
-            for prefix in ("q", "k", "v")
-        )
-        projected = tuple(
-            _semantic_linear(
-                graph,
-                input,
-                prefix,
-                activation_scale,
-                dynamic=dynamic,
-                high_first=high_first,
-            )
-            for prefix, activation_scale in zip(("q", "k", "v"), activation_scales, strict=True)
-        )
-        q_norm = _placeholder(
-            graph,
-            "q_norm",
-            torch.empty(128, device="cuda", dtype=torch.bfloat16),
-        )
-        k_norm = _placeholder(
-            graph,
-            "k_norm",
-            torch.empty(128, device="cuda", dtype=torch.bfloat16),
-        )
-        cos = _placeholder(
-            graph,
-            "cos",
-            torch.empty((192, 96), device="cuda", dtype=torch.float32),
-        )
-        sin = _placeholder(
-            graph,
-            "sin",
-            torch.empty((192, 96), device="cuda", dtype=torch.float32),
-        )
-        query = _normalized_rope(graph, projected[0], q_norm if q_affine else None, cos, sin)
-        key = _normalized_rope(graph, projected[1], k_norm if k_affine else None, cos, sin)
-        value = graph.call_function(
-            torch.ops.aten.reshape.default,
-            args=(projected[2], (1, 192, 2, 128)),
-        )
-        block_lengths = (
-            _placeholder(
-                graph,
-                "block_lengths",
-                torch.empty(3, device="cuda", dtype=torch.int32),
-            )
-            if with_block_lengths
-            else None
-        )
-        optional_attention_arguments = (
-            (block_lengths, 2)
-            if with_sparse_query_blocks
-            else ((block_lengths,) if with_block_lengths else ())
-        )
-        output = graph.call_function(
-            torch.ops.piper_kernels.sparse_piper_attention.default,
-            args=(
-                query,
-                key,
-                value,
-                _profile_placeholder(graph),
-                2,
-                128**-0.5,
-                routing_mode,
-                *optional_attention_arguments,
-            ),
-        )
-        output.meta["val"] = torch.empty(
-            (1, 192, 2, 128),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        if with_coarse:
-            coarse_gate = _placeholder(
-                graph,
-                "coarse_gate",
-                torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
-            )
-            coarse_output = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
-                args=(
-                    query,
-                    key,
-                    value,
-                    coarse_gate,
-                    3,
-                    0.125,
-                    routing_mode,
-                    *((block_lengths,) if with_block_lengths else ()),
-                ),
-            )
-            output = graph.call_function(
-                torch.ops.aten.add.Tensor,
-                args=(output, coarse_output),
-            )
-            output.meta["val"] = torch.empty(
-                (1, 192, 2, 128),
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-        attention_output = output
-        if output_dynamic is not None:
-            reshaped_output = graph.call_function(
-                torch.ops.aten.reshape.default,
-                args=(output, (1, 192, 256)),
-            )
-            reshaped_output.meta["val"] = torch.empty(
-                (1, 192, 256),
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            output_activation_scale = (
-                None
-                if output_dynamic
-                else _placeholder(
-                    graph,
-                    "output_activation_scale",
-                    torch.empty((), device="cuda", dtype=torch.float32),
-                )
-            )
-            output = _semantic_linear(
-                graph,
-                reshaped_output,
-                "output",
-                output_activation_scale,
-                dynamic=output_dynamic,
-                output_features=320,
-                high_first=high_first,
-            )
-        graph.output((output, attention_output) if escape_attention else output)
-    torch.fx.GraphModule({}, graph)
-    return graph
-
-
-def _quantized_attention_output_graph(
-    *,
-    with_block_lengths: bool,
-    with_coarse: bool,
-    with_sparse_query_blocks: bool,
-    high_first: bool = False,
-) -> torch.fx.Graph:
-    """Build an already-prepared attention boundary for output-only folding."""
-    graph = torch.fx.Graph()
-    with FakeTensorMode():
-        tensors = {
-            "query": torch.empty((1, 2, 192, 128), device="cuda", dtype=torch.int8),
-            "query_scale": torch.empty((1, 2, 6), device="cuda", dtype=torch.float32),
-            "query_summary": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
-            "key": torch.empty((1, 2, 192, 128), device="cuda", dtype=torch.int8),
-            "key_scale": torch.empty((1, 2, 3), device="cuda", dtype=torch.float32),
-            "key_summary": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
-            "key_aux": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
-            "value": torch.empty((1, 2, 128, 192), device="cuda", dtype=torch.int8),
-            "value_scale": torch.empty((1, 2, 3, 1), device="cuda", dtype=torch.float32),
-            "value_mean": torch.empty((1, 2, 128), device="cuda", dtype=torch.float32),
-        }
-        operands = tuple(_placeholder(graph, name, value) for name, value in tensors.items())
-        block_lengths = (
-            _placeholder(
-                graph,
-                "block_lengths",
-                torch.empty(3, device="cuda", dtype=torch.int32),
-            )
-            if with_block_lengths
-            else None
-        )
-        if with_coarse:
-            block_mean = _placeholder(
-                graph,
-                "block_mean",
-                torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
-            )
-            coarse_gate = _placeholder(
-                graph,
-                "coarse_gate",
-                torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
-            )
-            attention = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
-                args=(
-                    *operands,
-                    block_mean,
-                    coarse_gate,
-                    [5_000, 10_000],
-                    2,
-                    192,
-                    _MINMAX_ROUTING,
-                    0.125,
-                    block_lengths,
-                    3,
-                    *((2,) if with_sparse_query_blocks else ()),
-                ),
-            )
-        else:
-            arguments = (*operands, [5_000, 10_000], 2, 192, _MINMAX_ROUTING)
-            optional_arguments = (
-                (block_lengths, 2)
-                if with_sparse_query_blocks
-                else ((block_lengths,) if with_block_lengths else ())
-            )
-            attention = graph.call_function(
-                torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
-                args=(*arguments, *optional_arguments),
-            )
-        attention.meta["val"] = torch.empty(
-            (1, 192, 2, 128),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        reshaped = graph.call_function(
-            torch.ops.aten.reshape.default,
-            args=(attention, (1, 192, 256)),
-        )
-        reshaped.meta["val"] = torch.empty(
-            (1, 192, 256),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        activation_scale = _placeholder(
-            graph,
-            "output_activation_scale",
-            torch.empty((), device="cuda", dtype=torch.float32),
-        )
-        output = _semantic_linear(
-            graph,
-            reshaped,
-            "output",
-            activation_scale,
-            dynamic=False,
-            output_features=320,
-            high_first=high_first,
-        )
-        graph.output(output)
-    torch.fx.GraphModule({}, graph)
-    return graph
 
 
 class _SparseProjectionAttention(torch.nn.Module):
@@ -553,7 +162,12 @@ class _SparseProjectionAttention(torch.nn.Module):
         rotary = rotary * cos + rotated * sin
         return torch.cat((rotary, normalized[..., self.rotary_dim :]), dim=-1).contiguous()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         query = self._norm_rope(self.query(hidden_states), self.query_norm)
         key = self._norm_rope(self.key(hidden_states), self.key_norm)
         value = self.value(hidden_states).view(
@@ -567,6 +181,8 @@ class _SparseProjectionAttention(torch.nn.Module):
             key,
             value,
             sparse_key_blocks=self.sparse_key_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
 
 
@@ -616,8 +232,13 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
             requires_grad=False,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        attention = super().forward(hidden_states)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attention = super().forward(hidden_states, force_tile_ids, force_tile_counts)
         return self.output(attention.flatten(2))
 
 
@@ -746,6 +367,8 @@ def _run_explicit_attention_output(
     coarse_gate: torch.Tensor | None = None,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_input = _prepare_nvfp4_input(hidden_states, model.query.weight)
     k_input = _prepare_nvfp4_input(hidden_states, model.key.weight)
@@ -812,6 +435,8 @@ def _run_explicit_attention_output(
             model.sparse_attention._routing_mode,
             *optional_arguments,
             output_dtype=hidden_states.dtype,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
     else:
         assert isinstance(model, _BoundedSparseProjectionAttentionOutput)
@@ -831,6 +456,8 @@ def _run_explicit_attention_output(
             model.coarse_key_blocks,
             sparse_query_blocks,
             output_dtype=hidden_states.dtype,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
     output_weight = model.output.weight
     assert isinstance(output_weight, PiperNVFP4Tensor)
@@ -887,7 +514,7 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     preparation_count: int,
     routing_mode: int,
 ) -> None:
-    graph = _semantic_attention_graph(
+    graph = build_attention_graph(
         dynamic=dynamic, routing_mode=routing_mode, q_affine=q_affine, k_affine=k_affine
     )
     monkeypatch.setattr(
@@ -928,7 +555,7 @@ def test_projection_fold_supports_every_bounded_attention_variant(
     with_coarse: bool,
     with_sparse_query_blocks: bool,
 ) -> None:
-    graph = _semantic_attention_graph(
+    graph = build_attention_graph(
         dynamic=False,
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
@@ -973,7 +600,7 @@ def test_static_output_fuses_after_prepared_sparse_projection(
     routing_mode: int,
     with_sparse_query_blocks: bool,
 ) -> None:
-    graph = _semantic_attention_graph(
+    graph = build_attention_graph(
         dynamic=dynamic,
         output_dynamic=False,
         routing_mode=routing_mode,
@@ -1012,7 +639,7 @@ def test_output_fold_supports_every_bounded_attention_variant(
     with_coarse: bool,
     with_sparse_query_blocks: bool,
 ) -> None:
-    graph = _quantized_attention_output_graph(
+    graph = build_quantized_attention_output_graph(
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
         with_sparse_query_blocks=with_sparse_query_blocks,
@@ -1039,7 +666,7 @@ def test_output_fold_supports_every_bounded_attention_variant(
 def test_high_first_output_fold_preserves_order_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _quantized_attention_output_graph(
+    graph = build_quantized_attention_output_graph(
         with_block_lengths=False,
         with_coarse=False,
         with_sparse_query_blocks=False,
@@ -1066,7 +693,7 @@ def test_high_first_output_fold_preserves_order_metadata(
 def test_dynamic_output_fuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _semantic_attention_graph(dynamic=False, output_dynamic=True)
+    graph = build_attention_graph(dynamic=False, output_dynamic=True)
     monkeypatch.setattr(
         AcceleratorTarget,
         "from_device",
@@ -1091,7 +718,7 @@ def test_dynamic_output_fuses(
 def test_static_output_fails_closed_when_attention_escapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _semantic_attention_graph(
+    graph = build_attention_graph(
         dynamic=False,
         output_dynamic=False,
         escape_attention=True,
@@ -1447,3 +1074,54 @@ def test_cuda_compile_fails_closed_for_batch_two() -> None:
 
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets
     assert capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention.default) == 1
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("output", [False, True])
+def test_forced_inputs_survive_projection_and_output_fusion(
+    monkeypatch: pytest.MonkeyPatch, rotated: bool, bounded: bool, output: bool
+) -> None:
+    graph = (build_convrot_attention_graph if rotated else build_attention_graph)(
+        dynamic=True,
+        output_dynamic=False if output else None,
+        with_block_lengths=bounded,
+        with_coarse=bounded,
+        with_sparse_query_blocks=bounded,
+        with_force_tiles=True,
+    )
+    ids = next(node for node in graph.nodes if node.target == "force_tile_ids")
+    counts = next(node for node in graph.nodes if node.target == "force_tile_counts")
+    if rotated:
+        run_convrot_passes(graph, monkeypatch)
+    else:
+        monkeypatch.setattr(
+            AcceleratorTarget,
+            "from_device",
+            classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+        )
+        nvfp4_compile_pass(graph, is_inference=True)
+        compile_pass(graph, is_inference=True)
+    if output:
+        prefix = "convrot_nvfp4" if rotated else "nvfp4"
+        target = getattr(
+            torch.ops.piper_kernels, f"{prefix}_sparse_piper_projected_query_attention_output"
+        ).default
+    else:
+        target = (
+            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
+            if bounded
+            else torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
+        )
+    calls = [node for node in graph.nodes if node.target == target]
+    assert len(calls) == 1
+    if output:
+        assert calls[0].kwargs["force_tile_ids"] is ids
+        assert calls[0].kwargs["force_tile_counts"] is counts
+    else:
+        assert calls[0].args[-2:] == (ids, counts)
+    assert all(
+        node.target != torch.ops.piper_kernels.sparse_piper_attention.default
+        for node in graph.nodes
+    )
+    graph.lint()

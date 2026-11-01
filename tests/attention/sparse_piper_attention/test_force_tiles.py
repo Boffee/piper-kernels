@@ -79,8 +79,9 @@ def test_forced_routes_keep_exact_budget_and_scores(device, ties, num_key_blocks
         query_blocks=6,
         sparse_key_blocks=num_key_blocks,
         device=device,
-        force_tile_ids=ids.to(device),
-        force_tile_counts=counts.to(device),
+        force_tile_mask=_backend.build_force_tile_bitmask(
+            ids.to(device), counts.to(device), num_key_blocks
+        ),
     )
     actual_scores = scores.to(device)
     for start, stop in ((0, 2), (2, 6)):
@@ -103,8 +104,7 @@ def test_forced_routes_leave_coarse_attention_unchanged(device):
         query_blocks=4,
         sparse_key_blocks=8,
         device=device,
-        force_tile_ids=ids,
-        force_tile_counts=counts,
+        force_tile_mask=_backend.build_force_tile_bitmask(ids, counts, 8),
     )
     builder.write(scores, query_block_offset=0)
     result = builder.finish()
@@ -226,8 +226,7 @@ def test_graph_replay_reads_mutated_forced_ids_and_counts():
             query_blocks=4,
             sparse_key_blocks=65,
             device=device,
-            force_tile_ids=ids,
-            force_tile_counts=counts,
+            force_tile_mask=_backend.build_force_tile_bitmask(ids, counts, 65),
         )
         builder.write(scores, query_block_offset=0)
         return builder.routes.indices

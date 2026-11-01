@@ -6,11 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 from . import _backend
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
 from ._dtype import validate_output_dtype
+from ._force_tiles import validate_force_tiles
 from ._interfaces import LaunchAttention
 from ._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -39,6 +41,7 @@ class _PreparedQuantizedSparsePiperContext:
     launch: LaunchAttention
     pooled_value: torch.Tensor | None = None
     coarse_scale: float | None = None
+    force_tile_mask: torch.Tensor | None = None
 
     @property
     def kernel_context(self) -> _PreparedSparsePiperContext:
@@ -62,8 +65,15 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    *,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> _PreparedQuantizedSparsePiperContext:
-    """Prepare global K/V and routing state without requiring materialized Q."""
+    """Prepare global K/V and routing state without requiring materialized Q.
+
+    Forced IDs/counts follow SparsePiperAttention.forward and cover every global
+    query block. Build their membership once here; Q windows take row views.
+    """
     backend = _backend.require_attention_backend(key)
     layout = _resolve_route_layout(
         ratio_profile.units,
@@ -104,6 +114,18 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
     )
+    validate_force_tiles(
+        force_tile_ids,
+        force_tile_counts,
+        query_blocks=key.shape[2] // TILE_ROWS,
+        device=key.device,
+    )
+    force_tile_mask = None
+    if force_tile_ids is not None and not layout.keeps_all_blocks(sparse_key_blocks):
+        assert force_tile_counts is not None
+        force_tile_mask = _backend.build_force_tile_bitmask(
+            force_tile_ids, force_tile_counts, sparse_key_blocks
+        )
     return _PreparedQuantizedSparsePiperContext(
         route_layout=layout,
         key_summary=key_summary[:, :, :route_key_blocks],
@@ -111,6 +133,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         routing_mode=routing_mode,
         launch=backend.bind_context(kernel_context),
         pooled_value=pooled_value,
+        force_tile_mask=force_tile_mask,
         coarse_scale=coarse_scale,
     )
 
@@ -124,6 +147,11 @@ def _prepare_quantized_sparse_piper_query(
     global_block_offset: int,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor | None]:
     """Route and prepare one compact Q chunk against global K/V state."""
+    force_tile_mask = context.force_tile_mask
+    if force_tile_mask is not None:
+        force_tile_mask = force_tile_mask[
+            global_block_offset : global_block_offset + query_summary.shape[2]
+        ]
     if context.pooled_value is None:
         routed = packed_routes_from_summaries(
             query_summary,
@@ -132,6 +160,7 @@ def _prepare_quantized_sparse_piper_query(
             context.route_layout,
             context.routing_mode,
             skip_dense_routing=context.kernel_context.routes_per_query == 0,
+            force_tile_mask=force_tile_mask,
         )
         coarse_output = None
     else:
@@ -146,6 +175,7 @@ def _prepare_quantized_sparse_piper_query(
             coarse_scale=context.coarse_scale,
             routing_mode=context.routing_mode,
             skip_dense_routing=context.kernel_context.routes_per_query == 0,
+            force_tile_mask=force_tile_mask,
         )
         routed = routed_with_coarse.routes
         coarse_output = routed_with_coarse.coarse_output
@@ -181,6 +211,9 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    *,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> _PreparedSparsePiperAttention:
     """Build validated shared launch state for quantized sparse Piper."""
     context = _prepare_quantized_sparse_piper_context(
@@ -197,6 +230,8 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         routing_mode,
         block_lengths,
         sparse_query_blocks=sparse_query_blocks,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     return _prepare_quantized_sparse_piper_query(
         context,
@@ -227,6 +262,9 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     block_lengths: torch.Tensor | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    *,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor]:
     """Prepare fine routes and a potentially wider coarse K/V prefix."""
     context = _prepare_quantized_sparse_piper_context(
@@ -246,6 +284,8 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     prepared, coarse_output = _prepare_quantized_sparse_piper_query(
         context,
@@ -267,25 +307,41 @@ def _quantized_attention_output_sequence_length(
     return query.shape[2] if block_lengths is not None else logical_sequence_length
 
 
-def _new_quantized_attention_output(
-    query: torch.Tensor,
+def validate_quantized_attention_output(
+    attention_storage: torch.Tensor,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None,
     *,
-    output_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
+    output_dtype: torch.dtype,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
+) -> int:
+    """Validate output dtype and forced-route metadata, returning the output rows.
+
+    Fake quantized and projected-output boundaries share these metadata checks.
+    Runtime contexts validate forced inputs when preparing global routing state.
+    """
     validate_output_dtype(output_dtype)
+    sequence_length = _quantized_attention_output_sequence_length(
+        attention_storage, logical_sequence_length, block_lengths
+    )
+    validate_force_tiles(
+        force_tile_ids,
+        force_tile_counts,
+        query_blocks=(sequence_length + TILE_ROWS - 1) // TILE_ROWS,
+        device=attention_storage.device,
+    )
+    return sequence_length
+
+
+def _new_quantized_attention_output(
+    query: torch.Tensor,
+    sequence_length: int,
+    *,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
     return query.new_empty(
-        (
-            query.shape[0],
-            _quantized_attention_output_sequence_length(
-                query,
-                logical_sequence_length,
-                block_lengths,
-            ),
-            query.shape[1],
-            query.shape[3],
-        ),
+        (query.shape[0], sequence_length, query.shape[1], query.shape[3]),
         dtype=output_dtype,
     )
 
@@ -332,6 +388,8 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -345,12 +403,11 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     and must be removed by the caller's layout gather. ``sparse_query_blocks``
     optionally limits route use to the leading query blocks; the suffix is dense.
     """
-    output = _new_quantized_attention_output(
-        query,
-        logical_sequence_length,
-        block_lengths,
-        output_dtype=output_dtype,
+    validate_output_dtype(output_dtype)
+    sequence_length = _quantized_attention_output_sequence_length(
+        query, logical_sequence_length, block_lengths
     )
+    output = _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
     prepared = _prepare_quantized_sparse_piper_attention(
         query,
         query_scale,
@@ -368,6 +425,8 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         routing_mode,
         block_lengths,
         sparse_query_blocks,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     _launch_quantized_sparse_piper_attention(prepared, output.transpose(1, 2))
     return output
@@ -399,16 +458,17 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     block_lengths: torch.Tensor | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Run quantized sparse attention plus a gated, independently scoped residual."""
-    output = _new_quantized_attention_output(
-        query,
-        logical_sequence_length,
-        block_lengths,
-        output_dtype=output_dtype,
+    validate_output_dtype(output_dtype)
+    sequence_length = _quantized_attention_output_sequence_length(
+        query, logical_sequence_length, block_lengths
     )
+    output = _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
     prepared, coarse_output = _prepare_quantized_sparse_piper_attention_with_coarse(
         query,
         query_scale,
@@ -429,6 +489,8 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         block_lengths,
         coarse_key_blocks,
         sparse_query_blocks,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     _launch_quantized_sparse_piper_attention(
         prepared,
@@ -457,15 +519,20 @@ def _sparse_piper_attention_from_quantized_op_fake(
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
     _sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    return _new_quantized_attention_output(
+    sequence_length = validate_quantized_attention_output(
         query,
         logical_sequence_length,
         _block_lengths,
         output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
+    return _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
 
 
 @_sparse_piper_attention_with_coarse_residual_from_quantized_op.register_fake
@@ -490,12 +557,17 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     _block_lengths: torch.Tensor | None = None,
     _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    return _new_quantized_attention_output(
+    sequence_length = validate_quantized_attention_output(
         query,
         logical_sequence_length,
         _block_lengths,
         output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
+    return _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)

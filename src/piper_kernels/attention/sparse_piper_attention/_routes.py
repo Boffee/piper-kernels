@@ -8,7 +8,6 @@ import torch
 
 from . import _backend
 from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
-from ._force_tiles import validate_force_tiles
 from .coarse import coarse_attention
 
 
@@ -30,7 +29,12 @@ class PackedRoutesAndCoarseOutput:
 
 
 class PackedRouteBuilder:
-    """Build packed routes while resolving shared layout state only once."""
+    """Build packed routes while resolving shared layout state only once.
+
+    Optional membership is a prebuilt contiguous INT32 bitset for this query
+    window: [query_blocks, ceil(sparse_key_blocks / 32)]. Its invocation owner
+    validates the caller's IDs/counts and shares the bitset across windows.
+    """
 
     def __init__(
         self,
@@ -42,13 +46,9 @@ class PackedRouteBuilder:
         sparse_key_blocks: int,
         device: torch.device,
         skip_dense_routing: bool = False,
-        force_tile_ids: torch.Tensor | None = None,
-        force_tile_counts: torch.Tensor | None = None,
+        force_tile_mask: torch.Tensor | None = None,
     ) -> None:
         _validate_route_layout(layout, heads, sparse_key_blocks, device)
-        validate_force_tiles(
-            force_tile_ids, force_tile_counts, query_blocks=query_blocks, device=device
-        )
         self._layout = layout
         self._full_keep = layout.keeps_all_blocks(sparse_key_blocks)
         skip_dense_routing = self._full_keep and skip_dense_routing
@@ -66,12 +66,7 @@ class PackedRouteBuilder:
                 _backend.fill_full_keep_routes(self.routes.indices, sparse_key_blocks)
             return
         self._select_routes = _backend.select_route_selector(self.routes.indices)
-        self._force_tile_mask = None
-        if force_tile_ids is not None:
-            assert force_tile_counts is not None
-            self._force_tile_mask = _backend.build_force_tile_bitmask(
-                force_tile_ids, force_tile_counts, sparse_key_blocks
-            )
+        self._force_tile_mask = force_tile_mask
         self._route_head_offsets = (
             None
             if self._select_routes is not None
@@ -128,8 +123,7 @@ class PackedRouteAndCoarseBuilder:
         sparse_key_blocks: int,
         device: torch.device,
         skip_dense_routing: bool = False,
-        force_tile_ids: torch.Tensor | None = None,
-        force_tile_counts: torch.Tensor | None = None,
+        force_tile_mask: torch.Tensor | None = None,
     ) -> None:
         if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
             raise ValueError("pooled V must use [batch,heads,key blocks,features]")
@@ -150,8 +144,7 @@ class PackedRouteAndCoarseBuilder:
             sparse_key_blocks=sparse_key_blocks,
             device=device,
             skip_dense_routing=skip_dense_routing,
-            force_tile_ids=force_tile_ids,
-            force_tile_counts=force_tile_counts,
+            force_tile_mask=force_tile_mask,
         )
         self._pooled_value = pooled_value
         self._sparse_key_blocks = sparse_key_blocks

@@ -9,7 +9,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
-from . import _interfaces, _launch, _plan, _prepared
+from . import _force_tiles, _interfaces, _launch, _plan, _prepared
 from ._amd import policy as amd_policy
 from ._dtype import SUPPORTED_DTYPES
 from ._force_tiles import build_portable_force_tile_bitmask
@@ -152,6 +152,7 @@ def source_files() -> tuple[str, ...]:
         __file__,
         _plan.__file__,
         _interfaces.__file__,
+        _force_tiles.__file__,
         _prepared.__file__,
         _launch.__file__,
         layout.__file__,
@@ -162,7 +163,7 @@ def source_files() -> tuple[str, ...]:
         from ._amd import _parameters  # noqa: PLC0415
 
         paths.extend((amd_gluon.__file__, _parameters.__file__))
-    for implementation in (preparation, nvidia_tma_gluon, nvidia_async_copy_gluon):
+    for implementation in (preparation, nvidia_tma_gluon, nvidia_async_copy_gluon, _route_backend):
         if implementation is not None:
             paths.append(implementation.__file__)
     if nvidia_fragments is not None:

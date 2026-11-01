@@ -236,6 +236,8 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     sparse_routing_mode: int,
     sparse_block_lengths: torch.fx.Node | None = None,
     sparse_query_blocks: Argument | None = None,
+    sparse_force_tile_ids: torch.fx.Node | None = None,
+    sparse_force_tile_counts: torch.fx.Node | None = None,
     coarse_gate: torch.fx.Node | None = None,
     coarse_key_blocks: Argument | None = None,
     coarse_scale: float | None = None,
@@ -393,6 +395,8 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             routing_mode=sparse_routing_mode,
             block_lengths=sparse_block_lengths,
             sparse_query_blocks=sparse_query_blocks,
+            force_tile_ids=sparse_force_tile_ids,
+            force_tile_counts=sparse_force_tile_counts,
             block_mean=value_nodes[2] if with_coarse_residual else None,
             coarse_gate=coarse_gate,
             coarse_scale=coarse_scale,
@@ -413,7 +417,8 @@ for _activation_dtype in SUPPORTED_DTYPES:
         _with_coarse,
         _with_block_lengths,
         _with_sparse_query_blocks,
-    ) in product((True, False), repeat=5):
+        _with_force_tiles,
+    ) in product((True, False), repeat=6):
         register_graph_pattern(
             sparse_piper_pattern.sparse_piper_projection_pattern(
                 _linear_pattern,
@@ -423,6 +428,7 @@ for _activation_dtype in SUPPORTED_DTYPES:
                 with_block_lengths=_with_block_lengths,
                 with_coarse=_with_coarse,
                 with_sparse_query_blocks=_with_sparse_query_blocks,
+                with_force_tiles=_with_force_tiles,
             ),
             extra_check=_valid_coarse_projection if _with_coarse else _valid_projection,
             pass_dict=_patterns,  # pyright: ignore[reportArgumentType]

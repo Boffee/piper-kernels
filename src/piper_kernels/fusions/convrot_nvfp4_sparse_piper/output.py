@@ -90,6 +90,8 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_weight_per_tensor_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -147,6 +149,8 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         gate_projection,
         output_dtype=output_dtype,
         dynamic_activation_scale=dynamic_activation_scale,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
@@ -195,6 +199,8 @@ def _projected_query_attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_weight_per_tensor_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -208,12 +214,16 @@ def _projected_query_attention_output_op_fake(
             f"ConvRot NVFP4 projection input features {input_features} must be divisible "
             f"by group size {group_size}"
         )
-    return output_common.new_projected_output(
+    sequence_length = output_common.validate_output_metadata(
         key,
         logical_sequence_length,
         block_lengths,
-        weight_qdata.shape[0],
         output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    return output_common.new_projected_output(
+        key, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
     )
 
 
@@ -257,6 +267,8 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_weight_per_tensor_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -305,6 +317,8 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         gate_projection,
         output_dtype=output_dtype,
         dynamic_activation_scale=dynamic_activation_scale,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
@@ -344,6 +358,8 @@ def _attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_weight_per_tensor_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -357,12 +373,16 @@ def _attention_output_op_fake(
             f"ConvRot NVFP4 projection input features {input_features} must be divisible "
             f"by group size {group_size}"
         )
-    return output_common.new_projected_output(
+    sequence_length = output_common.validate_output_metadata(
         query,
         logical_sequence_length,
         block_lengths,
-        weight_qdata.shape[0],
         output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    return output_common.new_projected_output(
+        query, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
     )
 
 
