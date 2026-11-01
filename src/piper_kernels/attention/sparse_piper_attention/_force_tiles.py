@@ -30,7 +30,7 @@ def validate_force_tiles(
         raise ValueError("forced tile IDs and counts must use contiguous strided storage")
 
 
-def portable_force_tile_bitmask(
+def build_portable_force_tile_bitmask(
     ids: torch.Tensor, counts: torch.Tensor, sparse_key_blocks: int
 ) -> torch.Tensor:
     """Pack unique active IDs into 32-bit words without reading them on the host."""

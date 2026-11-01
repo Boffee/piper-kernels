@@ -56,15 +56,18 @@ def _oracle(scores, ids, counts, budgets):
 
 
 @pytest.mark.parametrize("ties", [False, True])
-def test_forced_routes_keep_exact_budget_and_scores(device, ties):
-    budgets = [3, 17, 65]
+@pytest.mark.parametrize("num_key_blocks", [65, 513])
+def test_forced_routes_keep_exact_budget_and_scores(device, ties, num_key_blocks):
+    budgets = [3, 17, num_key_blocks]
     scores = torch.randint(
-        -5, 6, (2, 3, 6, 65), generator=torch.Generator().manual_seed(83)
+        -5, 6, (2, 3, 6, num_key_blocks), generator=torch.Generator().manual_seed(83)
     ).float()
     if ties:
         scores.zero_()
+    # Cover both membership-word boundaries and the selector's 512-key tile boundary.
+    last_key = num_key_blocks - 1
     ids = torch.tensor(
-        [[64, 31, 32, -999], [32, 0, 64, -999], [31, 32, 64, -999]] * 2,
+        [[last_key, 31, 32, -999], [32, 0, last_key, -999], [31, 32, last_key, -999]] * 2,
         dtype=torch.int32,
     )
     counts = torch.tensor([0, 1, 3, 2, 3, 0], dtype=torch.int32)
@@ -74,7 +77,7 @@ def test_forced_routes_keep_exact_budget_and_scores(device, ties):
         batch=2,
         heads=3,
         query_blocks=6,
-        sparse_key_blocks=65,
+        sparse_key_blocks=num_key_blocks,
         device=device,
         force_tile_ids=ids.to(device),
         force_tile_counts=counts.to(device),

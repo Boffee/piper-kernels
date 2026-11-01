@@ -93,22 +93,13 @@ class PackedRouteBuilder:
         if self._full_keep:
             return
         if self._select_routes is not None:
-            if self._force_tile_mask is not None:
-                self._select_routes(
-                    scores,
-                    self.routes.indices,
-                    self._layout.head_keep_blocks,
-                    self._layout.route_head_offsets,
-                    query_block_offset=query_block_offset,
-                    force_tile_mask=self._force_tile_mask,
-                )
-                return
             self._select_routes(
                 scores,
                 self.routes.indices,
                 self._layout.head_keep_blocks,
                 self._layout.route_head_offsets,
                 query_block_offset=query_block_offset,
+                force_tile_mask=self._force_tile_mask,
             )
             return
         assert self._route_head_offsets is not None

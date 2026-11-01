@@ -12,7 +12,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_D
 from . import _interfaces, _launch, _plan, _prepared
 from ._amd import policy as amd_policy
 from ._dtype import SUPPORTED_DTYPES
-from ._force_tiles import portable_force_tile_bitmask
+from ._force_tiles import build_portable_force_tile_bitmask
 from ._interfaces import (
     AttentionBackend,
     MinmaxScores,
@@ -289,4 +289,4 @@ def build_force_tile_bitmask(
     """Build call-local membership once, then share it across heads and score chunks."""
     if _route_backend is not None and select_route_selector(ids) is not None:
         return _route_backend.build_force_tile_bitmask(ids, counts, sparse_key_blocks)
-    return portable_force_tile_bitmask(ids, counts, sparse_key_blocks)
+    return build_portable_force_tile_bitmask(ids, counts, sparse_key_blocks)
