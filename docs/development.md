@@ -225,6 +225,11 @@ uses their default locations or honors `TRITON_CACHE_DIR` and
 `TORCHINDUCTOR_CACHE_DIR` from the environment. The suite does not create a
 separate cache or clear compiled artifacts on exit, so later runs can reuse them.
 
+Linux CI persists both compiler caches between runs. It restores caches for the
+same platform and dependency lockfile, and the compilers invalidate entries when
+their inputs change. Every test still runs on a cache hit; `--durations=20` in
+the CI log reports the remaining slow cases.
+
 Configure cache directories on a local filesystem that supports executable
 mappings (DLL loading on Windows), with enough free space and access restricted
 to the current user. These caches contain native code that the test process
