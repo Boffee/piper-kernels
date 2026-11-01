@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-10-31
+
 ### Added
 
 - Experimental caller-forced tiles in `SparsePiperAttention`, included within
