@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 30
     env:
       CUDA_VISIBLE_DEVICES: ""
+      TRITON_CACHE_DIR: ${{ github.workspace }}/artifacts/triton-cache
+      TORCHINDUCTOR_CACHE_DIR: ${{ github.workspace }}/artifacts/torchinductor-cache
 
     steps:
       - name: Check out repository
@@ -46,8 +48,20 @@ jobs:
       - name: Type check
         run: uv run pyright
 
+      - name: Cache compiled kernels
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.TRITON_CACHE_DIR }}
+            ${{ env.TORCHINDUCTOR_CACHE_DIR }}
+          # Each source revision can save new entries. The compilers' own cache
+          # keys invalidate changed kernels when restoring an earlier snapshot.
+          key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-py313-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py', 'benchmarks/**/*.py', 'pyproject.toml') }}
+          restore-keys: |
+            compiler-v1-${{ runner.os }}-${{ runner.arch }}-py313-${{ hashFiles('uv.lock') }}-
+
       - name: Test portable backends
-        run: uv run pytest
+        run: uv run pytest --durations=20
 
       - name: Build distributions without local sources
         run: uv build --no-sources
