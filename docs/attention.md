@@ -122,13 +122,14 @@ physical keep budget. These are caller preconditions, with metadata-only validat
 Supply rows for every physical query block; dense query suffixes already include
 every key and ignore route selection. Unused ID slots are ignored.
 
-IDs and counts can change as tensor contents without recompiling; zero counts
-disable forcing without changing the compiled call. Graph replay uses updated
-contents in the captured input buffers. The prototype builds a compact membership
-bitset once per call and leaves routing scores, attention arithmetic, and route
-capacity unchanged. It uses a separate custom operator: existing projection/output
-fusion rewrites do not match forced calls yet. Calls without forced inputs retain
-their existing compiler boundary and fusions.
+ID and count contents can change at fixed tensor shapes without recompiling; zero
+counts disable forcing without changing the compiled call. Explicit graph replay
+with a fixed ratio profile uses updated contents in the captured input buffers.
+The prototype builds a compact membership bitset once per call and leaves routing
+scores, attention arithmetic, and route capacity unchanged. It uses a separate
+custom operator: existing projection/output fusion rewrites do not match forced
+calls yet. Calls without forced inputs retain their existing compiler boundary
+and fusions.
 
 ### Coarse residual
 

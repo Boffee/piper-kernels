@@ -91,8 +91,9 @@ class SparsePiperAttention(torch.nn.Module):
         The active count must fit every head's resolved keep budget. These value
         requirements are caller preconditions, not runtime tensor-content checks.
         Forced tiles consume the existing budget; the remainder is selected by
-        score. IDs/counts may change without recompiling. This prototype uses a
-        separate compiler boundary and does not enable projection/output fusions.
+        score. ID/count contents may change at fixed shapes without recompiling.
+        This prototype uses a separate compiler boundary and does not enable
+        projection/output fusions.
         """
         converted_scale = _validate_inputs(
             query,
@@ -118,7 +119,7 @@ class SparsePiperAttention(torch.nn.Module):
                 value,
                 force_tile_ids,
                 force_tile_counts,
-                list(self._head_keep_ratio_units),
+                self._ratio_profile,
                 sparse_key_blocks,
                 converted_scale,
                 self._routing_mode,
@@ -383,21 +384,25 @@ def _sparse_piper_attention_op_fake(
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
-@torch.library.custom_op("piper_kernels::sparse_piper_attention_forced", mutates_args=())
+@torch.library.custom_op(
+    "piper_kernels::sparse_piper_attention_forced",
+    mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
 def _sparse_piper_attention_forced_op(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     force_tile_ids: torch.Tensor,
     force_tile_counts: torch.Tensor,
-    head_keep_ratio_units: list[int],
+    ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
     scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
 ) -> torch.Tensor:
-    layout = _resolve_route_layout(tuple(head_keep_ratio_units), sparse_key_blocks, query.device)
+    layout = _resolve_route_layout(ratio_profile.units, sparse_key_blocks, query.device)
     return _run_sparse_piper_attention(
         query,
         key,
@@ -420,7 +425,7 @@ def _sparse_piper_attention_forced_op_fake(
     _value: torch.Tensor,
     _force_tile_ids: torch.Tensor,
     _force_tile_counts: torch.Tensor,
-    _head_keep_ratio_units: list[int],
+    _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     _scale: float,
     _routing_mode: int,

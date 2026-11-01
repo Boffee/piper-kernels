@@ -413,17 +413,28 @@ def test_operator_is_opaque_to_a_full_compile_graph(routing: str) -> None:
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def test_compiled_attention_reuses_ratio_profiles() -> None:
+@pytest.mark.parametrize("forced", [False, True])
+def test_compiled_attention_reuses_ratio_profiles(forced: bool) -> None:
     class Model(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.attention = SparsePiperAttention((0.5, 0.5))
 
-        def forward(self, query, key, value):
-            return self.attention(query, key, value, sparse_key_blocks=3, scale=128**-0.5)
+        def forward(self, query, key, value, **force_tiles):
+            return self.attention(
+                query, key, value, sparse_key_blocks=3, scale=128**-0.5, **force_tiles
+            )
 
     model = Model()
     operands = _inputs()
+    force_tiles = (
+        {
+            "force_tile_ids": torch.full((3, 1), 2, dtype=torch.int32),
+            "force_tile_counts": torch.ones(3, dtype=torch.int32),
+        }
+        if forced
+        else {}
+    )
     captures = []
 
     def capture(graph, _inputs):
@@ -436,23 +447,36 @@ def test_compiled_attention_reuses_ratio_profiles() -> None:
     with torch.no_grad():
         for ratio in ratios:
             model.attention = SparsePiperAttention((ratio, 1.0))
-            torch.testing.assert_close(compiled(*operands), model(*operands), atol=0, rtol=0)
+            torch.testing.assert_close(
+                compiled(*operands, **force_tiles), model(*operands, **force_tiles), atol=0, rtol=0
+            )
     assert len(captures) == 1
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
-def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile() -> None:
+@pytest.mark.parametrize("forced", [False, True])
+def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile(forced: bool) -> None:
     class Model(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.attention = SparsePiperAttention((0.125, 0.25))
 
-        def forward(self, query, key, value):
-            return self.attention(query, key, value, sparse_key_blocks=12, scale=128**-0.5)
+        def forward(self, query, key, value, **force_tiles):
+            return self.attention(
+                query, key, value, sparse_key_blocks=12, scale=128**-0.5, **force_tiles
+            )
 
     model = Model().eval()
     operands = _inputs("cuda", sequence_length=1024)
+    force_tiles = (
+        {
+            "force_tile_ids": torch.full((16, 1), 11, device="cuda", dtype=torch.int32),
+            "force_tile_counts": torch.ones(16, device="cuda", dtype=torch.int32),
+        }
+        if forced
+        else {}
+    )
     capture = TargetCapturePass()
     compiled = torch.compile(
         model,
@@ -465,6 +489,6 @@ def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile() -> None:
         for profile in profiles:
             model.attention = SparsePiperAttention(profile)
             torch.compiler.cudagraph_mark_step_begin()
-            actual = compiled(*operands).clone()
-            torch.testing.assert_close(actual, model(*operands), rtol=0, atol=0)
+            actual = compiled(*operands, **force_tiles).clone()
+            torch.testing.assert_close(actual, model(*operands, **force_tiles), rtol=0, atol=0)
     assert capture.calls == 1
