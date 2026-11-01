@@ -28,6 +28,7 @@ CoarseGateChunkProjector = output_pipeline.AuxiliaryChunkProjector
 type QueryChunkProjector = Callable[[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 output_sequence_length = _quantized_dispatch._quantized_attention_output_sequence_length
+validate_output_metadata = _quantized_dispatch.validate_quantized_attention_output
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,24 +52,14 @@ class _PreparedAttentionContext:
 
 def new_projected_output(
     attention_storage: torch.Tensor,
-    logical_sequence_length: int,
-    block_lengths: torch.Tensor | None,
+    sequence_length: int,
     output_features: int,
     *,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Allocate the projected compact or valid-front padded output shape."""
-    validate_output_dtype(output_dtype)
+    """Allocate the projected output after its boundary validates metadata."""
     return attention_storage.new_empty(
-        (
-            attention_storage.shape[0],
-            output_sequence_length(
-                attention_storage,
-                logical_sequence_length,
-                block_lengths,
-            ),
-            output_features,
-        ),
+        (attention_storage.shape[0], sequence_length, output_features),
         dtype=output_dtype,
     )
 
@@ -116,6 +107,8 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
     *,
     has_projected_coarse_gate: bool = False,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> _PreparedAttentionContext:
     """Prepare global K/V state for bounded, independently projected Q chunks."""
     if coarse_gate is not None and has_projected_coarse_gate:
@@ -140,6 +133,8 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     return _PreparedAttentionContext(
         quantized_context=quantized_context,
@@ -175,6 +170,8 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
     *,
     has_projected_coarse_gate: bool = False,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> _PreparedAttentionOutput:
     """Prepare fine routing and, when requested, one shared coarse result."""
     context = prepare_attention_context(
@@ -196,6 +193,8 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         has_projected_coarse_gate=has_projected_coarse_gate,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     prepared, coarse_output = _quantized_dispatch._prepare_quantized_sparse_piper_query(
         context.quantized_context,
@@ -378,4 +377,5 @@ __all__ = [
     "run_chunked_projected_query_attention_output",
     "source_files",
     "validate_attention_output",
+    "validate_output_metadata",
 ]

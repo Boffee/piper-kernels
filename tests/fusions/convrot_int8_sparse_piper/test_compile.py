@@ -200,6 +200,8 @@ class _SparseProjectionAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value = self._project_inputs(hidden_states)
         return self.sparse_attention(
@@ -209,6 +211,8 @@ class _SparseProjectionAttention(torch.nn.Module):
             sparse_key_blocks=self.sparse_key_blocks,
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
 
 
@@ -231,6 +235,8 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
         coarse_gate: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value = self._project_inputs(hidden_states)
         fine_output = self.sparse_attention(
@@ -240,6 +246,8 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
             sparse_key_blocks=self.sparse_key_blocks,
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
         coarse_output = sparse_piper_coarse_residual(
             query,
@@ -283,6 +291,8 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
         cos: torch.Tensor,
         sin: torch.Tensor,
         sparse_key_blocks: int,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, sequence, _features = hidden_states.shape
         query = self._dynamic_norm_rope(
@@ -303,6 +313,8 @@ class _DynamicSparseProjectionAttention(_SparseProjectionAttention):
             key,
             value,
             sparse_key_blocks=sparse_key_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
 
 
@@ -321,6 +333,8 @@ class _DynamicCoarseSparseProjectionAttention(_DynamicSparseProjectionAttention)
         sparse_key_blocks: int,
         coarse_gate: torch.Tensor,
         coarse_key_blocks: int | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, sequence, _features = hidden_states.shape
         query = self._dynamic_norm_rope(
@@ -341,6 +355,8 @@ class _DynamicCoarseSparseProjectionAttention(_DynamicSparseProjectionAttention)
             key,
             value,
             sparse_key_blocks=sparse_key_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
         coarse_output = sparse_piper_coarse_residual(
             query,
@@ -420,8 +436,16 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
         hidden_states: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        attention = super().forward(hidden_states, block_lengths, sparse_query_blocks)
+        attention = super().forward(
+            hidden_states,
+            block_lengths,
+            sparse_query_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
+        )
         projected = self.output(
             attention.reshape(
                 self.batch,
@@ -455,12 +479,16 @@ class _CoarseSparseProjectionAttentionOutput(_CoarseSparseProjectionAttention):
         coarse_gate: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attention = super().forward(
             hidden_states,
             coarse_gate,
             block_lengths,
             sparse_query_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
         return self.output(
             attention.reshape(
@@ -487,6 +515,8 @@ class _ProjectedGateCoarseSparseAttentionOutput(_CoarseSparseProjectionAttention
         hidden_states: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         coarse_gate = self.gate(hidden_states).reshape(
             self.batch,
@@ -500,6 +530,8 @@ class _ProjectedGateCoarseSparseAttentionOutput(_CoarseSparseProjectionAttention
             coarse_gate,
             block_lengths,
             sparse_query_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
         return self.output(attention.flatten(2))
 
@@ -521,8 +553,17 @@ class _DynamicSparseProjectionAttentionOutput(_DynamicSparseProjectionAttention)
         cos: torch.Tensor,
         sin: torch.Tensor,
         sparse_key_blocks: int,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        attention = super().forward(hidden_states, cos, sin, sparse_key_blocks)
+        attention = super().forward(
+            hidden_states,
+            cos,
+            sin,
+            sparse_key_blocks,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
+        )
         return self.output(
             attention.reshape(
                 hidden_states.shape[0],
@@ -532,7 +573,7 @@ class _DynamicSparseProjectionAttentionOutput(_DynamicSparseProjectionAttention)
         )
 
 
-def _run_explicit_fused_projection(
+def _run_explicit_fused_projection(  # noqa: PLR0913
     model: _DynamicSparseProjectionAttention | _SparseProjectionAttention,
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
@@ -544,6 +585,8 @@ def _run_explicit_fused_projection(
     coarse_key_blocks: int | None = None,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     query_input, key_input, value_input = (
         int8_ops.prepare_input(
@@ -610,6 +653,8 @@ def _run_explicit_fused_projection(
             block_lengths,
             sparse_query_blocks,
             output_dtype=hidden_states.dtype,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
         )
     assert coarse_scale is not None
     assert coarse_key_blocks is not None
@@ -634,10 +679,12 @@ def _run_explicit_fused_projection(
         coarse_key_blocks,
         sparse_query_blocks,
         output_dtype=hidden_states.dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
-def _run_explicit_attention_output(
+def _run_explicit_attention_output(  # noqa: PLR0913
     model: _DynamicSparseProjectionAttentionOutput | _SparseProjectionAttentionOutput,
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
@@ -649,6 +696,8 @@ def _run_explicit_attention_output(
     coarse_key_blocks: int | None = None,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     attention = _run_explicit_fused_projection(
         model,
@@ -661,6 +710,8 @@ def _run_explicit_attention_output(
         coarse_key_blocks=coarse_key_blocks,
         block_lengths=block_lengths,
         sparse_query_blocks=sparse_query_blocks,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     projected = linear_backend.require_linear_backend(attention).linear(
         attention.reshape(
@@ -1769,3 +1820,135 @@ def test_sparse_piper_projection_fails_closed_for_strided_rope() -> None:
     )
     assert capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention.default) == 1
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_linear_prepared.default) == 3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
+def test_forced_output_fusion_reuses_dynamic_shapes_and_runtime_contents(monkeypatch) -> None:
+    from piper_kernels.attention.sparse_piper_attention._routes_triton import (  # noqa: PLC0415
+        _scatter_force_tile_bits,
+        _tiled_radix_select_packed_routes_kernel,
+    )
+
+    torch.manual_seed(739)
+    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 128)
+    model = _DynamicSparseProjectionAttentionOutput().eval()
+
+    def run(hidden, cos, sin, ids, counts):
+        return model(
+            hidden, cos, sin, hidden.shape[1] // 64, force_tile_ids=ids, force_tile_counts=counts
+        )
+
+    capture = TargetCapturePass()
+    compiled = torch.compile(
+        run,
+        fullgraph=True,
+        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+    )
+    attention_kernel = _reset_attention_kernel_cache()
+    kernels = (_scatter_force_tile_bits, _tiled_radix_select_packed_routes_kernel, attention_kernel)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    specializations = None
+    with torch.no_grad():
+        for batch, sequence, capacity in ((2, 512, 3), (3, 1024, 7), (2, 768, 5)):
+            hidden = torch.randn(
+                batch, sequence, model.input_features, device="cuda", dtype=torch.bfloat16
+            )
+            angles = torch.randn(sequence, model.rotary_dim, device="cuda")
+            cos, sin = angles.cos(), angles.sin()
+            blocks = sequence // 64
+            ids = (
+                (
+                    torch.arange(blocks, device="cuda")[:, None]
+                    + torch.arange(capacity, device="cuda")[None, :]
+                )
+                .remainder(blocks)
+                .int()
+            )
+            counts = torch.zeros(blocks, device="cuda", dtype=torch.int32)
+            torch._dynamo.mark_dynamic(hidden, (0, 1))
+            torch._dynamo.mark_dynamic(cos, 0)
+            torch._dynamo.mark_dynamic(sin, 0)
+            torch._dynamo.mark_dynamic(ids, (0, 1))
+            torch._dynamo.mark_dynamic(counts, 0)
+            for active in (0, 2, 1):
+                counts.fill_(active)
+                ids.add_(1).remainder_(blocks)
+                force_tiles = {"force_tile_ids": ids, "force_tile_counts": counts}
+                expected, _ = _run_explicit_attention_output(
+                    model, hidden, cos, sin, blocks, **force_tiles
+                )
+                actual = compiled(hidden, cos, sin, ids, counts)
+                assert_fusion_output_close(actual, expected)
+                assert capture.calls == 1
+            compiled_counts = tuple(_compiled_specialization_count(kernel) for kernel in kernels)
+            if specializations is None:
+                specializations = compiled_counts
+            else:
+                assert compiled_counts == specializations
+    assert (
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
+        )
+        == 1
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
+def test_forced_coarse_output_builds_membership_once(monkeypatch) -> None:
+    torch.manual_seed(743)
+    monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64)
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sparse_key_blocks", 6)
+    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "coarse_key_blocks", 8)
+    model = _ProjectedGateCoarseSparseAttentionOutput(routing="minmax").eval()
+    hidden = torch.randn(1, 512, model.input_features, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([64, 17, 63, 32, 64, 48, 21, 64], device="cuda", dtype=torch.int32)
+    ids = (
+        (torch.arange(8, device="cuda")[:, None] + torch.arange(2, device="cuda")[None, :])
+        .remainder(6)
+        .int()
+    )
+    counts = torch.tensor([0, 1, 2, 1, 2, 0, 2, 1], device="cuda", dtype=torch.int32)
+    force_tiles = {"force_tile_ids": ids, "force_tile_counts": counts}
+    capture = TargetCapturePass()
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+    )
+    with torch.no_grad():
+        gate = model.gate(hidden).reshape(1, 512, model.heads, model.head_dim)
+        expected, _ = _run_explicit_attention_output(
+            model,
+            hidden,
+            model.cos,
+            model.sin,
+            6,
+            coarse_gate=gate,
+            coarse_scale=model.coarse_scale,
+            coarse_key_blocks=8,
+            block_lengths=lengths,
+            sparse_query_blocks=6,
+            **force_tiles,
+        )
+        build = attention_backend.build_force_tile_bitmask
+        builds = []
+
+        def counted_build(*args):
+            builds.append(1)
+            return build(*args)
+
+        monkeypatch.setattr(attention_backend, "build_force_tile_bitmask", counted_build)
+        actual = compiled(hidden, lengths, 6, **force_tiles)
+    assert len(builds) == 1
+    valid = (torch.arange(64, device="cuda")[None, :] < lengths[:, None]).flatten()
+    assert_fusion_output_close(actual[:, valid], expected[:, valid])
+    assert (
+        capture.targets.count(
+            torch.ops.piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
+        )
+        == 1
+    )

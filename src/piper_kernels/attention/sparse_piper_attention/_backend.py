@@ -9,9 +9,10 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
-from . import _interfaces, _launch, _plan, _prepared
+from . import _force_tiles, _interfaces, _launch, _plan, _prepared
 from ._amd import policy as amd_policy
 from ._dtype import SUPPORTED_DTYPES
+from ._force_tiles import build_portable_force_tile_bitmask
 from ._interfaces import (
     AttentionBackend,
     MinmaxScores,
@@ -151,6 +152,7 @@ def source_files() -> tuple[str, ...]:
         __file__,
         _plan.__file__,
         _interfaces.__file__,
+        _force_tiles.__file__,
         _prepared.__file__,
         _launch.__file__,
         layout.__file__,
@@ -161,7 +163,7 @@ def source_files() -> tuple[str, ...]:
         from ._amd import _parameters  # noqa: PLC0415
 
         paths.extend((amd_gluon.__file__, _parameters.__file__))
-    for implementation in (preparation, nvidia_tma_gluon, nvidia_async_copy_gluon):
+    for implementation in (preparation, nvidia_tma_gluon, nvidia_async_copy_gluon, _route_backend):
         if implementation is not None:
             paths.append(implementation.__file__)
     if nvidia_fragments is not None:
@@ -280,3 +282,12 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
     ):
         return None
     return _summary_backend.sequence_block_summaries
+
+
+def build_force_tile_bitmask(
+    ids: torch.Tensor, counts: torch.Tensor, sparse_key_blocks: int
+) -> torch.Tensor:
+    """Build call-local membership once, then share it across heads and score chunks."""
+    if _route_backend is not None and select_route_selector(ids) is not None:
+        return _route_backend.build_force_tile_bitmask(ids, counts, sparse_key_blocks)
+    return build_portable_force_tile_bitmask(ids, counts, sparse_key_blocks)

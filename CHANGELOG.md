@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Experimental caller-forced tiles in `SparsePiperAttention`, included within
+  each head's existing keep budget. Per-query ID lists and counts can change at
+  fixed tensor shapes without recompiling, including compatible ConvRot INT8,
+  NVFP4, and ConvRot NVFP4 projection/output fusions.
+- `SparsePiperAttention.resolve_head_keep_blocks` reports per-head physical
+  budgets without device access, so callers can determine valid force counts.
+
 ### Changed
 
 - ConvRot INT8 LoRA merges on NVIDIA SM80+ and HIP fuse rotation, multiplication,

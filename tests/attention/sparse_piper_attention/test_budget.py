@@ -2,7 +2,9 @@
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_head_keep_blocks,
@@ -21,15 +23,39 @@ def test_h3_ratio_profile_resolves_exact_physical_budget() -> None:
 
 
 def test_largest_remainder_rounding_preserves_nearest_total() -> None:
-    units = _normalize_head_keep_ratios((0.5, 0.5))
+    attention = SparsePiperAttention((0.5, 0.5))
 
-    assert _resolve_head_keep_blocks(units, 3) == (2, 1)
+    assert attention.resolve_head_keep_blocks(3) == (2, 1)
 
 
 def test_minimum_route_does_not_reduce_a_dense_head() -> None:
-    units = _normalize_head_keep_ratios((0.001, 1.0))
+    attention = SparsePiperAttention((0.001, 1.0))
 
-    assert _resolve_head_keep_blocks(units, 100) == (1, 100)
+    assert attention.resolve_head_keep_blocks(100) == (1, 100)
+
+
+def test_budget_query_uses_host_configuration_only() -> None:
+    class NoTensorOperations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            raise AssertionError(f"budget query performed a tensor operation: {func}")
+
+    attention = SparsePiperAttention((0.2, 0.4, 0.6))
+    with NoTensorOperations():
+        assert attention.resolve_head_keep_blocks(1036) == (207, 414, 622)
+        assert attention.resolve_head_keep_blocks(1) == (1, 1, 1)
+        assert attention.resolve_head_keep_blocks(65536) == (13107, 26214, 39322)
+
+
+@pytest.mark.parametrize("sparse_key_blocks", [0, 65537])
+def test_budget_query_rejects_out_of_range_prefix(sparse_key_blocks):
+    with pytest.raises(ValueError, match="sparse key block count"):
+        SparsePiperAttention((0.5,)).resolve_head_keep_blocks(sparse_key_blocks)
+
+
+@pytest.mark.parametrize("sparse_key_blocks", [True, 1.5])
+def test_budget_query_requires_integer_prefix(sparse_key_blocks):
+    with pytest.raises(TypeError, match="must be an integer"):
+        SparsePiperAttention((0.5,)).resolve_head_keep_blocks(sparse_key_blocks)
 
 
 @pytest.mark.parametrize("units", [(), (0,), (1_000_001,)])

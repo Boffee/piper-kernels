@@ -39,8 +39,12 @@ _QUANTIZED_ATTENTION_ARGUMENT_NAMES = (
 def optional_attention_layout_arguments[ArgumentT](
     block_lengths: ArgumentT | None,
     sparse_query_blocks: ArgumentT | None,
+    force_tile_ids: ArgumentT | None = None,
+    force_tile_counts: ArgumentT | None = None,
 ) -> tuple[ArgumentT | None, ...]:
     """Preserve positional defaults only when a later layout argument is present."""
+    if force_tile_ids is not None:
+        return block_lengths, sparse_query_blocks, force_tile_ids, force_tile_counts
     if sparse_query_blocks is not None:
         return block_lengths, sparse_query_blocks
     return (block_lengths,) if block_lengths is not None else ()
@@ -76,6 +80,7 @@ def sparse_piper_projection_pattern(
     with_block_lengths: bool = False,
     with_coarse: bool = False,
     with_sparse_query_blocks: bool = False,
+    with_force_tiles: bool = False,
     activation_dtype: torch.dtype = torch.bfloat16,
     q_affine: bool = True,
     k_affine: bool = True,
@@ -108,6 +113,8 @@ def sparse_piper_projection_pattern(
     optional_arguments = optional_attention_layout_arguments(
         block_lengths,
         sparse_query_blocks,
+        KeywordArg("sparse_force_tile_ids") if with_force_tiles else None,
+        KeywordArg("sparse_force_tile_counts") if with_force_tiles else None,
     )
     arguments = (
         torch.ops.piper_kernels.sparse_piper_attention.default,
@@ -143,10 +150,16 @@ def reshaped_quantized_attention_pattern(
     with_block_lengths: bool,
     with_coarse: bool,
     with_sparse_query_blocks: bool,
+    with_force_tiles: bool = False,
 ) -> CallFunction:
     """Match one materialized quantized attention result before projection."""
     operands = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_OPERAND_NAMES)
     policy = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_POLICY_NAMES)
+    force_arguments = (
+        (KeywordArg("output_force_tile_ids"), KeywordArg("output_force_tile_counts"))
+        if with_force_tiles
+        else ()
+    )
     if with_coarse:
         attention = CallFunction(
             torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
@@ -157,7 +170,12 @@ def reshaped_quantized_attention_pattern(
             KeywordArg("output_coarse_scale"),
             KeywordArg("output_block_lengths") if with_block_lengths else None,
             KeywordArg("output_coarse_key_blocks"),
-            *((KeywordArg("output_sparse_query_blocks"),) if with_sparse_query_blocks else ()),
+            *(
+                (KeywordArg("output_sparse_query_blocks") if with_sparse_query_blocks else None,)
+                if with_sparse_query_blocks or with_force_tiles
+                else ()
+            ),
+            *force_arguments,
             _users=1,
         )
     else:
@@ -168,6 +186,7 @@ def reshaped_quantized_attention_pattern(
         optional_arguments = optional_attention_layout_arguments(
             block_lengths,
             sparse_query_blocks,
+            *force_arguments,
         )
         attention = CallFunction(
             torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
@@ -182,6 +201,16 @@ def reshaped_quantized_attention_pattern(
         KeywordArg("output_attention_shape"),
         _users=1,
     )
+
+
+def build_forced_attention_keywords(match: Match) -> dict[str, Argument]:
+    """Preserve the optional runtime routing inputs across output fusion."""
+    if "output_force_tile_ids" not in match.kwargs:
+        return {}
+    return {
+        "force_tile_ids": cast(Argument, match.kwargs["output_force_tile_ids"]),
+        "force_tile_counts": cast(Argument, match.kwargs["output_force_tile_counts"]),
+    }
 
 
 def quantized_attention_arguments(match: Match) -> tuple[Argument, ...]:
@@ -209,6 +238,7 @@ def bounded_attention_arguments(match: Match) -> tuple[Argument, ...]:
 
 __all__ = [
     "bounded_attention_arguments",
+    "build_forced_attention_keywords",
     "optional_attention_layout_arguments",
     "quantized_attention_arguments",
     "reshaped_quantized_attention_pattern",

@@ -499,6 +499,7 @@ def test_route_builder_uses_selected_operation_once_and_preserves_offsets(monkey
         layout.head_keep_blocks,
         layout.route_head_offsets,
         query_block_offset=2,
+        force_tile_mask=None,
     )
     assert builder._route_head_offsets is None
     assert builder._head_keep_block_values is None

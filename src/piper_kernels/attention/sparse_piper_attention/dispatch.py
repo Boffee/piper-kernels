@@ -16,10 +16,12 @@ from ._block_layout import validate_block_lengths, validate_sparse_query_blocks
 from ._budget import (
     _RATIO_SCALE,
     _normalize_head_keep_ratios,
+    _resolve_head_keep_blocks,
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
 from ._dtype import SUPPORTED_DTYPES
+from ._force_tiles import validate_force_tiles
 from ._routing import packed_routes_from_sequences, packed_routes_from_summaries
 from ._routing_modes import (
     _ROUTING_NAME_BY_MODE,
@@ -59,6 +61,20 @@ class SparsePiperAttention(torch.nn.Module):
         """Return the block-routing policy selected for this module."""
         return _ROUTING_NAME_BY_MODE[self._routing_mode]
 
+    def resolve_head_keep_blocks(self, sparse_key_blocks: int) -> tuple[int, ...]:
+        """Return the physical K64 keep budget for each query head, in head order.
+
+        ``sparse_key_blocks`` must be an integer in [1, 65536]. Budgets use the
+        same rounding as attention, retain at least one block per head, and
+        exclude the always-dense key suffix. Each forced count must fit the
+        smallest returned budget as well as the caller's ID capacity.
+
+        Call this host-only configuration query outside compiled forward calls,
+        using the current module and a concrete sparse prefix size. It allocates
+        no tensors and accesses no device state.
+        """
+        return _resolve_head_keep_blocks(self._ratio_profile.units, sparse_key_blocks)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -69,6 +85,8 @@ class SparsePiperAttention(torch.nn.Module):
         sparse_query_blocks: int | None = None,
         scale: float | None = None,
         block_lengths: torch.Tensor | None = None,
+        force_tile_ids: torch.Tensor | None = None,
+        force_tile_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Route leading query blocks over a sparse K64 prefix and dense suffix.
 
@@ -80,6 +98,17 @@ class SparsePiperAttention(torch.nn.Module):
         blocks; all later query blocks attend every key block densely. Query heads
         may be an integer multiple of the shared K/V head count. Keep ratios and
         routes belong to query heads; K/V preparation and storage remain shared.
+
+        Experimental fixed-budget forced routing takes contiguous device INT32
+        ``force_tile_ids[query_blocks, capacity]`` and ``force_tile_counts[query_blocks]``.
+        Each row's active prefix is shared across batches and heads. Counts must
+        lie in [0, capacity]; active IDs must be unique and in [0, sparse_key_blocks).
+        The active count must fit every head's budget from ``resolve_head_keep_blocks``.
+        These value requirements are caller preconditions, not runtime tensor-content checks.
+        Forced tiles consume the existing budget; the remainder is selected by
+        score. ID/count contents may change at fixed shapes without recompiling.
+        Compatible projection/output fusions preserve these runtime inputs,
+        including chunked query execution and the independent coarse residual.
         """
         converted_scale = _validate_inputs(
             query,
@@ -91,6 +120,12 @@ class SparsePiperAttention(torch.nn.Module):
             scale=scale,
             block_lengths=block_lengths,
         )
+        validate_force_tiles(
+            force_tile_ids,
+            force_tile_counts,
+            query_blocks=(query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
+            device=query.device,
+        )
         return _sparse_piper_attention_op(
             query,
             key,
@@ -101,6 +136,8 @@ class SparsePiperAttention(torch.nn.Module):
             self._routing_mode,
             block_lengths,
             sparse_query_blocks,
+            force_tile_ids,
+            force_tile_counts,
         )
 
 
@@ -195,7 +232,7 @@ def _validate_inputs(
     return converted_scale
 
 
-def _run_sparse_piper_attention(
+def _run_sparse_piper_attention(  # noqa: PLR0913
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -206,6 +243,8 @@ def _run_sparse_piper_attention(
     scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
     backend = _backend.select_attention_backend(query)
@@ -214,6 +253,12 @@ def _run_sparse_piper_attention(
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
     validate_routing_mode(routing_mode)
+    force_tile_mask = None
+    if force_tile_ids is not None and not layout.keeps_all_blocks(sparse_key_blocks):
+        assert force_tile_counts is not None
+        force_tile_mask = _backend.build_force_tile_bitmask(
+            force_tile_ids, force_tile_counts, sparse_key_blocks
+        )
     # Take min/max routing summaries from the Q/K quantization pass
     # unless this call keeps every block, which needs no summaries at all.
     fuse_summaries = (
@@ -229,6 +274,7 @@ def _run_sparse_piper_attention(
             routing_mode,
             block_lengths,
             skip_dense_routing=backend is not None and backend.skip_dense_routing,
+            force_tile_mask=force_tile_mask,
         )
         if backend is None:
             return reference_sparse_piper_attention(
@@ -279,6 +325,7 @@ def _run_sparse_piper_attention(
             layout,
             routing_mode,
             skip_dense_routing=backend.skip_dense_routing,
+            force_tile_mask=force_tile_mask,
         )
         prepared = operands.with_routes(
             routes.indices,
@@ -299,7 +346,7 @@ def _run_sparse_piper_attention(
     mutates_args=(),
     tags=(torch.Tag.cudagraph_unsafe,),
 )
-def _sparse_piper_attention_op(
+def _sparse_piper_attention_op(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -309,6 +356,8 @@ def _sparse_piper_attention_op(
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layout = _resolve_route_layout(
         ratio_profile.units,
@@ -325,6 +374,8 @@ def _sparse_piper_attention_op(
         scale=scale,
         routing_mode=routing_mode,
         block_lengths=block_lengths,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
@@ -339,5 +390,7 @@ def _sparse_piper_attention_op_fake(
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
     _sparse_query_blocks: int | None = None,
+    _force_tile_ids: torch.Tensor | None = None,
+    _force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)

@@ -9,7 +9,14 @@ from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
-from piper_kernels.attention.sparse_piper_attention import _backend, _budget, _dtype, _profile
+from piper_kernels.attention.sparse_piper_attention import (
+    _backend,
+    _budget,
+    _dtype,
+    _profile,
+    _routes,
+    _routing,
+)
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
 from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
@@ -54,6 +61,8 @@ def source_files() -> tuple[str, ...]:
             _dtype.__file__,
             _budget.__file__,
             _profile.__file__,
+            _routes.__file__,
+            _routing.__file__,
             projected_qk_validation.__file__,
             projected_qk_compile.__file__,
             projected_qk_pattern.__file__,
@@ -111,8 +120,11 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     coarse_scale: Argument | None = None,
     coarse_key_blocks: Argument | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    force_tile_ids: Argument | None = None,
+    force_tile_counts: Argument | None = None,
 ) -> torch.fx.Node:
     """Emit the shared fine or coarse quantized sparse-attention call."""
+    force_arguments = (force_tile_ids, force_tile_counts) if force_tile_ids is not None else ()
     coarse_arguments = block_mean, coarse_gate, coarse_scale, coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
     if with_coarse:
@@ -132,6 +144,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
                 block_lengths,
                 coarse_key_blocks,
                 sparse_query_blocks,
+                *force_arguments,
             ),
             kwargs={"output_dtype": output_dtype},
         )
@@ -146,6 +159,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
             *sparse_piper_pattern.optional_attention_layout_arguments(
                 block_lengths,
                 sparse_query_blocks,
+                *force_arguments,
             ),
         ),
         kwargs={"output_dtype": output_dtype},

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
@@ -221,7 +222,10 @@ def test_attention_output_supports_mixed_precision_bias(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
-def test_projected_query_attention_output_matches_multiple_materialized_q_windows() -> None:
+@pytest.mark.parametrize("forced", [False, True])
+def test_projected_query_attention_output_matches_multiple_materialized_q_windows(
+    forced: bool,
+) -> None:
     sequence_length = 193
     operands = _operands(batch=1, sequence_length=sequence_length)
     prepared_query, prepared_key, prepared_value = _prepare(operands)
@@ -242,10 +246,19 @@ def test_projected_query_attention_output_matches_multiple_materialized_q_window
         64,
     )
 
+    force_tiles = (
+        {
+            "force_tile_ids": torch.tensor([[2], [1], [0], [2]], device="cuda", dtype=torch.int32),
+            "force_tile_counts": torch.ones(4, device="cuda", dtype=torch.int32),
+        }
+        if forced
+        else {}
+    )
     with torch.no_grad():
         expected = output_fusion._attention_output_op(
             *prepared_query,
             *attention_tail,
+            **force_tiles,
         )
         actual = output_fusion._projected_query_attention_output_op(
             operands.input_qdata,
@@ -258,6 +271,7 @@ def test_projected_query_attention_output_matches_multiple_materialized_q_window
             1e-5,
             _HEAD_DIM**-0.5,
             *attention_tail,
+            **force_tiles,
         )
 
     assert_fusion_output_close(actual, expected)
@@ -436,6 +450,8 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         128,
         64,
         output_dtype=dtype,
+        force_tile_ids=torch.empty((3, 1), device="meta", dtype=torch.int32),
+        force_tile_counts=torch.empty(3, device="meta", dtype=torch.int32),
     )
 
     assert output.shape == (2, 191, _OUTPUT_FEATURES)
@@ -469,6 +485,57 @@ def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:
     output = output_fusion._attention_output_op(*arguments)
 
     assert output.shape == (2, 192, _OUTPUT_FEATURES)
+
+
+def test_inplace_fake_validates_forced_metadata_without_tensor_operations() -> None:
+    class MetadataOnly(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            raise AssertionError(f"in-place fake performed a tensor operation: {func}")
+
+    hidden = torch.empty((1, 65, 64), device="meta", dtype=torch.bfloat16)
+    weight = torch.empty((64, 64), device="meta", dtype=torch.int8)
+    weight_scale = torch.empty((64, 1), device="meta")
+    rope = torch.empty((65, 64), device="meta")
+    key = torch.empty((1, 1, 128, 64), device="meta", dtype=torch.int8)
+    summary = torch.empty((1, 1, 2, 64), device="meta")
+    arguments = (
+        hidden,
+        None,
+        weight,
+        weight_scale,
+        None,
+        rope,
+        rope,
+        1e-5,
+        64**-0.5,
+        key,
+        torch.empty((1, 1, 2), device="meta"),
+        summary,
+        summary,
+        torch.empty((1, 1, 64, 128), device="meta", dtype=torch.int8),
+        torch.empty((1, 1, 2, 1), device="meta"),
+        torch.empty((1, 1, 64), device="meta"),
+        _SparsePiperRatioProfile((500_000,)),
+        1,
+        65,
+        0,
+        weight,
+        weight_scale,
+        None,
+        64,
+    )
+    ids = torch.empty((2, 1), device="meta", dtype=torch.int32)
+    counts = torch.empty(2, device="meta", dtype=torch.int32)
+    wrong_counts = torch.empty(1, device="meta", dtype=torch.int32)
+    with MetadataOnly():
+        result = output_fusion._projected_query_attention_output_inplace_op_fake(
+            *arguments, input_group_size=64, force_tile_ids=ids, force_tile_counts=counts
+        )
+        assert result is None
+        with pytest.raises(ValueError, match="forced tiles require"):
+            output_fusion._projected_query_attention_output_inplace_op_fake(
+                *arguments, input_group_size=64, force_tile_ids=ids, force_tile_counts=wrong_counts
+            )
 
 
 @pytest.mark.gpu

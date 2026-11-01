@@ -29,7 +29,12 @@ class PackedRoutesAndCoarseOutput:
 
 
 class PackedRouteBuilder:
-    """Build packed routes while resolving shared layout state only once."""
+    """Build packed routes while resolving shared layout state only once.
+
+    Optional membership is a prebuilt contiguous INT32 bitset for this query
+    window: [query_blocks, ceil(sparse_key_blocks / 32)]. Its invocation owner
+    validates the caller's IDs/counts and shares the bitset across windows.
+    """
 
     def __init__(
         self,
@@ -41,6 +46,7 @@ class PackedRouteBuilder:
         sparse_key_blocks: int,
         device: torch.device,
         skip_dense_routing: bool = False,
+        force_tile_mask: torch.Tensor | None = None,
     ) -> None:
         _validate_route_layout(layout, heads, sparse_key_blocks, device)
         self._layout = layout
@@ -60,6 +66,7 @@ class PackedRouteBuilder:
                 _backend.fill_full_keep_routes(self.routes.indices, sparse_key_blocks)
             return
         self._select_routes = _backend.select_route_selector(self.routes.indices)
+        self._force_tile_mask = force_tile_mask
         self._route_head_offsets = (
             None
             if self._select_routes is not None
@@ -87,6 +94,7 @@ class PackedRouteBuilder:
                 self._layout.head_keep_blocks,
                 self._layout.route_head_offsets,
                 query_block_offset=query_block_offset,
+                force_tile_mask=self._force_tile_mask,
             )
             return
         assert self._route_head_offsets is not None
@@ -97,6 +105,7 @@ class PackedRouteBuilder:
             self._route_head_offsets,
             self._head_keep_block_values,
             query_block_offset=query_block_offset,
+            force_tile_mask=self._force_tile_mask,
         )
 
 
@@ -114,6 +123,7 @@ class PackedRouteAndCoarseBuilder:
         sparse_key_blocks: int,
         device: torch.device,
         skip_dense_routing: bool = False,
+        force_tile_mask: torch.Tensor | None = None,
     ) -> None:
         if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
             raise ValueError("pooled V must use [batch,heads,key blocks,features]")
@@ -134,6 +144,7 @@ class PackedRouteAndCoarseBuilder:
             sparse_key_blocks=sparse_key_blocks,
             device=device,
             skip_dense_routing=skip_dense_routing,
+            force_tile_mask=force_tile_mask,
         )
         self._pooled_value = pooled_value
         self._sparse_key_blocks = sparse_key_blocks
@@ -209,15 +220,28 @@ def _select_portable_routes(
     head_keep_block_values: list[int],
     *,
     query_block_offset: int,
+    force_tile_mask: torch.Tensor | None = None,
 ) -> None:
     query_stop = query_block_offset + scores.shape[2]
+    forced = None
+    if force_tile_mask is not None:
+        key_ids = torch.arange(scores.shape[-1], device=scores.device)
+        words = force_tile_mask[query_block_offset:query_stop, key_ids // 32]
+        forced = ((words >> (key_ids % 32)) & 1).bool()
     for head, count in enumerate(head_keep_block_values):
+        # Stable partition by priority after the score sort; scores remain intact
+        # for callers that also use them for the coarse attention branch.
         selected = torch.argsort(
             scores[:, head],
             dim=-1,
             descending=True,
             stable=True,
-        )[..., :count]
+        )
+        if forced is not None:
+            priority = forced[None].expand(scores.shape[0], -1, -1).gather(-1, selected)
+            priority_order = torch.argsort(priority.int(), dim=-1, descending=True, stable=True)
+            selected = selected.gather(-1, priority_order)
+        selected = selected[..., :count]
         selected = selected.sort(dim=-1).values.to(torch.uint16)
         routes[
             :,

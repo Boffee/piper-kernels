@@ -287,6 +287,8 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     *,
     output_dtype: torch.dtype = torch.bfloat16,
     output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pipeline bounded attention chunks into the final ConvRot INT8 output."""
     backend = fusion_backend.require_output_backend(query)
@@ -312,6 +314,8 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         has_projected_coarse_gate=gate_projection is not None,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     output_features, project_chunk, projector_tensors = _prepare_output_chunk_projector(
         query,
@@ -377,6 +381,8 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     output_dtype: torch.dtype = torch.bfloat16,
     query_bias: torch.Tensor | None = None,
     output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output.
 
@@ -407,6 +413,8 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         coarse_key_blocks,
         sparse_query_blocks,
         has_projected_coarse_gate=gate_projection is not None,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
     if (
         query_input.ndim != 3
@@ -538,6 +546,8 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     gate_bias: torch.Tensor | None = None,
     query_bias: torch.Tensor | None = None,
     output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -595,6 +605,8 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         output_input_scale=output_input_scale,
         query_bias=query_bias,
         input_group_size=input_group_size,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
@@ -642,6 +654,8 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
     gate_bias: torch.Tensor | None = None,
     query_bias: torch.Tensor | None = None,
     output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -707,12 +721,65 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
         query_bias=query_bias,
         input_group_size=input_group_size,
         out=query_input,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
 @_projected_query_attention_output_inplace_op.register_fake
-def _projected_query_attention_output_inplace_op_fake(*_args, **_kwargs) -> None:
-    return None
+def _projected_query_attention_output_inplace_op_fake(
+    _query_input: torch.Tensor,
+    _query_input_scale: torch.Tensor | None,
+    _query_weight_qdata: torch.Tensor,
+    _query_weight_scale: torch.Tensor,
+    _query_norm_weight: torch.Tensor | None,
+    _cos: torch.Tensor,
+    _sin: torch.Tensor,
+    _query_norm_epsilon: float,
+    _softmax_scale: float,
+    key: torch.Tensor,
+    _key_scale: torch.Tensor,
+    _key_summary: torch.Tensor,
+    _key_aux: torch.Tensor,
+    _value: torch.Tensor,
+    _value_scale_multiplier: torch.Tensor,
+    _value_mean: torch.Tensor,
+    _ratio_profile: _SparsePiperRatioProfile,
+    _sparse_key_blocks: int,
+    logical_sequence_length: int,
+    _routing_mode: int,
+    _weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _bias: torch.Tensor | None,
+    _group_size: int,
+    _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    _block_mean: torch.Tensor | None = None,
+    _coarse_gate: torch.Tensor | None = None,
+    _coarse_scale: float | None = None,
+    _coarse_key_blocks: int | None = None,
+    _sparse_query_blocks: int | None = None,
+    _gate_input: torch.Tensor | None = None,
+    _gate_input_scale: torch.Tensor | None = None,
+    _gate_weight_qdata: torch.Tensor | None = None,
+    _gate_weight_scale: torch.Tensor | None = None,
+    _gate_bias: torch.Tensor | None = None,
+    _query_bias: torch.Tensor | None = None,
+    _output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
+    *,
+    input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    output_common.validate_output_metadata(
+        key,
+        logical_sequence_length,
+        block_lengths,
+        output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
 
 
 @_projected_query_attention_output_op.register_fake
@@ -755,16 +822,22 @@ def _projected_query_attention_output_op_fake(
     _gate_bias: torch.Tensor | None = None,
     _query_bias: torch.Tensor | None = None,
     _output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    return output_common.new_projected_output(
+    sequence_length = output_common.validate_output_metadata(
         key,
         logical_sequence_length,
         block_lengths,
-        weight_qdata.shape[0],
         output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    return output_common.new_projected_output(
+        key, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
     )
 
 
@@ -805,6 +878,8 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     gate_weight_scale: torch.Tensor | None = None,
     gate_bias: torch.Tensor | None = None,
     output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
@@ -847,6 +922,8 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         gate_projection,
         output_dtype=output_dtype,
         output_input_scale=output_input_scale,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
     )
 
 
@@ -883,15 +960,21 @@ def _attention_output_op_fake(
     _gate_weight_scale: torch.Tensor | None = None,
     _gate_bias: torch.Tensor | None = None,
     _output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    return output_common.new_projected_output(
+    sequence_length = output_common.validate_output_metadata(
         query,
         logical_sequence_length,
         block_lengths,
-        weight_qdata.shape[0],
         output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    return output_common.new_projected_output(
+        query, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
     )
 
 

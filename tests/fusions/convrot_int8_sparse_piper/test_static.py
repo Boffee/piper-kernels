@@ -234,13 +234,16 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
 
 
 @pytest.mark.parametrize("escape", [False, True])
-def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatch, escape):
+@pytest.mark.parametrize("forced", [False, True])
+def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatch, escape, forced):
     class IntermediateInput(_ProjectedGateCoarseSparseAttentionOutput):
         output_features = _ProjectedGateCoarseSparseAttentionOutput.input_features
 
-        def forward(self, hidden):
+        def forward(self, hidden, force_tile_ids=None, force_tile_counts=None):
             intermediate = torch.nn.functional.silu(hidden)
-            projected = super().forward(intermediate)
+            projected = super().forward(
+                intermediate, force_tile_ids=force_tile_ids, force_tile_counts=force_tile_counts
+            )
             if escape:
                 return projected, intermediate.view_as(intermediate)
             return projected
@@ -254,6 +257,18 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
     model = IntermediateInput(routing="minmax").eval()
     _set_scales(model, "distinct")
     hidden = torch.randn(2, sequence, model.input_features, device="cuda", dtype=torch.bfloat16)
+    force_tiles = (
+        {
+            "force_tile_ids": torch.ones(
+                ((sequence + 63) // 64, 1), device="cuda", dtype=torch.int32
+            ),
+            "force_tile_counts": torch.ones(
+                (sequence + 63) // 64, device="cuda", dtype=torch.int32
+            ),
+        }
+        if forced
+        else {}
+    )
     before = hidden.clone()
     capture = TargetCapturePass()
     with torch.inference_mode():
@@ -268,6 +283,7 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
             coarse_gate=gate,
             coarse_scale=model.coarse_scale,
             coarse_key_blocks=model.coarse_key_blocks,
+            **force_tiles,
         )
         compiled = torch.compile(
             model,
@@ -275,7 +291,7 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
             options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
         )
         for _ in range(3):
-            actual = compiled(hidden)
+            actual = compiled(hidden, **force_tiles)
             if escape:
                 actual, returned_intermediate = actual
                 torch.testing.assert_close(returned_intermediate, intermediate, rtol=0, atol=0)

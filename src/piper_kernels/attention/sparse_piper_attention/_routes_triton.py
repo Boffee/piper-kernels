@@ -16,6 +16,71 @@ _RADIX_BINS = tl.constexpr(256)
 _SELECTOR_TILE = 512
 
 
+@triton.jit(do_not_specialize=["capacity", "mask_words", "query_blocks"])
+def _scatter_force_tile_bits(
+    ids_ptr: torch.Tensor,
+    counts_ptr: torch.Tensor,
+    mask_ptr: torch.Tensor,
+    capacity: int,
+    mask_words: int,
+    query_blocks: int,
+    block: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    query = offsets // capacity
+    slot = offsets % capacity
+    count = tl.load(counts_ptr + query, query < query_blocks, other=0)
+    active = (query < query_blocks) & (slot < count)
+    key = tl.load(ids_ptr + offsets, active, other=0)
+    tl.atomic_or(
+        mask_ptr + query * mask_words + key // 32,
+        (1 << (key % 32)).to(tl.int32),
+        active,
+        sem="relaxed",
+    )
+
+
+def build_force_tile_bitmask(
+    ids: torch.Tensor, counts: torch.Tensor, sparse_key_blocks: int
+) -> torch.Tensor:
+    """Pack active IDs; membership is shared by every batch and query head."""
+    with device_context(ids.device):
+        mask = torch.zeros(
+            (ids.shape[0], triton.cdiv(sparse_key_blocks, 32)),
+            dtype=torch.int32,
+            device=ids.device,
+        )
+        if ids.numel():
+            _scatter_force_tile_bits[(triton.cdiv(ids.numel(), 256),)](
+                ids,
+                counts,
+                mask,
+                ids.shape[1],
+                mask.shape[1],
+                ids.shape[0],
+                256,  # pyright: ignore[reportArgumentType]
+            )
+    return mask
+
+
+@triton.jit
+def _route_priority_bits(  # noqa: ANN202
+    scores,  # noqa: ANN001
+    key_offsets,  # noqa: ANN001
+    valid,  # noqa: ANN001
+    force_mask_ptr,  # noqa: ANN001
+    has_force: tl.constexpr,
+):
+    ordered_bits = _ordered_float_bits(scores)
+    if has_force:
+        words = tl.load(force_mask_ptr + key_offsets // 32, valid, other=0).to(tl.uint32)
+        forced = ((words >> (key_offsets % 32)) & 1) != 0
+        # Reserve the maximum priority for forced IDs. Original scores are never
+        # modified, including when coarse attention consumes the same chunk.
+        ordered_bits = tl.where(forced, 0xFFFFFFFF, ordered_bits)
+    return ordered_bits
+
+
 @triton.jit
 def _fill_full_keep_routes_kernel(  # noqa: ANN202
     routes_ptr,  # noqa: ANN001
@@ -57,6 +122,8 @@ def _tiled_radix_select_pass(  # noqa: ANN202
     rank,  # noqa: ANN001
     shift: tl.constexpr,
     selector_tile: tl.constexpr,
+    force_mask_ptr,  # noqa: ANN001
+    has_force: tl.constexpr,
 ):
     """Select one radix byte while streaming a score row in fixed tiles."""
     histogram = tl.zeros([_RADIX_BINS], tl.int32)
@@ -64,7 +131,7 @@ def _tiled_radix_select_pass(  # noqa: ANN202
         key_offsets = tile_start + tl.arange(0, selector_tile)
         valid = key_offsets < sparse_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
-        ordered_bits = _ordered_float_bits(scores)
+        ordered_bits = _route_priority_bits(scores, key_offsets, valid, force_mask_ptr, has_force)
         active = valid
         if shift < 24:
             active &= (ordered_bits >> (shift + 8)) == prefix
@@ -93,6 +160,7 @@ def _tiled_radix_select_pass(  # noqa: ANN202
         "route_batch_stride",
         "route_query_stride",
         "route_route_stride",
+        "force_mask_stride",
     ]
 )
 def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
@@ -100,6 +168,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     routes_ptr: torch.Tensor,
     head_keep_blocks_ptr: torch.Tensor,
     route_head_offsets_ptr: torch.Tensor,
+    force_mask_ptr: torch.Tensor,
     sparse_key_blocks: int,
     query_block_offset: int,
     score_batch_stride: int,
@@ -108,7 +177,9 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     route_batch_stride: int,
     route_query_stride: int,
     route_route_stride: int,
+    force_mask_stride: int,
     selector_tile: tl.constexpr,
+    has_force: tl.constexpr,
 ) -> None:
     """Select exact stable FP32 top-k routes with runtime row dimensions."""
     query_block = tl.program_id(0)
@@ -124,6 +195,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         + route_head_offset * route_route_stride
     )
     head_keep_block_count = tl.load(head_keep_blocks_ptr + head)
+    force_row = force_mask_ptr + (query_block_offset + query_block) * force_mask_stride
 
     prefix = 0
     rank = head_keep_block_count
@@ -135,6 +207,8 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         rank,
         tl.constexpr(24),
         selector_tile,
+        force_row,
+        has_force,
     )
     prefix, rank = _tiled_radix_select_pass(
         scores_ptr,
@@ -144,6 +218,8 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         rank,
         tl.constexpr(16),
         selector_tile,
+        force_row,
+        has_force,
     )
     prefix, rank = _tiled_radix_select_pass(
         scores_ptr,
@@ -153,6 +229,8 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         rank,
         tl.constexpr(8),
         selector_tile,
+        force_row,
+        has_force,
     )
     threshold_bits, equal_keep = _tiled_radix_select_pass(
         scores_ptr,
@@ -162,6 +240,8 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         rank,
         tl.constexpr(0),
         selector_tile,
+        force_row,
+        has_force,
     )
 
     output_offset = 0
@@ -170,7 +250,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         key_offsets = tile_start + tl.arange(0, selector_tile)
         valid = key_offsets < sparse_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
-        ordered_bits = _ordered_float_bits(scores)
+        ordered_bits = _route_priority_bits(scores, key_offsets, valid, force_row, has_force)
         equal = valid & (ordered_bits == threshold_bits)
         equal_rank = equal_offset + tl.cumsum(equal.to(tl.int32), axis=0)
         selected = valid & ((ordered_bits > threshold_bits) | (equal & (equal_rank <= equal_keep)))
@@ -191,6 +271,7 @@ def tiled_radix_select_packed_routes(
     route_head_offsets: torch.Tensor,
     *,
     query_block_offset: int,
+    force_tile_mask: torch.Tensor | None = None,
 ) -> None:
     """Write exact stable FP32 top-k routes directly into packed UINT16 storage."""
     if scores.ndim != 4 or scores.stride(-1) != 1 or scores.dtype != torch.float32:
@@ -221,12 +302,20 @@ def tiled_radix_select_packed_routes(
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled scores and packed routes must share the batch dimension")
     batch, heads, query_blocks, sparse_key_blocks = scores.shape
+    if force_tile_mask is not None and (
+        force_tile_mask.shape != (routes.shape[1], triton.cdiv(sparse_key_blocks, 32))
+        or force_tile_mask.dtype is not torch.int32
+        or force_tile_mask.device != scores.device
+        or not force_tile_mask.is_contiguous()
+    ):
+        raise ValueError("forced membership must use contiguous INT32 [query_blocks,key_words]")
     with device_context(scores.device):
         _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
             scores,
             routes,
             head_keep_blocks,
             route_head_offsets,
+            head_keep_blocks if force_tile_mask is None else force_tile_mask,
             sparse_key_blocks,
             query_block_offset,
             scores.stride(0),
@@ -235,7 +324,9 @@ def tiled_radix_select_packed_routes(
             routes.stride(0),
             routes.stride(1),
             routes.stride(2),
+            0 if force_tile_mask is None else force_tile_mask.stride(0),
             selector_tile=_SELECTOR_TILE,
+            has_force=force_tile_mask is not None,
             num_warps=4,
             num_stages=1,
         )

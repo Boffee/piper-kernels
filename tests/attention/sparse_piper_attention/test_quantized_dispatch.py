@@ -193,7 +193,10 @@ def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_
     reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize("sequence_length", [65, 193])
-def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: int) -> None:
+@pytest.mark.parametrize("forced", [False, True])
+def test_ragged_quantized_path_matches_materialized_dispatch(
+    sequence_length: int, forced: bool
+) -> None:
     generator = torch.Generator(device="cuda").manual_seed(66 + sequence_length)
     shape = (1, sequence_length, 2, 128)
     query = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
@@ -242,17 +245,34 @@ def test_ragged_quantized_path_matches_materialized_dispatch(sequence_length: in
         sequence_length,
         _MINMAX_ROUTING,
     )
+    force_tiles = (
+        {
+            "force_tile_ids": torch.full(
+                ((sequence_length + 63) // 64, 1),
+                sparse_key_blocks - 1,
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            "force_tile_counts": torch.ones(
+                (sequence_length + 63) // 64, device="cuda", dtype=torch.int32
+            ),
+        }
+        if forced
+        else {}
+    )
     with torch.no_grad():
         expected = SparsePiperAttention(ratios)(
             query,
             key,
             value,
             sparse_key_blocks=sparse_key_blocks,
+            **force_tiles,
         )
-        actual = _sparse_piper_attention_from_quantized_op(*quantized_arguments)
+        actual = _sparse_piper_attention_from_quantized_op(*quantized_arguments, **force_tiles)
         opcheck = torch.library.opcheck(
             _sparse_piper_attention_from_quantized_op,
             quantized_arguments,
+            force_tiles,
         )
 
     assert actual.shape == query.shape

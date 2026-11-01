@@ -85,8 +85,10 @@ attend all keys densely. Omitting `sparse_query_blocks` routes every query block
 zero makes every query dense.
 
 Keep ratios lie in `(0, 1]` and belong to immutable model configuration. Physical
-budgets round to whole blocks, with at least one retained block per head. Routes
-are recomputed from the current Q/K values on every call. The default `"minmax"`
+budgets round to whole blocks across heads, with at least one retained block per
+head. `attention.resolve_head_keep_blocks(sparse_key_blocks)` returns the exact
+per-query-head budgets as a tuple of Python integers. Routes are recomputed from
+the current Q/K values on every call. The default `"minmax"`
 policy scores extrema summaries; `"mean"` scores block means. The application owns
 the ratio profile and its quality validation. Even a full keep budget uses sparse
 Piper's quantized arithmetic, which differs from dense Piper's V quantization.
@@ -108,6 +110,60 @@ responsibility under the [validation contract](development.md#validation-contrac
 Native sparse backends cover NVIDIA SM89/SM120 and AMD RDNA4. Other devices run the
 portable quantized reference. There is a separate exact sparse reference for
 quality comparisons; it is not the fallback used by this API.
+
+### Caller-forced tiles (experimental)
+
+The experimental fixed-budget forced-routing path additionally accepts
+`force_tile_ids` (contiguous device INT32 `[query_blocks, capacity]`) and
+`force_tile_counts` (contiguous device INT32 `[query_blocks]`). Active IDs in each
+row's counted prefix are shared across batches and heads. Every forced tile is
+included, and the remaining per-head budget is filled by ordinary score selection.
+Counts must lie in `[0, capacity]`; active IDs must be unique and lie in
+`[0, sparse_key_blocks)`, and each count must fit every affected head's resolved
+physical keep budget. These are caller preconditions, with metadata-only validation.
+Supply rows for every physical query block; dense query suffixes already include
+every key and ignore route selection. Unused ID slots are ignored.
+
+Query the budgets outside the compiled forward call when preparing forced lists:
+
+```python
+attention = SparsePiperAttention((0.5, 0.5))
+budgets = attention.resolve_head_keep_blocks(sparse_key_blocks=3)  # (2, 1)
+capacity = 2  # padded ID slots per query block
+max_force_count = min(capacity, min(budgets))  # 1
+```
+
+Rounding is shared across heads, so independently rounding each ratio can
+overestimate a head's budget. Here, each row may force at most one tile even
+though the first head keeps two. The query allocates no tensors and accesses no
+device state; recompute the limit when the ratio profile or sparse prefix size changes.
+
+ID and count contents can change at fixed tensor shapes without recompiling; zero
+counts disable forcing without changing the compiled call. Explicit graph replay
+with a fixed ratio profile uses updated contents in the captured input buffers.
+Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 projection/output fusions
+preserve forced routing. Each invocation builds one compact membership bitset,
+shared across heads and query chunks. Routing scores, the coarse residual, and
+the total route budget retain their existing behavior.
+
+Changing sequence length or force capacity can also reuse a Torch graph when
+the caller marks the corresponding input dimensions dynamic before the compiled
+call. Mark the model input's sequence dimension and the query-row dimension of
+both force tensors; mark the IDs' capacity dimension if it varies. For example:
+
+```python
+torch._dynamo.mark_dynamic(hidden_states, 1)  # [batch, sequence, features]
+torch._dynamo.mark_dynamic(force_tile_ids, (0, 1))
+torch._dynamo.mark_dynamic(force_tile_counts, 0)
+```
+
+Other sequence-shaped model inputs, such as rotary tables, need matching dynamic
+dimensions. Changing a Python integer argument such as `sparse_key_blocks` can
+still recompile; derive it from dynamic tensor shapes inside the compiled
+function when applicable. Keep model head count and head dimension fixed.
+Shape guards and GPU kernel policies still apply: one Torch graph does not
+promise one kernel variant across every layout, alignment, or backend. Zero and
+singleton dimensions may also receive separate compiler specializations.
 
 ### Coarse residual
 
