@@ -40,6 +40,42 @@ _RESCALE_CONSTRAINTS = gl.constexpr(
 
 
 @gluon.jit
+def scalar_fma(a, b, c):
+    """Compute ``gl.fma(a, b, c)`` with one ``v_fma_f32`` per element.
+
+    LLVM's SLP vectorizer can regroup FMAs into vector FMAs. RDNA4 has no packed
+    FP32 FMA, so those vectors only add register pressure and cost occupancy.
+    Opaque inline assembly keeps each FMA scalar with the same single rounding.
+    """
+    return gl.inline_asm_elementwise(
+        "v_fma_f32 $0, $1, $2, $3",
+        constraints="=v,v,v,v",
+        args=(a, b, c),
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _recover_scores(biased, scalar_fma: gl.constexpr):
+    """Recover exact integer QK sums from the binade the accumulator bias selects."""
+    if scalar_fma:
+        # A literal 2^26 and an SGPR offset keep this FMA scalar without
+        # spending VGPRs on splat constants; see scalar_fma.
+        offset = gl.full(biased.shape, -10680707.0, gl.float32, biased.type.layout)
+        return gl.inline_asm_elementwise(
+            "v_fma_f32 $0, $1, 0x4c800000, $2",
+            constraints="=v,v,s",
+            args=(biased, offset),
+            dtype=gl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    return gl.fma(biased, 67108864.0, -10680707.0)
+
+
+@gluon.jit
 def pipeline_boundary(label: gl.constexpr, priority: gl.constexpr = None):
     """End a warp-pipeline stage, preserving the compiler's default priority."""
     # Omit the keyword: Gluon cannot unwrap an explicitly passed constexpr(None).
@@ -152,6 +188,7 @@ def qk_tiles(
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
     pipeline_priority: gl.constexpr = None,
+    scalar_bias_fma: gl.constexpr = False,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
 
@@ -180,7 +217,7 @@ def qk_tiles(
                 key = gl.load((key_ptr + offset).to(gl.pointer_type(gl.uint64)))
                 acc = int8_wmma(query[k], key, acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
-            results += (gl.fma(result.to(gl.float32, bitcast=True), 67108864.0, -10680707.0),)
+            results += (_recover_scores(result.to(gl.float32, bitcast=True), scalar_bias_fma),)
         pipeline_boundary("qk", pipeline_priority)
     return _join_matrix(results)
 

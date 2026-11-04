@@ -11,6 +11,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
   also apply again under PyTorch 2.15's stricter pattern matching, instead of
   silently running unfused. Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
+- On AMD RDNA4 with Triton 3.9, dense Piper attention no longer runs 12–17% slower
+  than with Triton 3.8, nor sparse Piper attention about 3% slower. Triton 3.9
+  vectorizes the kernels' scalar FMAs and pins loads inside warp-pipeline stages;
+  dense attention now stays within about 2% (head dimension 128) and 4% (64) of
+  Triton 3.8, and sparse attention within about 1%. ConvRot INT8 linear and FFN
+  kernels remain 2–5% slower with Triton 3.9. Triton 3.8 is unaffected.
 - Compiled ConvRot INT8 `add_` no longer fails on PyTorch 2.14 with a
   `rounding_seed` type error. PyTorch 2.14 Inductor moved the keyword-only `beta`
   into `alpha`'s position, so `beta` is now the last positional argument of the

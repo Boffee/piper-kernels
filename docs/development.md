@@ -284,7 +284,11 @@ uv --no-config pip install --python .venv-rocm/bin/python --group test \
 ```
 
 The device extra installs the matching ROCm libraries; torchvision and torchaudio
-are not required. Use separate environments when comparing stable and nightly
+are not required. PyTorch 2.15 for ROCm 10.0 (`torch==2.15.0+rocm10.0` from
+PyTorch's `rocm10.0` index) with its Triton 3.9 also passes the regressions.
+Triton 3.9 needs RDNA4 code-generation workarounds in dense Piper; see its
+[implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior).
+ConvRot INT8 linear and FFN kernels remain 2–5% slower with Triton 3.9 than 3.8. Use separate environments when comparing stable and nightly
 builds. Run the regressions below and representative benchmarks before promoting
 a new stack to the development or CI default.
 

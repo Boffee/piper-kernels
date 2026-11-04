@@ -13,6 +13,9 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from piper_kernels._triton import (
+    amd_warp_pipeline as _amd_warp_pipeline,  # noqa: F401 - installs the hook
+)
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
