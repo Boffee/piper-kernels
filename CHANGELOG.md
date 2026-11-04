@@ -13,6 +13,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Long-sequence attention centering bounds each FP32 mean-reduction tile to
+  avoid register spills and excessive CUDA memory use. Reduction scheduling
+  can change last-bit FP32 rounding; attention algorithms and APIs are unchanged.
+
 - PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
   NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
   also apply again under PyTorch 2.15 instead of silently running unfused.
