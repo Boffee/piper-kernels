@@ -207,7 +207,8 @@ For optional fusion of explicit zero/spatial-reflection padding, use
 cover storage, offload integration, and fusion limits. H3-specific calibration and
 normalization fusion belong to the
 [encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
-Matrix updates, GGUF conversion, transpose, and sharding below apply to 2-D weights only.
+Matrix updates, GGUF conversion, trellis decoding, transpose, and sharding below apply to 2-D
+weights only.
 
 ## Compile a model
 
@@ -305,6 +306,33 @@ raise rather than allocate a dense fallback. ConvRot NVFP4 accepts the same scal
 and activation configuration as `from_hp`, including
 `compute_per_tensor_scale=True`. See the [INT8](../src/piper_kernels/weights/convrot/int8/tensor.py)
 and [NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) constructors for signatures.
+
+## Decode trellis-coded storage
+
+Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It is a
+storage format: decoding produces ordinary ConvRot INT8 storage, and execution is
+unchanged. An exporter supplies the stored tensors and their block size; see
+the [format](../src/piper_kernels/trellis/README.md).
+
+```python
+weight = ConvRotInt8Tensor.from_trellis(
+    bitstreams,  # uint8 [out, in / 256, bytes]; 143 bytes is 4.5 bits per weight
+    block_scales,  # float8_e4m3fn [out, in / 256]
+    scale,  # float32 [out] or [out, 1]
+    block_size=256,
+    group_size=256,
+)
+weight.copy_from_trellis_(bitstreams, block_scales, scale)
+```
+
+A block is the run of weights that share one scale, as in GGUF and NVFP4; it is
+independent of the ConvRot rotation `group_size`. The bytes per block set the rate,
+so tensors in one model can use different rates. The streams already hold the
+weight rotated for `group_size`, so decoding does not rotate; contiguous `scale`
+storage is reused. `copy_from_trellis_` refills compatible existing storage, taking
+the block size from the weight's width. Decoding is exact: CUDA and HIP produce the
+same INT8 values. It requires a supported Triton accelerator and raises on other
+devices.
 
 ## Shard a quantized weight
 
