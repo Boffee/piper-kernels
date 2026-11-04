@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
@@ -9,10 +10,12 @@ from typing import cast
 import torch
 from torch.fx.node import Argument
 
+_AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
+
 
 @dataclass(frozen=True, slots=True)
 class ResidualAdd:
-    """A ``residual_add_(base, update, gate, gate_indices, python_indexing)`` call."""
+    """A functional ``residual_add_(base, update, gate, gate_indices, python_indexing)`` call."""
 
     node: torch.fx.Node
     base: torch.fx.Node
@@ -35,28 +38,25 @@ def bind_arguments(node: torch.fx.Node) -> dict[str, Argument]:
     return values
 
 
-def call_by_name(
+def call_functional(
     graph: torch.fx.Graph,
     target: torch._ops.OpOverload,
     values: Mapping[str, Argument],
 ) -> torch.fx.Node:
-    """Emit ``target`` with arguments taken by schema name; omitted ones use defaults."""
-    arguments: list[Argument] = []
-    kwargs: dict[str, Argument] = {}
-    deferred_defaults: list[Argument] = []
-    for argument in target._schema.arguments:
-        if argument.name in values:
-            if argument.kwarg_only:
-                kwargs[argument.name] = values[argument.name]
-            else:
-                arguments.extend(deferred_defaults)
-                deferred_defaults.clear()
-                arguments.append(values[argument.name])
-        elif not argument.has_default_value():
-            raise ValueError(f"{target} requires {argument.name}")
-        elif not argument.kwarg_only:
-            deferred_defaults.append(argument.default_value)
-    return graph.call_function(target, tuple(arguments), kwargs)
+    """Emit ``target``, which mutates only ``base``, as a functional call; return the new value.
+
+    Arguments are taken by schema name; omitted ones use their defaults. The graph
+    stays functional, so Inductor's reinplacing pass decides whether ``base`` is
+    updated in place or copied first.
+    """
+    call = graph.call_function(_AUTO_FUNCTIONALIZED, (target,), dict(values))
+    # The call returns the operator's result (None) followed by the new ``base``.
+    return graph.call_function(operator.getitem, (call, 1))
 
 
-__all__ = ["ResidualAdd", "bind_arguments", "call_by_name"]
+def functional_target(node: torch.fx.Node) -> object:
+    """The operator a functional call emitted by ``call_functional`` wraps, else ``None``."""
+    return node.args[0] if node.target is _AUTO_FUNCTIONALIZED else None
+
+
+__all__ = ["ResidualAdd", "bind_arguments", "call_functional", "functional_target"]

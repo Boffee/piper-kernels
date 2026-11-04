@@ -17,9 +17,12 @@ def residual_updates_compile_options(
     updated in place, and the caller must not read it or any view of its storage
     afterward. A gated ConvRot INT8 SwiGLU FFN update and the attention update before
     it add into the input; a fused dense ConvRot INT8 Piper attention output does so
-    without a full-size output. Other graphs are unchanged. Each update rounds the
-    input to its dtype. The returned options also set ``allow_buffer_reuse`` to
-    ``False``. See docs/attention.md#update-a-residual-stream-in-place for an example.
+    without a full-size output. Inductor adds an update in place only when the block
+    reads none of the input's original values afterward, through any view; otherwise
+    it copies the input first, which forgoes that update's saving. Other graphs are
+    unchanged. Each update rounds the input to its dtype. The returned options also
+    set ``allow_buffer_reuse`` to ``False``. See
+    docs/attention.md#update-a-residual-stream-in-place for an example.
     """
     from ._compile import (  # noqa: PLC0415 - keep compiler integration lazy
         residual_updates_compile_options as compile_options,

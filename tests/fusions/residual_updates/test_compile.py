@@ -3,6 +3,7 @@
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
+from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
@@ -10,6 +11,7 @@ from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
+from piper_kernels.fusions.residual_updates._graph import functional_target
 from piper_kernels.linear.convrot.int8 import _ops
 
 from ..convrot_int8_piper.test_compile import _available
@@ -29,8 +31,25 @@ class _Ffn(SwiGluFfn):
     output_features = 256
 
 
+class _FunctionalCapture(TargetCapturePass):
+    """Record each functional call as the mutating operator it wraps."""
+
+    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
+        super().__call__(graph, is_inference)
+        self.targets = [
+            functional_target(node) or node.target
+            for node in graph.nodes
+            if node.op == "call_function"
+        ]
+
+
 class _ResidualBlock(torch.nn.Module):
-    """Gated self-attention, then a gated SwiGLU FFN, over one hidden stream."""
+    """Gated self-attention, then a gated SwiGLU FFN, over one hidden stream.
+
+    A nonzero ``input_skip`` also adds that multiple of the original input to the FFN
+    input, read after the attention update through the row view attention normalization
+    read.
+    """
 
     width = 256
     heads = 4
@@ -38,8 +57,9 @@ class _ResidualBlock(torch.nn.Module):
     head_dim = 64
     rotary_dim = 48
 
-    def __init__(self) -> None:
+    def __init__(self, *, input_skip: float = 0.0) -> None:
         super().__init__()
+        self.input_skip = input_skip
         torch.manual_seed(1201)
         for name, rows, columns in (
             ("query", self.heads * self.head_dim, self.width),
@@ -79,7 +99,8 @@ class _ResidualBlock(torch.nn.Module):
         shift, scale, attention_gate, ffn_shift, ffn_scale, ffn_gate = self.modulation.split(
             self.width, dim=-1
         )
-        normalized = F.rms_norm(hidden, (self.width,), eps=1e-6)
+        rows = hidden.view(-1, self.width)
+        normalized = F.rms_norm(rows, (self.width,), eps=1e-6).view(hidden.shape)
         normalized = normalized * (1 + scale[gate_indices]) + shift[gate_indices]
         query = self._heads(
             _ops.linear(normalized, self.query_weight, self.query_scale, None, 256, None, None),
@@ -99,7 +120,10 @@ class _ResidualBlock(torch.nn.Module):
         merged = attended.transpose(1, 2).reshape(hidden.shape[0], hidden.shape[1], -1)
         attention = _ops.linear(merged, self.output_weight, self.output_scale, None, 64, None, None)
         residual = hidden + attention_gate[gate_indices] * attention
-        ffn_input = F.rms_norm(residual, (self.width,), eps=1e-6)
+        ffn_source = residual
+        if self.input_skip:
+            ffn_source = residual + (rows * self.input_skip).view(residual.shape)
+        ffn_input = F.rms_norm(ffn_source, (self.width,), eps=1e-6)
         ffn_input = ffn_input * (1 + ffn_scale[gate_indices]) + ffn_shift[gate_indices]
         return residual + ffn_gate[gate_indices] * self.ffn(ffn_input)
 
@@ -118,17 +142,20 @@ def _inputs(model, sequence):
     return hidden, angles.cos(), angles.sin(), gate_indices
 
 
-def _compiled_copy_back(model, capture, **options):
+def _compile_copy_back(model, options):
     def copy_back(hidden, cos, sin, gate_indices):
         return hidden.copy_(model(hidden, cos, sin, gate_indices))
 
     torch._dynamo.reset()
-    return torch.compile(
-        copy_back, fullgraph=True, dynamic=True, options=_options(capture, **options)
-    )
+    return torch.compile(copy_back, fullgraph=True, dynamic=True, options=options)
+
+
+def _relative_l2(actual, expected):
+    return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
 
 
 def _assert_updates_input_in_place(model, compiled):
+    ReinplaceCounters.clear()
     with torch.no_grad():
         for sequence in (65, 300):
             hidden, cos, sin, gate_indices = _inputs(model, sequence)
@@ -136,16 +163,17 @@ def _assert_updates_input_in_place(model, compiled):
             result = compiled(hidden, cos, sin, gate_indices)
 
             assert result.data_ptr() == hidden.data_ptr()
-            relative_l2 = (hidden.float() - expected.float()).norm() / expected.float().norm()
-            assert relative_l2 < 0.01
+            assert _relative_l2(hidden, expected) < 0.01
+    # Inductor added every update into the input instead of copying it first.
+    assert ReinplaceCounters.get_total_missed() == 0
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
 def test_copy_back_block_updates_its_input_in_place():
     model = _ResidualBlock()
-    capture = TargetCapturePass()
-    compiled = _compiled_copy_back(model, capture)
+    capture = _FunctionalCapture()
+    compiled = _compile_copy_back(model, _options(capture))
     _assert_updates_input_in_place(model, compiled)
 
     assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
@@ -159,8 +187,8 @@ def test_copy_back_block_updates_its_input_in_place():
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
 def test_unfused_attention_output_is_added_in_place_by_the_ffn_rewrite():
     model = _ResidualBlock()
-    capture = TargetCapturePass()
-    compiled = _compiled_copy_back(model, capture, fuse_output=False)
+    capture = _FunctionalCapture()
+    compiled = _compile_copy_back(model, _options(capture, fuse_output=False))
 
     _assert_updates_input_in_place(model, compiled)
 
@@ -168,6 +196,29 @@ def test_unfused_attention_output_is_added_in_place_by_the_ffn_rewrite():
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _ATTENTION_RESIDUAL_ADD not in capture.targets
     assert _FFN_UPDATES not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
+def test_input_read_after_an_update_is_copied_instead_of_overwritten():
+    model = _ResidualBlock(input_skip=16.0)
+    # Let the FFN, whose input mostly reads the original input, shape the result.
+    model.modulation[:, 5 * model.width :].mul_(100)
+    capture = _FunctionalCapture()
+    compiled = _compile_copy_back(model, _options(capture))
+    ReinplaceCounters.clear()
+    with torch.no_grad():
+        hidden, cos, sin, gate_indices = _inputs(model, 300)
+        expected = model(hidden.clone(), cos, sin, gate_indices)
+        result = compiled(hidden, cos, sin, gate_indices)
+
+    assert result.data_ptr() == hidden.data_ptr()
+    # The compiled block is within 2% of eager; reading the updated input would be 6% off.
+    assert _relative_l2(hidden, expected) < 0.03
+    # Inductor copies the input before the attention add, then adds into that copy.
+    assert ReinplaceCounters.get_total_missed() == 1
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
 
 
 @pytest.mark.gpu

@@ -12,9 +12,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   (`hidden.copy_(block(hidden, ...))`) add its gated updates into that input.
   A gated ConvRot INT8 SwiGLU FFN update and the attention update before it no
   longer allocate the block's new output buffer, and a fused dense ConvRot INT8
-  Piper output also drops its full-size output. Other graphs are unchanged.
-  Results can differ slightly because each update rounds the residual. The
-  returned options also disable Inductor buffer reuse.
+  Piper output also drops its full-size output. If the block still reads its
+  input's original values after an update, Inductor copies the input first
+  instead. Other graphs are unchanged. Results can differ slightly because each
+  update rounds the residual. The returned options also disable Inductor buffer
+  reuse.
 
 ### Changed
 

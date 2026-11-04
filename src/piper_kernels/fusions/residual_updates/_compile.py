@@ -1,8 +1,12 @@
-"""Rewrite copy-back residual blocks to add their updates into their input in place.
+"""Rewrite copy-back residual blocks so their updates can add into their input in place.
 
 A compiled block whose program ends with ``hidden.copy_(result)`` declares that the
-caller no longer needs ``hidden``; Inductor then permits writes to it. Two independent
-rewrites follow, joined only by the residual:
+caller no longer needs ``hidden``. The rewrite expresses the block's residual updates
+as operators that add into a ``base``, emitted as functional calls so the graph stays
+functional. Inductor's reinplacing pass, which runs after every custom pass and tracks
+every view of ``hidden``, then updates ``hidden`` in place when nothing reads its
+original value afterward and the copy back permits it; otherwise it copies ``hidden``
+first. Two independent rewrites follow, joined only by the residual:
 
 1. FFN residual adds. After FFN fusion, a block contains::
 
@@ -12,17 +16,19 @@ rewrites follow, joined only by the residual:
 
    which becomes::
 
-       residual_add_(hidden, update, gate, indices)      # hidden += gate[indices] * update
-       ffn_residual_add_(..., base=hidden, ...)          # hidden += ffn_gate[indices] * ffn
-                                                         # (the FFN input reads ``hidden``)
+       added = residual_add(hidden, update, gate, indices)  # hidden + gate[indices] * update
+       result = ffn_residual_add(..., base=added, ...)      # added + ffn_gate[indices] * ffn
+       hidden.copy_(result)                                 # (the FFN input reads ``added``)
 
-   Any producer of ``update`` qualifies; the block's new output buffer is gone.
+   Any producer of ``update`` qualifies. Once both adds are in place, the block's new
+   output buffer is gone.
 
 2. Attention residual adds. A registered attention output consumed only by a residual
-   add folds into its family's in-place operator, removing the full-size output.
+   add folds into its family's residual-add operator, removing the full-size output.
 
 Each FFN family registers its residual-add operator and each attention family its fold.
-Unmatched graphs are unchanged; debug logging reports what was rewritten.
+Unmatched graphs are unchanged; debug logging reports what was rewritten, and
+Inductor's reinplacing log reports any input it had to copy.
 """
 
 from __future__ import annotations
@@ -39,9 +45,9 @@ from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as convrot_int8
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _graph, _ops, triton
-from ._graph import ResidualAdd, bind_arguments, call_by_name
+from ._graph import ResidualAdd, bind_arguments, call_functional, functional_target
 
-type AttentionFold = Callable[[torch.fx.Graph, ResidualAdd], bool]
+type AttentionFold = Callable[[torch.fx.Graph, ResidualAdd], torch.fx.Node | None]
 
 _log = logging.getLogger(__name__)
 _COMPILE_PASS_VERSION = "residual-updates-compile-v3"
@@ -61,7 +67,7 @@ _FFN_RESIDUAL_ADDS: dict[object, torch._ops.OpOverload] = {
         _kernels.convrot_int8_swiglu_ffn_residual_add_.default
     ),
 }
-# Each attention output operator and the fold into its in-place residual add.
+# Each attention output operator and the fold into its residual-add operator.
 _ATTENTION_FOLDS: dict[object, AttentionFold] = {
     _kernels.convrot_int8_piper_projected_query_attention_output.default: (
         dense_attention.fold_residual_add
@@ -96,56 +102,56 @@ def _rewrite_ffn_updates(
     # Tensor operands of the two-update operator are graph nodes.
     base = cast(torch.fx.Node, values["base"])
     update = cast(torch.fx.Node, values["reusable_update"])
-    if base.op != "placeholder":
-        return False
+    # Without a copy back into ``base``, Inductor would copy it rather than update it in
+    # place, so the rewrite would only add work.
     copies = [user for user in update.users if user.target is _COPY]
     if len(copies) != 1 or copies[0].args != (base, update):
         return False
     (copy,) = copies
     # Another reader would expect ``update`` to hold the block result, which the
-    # rewrite writes into ``base`` instead.
+    # rewrite no longer stores there.
     readers = set(update.users) - {ffn, copy}
     if len(readers) != 1:
         _log.debug("%s: update %s has other consumers", ffn.name, update.name)
         return False
     (product,) = readers
     (residual,) = product.users
-    # Every other reader of the original input must precede the in-place add.
-    order = {node: index for index, node in enumerate(graph.nodes)}
-    if any(
-        user not in (residual, ffn, copy) and order[user] > order[residual] for user in base.users
-    ):
-        _log.debug("%s: %s is read after the residual update", ffn.name, base.name)
-        return False
 
     with graph.inserting_before(residual):
-        graph.call_function(
+        updated = call_functional(
+            graph,
             _RESIDUAL_ADD,
-            (
-                base,
-                update,
-                values["update_gate"],
-                values["gate_indices"],
-                values["python_indexing"],
-            ),
+            {
+                "base": base,
+                "update": update,
+                "gate": values["update_gate"],
+                "gate_indices": values["gate_indices"],
+                "python_indexing": values["python_indexing"],
+            },
         )
-    residual.replace_all_uses_with(base)
+    residual.replace_all_uses_with(updated)
     with graph.inserting_before(ffn):
-        call_by_name(
+        result = call_functional(
             graph,
             residual_add,
-            {name: value for name, value in values.items() if name not in _FIRST_UPDATE_ARGUMENTS},
+            {
+                **{
+                    name: value
+                    for name, value in values.items()
+                    if name not in _FIRST_UPDATE_ARGUMENTS
+                },
+                "base": updated,
+            },
         )
-    copy.replace_all_uses_with(base)
-    graph.erase_node(copy)
+    copy.args = (base, result)
     graph.erase_node(ffn)
-    _log.debug("%s: FFN updates %s in place", ffn.name, base.name)
+    _log.debug("%s: FFN adds into %s", ffn.name, base.name)
     return True
 
 
 def _fold_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
-    values = bind_arguments(node)
-    # Step 1 emitted this add with node operands and a constant index mode.
+    # Step 1 emitted this call by name, with node operands and a constant index mode.
+    values = node.kwargs
     add = ResidualAdd(
         node,
         cast(torch.fx.Node, values["base"]),
@@ -155,11 +161,15 @@ def _fold_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
         cast(bool, values["python_indexing"]),
     )
     fold = _ATTENTION_FOLDS.get(add.update.target)
-    if fold is None or not fold(graph, add):
+    folded = None if fold is None else fold(graph, add)
+    if folded is None:
         _log.debug("%s: %s stays materialized before its add", node.name, add.update.target)
         return
+    (added,) = node.users
+    added.replace_all_uses_with(folded)
+    graph.erase_node(added)
     graph.erase_node(node)
-    _log.debug("%s: %s adds into %s in place", node.name, add.update.target, add.base.name)
+    _log.debug("%s: %s adds into %s", node.name, add.update.target, add.base.name)
 
 
 class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
@@ -176,7 +186,7 @@ class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
         # Drop the replaced residual sums so each update's only consumer is its add.
         graph.eliminate_dead_code()
         for node in list(graph.nodes):
-            if node.target is _RESIDUAL_ADD:
+            if functional_target(node) is _RESIDUAL_ADD:
                 _fold_attention(graph, node)
         graph.eliminate_dead_code()
         graph.lint()

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.fusions.residual_updates._graph import ResidualAdd, bind_arguments, call_by_name
+from piper_kernels.fusions.residual_updates._graph import (
+    ResidualAdd,
+    bind_arguments,
+    call_functional,
+)
 
 from . import output
 
@@ -20,20 +24,22 @@ def source_files() -> tuple[str, ...]:
     return (__file__, output.__file__)
 
 
-def fold_residual_add(graph: torch.fx.Graph, add: ResidualAdd) -> bool:
+def fold_residual_add(graph: torch.fx.Graph, add: ResidualAdd) -> torch.fx.Node | None:
     """Add an exclusive dense attention output into the residual as it is projected.
 
-    The in-place operator takes the same attention operands. The residual add already
-    requires its update's dtype to match ``base``, so ``base`` supplies the output dtype.
+    Emits the attention residual-add operator, which takes the same attention operands,
+    before ``add`` and returns its new ``base``; returns ``None`` when the output has
+    other consumers. The residual add already requires its update's dtype to match
+    ``base``, so ``base`` supplies the output dtype.
     """
     attention = add.update
     if attention.target is not _ATTENTION_OUTPUT or set(attention.users) != {add.node}:
-        return False
+        return None
     operands = {
         name: value for name, value in bind_arguments(attention).items() if name != "output_dtype"
     }
     with graph.inserting_before(add.node):
-        call_by_name(
+        return call_functional(
             graph,
             _ATTENTION_RESIDUAL_ADD,
             {
@@ -44,7 +50,6 @@ def fold_residual_add(graph: torch.fx.Graph, add: ResidualAdd) -> bool:
                 "python_indexing": add.python_indexing,
             },
         )
-    return True
 
 
 __all__ = ["fold_residual_add", "source_files"]
