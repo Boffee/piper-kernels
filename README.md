@@ -31,7 +31,8 @@ For example, install `"piper-kernels[convrot,triton]"` for ConvRot INT8 GPU
 execution. On Linux, install the CUDA or ROCm PyTorch build and its matching
 Triton first; the extra does not install Linux Triton.
 
-On 64-bit Windows, the `triton` extra selects Triton 3.8 through
+On 64-bit Windows, the `triton` extra requires PyTorch 2.15 and selects its
+matching Triton 3.9 through
 [`triton-windows`](https://github.com/triton-lang/triton-windows). Optimized
 execution needs Windows 10 or 11, a supported GPU with a current driver, and
 the Visual C++ Redistributable for Visual Studio 2015–2022. For NVIDIA,

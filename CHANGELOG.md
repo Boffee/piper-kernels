@@ -5,6 +5,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- On Windows, the `triton` extra now requires PyTorch 2.15 and selects its matching
+  Triton 3.9 through `triton-windows`. A Triton 3.8 build does not match PyTorch 2.15's
+  compiler. Linux still supports PyTorch 2.14.
+
 ### Fixed
 
 - PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
