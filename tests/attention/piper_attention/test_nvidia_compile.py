@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 import triton
+from _nvidia_resources import ATTENTION_STACK_BUDGET_BYTES, stack_frame_bytes
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.experimental.gluon._runtime import GluonASTSource
@@ -152,6 +153,8 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
     assert ".s32.s8.s8.s32" in compiled.asm["ptx"]
     assert ".s32.u8.s8.s32" in compiled.asm["ptx"]
     assert "piper_attention_u8s8_dot_marker" not in compiled.asm["ptx"]
+    # This is the exact SM89 production kernel, unlike the pointer variants above.
+    assert stack_frame_bytes(compiled.asm["cubin"]) <= ATTENTION_STACK_BUDGET_BYTES
 
 
 @pytest.mark.parametrize("architecture", [89, 120])

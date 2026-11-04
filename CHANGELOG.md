@@ -17,6 +17,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `convrot_int8_add_` and `nvfp4_add_` custom ops; existing calls remain valid.
   If an earlier compile failed this way, clear the TorchInductor cache, which can
   retain the failing call.
+- SageAttention2++ on NVIDIA SM120 is no longer up to 36% slower with Triton 3.9,
+  and SM89 causal attention no longer up to 20% slower. These schedules disabled
+  loop-invariant code motion, which Triton 3.9 now applies to the query tile's
+  shared-memory copy. SM120 schedules and SM89 causal schedules now enable it.
+  On SM120 this changes Triton 3.8 timings by between 1% slower and 4% faster.
+  The SM89 schedules were timed on SM120, not on SM89 hardware.
 
 ## [0.7.10] - 2026-10-31
 

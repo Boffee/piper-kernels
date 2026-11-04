@@ -229,7 +229,7 @@ def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
         num_stages=2,
         use_tensor_descriptors=False,
         loop_num_stages=3,
-        loop_licm=True,
+        loop_licm=False,
     )
 
     with torch.no_grad():
