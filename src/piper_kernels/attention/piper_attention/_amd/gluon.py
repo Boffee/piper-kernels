@@ -5,7 +5,6 @@
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false, reportAttributeAccessIssue=false
 
-import re
 from dataclasses import dataclass
 
 import torch
@@ -13,9 +12,7 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from piper_kernels._triton import (
-    amd_warp_pipeline as _amd_warp_pipeline,  # noqa: F401 - installs the hook
-)
+from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
@@ -34,11 +31,11 @@ from .._quantization import compute_kv_means
 from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
 from .triton import prepare_value
 
-# Triton 3.9's LLVM SLP vectorizer bundles this kernel's per-tile FMAs into
-# vector FMAs that RDNA4 cannot execute natively. The extra live vectors cost
-# an occupancy level (188 -> 208 VGPRs); opaque scalar FMAs avoid that. On
-# Triton 3.8 the plain FMAs stay scalar and inline assembly costs 1-3%.
-_SCALAR_FMA_OPS = tuple(map(int, re.findall(r"\d+", triton.__version__)[:2])) >= (3, 9)
+# Launch attributes shared by every dense RDNA4 kernel compile.
+_LLVM_FN_ATTRS = (
+    ("target-features", "+cumode"),
+    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
+)
 
 
 @gluon.jit
@@ -114,7 +111,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
     is_causal: gl.constexpr,
     wide_query_offsets: gl.constexpr,
     wide_context_offsets: gl.constexpr,
-    scalar_fma_ops: gl.constexpr,
+    use_scalar_fma: gl.constexpr,
 ):
     head = gl.program_id(1).to(gl.int64)
     batch = gl.program_id(2).to(gl.int64)
@@ -159,7 +156,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
             wide_context_offsets,
             head_dim,
             two_tiles=False,
-            scalar_bias_fma=scalar_fma_ops,
+            use_scalar_fma=use_scalar_fma,
         )
         scale = query_scale * gl.load(key_scale_ptr + kv_batch_head * (key_storage // 64) + tile)
         key_rows = tile.to(gl.int64) * 64 + columns
@@ -175,7 +172,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
             scale = gl.where(scale == 0, 1.0, scale)
         multiplier = gl.load(multiplier_ptr + kv_batch_head * key_storage + key_rows[None, :])
         log_scale = gl.load(log_scale_ptr + kv_batch_head * key_storage + key_rows[None, :])
-        if scalar_fma_ops:
+        if use_scalar_fma:
             block_max = gl.max(scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
         else:
             block_max = gl.max(gl.fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
@@ -383,10 +380,10 @@ def launch_attention_into(
             context.is_causal,
             query_storage * (head_dim // 8) > (1 << 31),
             key_storage * head_dim > (1 << 32),
-            _SCALAR_FMA_OPS,
+            amd_compiler_workarounds.USE_SCALAR_FMA,
             num_warps=4,
             num_stages=1,
-            llvm_fn_attrs=(("target-features", "+cumode"),),
+            llvm_fn_attrs=_LLVM_FN_ATTRS,
         )
     return output
 

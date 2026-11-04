@@ -2,7 +2,13 @@
 
 import torch
 
-from piper_kernels._triton import amd_warp_pipeline, mixed_int8, reductions, runtime, targets
+from piper_kernels._triton import (
+    amd_compiler_workarounds,
+    mixed_int8,
+    reductions,
+    runtime,
+    targets,
+)
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.piper._amd import _wmma, fragments
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import _rotation as qk_rotation
@@ -20,7 +26,7 @@ from ._nvidia import triton as nvidia_backend
 def source_files() -> tuple[str, ...]:
     """Include preparation, dispatch, and launch semantics in compiler cache keys."""
     modules = (
-        amd_warp_pipeline,
+        amd_compiler_workarounds,
         mixed_int8,
         reductions,
         runtime,

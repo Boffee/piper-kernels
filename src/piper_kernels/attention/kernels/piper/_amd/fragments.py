@@ -58,9 +58,9 @@ def scalar_fma(a, b, c):
 
 
 @gluon.jit
-def _recover_scores(biased, scalar_fma: gl.constexpr):
+def _recover_scores(biased, use_scalar_fma: gl.constexpr):
     """Recover exact integer QK sums from the binade the accumulator bias selects."""
-    if scalar_fma:
+    if use_scalar_fma:
         # A literal 2^26 and an SGPR offset keep this FMA scalar without
         # spending VGPRs on splat constants; see scalar_fma.
         offset = gl.full(biased.shape, -10680707.0, gl.float32, biased.type.layout)
@@ -188,7 +188,7 @@ def qk_tiles(
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
     pipeline_priority: gl.constexpr = None,
-    scalar_bias_fma: gl.constexpr = False,
+    use_scalar_fma: gl.constexpr = False,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
 
@@ -217,7 +217,7 @@ def qk_tiles(
                 key = gl.load((key_ptr + offset).to(gl.pointer_type(gl.uint64)))
                 acc = int8_wmma(query[k], key, acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
-            results += (_recover_scores(result.to(gl.float32, bitcast=True), scalar_bias_fma),)
+            results += (_recover_scores(result.to(gl.float32, bitcast=True), use_scalar_fma),)
         pipeline_boundary("qk", pipeline_priority)
     return _join_matrix(results)
 
