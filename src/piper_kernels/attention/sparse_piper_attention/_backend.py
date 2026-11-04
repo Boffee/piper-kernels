@@ -160,9 +160,11 @@ def source_files() -> tuple[str, ...]:
         amd_policy.__file__,
     ]
     if amd_gluon is not None:
+        from piper_kernels._triton import amd_compiler_workarounds  # noqa: PLC0415
+
         from ._amd import _parameters  # noqa: PLC0415
 
-        paths.extend((amd_gluon.__file__, _parameters.__file__))
+        paths.extend((amd_gluon.__file__, _parameters.__file__, amd_compiler_workarounds.__file__))
     for implementation in (preparation, nvidia_tma_gluon, nvidia_async_copy_gluon, _route_backend):
         if implementation is not None:
             paths.append(implementation.__file__)

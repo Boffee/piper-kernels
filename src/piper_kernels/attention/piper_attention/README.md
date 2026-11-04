@@ -76,6 +76,17 @@ key tails and causal diagonals retain them. AMD uses round-to-nearest-even
 probability packing. FMA/reduction reassociation and backend rounding mean
 cross-backend bitwise equality is not promised.
 
+Two Triton 3.9 compiler changes cost this kernel 12–17% on RX 9070 XT. LLVM's SLP
+vectorizer bundles the per-tile score FMAs into vector FMAs, which RDNA4 cannot
+execute natively, raising D128 register use from 188 to 208 VGPRs and dropping
+occupancy from eight waves to seven. Triton 3.9 also pins each memory operation
+inside a warp-pipeline stage, which stops LLVM from hoisting and pairing K/V
+loads. On the affected Triton releases, the kernel issues those FMAs as scalar
+`v_fma_f32` inline assembly, which rounds identically, and opts out of the
+pinned loads. [`amd_compiler_workarounds`](../../_triton/amd_compiler_workarounds.py)
+owns both workarounds, the releases they apply to, and how to retire them. With
+both, Triton 3.9 runs within about 2% (D128) and 4% (D64) of Triton 3.8.
+
 `gfx1201` has hardware coverage on RX 9070 XT; `gfx1200` has offline compilation
 coverage. This does not establish exhaustive performance tuning. Use the shared
 [attention benchmark](../../../../benchmarks/README.md#run-the-suite)

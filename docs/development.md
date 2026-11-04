@@ -279,6 +279,12 @@ are not required. Use separate environments when comparing stable and nightly
 builds. Run the regressions below and representative benchmarks before promoting
 a new stack to the development or CI default.
 
+PyTorch 2.15 for ROCm 10.0 (`torch==2.15.0+rocm10.0` from PyTorch's `rocm10.0`
+index) with its Triton 3.9 also passes the regressions. Piper attention relies on
+RDNA4 code-generation workarounds there; see the
+[dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior).
+ConvRot INT8 linear and FFN kernels remain 2–5% slower with Triton 3.9 than 3.8.
+
 AMD dispatch accepts Linux and Windows with the same architecture limits;
 existing on-device validation is Linux-only. The documented INT8 hardware
 validation is RX 9070 XT (`gfx1201`); compiler coverage for other accepted targets

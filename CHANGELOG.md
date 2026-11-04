@@ -24,6 +24,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   3.9. SM89 causal schedules receive the same fix, but its timing was validated
   only on SM120. On SM120, Triton 3.8 timings change by between 1% slower and
   4% faster.
+- Piper attention on AMD RDNA4 avoids the slowdown with Triton 3.9 of 12–17% for
+  dense and about 3% for sparse attention. On RX 9070 XT, dense attention now
+  stays within about 2% (head dimension 128) to 4% (64) of Triton 3.8 and sparse
+  attention within about 1%. ConvRot INT8 linear and FFN remain 2–5% slower with
+  Triton 3.9. Behavior with Triton 3.8 is unchanged.
 
 ## [0.7.10] - 2026-10-31
 

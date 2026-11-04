@@ -13,6 +13,7 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
@@ -386,5 +387,6 @@ class _ContextLauncher:
                 num_stages=1,
                 llvm_fn_attrs=(
                     ("target-features", "-cumode" if launch.head_dim == 128 else "+cumode"),
+                    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
                 ),
             )

@@ -9,6 +9,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import AMDWMMALayout
 
+from piper_kernels._triton import amd_compiler_workarounds
+
 from ._wmma import int8_wmma, uint8_int8_wmma
 
 MMA_LAYOUT: gl.constexpr = AMDWMMALayout(
@@ -37,6 +39,48 @@ _RESCALE_CONSTRAINTS = gl.constexpr(
         for registers in (32, 64)
     )
 )
+
+
+# Whether FMAs that LLVM must not vectorize use opaque scalar assembly; see
+# amd_compiler_workarounds.USE_SCALAR_FMA. Kernels read it at compile time.
+_SCALAR_FMA: gl.constexpr = gl.constexpr(amd_compiler_workarounds.USE_SCALAR_FMA)
+
+
+@gluon.jit
+def scalar_fma(a, b, c):
+    """Compute ``gl.fma(a, b, c)`` without letting LLVM bundle it into vector FMAs.
+
+    RDNA4 has no packed FP32 FMA, so bundled FMAs only add register pressure.
+    Where that happens, one ``v_fma_f32`` per element keeps the same rounding.
+    """
+    if _SCALAR_FMA:
+        return gl.inline_asm_elementwise(
+            "v_fma_f32 $0, $1, $2, $3",
+            constraints="=v,v,v,v",
+            args=(a, b, c),
+            dtype=gl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    return gl.fma(a, b, c)
+
+
+@gluon.jit
+def _recover_scores(biased, scalar: gl.constexpr):
+    """Recover exact integer QK sums from the binade the accumulator bias selects."""
+    if scalar and _SCALAR_FMA:
+        # A literal 2^26 and an SGPR offset keep this FMA scalar without
+        # spending VGPRs on splat constants; see scalar_fma.
+        offset = gl.full(biased.shape, -10680707.0, gl.float32, biased.type.layout)
+        return gl.inline_asm_elementwise(
+            "v_fma_f32 $0, $1, 0x4c800000, $2",
+            constraints="=v,v,s",
+            args=(biased, offset),
+            dtype=gl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    return gl.fma(biased, 67108864.0, -10680707.0)
 
 
 @gluon.jit
@@ -152,11 +196,14 @@ def qk_tiles(
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
     pipeline_priority: gl.constexpr = None,
+    scalar_score_recovery: gl.constexpr = False,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
 
     Paired mode preserves sparse Piper's K128 layout. Single-tile mode ignores
     ``tile_1`` and returns K64 scores for dense Piper's per-tile recurrence.
+    ``scalar_score_recovery`` uses :func:`scalar_fma`'s form for score recovery,
+    which dense Piper needs; sparse Piper keeps plain FMAs, about 1% faster there.
     """
     offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
@@ -180,7 +227,9 @@ def qk_tiles(
                 key = gl.load((key_ptr + offset).to(gl.pointer_type(gl.uint64)))
                 acc = int8_wmma(query[k], key, acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
-            results += (gl.fma(result.to(gl.float32, bitcast=True), 67108864.0, -10680707.0),)
+            results += (
+                _recover_scores(result.to(gl.float32, bitcast=True), scalar_score_recovery),
+            )
         pipeline_boundary("qk", pipeline_priority)
     return _join_matrix(results)
 

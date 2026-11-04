@@ -12,6 +12,7 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
@@ -22,12 +23,19 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     qk_tiles,
     query_fragments,
     rescale_numerator,
+    scalar_fma,
 )
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 
 from .._quantization import compute_kv_means
 from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
 from .triton import prepare_value
+
+# Launch attributes shared by every dense RDNA4 kernel compile.
+_LLVM_FN_ATTRS = (
+    ("target-features", "+cumode"),
+    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
+)
 
 
 @gluon.jit
@@ -147,6 +155,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
             wide_context_offsets,
             head_dim,
             two_tiles=False,
+            scalar_score_recovery=True,
         )
         scale = query_scale * gl.load(key_scale_ptr + kv_batch_head * (key_storage // 64) + tile)
         key_rows = tile.to(gl.int64) * 64 + columns
@@ -162,7 +171,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
             scale = gl.where(scale == 0, 1.0, scale)
         multiplier = gl.load(multiplier_ptr + kv_batch_head * key_storage + key_rows[None, :])
         log_scale = gl.load(log_scale_ptr + kv_batch_head * key_storage + key_rows[None, :])
-        block_max = gl.max(gl.fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
+        block_max = gl.max(scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
         next_max = gl.maximum(running_max, block_max)
         old_weight = gl.exp2(running_max - next_max)
         current_weight = gl.exp2(block_max - next_max)
@@ -369,7 +378,7 @@ def launch_attention_into(
             key_storage * head_dim > (1 << 32),
             num_warps=4,
             num_stages=1,
-            llvm_fn_attrs=(("target-features", "+cumode"),),
+            llvm_fn_attrs=_LLVM_FN_ATTRS,
         )
     return output
 
