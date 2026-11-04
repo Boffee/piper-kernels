@@ -14,6 +14,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.weights.convrot.int8._policy import select_addmm_plan
 
+# Triton 3.9 removed RDNA2 (gfx103x) compile targets.
 _TARGETS = [
     GPUTarget("cuda", 70, 32),
     GPUTarget("cuda", 75, 32),
@@ -22,7 +23,7 @@ _TARGETS = [
             GPUTarget("hip", architecture, 64 if architecture == "gfx942" else 32),
             marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
         )
-        for architecture in ("gfx1030", "gfx1036", "gfx942", "gfx1201")
+        for architecture in ("gfx942", "gfx1201")
     ],
 ]
 
@@ -38,7 +39,7 @@ _TARGETS = [
                     sys.platform != "linux", reason="HIP compiler is Linux-only"
                 ),
             )
-            for architecture in ("gfx1030", "gfx1036", "gfx1100", "gfx942", "gfx1201")
+            for architecture in ("gfx1100", "gfx942", "gfx1201")
         ],
     ],
 )

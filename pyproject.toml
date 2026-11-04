@@ -29,7 +29,10 @@ convrot = ["torchao>=0.17"]
 nvfp4 = ["numpy>=2", "torchao>=0.18"]
 triton = [
     # Linux PyTorch distributions supply their matching CUDA or ROCm Triton.
-    "triton-windows>=3.8,<3.9; sys_platform == 'win32'",
+    # On Windows, triton-windows must match the Triton release PyTorch's
+    # compiler targets: 3.9 for PyTorch 2.15.
+    "torch>=2.15; sys_platform == 'win32'",
+    "triton-windows>=3.9,<3.10; sys_platform == 'win32'",
 ]
 
 [build-system]
@@ -127,13 +130,13 @@ version = "2.2.0"
 [tool.uv.sources]
 sageattention = { git = "https://github.com/thu-ml/SageAttention.git", rev = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5" }
 torch = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchao = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true

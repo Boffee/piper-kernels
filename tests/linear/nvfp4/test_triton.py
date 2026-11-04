@@ -282,8 +282,11 @@ def test_prepared_linear_bounds_workspace(
 
     peak = torch.cuda.max_memory_allocated() - baseline
     # Above the 128 MiB output, mixed bias gets at most 32 MiB of FP32 row workspace.
+    # PyTorch 2.15 also allocates its cuBLASLt workspace on every call by default.
     mixed_bias = bias_dtype is not None and bias_dtype is not output_dtype
-    workspace_limit = (33 if mixed_bias else 1) * 1024 * 1024
+    workspace_limit = (
+        33 if mixed_bias else 1
+    ) * 1024 * 1024 + torch.backends.cuda.cublaslt_workspace_size()
     assert peak < actual.numel() * actual.element_size() + workspace_limit
     expected_value = features / 16 * (1 / 8 if two_level else 1) + (bias is not None)
     assert (actual == expected_value).all()

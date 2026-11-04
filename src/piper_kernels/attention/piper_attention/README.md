@@ -29,8 +29,11 @@ probabilities. Preserve the all-zero scale guards and handle zero QK scales
 before applying masked infinities.
 
 GQA/MQA maps each query head to its KV head without repeating K/V storage.
-Query windows retain global row coordinates for causal masking. Changes to
-preparation, layouts, or rounding must also cover the
+Query windows retain global row coordinates for causal masking. Window shapes
+and output strides can change FMA contraction and final rounding; bitwise
+equality with a full launch is not guaranteed. Downstream INT8 activation
+quantization can amplify these small differences. Changes to preparation,
+layouts, or rounding must also cover the
 [projection-fusion consumers](../../fusions/convrot_int8_piper/README.md).
 
 ## NVIDIA scheduling
