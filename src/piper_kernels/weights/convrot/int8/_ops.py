@@ -51,8 +51,8 @@ def add_(
     group_size: int,
     alpha: float,
     rounding_seed: int | None = None,
-    *,
-    # Keep calls in existing compiled graphs valid.
+    # Last, so calls in existing compiled graphs stay valid. Not keyword-only:
+    # PyTorch 2.14 Inductor passes it in alpha's position.
     beta: float = 1.0,
 ) -> None:
     """Dispatch the stable add_ operation to a supported implementation."""
@@ -70,7 +70,6 @@ def _add_fake(
     _group_size: int,
     _alpha: float,
     _rounding_seed: int | None = None,
-    *,
-    beta: float = 1.0,
+    _beta: float = 1.0,
 ) -> None:
-    del beta
+    return None
