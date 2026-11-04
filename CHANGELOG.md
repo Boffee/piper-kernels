@@ -5,6 +5,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
+  NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
+  also apply again under PyTorch 2.15's stricter pattern matching, instead of
+  silently running unfused. Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
+- Compiled ConvRot INT8 `add_` no longer fails on PyTorch 2.14 with a
+  `rounding_seed` type error. PyTorch 2.14 Inductor moved the keyword-only `beta`
+  into `alpha`'s position, so `beta` is now the last positional argument of the
+  `convrot_int8_add_` and `nvfp4_add_` custom ops; existing calls remain valid.
+  If an earlier compile failed this way, clear the TorchInductor cache, which can
+  retain the failing call.
+
 ## [0.7.10] - 2026-10-31
 
 ### Added

@@ -153,6 +153,9 @@ def reshaped_quantized_attention_pattern(
     with_force_tiles: bool = False,
 ) -> CallFunction:
     """Match one materialized quantized attention result before projection."""
+    # PyTorch 2.15+ rejects nodes with undeclared non-default keywords, such as
+    # FP16 outputs; output fusions validate this dtype against the attention result.
+    output_dtype = KeywordArg("output_attention_dtype")
     operands = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_OPERAND_NAMES)
     policy = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_POLICY_NAMES)
     force_arguments = (
@@ -177,6 +180,7 @@ def reshaped_quantized_attention_pattern(
             ),
             *force_arguments,
             _users=1,
+            output_dtype=output_dtype,
         )
     else:
         block_lengths = KeywordArg("output_block_lengths") if with_block_lengths else None
@@ -194,6 +198,7 @@ def reshaped_quantized_attention_pattern(
             *policy,
             *optional_arguments,
             _users=1,
+            output_dtype=output_dtype,
         )
     return CallFunction(
         torch.ops.aten.reshape.default,

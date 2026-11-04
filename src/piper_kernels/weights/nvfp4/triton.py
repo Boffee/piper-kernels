@@ -344,8 +344,8 @@ def add_(
     swizzled: bool,
     high_first: bool,
     rounding_seed: int | None = None,
-    *,
-    # Keep calls in existing compiled graphs valid.
+    # Last, so calls in existing compiled graphs stay valid. Not keyword-only:
+    # PyTorch 2.14 Inductor can pass it in another argument's position.
     beta: float = 1.0,
 ) -> None:
     """Fuse a dense update and optional rotation into in-place NVFP4 packing."""
@@ -375,7 +375,6 @@ def _add_fake(
     _swizzled: bool,
     _high_first: bool,
     _rounding_seed: int | None = None,
-    *,
-    beta: float = 1.0,
+    _beta: float = 1.0,
 ) -> None:
-    del beta
+    return None

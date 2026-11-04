@@ -79,9 +79,11 @@ def _normalize_nvfp4_blocks(values, per_tensor_scale):
         block_amax * (1.0 / 6.0) / effective_global_scale,  # pyright: ignore[reportOperatorIssue]
         448.0,
     ).to(tl.float8e4nv)
-    reciprocal_scale = (1.0 / effective_global_scale) / encoded_scale.to(tl.float32)
+    # Compare the decoded scale: Triton 3.9 cannot lower FP8 comparisons.
+    decoded_scale = encoded_scale.to(tl.float32)
+    reciprocal_scale = (1.0 / effective_global_scale) / decoded_scale
     scaled = tl.where(
-        encoded_scale[:, None] == 0.0,
+        decoded_scale[:, None] == 0.0,
         tl.where(block_amax[:, None] == 0.0, 0.0, tl.where(values < 0.0, -6.0, 6.0)),  # pyright: ignore[reportArgumentType]
         tl.clamp(values * reciprocal_scale[:, None], -6.0, 6.0),
     )
