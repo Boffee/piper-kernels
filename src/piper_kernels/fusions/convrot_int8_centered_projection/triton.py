@@ -53,14 +53,15 @@ def finalize_mean(
     padding beyond ``sequence_length`` does not.
     """
     batch, groups, num_chunks, features = partials.shape
+    block_chunks, block_d = reductions.mean_reduction_tile(num_chunks)
     with device_context(partials.device):
-        _kernels._mean_finalize_kernel[(batch * groups, triton.cdiv(features, 64))](
+        _kernels._mean_finalize_kernel[(batch * groups, triton.cdiv(features, block_d))](
             partials,
             out,
             sequence_length,
             num_chunks,
             features=features,
-            block_chunks=triton.next_power_of_2(num_chunks),
-            block_d=64,
+            block_chunks=block_chunks,
+            block_d=block_d,
             num_warps=4,
         )
