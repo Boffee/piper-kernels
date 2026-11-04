@@ -44,17 +44,29 @@ def sage_attention_2pp(
     scale: float | None = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
-    """Run canonical SageAttention2++ 8+8 forward attention.
+    """Compute dense or causal attention with canonical SageAttention2++ 8+8.
 
-    Query, key, and value use ``[batch, heads, sequence, head_dim]`` layout
-    with FP16 or BF16 elements and contiguous head dimensions. Query and key
-    sequence lengths may differ for non-causal attention. ``scale`` defaults
-    to ``head_dim**-0.5``.
+    ``query``, ``key``, and ``value`` use strided
+    ``[batch, heads, sequence, head_dim]`` tensors on the same device, with
+    matching FP16 or BF16 dtype, batch size, head count, and head dimension of
+    64 or 128. The final dimension must be contiguous; outer dimensions may
+    be strided. Key and value shapes match. Head counts and sequence lengths
+    must be positive. Grouped-query attention is unsupported.
 
-    The optimized backend requires NVIDIA FP8 tensor cores with FP16
-    accumulation. Architecture-specific schedules are selected independently.
-    Other devices use the portable quantized reference, which is intended for
-    correctness rather than performance. This is an inference-only operator.
+    ``scale`` must be finite and positive and defaults to ``head_dim**-0.5``.
+    Non-causal calls allow different query and key lengths. ``is_causal=True``
+    requires equal lengths and lets query row ``i`` attend key rows through
+    ``i``; offset-causal decoding, arbitrary masks, and dropout are unsupported.
+
+    Returns a tensor with the query's shape, dtype, and device, without mutating
+    the inputs. This operator is inference-only: detach inputs or use
+    ``torch.no_grad()`` / ``torch.inference_mode()`` when they require gradients.
+
+    INT8 Q/K, FP8 probabilities/V, and FP16 tile accumulation approximate
+    floating-point attention. The optimized backend requires NVIDIA FP8 tensor
+    cores with FP16 accumulation and the Triton backend installed. Other
+    configurations use a slower reference for the same quantized algorithm,
+    not exact floating-point SDPA. Cross-backend bitwise equality is not promised.
     """
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)
     target = AcceleratorTarget.from_device(query.device)

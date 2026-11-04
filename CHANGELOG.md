@@ -9,20 +9,20 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
   NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
-  also apply again under PyTorch 2.15's stricter pattern matching, instead of
-  silently running unfused. Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
-- On AMD RDNA4 with Triton 3.9, dense Piper attention no longer runs 12–17% slower
-  than with Triton 3.8, nor sparse Piper attention about 3% slower. Triton 3.9
-  vectorizes the kernels' scalar FMAs and pins loads inside warp-pipeline stages;
-  dense attention now stays within about 2% (head dimension 128) and 4% (64) of
-  Triton 3.8, and sparse attention within about 1%. ConvRot INT8 linear and FFN
-  kernels remain 2–5% slower with Triton 3.9. Triton 3.8 is unaffected.
+  also apply again under PyTorch 2.15 instead of silently running unfused.
+  Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
 - Compiled ConvRot INT8 `add_` no longer fails on PyTorch 2.14 with a
-  `rounding_seed` type error. PyTorch 2.14 Inductor moved the keyword-only `beta`
-  into `alpha`'s position, so `beta` is now the last positional argument of the
-  `convrot_int8_add_` and `nvfp4_add_` custom ops; existing calls remain valid.
-  If an earlier compile failed this way, clear the TorchInductor cache, which can
-  retain the failing call.
+  `rounding_seed` type error; existing calls remain valid. If an earlier compile
+  failed this way, clear the TorchInductor cache, which can retain the failing call.
+- SageAttention2++ on NVIDIA SM120 avoids the slowdown of up to 36% with Triton
+  3.9. SM89 causal schedules receive the same fix, but its timing was validated
+  only on SM120. On SM120, Triton 3.8 timings change by between 1% slower and
+  4% faster.
+- Piper attention on AMD RDNA4 avoids the slowdown with Triton 3.9 of 12–17% for
+  dense and about 3% for sparse attention. On RX 9070 XT, dense attention now
+  stays within about 2% (head dimension 128) to 4% (64) of Triton 3.8 and sparse
+  attention within about 1%. ConvRot INT8 linear and FFN remain 2–5% slower with
+  Triton 3.9. Behavior with Triton 3.8 is unchanged.
 
 ## [0.7.10] - 2026-10-31
 

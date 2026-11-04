@@ -53,6 +53,7 @@ def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> N
                 grouped_qk=True,
                 use_tensor_descriptors=True,
                 use_packed_probability_conversion=False,
+                loop_licm=True,
             ),
         ),
         (
@@ -119,6 +120,7 @@ def test_sm120_uses_uniform_128_row_query_tiles(
 
     assert plan.block_m == 128
     assert plan.use_tensor_descriptors is (head_dim == 128)
+    assert plan.loop_licm
 
 
 def test_sm89_d128_causal_schedule_uses_measured_launch_policy() -> None:
@@ -132,6 +134,21 @@ def test_sm89_d128_causal_schedule_uses_measured_launch_policy() -> None:
     assert plan.num_warps == 4
     assert plan.num_stages == 2
     assert plan.reverse_causal_blocks
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "is_causal", "expected"),
+    [(64, False, False), (64, True, True), (128, True, True)],
+)
+def test_sm89_loop_licm_policy(head_dim: int, is_causal: bool, expected: bool) -> None:
+    plan = select_execution_plan(
+        _SM89,
+        candidate_block_m=128,
+        head_dim=head_dim,
+        is_causal=is_causal,
+    )
+
+    assert plan.loop_licm is expected
 
 
 def test_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> None:
