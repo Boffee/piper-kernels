@@ -1,4 +1,9 @@
-"""Versioned fixed input scales for the H3 VAE INT8 encoder."""
+"""Candidate fixed input scales for the H3 VAE INT8 encoder.
+
+The candidate layer selection uses group 64 for 128 input channels and 256
+otherwise, excluding RGB input convolutions and 1x1 shortcuts. Applications
+own layer eligibility, checkpoint compatibility, and quality validation.
+"""
 
 from types import MappingProxyType
 

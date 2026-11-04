@@ -64,5 +64,7 @@ wrongly or misinterpret the result.
 
 Follow [writing tests](docs/development.md#writing-tests) when changing coverage.
 Use the [development checks](docs/development.md#checks) for tests, lint,
-formatting, types, and hardware regressions. See [VERSIONING.md](VERSIONING.md)
-for compatibility and releases.
+formatting, types, and hardware regressions. Write commits, pull request
+descriptions, and changelog entries using the
+[contributor writing conventions](docs/development.md#commits-and-pull-requests).
+See [VERSIONING.md](VERSIONING.md) for compatibility and releases.

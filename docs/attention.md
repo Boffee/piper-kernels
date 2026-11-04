@@ -142,9 +142,7 @@ ID and count contents can change at fixed tensor shapes without recompiling; zer
 counts disable forcing without changing the compiled call. Explicit graph replay
 with a fixed ratio profile uses updated contents in the captured input buffers.
 Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 projection/output fusions
-preserve forced routing. Each invocation builds one compact membership bitset,
-shared across heads and query chunks. Routing scores, the coarse residual, and
-the total route budget retain their existing behavior.
+preserve forced routing. The coarse residual is unaffected.
 
 Changing sequence length or force capacity can also reuse a Torch graph when
 the caller marks the corresponding input dimensions dynamic before the compiled

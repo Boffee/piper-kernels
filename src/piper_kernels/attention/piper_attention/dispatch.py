@@ -46,26 +46,32 @@ def piper_attention(
     scale: float | None = None,
     is_causal: bool = False,
 ) -> torch.Tensor:
-    """Run Piper Attention's key-scaled UINT8-P/INT8-V forward attention.
+    """Compute dense or causal quantized attention, including grouped queries.
 
-    Query, key, and value use ``[batch, heads, sequence, head_dim]`` layout
-    with FP16 or BF16 elements and contiguous head dimensions. The query head
-    count may be an integer multiple of the shared key/value head count. Query and key
-    sequence lengths may differ for non-causal attention. ``scale`` defaults
-    to ``head_dim**-0.5``.
+    ``query``, ``key``, and ``value`` use strided
+    ``[batch, heads, sequence, head_dim]`` tensors on the same device, with
+    matching FP16 or BF16 dtype, batch size, and head dimension of 64 or 128.
+    The final dimension must be contiguous; outer dimensions may be strided.
+    Key and value shapes match. Head counts and sequence lengths must be positive;
+    query heads must be an integer multiple of KV heads. Query head ``h`` uses
+    KV head ``h // (query_heads // kv_heads)`` without repeating K/V storage.
 
-    The algorithm retains Sage-style INT8 QK and FP32 online softmax, then
-    quantizes each V row with its own signed-INT8 scale and folds that scale
-    into a UINT8 probability operand. Non-causal calls center V by its
-    sequence-wide per-feature mean and restore that mean in the epilogue;
-    causal calls remain uncentered so future V rows cannot affect earlier
-    outputs through quantization.
+    ``scale`` must be finite and positive and defaults to ``head_dim**-0.5``.
+    Non-causal calls allow different query and key lengths. ``is_causal=True``
+    requires equal lengths and lets query row ``i`` attend key rows through
+    ``i``; offset-causal decoding, arbitrary masks, and dropout are unsupported.
 
-    The optimized backend supports NVIDIA SM8x and consumer Blackwell SM12x,
-    where the packaged compiler extension can select mixed-sign MMAv2, and
-    ROCm RDNA4 (gfx1200/gfx1201) using native mixed-sign WMMA. Other devices
-    use the portable quantized reference. This is an inference-only
-    operator.
+    Returns a tensor with the query's shape, dtype, and device, without mutating
+    the inputs. This operator is inference-only: detach inputs or use
+    ``torch.no_grad()`` / ``torch.inference_mode()`` when they require gradients.
+
+    INT8 Q/K/V and UINT8 probabilities approximate floating-point attention.
+    Non-causal calls center V and restore its mean in the result; causal calls
+    leave V uncentered so future values cannot affect earlier quantization.
+    Native backends cover NVIDIA SM8x/SM12x and AMD RDNA4 (gfx1200/gfx1201)
+    with the required backend installed. Other configurations use a slower
+    reference for the same quantized algorithm, not exact floating-point SDPA.
+    Cross-backend bitwise equality is not promised.
     """
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)
     target = AcceleratorTarget.from_device(query.device)

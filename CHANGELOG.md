@@ -9,20 +9,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
   NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
-  also apply again under PyTorch 2.15's stricter pattern matching, instead of
-  silently running unfused. Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
+  also apply again under PyTorch 2.15 instead of silently running unfused.
+  Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
 - Compiled ConvRot INT8 `add_` no longer fails on PyTorch 2.14 with a
-  `rounding_seed` type error. PyTorch 2.14 Inductor moved the keyword-only `beta`
-  into `alpha`'s position, so `beta` is now the last positional argument of the
-  `convrot_int8_add_` and `nvfp4_add_` custom ops; existing calls remain valid.
-  If an earlier compile failed this way, clear the TorchInductor cache, which can
-  retain the failing call.
-- SageAttention2++ on NVIDIA SM120 is no longer up to 36% slower with Triton 3.9,
-  and SM89 causal attention no longer up to 20% slower. These schedules disabled
-  loop-invariant code motion, which Triton 3.9 now applies to the query tile's
-  shared-memory copy. SM120 schedules and SM89 causal schedules now enable it.
-  On SM120 this changes Triton 3.8 timings by between 1% slower and 4% faster.
-  The SM89 schedules were timed on SM120, not on SM89 hardware.
+  `rounding_seed` type error; existing calls remain valid. If an earlier compile
+  failed this way, clear the TorchInductor cache, which can retain the failing call.
+- SageAttention2++ on NVIDIA SM120 avoids the slowdown of up to 36% with Triton
+  3.9. SM89 causal schedules receive the same fix, but its timing was validated
+  only on SM120. On SM120, Triton 3.8 timings change by between 1% slower and
+  4% faster.
 
 ## [0.7.10] - 2026-10-31
 
