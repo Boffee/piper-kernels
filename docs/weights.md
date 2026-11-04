@@ -330,9 +330,10 @@ independent of the ConvRot rotation `group_size`. The bytes per block set the ra
 so tensors in one model can use different rates. The streams already hold the
 weight rotated for `group_size`, so decoding does not rotate; contiguous `scale`
 storage is reused. `copy_from_trellis_` refills compatible existing storage, taking
-the block size from the weight's width. Decoding is exact: CUDA and HIP produce the
-same INT8 values. It requires a supported Triton accelerator and raises on other
-devices.
+the block size from the weight's width. Decoding is exact by construction, so every
+backend produces the same INT8 values; this is validated on NVIDIA, and AMD decoding
+has compile coverage only. It requires a supported Triton accelerator and raises on
+other devices.
 
 ## Shard a quantized weight
 

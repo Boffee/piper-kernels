@@ -28,6 +28,7 @@ from ._layout import (
     TrellisLayout,
 )
 
+# Untuned launch shape: decode is off the critical path (see the README).
 _BLOCKS_PER_PROGRAM = 8
 _NUM_WARPS = 4
 _STATE_BITS = tl.constexpr(STATE_BITS)
@@ -38,7 +39,7 @@ _CODE_RECIPROCAL = tl.constexpr(CODE_RECIPROCAL)
 
 
 @triton.jit
-def _e4m3_to_fp32(code):
+def _decode_e4m3(code):
     """Exact FP32 value of FP8 E4M3 bits, without relying on backend FP8 support."""
     sign = code >> 7
     exponent = (code >> 3) & 15
@@ -54,6 +55,7 @@ def _read_bits(block_bytes, bytes_per_block, valid, start_bit, num_bits):
     """``num_bits`` (at most 16) stream bits from ``start_bit``, most significant first."""
     byte = start_bit // 8
     window = tl.zeros(start_bit.shape, tl.uint32)
+    # Triton's typing does not declare static_range iterable.
     for index in tl.static_range(3):  # pyright: ignore[reportGeneralTypeIssues]
         in_stream = valid & (byte + index < bytes_per_block)
         value = tl.load(block_bytes + byte + index, mask=in_stream, other=0)
@@ -100,7 +102,7 @@ def decode_int8_kernel(
     numerators -= _CODE_OFFSET
 
     scale_codes = tl.load(block_scales + blocks, mask=block_mask, other=0)
-    multipliers = _e4m3_to_fp32(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
+    multipliers = _decode_e4m3(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
     scaled = numerators.to(tl.float32) * multipliers[:, None]
     values = libdevice.rint(tl.clamp(scaled, -127.0, 127.0)).to(tl.int8)
     destination = blocks.to(tl.int64)[:, None] * block_size + steps[None, :]

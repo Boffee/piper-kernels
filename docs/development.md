@@ -35,7 +35,8 @@ The source-local READMEs explain implementation details for
 [dense attention](../src/piper_kernels/attention/piper_attention/README.md),
 [dense projection fusion](../src/piper_kernels/fusions/convrot_int8_piper/README.md),
 [NVIDIA INT8 linear](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md),
-[Conv3D](../src/piper_kernels/conv3d/convrot/int8/README.md), and the
+[Conv3D](../src/piper_kernels/conv3d/convrot/int8/README.md),
+[trellis-coded weights](../src/piper_kernels/trellis/README.md), and the
 [MiniMax-H3 encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
 Tests follow the operator and format structure in [`tests/`](../tests).
 

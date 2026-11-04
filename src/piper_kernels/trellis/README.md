@@ -56,7 +56,9 @@ A block's `B` bits are stored most significant bit first.
    weight.
 
 Both products are single IEEE FP32 multiplies of exactly representable values, so
-CUDA, HIP and the PyTorch reference decode identical INT8 values. Scales must not
+CUDA, HIP and the PyTorch reference decode identical INT8 values by construction.
+Tests confirm this on NVIDIA hardware; on AMD the kernel has so far only been
+compiled (gfx942, gfx1201), not run. Scales must not
 be NaN encodings (`0x7F`, `0xFF`); this is a caller precondition, not a runtime
 check.
 
@@ -79,11 +81,14 @@ chooses the largest multiple of 16 up to 256 that divides it: 256 for most width
 [`triton.py`](triton.py) decodes a tile of 8 blocks per program. Each weight
 computes its offset in closed form and gathers the at most three bytes holding its
 window. The few windows within 16 bits of the stream's end join its last bits to
-its first. The kernel takes the layout as runtime arguments, so one compiled
-kernel serves every rate.
+its first. The kernel takes the rate as runtime arguments, so one compiled kernel
+serves every rate.
 
 On an RTX 5090 it decodes about 600 G weights/s at every rate. That consumes
 packed bytes about ten times faster than a pinned PCIe copy delivers them (33 GB/s
-measured), so blocks are stored packed rather than padded to words.
+measured), so blocks are stored packed rather than padded to words. For the same
+reason the launch shape (8 blocks per program, 4 warps) was not tuned: decode is
+not on the transfer's critical path. It has not been measured on AMD, including
+wave64 targets such as gfx942.
 [`_reference.py`](_reference.py) is the PyTorch oracle; tests check both against
 blocks encoded by the research encoder.

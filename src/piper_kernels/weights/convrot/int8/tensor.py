@@ -212,9 +212,10 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         ``block_scales`` is FP8 E4M3 ``[out, in / T]``, and ``scale`` is the FP32
         row scale, ``[out]`` or ``[out, 1]``. The streams already hold the weight
         rotated for ``group_size``, so decoding produces its INT8 values without
-        rotating; contiguous ``scale`` storage is reused. The result is exact:
-        every backend decodes the same INT8 values. Decoding requires a supported
-        Triton accelerator, including ROCm, and raises on other devices.
+        rotating; contiguous ``scale`` storage is reused. Decoding is exact by
+        construction, so every backend produces the same INT8 values. It requires a
+        supported Triton accelerator and raises on other devices; it is validated on
+        NVIDIA, and ROCm has compile coverage only.
         """
         from piper_kernels.weights.convrot.int8._trellis import convert  # noqa: PLC0415
 
