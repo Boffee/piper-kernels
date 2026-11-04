@@ -1,6 +1,8 @@
 """Offline coverage of dense RDNA4 signed QK and mixed-sign PV lowering."""
 
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,7 +25,6 @@ def _compile_dense_kernel(
     dtype="bf16",
     wide=False,
     *,
-    use_scalar_fma=amd_compiler_workarounds.USE_SCALAR_FMA,
     llvm_fn_attrs=amd_gluon._LLVM_FN_ATTRS,
 ):
     constants = {
@@ -32,7 +33,6 @@ def _compile_dense_kernel(
         "is_causal": causal,
         "wide_query_offsets": wide,
         "wide_context_offsets": wide,
-        "use_scalar_fma": use_scalar_fma,
     }
     kernel = amd_gluon._dense_piper_kernel
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
@@ -82,12 +82,33 @@ def test_dense_amd_compilation(architecture, head_dim, causal, dtype, wide):
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final output only
 
 
+def _compile_llvm_ir_with_scalar_fma(scalar_fma: bool, head_dim: int = 128) -> str:
+    """Compile in a fresh process: Triton keys kernels on globals at first compile."""
+    tests_root = Path(__file__).resolve().parents[2]
+    script = f"""
+import sys
+from triton.experimental.gluon import language as gl
+from piper_kernels.attention.kernels.piper._amd import fragments
+
+fragments._SCALAR_FMA = gl.constexpr({scalar_fma!r})
+sys.path.insert(0, {str(tests_root)!r})
+from attention.piper_attention.test_amd_compile import _compile_dense_kernel
+
+sys.stdout.write(_compile_dense_kernel(head_dim={head_dim}).asm["llir"])
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_dense_amd_scalar_fma_emits_no_vector_fma(head_dim):
-    compiled = _compile_dense_kernel(head_dim=head_dim, use_scalar_fma=True)
+    llvm_ir = _compile_llvm_ir_with_scalar_fma(True, head_dim)
     # RDNA4 has no packed FP32 FMA, so vector FMAs would only add register pressure.
-    assert "@llvm.fma.v" not in compiled.asm["llir"]
-    assert "v_fma_f32 $0, $1, 0x4c800000, $2" in compiled.asm["llir"]  # QK score recovery
+    assert "@llvm.fma.v" not in llvm_ir
+    assert "v_fma_f32 $0, $1, 0x4c800000, $2" in llvm_ir  # QK score recovery
 
 
 @pytest.mark.skipif(
@@ -95,9 +116,9 @@ def test_dense_amd_scalar_fma_emits_no_vector_fma(head_dim):
     reason="the installed Triton keeps these FMAs scalar",
 )
 def test_dense_amd_plain_fma_is_still_vectorized():
-    compiled = _compile_dense_kernel(use_scalar_fma=False)
-    # When this fails, Triton no longer vectorizes these FMAs: remove USE_SCALAR_FMA.
-    assert "@llvm.fma.v" in compiled.asm["llir"]
+    # When this fails, the installed Triton no longer vectorizes these FMAs:
+    # retire USE_SCALAR_FMA as amd_compiler_workarounds describes.
+    assert "@llvm.fma.v" in _compile_llvm_ir_with_scalar_fma(False)
 
 
 @pytest.mark.skipif(
@@ -108,7 +129,8 @@ def test_dense_amd_launch_attributes_unpin_warp_pipeline_loads():
     pinned = _compile_dense_kernel(llvm_fn_attrs=(("target-features", "+cumode"),))
     unpinned = _compile_dense_kernel()
     # The first check fails if Triton changes how it pins loads, which would
-    # otherwise silently disable the workaround.
+    # otherwise silently disable the workaround, or stops pinning them: then
+    # retire the workaround as amd_compiler_workarounds describes.
     assert _PINNED_LOAD_BARRIER in pinned.asm["llir"]
     assert _PINNED_LOAD_BARRIER not in unpinned.asm["llir"]
     assert "sched_barrier mask(0x00000001)" not in unpinned.asm["amdgcn"]

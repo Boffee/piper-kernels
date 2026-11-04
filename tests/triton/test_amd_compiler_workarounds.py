@@ -29,6 +29,27 @@ _OPT_IN = SimpleNamespace(
 _NO_OPT_IN = SimpleNamespace(llvm_fn_attrs=(("target-features", "+cumode"),))
 
 
+@pytest.mark.parametrize(
+    ("version", "fixed", "applies"),
+    [
+        ((3, 8), None, False),
+        ((3, 9), None, True),
+        ((3, 12), None, True),
+        ((3, 9), (3, 10), True),
+        ((3, 10), (3, 10), False),
+    ],
+)
+def test_workarounds_apply_from_first_release_until_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int],
+    fixed: tuple[int, int] | None,
+    applies: bool,
+) -> None:
+    monkeypatch.setattr(amd_compiler_workarounds, "_TRITON_VERSION", version)
+
+    assert amd_compiler_workarounds._applies_to_installed_triton((3, 9), fixed) is applies
+
+
 def test_strip_removes_pinned_load_barriers_and_keeps_stage_boundaries() -> None:
     stripped = amd_compiler_workarounds.strip_memory_order_barriers(_KERNEL_IR)
 

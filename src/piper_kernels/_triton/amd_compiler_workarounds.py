@@ -2,7 +2,7 @@
 
 Two Triton 3.9 compiler changes made dense Piper attention 12-17% slower on
 RX 9070 XT, and sparse Piper attention about 3% slower. Each workaround below
-applies only with Triton 3.9 or newer; remove it once Triton addresses its cause.
+applies to a range of Triton releases.
 
 1. Triton 3.8.0 disabled LLVM's ``slp-copyable-elements`` for that release only.
    With it enabled, the SLP vectorizer bundles scalar FMAs into vector FMAs.
@@ -10,14 +10,23 @@ applies only with Triton 3.9 or newer; remove it once Triton addresses its cause
    D128 attention grows from 188 to 208 VGPRs and drops from eight waves to
    seven. Kernels that read :data:`USE_SCALAR_FMA` issue those FMAs as opaque
    scalar instructions instead. Remove this once Triton disables that
-   vectorization for AMD again or offers a per-kernel opt-out.
+   vectorization for AMD again or offers a per-kernel opt-out. Uses:
+   ``_SCALAR_FMA``, ``scalar_fma``, and ``qk_tiles(scalar_score_recovery=...)``
+   in the shared RDNA4 fragments, and their dense Piper callers.
 2. triton-lang/triton#10840 adds a scheduling barrier after every memory
    operation in a warp-pipeline stage. That keeps CDNA GEMM prefetches in order,
    but it pins Piper's K/V loads beside their WMMAs, so LLVM can no longer hoist
    or pair them. Kernels that pass :data:`UNPINNED_WARP_PIPELINE_ATTRS` in their
    ``llvm_fn_attrs`` have those barriers removed from their LLVM IR; stage
    boundaries remain. Remove this once Triton scopes the barriers or offers an
-   opt-out.
+   opt-out. Uses: :data:`UNPINNED_WARP_PIPELINE_ATTRS` at the dense and sparse
+   Piper launches, and the stage hook below.
+
+To retire a workaround, set its ``fixed`` version below when a Triton release
+addresses the cause; releases from then on compile without it. Once Piper's
+minimum supported Triton reaches ``fixed``, delete the workaround and the uses
+it lists. Tests in ``tests/attention/piper_attention/test_amd_compile.py`` fail
+when an installed Triton no longer needs a workaround that still applies.
 """
 
 from __future__ import annotations
@@ -33,9 +42,14 @@ import triton
 from triton import knobs
 
 _TRITON_VERSION = tuple(int(part) for part in re.findall(r"\d+", triton.__version__)[:2])
-_HAS_TRITON_3_9_CODEGEN = _TRITON_VERSION >= (3, 9)
 
-USE_SCALAR_FMA = _HAS_TRITON_3_9_CODEGEN
+
+def _applies_to_installed_triton(first: tuple[int, int], fixed: tuple[int, int] | None) -> bool:
+    """Whether the installed Triton is in ``[first, fixed)``; ``fixed=None`` is unfixed."""
+    return first <= _TRITON_VERSION and (fixed is None or fixed > _TRITON_VERSION)
+
+
+USE_SCALAR_FMA = _applies_to_installed_triton(first=(3, 9), fixed=None)
 """Whether RDNA4 kernels issue FMAs that LLVM must not vectorize as scalar assembly.
 
 On Triton 3.8 plain FMAs stay scalar, and inline assembly would cost 1-3% because
@@ -43,12 +57,13 @@ the compiler cannot dual-issue it.
 """
 
 _UNPINNED_WARP_PIPELINE_MARKER = "piper-unpinned-warp-pipeline"
+_PINS_WARP_PIPELINE_MEMORY = _applies_to_installed_triton(first=(3, 9), fixed=None)
 UNPINNED_WARP_PIPELINE_ATTRS: tuple[tuple[str, str], ...] = (
-    ((_UNPINNED_WARP_PIPELINE_MARKER, ""),) if _HAS_TRITON_3_9_CODEGEN else ()
+    ((_UNPINNED_WARP_PIPELINE_MARKER, ""),) if _PINS_WARP_PIPELINE_MEMORY else ()
 )
 """``llvm_fn_attrs`` entries that opt a warp-pipelined kernel out of pinned loads.
 
-LLVM ignores the attribute itself. It is empty with Triton 3.8, which adds no
+LLVM ignores the attribute itself. It is empty for Triton releases that add no
 such barriers, so those kernels compile unchanged.
 """
 
@@ -123,5 +138,5 @@ def _register() -> None:
 
 # Install at import so every kernel's cache identity is settled before the first
 # compile; installing later would recompile kernels that were already cached.
-if torch.version.hip is not None and _HAS_TRITON_3_9_CODEGEN:
+if torch.version.hip is not None and _PINS_WARP_PIPELINE_MEMORY:
     _register()

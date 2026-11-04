@@ -111,7 +111,6 @@ def _dense_piper_kernel(  # noqa: PLR0915
     is_causal: gl.constexpr,
     wide_query_offsets: gl.constexpr,
     wide_context_offsets: gl.constexpr,
-    use_scalar_fma: gl.constexpr,
 ):
     head = gl.program_id(1).to(gl.int64)
     batch = gl.program_id(2).to(gl.int64)
@@ -156,7 +155,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
             wide_context_offsets,
             head_dim,
             two_tiles=False,
-            use_scalar_fma=use_scalar_fma,
+            scalar_score_recovery=True,
         )
         scale = query_scale * gl.load(key_scale_ptr + kv_batch_head * (key_storage // 64) + tile)
         key_rows = tile.to(gl.int64) * 64 + columns
@@ -172,10 +171,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
             scale = gl.where(scale == 0, 1.0, scale)
         multiplier = gl.load(multiplier_ptr + kv_batch_head * key_storage + key_rows[None, :])
         log_scale = gl.load(log_scale_ptr + kv_batch_head * key_storage + key_rows[None, :])
-        if use_scalar_fma:
-            block_max = gl.max(scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
-        else:
-            block_max = gl.max(gl.fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
+        block_max = gl.max(scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
         next_max = gl.maximum(running_max, block_max)
         old_weight = gl.exp2(running_max - next_max)
         current_weight = gl.exp2(block_max - next_max)
@@ -380,7 +376,6 @@ def launch_attention_into(
             context.is_causal,
             query_storage * (head_dim // 8) > (1 << 31),
             key_storage * head_dim > (1 << 32),
-            amd_compiler_workarounds.USE_SCALAR_FMA,
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=_LLVM_FN_ATTRS,
