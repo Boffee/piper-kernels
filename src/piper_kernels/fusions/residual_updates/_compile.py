@@ -6,25 +6,24 @@ as operators that add into a ``base``, emitted as functional calls so the graph 
 functional. Inductor's reinplacing pass, which runs after every custom pass and tracks
 every view of ``hidden``, then updates ``hidden`` in place when nothing reads its
 original value afterward and the copy back permits it; otherwise it copies ``hidden``
-first. Two independent rewrites follow, joined only by the residual:
+first.
 
-1. FFN residual adds. After FFN fusion, a block contains::
+After FFN fusion, a block contains::
 
-       residual = hidden + gate[indices] * update        # feeds the FFN input
-       ffn_gated_updates_(..., base=hidden, reusable_update=update, update_gate=gate, ...)
-       hidden.copy_(update)
+    residual = hidden + gate[indices] * update        # feeds the FFN input
+    ffn_gated_updates_(..., base=hidden, reusable_update=update, update_gate=gate, ...)
+    hidden.copy_(update)
 
-   which becomes::
+which becomes::
 
-       added = residual_add(hidden, update, gate, indices)  # hidden + gate[indices] * update
-       result = ffn_residual_add(..., base=added, ...)      # added + ffn_gate[indices] * ffn
-       hidden.copy_(result)                                 # (the FFN input reads ``added``)
+    added = residual_add(hidden, update, gate, indices)  # hidden + gate[indices] * update
+    result = ffn_residual_add(..., base=added, ...)      # added + ffn_gate[indices] * ffn
+    hidden.copy_(result)                                 # (the FFN input reads ``added``)
 
-   Any producer of ``update`` qualifies. Once both adds are in place, the block's new
-   output buffer is gone.
-
-2. Attention residual adds. A registered attention output consumed only by a residual
-   add folds into its family's residual-add operator, removing the full-size output.
+Any producer of ``update`` qualifies; once both adds are in place, the block's new
+output buffer is gone. The rewrite leaves ``update`` with no other consumer, so when it
+is a registered attention output, its family's fold computes it inside the add instead,
+and the full-size attention output is gone too.
 
 Each FFN family registers its residual-add operator and each attention family its fold.
 Unmatched graphs are unchanged; debug logging reports what was rewritten, and
@@ -39,15 +38,21 @@ from typing import cast
 
 import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass, get_hash_for_files
+from torch.fx.node import Argument
 
 from piper_kernels.fusions.convrot_int8_piper import _residual_compile as dense_attention
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as convrot_int8_swiglu_ffn
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _graph, _ops, triton
-from ._graph import ResidualAdd, bind_arguments, call_functional, functional_target
+from ._graph import bind_arguments, call_functional
 
-type AttentionFold = Callable[[torch.fx.Graph, ResidualAdd], torch.fx.Node | None]
+# Emits an attention output and its residual add as one functional call, given the
+# output node and the add's ``base``, ``gate``, ``gate_indices``, and
+# ``python_indexing``; returns the new ``base``.
+type AttentionFold = Callable[
+    [torch.fx.Graph, torch.fx.Node, Mapping[str, Argument]], torch.fx.Node
+]
 
 _log = logging.getLogger(__name__)
 _COMPILE_PASS_VERSION = "residual-updates-compile-v3"
@@ -67,7 +72,7 @@ _FFN_RESIDUAL_ADDS: dict[object, torch._ops.OpOverload] = {
         _kernels.convrot_int8_swiglu_ffn_residual_add_.default
     ),
 }
-# Each attention output operator and the fold into its residual-add operator.
+# Each attention output operator and the fold that computes it inside its residual add.
 _ATTENTION_FOLDS: dict[object, AttentionFold] = {
     _kernels.convrot_int8_piper_projected_query_attention_output.default: (
         dense_attention.fold_residual_add
@@ -117,59 +122,34 @@ def _rewrite_ffn_updates(
     (product,) = readers
     (residual,) = product.users
 
+    first_update: dict[str, Argument] = {
+        "base": base,
+        "gate": values["update_gate"],
+        "gate_indices": values["gate_indices"],
+        "python_indexing": values["python_indexing"],
+    }
+    fold = _ATTENTION_FOLDS.get(update.target)
     with graph.inserting_before(residual):
-        updated = call_functional(
-            graph,
-            _RESIDUAL_ADD,
-            {
-                "base": base,
-                "update": update,
-                "gate": values["update_gate"],
-                "gate_indices": values["gate_indices"],
-                "python_indexing": values["python_indexing"],
-            },
-        )
-    residual.replace_all_uses_with(updated)
+        if fold is None:
+            added = call_functional(graph, _RESIDUAL_ADD, {**first_update, "update": update})
+        else:
+            added = fold(graph, update, first_update)
+    residual.replace_all_uses_with(added)
+    ffn_update = {
+        name: value for name, value in values.items() if name not in _FIRST_UPDATE_ARGUMENTS
+    }
     with graph.inserting_before(ffn):
-        result = call_functional(
-            graph,
-            residual_add,
-            {
-                **{
-                    name: value
-                    for name, value in values.items()
-                    if name not in _FIRST_UPDATE_ARGUMENTS
-                },
-                "base": updated,
-            },
-        )
+        result = call_functional(graph, residual_add, {**ffn_update, "base": added})
     copy.args = (base, result)
     graph.erase_node(ffn)
-    _log.debug("%s: FFN adds into %s", ffn.name, base.name)
-    return True
-
-
-def _fold_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
-    # Step 1 emitted this call by name, with node operands and a constant index mode.
-    values = node.kwargs
-    add = ResidualAdd(
-        node,
-        cast(torch.fx.Node, values["base"]),
-        cast(torch.fx.Node, values["update"]),
-        values["gate"],
-        values["gate_indices"],
-        cast(bool, values["python_indexing"]),
+    _log.debug(
+        "%s: %s %s its add, and the FFN adds into %s",
+        ffn.name,
+        update.target,
+        "folds into" if fold is not None else "stays materialized before",
+        base.name,
     )
-    fold = _ATTENTION_FOLDS.get(add.update.target)
-    folded = None if fold is None else fold(graph, add)
-    if folded is None:
-        _log.debug("%s: %s stays materialized before its add", node.name, add.update.target)
-        return
-    (added,) = node.users
-    added.replace_all_uses_with(folded)
-    graph.erase_node(added)
-    graph.erase_node(node)
-    _log.debug("%s: %s adds into %s", node.name, add.update.target, add.base.name)
+    return True
 
 
 class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
@@ -181,15 +161,10 @@ class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
             residual_add = _FFN_RESIDUAL_ADDS.get(node.target)
             if residual_add is not None:
                 changed = _rewrite_ffn_updates(graph, node, residual_add) or changed
-        if not changed:
-            return
-        # Drop the replaced residual sums so each update's only consumer is its add.
-        graph.eliminate_dead_code()
-        for node in list(graph.nodes):
-            if functional_target(node) is _RESIDUAL_ADD:
-                _fold_attention(graph, node)
-        graph.eliminate_dead_code()
-        graph.lint()
+        if changed:
+            # Drop the replaced residual sums and any attention output computed in its add.
+            graph.eliminate_dead_code()
+            graph.lint()
 
     def uuid(self) -> bytes:
         return get_hash_for_files(_source_files(), extra=_COMPILE_PASS_VERSION)

@@ -83,12 +83,11 @@ Measure the complete pipeline, including output storage and workspace, with the
 
 ## In-place residual adds
 
-The [residual-update rewrite](../residual_updates/_compile.py) first turns a
-copy-back block's attention update into `residual_add_(base, update, gate, ...)`.
-[`_residual_compile.py`](_residual_compile.py) then folds a fused dense output that
-only that add consumes into
-`convrot_int8_piper_projected_query_attention_residual_add_`. It takes the same
-attention operands, uses `base`'s dtype as the output dtype, and adds
+When the [residual-update rewrite](../residual_updates/_compile.py) adds a
+copy-back block's attention update into `base` and that update is a fused dense
+output, [`_residual_compile.py`](_residual_compile.py) folds the output and its add
+into `convrot_int8_piper_projected_query_attention_residual_add_`. It takes the
+same attention operands, uses `base`'s dtype as the output dtype, and adds
 `gate[gate_indices] * projection` into `base` without allocating a full-size
 output.
 

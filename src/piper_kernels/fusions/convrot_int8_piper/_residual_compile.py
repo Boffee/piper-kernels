@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-import torch
+from collections.abc import Mapping
 
-from piper_kernels.fusions.residual_updates._graph import (
-    ResidualAdd,
-    bind_arguments,
-    call_functional,
-)
+import torch
+from torch.fx.node import Argument
+
+from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
 
 from . import output
 
-_kernels = torch.ops.piper_kernels
-_ATTENTION_OUTPUT = _kernels.convrot_int8_piper_projected_query_attention_output.default
 _ATTENTION_RESIDUAL_ADD = (
-    _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
+    torch.ops.piper_kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
 )
 
 
@@ -24,32 +21,23 @@ def source_files() -> tuple[str, ...]:
     return (__file__, output.__file__)
 
 
-def fold_residual_add(graph: torch.fx.Graph, add: ResidualAdd) -> torch.fx.Node | None:
-    """Add an exclusive dense attention output into the residual as it is projected.
+def fold_residual_add(
+    graph: torch.fx.Graph,
+    attention: torch.fx.Node,
+    residual_add: Mapping[str, Argument],
+) -> torch.fx.Node:
+    """Compute a dense attention output inside the residual add that is its only consumer.
 
-    Emits the attention residual-add operator, which takes the same attention operands,
-    before ``add`` and returns its new ``base``; returns ``None`` when the output has
-    other consumers. The residual add already requires its update's dtype to match
-    ``base``, so ``base`` supplies the output dtype.
+    ``residual_add`` holds the add's ``base``, ``gate``, ``gate_indices``, and
+    ``python_indexing``. Emits the attention residual-add operator, which takes the
+    output's operands, at the graph's insertion point and returns the new ``base``. The
+    FFN fusion matched the output and ``base`` with one dtype, so ``base`` supplies the
+    output dtype.
     """
-    attention = add.update
-    if attention.target is not _ATTENTION_OUTPUT or set(attention.users) != {add.node}:
-        return None
     operands = {
         name: value for name, value in bind_arguments(attention).items() if name != "output_dtype"
     }
-    with graph.inserting_before(add.node):
-        return call_functional(
-            graph,
-            _ATTENTION_RESIDUAL_ADD,
-            {
-                **operands,
-                "base": add.base,
-                "gate": add.gate,
-                "gate_indices": add.gate_indices,
-                "python_indexing": add.python_indexing,
-            },
-        )
+    return call_functional(graph, _ATTENTION_RESIDUAL_ADD, {**operands, **residual_add})
 
 
 __all__ = ["fold_residual_add", "source_files"]

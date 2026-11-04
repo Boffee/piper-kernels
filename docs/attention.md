@@ -250,18 +250,17 @@ The copy back declares that the caller no longer needs the original input; do no
 read it, or any view of its storage, after the call. Without it the block is
 unchanged.
 
-The rewrite has two independent steps. A gated ConvRot INT8 SwiGLU FFN update
-becomes an in-place add into the input, and the attention output before it is
-added in place by a generic residual add, which removes the block's new output
-buffer. When that attention output is a fused dense ConvRot INT8 Piper output, it
-then folds into an operator that adds its projection directly, which also removes
-the full-size attention output. The rewritten graph stays functional, and Inductor
+A gated ConvRot INT8 SwiGLU FFN update becomes an add into the input, and so does
+the attention update before it, which removes the block's new output buffer. A
+fused dense ConvRot INT8 Piper attention output is computed inside its add, which
+also removes the full-size attention output; any other attention output is added
+by a generic residual add. The rewritten graph stays functional, and Inductor
 adds an update in place only when the block reads none of the input's original
 values afterward, through any view; otherwise it copies the input first, which
 keeps the result correct but forgoes that update's saving. Updates round the
 residual separately, so results can differ slightly. The helper also disables
-Inductor buffer reuse, which could
-otherwise hold a dead full-size buffer across attention. See the
+Inductor buffer reuse, which could otherwise hold a dead full-size buffer across
+attention. See the
 [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
 for numerical and storage details.
 

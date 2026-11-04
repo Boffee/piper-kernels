@@ -5,11 +5,7 @@ import operator
 import torch
 
 from piper_kernels.fusions.residual_updates import _ops  # noqa: F401 - registers residual_add_
-from piper_kernels.fusions.residual_updates._graph import (
-    bind_arguments,
-    call_functional,
-    functional_target,
-)
+from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
 
 
 def test_bind_arguments_names_positional_and_keyword_values():
@@ -40,5 +36,3 @@ def test_call_functional_returns_the_new_base_of_a_wrapped_mutation():
     assert call.target is torch.ops.higher_order.auto_functionalized
     assert call.args == (residual_add,)
     assert call.kwargs == values
-    assert functional_target(call) is residual_add
-    assert functional_target(base) is None

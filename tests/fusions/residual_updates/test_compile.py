@@ -11,7 +11,6 @@ from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
-from piper_kernels.fusions.residual_updates._graph import functional_target
 from piper_kernels.linear.convrot.int8 import _ops
 
 from ..convrot_int8_piper.test_compile import _available
@@ -37,7 +36,9 @@ class _FunctionalCapture(TargetCapturePass):
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         super().__call__(graph, is_inference)
         self.targets = [
-            functional_target(node) or node.target
+            node.args[0]
+            if node.target is torch.ops.higher_order.auto_functionalized
+            else node.target
             for node in graph.nodes
             if node.op == "call_function"
         ]
