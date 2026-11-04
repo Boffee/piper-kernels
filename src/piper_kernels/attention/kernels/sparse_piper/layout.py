@@ -1,4 +1,11 @@
-"""Logical and storage layout shared by sparse-Piper operand producers."""
+"""Logical and storage layout shared by sparse-Piper operand producers.
+
+The backend selects the final ``ValueFormat``. Standalone preparation and fused
+projections write it directly; the projection custom op carries it as a static
+argument shared by runtime allocation, fake tensors, and compiler metadata.
+Changing V storage preserves Q/K storage, scale groups, logical K64 route
+indices, and prequantization routing/coarse summaries.
+"""
 
 from __future__ import annotations
 

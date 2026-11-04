@@ -33,8 +33,9 @@ compiler rewrites use those choices rather than duplicating them.
 The source-local READMEs explain implementation details for
 [dense attention](../src/piper_kernels/attention/piper_attention/README.md),
 [dense projection fusion](../src/piper_kernels/fusions/convrot_int8_piper/README.md),
-[NVIDIA INT8 linear](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md), and
-[Conv3D](../src/piper_kernels/conv3d/convrot/int8/README.md).
+[NVIDIA INT8 linear](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md),
+[Conv3D](../src/piper_kernels/conv3d/convrot/int8/README.md), and the
+[MiniMax-H3 encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
 Tests follow the operator and format structure in [`tests/`](../tests).
 
 ## Code conventions
@@ -72,25 +73,31 @@ external terminology at its integration boundary. For new interfaces:
 
 ## Documentation ownership
 
-Write for the reader's task. Lead with the behavior or decision they need, then
-explain the relevant constraints. Use plain language, concrete terms, short
-paragraphs, and small examples. Keep explanations concise while preserving the
-contract and important numerical distinctions. Remove repetition and details
-that do not help the reader use or maintain the code.
+Write for the reader's task. Lead with the behavior or decision they need and its
+constraints. Use plain language, short paragraphs, and small examples. Preserve
+contracts and numerical distinctions; remove repetition and irrelevant detail.
 
-Topic guides explain subsystem concepts, ownership, invariants, and how APIs
-work together. Public API docstrings state the behavior and constraints needed
-to make a valid call and interpret its result, including relevant tensor layouts,
-numerical behavior, mutation, and backend support. Reuse an existing contract
-when it already covers the requirement.
+Each explanation has one owner, and other places link to it rather than restate it:
 
-Module docstrings and source-local READMEs explain algorithms, packed layouts,
-internal assumptions, and execution-plan rationale. Benchmark tools and their
-help own specialized experiments and measurement controls; the benchmark guide
-owns shared methodology. Preserve useful information with its owner and link
-to it, rather than maintaining the same explanation in several places.
-Implementation details belong in caller-facing documentation when they affect
-valid usage or observable behavior.
+- **Topic guides** in `docs/` are written for callers. They explain subsystem
+  concepts, invariants, and how APIs work together, with examples for common
+  tasks. Model and backend examples link to their owners for specific requirements.
+- **Public API docstrings** lead with a short summary of what the caller can do.
+  They describe inputs and options in signature order and the result, including
+  relevant tensor layouts, shapes, dtypes, numerical behavior, mutation, and backend
+  support. Distinguish numerical caller preconditions from runtime checks using the
+  [validation contract](#validation-contract), and reuse an existing contract when
+  it covers the requirement.
+- **Module and internal API docstrings and source-local READMEs** own algorithms,
+  packed layouts, internal assumptions, and execution-plan rationale. Caller
+  guides and public docstrings include implementation details only when they
+  affect valid usage or observable behavior. Model-specific assumptions stay
+  with their `specializations/` code.
+- **Benchmark tools and command help** own specialized experiments and measurement
+  controls; the [benchmark guide](../benchmarks/README.md) owns shared methodology.
+- **This guide** owns conventions and invariants that span subsystems.
+  **CHANGELOG.md** owns release history; see
+  [commits and pull requests](#commits-and-pull-requests).
 
 ## Validation contract
 
@@ -159,22 +166,6 @@ fields so saved measurements remain interpretable.
 Type and policy modules must import without Triton. Compiler passes include
 implementation source files in their cache keys; keep that tracking complete
 when definitions move, including plan and policy modules.
-
-Sparse Piper's backend specifies the final V storage through
-[`ValueFormat`](../src/piper_kernels/attention/kernels/sparse_piper/layout.py).
-Standalone preparation and fused projections write that format directly. The
-projection custom op carries its format as a static argument, shared by runtime
-allocation, fake tensors, and compiler metadata. Q/K storage, scale groups,
-logical K64 route indices, and prequantization routing/coarse summaries retain
-their common contracts.
-
-Every sparse-attention backend binds immutable sequence-global K/V once.
-The bound launch owns those tensors and its backend state: AMD's folded scale
-table or NVIDIA TMA's K/V descriptors. Each call supplies query-local Q, scales,
-routes, output, and optional coarse output/gate. Rebind after changing context
-tensors; there is no implicit tensor cache or second V representation. The
-[`prepared-state contracts`](../src/piper_kernels/attention/sparse_piper_attention/_prepared.py)
-define the ownership and query-window boundaries.
 
 ## Performance tuning
 
@@ -316,6 +307,38 @@ example `-k sparse_gqa`.
 
 The opt-in [ROCm workflow](../.github/workflows/rocm.yml) runs this script on a
 provisioned RDNA4 runner, nightly or by manual dispatch.
+
+## Commits and pull requests
+
+Commit messages use the standard Git format: an imperative subject of at most 72
+characters, such as "Preserve static scales when sharding weights", then a blank
+line and a body wrapped at 72 columns that explains why. Subjects take no type
+prefix such as `feat:`; the changelog classifies changes. Pull request titles
+follow the same subject rule. Keep commits focused and include the checks and
+fixes needed for the change. Do not commit generated outputs, benchmark artifacts,
+compiler caches, model checkpoints, or local secrets.
+
+A pull request description leads with the problem: what goes wrong, for whom,
+and how often. Then it covers:
+
+- **Change:** what the PR does, why this design, and what it removes or supersedes.
+- **Compatibility:** whether public APIs, accepted tensor metadata, numerical
+  results, mutation, backend support, or packed storage and checkpoints change.
+  Call out changes to rounding or accumulation even when signatures stay the same;
+  use [VERSIONING.md](../VERSIONING.md) for the public compatibility boundary.
+- **Validation:** the commands run and their results, and what remains unvalidated.
+  Identify the hardware and workload behind numerical or performance claims;
+  distinguish portable tests and compiler coverage from on-device validation.
+
+Link related issues and PRs.
+
+Add a `CHANGELOG.md` entry under **Unreleased** when a caller can observe the change:
+in APIs, supported inputs or backends, numerical results, performance, mutation,
+or stored data. Documentation-only changes, tests, and internal refactors need
+none. Use the existing Added, Changed, or Fixed heading, and prefix a breaking
+change with "Breaking:". State what changes for the caller and what they must do;
+implementation and test details belong in the PR. Keep any qualification needed
+to avoid overstating hardware support or measured improvements.
 
 ## Releases
 

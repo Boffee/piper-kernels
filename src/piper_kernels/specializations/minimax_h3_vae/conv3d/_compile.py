@@ -1,4 +1,14 @@
-"""Fuse H3 framewise normalization around standard or explicit quantized convolutions."""
+"""Fuse H3 framewise normalization around standard or explicit quantized convolutions.
+
+The matcher proves framewise reshape relationships, exact residual shapes, and
+reflection bounds without specializing activation dimensions to the tracing
+example. It includes the generic padding pass; unsupported or shared patterns
+remain unfused.
+
+Fusion retains separate statistics, preparation, and convolution launches, with
+a full INT8 activation and small FP32 statistics buffers. Native kernels select
+shape-specific schedules independently of Dynamo graph reuse.
+"""
 
 import operator
 from collections.abc import Mapping
