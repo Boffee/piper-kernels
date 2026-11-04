@@ -234,6 +234,8 @@ For FFNs, use the matching package under `piper_kernels.fusions`:
 rewriting, and preserves each projection's static/dynamic scale. SwiGLU matches
 separate gate/value/down projections; GELU matches an exclusive
 `down(gelu(up(x), approximate="tanh"))`. FFN fusions support FP16/BF16 activations.
+To add a gated SwiGLU update into a block's residual input in place, see
+[residual updates](attention.md#update-a-residual-stream-in-place).
 See [attention](attention.md#compile-and-fuse-projections) for attention-region
 helpers, and the [specializations](../src/piper_kernels/specializations) for
 model-specific compile options.

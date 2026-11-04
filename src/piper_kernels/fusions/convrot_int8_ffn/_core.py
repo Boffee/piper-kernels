@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._input_activations import InputActivation, input_activation_width
-from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as indexed_updates
 from piper_kernels.linear import _bias
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.convrot.int8 import _backend
@@ -153,7 +153,7 @@ def run_chunked_ffn(
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
         if gated_updates is None
-        else gated_updates.reusable_update
+        else gated_updates.output
     )
     output_2d = output.view(rows, output_features)
     base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)

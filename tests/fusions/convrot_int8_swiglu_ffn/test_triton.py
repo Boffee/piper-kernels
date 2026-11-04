@@ -7,6 +7,7 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels.fusions.convrot_int8_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
+    _chunked_swiglu_ffn_residual_add_op,
 )
 from piper_kernels.linear.convrot.int8 import _ops, reference
 
@@ -282,3 +283,34 @@ def test_chunked_ffn_runs_under_dynamic_fullgraph_compile() -> None:
         actual = run(activation)
         relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
         assert relative_l2 < 0.01
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+@pytest.mark.parametrize("python_indexing", [False, True])
+def test_chunked_ffn_residual_add_adds_into_base(python_indexing: bool) -> None:
+    torch.manual_seed(207)
+    operands = make_operands(rows=385, bias_dtype=torch.float32)
+    rows, output_features = operands.input.shape[0], operands.down.qdata.shape[0]
+    base = torch.randn(rows, output_features, dtype=torch.bfloat16, device="cuda")
+    gate_storage = torch.randn(7, 2 * output_features, dtype=torch.bfloat16, device="cuda")
+    ffn_gate = gate_storage[:, output_features:]
+    lowest_index = -7 if python_indexing else 0
+    gate_indices = torch.randint(lowest_index, 7, (rows,), dtype=torch.int64, device="cuda")
+    expected = (base.float() + ffn_gate[gate_indices].float() * _materialized(operands).float()).to(
+        base.dtype
+    )
+    actual = base.clone()
+
+    result = _chunked_swiglu_ffn_residual_add_op(
+        *operands.arguments(128)[:-1],
+        actual,
+        ffn_gate,
+        gate_indices,
+        python_indexing,
+        128,
+    )
+
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert result is None
+    assert relative_l2 < 0.01

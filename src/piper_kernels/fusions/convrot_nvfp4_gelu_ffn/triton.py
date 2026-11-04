@@ -5,11 +5,11 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.fusions.convrot_nvfp4_ffn._preparation import ConvRotSourcePreparation
-from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
 from piper_kernels.fusions.nvfp4_gelu_ffn import _operands
 from piper_kernels.fusions.nvfp4_gelu_ffn._preparation import StandardGELUPreparation
+from piper_kernels.fusions.residual_updates import triton as indexed_updates
 
 from ._preparation import ConvRotGELUPreparation
 
@@ -279,11 +279,10 @@ def _chunked_gelu_ffn_gated_updates_op(
         chunk_rows,
         gated_updates=indexed_updates.IndexedGatedUpdates(
             base=base,
-            reusable_update=reusable_update,
-            update_gate=update_gate,
-            ffn_gate=ffn_gate,
+            gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
+            first=indexed_updates.FirstGatedUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -339,11 +338,10 @@ def _chunked_gelu_ffn_gated_updates_op_fake(
         input,
         indexed_updates.IndexedGatedUpdates(
             base,
-            reusable_update,
-            update_gate,
             ffn_gate,
             gate_indices,
             python_indexing,
+            indexed_updates.FirstGatedUpdate(reusable_update, update_gate),
         ),
         output_features,
     )

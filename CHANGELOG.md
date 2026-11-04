@@ -5,8 +5,25 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `residual_updates_compile_options()` in `piper_kernels.fusions.residual_updates`
+  lets a compiled block that copies its result back into its input
+  (`hidden.copy_(block(hidden, ...))`) add its gated updates into that input.
+  A gated ConvRot INT8 SwiGLU FFN update and the attention update before it no
+  longer allocate the block's new output buffer, and a fused dense ConvRot INT8
+  Piper output also drops its full-size output. Other graphs are unchanged.
+  Results can differ slightly because each update rounds the residual. The
+  returned options also disable Inductor buffer reuse.
+
 ### Changed
 
+- The indexed gated-update epilogue moved from `piper_kernels.fusions.ffn.triton` to
+  `piper_kernels.fusions.residual_updates.triton`. `IndexedGatedUpdates` now holds one
+  projection update (`gate`) and an optional earlier `FirstGatedUpdate` instead of
+  fixed `reusable_update`, `update_gate`, and `ffn_gate` fields, and
+  `IndexedGatedUpdateLayout` fields are renamed to match. Built-in operators are
+  unchanged.
 - On Windows, the `triton` extra now requires PyTorch 2.15 and selects its matching
   Triton 3.9 through `triton-windows`. A Triton 3.8 build does not match PyTorch 2.15's
   compiler. Linux still supports PyTorch 2.14.

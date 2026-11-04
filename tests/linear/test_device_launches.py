@@ -14,7 +14,7 @@ from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
-from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as indexed_updates
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import _generic
 from piper_kernels.linear.convrot.int8._amd import triton as amd
@@ -261,9 +261,12 @@ def test_attention_and_fusion_epilogue_launchers_own_context(launches):
         )
         assert sage._launch_sage_attention_2pp(prepared) is prepared.output
         updates = SimpleNamespace(
-            update_gate=value, ffn_gate=value, gate_indices=value, python_indexing=False
+            gate=value,
+            gate_indices=value,
+            python_indexing=False,
+            first=SimpleNamespace(storage=value, gate=value),
         )
-        layout = indexed_updates.IndexedGatedUpdateLayout(64, 64, 1, 1)
+        layout = indexed_updates.IndexedGatedUpdateLayout(64, 1, 64, 1)
         indexed_updates.apply_indexed_gated_updates(
             value, value, torch.empty_like(value), updates, layout, 0
         )

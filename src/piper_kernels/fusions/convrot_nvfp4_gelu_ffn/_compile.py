@@ -18,12 +18,12 @@ from piper_kernels.fusions.convrot_nvfp4_ffn import _compile as ffn_compile_comm
 from piper_kernels.fusions.convrot_nvfp4_ffn import _preparation as convrot_source_preparation
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
-from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.fusions.gelu_ffn import _pattern as gelu_ffn_pattern
 from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
 from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
 from piper_kernels.fusions.nvfp4_gelu_ffn import _operands, _preparation
 from piper_kernels.fusions.nvfp4_gelu_ffn import triton as standard_gelu_backend
+from piper_kernels.fusions.residual_updates import triton as indexed_updates
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views

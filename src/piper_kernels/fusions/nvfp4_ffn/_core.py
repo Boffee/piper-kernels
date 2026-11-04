@@ -7,7 +7,7 @@ from typing import ClassVar, Protocol, cast
 
 import torch
 
-from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as indexed_updates
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -274,7 +274,7 @@ def run_chunked_ffn(
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
         if gated_updates is None
-        else gated_updates.reusable_update
+        else gated_updates.output
     )
     output_2d = output.view(rows, output_features)
     base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)

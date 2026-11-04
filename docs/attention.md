@@ -221,6 +221,46 @@ Sparse integrations additionally recognize compatible coarse branches and padded
 layouts; their exact matchers live beside the helper in each package. Do not infer
 fusion eligibility from the standalone attention API alone.
 
+### Update a residual stream in place
+
+Transformer blocks often add gated attention and FFN outputs to a residual stream.
+When a compiled block may overwrite that input, `residual_updates_compile_options`
+from `piper_kernels.fusions.residual_updates` makes those additions write into it
+directly instead of allocating new full-size outputs. Apply it after the attention
+and FFN helpers:
+
+```python
+from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
+from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
+from piper_kernels.fusions.residual_updates import residual_updates_compile_options
+
+options = convrot_int8_swiglu_ffn_compile_options()
+options = convrot_int8_piper_compile_options(options, fuse_output=True)
+options = residual_updates_compile_options(options)
+
+
+def update_block(hidden, *block_inputs):
+    return hidden.copy_(block(hidden, *block_inputs))
+
+
+compiled = torch.compile(update_block, fullgraph=True, options=options)
+```
+
+The copy back declares that the caller no longer needs the original input; do not
+read it, or any view of its storage, after the call. Without it the block is
+unchanged.
+
+The rewrite has two independent steps. A gated ConvRot INT8 SwiGLU FFN update
+becomes an in-place add into the input, and the attention output before it is
+added in place by a generic residual add, which removes the block's new output
+buffer. When that attention output is a fused dense ConvRot INT8 Piper output, it
+then folds into an operator that adds its projection directly, which also removes
+the full-size attention output. Updates round the residual separately, so results
+can differ slightly. The helper also disables Inductor buffer reuse, which could
+otherwise hold a dead full-size buffer across attention. See the
+[fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
+for numerical and storage details.
+
 For installation and next steps, return to the [README](../README.md). See
 [weights](weights.md) for constructing projection weights and
 [benchmarks](../benchmarks/README.md) for reproducible quality and performance checks.
