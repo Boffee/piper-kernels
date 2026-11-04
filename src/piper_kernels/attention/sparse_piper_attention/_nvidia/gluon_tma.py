@@ -34,7 +34,7 @@ _GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
 @gluon.jit
 def _issue_tma(descriptor, offsets, shared, barrier):
     mbarrier.expect(barrier, descriptor.block_type.nbytes)
-    tma.async_copy_global_to_shared(descriptor, offsets, barrier, shared)
+    tma.async_load(descriptor, offsets, barrier, shared)
 
 
 @gluon.jit
@@ -47,8 +47,8 @@ def _issue_tma_pair(
     barrier,
 ):
     mbarrier.expect(barrier, descriptor.block_type.nbytes * 2)
-    tma.async_copy_global_to_shared(descriptor, offsets_0, barrier, shared_0)
-    tma.async_copy_global_to_shared(descriptor, offsets_1, barrier, shared_1)
+    tma.async_load(descriptor, offsets_0, barrier, shared_0)
+    tma.async_load(descriptor, offsets_1, barrier, shared_1)
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)

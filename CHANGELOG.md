@@ -5,6 +5,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
+  NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
+  also apply again under PyTorch 2.15's stricter pattern matching, instead of
+  silently running unfused. Behavior on PyTorch 2.14 with Triton 3.8 is unchanged.
+
 ## [0.7.10] - 2026-10-31
 
 ### Added
