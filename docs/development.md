@@ -22,7 +22,7 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels).
 | `fusions/` | Composed operations and compiler rewrites that share preparation or intermediates |
 | `specializations/` | Explicitly enabled model/workload integrations built from reusable kernels |
 | `_triton/`, `attention/kernels/` | Shared GPU primitives and target descriptions |
-| `gguf/`, `trellis/`, `stochastic_quantization/` | Packed GGUF and trellis-coded decoding, and reusable rounding arithmetic |
+| `gguf/`, `trellis/`, `stochastic_quantization/` | Packed GGUF decoding, trellis-coded encoding and decoding, and reusable rounding arithmetic |
 
 Weight representation and execution are separate concerns: `weights/` owns
 storage and its lifecycle; linear and convolution operators own execution.
