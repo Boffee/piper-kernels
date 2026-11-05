@@ -53,7 +53,7 @@ def _run_chunked_gelu_ffn(
     down_high_first: bool,
     chunk_rows: int,
     *,
-    gated_updates: residual_updates.ResidualAdd | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     up, down = _operands.linear_operands(
         up_weight_qdata,
@@ -84,7 +84,7 @@ def _run_chunked_gelu_ffn(
         chunk_rows,
         source_preparation,
         activation_preparation,
-        gated_updates=gated_updates,
+        residual_add=residual_add,
     )
 
 
@@ -277,7 +277,7 @@ def _chunked_gelu_ffn_gated_updates_op(
         down_group_size,
         down_high_first,
         chunk_rows,
-        gated_updates=residual_updates.ResidualAdd(
+        residual_add=residual_updates.ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,

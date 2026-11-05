@@ -186,7 +186,7 @@ def prepare_residual_add_projector(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
-    updates: ResidualAdd,
+    residual_add: ResidualAdd,
     layout: ResidualAddLayout,
     *,
     backend: LinearBackend,
@@ -194,8 +194,8 @@ def prepare_residual_add_projector(
 ) -> tuple[ChunkProjector, tuple[torch.Tensor, ...]]:
     """Project each chunk into bounded scratch, then add its gated rows into the output.
 
-    ``updates`` has no reusable update: the pipeline output is ``updates.base``, and each
-    row becomes ``base + updates.gate[index] * projection`` with one rounding.
+    ``residual_add`` has no reusable update: the pipeline output is ``residual_add.base``, and each
+    row becomes ``base + residual_add.gate[index] * projection`` with one rounding.
     Output rows hold live data, so attention must not share their storage.
     """
     # Triton loads only when the gated update runs.
@@ -207,7 +207,9 @@ def prepare_residual_add_projector(
     device = weight_qdata.device
     prepared_input = torch.empty((capacity, input_features), device=device, dtype=torch.int8)
     prepared_scale = torch.empty(capacity, device=device, dtype=torch.float32)
-    projected = torch.empty((capacity, output_features), device=device, dtype=updates.base.dtype)
+    projected = torch.empty(
+        (capacity, output_features), device=device, dtype=residual_add.base.dtype
+    )
 
     def project_chunk(
         attention_chunk: torch.Tensor,
@@ -234,7 +236,7 @@ def prepare_residual_add_projector(
                 chunk_projected,
                 output_rows,
                 output_rows,
-                updates,
+                residual_add,
                 layout,
                 batch_index * sequence_length + start,
             )
@@ -249,8 +251,8 @@ def prepare_residual_add_projector(
             weight_scale,
             bias,
             output_input_scale,
-            updates.gate,
-            updates.gate_indices,
+            residual_add.gate,
+            residual_add.gate_indices,
         )
         if tensor is not None
     )

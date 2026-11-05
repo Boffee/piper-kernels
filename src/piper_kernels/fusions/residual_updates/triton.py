@@ -127,7 +127,7 @@ def _residual_add_kernel(
 
 def validate_residual_add(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    updates: ResidualAdd,
+    residual_add: ResidualAdd,
     output_features: int | torch.SymInt,
 ) -> ResidualAddLayout:
     """Validate update metadata for one row per leading position of ``input``.
@@ -135,10 +135,10 @@ def validate_residual_add(
     ``input`` supplies the row shape, dtype, and device. Index values are caller
     preconditions under the library validation contract.
     """
-    reusable = updates.reusable
+    reusable = residual_add.reusable
     expected_shape = (*input.shape[:-1], output_features)
     for name, tensor in (
-        ("base", updates.base),
+        ("base", residual_add.base),
         ("reusable update", None if reusable is None else reusable.update),
     ):
         if tensor is None:
@@ -154,7 +154,7 @@ def validate_residual_add(
                 f"gated update {name} must be a contiguous strided tensor "
                 f"with shape {expected_shape}, dtype {input.dtype}, and device {input.device}"
             )
-    for gate in (None if reusable is None else reusable.gate, updates.gate):
+    for gate in (None if reusable is None else reusable.gate, residual_add.gate):
         if gate is None:
             continue
         if (
@@ -172,7 +172,7 @@ def validate_residual_add(
                 f"{input.dtype}, and device {input.device}"
             )
     rows = math.prod(input.shape[:-1])
-    gate_indices = updates.gate_indices
+    gate_indices = residual_add.gate_indices
     if (
         gate_indices.numel() != rows
         or gate_indices.ndim != 1
@@ -186,20 +186,20 @@ def validate_residual_add(
             f"tensor with {rows} elements on {input.device}"
         )
     tensors = (
-        updates.base,
-        updates.gate,
+        residual_add.base,
+        residual_add.gate,
         *(() if reusable is None else (reusable.update, reusable.gate)),
     )
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         raise RuntimeError("gated updates are inference-only and do not support autograd")
     if reusable is None:
         return ResidualAddLayout(
-            gate_row_stride=updates.gate.stride(0),
-            gate_rows=updates.gate.shape[0],
+            gate_row_stride=residual_add.gate.stride(0),
+            gate_rows=residual_add.gate.shape[0],
         )
     return ResidualAddLayout(
-        gate_row_stride=updates.gate.stride(0),
-        gate_rows=updates.gate.shape[0],
+        gate_row_stride=residual_add.gate.stride(0),
+        gate_rows=residual_add.gate.shape[0],
         reusable_gate_row_stride=reusable.gate.stride(0),
         reusable_gate_rows=reusable.gate.shape[0],
     )
@@ -209,25 +209,25 @@ def apply_residual_add(
     projection: torch.Tensor,
     base: torch.Tensor,
     output: torch.Tensor,
-    updates: ResidualAdd,
+    residual_add: ResidualAdd,
     layout: ResidualAddLayout,
     row_offset: int,
 ) -> None:
     """Apply one validated chunk of gated updates into its output rows.
 
-    ``base`` and ``output`` are the chunk's rows of ``updates.base`` and
-    ``updates.output``; ``row_offset`` locates the chunk in ``gate_indices``.
+    ``base`` and ``output`` are the chunk's rows of ``residual_add.base`` and
+    ``residual_add.output``; ``row_offset`` locates the chunk in ``gate_indices``.
     """
     elements = projection.numel()
-    reusable = updates.reusable
+    reusable = residual_add.reusable
     with device_context(projection.device):
         _residual_add_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
             projection,
             base,
             output,
-            updates.gate if reusable is None else reusable.gate,
-            updates.gate,
-            updates.gate_indices,
+            residual_add.gate if reusable is None else reusable.gate,
+            residual_add.gate,
+            residual_add.gate_indices,
             elements,
             row_offset,
             features=projection.shape[-1],
@@ -237,7 +237,7 @@ def apply_residual_add(
             reusable_gate_rows=layout.reusable_gate_rows,
             gate_rows=layout.gate_rows,
             has_reusable_update=reusable is not None,
-            python_indexing=updates.python_indexing,
+            python_indexing=residual_add.python_indexing,
             block_size=_EPILOGUE_BLOCK_SIZE,
             num_warps=4,
         )

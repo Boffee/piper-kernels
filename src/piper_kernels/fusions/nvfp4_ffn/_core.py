@@ -237,7 +237,7 @@ def run_chunked_ffn(
     source_preparation: SourcePreparationBackend,
     activation_preparation: ActivationPreparationBackend,
     *,
-    gated_updates: residual_updates.ResidualAdd | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     dimensions = validate_ffn(
@@ -264,20 +264,20 @@ def run_chunked_ffn(
     )
     update_layout = (
         None
-        if gated_updates is None
+        if residual_add is None
         else residual_updates.validate_residual_add(
             input,
-            gated_updates,
+            residual_add,
             output_features,
         )
     )
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
-        if gated_updates is None
-        else gated_updates.output
+        if residual_add is None
+        else residual_add.output
     )
     output_2d = output.view(rows, output_features)
-    base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)
+    base_2d = None if residual_add is None else residual_add.base.view(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
     source_storage = prepare_activation_storage(
         input,
@@ -291,7 +291,7 @@ def run_chunked_ffn(
         dtype=input.dtype,
     )
     projected_workspace = None
-    if gated_updates is not None:
+    if residual_add is not None:
         projection_columns = projection_workspace.shape[1]
         projected_workspace = (
             projection_workspace[:, :output_features]
@@ -343,7 +343,7 @@ def run_chunked_ffn(
             down.activation_per_tensor_scale,
             down.dynamic_activation_scale,
         )
-        if gated_updates is None:
+        if residual_add is None:
             _project_affine_chunk(
                 down_qdata,
                 down_scale,
@@ -369,7 +369,7 @@ def run_chunked_ffn(
             projected,
             base_2d[start:stop],
             output_2d[start:stop],
-            gated_updates,
+            residual_add,
             update_layout,
             start,
         )

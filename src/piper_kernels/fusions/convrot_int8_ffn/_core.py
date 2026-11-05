@@ -126,7 +126,7 @@ def run_chunked_ffn(
     activation_fn: InputActivation,
     chunk_rows: int,
     *,
-    gated_updates: residual_updates.ResidualAdd | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     input_features, intermediate_features, output_features = validate_ffn(
@@ -143,20 +143,20 @@ def run_chunked_ffn(
     input_2d = input.view(rows, input_features)
     update_layout = (
         None
-        if gated_updates is None
+        if residual_add is None
         else residual_updates.validate_residual_add(
             input,
-            gated_updates,
+            residual_add,
             output_features,
         )
     )
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
-        if gated_updates is None
-        else gated_updates.output
+        if residual_add is None
+        else residual_add.output
     )
     output_2d = output.view(rows, output_features)
-    base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)
+    base_2d = None if residual_add is None else residual_add.base.view(rows, output_features)
     projection_features = len(sources) * intermediate_features
     projection_workspace = torch.empty(
         (capacity, projection_features),
@@ -164,7 +164,7 @@ def run_chunked_ffn(
         dtype=input.dtype,
     )
     projected = None
-    if gated_updates is not None:
+    if residual_add is not None:
         projected = (
             projection_workspace.reshape(-1)[: capacity * output_features].view(
                 capacity,
@@ -273,14 +273,14 @@ def run_chunked_ffn(
             input.dtype,
             out=output_chunk,
         )
-        if gated_updates is not None:
+        if residual_add is not None:
             assert base_2d is not None
             assert update_layout is not None
             residual_updates.apply_residual_add(
                 output_chunk,
                 base_2d[start:stop],
                 output_2d[start:stop],
-                gated_updates,
+                residual_add,
                 update_layout,
                 start,
             )

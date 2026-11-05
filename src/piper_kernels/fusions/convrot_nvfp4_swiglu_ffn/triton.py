@@ -260,7 +260,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
         chunk_rows,
         source_preparation,
         activation_preparation,
-        gated_updates=residual_updates.ResidualAdd(
+        residual_add=residual_updates.ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,

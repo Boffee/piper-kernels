@@ -24,13 +24,13 @@ def _validate(
         or not update.is_contiguous()
     ):
         raise ValueError("residual add update must be contiguous and match base")
-    updates = residual_updates.ResidualAdd(
+    residual_add = residual_updates.ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    return updates, residual_updates.validate_residual_add(base, updates, base.shape[-1])
+    return residual_add, residual_updates.validate_residual_add(base, residual_add, base.shape[-1])
 
 
 @torch.library.custom_op("piper_kernels::residual_add_", mutates_args=("base",))
@@ -46,12 +46,12 @@ def _residual_add_op(
     Rows are ``base``'s leading positions; ``gate_indices`` selects one ``gate`` row
     for each, wrapping negative values under ``python_indexing``.
     """
-    updates, layout = _validate(base, update, gate, gate_indices, python_indexing)
+    residual_add, layout = _validate(base, update, gate, gate_indices, python_indexing)
     if base.numel() == 0:
         return
     rows = base.view(-1, base.shape[-1])
     residual_updates.apply_residual_add(
-        update.view(-1, base.shape[-1]), rows, rows, updates, layout, 0
+        update.view(-1, base.shape[-1]), rows, rows, residual_add, layout, 0
     )
 
 

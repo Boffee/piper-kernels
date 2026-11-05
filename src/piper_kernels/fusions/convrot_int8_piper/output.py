@@ -416,14 +416,14 @@ def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
     batch, _, sequence, _ = shape
     if base.ndim != 3 or base.shape[:2] != (batch, sequence):
         raise ValueError("dense Piper residual base must have one row per query token")
-    updates = residual_updates.ResidualAdd(
+    residual_add = residual_updates.ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    layout = residual_updates.validate_residual_add(base, updates, weight_qdata.shape[0])
-    return shape, updates, layout
+    layout = residual_updates.validate_residual_add(base, residual_add, weight_qdata.shape[0])
+    return shape, residual_add, layout
 
 
 @torch.library.custom_op(
@@ -468,7 +468,7 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     the output dtype is ``base``'s. Each window is projected into bounded scratch and
     added into its ``base`` rows in FP32 with one rounding.
     """
-    shape, updates, layout = _validate_residual_add_inputs(
+    shape, residual_add, layout = _validate_residual_add_inputs(
         base,
         gate,
         gate_indices,
@@ -513,7 +513,7 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
             weight_scale,
             bias,
             group_size,
-            updates,
+            residual_add,
             layout,
             backend=output_backend,
             output_input_scale=output_input_scale,

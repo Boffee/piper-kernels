@@ -29,7 +29,7 @@ def _run_chunked_swiglu_ffn(
     value_input_scale: torch.Tensor | None = None,
     down_input_scale: torch.Tensor | None = None,
     *,
-    gated_updates: residual_updates.ResidualAdd | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Run the public gate/value topology through the shared bounded runner."""
     gate = _core.LinearOperands(
@@ -59,7 +59,7 @@ def _run_chunked_swiglu_ffn(
         down,
         "swiglu",
         chunk_rows,
-        gated_updates=gated_updates,
+        residual_add=residual_add,
     )
 
 
@@ -174,7 +174,7 @@ def _chunked_swiglu_ffn_gated_updates_op(
         gate_input_scale,
         value_input_scale,
         down_input_scale,
-        gated_updates=residual_updates.ResidualAdd(
+        residual_add=residual_updates.ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
@@ -259,7 +259,7 @@ def _chunked_swiglu_ffn_residual_add_op(
         gate_input_scale,
         value_input_scale,
         down_input_scale,
-        gated_updates=residual_updates.ResidualAdd(
+        residual_add=residual_updates.ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,

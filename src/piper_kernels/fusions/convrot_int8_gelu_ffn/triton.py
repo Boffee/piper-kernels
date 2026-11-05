@@ -57,7 +57,7 @@ def _run_chunked_gelu_ffn(
     up_input_scale: torch.Tensor | None = None,
     down_input_scale: torch.Tensor | None = None,
     *,
-    gated_updates: residual_updates.ResidualAdd | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Run the public up/down topology through the shared bounded runner."""
     up = _core.LinearOperands(
@@ -80,7 +80,7 @@ def _run_chunked_gelu_ffn(
         down,
         "gelu_tanh",
         chunk_rows,
-        gated_updates=gated_updates,
+        residual_add=residual_add,
     )
 
 
@@ -216,7 +216,7 @@ def _chunked_gelu_ffn_gated_updates_op(
         chunk_rows,
         up_input_scale,
         down_input_scale,
-        gated_updates=residual_updates.ResidualAdd(
+        residual_add=residual_updates.ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
