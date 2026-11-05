@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.8.0rc2] - 2026-11-05
+
 ### Added
 
 - `residual_updates_compile_options()` in `piper_kernels.fusions.residual_updates`
@@ -930,7 +932,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc2...HEAD
+[0.8.0rc2]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc1...v0.8.0rc2
 [0.8.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.7.10...v0.8.0rc1
 [0.7.10]: https://github.com/Boffee/piper-kernels/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/Boffee/piper-kernels/compare/v0.7.8...v0.7.9
