@@ -1,10 +1,12 @@
 # Trellis-coded weights
 
 Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It is a
-storage and transfer format: `ConvRotInt8Tensor.from_trellis` and
-`copy_from_trellis_` decode it into ordinary ConvRot INT8 storage, and execution
-uses the INT8 kernels unchanged. This README owns the format; the
-[weights guide](../../../docs/weights.md#decode-trellis-coded-storage) shows the API.
+storage and transfer format: `TrellisStorage.from_hp` encodes a weight once, and
+`ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` decode it into ordinary
+ConvRot INT8 storage, so execution uses the INT8 kernels unchanged. This README
+owns the format and its encoder; the
+[weights guide](../../../docs/weights.md#encode-and-decode-trellis-coded-storage)
+shows the API.
 
 The code is QTIP's bitshift trellis with its 1MAD code ([Tseng et al., 2024,
 arXiv:2406.11235](https://arxiv.org/abs/2406.11235)). It is tail-biting, has one
@@ -16,7 +18,7 @@ values the GEMM consumes.
 A logical `[out, in]` weight, already rotated for its ConvRot group size, is cut
 into blocks of `T = block_size` consecutive weights of a row. Each block is one
 tail-biting trellis sequence (QTIP's `T`) with its own scale, the same unit GGUF and
-NVFP4 call a block:
+NVFP4 call a block. `TrellisStorage` holds the tensors and the block size:
 
 | Tensor | Shape | Dtype | Meaning |
 |---|---|---|---|
@@ -72,9 +74,31 @@ check.
 Whole bytes cost at most 1/32 bit per weight of rate granularity at `T = 256`, and
 let the rate come from the tensor shape instead of more metadata.
 
-The block size must divide the weight's input width. The research encoder
-chooses the largest multiple of 16 up to 256 that divides it: 256 for most widths,
-224 for 2688.
+The block size must divide the weight's input width. The encoder chooses the
+largest multiple of 16 up to 256 that divides it: 256 for most widths, 224 for 2688.
+
+## Encoding
+
+`TrellisStorage.from_hp(weight, group_size=..., bits_per_weight=...)` rotates the
+weight in FP32 and encodes each block. The rate counts the block's FP8 scale: a
+block of `T` weights stores `⌊bits_per_weight · T⌋ - 8` bits, rounded down to whole
+bytes. At 4.5 bits per weight a 256-weight block takes 143 bytes, 4- and 5-bit
+steps; at 3.5 it takes 111 bytes, 3- and 4-bit steps.
+
+The [encoder](_encoder.py) minimizes each block's squared error in the rotated
+basis against the exact INT8 decode, without calibration data. A coarse search
+with 12-bit states picks each block's scale and each row's scale; one tail-biting
+Viterbi pass on the stored 16-bit trellis then sets the walk. The module docstring
+describes the stages and where they come from.
+
+On Gaussian rows, which ConvRot-rotated weights resemble, the weight SQNR is:
+
+| Bits per weight | 3.03 | 3.5 | 4.03 | 4.5 | 5.5 | 6.03 |
+|---|---|---|---|---|---|---|
+| SQNR (dB) | 17.5 | 20.3 | 23.5 | 26.3 | 32.2 | 35.3 |
+
+Rows with heavy outliers encode worse: the search starts each block at a scale
+from its RMS.
 
 ## Decode implementation
 
@@ -92,3 +116,24 @@ not on the transfer's critical path. It has not been measured on AMD, including
 wave64 targets such as gfx942.
 [`_reference.py`](_reference.py) is the PyTorch oracle; tests check both against
 blocks encoded by the research encoder.
+
+## Encode implementation
+
+The [Viterbi search](_viterbi.py) finds the exact minimum over every walk of a
+block and a few candidate scales, with pinned FP32 arithmetic. Its forward runs
+in one of two ways, with identical results:
+
+- **Persistent forward** ([`_gluon_forward.py`](_gluon_forward.py)): one Gluon
+  launch runs every step of a batch, keeping each row's prefix costs in shared
+  memory. It needs an NVIDIA GPU from sm_80 with 99 KiB of opt-in shared memory per
+  CTA, and Triton 3.9, whose Gluon it was written and measured for. Its inline PTX
+  is NVIDIA-only.
+- **Step loop:** one Triton launch per step. It runs on other NVIDIA GPUs and is
+  the persistent forward's bitwise reference.
+
+Encoding requires an NVIDIA GPU: there is no ROCm encoder, since checkpoints are
+encoded once, offline. On an RTX 5090 with Triton 3.9, a 4096×5120 weight encodes
+at 37 to 46 M weights/s from 3 to 6 bits per weight with the persistent forward,
+about 13 minutes for 34 G weights. The step loop runs at 6.6 M weights/s.
+Search batches hold up to 4 GiB of backpointers, for a peak of about 4.6 GiB
+beyond the weight. Batches and row chunks do not change the result.

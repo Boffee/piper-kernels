@@ -7,11 +7,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
-- `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` decode trellis-coded
-  weights, stored at 3 to 6 bits per weight, into ConvRot INT8 storage. Execution
-  is unchanged. Each tensor's rate comes from its stored shape. Decoding needs a
-  supported Triton accelerator and is exact across CUDA and ROCm. It was validated
-  on NVIDIA hardware only.
+- Trellis-coded weights store a ConvRot INT8 linear weight at 3 to 6 bits per
+  weight. `piper_kernels.trellis.TrellisStorage.from_hp` rotates and encodes a
+  weight at a chosen rate per tensor, counting each block's FP8 scale; it requires
+  an NVIDIA CUDA GPU and runs at about 45 M weights/s at 4.5 bits per weight on an
+  RTX 5090. `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` decode the
+  storage into ConvRot INT8, so execution is unchanged. Decoding needs a supported
+  Triton accelerator and is exact across CUDA and ROCm; it was validated on NVIDIA
+  hardware only.
 
 ### Changed
 
