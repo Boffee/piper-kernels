@@ -80,3 +80,18 @@ and compact FP32 statistics. Output fusion has no automatic profitability guard.
 Reduced scratch does not guarantee lower peak allocation or faster execution.
 Measure the complete pipeline, including output storage and workspace, with the
 [dense fusion benchmark](../../../../benchmarks/README.md#run-the-suite).
+
+## In-place residual adds
+
+When the [residual-update rewrite](../residual_updates/_compile.py) adds a
+copy-back block's attention update into `base` and that update is a fused dense
+output, [`_residual_compile.py`](_residual_compile.py) folds the output and its add
+into `convrot_int8_piper_projected_query_attention_residual_add_`. It takes the
+same attention operands, uses `base`'s dtype as the output dtype, and adds
+`gate[gate_indices] * projection` into `base` without allocating a full-size
+output.
+
+Residual rows hold live data, so attention windows never borrow them: attention
+uses its separate window buffers (two when several windows overlap projection),
+and projection writes into a bounded scratch window before its gated add. The
+add runs in FP32 and rounds `base` once per window row.

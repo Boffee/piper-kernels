@@ -7,9 +7,9 @@ from typing import cast
 
 import torch
 
-from piper_kernels.fusions.ffn import triton as indexed_updates
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
+from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import _operands
@@ -82,7 +82,7 @@ def _run_chunked_gelu_ffn(
     down_high_first: bool,
     chunk_rows: int,
     *,
-    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     up, down = _operands.linear_operands(
         up_weight_qdata,
@@ -107,7 +107,7 @@ def _run_chunked_gelu_ffn(
         chunk_rows,
         StandardSourcePreparation(up_high_first),
         StandardGELUPreparation(down_high_first),
-        gated_updates=gated_updates,
+        residual_add=residual_add,
     )
 
 
@@ -280,13 +280,12 @@ def _chunked_gelu_ffn_gated_updates_op(
         down_dynamic_activation_scale,
         down_high_first,
         chunk_rows,
-        gated_updates=indexed_updates.IndexedGatedUpdates(
+        residual_add=residual_updates.ResidualAdd(
             base=base,
-            reusable_update=reusable_update,
-            update_gate=update_gate,
-            ffn_gate=ffn_gate,
+            gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
+            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -334,15 +333,14 @@ def _chunked_gelu_ffn_gated_updates_op_fake(
         down_high_first,
         chunk_rows,
     )
-    indexed_updates.validate_indexed_gated_updates(
+    residual_updates.validate_residual_add(
         input,
-        indexed_updates.IndexedGatedUpdates(
+        residual_updates.ResidualAdd(
             base,
-            reusable_update,
-            update_gate,
             ffn_gate,
             gate_indices,
             python_indexing,
+            residual_updates.ReusableUpdate(reusable_update, update_gate),
         ),
         output_features,
     )

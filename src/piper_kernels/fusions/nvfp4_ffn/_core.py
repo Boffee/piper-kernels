@@ -7,7 +7,7 @@ from typing import ClassVar, Protocol, cast
 
 import torch
 
-from piper_kernels.fusions.ffn import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -237,7 +237,7 @@ def run_chunked_ffn(
     source_preparation: SourcePreparationBackend,
     activation_preparation: ActivationPreparationBackend,
     *,
-    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
+    residual_add: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     dimensions = validate_ffn(
@@ -264,20 +264,20 @@ def run_chunked_ffn(
     )
     update_layout = (
         None
-        if gated_updates is None
-        else indexed_updates.validate_indexed_gated_updates(
+        if residual_add is None
+        else residual_updates.validate_residual_add(
             input,
-            gated_updates,
+            residual_add,
             output_features,
         )
     )
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
-        if gated_updates is None
-        else gated_updates.reusable_update
+        if residual_add is None
+        else residual_add.output
     )
     output_2d = output.view(rows, output_features)
-    base_2d = None if gated_updates is None else gated_updates.base.view(rows, output_features)
+    base_2d = None if residual_add is None else residual_add.base.view(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
     source_storage = prepare_activation_storage(
         input,
@@ -291,7 +291,7 @@ def run_chunked_ffn(
         dtype=input.dtype,
     )
     projected_workspace = None
-    if gated_updates is not None:
+    if residual_add is not None:
         projection_columns = projection_workspace.shape[1]
         projected_workspace = (
             projection_workspace[:, :output_features]
@@ -343,7 +343,7 @@ def run_chunked_ffn(
             down.activation_per_tensor_scale,
             down.dynamic_activation_scale,
         )
-        if gated_updates is None:
+        if residual_add is None:
             _project_affine_chunk(
                 down_qdata,
                 down_scale,
@@ -365,11 +365,11 @@ def run_chunked_ffn(
             chunk_row_count,
             projected,
         )
-        indexed_updates.apply_indexed_gated_updates(
+        residual_updates.apply_residual_add(
             projected,
             base_2d[start:stop],
             output_2d[start:stop],
-            gated_updates,
+            residual_add,
             update_layout,
             start,
         )

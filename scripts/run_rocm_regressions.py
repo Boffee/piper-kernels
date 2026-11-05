@@ -34,6 +34,8 @@ _SUITE = (
     "::test_fused_coarse_projection_reuses_one_dynamic_shape_graph",
     "tests/fusions/convrot_int8_sparse_piper/test_compile.py"
     "::test_attention_output_fusion_reuses_one_dynamic_shape_graph",
+    "tests/fusions/convrot_int8_piper/test_residual_add.py",
+    "tests/fusions/residual_updates",
 )
 
 
