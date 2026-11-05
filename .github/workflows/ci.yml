@@ -48,6 +48,15 @@ jobs:
       - name: Type check
         run: uv run pyright
 
+      # Hosted runners vary between AVX2, AVX-512, and AMX CPUs. Inductor generates
+      # C++ kernels for the runner's vector ISA but omits the ISA from its cache keys,
+      # so kernels generated on one ISA compute wrong results when reused on another.
+      - name: Identify the compiler's CPU vector ISA
+        id: compiler-target
+        run: >-
+          uv run python -c "from torch._inductor.cpu_vec_isa import pick_vec_isa;
+          print('isa=' + str(pick_vec_isa()).replace(' ', '-'))" >> "$GITHUB_OUTPUT"
+
       - name: Cache compiled kernels
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -55,10 +64,11 @@ jobs:
             ${{ env.TRITON_CACHE_DIR }}
             ${{ env.TORCHINDUCTOR_CACHE_DIR }}
           # Each source revision can save new entries. The compilers' own cache
-          # keys invalidate changed kernels when restoring an earlier snapshot.
-          key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-py313-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py', 'benchmarks/**/*.py', 'pyproject.toml') }}
+          # keys invalidate changed kernels when restoring an earlier snapshot of
+          # the same vector ISA.
+          key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler-target.outputs.isa }}-py313-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py', 'benchmarks/**/*.py', 'pyproject.toml') }}
           restore-keys: |
-            compiler-v1-${{ runner.os }}-${{ runner.arch }}-py313-${{ hashFiles('uv.lock') }}-
+            compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler-target.outputs.isa }}-py313-${{ hashFiles('uv.lock') }}-
 
       - name: Test portable backends
         run: uv run pytest --durations=20
