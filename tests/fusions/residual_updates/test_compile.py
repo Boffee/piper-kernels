@@ -251,12 +251,12 @@ def test_compile_options_append_the_rewrite_and_disable_buffer_reuse():
     assert residual_updates_compile_options(options)["post_grad_custom_pre_pass"][-1] is passes[-1]
 
 
-def test_ffn_residual_adds_take_the_two_update_arguments_without_the_first_update():
+def test_ffn_residual_adds_take_the_two_update_arguments_without_the_reusable_update():
     for two_updates, residual_add in residual_compile._FFN_RESIDUAL_ADDS.items():
         assert isinstance(two_updates, torch._ops.OpOverload)
         expected = [
             argument.name
             for argument in two_updates._schema.arguments
-            if argument.name not in residual_compile._FIRST_UPDATE_ARGUMENTS
+            if argument.name not in residual_compile._REUSABLE_UPDATE_ARGUMENTS
         ]
         assert [argument.name for argument in residual_add._schema.arguments] == expected

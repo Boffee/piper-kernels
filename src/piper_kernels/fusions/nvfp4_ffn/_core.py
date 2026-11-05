@@ -7,7 +7,7 @@ from typing import ClassVar, Protocol, cast
 
 import torch
 
-from piper_kernels.fusions.residual_updates import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -237,7 +237,7 @@ def run_chunked_ffn(
     source_preparation: SourcePreparationBackend,
     activation_preparation: ActivationPreparationBackend,
     *,
-    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
+    gated_updates: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     dimensions = validate_ffn(
@@ -265,7 +265,7 @@ def run_chunked_ffn(
     update_layout = (
         None
         if gated_updates is None
-        else indexed_updates.validate_indexed_gated_updates(
+        else residual_updates.validate_residual_add(
             input,
             gated_updates,
             output_features,
@@ -365,7 +365,7 @@ def run_chunked_ffn(
             chunk_row_count,
             projected,
         )
-        indexed_updates.apply_indexed_gated_updates(
+        residual_updates.apply_residual_add(
             projected,
             base_2d[start:stop],
             output_2d[start:stop],

@@ -15,8 +15,8 @@ from . import _backend, _schedule, query
 
 if TYPE_CHECKING:
     from piper_kernels.fusions.residual_updates.triton import (
-        IndexedGatedUpdateLayout,
-        IndexedGatedUpdates,
+        ResidualAdd,
+        ResidualAddLayout,
     )
 
 # Share the storage cap with sparse; dense scheduling may select smaller windows.
@@ -380,10 +380,10 @@ def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int,
     query_chunk_rows: int,
-) -> tuple[tuple[int, int, int, int], "IndexedGatedUpdates", "IndexedGatedUpdateLayout"]:
+) -> tuple[tuple[int, int, int, int], "ResidualAdd", "ResidualAddLayout"]:
     """Check attention-output and residual metadata without tensor work."""
     # Triton loads only when the residual add runs.
-    from piper_kernels.fusions.residual_updates import triton as indexed_updates  # noqa: PLC0415
+    from piper_kernels.fusions.residual_updates import triton as residual_updates  # noqa: PLC0415
 
     shape = _validate_inputs(
         input_qdata,
@@ -416,13 +416,13 @@ def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
     batch, _, sequence, _ = shape
     if base.ndim != 3 or base.shape[:2] != (batch, sequence):
         raise ValueError("dense Piper residual base must have one row per query token")
-    updates = indexed_updates.IndexedGatedUpdates(
+    updates = residual_updates.ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    layout = indexed_updates.validate_indexed_gated_updates(base, updates, weight_qdata.shape[0])
+    layout = residual_updates.validate_residual_add(base, updates, weight_qdata.shape[0])
     return shape, updates, layout
 
 

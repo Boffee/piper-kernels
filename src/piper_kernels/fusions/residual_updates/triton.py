@@ -1,4 +1,4 @@
-"""Indexed gated residual-update epilogue shared by FFN and attention projections."""
+"""Gated residual-add epilogue shared by FFN and attention projections."""
 
 # Triton's JIT launcher accepts compile-time options outside its Python signature.
 # pyright: reportCallIssue=false
@@ -18,69 +18,69 @@ _EPILOGUE_BLOCK_SIZE = 256
 
 
 @dataclass(frozen=True, slots=True)
-class FirstGatedUpdate:
-    """An earlier update applied with the projection's; ``storage`` receives the result."""
+class ReusableUpdate:
+    """A computed gated update whose ``update`` storage receives the residual sum."""
 
-    storage: torch.Tensor
+    update: torch.Tensor
     gate: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
-class IndexedGatedUpdates:
-    """Gated updates of ``base`` applied after each projected chunk.
+class ResidualAdd:
+    """Add ``gate[i] * projection`` to each row of ``base`` after each projected chunk.
 
-    Each row becomes ``base + first.gate[i] * first.storage + gate[i] * projection``,
-    stored in ``first.storage``. Without a first update it becomes
-    ``base + gate[i] * projection``, stored in ``base``. Gate rows are selected by
-    ``gate_indices``, which wrap negative values under ``python_indexing``.
-    Arithmetic is FP32 with one rounding to the storage dtype.
+    Each row becomes ``base + gate[i] * projection``, stored in ``base``. With a
+    ``reusable`` update, it becomes ``base + reusable.gate[i] * reusable.update +
+    gate[i] * projection``, stored over ``reusable.update`` so ``base`` is unchanged.
+    Gate rows are selected by ``gate_indices``, which wrap negative values under
+    ``python_indexing``. Arithmetic is FP32 with one rounding to the storage dtype.
     """
 
     base: torch.Tensor
     gate: torch.Tensor
     gate_indices: torch.Tensor
     python_indexing: bool
-    first: FirstGatedUpdate | None = None
+    reusable: ReusableUpdate | None = None
 
     @property
     def output(self) -> torch.Tensor:
         """Storage that receives the updated rows."""
-        return self.base if self.first is None else self.first.storage
+        return self.base if self.reusable is None else self.reusable.update
 
 
 @dataclass(frozen=True, slots=True)
-class IndexedGatedUpdateLayout:
+class ResidualAddLayout:
     """Validated gate layout values passed to the Triton epilogue."""
 
     gate_row_stride: int
     gate_rows: int
-    first_gate_row_stride: int = 0
-    first_gate_rows: int = 1
+    reusable_gate_row_stride: int = 0
+    reusable_gate_rows: int = 1
 
 
 @triton.jit
-def _indexed_gated_updates_kernel(
+def _residual_add_kernel(
     projection_ptr,
     base_ptr,
     output_ptr,
-    first_gate_ptr,
+    reusable_gate_ptr,
     gate_ptr,
     gate_indices_ptr,
     elements,
     row_offset,
     features: tl.constexpr,
     projection_row_stride: tl.constexpr,
-    first_gate_row_stride: tl.constexpr,
+    reusable_gate_row_stride: tl.constexpr,
     gate_row_stride: tl.constexpr,
-    first_gate_rows,
+    reusable_gate_rows,
     gate_rows,
-    has_first_update: tl.constexpr,
+    has_reusable_update: tl.constexpr,
     python_indexing: tl.constexpr,
     block_size: tl.constexpr,
 ):
-    """Apply an optional first indexed gated update and the projection's update.
+    """Add the projection's gated update, and an optional reusable update, to ``base``.
 
-    With a first update, ``output_ptr`` holds that update and receives the result;
+    With a reusable update, ``output_ptr`` holds that update and receives the result;
     without one, it is ``base_ptr``. Each element is read before it is written.
     """
     offsets = (tl.program_id(0) * block_size + tl.arange(0, block_size)).to(tl.int64)
@@ -100,22 +100,22 @@ def _indexed_gated_updates_kernel(
     ).to(tl.int64)
     if python_indexing:
         gate_row = tl.where(indices < 0, indices + gate_rows, indices)
-        first_gate_row = tl.where(indices < 0, indices + first_gate_rows, indices)
+        reusable_gate_row = tl.where(indices < 0, indices + reusable_gate_rows, indices)
     else:
         gate_row = indices
-        first_gate_row = indices
-    if has_first_update:
-        first_update = tl.load(
+        reusable_gate_row = indices
+    if has_reusable_update:
+        reusable_update = tl.load(
             output_ptr + offsets,
             mask=valid,
             other=0.0,
         ).to(tl.float32)
-        first_gate = tl.load(
-            first_gate_ptr + first_gate_row * first_gate_row_stride + columns,
+        reusable_gate = tl.load(
+            reusable_gate_ptr + reusable_gate_row * reusable_gate_row_stride + columns,
             mask=valid,
             other=0.0,
         ).to(tl.float32)
-        hidden = hidden + first_gate * first_update
+        hidden = hidden + reusable_gate * reusable_update
     gate = tl.load(
         gate_ptr + gate_row * gate_row_stride + columns,
         mask=valid,
@@ -125,21 +125,21 @@ def _indexed_gated_updates_kernel(
     tl.store(output_ptr + offsets, result, mask=valid)
 
 
-def validate_indexed_gated_updates(
+def validate_residual_add(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
-    updates: IndexedGatedUpdates,
+    updates: ResidualAdd,
     output_features: int | torch.SymInt,
-) -> IndexedGatedUpdateLayout:
+) -> ResidualAddLayout:
     """Validate update metadata for one row per leading position of ``input``.
 
     ``input`` supplies the row shape, dtype, and device. Index values are caller
     preconditions under the library validation contract.
     """
-    first = updates.first
+    reusable = updates.reusable
     expected_shape = (*input.shape[:-1], output_features)
     for name, tensor in (
         ("base", updates.base),
-        ("reusable update", None if first is None else first.storage),
+        ("reusable update", None if reusable is None else reusable.update),
     ):
         if tensor is None:
             continue
@@ -154,7 +154,7 @@ def validate_indexed_gated_updates(
                 f"gated update {name} must be a contiguous strided tensor "
                 f"with shape {expected_shape}, dtype {input.dtype}, and device {input.device}"
             )
-    for gate in (None if first is None else first.gate, updates.gate):
+    for gate in (None if reusable is None else reusable.gate, updates.gate):
         if gate is None:
             continue
         if (
@@ -185,28 +185,32 @@ def validate_indexed_gated_updates(
             "gated update indices must be a one-dimensional contiguous INT32 or INT64 "
             f"tensor with {rows} elements on {input.device}"
         )
-    tensors = (updates.base, updates.gate, *(() if first is None else (first.storage, first.gate)))
+    tensors = (
+        updates.base,
+        updates.gate,
+        *(() if reusable is None else (reusable.update, reusable.gate)),
+    )
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         raise RuntimeError("gated updates are inference-only and do not support autograd")
-    if first is None:
-        return IndexedGatedUpdateLayout(
+    if reusable is None:
+        return ResidualAddLayout(
             gate_row_stride=updates.gate.stride(0),
             gate_rows=updates.gate.shape[0],
         )
-    return IndexedGatedUpdateLayout(
+    return ResidualAddLayout(
         gate_row_stride=updates.gate.stride(0),
         gate_rows=updates.gate.shape[0],
-        first_gate_row_stride=first.gate.stride(0),
-        first_gate_rows=first.gate.shape[0],
+        reusable_gate_row_stride=reusable.gate.stride(0),
+        reusable_gate_rows=reusable.gate.shape[0],
     )
 
 
-def apply_indexed_gated_updates(
+def apply_residual_add(
     projection: torch.Tensor,
     base: torch.Tensor,
     output: torch.Tensor,
-    updates: IndexedGatedUpdates,
-    layout: IndexedGatedUpdateLayout,
+    updates: ResidualAdd,
+    layout: ResidualAddLayout,
     row_offset: int,
 ) -> None:
     """Apply one validated chunk of gated updates into its output rows.
@@ -215,24 +219,24 @@ def apply_indexed_gated_updates(
     ``updates.output``; ``row_offset`` locates the chunk in ``gate_indices``.
     """
     elements = projection.numel()
-    first = updates.first
+    reusable = updates.reusable
     with device_context(projection.device):
-        _indexed_gated_updates_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
+        _residual_add_kernel[(triton.cdiv(elements, _EPILOGUE_BLOCK_SIZE),)](
             projection,
             base,
             output,
-            updates.gate if first is None else first.gate,
+            updates.gate if reusable is None else reusable.gate,
             updates.gate,
             updates.gate_indices,
             elements,
             row_offset,
             features=projection.shape[-1],
             projection_row_stride=projection.stride(0),
-            first_gate_row_stride=layout.first_gate_row_stride,
+            reusable_gate_row_stride=layout.reusable_gate_row_stride,
             gate_row_stride=layout.gate_row_stride,
-            first_gate_rows=layout.first_gate_rows,
+            reusable_gate_rows=layout.reusable_gate_rows,
             gate_rows=layout.gate_rows,
-            has_first_update=first is not None,
+            has_reusable_update=reusable is not None,
             python_indexing=updates.python_indexing,
             block_size=_EPILOGUE_BLOCK_SIZE,
             num_warps=4,
@@ -240,9 +244,9 @@ def apply_indexed_gated_updates(
 
 
 __all__ = [
-    "FirstGatedUpdate",
-    "IndexedGatedUpdateLayout",
-    "IndexedGatedUpdates",
-    "apply_indexed_gated_updates",
-    "validate_indexed_gated_updates",
+    "ResidualAdd",
+    "ResidualAddLayout",
+    "ReusableUpdate",
+    "apply_residual_add",
+    "validate_residual_add",
 ]

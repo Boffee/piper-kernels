@@ -13,8 +13,8 @@ from piper_kernels.weights.convrot.int8._quantization import validate_storage
 
 if TYPE_CHECKING:
     from piper_kernels.fusions.residual_updates.triton import (
-        IndexedGatedUpdateLayout,
-        IndexedGatedUpdates,
+        ResidualAdd,
+        ResidualAddLayout,
     )
 
 
@@ -186,20 +186,20 @@ def prepare_residual_add_projector(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     group_size: int,
-    updates: IndexedGatedUpdates,
-    layout: IndexedGatedUpdateLayout,
+    updates: ResidualAdd,
+    layout: ResidualAddLayout,
     *,
     backend: LinearBackend,
     output_input_scale: torch.Tensor | None = None,
 ) -> tuple[ChunkProjector, tuple[torch.Tensor, ...]]:
     """Project each chunk into bounded scratch, then add its gated rows into the output.
 
-    ``updates`` has no first update: the pipeline output is ``updates.base``, and each
+    ``updates`` has no reusable update: the pipeline output is ``updates.base``, and each
     row becomes ``base + updates.gate[index] * projection`` with one rounding.
     Output rows hold live data, so attention must not share their storage.
     """
     # Triton loads only when the gated update runs.
-    from piper_kernels.fusions.residual_updates import triton as indexed_updates  # noqa: PLC0415
+    from piper_kernels.fusions.residual_updates import triton as residual_updates  # noqa: PLC0415
 
     input_features = weight_qdata.shape[1]
     output_features = weight_qdata.shape[0]
@@ -230,7 +230,7 @@ def prepare_residual_add_projector(
                 output_input_scale,
             )
             output_rows = output[batch_index, start : start + rows]
-            indexed_updates.apply_indexed_gated_updates(
+            residual_updates.apply_residual_add(
                 chunk_projected,
                 output_rows,
                 output_rows,

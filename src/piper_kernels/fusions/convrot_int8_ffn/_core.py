@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._input_activations import InputActivation, input_activation_width
-from piper_kernels.fusions.residual_updates import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.linear import _bias
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.convrot.int8 import _backend
@@ -126,7 +126,7 @@ def run_chunked_ffn(
     activation_fn: InputActivation,
     chunk_rows: int,
     *,
-    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
+    gated_updates: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     input_features, intermediate_features, output_features = validate_ffn(
@@ -144,7 +144,7 @@ def run_chunked_ffn(
     update_layout = (
         None
         if gated_updates is None
-        else indexed_updates.validate_indexed_gated_updates(
+        else residual_updates.validate_residual_add(
             input,
             gated_updates,
             output_features,
@@ -276,7 +276,7 @@ def run_chunked_ffn(
         if gated_updates is not None:
             assert base_2d is not None
             assert update_layout is not None
-            indexed_updates.apply_indexed_gated_updates(
+            residual_updates.apply_residual_add(
                 output_chunk,
                 base_2d[start:stop],
                 output_2d[start:stop],

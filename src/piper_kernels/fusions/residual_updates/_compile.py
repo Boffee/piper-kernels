@@ -62,8 +62,8 @@ _RESIDUAL_ADD = _kernels.residual_add_.default
 _COPY = torch.ops.aten.copy_.default
 
 # Each FFN two-update operator and its in-place residual-add counterpart. A
-# counterpart takes the two-update operator's arguments, by name, without the
-# first update's ``reusable_update`` and ``update_gate``. The FFN fusion replaces
+# counterpart takes the two-update operator's arguments, by name, without
+# ``reusable_update`` and its ``update_gate``. The FFN fusion replaces
 # ``base + update_gate[i] * reusable_update + ffn_gate[i] * ffn(...)`` with the
 # two-update operator and keeps ``base + update_gate[i] * reusable_update`` as the
 # FFN input's source, so that gated product is ``reusable_update``'s other reader.
@@ -78,7 +78,7 @@ _ATTENTION_FOLDS: dict[object, AttentionFold] = {
         dense_attention.fold_residual_add
     ),
 }
-_FIRST_UPDATE_ARGUMENTS = ("reusable_update", "update_gate")
+_REUSABLE_UPDATE_ARGUMENTS = ("reusable_update", "update_gate")
 
 
 def _source_files() -> tuple[str, ...]:
@@ -122,7 +122,7 @@ def _rewrite_ffn_updates(
     (product,) = readers
     (residual,) = product.users
 
-    first_update: dict[str, Argument] = {
+    update_add: dict[str, Argument] = {
         "base": base,
         "gate": values["update_gate"],
         "gate_indices": values["gate_indices"],
@@ -131,15 +131,15 @@ def _rewrite_ffn_updates(
     fold = _ATTENTION_FOLDS.get(update.target)
     with graph.inserting_before(residual):
         if fold is None:
-            added = call_functional(graph, _RESIDUAL_ADD, {**first_update, "update": update})
+            added = call_functional(graph, _RESIDUAL_ADD, {**update_add, "update": update})
         else:
-            added = fold(graph, update, first_update)
+            added = fold(graph, update, update_add)
     residual.replace_all_uses_with(added)
-    ffn_update = {
-        name: value for name, value in values.items() if name not in _FIRST_UPDATE_ARGUMENTS
+    ffn_add = {
+        name: value for name, value in values.items() if name not in _REUSABLE_UPDATE_ARGUMENTS
     }
     with graph.inserting_before(ffn):
-        result = call_functional(graph, residual_add, {**ffn_update, "base": added})
+        result = call_functional(graph, residual_add, {**ffn_add, "base": added})
     copy.args = (base, result)
     graph.erase_node(ffn)
     _log.debug(

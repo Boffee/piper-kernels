@@ -21,11 +21,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 ### Changed
 
 - The indexed gated-update epilogue moved from `piper_kernels.fusions.ffn.triton` to
-  `piper_kernels.fusions.residual_updates.triton`. `IndexedGatedUpdates` now holds one
-  projection update (`gate`) and an optional earlier `FirstGatedUpdate` instead of
-  fixed `reusable_update`, `update_gate`, and `ffn_gate` fields, and
-  `IndexedGatedUpdateLayout` fields are renamed to match. Built-in operators are
-  unchanged.
+  `piper_kernels.fusions.residual_updates.triton` and is named for what it does.
+  `IndexedGatedUpdates` is now `ResidualAdd`: it adds one gated projection (`gate`) to
+  `base` and, with an optional `ReusableUpdate`, also adds that computed update and
+  stores the sum over it. This replaces the fixed `reusable_update`, `update_gate`, and
+  `ffn_gate` fields. `IndexedGatedUpdateLayout` is now `ResidualAddLayout`, and
+  `apply_indexed_gated_updates` and `validate_indexed_gated_updates` are now
+  `apply_residual_add` and `validate_residual_add`. Built-in operators are unchanged.
 - On Windows, the `triton` extra now requires PyTorch 2.15 and selects its matching
   Triton 3.9 through `triton-windows`. A Triton 3.8 build does not match PyTorch 2.15's
   compiler. Linux still supports PyTorch 2.14.

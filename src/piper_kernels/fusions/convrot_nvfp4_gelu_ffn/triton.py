@@ -9,7 +9,7 @@ from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
 from piper_kernels.fusions.nvfp4_gelu_ffn import _operands
 from piper_kernels.fusions.nvfp4_gelu_ffn._preparation import StandardGELUPreparation
-from piper_kernels.fusions.residual_updates import triton as indexed_updates
+from piper_kernels.fusions.residual_updates import triton as residual_updates
 
 from ._preparation import ConvRotGELUPreparation
 
@@ -53,7 +53,7 @@ def _run_chunked_gelu_ffn(
     down_high_first: bool,
     chunk_rows: int,
     *,
-    gated_updates: indexed_updates.IndexedGatedUpdates | None = None,
+    gated_updates: residual_updates.ResidualAdd | None = None,
 ) -> torch.Tensor:
     up, down = _operands.linear_operands(
         up_weight_qdata,
@@ -277,12 +277,12 @@ def _chunked_gelu_ffn_gated_updates_op(
         down_group_size,
         down_high_first,
         chunk_rows,
-        gated_updates=indexed_updates.IndexedGatedUpdates(
+        gated_updates=residual_updates.ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
-            first=indexed_updates.FirstGatedUpdate(reusable_update, update_gate),
+            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -334,14 +334,14 @@ def _chunked_gelu_ffn_gated_updates_op_fake(
         down_high_first,
         chunk_rows,
     )
-    indexed_updates.validate_indexed_gated_updates(
+    residual_updates.validate_residual_add(
         input,
-        indexed_updates.IndexedGatedUpdates(
+        residual_updates.ResidualAdd(
             base,
             ffn_gate,
             gate_indices,
             python_indexing,
-            indexed_updates.FirstGatedUpdate(reusable_update, update_gate),
+            residual_updates.ReusableUpdate(reusable_update, update_gate),
         ),
         output_features,
     )

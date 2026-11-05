@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from . import triton as indexed_updates
+from . import triton as residual_updates
 
 
 def _validate(
@@ -13,7 +13,7 @@ def _validate(
     gate: torch.Tensor,
     gate_indices: torch.Tensor,
     python_indexing: bool,
-) -> tuple[indexed_updates.IndexedGatedUpdates, indexed_updates.IndexedGatedUpdateLayout]:
+) -> tuple[residual_updates.ResidualAdd, residual_updates.ResidualAddLayout]:
     if base.ndim < 1 or not base.dtype.is_floating_point:
         raise ValueError("residual add base must be a floating-point tensor with features")
     if (
@@ -24,13 +24,13 @@ def _validate(
         or not update.is_contiguous()
     ):
         raise ValueError("residual add update must be contiguous and match base")
-    updates = indexed_updates.IndexedGatedUpdates(
+    updates = residual_updates.ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    return updates, indexed_updates.validate_indexed_gated_updates(base, updates, base.shape[-1])
+    return updates, residual_updates.validate_residual_add(base, updates, base.shape[-1])
 
 
 @torch.library.custom_op("piper_kernels::residual_add_", mutates_args=("base",))
@@ -50,7 +50,7 @@ def _residual_add_op(
     if base.numel() == 0:
         return
     rows = base.view(-1, base.shape[-1])
-    indexed_updates.apply_indexed_gated_updates(
+    residual_updates.apply_residual_add(
         update.view(-1, base.shape[-1]), rows, rows, updates, layout, 0
     )
 
