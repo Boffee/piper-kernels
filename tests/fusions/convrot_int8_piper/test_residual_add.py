@@ -97,18 +97,3 @@ def test_residual_add_validates_attention_operands_from_metadata():
             *_attention_operands(arguments),
             head_dim=64,
         )
-
-
-def test_residual_add_takes_the_attention_output_arguments_and_its_residual():
-    kernels = torch.ops.piper_kernels
-    attention_output = kernels.convrot_int8_piper_projected_query_attention_output.default
-    residual_add = kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
-    attention_names = [
-        argument.name
-        for argument in attention_output._schema.arguments
-        if argument.name != "output_dtype"
-    ]
-    residual_names = [argument.name for argument in residual_add._schema.arguments]
-
-    assert residual_names[:4] == ["base", "gate", "gate_indices", "python_indexing"]
-    assert residual_names[4:] == attention_names

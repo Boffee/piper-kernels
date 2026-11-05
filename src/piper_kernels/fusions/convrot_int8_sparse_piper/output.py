@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -20,6 +21,12 @@ from piper_kernels.weights.convrot.int8._quantization import (
 from . import _backend as fusion_backend
 from . import query as query_projection
 from ._layout import TILE_ROWS
+
+if TYPE_CHECKING:
+    from piper_kernels.fusions.residual_updates.triton import (
+        ResidualAdd,
+        ResidualAddLayout,
+    )
 
 _DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
 
@@ -231,8 +238,13 @@ def _prepare_output_chunk_projector(  # noqa: PLR0913
     backend: LinearBackend,
     output_dtype: torch.dtype = torch.bfloat16,
     output_input_scale: torch.Tensor | None = None,
+    residual_add: tuple[ResidualAdd, ResidualAddLayout] | None = None,
 ) -> tuple[int, output_common.ChunkProjector, tuple[torch.Tensor, ...]]:
-    """Prepare output-chunk buffers using the fusion's already-selected backend."""
+    """Prepare output-chunk buffers using the fusion's already-selected backend.
+
+    With a validated ``residual_add``, chunks add their gated projection into its base
+    rows instead of filling output rows that attention may borrow.
+    """
     validate_activation_scale(output_input_scale, attention_storage.device)
     _input_features, output_features = _validate_output_projection(
         attention_storage,
@@ -244,16 +256,29 @@ def _prepare_output_chunk_projector(  # noqa: PLR0913
         query_chunk_rows,
         output_dtype=output_dtype,
     )
-    project_chunk, retained = projection_output.prepare_chunk_projector(
-        sequence_length,
-        query_chunk_rows,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        backend=backend,
-        output_input_scale=output_input_scale,
-    )
+    if residual_add is None:
+        project_chunk, retained = projection_output.prepare_chunk_projector(
+            sequence_length,
+            query_chunk_rows,
+            weight_qdata,
+            weight_scale,
+            bias,
+            group_size,
+            backend=backend,
+            output_input_scale=output_input_scale,
+        )
+    else:
+        project_chunk, retained = projection_output.prepare_residual_add_projector(
+            sequence_length,
+            query_chunk_rows,
+            weight_qdata,
+            weight_scale,
+            bias,
+            group_size,
+            *residual_add,
+            backend=backend,
+            output_input_scale=output_input_scale,
+        )
     return output_features, project_chunk, retained
 
 
@@ -383,12 +408,16 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     output_input_scale: torch.Tensor | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    residual_add: tuple[ResidualAdd, ResidualAddLayout] | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output.
 
     With ``input_group_size``, Q/gate inputs are floating-point sources and their
     scales are optional calibrated scalars. Otherwise they are prepared INT8
     tensors with FP32 row scales. Preparation workspaces belong to each stream.
+    ``out`` rows may hold attention windows before their projection overwrites them.
+    With a validated ``residual_add`` instead, each window's projection is added
+    into its base rows, which hold live data, so attention uses separate buffers.
     """
     projection_backend = fusion_backend.require_projection_backend(
         query_input, head_dim=key.shape[-1]
@@ -444,6 +473,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         backend=backend,
         output_dtype=output_dtype,
         output_input_scale=output_input_scale,
+        residual_add=residual_add,
     )
 
     def project_query_chunk(
@@ -497,8 +527,8 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
         output_dtype=output_dtype,
-        out=out,
-        reuse_output_for_attention=True,
+        out=out if residual_add is None else residual_add[0].base,
+        reuse_output_for_attention=residual_add is None,
     )
 
 
@@ -838,6 +868,237 @@ def _projected_query_attention_output_op_fake(
     )
     return output_common.new_projected_output(
         key, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
+    )
+
+
+def _validate_residual_add(
+    base: torch.Tensor,
+    gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    key: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    weight_qdata: torch.Tensor,
+    force_tile_ids: torch.Tensor | None,
+    force_tile_counts: torch.Tensor | None,
+) -> tuple[ResidualAdd, ResidualAddLayout]:
+    """Check from metadata that ``base`` has the projected output's rows and dtype."""
+    # Triton loads only when the residual add runs.
+    from piper_kernels.fusions.residual_updates import triton as residual_updates  # noqa: PLC0415
+
+    sequence_length = output_common.validate_output_metadata(
+        key,
+        logical_sequence_length,
+        block_lengths,
+        output_dtype=base.dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    if base.ndim != 3 or base.shape[:2] != (key.shape[0], sequence_length):
+        raise ValueError("sparse Piper residual base must have one row per output row")
+    residual_add = residual_updates.ResidualAdd(
+        base=base,
+        gate=gate,
+        gate_indices=gate_indices,
+        python_indexing=python_indexing,
+    )
+    layout = residual_updates.validate_residual_add(base, residual_add, weight_qdata.shape[0])
+    return residual_add, layout
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_sparse_piper_projected_query_attention_residual_add_",
+    mutates_args=("base",),
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
+def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
+    base: torch.Tensor,
+    gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    query_input: torch.Tensor,
+    query_input_scale: torch.Tensor | None,
+    query_weight_qdata: torch.Tensor,
+    query_weight_scale: torch.Tensor,
+    query_norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query_norm_epsilon: float,
+    softmax_scale: float,
+    key: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_summary: torch.Tensor,
+    key_aux: torch.Tensor,
+    value: torch.Tensor,
+    value_scale_multiplier: torch.Tensor,
+    value_mean: torch.Tensor,
+    ratio_profile: _SparsePiperRatioProfile,
+    sparse_key_blocks: int,
+    logical_sequence_length: int,
+    routing_mode: int,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+    query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    block_mean: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
+    sparse_query_blocks: int | None = None,
+    gate_input: torch.Tensor | None = None,
+    gate_input_scale: torch.Tensor | None = None,
+    gate_weight_qdata: torch.Tensor | None = None,
+    gate_weight_scale: torch.Tensor | None = None,
+    gate_bias: torch.Tensor | None = None,
+    query_bias: torch.Tensor | None = None,
+    output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
+    *,
+    input_group_size: int | None = None,
+) -> None:
+    """Add ``gate[gate_indices] * attention_output`` into ``base`` without a full-size output.
+
+    The attention operands match
+    ``convrot_int8_sparse_piper_projected_query_attention_output``, whose ``gate_*``
+    operands project the coarse gate; ``gate`` is the residual gate, and the output
+    dtype is ``base``'s. Each window is projected into bounded scratch and added into
+    its ``base`` rows in FP32 with one rounding.
+    """
+    residual_add = _validate_residual_add(
+        base,
+        gate,
+        gate_indices,
+        python_indexing,
+        key,
+        logical_sequence_length,
+        block_lengths,
+        weight_qdata,
+        force_tile_ids,
+        force_tile_counts,
+    )
+    gate_projection = _prepare_optional_gate_projection(
+        key,
+        logical_sequence_length,
+        block_lengths,
+        _resolve_projected_gate_input(
+            query_input,
+            gate_input,
+            gate_weight_qdata,
+            input_group_size,
+        ),
+        gate_input_scale,
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_bias,
+        input_group_size,
+    )
+    _run_projected_query_attention_output(
+        query_input,
+        query_input_scale,
+        query_weight_qdata,
+        query_weight_scale,
+        query_norm_weight,
+        cos,
+        sin,
+        query_norm_epsilon,
+        softmax_scale,
+        key,
+        key_scale,
+        key_summary,
+        key_aux,
+        value,
+        value_scale_multiplier,
+        value_mean,
+        ratio_profile,
+        sparse_key_blocks,
+        logical_sequence_length,
+        routing_mode,
+        weight_qdata,
+        weight_scale,
+        bias,
+        group_size,
+        query_chunk_rows,
+        block_lengths,
+        block_mean,
+        coarse_gate,
+        coarse_scale,
+        coarse_key_blocks,
+        sparse_query_blocks,
+        gate_projection,
+        output_dtype=base.dtype,
+        output_input_scale=output_input_scale,
+        query_bias=query_bias,
+        input_group_size=input_group_size,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+        residual_add=residual_add,
+    )
+
+
+@_projected_query_attention_residual_add_op.register_fake
+def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913
+    base: torch.Tensor,
+    gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    _query_input: torch.Tensor,
+    _query_input_scale: torch.Tensor | None,
+    _query_weight_qdata: torch.Tensor,
+    _query_weight_scale: torch.Tensor,
+    _query_norm_weight: torch.Tensor | None,
+    _cos: torch.Tensor,
+    _sin: torch.Tensor,
+    _query_norm_epsilon: float,
+    _softmax_scale: float,
+    key: torch.Tensor,
+    _key_scale: torch.Tensor,
+    _key_summary: torch.Tensor,
+    _key_aux: torch.Tensor,
+    _value: torch.Tensor,
+    _value_scale_multiplier: torch.Tensor,
+    _value_mean: torch.Tensor,
+    _ratio_profile: _SparsePiperRatioProfile,
+    _sparse_key_blocks: int,
+    logical_sequence_length: int,
+    _routing_mode: int,
+    weight_qdata: torch.Tensor,
+    _weight_scale: torch.Tensor,
+    _bias: torch.Tensor | None,
+    _group_size: int,
+    _query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
+    _block_mean: torch.Tensor | None = None,
+    _coarse_gate: torch.Tensor | None = None,
+    _coarse_scale: float | None = None,
+    _coarse_key_blocks: int | None = None,
+    _sparse_query_blocks: int | None = None,
+    _gate_input: torch.Tensor | None = None,
+    _gate_input_scale: torch.Tensor | None = None,
+    _gate_weight_qdata: torch.Tensor | None = None,
+    _gate_weight_scale: torch.Tensor | None = None,
+    _gate_bias: torch.Tensor | None = None,
+    _query_bias: torch.Tensor | None = None,
+    _output_input_scale: torch.Tensor | None = None,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
+    *,
+    input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
+) -> None:
+    _validate_residual_add(
+        base,
+        gate,
+        gate_indices,
+        python_indexing,
+        key,
+        logical_sequence_length,
+        block_lengths,
+        weight_qdata,
+        force_tile_ids,
+        force_tile_counts,
     )
 
 

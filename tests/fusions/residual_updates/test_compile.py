@@ -8,18 +8,29 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
 from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
+from piper_kernels.fusions.convrot_int8_sparse_piper import (
+    convrot_int8_sparse_piper_compile_options,
+)
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 from piper_kernels.linear.convrot.int8 import _ops
 
 from ..convrot_int8_piper.test_compile import _available
+from ..convrot_int8_sparse_piper._helpers import output_available as _sparse_output_available
+from ..convrot_int8_sparse_piper.test_compile import _SparseProjectionAttentionOutput
 from ..convrot_int8_swiglu_ffn._helpers import SwiGluFfn
 
 _kernels = torch.ops.piper_kernels
 _ATTENTION_OUTPUT = _kernels.convrot_int8_piper_projected_query_attention_output.default
 _ATTENTION_RESIDUAL_ADD = (
     _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
+)
+_SPARSE_ATTENTION_OUTPUT = (
+    _kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
+)
+_SPARSE_ATTENTION_RESIDUAL_ADD = (
+    _kernels.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
 )
 _FFN_UPDATES = _kernels.convrot_int8_swiglu_ffn_gated_updates_.default
 _FFN_RESIDUAL_ADD = _kernels.convrot_int8_swiglu_ffn_residual_add_.default
@@ -129,6 +140,39 @@ class _ResidualBlock(torch.nn.Module):
         return residual + ffn_gate[gate_indices] * self.ffn(ffn_input)
 
 
+class _SparseAttention(_SparseProjectionAttentionOutput):
+    """Sparse Piper attention whose output projection returns to the residual width."""
+
+    output_features = 256
+
+
+class _SparseResidualBlock(torch.nn.Module):
+    """The gated residual block with sparse Piper attention over a fixed 192-token layout."""
+
+    width = _SparseAttention.input_features
+    sequence_length = _SparseAttention.sequence_length
+
+    def __init__(self) -> None:
+        super().__init__()
+        torch.manual_seed(1301)
+        self.attention = _SparseAttention()
+        modulation = torch.randn(3, 6 * self.width, device="cuda", dtype=torch.bfloat16)
+        modulation[:, 5 * self.width :].mul_(0.01)
+        self.register_buffer("modulation", modulation.mul_(0.1))
+        self.ffn = _Ffn(promote_gate=True, reverse_multiply=True, bias_dtype=None)
+
+    def forward(self, hidden, gate_indices):
+        shift, scale, attention_gate, ffn_shift, ffn_scale, ffn_gate = self.modulation.split(
+            self.width, dim=-1
+        )
+        normalized = F.rms_norm(hidden, (self.width,), eps=1e-6)
+        normalized = normalized * (1 + scale[gate_indices]) + shift[gate_indices]
+        residual = hidden + attention_gate[gate_indices] * self.attention(normalized)
+        ffn_input = F.rms_norm(residual, (self.width,), eps=1e-6)
+        ffn_input = ffn_input * (1 + ffn_scale[gate_indices]) + ffn_shift[gate_indices]
+        return residual + ffn_gate[gate_indices] * self.ffn(ffn_input)
+
+
 def _options(capture, *, fuse_output=True):
     options = convrot_int8_piper_compile_options(
         convrot_int8_swiglu_ffn_compile_options(), fuse_output=fuse_output
@@ -181,6 +225,44 @@ def test_copy_back_block_updates_its_input_in_place():
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _ATTENTION_OUTPUT not in capture.targets
     assert _FFN_UPDATES not in capture.targets
+    assert _RESIDUAL_ADD not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _sparse_output_available(), reason="requires fused sparse output support")
+def test_sparse_attention_output_is_computed_inside_its_residual_add():
+    model = _SparseResidualBlock()
+    capture = _FunctionalCapture()
+    options = convrot_int8_sparse_piper_compile_options(convrot_int8_swiglu_ffn_compile_options())
+    hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
+    gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
+    torch._dynamo.reset()
+    with torch.no_grad():
+        # The sparse fusions alone differ from eager by about 2% here, so compare
+        # against them without the rewrite.
+        expected = torch.compile(model, fullgraph=True, options=options)(
+            hidden.clone(), gate_indices
+        )
+    torch._dynamo.reset()
+
+    def copy_back(hidden, gate_indices):
+        return hidden.copy_(model(hidden, gate_indices))
+
+    compiled = torch.compile(
+        copy_back,
+        fullgraph=True,
+        options=capture.wrap_options(residual_updates_compile_options(options)),
+    )
+    ReinplaceCounters.clear()
+    with torch.no_grad():
+        result = compiled(hidden, gate_indices)
+
+    assert result.data_ptr() == hidden.data_ptr()
+    assert _relative_l2(hidden, expected) < 0.01
+    assert ReinplaceCounters.get_total_missed() == 0
+    assert capture.targets.count(_SPARSE_ATTENTION_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+    assert _SPARSE_ATTENTION_OUTPUT not in capture.targets
     assert _RESIDUAL_ADD not in capture.targets
 
 
@@ -260,3 +342,20 @@ def test_ffn_residual_adds_take_the_two_update_arguments_without_the_reusable_up
             if argument.name not in residual_compile._REUSABLE_UPDATE_ARGUMENTS
         ]
         assert [argument.name for argument in residual_add._schema.arguments] == expected
+
+
+def test_attention_residual_adds_take_the_add_then_the_output_arguments():
+    for attention_output, residual_add in residual_compile._ATTENTION_RESIDUAL_ADDS.items():
+        assert isinstance(attention_output, torch._ops.OpOverload)
+        output_names = [
+            argument.name
+            for argument in attention_output._schema.arguments
+            if argument.name != "output_dtype"
+        ]
+        assert [argument.name for argument in residual_add._schema.arguments] == [
+            "base",
+            "gate",
+            "gate_indices",
+            "python_indexing",
+            *output_names,
+        ]

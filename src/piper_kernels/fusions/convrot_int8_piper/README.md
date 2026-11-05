@@ -85,11 +85,11 @@ Measure the complete pipeline, including output storage and workspace, with the
 
 When the [residual-update rewrite](../residual_updates/_compile.py) adds a
 copy-back block's attention update into `base` and that update is a fused dense
-output, [`_residual_compile.py`](_residual_compile.py) folds the output and its add
-into `convrot_int8_piper_projected_query_attention_residual_add_`. It takes the
-same attention operands, uses `base`'s dtype as the output dtype, and adds
-`gate[gate_indices] * projection` into `base` without allocating a full-size
-output.
+output, it calls `convrot_int8_piper_projected_query_attention_residual_add_`
+instead. That operator takes the output's operands, uses `base`'s dtype as the
+output dtype, and adds `gate[gate_indices] * projection` into `base` without
+allocating a full-size output. Sparse Piper's projected-Q output has the same
+counterpart, `convrot_int8_sparse_piper_projected_query_attention_residual_add_`.
 
 Residual rows hold live data, so attention windows never borrow them: attention
 uses its separate window buffers (two when several windows overlap projection),

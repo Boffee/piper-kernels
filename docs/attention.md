@@ -252,9 +252,9 @@ unchanged.
 
 A gated ConvRot INT8 SwiGLU FFN update becomes an add into the input, and so does
 the attention update before it, which removes the block's new output buffer. A
-fused dense ConvRot INT8 Piper attention output is computed inside its add, which
-also removes the full-size attention output; any other attention output is added
-by a generic residual add. The rewritten graph stays functional, and Inductor
+fused ConvRot INT8 Piper attention output, dense or sparse with fused Q projection,
+is computed inside its add, which also removes the full-size attention output; any
+other attention output is added by a generic residual add. The rewritten graph stays functional, and Inductor
 adds an update in place only when the block reads none of the input's original
 values afterward, through any view; otherwise it copies the input first, which
 keeps the result correct but forgoes that update's saving. Updates round the
