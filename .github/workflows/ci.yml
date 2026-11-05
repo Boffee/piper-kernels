@@ -60,21 +60,6 @@ jobs:
           restore-keys: |
             compiler-v1-${{ runner.os }}-${{ runner.arch }}-py313-${{ hashFiles('uv.lock') }}-
 
-      - name: Diagnose conv3d autocast test (temporary)
-        continue-on-error: true
-        run: |
-          grep -m1 "model name" /proc/cpuinfo; nproc
-          grep -m1 "^flags" /proc/cpuinfo | tr ' ' '\n' | grep -E "avx512|amx|avx2|f16c" | tr '\n' ' '; echo
-          uv run python -c "import torch; from torch._inductor import cpu_vec_isa; print(torch.__version__, torch.backends.cpu.get_cpu_capability(), cpu_vec_isa.pick_vec_isa(), torch.get_num_threads())"
-          du -sh "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" || true
-          TEST=tests/conv3d/convrot/int8/test_padding_compile.py::test_padding_fusion_preserves_autocast_rounding
-          echo "== restored compiler cache"
-          uv run pytest -q -n 0 -p no:cacheprovider "$TEST" 2>&1 | tail -4 || true
-          echo "== fresh compiler cache"
-          TORCHINDUCTOR_CACHE_DIR=$(mktemp -d) TRITON_CACHE_DIR=$(mktemp -d) uv run pytest -q -n 0 -p no:cacheprovider "$TEST" 2>&1 | tail -4 || true
-          echo "== restored cache, FX graph and AOT autograd caches disabled"
-          TORCHINDUCTOR_FX_GRAPH_CACHE=0 TORCHINDUCTOR_AUTOGRAD_CACHE=0 uv run pytest -q -n 0 -p no:cacheprovider "$TEST" 2>&1 | tail -4 || true
-
       - name: Test portable backends
         run: uv run pytest --durations=20
 
