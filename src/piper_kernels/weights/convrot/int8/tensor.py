@@ -193,6 +193,54 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         )
         return self
 
+    @classmethod
+    def from_trellis(
+        cls,
+        bitstreams: torch.Tensor,
+        block_scales: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        block_size: int,
+        group_size: int,
+        logical_dtype: torch.dtype = torch.bfloat16,
+    ) -> "ConvRotInt8Tensor":
+        """Decode trellis-coded storage directly into ConvRot INT8 storage.
+
+        Each row is stored as ``in / T`` blocks of ``T = block_size``
+        weights (16 to 256). ``bitstreams`` is uint8 ``[out, in / T, bytes]``, where
+        the bytes per block set the rate: 3 to 6 bits per weight.
+        ``block_scales`` is FP8 E4M3 ``[out, in / T]``, and ``scale`` is the FP32
+        row scale, ``[out]`` or ``[out, 1]``. The streams already hold the weight
+        rotated for ``group_size``, so decoding produces its INT8 values without
+        rotating; contiguous ``scale`` storage is reused. Decoding is exact by
+        construction, so every backend produces the same INT8 values. It requires a
+        supported Triton accelerator and raises on other devices; it is validated on
+        NVIDIA, and ROCm has compile coverage only.
+        """
+        from piper_kernels.weights.convrot.int8._trellis import convert  # noqa: PLC0415
+
+        qdata, row_scale = convert(bitstreams, block_scales, scale, block_size=block_size)
+        return cls(qdata, row_scale, group_size, logical_dtype)
+
+    def copy_from_trellis_(
+        self,
+        bitstreams: torch.Tensor,
+        block_scales: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> "ConvRotInt8Tensor":
+        """Refill this tensor in place from compatible trellis-coded storage.
+
+        Arguments are as for :meth:`from_trellis`; the block size is this
+        weight's input width over the blocks per row. The streams must encode
+        this weight's shape in the basis of its group size, at any supported rate.
+        """
+        self._require_matrix("copy_from_trellis_")
+        require_untransposed(self, "copy_from_trellis_")
+        from piper_kernels.weights.convrot.int8._trellis import convert  # noqa: PLC0415
+
+        convert(bitstreams, block_scales, scale, out=(self.qdata, self.scale))
+        return self
+
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis and requested dtype."""
         validate_storage(self.qdata, self.scale, self.group_size, self.dtype)

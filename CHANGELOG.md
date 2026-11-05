@@ -5,6 +5,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` decode trellis-coded
+  weights, stored at 3 to 6 bits per weight, into ConvRot INT8 storage. Execution
+  is unchanged. Each tensor's rate comes from its stored shape. Decoding needs a
+  supported Triton accelerator and is exact across CUDA and ROCm. It was validated
+  on NVIDIA hardware only.
+
 ### Changed
 
 - On Windows, the `triton` extra now requires PyTorch 2.15 and selects its matching
