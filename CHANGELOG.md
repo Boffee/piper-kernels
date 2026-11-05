@@ -28,11 +28,31 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `ffn_gate` fields. `IndexedGatedUpdateLayout` is now `ResidualAddLayout`, and
   `apply_indexed_gated_updates` and `validate_indexed_gated_updates` are now
   `apply_residual_add` and `validate_residual_add`. Built-in operators are unchanged.
+
+## [0.8.0rc1] - 2026-11-04
+
+### Added
+
+- Trellis-coded weights store a ConvRot INT8 linear weight at 3 to 6 bits per
+  weight. `piper_kernels.trellis.TrellisStorage.from_hp` rotates and encodes a
+  weight at a chosen rate per tensor, counting each block's FP8 scale; it requires
+  an NVIDIA CUDA GPU and runs at about 45 M weights/s at 4.5 bits per weight on an
+  RTX 5090. `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` decode the
+  storage into ConvRot INT8, so execution is unchanged. Decoding needs a supported
+  Triton accelerator and is exact across CUDA and ROCm; it was validated on NVIDIA
+  hardware only.
+
+### Changed
+
 - On Windows, the `triton` extra now requires PyTorch 2.15 and selects its matching
   Triton 3.9 through `triton-windows`. A Triton 3.8 build does not match PyTorch 2.15's
   compiler. Linux still supports PyTorch 2.14.
 
 ### Fixed
+
+- Long-sequence attention centering bounds each FP32 mean-reduction tile to
+  avoid register spills and excessive CUDA memory use. Reduction scheduling
+  can change last-bit FP32 rounding; attention algorithms and APIs are unchanged.
 
 - PyTorch 2.15 with Triton 3.9 no longer fails to compile NVFP4 kernels or the
   NVIDIA SM120 sparse Piper attention kernel. FP16 sparse Piper output fusions
@@ -910,14 +930,26 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.7.9...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc1...HEAD
+[0.8.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.7.10...v0.8.0rc1
+[0.7.10]: https://github.com/Boffee/piper-kernels/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/Boffee/piper-kernels/compare/v0.7.8...v0.7.9
+[0.7.8]: https://github.com/Boffee/piper-kernels/compare/v0.7.7...v0.7.8
+[0.7.7]: https://github.com/Boffee/piper-kernels/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/Boffee/piper-kernels/compare/v0.7.6rc1...v0.7.6
+[0.7.6rc1]: https://github.com/Boffee/piper-kernels/compare/v0.7.5...v0.7.6rc1
 [0.7.5]: https://github.com/Boffee/piper-kernels/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/Boffee/piper-kernels/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/Boffee/piper-kernels/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/Boffee/piper-kernels/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/Boffee/piper-kernels/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...v0.7.0
+[0.7.0rc7]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc6...v0.7.0rc7
+[0.7.0rc6]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc5...v0.7.0rc6
+[0.7.0rc5]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc4...v0.7.0rc5
+[0.7.0rc4]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc3...v0.7.0rc4
+[0.7.0rc3]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc2...v0.7.0rc3
+[0.7.0rc2]: https://github.com/Boffee/piper-kernels/compare/v0.7.0rc1...v0.7.0rc2
 [0.7.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.6.1...v0.7.0rc1
 [0.6.1]: https://github.com/Boffee/piper-kernels/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Boffee/piper-kernels/compare/v0.5.0...v0.6.0

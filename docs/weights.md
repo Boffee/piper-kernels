@@ -207,7 +207,8 @@ For optional fusion of explicit zero/spatial-reflection padding, use
 cover storage, offload integration, and fusion limits. H3-specific calibration and
 normalization fusion belong to the
 [encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
-Matrix updates, GGUF conversion, transpose, and sharding below apply to 2-D weights only.
+Matrix updates, GGUF conversion, trellis coding, transpose, and sharding below apply to 2-D
+weights only.
 
 ## Compile a model
 
@@ -307,6 +308,45 @@ raise rather than allocate a dense fallback. ConvRot NVFP4 accepts the same scal
 and activation configuration as `from_hp`, including
 `compute_per_tensor_scale=True`. See the [INT8](../src/piper_kernels/weights/convrot/int8/tensor.py)
 and [NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) constructors for signatures.
+
+## Encode and decode trellis-coded storage
+
+Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It is a
+storage format: an exporter encodes each weight once, and loading decodes it into
+ordinary ConvRot INT8 storage, so execution is unchanged. See the
+[format](../src/piper_kernels/trellis/README.md).
+
+```python
+from piper_kernels.trellis import TrellisStorage
+
+storage = TrellisStorage.from_hp(weight, group_size=256, bits_per_weight=4.5)
+
+int8_weight = ConvRotInt8Tensor.from_trellis(
+    storage.bitstreams,  # uint8 [out, in / 256, 143]
+    storage.block_scales,  # float8_e4m3fn [out, in / 256]
+    storage.scale,  # float32 [out, 1]
+    block_size=storage.block_size,
+    group_size=256,
+)
+int8_weight.copy_from_trellis_(storage.bitstreams, storage.block_scales, storage.scale)
+```
+
+`from_hp` rotates a 2-D weight for `group_size` and encodes it in blocks of up to
+256 weights, each with an FP8 scale. `bits_per_weight` counts that scale, so 4.5
+stores a 256-weight block in 143 bytes of codes and a 1-byte scale; tensors in one
+model can use different rates. A checkpoint stores the three tensors, the block size and the ConvRot group
+size. Encoding reads the weight's values: it rejects a non-finite weight and
+requires an NVIDIA CUDA GPU. The format README covers the encoder and its
+throughput.
+
+A block is the run of weights that share one scale, as in GGUF and NVFP4; it is
+independent of the ConvRot rotation `group_size`. The streams already hold the
+weight rotated for `group_size`, so decoding does not rotate; contiguous `scale`
+storage is reused. `copy_from_trellis_` refills compatible existing storage at any
+rate, taking the block size from the weight's width. Decoding is exact by
+construction, so every backend produces the same INT8 values; this is validated
+on NVIDIA, and AMD decoding has compile coverage only. It requires a supported
+Triton accelerator and raises on other devices.
 
 ## Shard a quantized weight
 

@@ -37,16 +37,17 @@ def _rotate_weight_groups(value: torch.Tensor, group_size: int) -> torch.Tensor:
     return rotated.mul_(group_size**-0.5).reshape(value.shape)
 
 
-def quantize_weight(
-    weight: torch.Tensor,
-    group_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a linear or OI-DHW convolution weight per output channel."""
+def validate_hp_weight(weight: torch.Tensor, group_size: int, *, ndims: tuple[int, ...]) -> None:
+    """Validate a high-precision weight for ConvRot INT8 quantization or encoding.
+
+    ``ndims`` lists the accepted ranks: 2 for a linear weight, 5 for an OI-DHW
+    convolution weight.
+    """
     validate_group_size(group_size)
-    if weight.ndim not in (2, 5):
+    if weight.ndim not in ndims:
+        ranks = " or ".join(f"{ndim}-D" for ndim in ndims)
         raise ValueError(
-            "ConvRot INT8 high-precision weight must be 2-D or 5-D, "
-            f"got shape {tuple(weight.shape)}"
+            f"ConvRot INT8 high-precision weight must be {ranks}, got shape {tuple(weight.shape)}"
         )
     if weight.dtype not in _SUPPORTED_LOGICAL_DTYPES:
         raise ValueError(
@@ -61,6 +62,14 @@ def quantize_weight(
         raise ValueError(
             f"ConvRot in_features {weight.shape[1]} is not divisible by group size {group_size}"
         )
+
+
+def quantize_weight(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a linear or OI-DHW convolution weight per output channel."""
+    validate_hp_weight(weight, group_size, ndims=(2, 5))
     if weight.ndim == 5:
         if tuple(weight.shape[2:]) != (3, 3, 3) or weight.shape[0] <= 0:
             raise ValueError("ConvRot INT8 Conv3D weight must have shape [out, in, 3, 3, 3]")
