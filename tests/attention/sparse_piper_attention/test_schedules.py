@@ -4,9 +4,9 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
@@ -20,9 +20,7 @@ from piper_kernels.attention.sparse_piper_attention._routing import packed_route
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 
 requires_sm120 = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0),
-    reason="requires exact NVIDIA SM120",
+    not exact_sm120_available(), reason="requires exact NVIDIA SM120"
 )
 
 
