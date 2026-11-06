@@ -8,9 +8,11 @@ from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
+    _chunked_swiglu_ffn_residual_add_op,
 )
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 
+from .._ffn_residual_add import assert_residual_add_matches_gated_updates
 from ._helpers import make_operands, materialized
 
 
@@ -189,3 +191,24 @@ def test_chunked_ffn_rejects_mismatched_gate_value_group_sizes() -> None:
 
     with pytest.raises(ValueError, match="share a group size"):
         _chunked_swiglu_ffn_op(*arguments)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("python_indexing", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_residual_add_matches_gated_updates_without_reusable_update(
+    python_indexing: bool,
+    dynamic: bool,
+) -> None:
+    operands = make_operands(rows=385, dynamic=dynamic, seed=937)
+    torch.manual_seed(937)
+
+    assert_residual_add_matches_gated_updates(
+        _chunked_swiglu_ffn_gated_updates_op,
+        _chunked_swiglu_ffn_residual_add_op,
+        operands.arguments(128),
+        1,
+        operands.down.weight.shape[0],
+        python_indexing=python_indexing,
+    )

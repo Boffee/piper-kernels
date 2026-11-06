@@ -1,4 +1,4 @@
-"""Projection-independent compiler validation for indexed FFN updates."""
+"""Projection-independent compiler rules for indexed FFN updates."""
 
 from __future__ import annotations
 
@@ -7,10 +7,15 @@ from collections.abc import Callable
 
 import torch
 from torch._inductor.pattern_matcher import Match
+from torch.fx.node import Argument
 
+from piper_kernels.fusions.residual_updates import _graph as residual_graph
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 type FfnPatternValidator = Callable[[Match], bool]
+type UpDownChunkRows = Callable[..., int]
+
+SOURCE_FILES = (__file__, residual_graph.__file__)
 
 
 def _metadata(match: Match, name: str) -> torch.Tensor | None:
@@ -105,6 +110,44 @@ def valid_indexed_gated_updates(
     )
 
 
+def fold_residual_adds(
+    graph: torch.fx.Graph,
+    ffn: torch._ops.OpOverload,
+    residual_add: torch._ops.OpOverload,
+    chunk_rows: UpDownChunkRows | None = None,
+) -> int:
+    """Compute each ``ffn`` call that only a residual add reads inside that add.
+
+    ``residual_add`` takes ``ffn``'s arguments by name, with the add's ``base``,
+    ``gate`` as ``ffn_gate``, ``gate_indices``, and ``python_indexing``. An up/down FFN
+    whose chunk size depends on the add's output workspace passes its policy as
+    ``chunk_rows(input, up_weight_qdata, down_weight_qdata, gated_updates=True)``,
+    called with their metadata; otherwise the FFN's chunk size carries over. Returns
+    how many adds it replaced.
+    """
+
+    def arguments(operands: dict[str, Argument], add: dict[str, Argument]) -> dict[str, Argument]:
+        values = {
+            **operands,
+            "base": add["base"],
+            "ffn_gate": add["gate"],
+            "gate_indices": add["gate_indices"],
+            "python_indexing": add["python_indexing"],
+        }
+        if chunk_rows is not None:
+            metadata = [
+                preparation_sharing.tensor_metadata(value)
+                if isinstance(value := values[name], torch.fx.Node)
+                else None
+                for name in ("input", "up_weight_qdata", "down_weight_qdata")
+            ]
+            if all(value is not None for value in metadata):
+                values["chunk_rows"] = chunk_rows(*metadata, gated_updates=True)
+        return values
+
+    return residual_graph.compute_inside_adds(graph, ffn, residual_add, arguments)
+
+
 def uses_python_indexing(match: Match) -> bool:
     """Return whether a matched update uses Python indexing semantics."""
     return any(
@@ -114,7 +157,10 @@ def uses_python_indexing(match: Match) -> bool:
 
 
 __all__ = [
+    "SOURCE_FILES",
     "FfnPatternValidator",
+    "UpDownChunkRows",
+    "fold_residual_adds",
     "uses_python_indexing",
     "valid_indexed_gated_updates",
 ]

@@ -357,7 +357,171 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
     )
 
 
+@torch.library.custom_op(
+    "piper_kernels::convrot_nvfp4_swiglu_ffn_residual_add_",
+    mutates_args=("base",),
+)
+def _chunked_swiglu_ffn_residual_add_op(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    gate_weight_qdata: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    gate_weight_per_tensor_scale: torch.Tensor | None,
+    gate_activation_per_tensor_scale: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+    gate_dynamic_activation_scale: bool,
+    gate_group_size: int | None,
+    gate_high_first: bool,
+    value_weight_qdata: torch.Tensor,
+    value_weight_scale: torch.Tensor,
+    value_weight_per_tensor_scale: torch.Tensor | None,
+    value_activation_per_tensor_scale: torch.Tensor | None,
+    value_bias: torch.Tensor | None,
+    value_dynamic_activation_scale: bool,
+    value_group_size: int | None,
+    value_high_first: bool,
+    down_weight_qdata: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_weight_per_tensor_scale: torch.Tensor | None,
+    down_activation_per_tensor_scale: torch.Tensor | None,
+    down_bias: torch.Tensor | None,
+    down_dynamic_activation_scale: bool,
+    down_group_size: int | None,
+    down_high_first: bool,
+    base: torch.Tensor,
+    ffn_gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    chunk_rows: int,
+) -> None:
+    """Add ``ffn_gate[gate_indices] * ffn(input)`` into ``base`` one bounded chunk at a time."""
+    gate, value, down = _operands.linear_operands(
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_weight_per_tensor_scale,
+        gate_activation_per_tensor_scale,
+        gate_bias,
+        gate_dynamic_activation_scale,
+        gate_high_first,
+        value_weight_qdata,
+        value_weight_scale,
+        value_weight_per_tensor_scale,
+        value_activation_per_tensor_scale,
+        value_bias,
+        value_dynamic_activation_scale,
+        value_high_first,
+        down_weight_qdata,
+        down_weight_scale,
+        down_weight_per_tensor_scale,
+        down_activation_per_tensor_scale,
+        down_bias,
+        down_dynamic_activation_scale,
+        down_high_first,
+    )
+    source_preparation, activation_preparation = _preparation_backends(
+        gate_group_size,
+        value_group_size,
+        down_group_size,
+        gate_high_first,
+        value_high_first,
+        down_high_first,
+    )
+    _core.run_chunked_ffn(
+        input,
+        (value, gate),
+        down,
+        chunk_rows,
+        source_preparation,
+        activation_preparation,
+        residual_add=residual_updates.ResidualAdd(
+            base=base,
+            gate=ffn_gate,
+            gate_indices=gate_indices,
+            python_indexing=python_indexing,
+        ),
+    )
+
+
+@_chunked_swiglu_ffn_residual_add_op.register_fake
+def _chunked_swiglu_ffn_residual_add_op_fake(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    gate_weight_qdata: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    gate_weight_per_tensor_scale: torch.Tensor | None,
+    gate_activation_per_tensor_scale: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+    gate_dynamic_activation_scale: bool,
+    gate_group_size: int | None,
+    gate_high_first: bool,
+    value_weight_qdata: torch.Tensor,
+    value_weight_scale: torch.Tensor,
+    value_weight_per_tensor_scale: torch.Tensor | None,
+    value_activation_per_tensor_scale: torch.Tensor | None,
+    value_bias: torch.Tensor | None,
+    value_dynamic_activation_scale: bool,
+    value_group_size: int | None,
+    value_high_first: bool,
+    down_weight_qdata: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_weight_per_tensor_scale: torch.Tensor | None,
+    down_activation_per_tensor_scale: torch.Tensor | None,
+    down_bias: torch.Tensor | None,
+    down_dynamic_activation_scale: bool,
+    down_group_size: int | None,
+    down_high_first: bool,
+    base: torch.Tensor,
+    ffn_gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    chunk_rows: int,
+) -> None:
+    gate, value, down = _operands.linear_operands(
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_weight_per_tensor_scale,
+        gate_activation_per_tensor_scale,
+        gate_bias,
+        gate_dynamic_activation_scale,
+        gate_high_first,
+        value_weight_qdata,
+        value_weight_scale,
+        value_weight_per_tensor_scale,
+        value_activation_per_tensor_scale,
+        value_bias,
+        value_dynamic_activation_scale,
+        value_high_first,
+        down_weight_qdata,
+        down_weight_scale,
+        down_weight_per_tensor_scale,
+        down_activation_per_tensor_scale,
+        down_bias,
+        down_dynamic_activation_scale,
+        down_high_first,
+    )
+    source_preparation, activation_preparation = _preparation_backends(
+        gate_group_size,
+        value_group_size,
+        down_group_size,
+        gate_high_first,
+        value_high_first,
+        down_high_first,
+    )
+    output_features = _core.validate_ffn(
+        input,
+        (value, gate),
+        down,
+        chunk_rows,
+        source_preparation,
+        activation_preparation,
+    )[2]
+    residual_updates.validate_residual_add(
+        input,
+        residual_updates.ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
+        output_features,
+    )
+
+
 __all__ = [
     "_chunked_swiglu_ffn_gated_updates_op",
     "_chunked_swiglu_ffn_op",
+    "_chunked_swiglu_ffn_residual_add_op",
 ]

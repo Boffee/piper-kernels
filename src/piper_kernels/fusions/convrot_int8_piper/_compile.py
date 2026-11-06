@@ -19,6 +19,7 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.attention import _output as output_pipeline
+from piper_kernels.fusions.attention import _residual as attention_residual
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.projected_qk import _compile as projected_compile
 from piper_kernels.fusions.projected_qk import _pattern as projected_pattern
@@ -44,6 +45,7 @@ def _source_files() -> tuple[str, ...]:
         for path in (
             __file__,
             _output_compile.__file__,
+            *attention_residual.SOURCE_FILES,
             _schedule.__file__,
             output.__file__,
             output_pipeline.__file__,
@@ -527,6 +529,15 @@ class _OutputCompilePass(CustomInferenceAwareGraphPass):
             return
         with _compile_fx.canonical_linear_calls(graph):
             changed = _output_compile.fold_attention_output(graph)
+        ops = torch.ops.piper_kernels
+        changed = (
+            attention_residual.fold_residual_adds(
+                graph,
+                ops.convrot_int8_piper_projected_query_attention_output.default,
+                ops.convrot_int8_piper_projected_query_attention_residual_add_.default,
+            )
+            or changed
+        )
         if changed:
             graph.eliminate_dead_code()
             graph.lint()

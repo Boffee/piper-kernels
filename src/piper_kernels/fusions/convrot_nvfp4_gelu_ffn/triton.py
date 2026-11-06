@@ -347,7 +347,117 @@ def _chunked_gelu_ffn_gated_updates_op_fake(
     )
 
 
+@torch.library.custom_op(
+    "piper_kernels::convrot_nvfp4_gelu_ffn_residual_add_",
+    mutates_args=("base",),
+)
+def _chunked_gelu_ffn_residual_add_op(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    up_weight_qdata: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    up_weight_per_tensor_scale: torch.Tensor | None,
+    up_activation_per_tensor_scale: torch.Tensor | None,
+    up_bias: torch.Tensor | None,
+    up_dynamic_activation_scale: bool,
+    up_group_size: int | None,
+    up_high_first: bool,
+    down_weight_qdata: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_weight_per_tensor_scale: torch.Tensor | None,
+    down_activation_per_tensor_scale: torch.Tensor | None,
+    down_bias: torch.Tensor | None,
+    down_dynamic_activation_scale: bool,
+    down_group_size: int | None,
+    down_high_first: bool,
+    base: torch.Tensor,
+    ffn_gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    chunk_rows: int,
+) -> None:
+    """Add ``ffn_gate[gate_indices] * ffn(input)`` into ``base`` one bounded chunk at a time."""
+    _run_chunked_gelu_ffn(
+        input,
+        up_weight_qdata,
+        up_weight_scale,
+        up_weight_per_tensor_scale,
+        up_activation_per_tensor_scale,
+        up_bias,
+        up_dynamic_activation_scale,
+        up_group_size,
+        up_high_first,
+        down_weight_qdata,
+        down_weight_scale,
+        down_weight_per_tensor_scale,
+        down_activation_per_tensor_scale,
+        down_bias,
+        down_dynamic_activation_scale,
+        down_group_size,
+        down_high_first,
+        chunk_rows,
+        residual_add=residual_updates.ResidualAdd(
+            base=base,
+            gate=ffn_gate,
+            gate_indices=gate_indices,
+            python_indexing=python_indexing,
+        ),
+    )
+
+
+@_chunked_gelu_ffn_residual_add_op.register_fake
+def _chunked_gelu_ffn_residual_add_op_fake(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    up_weight_qdata: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    up_weight_per_tensor_scale: torch.Tensor | None,
+    up_activation_per_tensor_scale: torch.Tensor | None,
+    up_bias: torch.Tensor | None,
+    up_dynamic_activation_scale: bool,
+    up_group_size: int | None,
+    up_high_first: bool,
+    down_weight_qdata: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_weight_per_tensor_scale: torch.Tensor | None,
+    down_activation_per_tensor_scale: torch.Tensor | None,
+    down_bias: torch.Tensor | None,
+    down_dynamic_activation_scale: bool,
+    down_group_size: int | None,
+    down_high_first: bool,
+    base: torch.Tensor,
+    ffn_gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    chunk_rows: int,
+) -> None:
+    output_features = _validate_gelu_ffn(
+        input,
+        up_weight_qdata,
+        up_weight_scale,
+        up_weight_per_tensor_scale,
+        up_activation_per_tensor_scale,
+        up_bias,
+        up_dynamic_activation_scale,
+        up_group_size,
+        up_high_first,
+        down_weight_qdata,
+        down_weight_scale,
+        down_weight_per_tensor_scale,
+        down_activation_per_tensor_scale,
+        down_bias,
+        down_dynamic_activation_scale,
+        down_group_size,
+        down_high_first,
+        chunk_rows,
+    )
+    residual_updates.validate_residual_add(
+        input,
+        residual_updates.ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
+        output_features,
+    )
+
+
 __all__ = [
     "_chunked_gelu_ffn_gated_updates_op",
     "_chunked_gelu_ffn_op",
+    "_chunked_gelu_ffn_residual_add_op",
 ]
