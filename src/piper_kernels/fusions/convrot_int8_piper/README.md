@@ -106,8 +106,8 @@ twice the rows, so attention launches keep their unsliced size.
 
 Sparse Piper's fold slices its add the same way, with its K and V projections and its
 coarse gate's projection rows, as its own
-[`_HEAD_SLICING`](../convrot_int8_sparse_piper/_compile.py) names. Keep budgets round
-across every head, so each slice's add takes its position and covers its heads' share
-of the whole profile's budget. A coarse gate the fusion receives whole holds every head,
-so that add runs as one slice. Sparse windows keep their unsliced row cap: their Q,
+[`_HEAD_SLICING`](../convrot_int8_sparse_piper/_compile.py) names. Keep budgets are
+rounded across all heads, so each slice's add takes its position and covers its heads'
+share of the whole profile's budget. A coarse gate the fusion receives whole holds every
+head, so that add runs as one slice. Sparse windows keep their unsliced row cap: their Q,
 attention, and routing-score buffers then halve with the heads, at a small speed cost.

@@ -633,7 +633,7 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     # Sparse windows also hold Q, attention, and routing-score buffers that grow with
     # rows times heads, so full-size launches would keep those whole for little speed.
     widened_window_rows=None,
-    # Keep budgets round across every head, so each slice takes its heads' share.
+    # Keep budgets are rounded across all heads, so each slice takes its heads' share.
     slice_position=("head_slice_index", "num_head_slices"),
 )
 
