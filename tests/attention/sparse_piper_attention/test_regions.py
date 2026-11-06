@@ -11,6 +11,7 @@ from piper_kernels.attention.sparse_piper_attention import _backend, _routing
 from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
 from piper_kernels.attention.sparse_piper_attention._regions import resolve_region_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRouteBuilder
+from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -111,6 +112,68 @@ def test_absolute_routes_cover_uint16_limit(device):
     torch.testing.assert_close(builder.routes.indices.cpu().long().flatten(), expected)
 
 
+@pytest.mark.parametrize("device", [pytest.param("cuda", marks=pytest.mark.gpu)], indirect=True)
+def test_many_regions_do_not_exceed_native_grid_limits(device):
+    regions = (SparsePiperKeyRegion(2),) * 32768
+    layout = _layout((0.5, 0.5), regions, device)
+    builder = PackedRouteBuilder(
+        layout, batch=1, heads=2, query_blocks=1, sparse_key_blocks=65536, device=device
+    )
+    scores = torch.arange(65536, device=device, dtype=torch.float32).expand(1, 2, 1, -1)
+    builder.write(scores, query_block_offset=0)
+    expected = torch.arange(1, 65536, 2).repeat(2)
+    torch.testing.assert_close(builder.routes.indices.cpu().long().flatten(), expected)
+
+
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+def test_compact_summary_routes_match_independent_region_selection(device, routing):
+    regions = (
+        SparsePiperKeyRegion(2, sparse=False),
+        SparsePiperKeyRegion(5),
+        SparsePiperKeyRegion(1),  # Rounding retains this region without scoring it.
+        SparsePiperKeyRegion(3, sparse=False),
+        SparsePiperKeyRegion(513),  # Selection crosses a radix tile boundary.
+        SparsePiperKeyRegion(2, sparse=False),
+    )
+    ratios = (0.2, 0.5, 1.0, 0.75)
+    budgets = SparsePiperAttention(ratios).resolve_region_keep_blocks(regions)
+    generator = torch.Generator().manual_seed(298)
+    # Integer-valued FP32 summaries make the score oracle exact on both devices.
+    # 385 query blocks also crosses the routing chunk boundary.
+    query = torch.randint(-8, 9, (2, 4, 385, 64), generator=generator).float()
+    primary = torch.randint(-8, 9, (2, 2, 526, 64), generator=generator).float()
+    auxiliary = (
+        primary - torch.randint(0, 9, primary.shape, generator=generator)
+        if routing == "minmax"
+        else primary[:, :, :0]
+    )
+    scores = query @ primary.repeat_interleave(2, dim=1).transpose(-1, -2)
+    if routing == "minmax":
+        scores = torch.maximum(
+            scores, query @ auxiliary.repeat_interleave(2, dim=1).transpose(-1, -2)
+        )
+    expected_heads = []
+    for head in range(4):
+        start = 0
+        selected_regions = []
+        for region, counts in zip(regions, budgets, strict=True):
+            selected = scores[:, head, :, start : start + region.num_blocks].argsort(
+                dim=-1, descending=True, stable=True
+            )[..., : counts[head]]
+            selected_regions.append(start + selected.sort(dim=-1).values)
+            start += region.num_blocks
+        expected_heads.append(torch.cat(selected_regions, dim=-1))
+    expected = torch.cat(expected_heads, dim=-1)
+    actual = _routing.packed_routes_from_summaries(
+        query.to(device),
+        primary.to(device),
+        auxiliary.to(device),
+        _layout(ratios, regions, device),
+        routing_mode_from_name(routing),
+    )
+    torch.testing.assert_close(actual.indices.cpu().long(), expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     ("head_dim", "routing", "padded"), [(64, "mean", False), (128, "minmax", True)]
 )
@@ -182,6 +245,7 @@ def test_dense_regions_skip_scoring_and_full_keep_skips_all_routing(device, monk
     [
         ((), 128),
         ((SparsePiperKeyRegion(1),), 128),
+        ((SparsePiperKeyRegion(3),), 128),
         ((SparsePiperKeyRegion(2),), 129),
         ((SparsePiperKeyRegion(65536), SparsePiperKeyRegion(1)), 128),
     ],

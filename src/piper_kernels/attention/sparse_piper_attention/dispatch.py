@@ -150,15 +150,11 @@ class SparsePiperAttention(torch.nn.Module):
         """
         if (sparse_key_blocks is None) == (key_regions is None):
             raise ValueError("supply exactly one of sparse_key_blocks or key_regions")
-        if key_regions is not None:
-            sparse_key_blocks = validate_key_regions(key_regions)
-        assert sparse_key_blocks is not None
         converted_scale = _validate_inputs(
             query,
             key,
             value,
             self._ratio_profile.num_heads,
-            sparse_key_blocks=sparse_key_blocks,
             sparse_query_blocks=sparse_query_blocks,
             scale=scale,
             block_lengths=block_lengths,
@@ -170,7 +166,8 @@ class SparsePiperAttention(torch.nn.Module):
             device=query.device,
         )
         if key_regions is not None:
-            if query.shape[1] != sparse_key_blocks * _BLOCK_ROWS:
+            num_key_blocks = validate_key_regions(key_regions)
+            if query.shape[1] != num_key_blocks * _BLOCK_ROWS:
                 raise ValueError(
                     "key_regions must cover exactly the sequence's complete K64 blocks"
                 )
@@ -188,6 +185,11 @@ class SparsePiperAttention(torch.nn.Module):
                 force_tile_ids,
                 force_tile_counts,
             )
+        assert sparse_key_blocks is not None
+        _validate_sparse_key_blocks(
+            sparse_key_blocks,
+            available_sparse_key_blocks=query.shape[1] // _BLOCK_ROWS,
+        )
         return _sparse_piper_attention_op(
             query,
             key,
@@ -232,7 +234,6 @@ def _validate_inputs(
     value: torch.Tensor,
     num_heads: int,
     *,
-    sparse_key_blocks: int,
     sparse_query_blocks: int | None,
     scale: float | None,
     block_lengths: torch.Tensor | None,
@@ -279,10 +280,6 @@ def _validate_inputs(
             require_contiguous=True,
             check_values=False,
         )
-    _validate_sparse_key_blocks(
-        sparse_key_blocks,
-        available_sparse_key_blocks=sequence // _BLOCK_ROWS,
-    )
     validate_sparse_query_blocks(
         sparse_query_blocks,
         query_blocks=(sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS,

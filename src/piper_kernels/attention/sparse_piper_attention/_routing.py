@@ -135,7 +135,7 @@ def packed_routes_from_sequences(
 ) -> PackedRoutes:
     """Select routes for compact or valid-front padded Q and K64 sequences."""
     if key.ndim == 4 and (key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS):
-        raise ValueError("sparse routing requires complete sparse-prefix K64 blocks")
+        raise ValueError("sparse routing requires complete physical K64 blocks")
     if key.ndim == 4 and layout.keeps_all_blocks(key.shape[2] // _BLOCK_ROWS):
         validate_routing_mode(routing_mode)
         _validate_sequences(query, key, block_lengths)

@@ -156,6 +156,7 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 @triton.jit(
     do_not_specialize=[
         "sparse_key_blocks",
+        "query_blocks",
         "query_block_offset",
         "score_batch_stride",
         "score_head_stride",
@@ -174,6 +175,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     force_mask_ptr: torch.Tensor,
     region_metadata_ptr: torch.Tensor,
     sparse_key_blocks: int,
+    query_blocks: int,
     query_block_offset: int,
     score_batch_stride: int,
     score_head_stride: int,
@@ -190,12 +192,13 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
 ) -> None:
     """Select exact stable FP32 top-k routes with runtime row dimensions."""
     query_block = tl.program_id(0)
-    head = tl.program_id(1) % num_heads
+    head = tl.program_id(1)
     batch = tl.program_id(2)
     start_key_block = 0
     start_score_block = 0
     if has_regions:
-        region = tl.program_id(1) // num_heads
+        region = query_block // query_blocks
+        query_block = query_block % query_blocks
         metadata = region_metadata_ptr + region * (2 * num_heads + 3)
         start_key_block = tl.load(metadata)
         sparse_key_blocks = tl.load(metadata + 1)
@@ -342,7 +345,6 @@ def tiled_radix_select_packed_routes(
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled scores and packed routes must share the batch dimension")
     batch, heads, query_blocks, sparse_key_blocks = scores.shape
-    num_regions = 1 if region_metadata is None else region_metadata.shape[0]
     if region_metadata is not None and (
         region_metadata.ndim != 2
         or region_metadata.shape[1] != 2 * heads + 3
@@ -351,6 +353,7 @@ def tiled_radix_select_packed_routes(
         or not region_metadata.is_contiguous()
     ):
         raise ValueError("region metadata must use contiguous INT32 [regions, 2 * heads + 3]")
+    num_regions = 1 if region_metadata is None else region_metadata.shape[0]
     if force_tile_mask is not None and (
         force_tile_mask.ndim != 2
         or force_tile_mask.shape[0] != routes.shape[1]
@@ -364,7 +367,9 @@ def tiled_radix_select_packed_routes(
     ):
         raise ValueError("forced membership must use contiguous INT32 [query_blocks,key_words]")
     with device_context(scores.device):
-        _tiled_radix_select_packed_routes_kernel[(query_blocks, heads * num_regions, batch)](
+        # Regions can exceed CUDA's 65,535 limit on the second grid dimension
+        # when combined with heads. Keep them on the larger first dimension.
+        _tiled_radix_select_packed_routes_kernel[(query_blocks * num_regions, heads, batch)](
             scores,
             routes,
             head_keep_blocks,
@@ -372,6 +377,7 @@ def tiled_radix_select_packed_routes(
             head_keep_blocks if force_tile_mask is None else force_tile_mask,
             head_keep_blocks if region_metadata is None else region_metadata,
             sparse_key_blocks,
+            query_blocks,
             query_block_offset,
             scores.stride(0),
             scores.stride(1),
