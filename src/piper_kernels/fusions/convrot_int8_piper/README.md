@@ -83,20 +83,16 @@ Measure the complete pipeline, including output storage and workspace, with the
 
 ## In-place residual adds
 
-When the [residual-update rewrite](../residual_updates/_compile.py) adds a
-copy-back block's attention update into `base` and that update is a fused dense
-output, it calls `convrot_int8_piper_projected_query_attention_residual_add_`
-instead. That operator takes the output's operands, uses `base`'s dtype as the
-output dtype, and adds `gate[gate_indices] * projection` into `base` without
-allocating a full-size output. Sparse Piper's projected-Q output has the same
-counterpart, `convrot_int8_sparse_piper_projected_query_attention_residual_add_`.
+When the [residual-update rewrite](../residual_updates/_compile.py) adds a fused
+dense output into a copy-back block's input, the output fold then computes that
+output inside the add ([`_residual.py`](../attention/_residual.py)): it calls
+`convrot_int8_piper_projected_query_attention_residual_add_`, which takes the
+output's operands, uses `base`'s dtype as the output dtype, and adds
+`gate[gate_indices] * projection` into `base` without allocating a full-size output.
+Sparse Piper's projected-Q output does the same with its counterpart,
+`convrot_int8_sparse_piper_projected_query_attention_residual_add_`.
 
 Residual rows hold live data, so attention windows never borrow them: attention
 uses its separate window buffers (two when several windows overlap projection),
 and projection writes into a bounded scratch window before its gated add. The
 add runs in FP32 and rounds `base` once per window row.
-
-The rewrite also runs this add in two head groups when its K and V feed nothing else,
-calling `convrot_int8_piper_project_key`, `convrot_int8_piper_project_value`, and the add
-once per group on head-sliced weights; see
-[`residual_updates/_head_groups.py`](../residual_updates/_head_groups.py).

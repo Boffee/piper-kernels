@@ -13,6 +13,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn._compile import compile_pass as swig
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
+from .._ffn_residual_add import assert_copy_back_computes_ffn_inside_its_add
 from ._helpers import GatedUpdates, GeluFfn, make_gated_update_arguments, make_operands, relative_l2
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
@@ -196,6 +197,26 @@ def test_compile_options_fold_indexed_gated_updates(python_indexing: bool) -> No
     assert relative_l2(actual, expected) < 0.05
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_gelu_ffn_gated_updates_.default) == 1
     assert torch.ops.piper_kernels.nvfp4_gelu_ffn.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_copy_back_gated_updates_compute_the_ffn_inside_its_residual_add() -> None:
+    operands = make_operands(
+        rows=257,
+        up_dynamic=False,
+        down_dynamic=False,
+        output_features=384,
+        seed=1023,
+    )
+    assert_copy_back_computes_ffn_inside_its_add(
+        GatedUpdates(operands).eval(),
+        make_gated_update_arguments(257, operands.down.weight.shape[0]),
+        "nvfp4_gelu_ffn",
+        nvfp4_compile_options(),
+        nvfp4_gelu_ffn_compile_options(),
+        0.05,
+    )
 
 
 @pytest.mark.gpu

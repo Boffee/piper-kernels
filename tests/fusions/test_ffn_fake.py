@@ -3,39 +3,55 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 
 import pytest
 import torch
 
 from piper_kernels.fusions.convrot_int8_gelu_ffn import triton as int8_gelu
+from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as int8_swiglu
 from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import triton as convrot_gelu
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import triton as convrot_swiglu
 from piper_kernels.fusions.nvfp4_gelu_ffn import triton as nvfp4_gelu
 from piper_kernels.fusions.nvfp4_swiglu_ffn import triton as nvfp4_swiglu
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
+type _Kind = Literal["ffn", "gated_updates", "residual_add"]
+_KINDS: tuple[_Kind, ...] = ("ffn", "gated_updates", "residual_add")
 _OPERATIONS = {
     "convrot_int8_gelu": (
         int8_gelu._chunked_gelu_ffn_op,
         int8_gelu._chunked_gelu_ffn_gated_updates_op,
+        int8_gelu._chunked_gelu_ffn_residual_add_op,
     ),
     "nvfp4_gelu": (
         nvfp4_gelu._chunked_gelu_ffn_op,
         nvfp4_gelu._chunked_gelu_ffn_gated_updates_op,
+        nvfp4_gelu._chunked_gelu_ffn_residual_add_op,
     ),
     "convrot_nvfp4_gelu": (
         convrot_gelu._chunked_gelu_ffn_op,
         convrot_gelu._chunked_gelu_ffn_gated_updates_op,
+        convrot_gelu._chunked_gelu_ffn_residual_add_op,
     ),
     "nvfp4_swiglu": (
         nvfp4_swiglu._chunked_swiglu_ffn_op,
         nvfp4_swiglu._chunked_swiglu_ffn_gated_updates_op,
+        nvfp4_swiglu._chunked_swiglu_ffn_residual_add_op,
     ),
     "convrot_nvfp4_swiglu": (
         convrot_swiglu._chunked_swiglu_ffn_op,
         convrot_swiglu._chunked_swiglu_ffn_gated_updates_op,
+        convrot_swiglu._chunked_swiglu_ffn_residual_add_op,
     ),
+}
+# Every FFN two-update operator and its residual-add counterpart.
+_RESIDUAL_ADD_PAIRS = {
+    "convrot_int8_swiglu": (
+        int8_swiglu._chunked_swiglu_ffn_gated_updates_op,
+        int8_swiglu._chunked_swiglu_ffn_residual_add_op,
+    ),
+    **{name: operations[1:] for name, operations in _OPERATIONS.items()},
 }
 
 
@@ -48,7 +64,7 @@ class _Case:
 def _case(
     name: str,
     *,
-    gated: bool = False,
+    kind: _Kind = "ffn",
     input_features: int = 256,
     intermediate_features: int = 64,
 ) -> _Case:
@@ -86,24 +102,27 @@ def _case(
             if name.startswith("convrot"):
                 operands["group_size"] = 64
         arguments.update({f"{prefix}_{key}": value for key, value in operands.items()})
-    if gated:
+    if kind != "ffn":
         arguments.update(
             base=torch.empty(2, 3, 32, device="meta", dtype=torch.bfloat16),
-            reusable_update=torch.empty(2, 3, 32, device="meta", dtype=torch.bfloat16),
-            update_gate=torch.empty(4, 32, device="meta", dtype=torch.bfloat16),
             ffn_gate=torch.empty(4, 32, device="meta", dtype=torch.bfloat16),
             gate_indices=torch.empty(6, device="meta", dtype=torch.int64),
             python_indexing=False,
         )
-    return _Case(_OPERATIONS[name][int(gated)], arguments)
+    if kind == "gated_updates":
+        arguments.update(
+            reusable_update=torch.empty(2, 3, 32, device="meta", dtype=torch.bfloat16),
+            update_gate=torch.empty(4, 32, device="meta", dtype=torch.bfloat16),
+        )
+    return _Case(_OPERATIONS[name][_KINDS.index(kind)], arguments)
 
 
 @pytest.mark.parametrize("name", _OPERATIONS)
-@pytest.mark.parametrize("gated", [False, True])
-def test_fake_ffn_validates_projection_metadata(name: str, gated: bool) -> None:
-    case = _case(name, gated=gated)
+@pytest.mark.parametrize("kind", _KINDS)
+def test_fake_ffn_validates_projection_metadata(name: str, kind: _Kind) -> None:
+    case = _case(name, kind=kind)
     result = case.operation(**case.arguments)
-    if gated:
+    if kind != "ffn":
         assert result is None
     else:
         assert result is not None
@@ -119,30 +138,30 @@ def test_fake_ffn_validates_projection_metadata(name: str, gated: bool) -> None:
 
 
 @pytest.mark.parametrize("name", _OPERATIONS)
-@pytest.mark.parametrize("gated", [False, True])
-def test_fake_ffn_rejects_noncontiguous_input(name: str, gated: bool) -> None:
-    case = _case(name, gated=gated)
+@pytest.mark.parametrize("kind", _KINDS)
+def test_fake_ffn_rejects_noncontiguous_input(name: str, kind: _Kind) -> None:
+    case = _case(name, kind=kind)
     input = torch.empty(2, 3, 256, device="meta", dtype=torch.bfloat16).transpose(0, 1)  # noqa: A001
     with pytest.raises(ValueError, match="contiguous"):
         case.operation(**{**case.arguments, "input": input})
 
 
 @pytest.mark.parametrize("name", ["convrot_nvfp4_gelu", "convrot_nvfp4_swiglu"])
-@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("kind", _KINDS)
 @pytest.mark.parametrize(
     ("input_features", "intermediate_features", "match"),
     [(80, 64, "source features"), (256, 80, "activated features")],
 )
 def test_fake_ffn_validates_rotation_divisibility(
     name: str,
-    gated: bool,
+    kind: _Kind,
     input_features: int,
     intermediate_features: int,
     match: str,
 ) -> None:
     case = _case(
         name,
-        gated=gated,
+        kind=kind,
         input_features=input_features,
         intermediate_features=intermediate_features,
     )
@@ -152,7 +171,36 @@ def test_fake_ffn_validates_rotation_divisibility(
 
 @pytest.mark.parametrize("name", _OPERATIONS)
 def test_fake_gated_ffn_validates_update_metadata(name: str) -> None:
-    case = _case(name, gated=True)
+    case = _case(name, kind="gated_updates")
     invalid_update = torch.empty(2, 3, 32, device="meta", dtype=torch.float16)
     with pytest.raises(ValueError, match="reusable update"):
         case.operation(**{**case.arguments, "reusable_update": invalid_update})
+
+
+@pytest.mark.parametrize("name", _OPERATIONS)
+def test_fake_residual_add_ffn_validates_base_metadata(name: str) -> None:
+    case = _case(name, kind="residual_add")
+    invalid_base = torch.empty(2, 3, 32, device="meta", dtype=torch.float16)
+    with pytest.raises(ValueError, match="base"):
+        case.operation(**{**case.arguments, "base": invalid_base})
+
+
+@pytest.mark.parametrize("name", _RESIDUAL_ADD_PAIRS)
+def test_residual_add_takes_gated_update_arguments_without_reusable_update(name: str) -> None:
+    gated_updates, residual_add = (
+        operation._opoverload._schema for operation in _RESIDUAL_ADD_PAIRS[name]
+    )
+
+    def signature(schema: torch.FunctionSchema, omitted: tuple[str, ...] = ()) -> list[object]:
+        return [
+            (argument.name, str(argument.type), argument.default_value, argument.kwarg_only)
+            for argument in schema.arguments
+            if argument.name not in omitted
+        ]
+
+    assert signature(residual_add) == signature(gated_updates, ("reusable_update", "update_gate"))
+    assert [
+        argument.name
+        for argument in residual_add.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    ] == ["base"]

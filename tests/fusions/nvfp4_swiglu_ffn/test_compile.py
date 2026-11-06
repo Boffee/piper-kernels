@@ -22,6 +22,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import _chunked_swiglu_ffn_op
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
+from .._ffn_residual_add import assert_copy_back_computes_ffn_inside_its_add
 from ._helpers import Operands, SwiGluFfn, make_operands, materialized
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
@@ -354,3 +355,33 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) ->
         capture.targets.count(torch.ops.piper_kernels.nvfp4_swiglu_ffn_gated_updates_.default) == 1
     )
     assert torch.ops.piper_kernels.nvfp4_swiglu_ffn.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_copy_back_gated_updates_compute_the_ffn_inside_its_residual_add() -> None:
+    rows = 257
+    operands = make_operands(
+        rows=rows,
+        output_features=384,
+        dynamic=False,
+        bias_dtype=torch.float32,
+        seed=919,
+    )
+    output_features = operands.down.weight.shape[0]
+    base = torch.randn(rows, output_features, device="cuda", dtype=torch.bfloat16)
+    gate_storage = torch.randn(7, 6 * output_features, device="cuda", dtype=torch.bfloat16)
+    assert_copy_back_computes_ffn_inside_its_add(
+        _GatedUpdates(operands).eval(),
+        (
+            base,
+            torch.randn_like(base),
+            gate_storage[:, 2 * output_features : 3 * output_features],
+            gate_storage[:, 5 * output_features :],
+            torch.randint(0, 7, (rows,), device="cuda", dtype=torch.int64),
+        ),
+        "nvfp4_swiglu_ffn",
+        nvfp4_compile_options(),
+        nvfp4_swiglu_ffn_compile_options(),
+        0.03,
+    )

@@ -1,25 +1,26 @@
-"""A copy-back residual block updates its input in place after attention and FFN fusion."""
-
-import re
+"""A copy-back residual block adds its gated updates into its input in place."""
 
 import pytest
 import torch
-from _compile_capture import TargetCapturePass
+from _compile_capture import FunctionalTargetCapturePass, TargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
-from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
+from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
+from piper_kernels.fusions.convrot_int8_gelu_ffn import triton as gelu_ffn
 from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
+from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as swiglu_ffn
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
-from piper_kernels.fusions.residual_updates import _head_groups as head_groups
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
+from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _ops
 
+from ..convrot_int8_gelu_ffn.test_compile import _gated_update_arguments, _GatedUpdates
 from ..convrot_int8_piper.test_compile import _available
 from ..convrot_int8_sparse_piper._helpers import output_available as _sparse_output_available
 from ..convrot_int8_sparse_piper.test_compile import _SparseProjectionAttentionOutput
@@ -36,29 +37,14 @@ _SPARSE_ATTENTION_OUTPUT = (
 _SPARSE_ATTENTION_RESIDUAL_ADD = (
     _kernels.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
 )
-_FFN_UPDATES = _kernels.convrot_int8_swiglu_ffn_gated_updates_.default
-_FFN_RESIDUAL_ADD = _kernels.convrot_int8_swiglu_ffn_residual_add_.default
+_FFN_UPDATES = swiglu_ffn._chunked_swiglu_ffn_gated_updates_op._opoverload
+_FFN_RESIDUAL_ADD = swiglu_ffn._chunked_swiglu_ffn_residual_add_op._opoverload
+_GELU_FFN_RESIDUAL_ADD = gelu_ffn._chunked_gelu_ffn_residual_add_op._opoverload
 _RESIDUAL_ADD = _kernels.residual_add_.default
-_DENSE_KEY = _kernels.convrot_int8_piper_project_key.default
-_DENSE_VALUE = _kernels.convrot_int8_piper_project_value.default
 
 
 class _Ffn(SwiGluFfn):
     output_features = 256
-
-
-class _FunctionalCapture(TargetCapturePass):
-    """Record each functional call as the mutating operator it wraps."""
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        super().__call__(graph, is_inference)
-        self.targets = [
-            node.args[0]
-            if node.target is torch.ops.higher_order.auto_functionalized
-            else node.target
-            for node in graph.nodes
-            if node.op == "call_function"
-        ]
 
 
 class _ResidualBlock(torch.nn.Module):
@@ -66,7 +52,8 @@ class _ResidualBlock(torch.nn.Module):
 
     A nonzero ``input_skip`` also adds that multiple of the original input to the FFN
     input, read after the attention update through the row view attention normalization
-    read.
+    read. ``cross_update`` adds a third gated update, from an unfused linear, between
+    the attention and FFN updates.
     """
 
     width = 256
@@ -75,7 +62,7 @@ class _ResidualBlock(torch.nn.Module):
     head_dim = 64
     rotary_dim = 48
 
-    def __init__(self, *, input_skip: float = 0.0) -> None:
+    def __init__(self, *, input_skip: float = 0.0, cross_update: bool = False) -> None:
         super().__init__()
         self.input_skip = input_skip
         torch.manual_seed(1201)
@@ -101,6 +88,12 @@ class _ResidualBlock(torch.nn.Module):
         modulation[:, 5 * self.width :].mul_(0.01)
         self.register_buffer("modulation", modulation.mul_(0.1))
         self.ffn = _Ffn(promote_gate=True, reverse_multiply=True, bias_dtype=None)
+        self.cross = None
+        if cross_update:
+            self.cross = torch.nn.Linear(
+                self.width, self.width, bias=False, device="cuda", dtype=torch.bfloat16
+            )
+            self.cross.weight.requires_grad_(False)
 
     def _heads(self, projected, heads, cos, sin):
         shaped = projected.view(projected.shape[0], projected.shape[1], heads, self.head_dim)
@@ -138,6 +131,8 @@ class _ResidualBlock(torch.nn.Module):
         merged = attended.transpose(1, 2).reshape(hidden.shape[0], hidden.shape[1], -1)
         attention = _ops.linear(merged, self.output_weight, self.output_scale, None, 64, None, None)
         residual = hidden + attention_gate[gate_indices] * attention
+        if self.cross is not None:
+            residual = residual + attention_gate[gate_indices] * self.cross(normalized)
         ffn_source = residual
         if self.input_skip:
             ffn_source = residual + (rows * self.input_skip).view(residual.shape)
@@ -179,11 +174,16 @@ class _SparseResidualBlock(torch.nn.Module):
         return residual + ffn_gate[gate_indices] * self.ffn(ffn_input)
 
 
-def _options(capture, *, fuse_output=True):
-    options = convrot_int8_piper_compile_options(
-        convrot_int8_swiglu_ffn_compile_options(), fuse_output=fuse_output
-    )
-    return capture.wrap_options(residual_updates_compile_options(options))
+def _options(capture, *, fuse_output=True, residual_updates_first=False):
+    if residual_updates_first:
+        options = convrot_int8_swiglu_ffn_compile_options(residual_updates_compile_options())
+        options = convrot_int8_piper_compile_options(options, fuse_output=fuse_output)
+    else:
+        options = convrot_int8_piper_compile_options(
+            convrot_int8_swiglu_ffn_compile_options(), fuse_output=fuse_output
+        )
+        options = residual_updates_compile_options(options)
+    return capture.wrap_options(options)
 
 
 def _inputs(model, sequence):
@@ -221,16 +221,16 @@ def _assert_updates_input_in_place(model, compiled):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_copy_back_block_updates_its_input_in_place():
+@pytest.mark.parametrize("residual_updates_first", [False, True], ids=["last", "first"])
+def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
     model = _ResidualBlock()
-    capture = _FunctionalCapture()
-    compiled = _compile_copy_back(model, _options(capture))
+    capture = FunctionalTargetCapturePass()
+    compiled = _compile_copy_back(
+        model, _options(capture, residual_updates_first=residual_updates_first)
+    )
     _assert_updates_input_in_place(model, compiled)
 
-    # Two head groups, each projecting its own K and V before adding its attention.
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
-    assert capture.targets.count(_DENSE_KEY) == 2
-    assert capture.targets.count(_DENSE_VALUE) == 2
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _ATTENTION_OUTPUT not in capture.targets
     assert _FFN_UPDATES not in capture.targets
@@ -241,7 +241,7 @@ def test_copy_back_block_updates_its_input_in_place():
 @pytest.mark.skipif(not _sparse_output_available(), reason="requires fused sparse output support")
 def test_sparse_attention_output_is_computed_inside_its_residual_add():
     model = _SparseResidualBlock()
-    capture = _FunctionalCapture()
+    capture = FunctionalTargetCapturePass()
     options = convrot_int8_sparse_piper_compile_options(convrot_int8_swiglu_ffn_compile_options())
     hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
     gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
@@ -279,7 +279,7 @@ def test_sparse_attention_output_is_computed_inside_its_residual_add():
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
 def test_unfused_attention_output_is_added_in_place_by_the_ffn_rewrite():
     model = _ResidualBlock()
-    capture = _FunctionalCapture()
+    capture = FunctionalTargetCapturePass()
     compiled = _compile_copy_back(model, _options(capture, fuse_output=False))
 
     _assert_updates_input_in_place(model, compiled)
@@ -292,11 +292,62 @@ def test_unfused_attention_output_is_added_in_place_by_the_ffn_rewrite():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
+def test_every_gated_update_on_the_path_to_the_copy_adds_in_place():
+    model = _ResidualBlock(cross_update=True)
+    capture = FunctionalTargetCapturePass()
+    compiled = _compile_copy_back(model, _options(capture))
+
+    _assert_updates_input_in_place(model, compiled)
+
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+
+
+def _compiled_without_rewrite(model, *arguments):
+    """Run ``model`` with ordinary ConvRot INT8 linears, which round like the fused FFN."""
+    torch._dynamo.reset()
+    with torch.no_grad():
+        return torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
+            *arguments
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_ffn_output_read_elsewhere_stays_materialized_before_its_add():
+    model = _GatedUpdates(expose_ffn=True)
+    capture = FunctionalTargetCapturePass()
+    options = residual_updates_compile_options(convrot_int8_gelu_ffn_compile_options())
+
+    def copy_back(base, *operands):
+        output, ffn = model(base, *operands)
+        return base.copy_(output), ffn
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        copy_back, fullgraph=True, dynamic=True, options=capture.wrap_options(options)
+    )
+    arguments = _gated_update_arguments(129)
+    base = arguments[0]
+    expected, expected_ffn = _compiled_without_rewrite(model, base.clone(), *arguments[1:])
+    with torch.no_grad():
+        result, ffn = compiled(*arguments)
+
+    assert result.data_ptr() == base.data_ptr()
+    assert _relative_l2(base, expected) < 0.01
+    assert _relative_l2(ffn, expected_ffn) < 0.01
+    assert capture.targets.count(_RESIDUAL_ADD) == 2
+    assert _GELU_FFN_RESIDUAL_ADD not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
 def test_input_read_after_an_update_is_copied_instead_of_overwritten():
     model = _ResidualBlock(input_skip=16.0)
     # Let the FFN, whose input mostly reads the original input, shape the result.
     model.modulation[:, 5 * model.width :].mul_(100)
-    capture = _FunctionalCapture()
+    capture = FunctionalTargetCapturePass()
     compiled = _compile_copy_back(model, _options(capture))
     ReinplaceCounters.clear()
     with torch.no_grad():
@@ -309,7 +360,7 @@ def test_input_read_after_an_update_is_copied_instead_of_overwritten():
     assert _relative_l2(hidden, expected) < 0.03
     # Inductor copies the input before the attention add, then adds into that copy.
     assert ReinplaceCounters.get_total_missed() == 1
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
 
 
@@ -331,91 +382,18 @@ def test_block_without_copy_back_keeps_its_input():
     assert _FFN_UPDATES in capture.targets
 
 
-def test_compile_options_append_the_rewrite_and_disable_buffer_reuse():
+def test_compile_options_run_the_rewrite_first_and_disable_buffer_reuse():
     options = convrot_int8_piper_compile_options(fuse_output=True)
     combined = residual_updates_compile_options(options)
 
     passes = combined["post_grad_custom_pre_pass"]
     assert isinstance(passes, tuple)
-    assert passes[:-1] == options["post_grad_custom_pre_pass"]
+    assert passes[0] is residual_compile._compile_pass
+    assert passes[1:] == options["post_grad_custom_pre_pass"]
     assert combined["allow_buffer_reuse"] is False
-    assert residual_updates_compile_options(options)["post_grad_custom_pre_pass"][-1] is passes[-1]
-
-
-def test_ffn_residual_adds_take_the_two_update_arguments_without_the_reusable_update():
-    for two_updates, residual_add in residual_compile._FFN_RESIDUAL_ADDS.items():
-        assert isinstance(two_updates, torch._ops.OpOverload)
-        expected = [
-            argument.name
-            for argument in two_updates._schema.arguments
-            if argument.name not in residual_compile._REUSABLE_UPDATE_ARGUMENTS
-        ]
-        assert [argument.name for argument in residual_add._schema.arguments] == expected
-
-
-def test_attention_residual_adds_take_the_add_then_the_output_arguments():
-    for attention_output, residual_add in residual_compile._ATTENTION_RESIDUAL_ADDS.items():
-        assert isinstance(attention_output, torch._ops.OpOverload)
-        output_names = [
-            argument.name
-            for argument in attention_output._schema.arguments
-            if argument.name != "output_dtype"
-        ]
-        assert [argument.name for argument in residual_add._schema.arguments] == [
-            "base",
-            "gate",
-            "gate_indices",
-            "python_indexing",
-            *output_names,
-        ]
-
-
-class _MultiQueryResidualBlock(_ResidualBlock):
-    kv_heads = 1
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_each_head_group_projects_its_context_after_the_previous_group_adds():
-    model = _ResidualBlock()
-    compiled = _compile_copy_back(model, _options(_FunctionalCapture()))
-    with torch.no_grad():
-        _, (code, *_) = run_and_get_code(compiled, *_inputs(model, 300))
-
-    calls = re.findall(
-        r"torch\.ops\.piper_kernels\.convrot_int8_piper_"
-        r"(project_key|project_value|projected_query_attention_residual_add_)\.default\(",
-        code,
-    )
-    # Inductor frees the first group's K and V before the second group allocates its own.
-    first_add = calls.index("projected_query_attention_residual_add_")
-    assert sorted(calls[:first_add]) == ["project_key", "project_value"]
-    assert sorted(calls[first_add + 1 :]) == [
-        "project_key",
-        "project_value",
-        "projected_query_attention_residual_add_",
-    ]
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_attention_whose_heads_do_not_split_evenly_stays_one_group():
-    model = _MultiQueryResidualBlock()
-    capture = _FunctionalCapture()
-    compiled = _compile_copy_back(model, _options(capture))
-    _assert_updates_input_in_place(model, compiled)
-
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_DENSE_KEY) == 1
-
-
-@pytest.mark.parametrize(("attention_add", "split"), list(head_groups.HEAD_SPLITS.items()))
-def test_head_splits_name_arguments_their_operators_take(attention_add, split):
-    def names(operator):
-        return {argument.name for argument in operator._schema.arguments}
-
-    assert {*split.rows, split.columns, *split.once, split.alignment} <= names(attention_add)
-    for producer, outputs in split.producers:
-        assert set(split.producer_rows) <= names(producer)
-        assert set(outputs) <= names(attention_add)
-        assert len(outputs) == len(producer._schema.returns)
+    # Fusion helpers applied afterward still run after it, and applying it again keeps one copy.
+    later = residual_updates_compile_options(convrot_int8_swiglu_ffn_compile_options(combined))
+    later_passes = later["post_grad_custom_pre_pass"]
+    assert isinstance(later_passes, tuple)
+    assert later_passes[0] is residual_compile._compile_pass
+    assert later_passes.count(residual_compile._compile_pass) == 1

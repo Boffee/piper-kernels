@@ -7,13 +7,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- The in-place residual rewrite from `residual_updates_compile_options()` runs a fused
-  dense ConvRot INT8 Piper attention in two head groups, one after another, when its K
-  and V feed nothing else and its heads split evenly into halves aligned with the output
-  projection's ConvRot groups. Only half the attention's K and V then exist at a time:
-  with 104k tokens and 56 heads, its peak extra memory falls from 2.13 to 1.18 GiB at
-  the same speed. Results differ slightly, because each group quantizes its own share of
-  the output projection's input and the residual rounds once per group.
+- `residual_updates_compile_options()` now rewrites every gated sum
+  `base + gate[indices] * update` that builds a copy-back block's result from its
+  input, whatever produced the update, instead of only a ConvRot INT8 SwiGLU FFN
+  update and the attention update before it. Blocks with another FFN fusion, more
+  than two updates, or no fused FFN now add their updates into the input in place.
+  An output of any FFN fusion (ConvRot INT8, NVFP4, or ConvRot NVFP4; SwiGLU or
+  GELU) is computed inside its add, as a fused ConvRot INT8 Piper attention output
+  already was. The rewrite now runs ahead of every other post-grad pass, so the
+  helper can be applied before or after the fusion helpers. Blocks it rewrote
+  before compute the same results.
 
 ## [0.8.0rc2] - 2026-11-05
 

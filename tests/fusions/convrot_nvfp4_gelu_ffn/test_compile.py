@@ -24,6 +24,7 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
 from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
+from .._ffn_residual_add import assert_copy_back_computes_ffn_inside_its_add
 from ..nvfp4_gelu_ffn._helpers import (
     GatedUpdates,
     make_gated_update_arguments,
@@ -206,3 +207,23 @@ def test_compile_options_fold_indexed_gated_updates() -> None:
         == 1
     )
     assert torch.ops.piper_kernels.convrot_nvfp4_gelu_ffn.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_copy_back_gated_updates_compute_the_ffn_inside_its_residual_add() -> None:
+    operands = make_operands(
+        rows=257,
+        up_dynamic=False,
+        down_dynamic=False,
+        output_features=384,
+        seed=1041,
+    )
+    assert_copy_back_computes_ffn_inside_its_add(
+        GatedUpdates(operands).eval(),  # type: ignore[arg-type]
+        make_gated_update_arguments(257, operands.down.weight.shape[0]),
+        "convrot_nvfp4_gelu_ffn",
+        _ordinary_options(),
+        convrot_nvfp4_gelu_ffn_compile_options(),
+        0.07,
+    )

@@ -126,6 +126,26 @@ def add_post_grad_pass(
     return combined
 
 
+def add_first_post_grad_pass(
+    options: Mapping[str, object] | None,
+    compiler_pass: object,
+) -> dict[str, object]:
+    """Copy options and move or add one post-grad pass ahead of every other."""
+    combined = dict(options) if options is not None else {}
+    existing = combined.get(_POST_GRAD_PRE_PASS)
+    if existing is None:
+        passes: tuple[object, ...] = ()
+    elif isinstance(existing, (list, tuple)):
+        passes = tuple(existing)
+    else:
+        passes = (existing,)
+    combined[_POST_GRAD_PRE_PASS] = (
+        compiler_pass,
+        *(other for other in passes if other is not compiler_pass),
+    )
+    return combined
+
+
 def add_ordered_post_grad_passes(
     options: Mapping[str, object] | None,
     compiler_passes: Sequence[object],
@@ -170,6 +190,7 @@ def add_ordered_post_grad_passes(
 __all__ = [
     "PreparationMatchKey",
     "PreparationSharingRule",
+    "add_first_post_grad_pass",
     "add_ordered_post_grad_passes",
     "add_post_grad_pass",
     "dimension_key",

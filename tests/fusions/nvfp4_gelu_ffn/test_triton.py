@@ -9,8 +9,10 @@ from piper_kernels.fusions.nvfp4_gelu_ffn import _preparation
 from piper_kernels.fusions.nvfp4_gelu_ffn.triton import (
     _chunked_gelu_ffn_gated_updates_op,
     _chunked_gelu_ffn_op,
+    _chunked_gelu_ffn_residual_add_op,
 )
 
+from .._ffn_residual_add import assert_residual_add_matches_gated_updates
 from ._helpers import make_operands, materialized
 
 
@@ -151,3 +153,32 @@ def test_chunked_ffn_gated_updates_matches_materialized(
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert result is None
     assert relative_l2 < (0.1 if down_dynamic else 0.06)
+
+
+@pytest.mark.parametrize("python_indexing", [False, True])
+@pytest.mark.parametrize(
+    "output_features",
+    [384, 640],
+    ids=["reused-projection-workspace", "separate-output-workspace"],
+)
+def test_residual_add_matches_gated_updates_without_reusable_update(
+    python_indexing: bool,
+    output_features: int,
+) -> None:
+    operands = make_operands(
+        rows=129,
+        up_dynamic=True,
+        down_dynamic=False,
+        output_features=output_features,
+        seed=973,
+    )
+    torch.manual_seed(973)
+
+    assert_residual_add_matches_gated_updates(
+        _chunked_gelu_ffn_gated_updates_op,
+        _chunked_gelu_ffn_residual_add_op,
+        operands.arguments(128),
+        1,
+        output_features,
+        python_indexing=python_indexing,
+    )
