@@ -293,7 +293,7 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     stride_ob,
     stride_oh,
     stride_om,
-    head_groups: gl.constexpr,
+    heads_per_kv_head: gl.constexpr,
     head_dim: gl.constexpr,
     is_causal: gl.constexpr,
     block_q: gl.constexpr,
@@ -332,7 +332,7 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = (batch * heads + head).to(gl.int64)
-    kv_batch_head = (batch * (heads // head_groups) + head // head_groups).to(gl.int64)
+    kv_batch_head = (batch * (heads // heads_per_kv_head) + head // heads_per_kv_head).to(gl.int64)
     # Tile origin in output rows, prepared-Q rows, and global (causal) rows.
     start_m = query_block * block_q
     query_row = query_start + start_m

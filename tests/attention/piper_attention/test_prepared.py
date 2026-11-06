@@ -140,7 +140,7 @@ def test_launch_reuses_caller_outputs_and_logical_query_metadata_without_allocat
         assert all(actual is expected for actual, expected in operands)
         assert args[10:] == (65, 97, 0, 65, 0, *output.stride()[:3])
         assert kwargs["heads"] == 6
-        assert kwargs["head_groups"] == 3
+        assert kwargs["heads_per_kv_head"] == 3
         assert kwargs["head_dim"] == 64
         assert kwargs["aligned_queries"] is False
         assert kwargs["unmasked_key_tiles"] is False
