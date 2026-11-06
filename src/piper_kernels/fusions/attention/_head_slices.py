@@ -16,7 +16,7 @@ per slice, so results differ slightly from one slice.
 from __future__ import annotations
 
 import operator
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
@@ -25,33 +25,48 @@ from torch.fx.node import Argument
 
 from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
 
-# Two slices halve K and V at no measured speed cost; past that, other buffers dominate.
+# Two slices halve K and V for at most 1.4% of attention time in measurements; past
+# that, other buffers dominate.
 NUM_HEAD_SLICES = 2
+
+type Producer = Mapping[torch._ops.OpOverload, tuple[str, ...]]
+"""Operators that can supply some of an add's K or V arguments, with the add arguments
+each supplies, in output order."""
 
 
 @dataclass(frozen=True)
 class HeadSlicing:
     """Which arguments of an attention residual add, and of its producers, split by head.
 
-    ``producers`` pairs each K or V producer with the add arguments it supplies, in output
-    order; its ``producer_rows`` arguments hold one block of rows per head. In the add,
-    ``rows`` hold one block of rows per query head, ``columns`` names the output
-    projection's weight, whose input columns follow the query heads, and ``once`` is
-    added by the first slice only. Each slice's columns must be a multiple of the add's
-    ``alignment`` argument, such as a ConvRot group size.
+    Each of ``producers`` supplies some of the add's K and V arguments; its operators'
+    ``producer_rows`` arguments hold one block of rows per head. In the add, ``rows``
+    hold one block of rows per query head, ``columns`` names the output projection's
+    weight, whose input columns follow the query heads, and ``once`` is added by the
+    first slice only. ``rows`` and ``producer_rows`` start with the query and K or V
+    weights, which set the head counts. Each slice's columns must be a multiple of the add's
+    ``alignment`` argument, such as a ConvRot group size. An add given any of
+    ``unsliced``, which hold heads in some other layout, runs as one slice.
 
-    The add must also take ``base``, ``head_dim``, and ``query_chunk_rows`` as dense
-    Piper's does. Each slice adds into the previous slice's ``base``, and its
-    ``query_chunk_rows`` is ``NUM_HEAD_SLICES`` times the add's, so each attention launch
-    keeps its unsliced rows times heads.
+    ``window_rows`` names the add's query-window row cap, which each slice multiplies
+    by ``NUM_HEAD_SLICES`` so its attention launches keep their unsliced rows times
+    heads. With None, each slice keeps the cap, so its launches and their window
+    buffers cover half as many heads. ``position`` names the add's arguments for a
+    slice's index and the number of slices, for an add that resolves some state
+    across every head, such as sparse Piper's keep budgets.
+
+    Each slice adds into the previous slice's ``base``. The add or one of its producers
+    must take ``head_dim``.
     """
 
-    producers: tuple[tuple[torch._ops.OpOverload, tuple[str, ...]], ...]
+    producers: tuple[Producer, ...]
     producer_rows: tuple[str, ...]
     rows: tuple[str, ...]
     columns: str
     once: tuple[str, ...]
     alignment: str
+    unsliced: tuple[str, ...]
+    window_rows: str | None
+    position: tuple[str, str] | None
 
 
 def _find_exclusive_producer(
@@ -80,6 +95,17 @@ def _find_exclusive_producer(
     return producer
 
 
+def _find_producer(
+    operands: Mapping[str, Argument], producer: Producer, consumer: torch.fx.Node
+) -> tuple[torch._ops.OpOverload, dict[str, Argument], tuple[str, ...]] | None:
+    """Return the operator, arguments, and outputs of the call that supplies ``producer``."""
+    for target, names in producer.items():
+        node = _find_exclusive_producer(operands, names, target, consumer)
+        if node is not None:
+            return target, bind_arguments(node), names
+    return None
+
+
 def _metadata(value: Argument) -> object:
     return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
 
@@ -95,12 +121,19 @@ def _call(
     """Emit ``target`` with its fake result as the node's metadata.
 
     Arguments go positionally in schema order, as in traced graphs, since Inductor passes
-    read some operators' arguments by position.
+    read some operators' arguments by position. Those after an omitted argument go by
+    name, so they keep their meaning.
     """
-    arguments = target._schema.arguments
-    args = tuple(values[a.name] for a in arguments if not a.kwarg_only and a.name in values)
-    kwargs = {a.name: values[a.name] for a in arguments if a.kwarg_only and a.name in values}
-    node = graph.call_function(target, args, kwargs)
+    args: list[Argument] = []
+    kwargs: dict[str, Argument] = {}
+    for index, argument in enumerate(target._schema.arguments):
+        if argument.name not in values:
+            continue
+        if argument.kwarg_only or len(args) < index:
+            kwargs[argument.name] = values[argument.name]
+        else:
+            args.append(values[argument.name])
+    node = graph.call_function(target, tuple(args), kwargs)
     node.meta["val"] = target(
         *(_metadata(value) for value in args),
         **{name: _metadata(value) for name, value in kwargs.items()},
@@ -118,6 +151,31 @@ def _slice_share(graph: torch.fx.Graph, value: Argument, slice_index: int, dim: 
     return _call(graph, torch.ops.aten.slice.Tensor, {"self": value, **bounds})
 
 
+def _head_dim(operands: Iterable[Mapping[str, Argument]]) -> int | None:
+    """Return the first ``head_dim`` among the add's and its producers' arguments."""
+    for values in operands:
+        head_dim = values.get("head_dim")
+        if head_dim is not None:
+            return head_dim if isinstance(head_dim, int) else None
+    return None
+
+
+def _scaled_window_rows(
+    residual_add: torch._ops.OpOverload, values: Mapping[str, Argument], name: str | None
+) -> dict[str, Argument]:
+    """Return each slice's query-window row cap, when the slicing scales argument ``name``."""
+    if name is None:
+        return {}
+    rows = values.get(name)
+    if rows is None:
+        (rows,) = (
+            argument.default_value
+            for argument in residual_add._schema.arguments
+            if argument.name == name
+        )
+    return {name: cast(int, rows) * NUM_HEAD_SLICES}
+
+
 def add_in_head_slices(
     graph: torch.fx.Graph,
     residual_add: torch._ops.OpOverload,
@@ -129,17 +187,21 @@ def add_in_head_slices(
 
     ``values`` are the add's arguments by name, and ``update`` is the attention output it
     replaces, whose K and V operands must feed nothing else. Emits nothing and returns
-    None when K or V has other consumers or the heads don't split evenly into aligned
-    slices.
+    None when K or V has other consumers, the add takes an ``unsliced`` argument, or the
+    heads don't split evenly into aligned slices.
     """
+    if any(values.get(name) is not None for name in slicing.unsliced):
+        return None
     producers: list[tuple[torch._ops.OpOverload, dict[str, Argument], tuple[str, ...]]] = []
-    for target, names in slicing.producers:
-        producer = _find_exclusive_producer(values, names, target, update)
-        if producer is None:
+    for producer in slicing.producers:
+        found = _find_producer(values, producer, update)
+        if found is None:
             return None
-        producers.append((target, bind_arguments(producer), names))
+        producers.append(found)
 
-    head_dim = cast(int, values["head_dim"])
+    head_dim = _head_dim((values, *(arguments for _, arguments, _ in producers)))
+    if head_dim is None:
+        return None
     row_counts = [
         _rows(values[slicing.rows[0]]),
         *(_rows(arguments[slicing.producer_rows[0]]) for _, arguments, _ in producers),
@@ -151,20 +213,18 @@ def add_in_head_slices(
     if slice_columns % cast(int, values[slicing.alignment]):
         return None
 
-    chunk_rows = values.get("query_chunk_rows")
-    if chunk_rows is None:
-        (chunk_rows,) = (
-            argument.default_value
-            for argument in residual_add._schema.arguments
-            if argument.name == "query_chunk_rows"
-        )
+    window_rows = _scaled_window_rows(residual_add, values, slicing.window_rows)
     base = cast(torch.fx.Node, values["base"])
     for slice_index in range(NUM_HEAD_SLICES):
         slice_values = {
             **values,
             "base": base,
-            "query_chunk_rows": cast(int, chunk_rows) * NUM_HEAD_SLICES,
-            **{name: _slice_share(graph, values[name], slice_index, 0) for name in slicing.rows},
+            **window_rows,
+            **{
+                name: _slice_share(graph, values[name], slice_index, 0)
+                for name in slicing.rows
+                if name in values
+            },
             # The output GEMM needs each slice's input columns contiguous.
             slicing.columns: _call(
                 graph,
@@ -177,10 +237,14 @@ def add_in_head_slices(
         }
         if slice_index:
             slice_values.update(dict.fromkeys(slicing.once))
+        if slicing.position is not None:
+            index_name, count_name = slicing.position
+            slice_values.update({index_name: slice_index, count_name: NUM_HEAD_SLICES})
         for target, arguments, names in producers:
             sliced = {
                 name: _slice_share(graph, arguments[name], slice_index, 0)
                 for name in slicing.producer_rows
+                if name in arguments
             }
             produced = _call(graph, target, {**arguments, **sliced})
             for index, name in enumerate(names):
@@ -191,4 +255,4 @@ def add_in_head_slices(
     return base
 
 
-__all__ = ["NUM_HEAD_SLICES", "HeadSlicing", "add_in_head_slices"]
+__all__ = ["NUM_HEAD_SLICES", "HeadSlicing", "Producer", "add_in_head_slices"]

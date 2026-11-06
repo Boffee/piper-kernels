@@ -270,6 +270,8 @@ def test_sparse_attention_output_is_computed_inside_its_residual_add():
     assert result.data_ptr() == hidden.data_ptr()
     assert _relative_l2(hidden, expected) < 0.01
     assert ReinplaceCounters.get_total_missed() == 0
+    # Half the output projection's input is not a whole ConvRot group, so the add runs
+    # as one slice; see convrot_int8_sparse_piper/test_head_slices.py.
     assert capture.targets.count(_SPARSE_ATTENTION_RESIDUAL_ADD) == 1
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _SPARSE_ATTENTION_OUTPUT not in capture.targets

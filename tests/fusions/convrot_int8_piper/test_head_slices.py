@@ -7,8 +7,6 @@ import torch
 from _compile_capture import FunctionalTargetCapturePass
 from torch._inductor.utils import run_and_get_code
 
-from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
-
 from ..residual_updates.test_compile import (
     _assert_updates_input_in_place,
     _compile_copy_back,
@@ -74,25 +72,3 @@ def test_attention_whose_heads_do_not_split_evenly_stays_one_slice():
 
     assert capture.targets.count(_RESIDUAL_ADD) == 1
     assert capture.targets.count(_KEY) == 1
-
-
-def test_head_slicing_names_arguments_its_operators_take():
-    slicing = dense_compile._HEAD_SLICING
-
-    def names(operator):
-        return {argument.name for argument in operator._schema.arguments}
-
-    assert {
-        # HeadSlicing requires these of every add.
-        "base",
-        "head_dim",
-        "query_chunk_rows",
-        *slicing.rows,
-        slicing.columns,
-        *slicing.once,
-        slicing.alignment,
-    } <= names(_RESIDUAL_ADD)
-    for producer, outputs in slicing.producers:
-        assert set(slicing.producer_rows) <= names(producer)
-        assert set(outputs) <= names(_RESIDUAL_ADD)
-        assert len(outputs) == len(producer._schema.returns)

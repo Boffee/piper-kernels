@@ -68,17 +68,23 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     *,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    start_head: int = 0,
+    end_head: int | None = None,
 ) -> _PreparedQuantizedSparsePiperContext:
     """Prepare global K/V and routing state without requiring materialized Q.
 
     Forced IDs/counts follow SparsePiperAttention.forward and cover every global
     query block. Build their membership once here; Q windows take row views.
+    The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``,
+    which keep the blocks they keep when every profile head runs together.
     """
     backend = _backend.require_attention_backend(key)
     layout = _resolve_route_layout(
         ratio_profile.units,
         sparse_key_blocks,
         key.device,
+        start_head=start_head,
+        end_head=end_head,
     )
     validate_routing_mode(routing_mode)
     pooled_value = None

@@ -27,6 +27,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   memory falls from 2.13 to 1.18 GiB at the same speed. Results differ slightly, because
   each slice quantizes its own share of the output projection's input and the residual
   rounds once per slice.
+- A fused ConvRot INT8 sparse Piper attention computed inside a residual add also runs in
+  two head slices, when its head count is even, half the output projection's input is a
+  whole number of ConvRot groups, and its coarse gate, if any, is a ConvRot INT8
+  projection of the attention's input. Each head keeps the blocks it keeps unsliced. With
+  104k tokens and 56 heads on an RX 9070 XT, its peak extra memory falls from 2.17 to
+  1.09 GiB, and it runs 1.4% slower. Results differ slightly, as with dense head slices.
 
 ## [0.8.0rc2] - 2026-11-05
 

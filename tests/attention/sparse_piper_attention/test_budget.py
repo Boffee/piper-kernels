@@ -22,6 +22,20 @@ def test_h3_ratio_profile_resolves_exact_physical_budget() -> None:
     assert layout.routes_per_query == 1243
 
 
+def test_head_range_keeps_the_blocks_its_heads_keep_among_all_heads() -> None:
+    units = _normalize_head_keep_ratios((0.3,) * 4)
+
+    second = _resolve_route_layout(units, 8, torch.device("cpu"), start_head=2, end_head=4)
+
+    # Rounding gives the two extra blocks to the first two of all four heads; the last
+    # two heads alone would take one of them.
+    assert _resolve_head_keep_blocks(units, 8) == (3, 3, 2, 2)
+    assert _resolve_head_keep_blocks(units[2:], 8) == (3, 2)
+    assert second.head_keep_blocks.tolist() == [2, 2]
+    assert second.route_head_offsets.tolist() == [0, 2, 4]
+    assert second.routes_per_query == 4
+
+
 def test_largest_remainder_rounding_preserves_nearest_total() -> None:
     attention = SparsePiperAttention((0.5, 0.5))
 

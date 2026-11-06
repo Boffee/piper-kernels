@@ -409,6 +409,8 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
     residual_add: tuple[ResidualAdd, ResidualAddLayout] | None = None,
+    start_head: int = 0,
+    end_head: int | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output.
 
@@ -418,6 +420,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     ``out`` rows may hold attention windows before their projection overwrites them.
     With a validated ``residual_add`` instead, each window's projection is added
     into its base rows, which hold live data, so attention uses separate buffers.
+    The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``.
     """
     projection_backend = fusion_backend.require_projection_backend(
         query_input, head_dim=key.shape[-1]
@@ -444,6 +447,8 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         has_projected_coarse_gate=gate_projection is not None,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        start_head=start_head,
+        end_head=end_head,
     )
     if (
         query_input.ndim != 3
@@ -907,6 +912,23 @@ def _validate_residual_add(
     return residual_add, layout
 
 
+def _resolve_head_slice(
+    ratio_profile: _SparsePiperRatioProfile,
+    query_weight_qdata: torch.Tensor,
+    key: torch.Tensor,
+    head_slice_index: int,
+    num_head_slices: int,
+) -> tuple[int, int]:
+    """Return the profile heads ``[start_head, end_head)`` that this call's Q covers."""
+    if not 0 <= head_slice_index < num_head_slices:
+        raise ValueError("sparse Piper head slice index must lie in [0, num_head_slices)")
+    query_heads = query_weight_qdata.shape[0] // key.shape[-1]
+    if ratio_profile.num_heads != query_heads * num_head_slices:
+        raise ValueError("sparse Piper ratio profile must cover every head slice's query heads")
+    start_head = head_slice_index * query_heads
+    return start_head, start_head + query_heads
+
+
 @torch.library.custom_op(
     "piper_kernels::convrot_int8_sparse_piper_projected_query_attention_residual_add_",
     mutates_args=("base",),
@@ -959,6 +981,8 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,
+    head_slice_index: int = 0,
+    num_head_slices: int = 1,
 ) -> None:
     """Add ``gate[gate_indices] * attention_output`` into ``base`` without a full-size output.
 
@@ -967,7 +991,15 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     operands project the coarse gate; ``gate`` is the residual gate, and the output
     dtype is ``base``'s. Each window is projected into bounded scratch and added into
     its ``base`` rows in FP32 with one rounding.
+
+    To add attention in ``num_head_slices`` equal head slices, call once per slice:
+    the Q, K, V, and coarse-gate operands hold slice ``head_slice_index``'s heads, the
+    output projection takes their share of its input columns, and ``ratio_profile``
+    covers every slice's heads. Each head then keeps the blocks it keeps unsliced.
     """
+    start_head, end_head = _resolve_head_slice(
+        ratio_profile, query_weight_qdata, key, head_slice_index, num_head_slices
+    )
     residual_add = _validate_residual_add(
         base,
         gate,
@@ -1036,18 +1068,20 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
         residual_add=residual_add,
+        start_head=start_head,
+        end_head=end_head,
     )
 
 
 @_projected_query_attention_residual_add_op.register_fake
-def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913
+def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
     base: torch.Tensor,
     gate: torch.Tensor,
     gate_indices: torch.Tensor,
     python_indexing: bool,
     _query_input: torch.Tensor,
     _query_input_scale: torch.Tensor | None,
-    _query_weight_qdata: torch.Tensor,
+    query_weight_qdata: torch.Tensor,
     _query_weight_scale: torch.Tensor,
     _query_norm_weight: torch.Tensor | None,
     _cos: torch.Tensor,
@@ -1061,7 +1095,7 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913
     _value: torch.Tensor,
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
-    _ratio_profile: _SparsePiperRatioProfile,
+    ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,
@@ -1087,7 +1121,10 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913
     force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
+    head_slice_index: int = 0,
+    num_head_slices: int = 1,
 ) -> None:
+    _resolve_head_slice(ratio_profile, query_weight_qdata, key, head_slice_index, num_head_slices)
     _validate_residual_add(
         base,
         gate,

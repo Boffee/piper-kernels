@@ -101,4 +101,13 @@ When its heads split into aligned halves, the fold runs this add in two head sli
 calling `convrot_int8_piper_project_key`, `convrot_int8_piper_project_value`, and the add
 once per slice on head-sliced weights. `_HEAD_SLICING` in [`_compile.py`](_compile.py)
 names the arguments that split by head; the mechanism is
-[`attention/_head_slices.py`](../attention/_head_slices.py).
+[`attention/_head_slices.py`](../attention/_head_slices.py). Each slice's windows hold
+twice the rows, so attention launches keep their unsliced size.
+
+Sparse Piper's fold slices its add the same way, with its K and V projections and its
+coarse gate's projection rows, as its own
+[`_HEAD_SLICING`](../convrot_int8_sparse_piper/_compile.py) names. Keep budgets round
+across every head, so each slice's add takes its position and covers its heads' share
+of the whole profile's budget. A coarse gate the fusion receives whole holds every head,
+so that add runs as one slice. Sparse windows keep their unsliced row cap: their Q,
+attention, and routing-score buffers then halve with the heads, at a small speed cost.

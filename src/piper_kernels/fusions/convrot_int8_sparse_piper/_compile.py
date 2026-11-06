@@ -41,6 +41,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     is_valid_routing_mode,
 )
+from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _residual as attention_residual
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as convrot_int8_qk_validation
@@ -589,6 +590,55 @@ def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
     return changed
 
 
+_ops = torch.ops.piper_kernels
+# Which residual-add and K/V projection arguments hold rows per head, for head slices.
+_HEAD_SLICING = head_slices.HeadSlicing(
+    producers=(
+        {
+            _ops.convrot_int8_sparse_piper_project_key.default: (
+                "key",
+                "key_scale",
+                "key_summary",
+                "key_aux",
+            )
+        },
+        {
+            _ops.convrot_int8_sparse_piper_project_value.default: (
+                "value",
+                "value_scale_multiplier",
+                "value_mean",
+            ),
+            _ops.convrot_int8_sparse_piper_project_value_with_block_means.default: (
+                "value",
+                "value_scale_multiplier",
+                "value_mean",
+                "block_mean",
+            ),
+        },
+    ),
+    producer_rows=("weight_qdata", "weight_scale", "bias"),
+    rows=(
+        "query_weight_qdata",
+        "query_weight_scale",
+        "query_bias",
+        "gate_weight_qdata",
+        "gate_weight_scale",
+        "gate_bias",
+    ),
+    columns="weight_qdata",
+    once=("bias",),
+    alignment="group_size",
+    # A materialized coarse gate holds heads along its third dimension.
+    unsliced=("coarse_gate",),
+    # Full-size launches would also keep Q, attention windows, and routing scores
+    # whole: on RX 9070 XT they saved 0.2-0.5% of attention time for 0.2-0.3 GiB more
+    # peak memory with 104k tokens and 56 heads.
+    window_rows=None,
+    # Keep budgets round across every head, so each slice takes its heads' share.
+    position=("head_slice_index", "num_head_slices"),
+)
+
+
 class _CompilePass(CustomInferenceAwareGraphPass):
     """Fold compatible ConvRot INT8 projections into sparse Piper preparation."""
 
@@ -597,11 +647,11 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             projection_views.normalize_projection_views(graph)
             _fold_sparse_piper_projection(graph)
             _output_compile._fold_attention_output(graph)
-            ops = torch.ops.piper_kernels
             if attention_residual.fold_residual_adds(
                 graph,
-                ops.convrot_int8_sparse_piper_projected_query_attention_output.default,
-                ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default,
+                _ops.convrot_int8_sparse_piper_projected_query_attention_output.default,
+                _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default,
+                _HEAD_SLICING,
             ):
                 # Drop the operands that only the replaced output read.
                 graph.eliminate_dead_code()

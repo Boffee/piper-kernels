@@ -529,17 +529,26 @@ _kernels = torch.ops.piper_kernels
 # Which residual-add and K/V projection arguments hold rows per head, for head slices.
 _HEAD_SLICING = head_slices.HeadSlicing(
     producers=(
-        (_kernels.convrot_int8_piper_project_key.default, ("key", "key_scale")),
-        (
-            _kernels.convrot_int8_piper_project_value.default,
-            ("value", "multiplier", "log_scale", "value_mean"),
-        ),
+        {_kernels.convrot_int8_piper_project_key.default: ("key", "key_scale")},
+        {
+            _kernels.convrot_int8_piper_project_value.default: (
+                "value",
+                "multiplier",
+                "log_scale",
+                "value_mean",
+            )
+        },
     ),
     producer_rows=("weight_qdata", "weight_scale", "bias"),
     rows=("query_weight", "query_weight_scale", "query_bias"),
     columns="weight_qdata",
     once=("bias",),
     alignment="group_size",
+    unsliced=(),
+    # Half-head launches slowed dense attention by 1.4% on RX 9070 XT; full-size ones
+    # cost 0.2% and only a larger output-projection scratch window.
+    window_rows="query_chunk_rows",
+    position=None,
 )
 
 
