@@ -10,6 +10,7 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -121,7 +122,7 @@ def convrot_nvfp4_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Return Inductor options that share ConvRot NVFP4 preparation."""
-    return preparation_sharing.add_post_grad_pass(options, compile_pass)
+    return inductor_options.add_post_grad_pass(options, compile_pass)
 
 
 __all__ = ["convrot_nvfp4_compile_options"]

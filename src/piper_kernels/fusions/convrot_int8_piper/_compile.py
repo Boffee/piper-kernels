@@ -17,6 +17,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.attention import _output as output_pipeline
 from piper_kernels.fusions.attention import _residual as attention_residual
@@ -558,7 +559,7 @@ def convrot_int8_piper_compile_options(
     if not isinstance(fuse_output, bool):
         raise TypeError("fuse_output must be boolean")
     passes = (compile_pass, output_compile_pass) if fuse_output else (compile_pass,)
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options, (*passes, linear_compile.compile_pass)
     )
 

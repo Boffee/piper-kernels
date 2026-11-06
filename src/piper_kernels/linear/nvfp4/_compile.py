@@ -18,6 +18,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
@@ -227,7 +228,7 @@ def nvfp4_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Return Inductor options that share compatible NVFP4 preparation."""
-    return preparation_sharing.add_post_grad_pass(options, compile_pass)
+    return inductor_options.add_post_grad_pass(options, compile_pass)
 
 
 __all__ = ["nvfp4_compile_options"]

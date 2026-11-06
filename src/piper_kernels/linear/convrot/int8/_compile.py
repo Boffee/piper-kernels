@@ -17,6 +17,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton import convrot as convrot_triton
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -266,7 +267,7 @@ def convrot_int8_compile_options(
     unchanged. Pass these options to ``torch.compile`` without also supplying
     its mutually exclusive ``mode`` argument.
     """
-    return preparation_sharing.add_post_grad_pass(options, compile_pass)
+    return inductor_options.add_post_grad_pass(options, compile_pass)
 
 
 __all__ = ["convrot_int8_compile_options"]

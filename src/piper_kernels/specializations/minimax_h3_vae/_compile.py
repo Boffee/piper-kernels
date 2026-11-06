@@ -11,6 +11,7 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
@@ -205,7 +206,7 @@ def minimax_h3_vae_convrot_int8_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install ordinary ConvRot rewriting followed by the H3 VAE schedules."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (convrot_int8_compile.compile_pass, compile_pass),
     )
