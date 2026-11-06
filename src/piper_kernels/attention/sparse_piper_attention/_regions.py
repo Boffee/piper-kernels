@@ -11,7 +11,10 @@ from dataclasses import dataclass
 
 import torch
 from torch._custom_class_base import CustomClassBase
-from torch._library.opaque_object import MemberType, register_custom_class
+from torch._library.fake_class_registry import FakeScriptObject
+from torch._library.opaque_object import register_custom_class
+
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
 from ._budget import (
     _UINT16_ROUTE_CAPACITY,
@@ -53,11 +56,13 @@ class SparsePiperKeyLayout(CustomClassBase):
     immutable and shared by every batch, query, and head. Attention checks that
     its total block count covers the supplied sequence exactly.
 
-    Construct outside compiled forward calls. Replacing a layout with another
-    having the same ``num_blocks`` reuses the compiled graph, even when region
-    count, boundaries, or sparse/dense flags change. Tensor shapes and kernel
-    policies can still introduce other specializations. Explicit CUDA graphs
-    require a fixed layout and ratio profile; recapture when either changes.
+    Construct and inspect layouts outside compiled forward calls; compiled code
+    passes them opaquely to attention. Region count, boundaries,
+    sparse/dense flags, and total block count are runtime configuration. Mark
+    sequence dimensions dynamic to reuse compiled graphs across sequence lengths.
+    Other tensor shapes and kernel policies can still introduce specializations.
+    Explicit CUDA graphs require fixed shapes, layout, and ratio profile;
+    recapture when any changes.
     """
 
     regions: tuple[SparsePiperKeyRegion, ...]
@@ -78,26 +83,35 @@ class SparsePiperKeyLayout(CustomClassBase):
         return sum(region.num_blocks for region in self.regions)
 
 
-def _layout_guards(layout: SparsePiperKeyLayout) -> list[int]:
-    return [layout.num_blocks]
-
-
-# Match the ratio profile's runtime boundary: only sequence coverage is graph
-# metadata. Region structure is read inside the operator, outside Dynamo tracing.
+# No layout values are graph metadata, including its total block count. Exact
+# coverage is checked inside the operator on every execution, so dynamic sequence
+# lengths do not specialize the enclosing graph through the opaque object.
 # Consumers must remain cudagraph_unsafe because replay would retain the layout
-# and budgets used at capture, without running these custom-object guards.
-register_custom_class(
-    SparsePiperKeyLayout,
-    typ="symbolic",
-    guard_fn=_layout_guards,
-    members={"num_blocks": MemberType.USE_REAL},
-)
+# and budgets used at capture.
+register_custom_class(SparsePiperKeyLayout, typ="symbolic")
 
 
 def validate_key_layout(key_layout: SparsePiperKeyLayout) -> None:
     """Check the public argument type; construction owns partition validation."""
     if not isinstance(key_layout, SparsePiperKeyLayout):
         raise TypeError("key_layout must be a SparsePiperKeyLayout")
+
+
+def validate_key_layout_storage(key_layout: SparsePiperKeyLayout, sequence_length: int) -> None:
+    """Validate storage at the real/fake operator boundary before preparing routes.
+
+    Common input validation already requires a positive sequence. During compiler
+    fake execution, partition contents are opaque: check the physical block shape
+    and defer exact coverage to each runtime call. Concrete fake/meta calls can
+    also check coverage directly without inspecting any tensor contents.
+    """
+    if sequence_length % TILE_ROWS or sequence_length > _UINT16_ROUTE_CAPACITY * TILE_ROWS:
+        raise ValueError("key_layout must cover exactly the sequence's complete K64 blocks")
+    if (
+        not isinstance(key_layout, FakeScriptObject)
+        and sequence_length != key_layout.num_blocks * TILE_ROWS
+    ):
+        raise ValueError("key_layout must cover exactly the sequence's complete K64 blocks")
 
 
 def resolve_region_keep_blocks(

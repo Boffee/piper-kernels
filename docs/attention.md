@@ -139,17 +139,32 @@ assert budgets == ((10, 25), (4, 4), (10, 25), (10, 25))
 Construct an immutable `SparsePiperKeyLayout` from a nonempty tuple of
 `SparsePiperKeyRegion` values outside compiled forward calls. Each region counts
 consecutive physical K64 blocks, and together they must cover the entire sequence,
-up to 65,536 blocks. `layout.regions` exposes the partition and `layout.num_blocks`
-its total size. This prototype requires complete physical blocks, including the
-last one. Pad region boundaries when needed and use `block_lengths` to exclude
-padding. The partition is shared across batches, queries, and heads.
+up to 65,536 blocks. Outside compiled code, `layout.regions` exposes the partition
+and `layout.num_blocks` its total size. Compiled code passes layouts opaquely to
+attention and derives sequence dimensions from tensors. This prototype requires
+complete physical blocks, including the last one. Pad region boundaries when
+needed and use `block_lengths` to exclude padding. The partition is shared across
+batches, queries, and heads.
 
-Pass the layout as a forward argument or store it on the model. Replacing it with
-another layout of the same total block count reuses the compiled graph, including
-switching between one and two sparse regions, moving boundaries, or changing
-sparse/dense flags. Only the total block count is graph metadata; the partition
-is runtime configuration. Other tensor-shape and model guards still apply, and
-kernel policies can introduce their own variants.
+Pass the layout as a forward argument or store it on the model. The entire
+partition is runtime configuration, including its total block count. Changing
+region count, boundaries, or sparse/dense flags does not specialize the graph.
+Exact sequence coverage is checked inside the operator on every execution.
+
+To reuse a graph across sequence lengths, mark Q/K/V's sequence dimensions dynamic
+before calling the compiled model. Mark the block dimension of `block_lengths`
+and the query-block dimension of any forced-tile inputs when using those options:
+
+```python
+for tensor in (q, k, v):
+    torch._dynamo.mark_dynamic(tensor, 1)  # [batch, sequence, heads, features]
+```
+
+For each supplied `block_lengths`, `force_tile_ids`, or `force_tile_counts` tensor,
+likewise call `torch._dynamo.mark_dynamic(tensor, 0)`. Supply a layout covering the
+new sequence on each call. Without dynamic shape annotations, ordinary
+tensor-shape guards can still cause recompilation. Other model guards and kernel
+policies also retain their own specialization rules.
 
 Budgets round across heads independently within each sparse region, with at least
 one block per head per region. Regions cannot borrow each other's budget; small
@@ -164,8 +179,8 @@ that region. IDs in dense regions are already included. These are numerical
 caller preconditions, as for prefix routing.
 
 Region calls support the portable reference, native backends, standalone
-`torch.compile`, and explicit CUDA graphs with a fixed layout and ratio profile.
-Recapture an explicit graph when either configuration changes. The
+`torch.compile`, and explicit CUDA graphs with fixed shapes, layout, and ratio
+profile. Recapture an explicit graph when any of these change. The
 prototype uses a separate compiler operator boundary; projection/output and
 coarse-branch fusions currently recognize only the prefix API. A separately
 computed coarse residual can still be added. Existing prefix calls are unchanged.

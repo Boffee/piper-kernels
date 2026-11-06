@@ -9,8 +9,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Experimental `SparsePiperAttention` calls with `key_layout=...` partition key
   storage with an immutable `SparsePiperKeyLayout` of `SparsePiperKeyRegion` values.
-  Construct layouts outside compiled forwards; changing region count, boundaries,
-  or sparse/dense flags at the same total block count reuses the compiled graph.
+  Construct layouts outside compiled forwards; the entire partition is runtime
+  configuration. Dynamic sequence dimensions can reuse a compiled graph when
+  sequence length, region count, boundaries, or sparse/dense flags change.
   Each sparse region receives its own per-head keep budget; dense regions can
   appear between sparse regions, within one softmax. Regions must cover complete
   physical 64-token blocks.

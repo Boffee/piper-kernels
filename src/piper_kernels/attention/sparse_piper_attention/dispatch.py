@@ -27,6 +27,7 @@ from ._regions import (
     resolve_region_keep_blocks,
     resolve_region_route_layout,
     validate_key_layout,
+    validate_key_layout_storage,
 )
 from ._routing import packed_routes_from_sequences, packed_routes_from_summaries
 from ._routing_modes import (
@@ -126,10 +127,10 @@ class SparsePiperAttention(torch.nn.Module):
         (at most 65536); compact partial tails require padding. Sparse regions
         apply the head ratios independently, and dense regions keep all blocks,
         within one softmax. ``resolve_region_keep_blocks`` reports their budgets.
-        Layouts with the same total block count reuse compiled graphs when
-        region count, boundaries, or sparse/dense flags change. Projection/output
-        compiler fusions currently recognize only the prefix form. Explicit CUDA
-        graphs require a fixed layout and ratio profile.
+        Layout values do not specialize compiled graphs. Mark sequence dimensions
+        dynamic to reuse a graph when sequence length and region sizes change.
+        Projection/output compiler fusions currently recognize only the prefix
+        form. Explicit CUDA graphs require fixed shapes, layout, and ratio profile.
 
         Experimental fixed-budget forced routing takes contiguous device INT32
         ``force_tile_ids[query_blocks, capacity]`` and ``force_tile_counts[query_blocks]``.
@@ -166,8 +167,6 @@ class SparsePiperAttention(torch.nn.Module):
         )
         if key_layout is not None:
             validate_key_layout(key_layout)
-            if query.shape[1] != key_layout.num_blocks * _BLOCK_ROWS:
-                raise ValueError("key_layout must cover exactly the sequence's complete K64 blocks")
             return _sparse_piper_region_attention_op(
                 query,
                 key,
@@ -469,6 +468,7 @@ def _sparse_piper_region_attention_op(  # noqa: PLR0913, PLR0917
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    validate_key_layout_storage(key_layout, query.shape[1])
     layout = resolve_region_route_layout(ratio_profile.units, key_layout, query.device)
     # The existing consumer already supports a complete absolute route list:
     # set its routeable extent to the entire sequence, leaving no implicit suffix.
@@ -493,7 +493,7 @@ def _sparse_piper_region_attention_op_fake(
     _key: torch.Tensor,
     _value: torch.Tensor,
     _ratio_profile: _SparsePiperRatioProfile,
-    _key_layout: SparsePiperKeyLayout,
+    key_layout: SparsePiperKeyLayout,
     _scale: float,
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
@@ -501,4 +501,5 @@ def _sparse_piper_region_attention_op_fake(
     _force_tile_ids: torch.Tensor | None = None,
     _force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    validate_key_layout_storage(key_layout, query.shape[1])
     return torch.empty_like(query, memory_format=torch.contiguous_format)

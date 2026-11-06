@@ -323,23 +323,34 @@ def test_exactly_one_layout_is_required():
 
 def test_compiled_layout_rechecks_total_block_count():
     torch._dynamo.reset()
-    compiled = torch.compile(SparsePiperAttention((0.5,)), backend="eager")
+    capture = TargetCapturePass()
+    compiled = torch.compile(
+        SparsePiperAttention((0.5,)),
+        fullgraph=True,
+        options={"post_grad_custom_pre_pass": capture},
+    )
     q = torch.zeros((1, 128, 1, 64))
     compiled(q, q, q, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(2),)))
     for num_blocks in (1, 3):
         with pytest.raises(ValueError, match="key_layout must cover exactly"):
             compiled(q, q, q, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(num_blocks),)))
+    assert capture.calls == 1
 
 
-@pytest.mark.parametrize("layout_source", ["argument", "attribute"])
-def test_region_compile_preserves_runtime_layout_and_ratio_profile(device, layout_source):
+@pytest.mark.parametrize(
+    ("layout_source", "padded_forcing"), [("argument", False), ("attribute", True)]
+)
+def test_region_compile_reuses_dynamic_lengths_and_layouts(device, layout_source, padded_forcing):
     torch._dynamo.reset()
     layouts = (
         SparsePiperKeyLayout((SparsePiperKeyRegion(12),)),
         SparsePiperKeyLayout((SparsePiperKeyRegion(6), SparsePiperKeyRegion(6))),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(6), SparsePiperKeyRegion(7))),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(5), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(9))),
-        SparsePiperKeyLayout((SparsePiperKeyRegion(12, sparse=False),)),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(10))),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(16, sparse=False),)),
     )
 
     class Model(torch.nn.Module):
@@ -348,9 +359,15 @@ def test_region_compile_preserves_runtime_layout_and_ratio_profile(device, layou
             self.attention = SparsePiperAttention((0.25, 0.5))
             self.key_layout = layouts[0]
 
-        def forward(self, q, k, v, key_layout):
+        def forward(self, q, k, v, key_layout, lengths, ids, counts):
             return self.attention(
-                q, k, v, key_layout=self.key_layout if key_layout is None else key_layout
+                q,
+                k,
+                v,
+                key_layout=self.key_layout if key_layout is None else key_layout,
+                block_lengths=lengths,
+                force_tile_ids=ids,
+                force_tile_counts=counts,
             )
 
     model = Model()
@@ -363,34 +380,49 @@ def test_region_compile_preserves_runtime_layout_and_ratio_profile(device, layou
             "triton.cudagraphs": device.type == "cuda",
         },
     )
-    q = torch.zeros((1, 768, 2, 64), device=device)
-    k = torch.zeros((1, 768, 1, 64), device=device)
-    v = (
-        torch.arange(12, device=device, dtype=q.dtype)
-        .repeat_interleave(64)[None, :, None, None]
-        .expand_as(k)
-        .contiguous()
-    )
     cases = [(layout, (0.25, 0.5)) for layout in layouts]
     # Returning to the initial layout also changes the runtime ratio profile.
     cases.append((layouts[0], (0.75, 1.0)))
     for key_layout, ratios in cases:
+        num_blocks = key_layout.num_blocks
+        q = torch.zeros((1, num_blocks * 64, 2, 64), device=device)
+        k = torch.zeros((1, num_blocks * 64, 1, 64), device=device)
+        v = (
+            torch.arange(num_blocks, device=device, dtype=q.dtype)
+            .repeat_interleave(64)[None, :, None, None]
+            .expand_as(k)
+            .contiguous()
+        )
+        for tensor in (q, k, v):
+            torch._dynamo.mark_dynamic(tensor, 1)
+        lengths = ids = counts = None
+        if padded_forcing:
+            lengths = torch.full((num_blocks,), 64, device=device, dtype=torch.int32)
+            ids = torch.full((num_blocks, 1), num_blocks - 1, device=device, dtype=torch.int32)
+            counts = torch.ones(num_blocks, device=device, dtype=torch.int32)
+            for tensor in (lengths, ids, counts):
+                torch._dynamo.mark_dynamic(tensor, 0)
         model.attention = SparsePiperAttention(ratios)
         model.key_layout = key_layout
         argument = key_layout if layout_source == "argument" else None
         torch.compiler.cudagraph_mark_step_begin()
-        actual = compiled(q, k, v, argument).clone()
+        actual = compiled(q, k, v, argument, lengths, ids, counts).clone()
         budgets = model.attention.resolve_region_keep_blocks(key_layout)
         expected = torch.empty_like(q)
         for head in range(2):
             start = 0
             selected = []
-            for region, counts in zip(key_layout.regions, budgets, strict=True):
-                selected.extend(range(start, start + counts[head]))
+            for region, head_counts in zip(key_layout.regions, budgets, strict=True):
+                selected.extend(range(start, start + head_counts[head]))
                 start += region.num_blocks
+            if padded_forcing:
+                # Force the final physical block in the final region's budget.
+                selected[-1] = num_blocks - 1
             expected[:, :, head] = sum(selected) / len(selected)
         torch.testing.assert_close(actual, expected, atol=0.01, rtol=0)
-        torch.testing.assert_close(actual, model(q, k, v, argument), atol=0, rtol=0)
+        torch.testing.assert_close(
+            actual, model(q, k, v, argument, lengths, ids, counts), atol=0, rtol=0
+        )
     assert capture.calls == 1
 
 
