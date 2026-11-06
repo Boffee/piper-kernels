@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
@@ -24,7 +25,6 @@ from ..convrot_nvfp4_sparse_piper.test_compile import (
     _run_explicit_attention_output as convrot_reference,
 )
 from ..convrot_nvfp4_sparse_piper.test_output import _arguments as convrot_arguments
-from ._helpers import exact_sm120_available
 from .test_compile import _run_explicit_attention_output, _SparseProjectionAttentionOutput
 from .test_output import _arguments
 

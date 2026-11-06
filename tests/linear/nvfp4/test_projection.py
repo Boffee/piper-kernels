@@ -5,6 +5,7 @@ from threading import Barrier
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, unpack_uint4
 from torchao.prototype.mx_formats.utils import from_blocked
 
@@ -14,7 +15,7 @@ from piper_kernels.weights.nvfp4 import _layout
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+        not exact_sm120_available(),
         reason="requires exact NVIDIA SM120",
     ),
 ]

@@ -3,6 +3,7 @@
 import pytest
 import torch
 import triton
+from _accelerators import exact_sm120_available
 
 from piper_kernels._triton.reductions import mean_reduction_tile
 from piper_kernels._triton.runtime import device_context
@@ -46,5 +47,5 @@ def test_long_mean_is_accurate_without_register_spills(chunks, features):
             num_warps=4,
         )
     # The memory regression was measured on SM120; other targets still check accuracy.
-    if not torch.version.hip and torch.cuda.get_device_capability() == (12, 0):
+    if exact_sm120_available():
         assert kernel.n_spills == 0

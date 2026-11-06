@@ -5,12 +5,15 @@ import torch
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 from piper_kernels.weights.nvfp4._backend import triton_backend
 
-_CUDA_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+_CUDA_AVAILABLE = torch.cuda.is_available() and AcceleratorTarget.from_device(
+    torch.device("cuda")
+).cuda_capability_at_least(10)
 gpu = [pytest.mark.gpu, pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires Blackwell CUDA")]
 
 

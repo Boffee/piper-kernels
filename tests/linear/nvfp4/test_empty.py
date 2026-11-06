@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
@@ -35,7 +36,7 @@ def test_empty_reference_preparation_and_projection(dtype, dynamic, group_size, 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

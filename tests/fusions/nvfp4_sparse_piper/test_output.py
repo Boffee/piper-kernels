@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -22,7 +23,7 @@ from piper_kernels.linear.nvfp4 import _ops, _projection, reference
 from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from .._accuracy import assert_fusion_output_close
-from ._helpers import exact_sm120_available, make_operands
+from ._helpers import make_operands
 
 _HEADS = 2
 _HEAD_DIM = 128

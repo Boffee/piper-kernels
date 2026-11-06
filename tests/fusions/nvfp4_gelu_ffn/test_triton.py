@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
@@ -15,14 +16,9 @@ from piper_kernels.fusions.nvfp4_gelu_ffn.triton import (
 from .._ffn_residual_add import assert_residual_add_matches_gated_updates
 from ._helpers import make_operands, materialized
 
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
-
-
 pytestmark = [
     pytest.mark.gpu,
-    pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120"),
+    pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120"),
 ]
 
 

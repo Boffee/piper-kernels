@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -14,12 +15,8 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.nvfp4 import _layout
 
 
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
-
-
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_preparation_handles_subnormal_scales_and_zero_blocks(dynamic):
     torch.manual_seed(508)
@@ -46,7 +43,7 @@ def test_preparation_handles_subnormal_scales_and_zero_blocks(dynamic):
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(("rows", "features"), [(127, 80), (1_025, 5_376)])
 def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> None:
     torch.manual_seed(500 + rows)
@@ -64,7 +61,7 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 128, 129])
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("high_first", [False, True])
@@ -110,7 +107,7 @@ def test_static_activation_preparation_matches_portable_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
 def test_static_preparation_preserves_noncontiguous_logical_order(
     activation_fn: str | None,
@@ -144,7 +141,7 @@ def test_static_preparation_preserves_noncontiguous_logical_order(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_static_preparation_out_preserves_logical_shapes() -> None:
     torch.manual_seed(507)
     rows, input_features = 127, 80
@@ -183,7 +180,7 @@ def test_static_preparation_out_preserves_logical_shapes() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> None:
     torch.manual_seed(505)
     input = torch.randn(  # noqa: A001
@@ -203,7 +200,7 @@ def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> No
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
@@ -239,7 +236,7 @@ def test_add_bias_out_matches_pytorch(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("two_level", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16])
@@ -294,7 +291,7 @@ def test_prepared_linear_bounds_workspace(
 
 @pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_inplace_bias_addition_crosses_int32_element_boundary() -> None:
     if torch.cuda.mem_get_info()[0] < 5 * 1024**3:
         pytest.skip("requires 5 GiB of free CUDA memory")
@@ -309,7 +306,7 @@ def test_inplace_bias_addition_crosses_int32_element_boundary() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_linear_mean_matches_batched_represented_projection() -> None:
     torch.manual_seed(506)
     batch, sequence_length = 2, 257
@@ -365,7 +362,7 @@ def test_linear_mean_matches_batched_represented_projection() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_linear_mean_ignores_valid_front_padding() -> None:
     torch.manual_seed(507)
     batch, sequence_length = 2, 128
@@ -423,7 +420,7 @@ def test_linear_mean_ignores_valid_front_padding() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("count", [1_024, 1_025, 1_797, 4_097, 8_192, 8_193, 65_537])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_dynamic_scale_small_final_reduction_boundaries(count, dtype):
@@ -439,7 +436,7 @@ def test_dynamic_scale_small_final_reduction_boundaries(count, dtype):
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("maximum", [0.0, 2.0**-126, float("inf")])
 def test_dynamic_scale_small_reduction_extremes(maximum):
     values = torch.zeros(1_797, device="cuda", dtype=torch.float32)

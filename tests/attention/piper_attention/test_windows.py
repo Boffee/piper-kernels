@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import policy
@@ -44,7 +45,7 @@ def _operands(head_dim, causal, descriptors, *, optimize_causal=None, kernel="tr
         )
         block_m = plan.block_m
     else:
-        if descriptors and torch.cuda.get_device_capability() != (12, 0):
+        if descriptors and not exact_sm120_available():
             pytest.skip("tensor descriptor window coverage requires SM120")
         block_m = 64 if causal else 128
     sequence = 2 * block_m + 17
@@ -211,7 +212,7 @@ def test_window_graph_replay_uses_live_query_storage(head_dim, causal, descripto
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="causal strided schedule is calibrated on SM120",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

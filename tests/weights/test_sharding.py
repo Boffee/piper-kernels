@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
@@ -225,7 +226,7 @@ def test_nvfp4_without_global_scales(cls):
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("creation_device", ["cpu", "cuda"])
 def test_cuda_quantized_linear_composition(cls, high_first, compiled, creation_device):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+    if not exact_sm120_available():
         pytest.skip("requires an SM120 CUDA device")
     full = _weight(cls, rows=384, features=512, swizzled=True, high_first=high_first).to(
         creation_device

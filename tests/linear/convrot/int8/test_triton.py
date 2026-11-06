@@ -6,6 +6,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from _accelerators import exact_sm120_available
 from torch import nn
 
 from piper_kernels._triton import convrot as convrot_backend
@@ -594,29 +595,8 @@ def test_prepared_linear_populates_caller_owned_output(with_bias: bool) -> None:
     assert torch.isnan(output_storage[[0, -1]]).all()
 
 
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and AcceleratorTarget.from_device(
-        torch.device("cuda")
-    ).is_cuda_capability(12, 0)
-
-
-@pytest.mark.parametrize(
-    ("target", "expected"),
-    [
-        (AcceleratorTarget("hip", "gfx1201"), False),
-        (AcceleratorTarget("cuda", "sm120"), True),
-        (AcceleratorTarget("cuda", "sm89"), False),
-    ],
-)
-def test_sm120_availability_checks_backend_not_just_capability(monkeypatch, target, expected):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    assert _exact_sm120_available() is expected
-
-
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("activation_fn", [None, "swiglu"])
 def test_fused_preparation_keeps_rotation_beyond_fp16_range(activation_fn):
     signs = build_hadamard(256, torch.device("cuda"))[0].sign().to(torch.float16)[None, :]
@@ -643,7 +623,7 @@ def test_fused_preparation_keeps_rotation_beyond_fp16_range(activation_fn):
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="exact SM120 is not available")
+@pytest.mark.skipif(not exact_sm120_available(), reason="exact SM120 is not available")
 @pytest.mark.parametrize(
     ("rows", "out_features", "in_features", "group_size", "dtype"),
     [
@@ -723,7 +703,7 @@ def test_sm120_large_matmul_matches_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("rows", "k", "n"),
     [

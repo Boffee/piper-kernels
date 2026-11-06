@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -46,7 +47,6 @@ from .._nvfp4_sparse_piper_graphs import (
     build_quantized_attention_output_graph,
     run_convrot_passes,
 )
-from ._helpers import exact_sm120_available
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 

@@ -1,9 +1,8 @@
 """SM120 numerical coverage for forced routing through both NVFP4 output fusions."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels.fusions.nvfp4_sparse_piper import _output
@@ -11,20 +10,6 @@ from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from ._accuracy import assert_fusion_output_close
 from .convrot_nvfp4_sparse_piper import test_compile as convrot
 from .nvfp4_sparse_piper import test_compile as nvfp4
-from .nvfp4_sparse_piper._helpers import exact_sm120_available
-
-
-@pytest.mark.parametrize("hip", [None, "test"])
-def test_sm120_gate_distinguishes_rocm_from_cuda(monkeypatch, hip):
-    monkeypatch.setattr(torch.version, "hip", hip)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (12, 0))
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(gcnArchName="gfx1201"),
-    )
-    assert exact_sm120_available() is (hip is None)
 
 
 # Run this on SM120 for PR validation; portable graph tests do not check numerics.

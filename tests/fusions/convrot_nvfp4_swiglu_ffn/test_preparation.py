@@ -2,13 +2,14 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import _preparation
 from piper_kernels.linear.convrot.nvfp4 import _ops
 
 _GPU = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 
