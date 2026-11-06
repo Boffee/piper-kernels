@@ -74,10 +74,9 @@ Causal execution and other targets use balanced windows; sparse uses fixed
 windows. The internal output operator's `query_chunk_rows` overrides the cap.
 Scheduling does not dispatch on model identity or benchmark sequence ranges.
 
-Output, prepared input, and K/V remain full-sized, except that [head groups](#head-groups)
-hold one group's K/V at a time. Only Q and output-preparation scratch are
-window-bounded; K preparation still requires a global BF16 temporary and compact FP32
-statistics, per group when grouped. Output fusion has no automatic profitability guard.
+Output, prepared input, and K/V remain full-sized. Only Q and output-preparation
+scratch are window-bounded; K preparation still requires a global BF16 temporary
+and compact FP32 statistics. Output fusion has no automatic profitability guard.
 Reduced scratch does not guarantee lower peak allocation or faster execution.
 Measure the complete pipeline, including output storage and workspace, with the
 [dense fusion benchmark](../../../../benchmarks/README.md#run-the-suite).
@@ -97,28 +96,7 @@ uses its separate window buffers (two when several windows overlap projection),
 and projection writes into a bounded scratch window before its gated add. The
 add runs in FP32 and rounds `base` once per window row.
 
-## Head groups
-
-With `attention_head_groups` above 1, the residual rewrite replaces a dense
-residual add whose K and V producers feed only it with
-`convrot_int8_piper_head_grouped_attention_residual_add_`. That operator takes the
-producers' inputs and, per group, projects the group's K and V rows, runs the
-residual add on the group's Q rows and output-projection columns, and frees K and V
-before the next group. Only one group's K, V, and K BF16 temporary exist at a time;
-the prepared input stays shared. One operator keeps that order, since separate
-per-group nodes would let Inductor schedule every group's K and V first.
-
-Groups split query and K/V heads evenly, so GQA keeps its ratio. Each group's
-features must be a multiple of the output projection's ConvRot group size, because
-the projector rotates each group's slice on its own. The output GEMM needs each
-group's columns contiguous, so it copies them per call. `bias` is added with the
-first group.
-
-A group's query windows may hold `head_groups` times the ungrouped row cap, so each
-attention launch keeps the ungrouped rows times heads and its Q and attention-output
-buffers keep their size. Otherwise groups would make proportionally more, narrower
-launches, each paying per-launch costs and adding a projection tail that attention
-doesn't hide. The output-projection scratch spans every output feature, so it grows
-with the rows. Per-token output-activation scales cover one group's features, and
-`base` rounds once per group, so results differ from one group by INT8 activation
-rounding. One group matches the separate producers and residual add exactly.
+The rewrite also runs this add in two head groups when its K and V feed nothing else,
+calling `convrot_int8_piper_project_key`, `convrot_int8_piper_project_value`, and the add
+once per group on head-sliced weights; see
+[`residual_updates/_head_groups.py`](../residual_updates/_head_groups.py).

@@ -7,8 +7,6 @@ from collections.abc import Mapping
 
 def residual_updates_compile_options(
     options: Mapping[str, object] | None = None,
-    *,
-    attention_head_groups: int = 1,
 ) -> dict[str, object]:
     """Make compiled blocks add their residual updates into an input they overwrite.
 
@@ -26,20 +24,18 @@ def residual_updates_compile_options(
     its dtype. The returned options also set ``allow_buffer_reuse`` to ``False``. See
     docs/attention.md#update-a-residual-stream-in-place for an example.
 
-    With ``attention_head_groups`` above 1, a dense fused attention whose K and V feed
-    only it runs that many head groups in turn, each projecting and freeing its own K and
-    V, so only one group's K and V are ever allocated. The split must divide the query
-    and K/V heads and give each group a multiple of the output projection's ConvRot
-    group size; an attention it doesn't fit stays ungrouped with a logged warning.
-    Grouping changes outputs slightly: each group's output-projection input gets its own
-    per-token scales, and the input rounds once per group. Calling this again on options
-    that already install the rewrite replaces its earlier settings.
+    A fused dense attention whose K and V feed only it also runs in two head groups,
+    one after another, so only one group's K and V are allocated. That applies when its
+    query and K/V heads split evenly in two and each half of the output projection's
+    input is a multiple of its ConvRot group size. Each group quantizes its own
+    output-projection input per token and the input rounds once per group, so results
+    differ slightly from one group.
     """
     from ._compile import (  # noqa: PLC0415 - keep compiler integration lazy
         residual_updates_compile_options as compile_options,
     )
 
-    return compile_options(options, attention_head_groups=attention_head_groups)
+    return compile_options(options)
 
 
 __all__ = ["residual_updates_compile_options"]

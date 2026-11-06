@@ -264,18 +264,11 @@ attention. See the
 [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
 for numerical and storage details.
 
-Fused dense attention still holds the whole sequence's K and V while it runs. To bound
-that too, split its heads into groups that run one after another, so only one group's K
-and V exist at a time:
-
-```python
-options = residual_updates_compile_options(options, attention_head_groups=2)
-```
-
-Calling the helper again replaces its earlier settings. Its docstring says which
-attention can be grouped and how results change; the
-[fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#head-groups)
-covers the storage and window details.
+Fused dense attention also runs in two head groups, one after another, so only half its
+K and V exist at a time. That applies when its K and V feed nothing else and its heads
+split evenly into halves aligned with the output projection's ConvRot groups; otherwise
+it runs as one group. Grouping keeps attention's speed but changes results slightly,
+because each group quantizes its own share of the output projection's input.
 
 For installation and next steps, return to the [README](../README.md). See
 [weights](weights.md) for constructing projection weights and

@@ -1,9 +1,12 @@
 """A copy-back residual block updates its input in place after attention and FFN fusion."""
 
+import re
+
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
+from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
@@ -13,6 +16,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
+from piper_kernels.fusions.residual_updates import _head_groups as head_groups
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 from piper_kernels.linear.convrot.int8 import _ops
 
@@ -35,9 +39,6 @@ _SPARSE_ATTENTION_RESIDUAL_ADD = (
 _FFN_UPDATES = _kernels.convrot_int8_swiglu_ffn_gated_updates_.default
 _FFN_RESIDUAL_ADD = _kernels.convrot_int8_swiglu_ffn_residual_add_.default
 _RESIDUAL_ADD = _kernels.residual_add_.default
-_HEAD_GROUPED_ATTENTION_ADD = (
-    _kernels.convrot_int8_piper_head_grouped_attention_residual_add_.default
-)
 _DENSE_KEY = _kernels.convrot_int8_piper_project_key.default
 _DENSE_VALUE = _kernels.convrot_int8_piper_project_value.default
 
@@ -178,13 +179,11 @@ class _SparseResidualBlock(torch.nn.Module):
         return residual + ffn_gate[gate_indices] * self.ffn(ffn_input)
 
 
-def _options(capture, *, fuse_output=True, attention_head_groups=1):
+def _options(capture, *, fuse_output=True):
     options = convrot_int8_piper_compile_options(
         convrot_int8_swiglu_ffn_compile_options(), fuse_output=fuse_output
     )
-    return capture.wrap_options(
-        residual_updates_compile_options(options, attention_head_groups=attention_head_groups)
-    )
+    return capture.wrap_options(residual_updates_compile_options(options))
 
 
 def _inputs(model, sequence):
@@ -228,7 +227,10 @@ def test_copy_back_block_updates_its_input_in_place():
     compiled = _compile_copy_back(model, _options(capture))
     _assert_updates_input_in_place(model, compiled)
 
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    # Two head groups, each projecting its own K and V before adding its attention.
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
+    assert capture.targets.count(_DENSE_KEY) == 2
+    assert capture.targets.count(_DENSE_VALUE) == 2
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _ATTENTION_OUTPUT not in capture.targets
     assert _FFN_UPDATES not in capture.targets
@@ -307,7 +309,7 @@ def test_input_read_after_an_update_is_copied_instead_of_overwritten():
     assert _relative_l2(hidden, expected) < 0.03
     # Inductor copies the input before the attention add, then adds into that copy.
     assert ReinplaceCounters.get_total_missed() == 1
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
 
 
@@ -337,10 +339,7 @@ def test_compile_options_append_the_rewrite_and_disable_buffer_reuse():
     assert isinstance(passes, tuple)
     assert passes[:-1] == options["post_grad_custom_pre_pass"]
     assert combined["allow_buffer_reuse"] is False
-    # Applying the rewrite again keeps one copy of it, in place.
-    again = residual_updates_compile_options(combined)["post_grad_custom_pre_pass"]
-    assert again[:-1] == passes[:-1]
-    assert again[-1].uuid() == passes[-1].uuid()
+    assert residual_updates_compile_options(options)["post_grad_custom_pre_pass"][-1] is passes[-1]
 
 
 def test_ffn_residual_adds_take_the_two_update_arguments_without_the_reusable_update():
@@ -371,74 +370,52 @@ def test_attention_residual_adds_take_the_add_then_the_output_arguments():
         ]
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_head_grouped_attention_projects_each_groups_context_inside_its_add():
-    # Two groups of two query heads and one K/V head each.
-    model = _ResidualBlock()
-    capture = _FunctionalCapture()
-    compiled = _compile_copy_back(model, _options(capture, attention_head_groups=2))
-    _assert_updates_input_in_place(model, compiled)
-
-    assert capture.targets.count(_HEAD_GROUPED_ATTENTION_ADD) == 1
-    assert _ATTENTION_RESIDUAL_ADD not in capture.targets
-    # The grouped add projects K and V itself, so no sequence-wide K or V remains.
-    assert _DENSE_KEY not in capture.targets
-    assert _DENSE_VALUE not in capture.targets
-    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+class _MultiQueryResidualBlock(_ResidualBlock):
+    kv_heads = 1
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_head_groups_apply_to_options_that_already_install_the_rewrite():
+def test_each_head_group_projects_its_context_after_the_previous_group_adds():
     model = _ResidualBlock()
-    capture = _FunctionalCapture()
-    options = residual_updates_compile_options(
-        convrot_int8_piper_compile_options(
-            convrot_int8_swiglu_ffn_compile_options(), fuse_output=True
-        )
+    compiled = _compile_copy_back(model, _options(_FunctionalCapture()))
+    with torch.no_grad():
+        _, (code, *_) = run_and_get_code(compiled, *_inputs(model, 300))
+
+    calls = re.findall(
+        r"torch\.ops\.piper_kernels\.convrot_int8_piper_"
+        r"(project_key|project_value|projected_query_attention_residual_add_)\.default\(",
+        code,
     )
-    options = residual_updates_compile_options(options, attention_head_groups=2)
-    compiled = _compile_copy_back(model, capture.wrap_options(options))
-    _assert_updates_input_in_place(model, compiled)
-
-    assert capture.targets.count(_HEAD_GROUPED_ATTENTION_ADD) == 1
+    # Inductor frees the first group's K and V before the second group allocates its own.
+    first_add = calls.index("projected_query_attention_residual_add_")
+    assert sorted(calls[:first_add]) == ["project_key", "project_value"]
+    assert sorted(calls[first_add + 1 :]) == [
+        "project_key",
+        "project_value",
+        "projected_query_attention_residual_add_",
+    ]
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_head_groups_that_do_not_divide_the_heads_leave_attention_ungrouped(caplog):
-    model = _ResidualBlock()
+def test_attention_whose_heads_do_not_split_evenly_stays_one_group():
+    model = _MultiQueryResidualBlock()
     capture = _FunctionalCapture()
-    compiled = _compile_copy_back(model, _options(capture, attention_head_groups=3))
-    with caplog.at_level("WARNING", logger=residual_compile.__name__):
-        _assert_updates_input_in_place(model, compiled)
+    compiled = _compile_copy_back(model, _options(capture))
+    _assert_updates_input_in_place(model, compiled)
 
-    assert "attention keeps one group" in caplog.text
     assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
-    assert _HEAD_GROUPED_ATTENTION_ADD not in capture.targets
+    assert capture.targets.count(_DENSE_KEY) == 1
 
 
-def test_a_later_head_group_setting_replaces_the_earlier_rewrite_in_place():
-    options = convrot_int8_piper_compile_options(fuse_output=True)
-    ungrouped = residual_updates_compile_options(options)
-    grouped = residual_updates_compile_options(ungrouped, attention_head_groups=2)
+@pytest.mark.parametrize(("attention_add", "split"), list(head_groups.HEAD_SPLITS.items()))
+def test_head_splits_name_arguments_their_operators_take(attention_add, split):
+    def names(operator):
+        return {argument.name for argument in operator._schema.arguments}
 
-    passes = grouped["post_grad_custom_pre_pass"]
-    assert passes[:-1] == options["post_grad_custom_pre_pass"]
-    expected = residual_updates_compile_options(attention_head_groups=2)
-    assert passes[-1].uuid() == expected["post_grad_custom_pre_pass"][-1].uuid()
-    assert passes[-1].uuid() != ungrouped["post_grad_custom_pre_pass"][-1].uuid()
-
-
-@pytest.mark.parametrize(
-    ("attention_head_groups", "error", "message"),
-    [
-        (0, ValueError, "must be positive"),
-        (True, TypeError, "integer"),
-        (2.0, TypeError, "integer"),
-    ],
-)
-def test_head_group_counts_must_be_positive_integers(attention_head_groups, error, message):
-    with pytest.raises(error, match=message):
-        residual_updates_compile_options(attention_head_groups=attention_head_groups)
+    assert {*split.rows, split.columns, *split.once, split.alignment} <= names(attention_add)
+    for producer, outputs in split.producers:
+        assert set(split.producer_rows) <= names(producer)
+        assert set(outputs) <= names(attention_add)
+        assert len(outputs) == len(producer._schema.returns)

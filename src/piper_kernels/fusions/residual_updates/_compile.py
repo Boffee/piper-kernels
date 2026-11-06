@@ -30,17 +30,13 @@ Each FFN two-update operator and each attention output operator registers its
 residual-add counterpart. Unmatched graphs are unchanged; debug logging reports what
 was rewritten, and Inductor's reinplacing log reports any input it had to copy.
 
-With attention head groups, an attention residual add that registers a head-group fold,
-and whose K and V producers feed only it, becomes the fold's grouped add, which takes
-the producers' inputs and projects each group's K and V itself. One operator keeps the
-groups in order: separate per-group nodes would let Inductor schedule every group's K
-and V before the first attention. Dense Piper registers a fold; sparse doesn't yet.
+An attention residual add that splits by head runs in two head groups; see
+``_head_groups``.
 """
 
 from __future__ import annotations
 
 import logging
-import operator
 from collections.abc import Mapping
 from typing import cast
 
@@ -48,13 +44,12 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass, get_hash_for_files
 from torch.fx.node import Argument
 
-from piper_kernels.fusions.convrot_int8_piper import _head_groups as dense_head_groups
 from piper_kernels.fusions.convrot_int8_piper import output as dense_attention
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_attention
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as convrot_int8_swiglu_ffn
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _graph, _ops, triton
+from . import _graph, _head_groups, _ops, triton
 from ._graph import bind_arguments, call_functional
 
 _log = logging.getLogger(__name__)
@@ -90,15 +85,6 @@ _ATTENTION_RESIDUAL_ADDS: dict[object, torch._ops.OpOverload] = {
 }
 _REUSABLE_UPDATE_ARGUMENTS = ("reusable_update", "update_gate")
 
-# Attention residual adds that can run in head groups. Each fold names the K and V
-# producers it absorbs and maps their arguments onto its grouped add, so only one group's
-# K and V are ever allocated.
-_ATTENTION_HEAD_GROUP_FOLDS: dict[object, dense_head_groups.HeadGroupFold] = {
-    _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default: (
-        dense_head_groups.HEAD_GROUP_FOLD
-    ),
-}
-
 
 def _source_files() -> tuple[str, ...]:
     """Invalidate cached rewrites when matched or emitted operator contracts change."""
@@ -111,72 +97,18 @@ def _source_files() -> tuple[str, ...]:
             _ops.__file__,
             convrot_int8_swiglu_ffn.__file__,
             dense_attention.__file__,
-            dense_head_groups.__file__,
             sparse_attention.__file__,
             preparation_sharing.__file__,
+            *_head_groups.SOURCE_FILES,
         )
         if path is not None
     )
-
-
-def _exclusive_producer(
-    operands: Mapping[str, Argument],
-    names: tuple[str, ...],
-    target: torch._ops.OpOverload,
-    consumer: torch.fx.Node,
-) -> torch.fx.Node | None:
-    """Return the ``target`` node whose outputs ``names`` are, if only ``consumer`` reads it."""
-    producers = set()
-    for index, name in enumerate(names):
-        item = operands[name]
-        if (
-            not isinstance(item, torch.fx.Node)
-            or item.target is not operator.getitem
-            or item.args[1] != index
-        ):
-            return None
-        producers.add(item.args[0])
-    if len(producers) != 1:
-        return None
-    (producer,) = producers
-    if not isinstance(producer, torch.fx.Node) or producer.target is not target:
-        return None
-    if any(set(item.users) != {consumer} for item in producer.users):
-        return None
-    return producer
-
-
-def _fold_head_groups(
-    update: torch.fx.Node,
-    attention_add: torch._ops.OpOverload,
-    operands: dict[str, Argument],
-    head_groups: int,
-) -> tuple[torch._ops.OpOverload, dict[str, Argument]] | None:
-    """Return the grouped add and its arguments for ``attention_add``, if it can group."""
-    fold = _ATTENTION_HEAD_GROUP_FOLDS.get(attention_add)
-    if fold is None:
-        return None
-    key = _exclusive_producer(operands, fold.key_outputs, fold.key_producer, update)
-    value = _exclusive_producer(operands, fold.value_outputs, fold.value_producer, update)
-    if key is None or value is None:
-        _log.debug("%s: K or V has other consumers; attention keeps one group", update.name)
-        return None
-    try:
-        arguments = fold.build_arguments(
-            operands, bind_arguments(key), bind_arguments(value), head_groups
-        )
-    except ValueError as error:
-        # The requested split doesn't fit this attention; it still compiles ungrouped.
-        _log.warning("%s: %s; attention keeps one group", update.name, error)
-        return None
-    return fold.grouped_add, arguments
 
 
 def _rewrite_ffn_updates(
     graph: torch.fx.Graph,
     ffn: torch.fx.Node,
     residual_add: torch._ops.OpOverload,
-    attention_head_groups: int,
 ) -> bool:
     values = bind_arguments(ffn)
     # Tensor operands of the two-update operator are graph nodes.
@@ -214,13 +146,9 @@ def _rewrite_ffn_updates(
                 for name, value in bind_arguments(update).items()
                 if name != "output_dtype"
             }
-            if attention_head_groups > 1:
-                grouped = _fold_head_groups(update, attention_add, operands, attention_head_groups)
-            if grouped is None:
-                added = call_functional(graph, attention_add, {**update_add, **operands})
-            else:
-                grouped_add, arguments = grouped
-                added = call_functional(graph, grouped_add, {**update_add, **arguments})
+            add_values = {**update_add, **operands}
+            grouped = _head_groups.add_in_head_groups(graph, attention_add, update, add_values)
+            added = grouped or call_functional(graph, attention_add, add_values)
     residual.replace_all_uses_with(added)
     ffn_add = {
         name: value for name, value in values.items() if name not in _REUSABLE_UPDATE_ARGUMENTS
@@ -231,19 +159,15 @@ def _rewrite_ffn_updates(
     graph.erase_node(ffn)
     if attention_add is None:
         placement = "stays materialized before its add"
-    elif grouped is not None:
-        placement = f"is computed inside its add in {attention_head_groups} head groups"
-    else:
+    elif grouped is None:
         placement = "is computed inside its add"
+    else:
+        placement = f"is computed inside its add in {_head_groups.HEAD_GROUPS} head groups"
     _log.debug("%s: %s %s, and the FFN adds into %s", ffn.name, update.target, placement, base.name)
     return True
 
 
 class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
-    def __init__(self, attention_head_groups: int) -> None:
-        super().__init__()
-        self._attention_head_groups = attention_head_groups
-
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
@@ -251,26 +175,21 @@ class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
         for node in list(graph.nodes):
             residual_add = _FFN_RESIDUAL_ADDS.get(node.target)
             if residual_add is not None:
-                changed = (
-                    _rewrite_ffn_updates(graph, node, residual_add, self._attention_head_groups)
-                    or changed
-                )
+                changed = _rewrite_ffn_updates(graph, node, residual_add) or changed
         if changed:
             # Drop the replaced residual sums and any attention output computed in its add.
             graph.eliminate_dead_code()
             graph.lint()
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(
-            _source_files(),
-            extra=f"{_COMPILE_PASS_VERSION}:head-groups={self._attention_head_groups}",
-        )
+        return get_hash_for_files(_source_files(), extra=_COMPILE_PASS_VERSION)
+
+
+_compile_pass = _ResidualUpdatePass()
 
 
 def residual_updates_compile_options(
     options: Mapping[str, object] | None = None,
-    *,
-    attention_head_groups: int = 1,
 ) -> dict[str, object]:
     """Install the in-place residual rewrite after existing attention and FFN passes.
 
@@ -278,17 +197,7 @@ def residual_updates_compile_options(
     Inductor's planner would otherwise keep a dead full-size buffer allocated across
     the in-place attention to reuse it afterward.
     """
-    if not isinstance(attention_head_groups, int) or isinstance(attention_head_groups, bool):
-        raise TypeError("attention_head_groups must be an integer")
-    if attention_head_groups < 1:
-        raise ValueError("attention_head_groups must be positive")
-    # Passes combine by identity; the earlier rewrite would otherwise run first and leave
-    # nothing for this one to group.
-    combined = preparation_sharing.add_ordered_post_grad_passes(
-        options,
-        (_ResidualUpdatePass(attention_head_groups),),
-        replaces=lambda compiler_pass: isinstance(compiler_pass, _ResidualUpdatePass),
-    )
+    combined = preparation_sharing.add_ordered_post_grad_passes(options, (_compile_pass,))
     combined["allow_buffer_reuse"] = False
     return combined
 

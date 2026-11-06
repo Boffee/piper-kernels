@@ -5,18 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- `residual_updates_compile_options(attention_head_groups=n)` runs a fused dense ConvRot
-  INT8 Piper attention's residual add in `n` head groups, one after another, so only one
-  group's K and V are allocated. With 104k tokens and 56 heads, two groups cut the
-  attention's peak extra memory from 2.13 to 1.18 GiB at the same speed. Calling the
-  helper again replaces its earlier settings. The count must divide the attention's
-  query and K/V heads and give each group a multiple of the output projection's ConvRot
-  group size; attention it doesn't fit, sparse attention, and attention whose K or V has
-  other consumers stay ungrouped. Results differ slightly from one group, because each
-  group quantizes its own output-projection input and the residual rounds once per
-  group.
+- The in-place residual rewrite from `residual_updates_compile_options()` runs a fused
+  dense ConvRot INT8 Piper attention in two head groups, one after another, when its K
+  and V feed nothing else and its heads split evenly into halves aligned with the output
+  projection's ConvRot groups. Only half the attention's K and V then exist at a time:
+  with 104k tokens and 56 heads, its peak extra memory falls from 2.13 to 1.18 GiB at
+  the same speed. Results differ slightly, because each group quantizes its own share of
+  the output projection's input and the residual rounds once per group.
 
 ## [0.8.0rc2] - 2026-11-05
 
