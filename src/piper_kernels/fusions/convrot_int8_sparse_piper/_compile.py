@@ -629,13 +629,12 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     once=("bias",),
     alignment="group_size",
     # A materialized coarse gate holds heads along its third dimension.
-    unsliced=("coarse_gate",),
-    # Full-size launches would also keep Q, attention windows, and routing scores
-    # whole: on RX 9070 XT they saved 0.2-0.5% of attention time for 0.2-0.3 GiB more
-    # peak memory with 104k tokens and 56 heads.
-    window_rows=None,
+    unsliceable=("coarse_gate",),
+    # Sparse windows also hold Q, attention, and routing-score buffers that grow with
+    # rows times heads, so full-size launches would keep those whole for little speed.
+    widened_window_rows=None,
     # Keep budgets round across every head, so each slice takes its heads' share.
-    position=("head_slice_index", "num_head_slices"),
+    slice_position=("head_slice_index", "num_head_slices"),
 )
 
 

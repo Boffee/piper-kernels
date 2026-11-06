@@ -37,5 +37,5 @@ def test_residual_add_takes_the_add_then_the_output_arguments(name):
         "gate_indices",
         "python_indexing",
         *output_names,
-        *(slicing.position or ()),
+        *(slicing.slice_position or ()),
     ]

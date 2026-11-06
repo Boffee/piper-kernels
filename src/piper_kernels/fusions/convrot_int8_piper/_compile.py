@@ -544,11 +544,11 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     columns="weight_qdata",
     once=("bias",),
     alignment="group_size",
-    unsliced=(),
-    # Half-head launches slowed dense attention by 1.4% on RX 9070 XT; full-size ones
-    # cost 0.2% and only a larger output-projection scratch window.
-    window_rows="query_chunk_rows",
-    position=None,
+    unsliceable=(),
+    # Dense launches lose efficiency at half the heads; keeping their size costs only a
+    # larger output-projection scratch window.
+    widened_window_rows="query_chunk_rows",
+    slice_position=None,
 )
 
 

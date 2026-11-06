@@ -25,8 +25,7 @@ from torch.fx.node import Argument
 
 from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
 
-# Two slices halve K and V for at most 1.4% of attention time in measurements; past
-# that, other buffers dominate.
+# Two slices halve K and V; more would save less, since other buffers then dominate.
 NUM_HEAD_SLICES = 2
 
 type Producer = Mapping[torch._ops.OpOverload, tuple[str, ...]]
@@ -38,35 +37,46 @@ each supplies, in output order."""
 class HeadSlicing:
     """Which arguments of an attention residual add, and of its producers, split by head.
 
-    Each of ``producers`` supplies some of the add's K and V arguments; its operators'
-    ``producer_rows`` arguments hold one block of rows per head. In the add, ``rows``
-    hold one block of rows per query head, ``columns`` names the output projection's
-    weight, whose input columns follow the query heads, and ``once`` is added by the
-    first slice only. ``rows`` and ``producer_rows`` start with the query and K or V
-    weights, which set the head counts. Each slice's columns must be a multiple of the add's
-    ``alignment`` argument, such as a ConvRot group size. An add given any of
-    ``unsliced``, which hold heads in some other layout, runs as one slice.
-
-    ``window_rows`` names the add's query-window row cap, which each slice multiplies
-    by ``NUM_HEAD_SLICES`` so its attention launches keep their unsliced rows times
-    heads. With None, each slice keeps the cap, so its launches and their window
-    buffers cover half as many heads. ``position`` names the add's arguments for a
-    slice's index and the number of slices, for an add that resolves some state
-    across every head, such as sparse Piper's keep budgets.
-
-    Each slice adds into the previous slice's ``base``. The add or one of its producers
-    must take ``head_dim``.
+    Fields name arguments by their schema names. Besides these, the add must take
+    ``base``, which each slice adds into after the previous one, and the add or one of
+    its producers must take ``head_dim``.
     """
 
     producers: tuple[Producer, ...]
+    """One entry per call that projects some of the add's K and V arguments, such as K's
+    and V's projections; the add runs as one slice unless each feeds only the add."""
+
     producer_rows: tuple[str, ...]
+    """Producer arguments with one block of rows per head; the first is the weight,
+    which sets the producer's head count."""
+
     rows: tuple[str, ...]
+    """Add arguments with one block of rows per query head, such as the query and coarse
+    gate projections; the first is the query weight, which sets the query head count."""
+
     columns: str
+    """The output projection's weight, whose input columns follow the query heads."""
+
     once: tuple[str, ...]
+    """Add arguments that only the first slice takes, such as the output bias."""
+
     alignment: str
-    unsliced: tuple[str, ...]
-    window_rows: str | None
-    position: tuple[str, str] | None
+    """The add argument that each slice's share of ``columns`` must be a multiple of,
+    such as a ConvRot group size."""
+
+    unsliceable: tuple[str, ...]
+    """Add arguments that hold heads in some other layout; an add given any runs as one
+    slice."""
+
+    widened_window_rows: str | None
+    """The add's query-window row cap, which each slice multiplies by
+    ``NUM_HEAD_SLICES`` so its attention launches keep their unsliced rows times heads.
+    With None, each slice keeps the cap, and its launches and window buffers cover half
+    as many heads."""
+
+    slice_position: tuple[str, str] | None
+    """The add's arguments for a slice's index and the number of slices, for an add that
+    resolves some state across every head, such as sparse Piper's keep budgets."""
 
 
 def _find_exclusive_producer(
@@ -160,10 +170,10 @@ def _head_dim(operands: Iterable[Mapping[str, Argument]]) -> int | None:
     return None
 
 
-def _scaled_window_rows(
+def _widened_window_rows(
     residual_add: torch._ops.OpOverload, values: Mapping[str, Argument], name: str | None
 ) -> dict[str, Argument]:
-    """Return each slice's query-window row cap, when the slicing scales argument ``name``."""
+    """Return each slice's query-window row cap, when the slicing widens argument ``name``."""
     if name is None:
         return {}
     rows = values.get(name)
@@ -187,10 +197,10 @@ def add_in_head_slices(
 
     ``values`` are the add's arguments by name, and ``update`` is the attention output it
     replaces, whose K and V operands must feed nothing else. Emits nothing and returns
-    None when K or V has other consumers, the add takes an ``unsliced`` argument, or the
+    None when K or V has other consumers, the add takes an ``unsliceable`` argument, or the
     heads don't split evenly into aligned slices.
     """
-    if any(values.get(name) is not None for name in slicing.unsliced):
+    if any(values.get(name) is not None for name in slicing.unsliceable):
         return None
     producers: list[tuple[torch._ops.OpOverload, dict[str, Argument], tuple[str, ...]]] = []
     for producer in slicing.producers:
@@ -213,13 +223,13 @@ def add_in_head_slices(
     if slice_columns % cast(int, values[slicing.alignment]):
         return None
 
-    window_rows = _scaled_window_rows(residual_add, values, slicing.window_rows)
+    widened_window_rows = _widened_window_rows(residual_add, values, slicing.widened_window_rows)
     base = cast(torch.fx.Node, values["base"])
     for slice_index in range(NUM_HEAD_SLICES):
         slice_values = {
             **values,
             "base": base,
-            **window_rows,
+            **widened_window_rows,
             **{
                 name: _slice_share(graph, values[name], slice_index, 0)
                 for name in slicing.rows
@@ -237,8 +247,8 @@ def add_in_head_slices(
         }
         if slice_index:
             slice_values.update(dict.fromkeys(slicing.once))
-        if slicing.position is not None:
-            index_name, count_name = slicing.position
+        if slicing.slice_position is not None:
+            index_name, count_name = slicing.slice_position
             slice_values.update({index_name: slice_index, count_name: NUM_HEAD_SLICES})
         for target, arguments, names in producers:
             sliced = {

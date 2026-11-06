@@ -34,9 +34,9 @@ def test_head_slicing_names_arguments_its_operators_take(name):
         slicing.columns,
         *slicing.once,
         slicing.alignment,
-        *slicing.unsliced,
-        *([] if slicing.window_rows is None else [slicing.window_rows]),
-        *(slicing.position or ()),
+        *slicing.unsliceable,
+        *([] if slicing.widened_window_rows is None else [slicing.widened_window_rows]),
+        *(slicing.slice_position or ()),
     } <= add
     producers = [item for producer in slicing.producers for item in producer.items()]
     # HeadSlicing reads head_dim from the add or a producer.

@@ -21,6 +21,7 @@ from piper_kernels.fusions.residual_updates import residual_updates_compile_opti
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 from ._helpers import output_available
+from .test_attention import _HEAD_DIM, _INPUT_FEATURES, _operands
 from .test_compile import (
     _CoarseSparseProjectionAttentionOutput,
     _ProjectedGateCoarseSparseAttentionOutput,
@@ -34,9 +35,8 @@ _VALUE = _kernels.convrot_int8_sparse_piper_project_value.default
 _VALUE_WITH_BLOCK_MEANS = _kernels.convrot_int8_sparse_piper_project_value_with_block_means.default
 
 _HEADS = 4
-_HEAD_DIM = 128
 _SEQUENCE = 512
-_WIDTH = 256
+_WIDTH = _INPUT_FEATURES
 _KEY_BLOCKS = 8
 # Rounding gives all four heads (3, 3, 2, 2) blocks, but the last two alone (3, 2), so
 # each slice must take its heads' share of the whole budget.
@@ -199,47 +199,34 @@ def test_each_head_slice_projects_its_context_after_the_previous_slice_adds():
 @pytest.mark.gpu
 @pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 def test_head_slices_add_what_one_add_does():
-    torch.manual_seed(1402)
+    operands = _operands(sequence_length=_SEQUENCE, heads=_HEADS)
     features = _HEADS * _HEAD_DIM
-
-    def int8(*shape: int) -> torch.Tensor:
-        return torch.randint(-127, 128, shape, device="cuda", dtype=torch.int8)
-
-    def scale(rows: int) -> torch.Tensor:
-        return torch.rand((rows, 1), device="cuda").mul_(0.01).add_(0.001)
-
-    input_qdata = int8(1, _SEQUENCE, _WIDTH)
-    input_scale = torch.rand((1, _SEQUENCE), device="cuda").mul_(0.01).add_(0.001)
-    weights = {name: (int8(features, _WIDTH), scale(features)) for name in ("q", "k", "v")}
-    norm = torch.rand(_HEAD_DIM, device="cuda").add_(0.5).bfloat16()
-    angles = torch.rand((_SEQUENCE, 96), device="cuda") * (2 * torch.pi)
-    cos, sin = angles.cos().contiguous(), angles.sin().contiguous()
-    output_weight, output_scale = int8(_WIDTH, features), scale(_WIDTH)
+    output_weight = torch.randint(-127, 128, (_WIDTH, features), device="cuda", dtype=torch.int8)
+    output_scale = torch.rand((_WIDTH, 1), device="cuda").mul_(0.01).add_(0.001)
     gate = torch.ones((1, _WIDTH), device="cuda", dtype=torch.bfloat16)
     gate_indices = torch.zeros(_SEQUENCE, device="cuda", dtype=torch.int64)
-    input_mean = int8_ops.dequantized_input_mean(input_qdata, input_scale)
-    value_format = int(require_attention_backend(input_qdata).value_format)
+    input_mean = int8_ops.dequantized_input_mean(operands.input_qdata, operands.input_scale)
+    value_format = int(require_attention_backend(operands.input_qdata).value_format)
     attention = SparsePiperAttention(_RATIOS)
 
     def add(base: torch.Tensor, rows: slice, **position: int) -> None:
+        shared = (operands.cos, operands.sin, 1e-5)
         context = (
             *key._project_key_op(
-                input_qdata,
-                input_scale,
-                weights["k"][0][rows],
-                weights["k"][1][rows],
-                norm,
-                cos,
-                sin,
-                1e-5,
+                operands.input_qdata,
+                operands.input_scale,
+                operands.key_weight[rows],
+                operands.key_weight_scale[rows],
+                operands.key_norm,
+                *shared,
                 attention._routing_mode,
             ),
             *value._project_value_op(
-                input_qdata,
-                input_scale,
+                operands.input_qdata,
+                operands.input_scale,
                 input_mean,
-                weights["v"][0][rows],
-                weights["v"][1][rows],
+                operands.value_weight[rows],
+                operands.value_weight_scale[rows],
                 value_format=value_format,
             ),
         )
@@ -248,14 +235,12 @@ def test_head_slices_add_what_one_add_does():
             gate,
             gate_indices,
             True,
-            input_qdata,
-            input_scale,
-            weights["q"][0][rows],
-            weights["q"][1][rows],
-            norm,
-            cos,
-            sin,
-            1e-5,
+            operands.input_qdata,
+            operands.input_scale,
+            operands.query_weight[rows],
+            operands.query_weight_scale[rows],
+            operands.query_norm,
+            *shared,
             _HEAD_DIM**-0.5,
             *context,
             attention._ratio_profile,
