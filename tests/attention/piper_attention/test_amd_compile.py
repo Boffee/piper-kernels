@@ -28,7 +28,7 @@ def _compile_dense_kernel(
     llvm_fn_attrs=amd_gluon._LLVM_FN_ATTRS,
 ):
     constants = {
-        "heads_per_kv_head": 3,
+        "query_heads_per_kv_head": 3,
         "head_dim": head_dim,
         "is_causal": causal,
         "wide_query_offsets": wide,

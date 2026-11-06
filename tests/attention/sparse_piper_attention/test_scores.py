@@ -47,9 +47,9 @@ def summaries(generator):
 
 
 def _fp64_scores(query, primary, auxiliary, scale=None):
-    heads_per_kv_head = query.shape[1] // primary.shape[1]
-    primary = primary.repeat_interleave(heads_per_kv_head, dim=1)
-    auxiliary = auxiliary.repeat_interleave(heads_per_kv_head, dim=1)
+    query_heads_per_kv_head = query.shape[1] // primary.shape[1]
+    primary = primary.repeat_interleave(query_heads_per_kv_head, dim=1)
+    auxiliary = auxiliary.repeat_interleave(query_heads_per_kv_head, dim=1)
     left = query.double() @ primary.double().transpose(-1, -2)
     right = query.double() @ auxiliary.double().transpose(-1, -2)
     if scale is not None:

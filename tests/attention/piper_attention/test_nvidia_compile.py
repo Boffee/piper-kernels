@@ -50,7 +50,7 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         if name in _piper_attention_kernel.arg_names
     }
     constants.update(
-        heads_per_kv_head=3,
+        query_heads_per_kv_head=3,
         head_dim=head_dim,
         is_causal=causal,
         block_n=64,
@@ -101,7 +101,7 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(monkeypatch, head_dim, c
     )
     assert plan.attention_kernel == "gluon_async_copy"
     constants = {
-        "heads_per_kv_head": 3,
+        "query_heads_per_kv_head": 3,
         "head_dim": head_dim,
         "is_causal": causal,
         "block_q": plan.block_m,
