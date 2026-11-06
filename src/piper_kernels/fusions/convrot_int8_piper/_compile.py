@@ -18,6 +18,7 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from piper_kernels.attention.piper_attention import _quantized_dispatch
+from piper_kernels.fusions.attention import _head_groups as head_groups
 from piper_kernels.fusions.attention import _output as output_pipeline
 from piper_kernels.fusions.attention import _residual as attention_residual
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
@@ -523,18 +524,39 @@ class _CompilePass(CustomInferenceAwareGraphPass):
 compile_pass = _CompilePass()
 
 
+_kernels = torch.ops.piper_kernels
+# Which residual-add and K/V projection arguments hold rows per head, for head groups.
+_HEAD_SPLIT = head_groups.HeadSplit(
+    producers=(
+        (_kernels.convrot_int8_piper_project_key.default, ("key", "key_scale")),
+        (
+            _kernels.convrot_int8_piper_project_value.default,
+            ("value", "multiplier", "log_scale", "value_mean"),
+        ),
+    ),
+    producer_rows=("weight_qdata", "weight_scale", "bias"),
+    rows=("query_weight", "query_weight_scale", "query_bias"),
+    columns="weight_qdata",
+    once=("bias",),
+    alignment="group_size",
+)
+
+
 class _OutputCompilePass(CustomInferenceAwareGraphPass):
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if not is_inference:
             return
         with _compile_fx.canonical_linear_calls(graph):
             changed = _output_compile.fold_attention_output(graph)
-        ops = torch.ops.piper_kernels
+        if changed:
+            # Drop the replaced attention, so the fused output alone reads its K and V.
+            graph.eliminate_dead_code()
         changed = (
             attention_residual.fold_residual_adds(
                 graph,
-                ops.convrot_int8_piper_projected_query_attention_output.default,
-                ops.convrot_int8_piper_projected_query_attention_residual_add_.default,
+                _kernels.convrot_int8_piper_projected_query_attention_output.default,
+                _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default,
+                _HEAD_SPLIT,
             )
             or changed
         )

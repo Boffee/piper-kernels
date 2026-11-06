@@ -230,7 +230,8 @@ def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
     )
     _assert_updates_input_in_place(model, compiled)
 
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    # Dense attention adds in two head groups; see convrot_int8_piper/test_head_groups.py.
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _ATTENTION_OUTPUT not in capture.targets
     assert _FFN_UPDATES not in capture.targets
@@ -299,7 +300,7 @@ def test_every_gated_update_on_the_path_to_the_copy_adds_in_place():
 
     _assert_updates_input_in_place(model, compiled)
 
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
     assert capture.targets.count(_RESIDUAL_ADD) == 1
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
 
@@ -360,7 +361,7 @@ def test_input_read_after_an_update_is_copied_instead_of_overwritten():
     assert _relative_l2(hidden, expected) < 0.03
     # Inductor copies the input before the attention add, then adds into that copy.
     assert ReinplaceCounters.get_total_missed() == 1
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
 
 

@@ -126,9 +126,11 @@ def fold_residual_adds(
     how many adds it replaced.
     """
 
-    def arguments(operands: dict[str, Argument], add: dict[str, Argument]) -> dict[str, Argument]:
+    def compute(
+        graph: torch.fx.Graph, update: torch.fx.Node, add: dict[str, Argument]
+    ) -> torch.fx.Node:
         values = {
-            **operands,
+            **residual_graph.bind_arguments(update),
             "base": add["base"],
             "ffn_gate": add["gate"],
             "gate_indices": add["gate_indices"],
@@ -143,9 +145,9 @@ def fold_residual_adds(
             ]
             if all(value is not None for value in metadata):
                 values["chunk_rows"] = chunk_rows(*metadata, gated_updates=True)
-        return values
+        return residual_graph.call_functional(graph, residual_add, values)
 
-    return residual_graph.compute_inside_adds(graph, ffn, residual_add, arguments)
+    return residual_graph.compute_inside_adds(graph, ffn, compute)
 
 
 def uses_python_indexing(match: Match) -> bool:

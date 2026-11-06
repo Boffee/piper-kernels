@@ -7,25 +7,41 @@ from torch.fx.node import Argument
 
 from piper_kernels.fusions.residual_updates import _graph as residual_graph
 
-SOURCE_FILES = (__file__, residual_graph.__file__)
+from . import _head_groups as head_groups
 
-
-def _arguments(operands: dict[str, Argument], add: dict[str, Argument]) -> dict[str, Argument]:
-    # The add accepted the output as an update of ``base``'s dtype, so ``base`` supplies it.
-    return {**add, **{name: value for name, value in operands.items() if name != "output_dtype"}}
+SOURCE_FILES = (__file__, head_groups.__file__, residual_graph.__file__)
 
 
 def fold_residual_adds(
     graph: torch.fx.Graph,
     output: torch._ops.OpOverload,
     residual_add: torch._ops.OpOverload,
+    head_split: head_groups.HeadSplit | None = None,
 ) -> bool:
     """Compute each ``output`` call that only a residual add reads inside that add.
 
     ``residual_add`` takes the add's ``base``, ``gate``, ``gate_indices``, and
-    ``python_indexing``, then ``output``'s arguments by name without ``output_dtype``.
+    ``python_indexing``, then ``output``'s arguments by name without ``output_dtype``,
+    which is ``base``'s. With ``head_split``, an add whose K and V feed nothing else runs
+    in head groups; see ``_head_groups``.
     """
-    return residual_graph.compute_inside_adds(graph, output, residual_add, _arguments) > 0
+
+    def compute(
+        graph: torch.fx.Graph, update: torch.fx.Node, add: dict[str, Argument]
+    ) -> torch.fx.Node:
+        operands = residual_graph.bind_arguments(update)
+        values = {
+            **add,
+            **{name: value for name, value in operands.items() if name != "output_dtype"},
+        }
+        grouped = (
+            None
+            if head_split is None
+            else head_groups.add_in_head_groups(graph, residual_add, update, values, head_split)
+        )
+        return grouped or residual_graph.call_functional(graph, residual_add, values)
+
+    return residual_graph.compute_inside_adds(graph, output, compute) > 0
 
 
 __all__ = ["SOURCE_FILES", "fold_residual_adds"]

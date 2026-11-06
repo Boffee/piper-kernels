@@ -17,6 +17,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   already was. The rewrite now runs ahead of every other post-grad pass, so the
   helper can be applied before or after the fusion helpers. Blocks it rewrote
   before compute the same results.
+- A fused dense ConvRot INT8 Piper attention computed inside a residual add runs in two
+  head groups, one after another, when its K and V feed nothing else and its heads split
+  evenly into halves aligned with the output projection's ConvRot groups. Only half the
+  attention's K and V then exist at a time: with 104k tokens and 56 heads, its peak extra
+  memory falls from 2.13 to 1.18 GiB at the same speed. Results differ slightly, because
+  each group quantizes its own share of the output projection's input and the residual
+  rounds once per group.
 
 ## [0.8.0rc2] - 2026-11-05
 
