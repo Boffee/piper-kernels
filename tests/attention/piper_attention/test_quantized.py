@@ -142,7 +142,7 @@ def test_scale_contents_are_caller_preconditions(monkeypatch, scale_value):
         "batch",
         "head_dim",
         "unsupported_head_dim",
-        "head_groups",
+        "query_heads_per_kv_head",
         "empty_query_heads",
         "empty_kv_heads",
         "empty_keys",
@@ -201,7 +201,7 @@ def test_malformed_metadata_rejected_before_device_or_tensor_operations(  # noqa
             operands[3] = torch.empty_like(operands[2])
         elif invalid == "unsupported_head_dim":
             operands = _inputs(head_dim=32)
-        elif invalid == "head_groups":
+        elif invalid == "query_heads_per_kv_head":
             operands = _inputs(heads=5)
         elif invalid == "empty_query_heads":
             operands = _inputs(heads=0)

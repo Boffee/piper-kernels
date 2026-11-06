@@ -133,7 +133,7 @@ def _sparse_piper_attention_kernel(
     stride_gh,
     stride_gn,
     heads,
-    head_groups: gl.constexpr,
+    query_heads_per_kv_head: gl.constexpr,
     head_dim: gl.constexpr,
     mask_block_lengths: gl.constexpr,
     mask_ragged_tail: gl.constexpr,
@@ -158,7 +158,7 @@ def _sparse_piper_attention_kernel(
     head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
-    kv_batch_head = batch * (heads // head_groups) + head // head_groups
+    kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
     start_m = query_block * _GL_BLOCK_N
     output_start_m = local_query_block * _GL_BLOCK_N
     if skip_dense_routing:  # noqa: SIM108

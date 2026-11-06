@@ -106,7 +106,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
     stride_ob,
     stride_oh,
     stride_om,
-    head_groups: gl.constexpr,
+    query_heads_per_kv_head: gl.constexpr,
     head_dim: gl.constexpr,
     is_causal: gl.constexpr,
     wide_query_offsets: gl.constexpr,
@@ -115,7 +115,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
     head = gl.program_id(1).to(gl.int64)
     batch = gl.program_id(2).to(gl.int64)
     batch_head = batch * heads + head
-    kv_batch_head = batch * (heads // head_groups) + head // head_groups
+    kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
     query_block = gl.program_id(0)
     stored_query_block = query_start // 64 + query_block
     global_query_block = global_query_start // 64 + query_block

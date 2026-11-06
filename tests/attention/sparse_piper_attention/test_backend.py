@@ -177,14 +177,16 @@ def test_score_selection_is_independent_and_uses_operand_target(monkeypatch, tar
 
 
 @pytest.mark.parametrize("query_blocks", [65, 128, 384, 385])
-@pytest.mark.parametrize("head_groups", [1, 3])
-def test_score_selection_accepts_large_query_chunks(monkeypatch, query_blocks, head_groups):
+@pytest.mark.parametrize("query_heads_per_kv_head", [1, 3])
+def test_score_selection_accepts_large_query_chunks(
+    monkeypatch, query_blocks, query_heads_per_kv_head
+):
     score = Mock()
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
-    query = torch.empty(1, 2 * head_groups, query_blocks, 128)
+    query = torch.empty(1, 2 * query_heads_per_kv_head, query_blocks, 128)
     primary = torch.empty(1, 2, 17, 128)
     assert _backend.select_minmax_scores(query, primary, primary) is score
 

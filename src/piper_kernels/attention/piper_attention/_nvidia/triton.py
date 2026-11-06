@@ -419,7 +419,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     grouped_qk: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
     unmasked_key_tiles: tl.constexpr,
-    head_groups: tl.constexpr,
+    query_heads_per_kv_head: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -437,7 +437,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     """Evaluate one complete or masked query tile with the same FP32 recurrence."""
     batch = tl.program_id(2)
     batch_head = batch * heads + head
-    kv_batch_head = batch * (heads // head_groups) + head // head_groups
+    kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
     output_rows = query_block * block_m + tl.arange(0, block_m)
     offsets_m = query_start + output_rows
     global_rows = global_query_start + output_rows
@@ -696,7 +696,7 @@ def _piper_attention_kernel(
     aligned_queries: tl.constexpr,
     unmasked_key_tiles: tl.constexpr,
     heads,
-    head_groups: tl.constexpr,
+    query_heads_per_kv_head: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -762,7 +762,7 @@ def _piper_attention_kernel(
             grouped_qk,
             split_pv_head_dim,
             unmasked_key_tiles,
-            head_groups,
+            query_heads_per_kv_head,
             head_dim,
             block_m,
             block_n,
@@ -1166,7 +1166,7 @@ def _launch_piper_attention_into(
             aligned_queries=aligned_queries,
             unmasked_key_tiles=(not context.is_causal and context.key_length % _BLOCK_N == 0),
             heads=heads,
-            head_groups=heads // context.key_scale.shape[1],
+            query_heads_per_kv_head=heads // context.key_scale.shape[1],
             head_dim=head_dim,
             block_m=plan.block_m,
             block_n=_BLOCK_N,
