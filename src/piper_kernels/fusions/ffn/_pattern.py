@@ -7,6 +7,8 @@ from collections.abc import Callable
 import torch
 from torch._inductor.pattern_matcher import CallFunction, KeywordArg
 
+from piper_kernels.fusions.residual_updates import _gates as residual_gates
+
 type ProjectionPattern = Callable[[object, str, int | None], CallFunction]
 
 
@@ -14,36 +16,27 @@ def _indexed_gate_pattern(
     *,
     gate_name: str,
     indices_name: str,
-    use_aten_index: bool,
+    selection: torch._ops.OpOverload,
 ) -> CallFunction:
-    gate = KeywordArg(gate_name)
-    indices = KeywordArg(indices_name)
-    if use_aten_index:
-        return CallFunction(
-            torch.ops.aten.index.Tensor,
-            gate,
-            [indices],
-            _users=1,
-        )
-    return CallFunction(
-        torch.ops.aten.index_select.default,
-        gate,
-        0,
-        indices,
-        _users=1,
+    arguments = residual_gates.selection_arguments(
+        selection, KeywordArg(gate_name), KeywordArg(indices_name)
     )
+    return CallFunction(selection, *arguments, _users=1)
 
 
 def indexed_gated_updates_pattern(
     ffn_output: CallFunction,
     *,
-    use_aten_index: bool,
+    selection: torch._ops.OpOverload,
 ) -> CallFunction:
-    """Wrap an exclusive FFN pattern in two indexed gated updates."""
+    """Wrap an exclusive FFN pattern in two gated updates whose gates ``selection`` picks.
+
+    ``selection`` is one of ``residual_updates._gates.GATE_SELECTIONS``.
+    """
     update_gate = _indexed_gate_pattern(
         gate_name="update_gate",
         indices_name="gate_indices",
-        use_aten_index=use_aten_index,
+        selection=selection,
     )
     gated_update = CallFunction(
         torch.ops.aten.mul.Tensor,
@@ -60,7 +53,7 @@ def indexed_gated_updates_pattern(
     ffn_gate = _indexed_gate_pattern(
         gate_name="ffn_gate",
         indices_name="gate_indices",
-        use_aten_index=use_aten_index,
+        selection=selection,
     )
     gated_ffn = CallFunction(torch.ops.aten.mul.Tensor, ffn_gate, ffn_output, _users=1)
     return CallFunction(

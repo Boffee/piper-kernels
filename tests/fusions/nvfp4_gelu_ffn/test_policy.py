@@ -18,14 +18,14 @@ def _prepared_bytes_per_row(features: int) -> int:
 
 
 @pytest.mark.parametrize(
-    ("input_features", "intermediate_features", "output_features", "gated_updates"),
+    ("input_features", "intermediate_features", "output_features", "adds_residual"),
     [(5_120, 13_824, 5_120, False), (80, 144, 192, True)],
 )
 def test_default_chunk_rows_bounds_reusable_workspace(
     input_features: int,
     intermediate_features: int,
     output_features: int,
-    gated_updates: bool,
+    adds_residual: bool,
 ) -> None:
     input = torch.empty(100_000, input_features, dtype=torch.bfloat16, device="meta")  # noqa: A001
     up = torch.empty(
@@ -41,10 +41,10 @@ def test_default_chunk_rows_bounds_reusable_workspace(
         device="meta",
     )
 
-    rows = _default_chunk_rows(input, up, down, gated_updates=gated_updates)
+    rows = _default_chunk_rows(input, up, down, adds_residual=adds_residual)
     projected_output_bytes = (
         output_features * input.element_size()
-        if gated_updates and output_features > intermediate_features
+        if adds_residual and output_features > intermediate_features
         else 0
     )
     bytes_per_row = (

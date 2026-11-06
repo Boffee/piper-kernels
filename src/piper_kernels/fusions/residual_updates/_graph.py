@@ -7,6 +7,7 @@ call. A fusion whose operator has a residual-add counterpart then uses
 
 from __future__ import annotations
 
+import logging
 import operator
 from collections.abc import Callable, Mapping
 from typing import cast
@@ -16,6 +17,7 @@ from torch.fx.node import Argument
 
 from . import _ops  # noqa: F401 - registers residual_add_
 
+_log = logging.getLogger(__name__)
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
 RESIDUAL_ADD = torch.ops.piper_kernels.residual_add_.default
 
@@ -70,7 +72,7 @@ def compute_inside_adds(
     the ``producer`` call ``update``'s output into ``base`` themselves, given the add's
     ``base``, ``gate``, ``gate_indices``, and ``python_indexing`` by name, and returns
     the new ``base``; the add and ``update`` are then removed. Returns how many adds it
-    replaced.
+    replaced, and logs each at debug level.
     """
     replaced = 0
     for call in list(graph.nodes):
@@ -92,6 +94,7 @@ def compute_inside_adds(
             graph.erase_node(user)
         graph.erase_node(call)
         graph.erase_node(update)
+        _log.debug("%s is computed inside its add into %s", producer, add["base"])
         replaced += 1
     return replaced
 

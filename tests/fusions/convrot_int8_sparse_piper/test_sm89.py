@@ -28,11 +28,9 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
 )
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
-_MMA_V2_AVAILABLE = (
-    torch.cuda.is_available()
-    and torch.version.hip is None
-    and torch.cuda.get_device_capability()[0] >= 8
-)
+_MMA_V2_AVAILABLE = torch.cuda.is_available() and AcceleratorTarget.from_device(
+    torch.device("cuda")
+).cuda_capability_at_least(8)
 
 
 def _operands(

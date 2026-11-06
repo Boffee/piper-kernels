@@ -243,6 +243,12 @@ with temporary paths. Load optional backends and fixture dependencies when the
 test needs them. Test shared validation at its owning layer, with representative
 integration cases for each caller.
 
+Gate hardware-specific tests through `AcceleratorTarget`, as the library does.
+ROCm devices also report a CUDA capability, and RX 9070 XT reports `(12, 0)`, so
+`torch.cuda.get_device_capability()` alone selects AMD devices for NVIDIA tests.
+Use `exact_sm120_available()` from [`tests/_accelerators.py`](../tests/_accelerators.py)
+for tests that require exact NVIDIA SM120.
+
 Extend existing cases while preserving numerical oracles, storage invariants, and
 distinct failure checks. Keep helpers focused on shared mechanics. Parametrize
 meaningful format, layout, and device boundaries without multiplying cases that

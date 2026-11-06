@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
@@ -33,10 +34,6 @@ from ..nvfp4_gelu_ffn._helpers import (
 from ._helpers import Linear, Operands, make_operands
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 class GeluFfn(torch.nn.Module):
@@ -103,7 +100,7 @@ def test_compile_pass_uuid_is_versioned_and_stable() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("up_group_size", "down_group_size"),
     [(16, 64), (16, None), (None, 64)],
@@ -157,7 +154,7 @@ def test_compile_options_fold_semantic_gelu_ffn(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compile_options_fail_closed_when_projection_escapes() -> None:
     operands = make_operands(rows=129, up_dynamic=False, down_dynamic=False, seed=1033)
     model = GeluFfn(operands, expose_up=True).eval()
@@ -179,7 +176,7 @@ def test_compile_options_fail_closed_when_projection_escapes() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compile_options_fold_indexed_gated_updates() -> None:
     operands = make_operands(
         rows=257,
@@ -210,7 +207,7 @@ def test_compile_options_fold_indexed_gated_updates() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_copy_back_gated_updates_compute_the_ffn_inside_its_residual_add() -> None:
     operands = make_operands(
         rows=257,

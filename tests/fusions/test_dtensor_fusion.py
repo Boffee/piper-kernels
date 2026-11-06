@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
@@ -38,7 +39,7 @@ from .nvfp4_sparse_piper.test_compile import _SparseProjectionAttentionOutput
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+        not exact_sm120_available(),
         reason="requires an SM120 CUDA device",
     ),
 ]

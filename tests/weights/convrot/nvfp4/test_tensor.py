@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
@@ -18,10 +19,6 @@ from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
@@ -642,7 +639,7 @@ def _cuda_case(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -684,7 +681,7 @@ def test_cuda_linear_matches_materialized_rotation(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_cuda_linear_supports_mixed_precision_bias(
@@ -711,7 +708,7 @@ def test_cuda_linear_supports_mixed_precision_bias(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_cuda_high_first_linear_matches_low_first() -> None:
     torch.manual_seed(615)
     activation, _torchao_weight, low, bias = _cuda_case(False, 64)
@@ -736,7 +733,7 @@ def test_cuda_high_first_linear_matches_low_first() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_cuda_compile_preserves_semantic_linear(dynamic: bool) -> None:
     torch.manual_seed(613 + dynamic)
@@ -761,7 +758,7 @@ def test_cuda_compile_preserves_semantic_linear(dynamic: bool) -> None:
 @pytest.mark.parametrize("grad_mode", [torch.no_grad, torch.inference_mode])
 @pytest.mark.parametrize("autocast_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_cuda_autocast_normalizes_semantic_linear(
     compiled: bool,
     grad_mode: type[torch.no_grad | torch.inference_mode],

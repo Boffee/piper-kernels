@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -242,7 +243,7 @@ def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
 @pytest.mark.gpu
 @pytest.mark.parametrize(("dynamic", "group_size"), [(False, 16), (True, 64)])
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_compile_shares_three_projections(dynamic: bool, group_size: int) -> None:

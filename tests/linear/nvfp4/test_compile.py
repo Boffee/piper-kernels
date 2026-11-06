@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -204,7 +205,7 @@ def test_input_cast_sharing_preserves_source_dtype_and_external_storage(differen
 @pytest.mark.parametrize("unit_scale", [False, True])
 @pytest.mark.parametrize("autocast", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_compile_shares_three_static_projections(unit_scale: bool, autocast: bool) -> None:

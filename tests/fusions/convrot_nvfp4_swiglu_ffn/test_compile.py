@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
@@ -30,10 +31,6 @@ from ..nvfp4_swiglu_ffn._helpers import make_operands as make_standard_operands
 from ._helpers import Linear, Operands, make_operands
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 class _SwiGluFfn(torch.nn.Module):
@@ -112,7 +109,7 @@ class _GatedUpdates(torch.nn.Module):
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("high_first", [False, True])
 def test_shared_projection_weights_preserve_distinct_biases(
@@ -182,7 +179,7 @@ def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("dynamic", "promote_gate", "reverse_multiply", "bias_dtype", "high_first"),
     [
@@ -241,7 +238,7 @@ def test_cuda_compile_options_fold_semantic_swiglu_ffn(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("source_convrot", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(
@@ -276,7 +273,7 @@ def test_cuda_compile_options_fold_mixed_nvfp4_swiglu_ffn(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("failure", ["projection-escapes", "different-input"])
 def test_cuda_compile_options_fail_closed(failure: str) -> None:
     operands = make_operands(rows=129, dynamic=False, seed=943)
@@ -310,7 +307,7 @@ def test_cuda_compile_options_fail_closed(failure: str) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) -> None:
     rows = 257
@@ -359,7 +356,7 @@ def test_cuda_compile_options_fold_h3_style_gated_updates(dtype: torch.dtype) ->
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_copy_back_gated_updates_compute_the_ffn_inside_its_residual_add() -> None:
     rows = 257
     operands = make_operands(

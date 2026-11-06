@@ -278,7 +278,7 @@ def test_sparse_attention_output_is_computed_inside_its_residual_add():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_unfused_attention_output_is_added_in_place_by_the_ffn_rewrite():
+def test_unfused_attention_output_stays_materialized_before_its_add():
     model = _ResidualBlock()
     capture = FunctionalTargetCapturePass()
     compiled = _compile_copy_back(model, _options(capture, fuse_output=False))

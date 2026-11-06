@@ -597,11 +597,14 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             _fold_sparse_piper_projection(graph)
             _output_compile._fold_attention_output(graph)
             ops = torch.ops.piper_kernels
-            attention_residual.fold_residual_adds(
+            if attention_residual.fold_residual_adds(
                 graph,
                 ops.convrot_int8_sparse_piper_projected_query_attention_output.default,
                 ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default,
-            )
+            ):
+                # Drop the operands that only the replaced output read.
+                graph.eliminate_dead_code()
+                graph.lint()
 
     def uuid(self) -> bytes:
         return get_hash_for_files(

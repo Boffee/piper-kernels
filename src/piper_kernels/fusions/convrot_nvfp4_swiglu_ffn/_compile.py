@@ -25,6 +25,7 @@ from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
 from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _operands, _preparation
+from piper_kernels.fusions.residual_updates import _gates as residual_gates
 from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.fusions.swiglu_ffn import _pattern as swiglu_ffn_pattern
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -153,11 +154,11 @@ for _source_convrot, _down_convrot in ((True, True), (True, False), (False, True
                         promote_gate=_promote_gate,
                         reverse_multiply=_reverse_multiply,
                     )
-                    for _use_aten_index in (False, True):
+                    for _selection in residual_gates.GATE_SELECTIONS:
                         register_graph_pattern(
                             ffn_pattern.indexed_gated_updates_pattern(
                                 _semantic_ffn_pattern,
-                                use_aten_index=_use_aten_index,
+                                selection=_selection,
                             ),
                             extra_check=lambda match, promote_gate=_promote_gate: (
                                 _valid_semantic_gated_updates(

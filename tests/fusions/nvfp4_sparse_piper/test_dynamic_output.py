@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor, per_tensor_amax_to_scale
 
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
@@ -15,7 +16,6 @@ from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_ops
 from piper_kernels.linear.nvfp4 import _ops
 
 from .._accuracy import assert_fusion_output_close
-from ._helpers import exact_sm120_available
 from .test_output import _arguments
 
 

@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -298,7 +299,7 @@ def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
     ids=["no-bias", "fp16", "bf16", "fp32"],
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_semantic_linear_matches_portable_reference(
@@ -343,7 +344,7 @@ def test_cuda_semantic_linear_matches_portable_reference(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_high_first_linear_matches_low_first() -> None:
@@ -390,7 +391,7 @@ def test_cuda_high_first_linear_matches_low_first() -> None:
 @pytest.mark.parametrize("autocast_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="requires exact NVIDIA SM120",
 )
 def test_cuda_autocast_normalizes_semantic_linear(

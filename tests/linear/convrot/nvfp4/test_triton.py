@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton import convrot as convrot_backend
@@ -11,10 +12,6 @@ from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _materialized_optimized_preparation(
@@ -56,7 +53,7 @@ def test_rotation_chunk_sizes_reject_widths_beyond_three_chunks() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("group_size", "input_features", "dtype"),
     [
@@ -89,7 +86,7 @@ def test_dynamic_preparation_matches_materialized_rotation_exactly(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("input_features", [13_824, 15_360])
 def test_padded_chunks_match_materialized_rotation_exactly(input_features: int) -> None:
     torch.manual_seed(604 + input_features)
@@ -107,7 +104,7 @@ def test_padded_chunks_match_materialized_rotation_exactly(input_features: int) 
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_scale_and_static_stages_match_dynamic_preparation_with_reusable_output() -> None:
     torch.manual_seed(605)
     rows, input_features = 130, 5_376
@@ -149,7 +146,7 @@ def test_scale_and_static_stages_match_dynamic_preparation_with_reusable_output(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_preparation_preserves_noncontiguous_logical_order() -> None:
     torch.manual_seed(602)
     input = torch.randn(  # noqa: A001
@@ -167,7 +164,7 @@ def test_dynamic_preparation_preserves_noncontiguous_logical_order() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_preparation_matches_materialized_zero_input() -> None:
     input = torch.zeros((130, 256), device="cuda", dtype=torch.bfloat16)  # noqa: A001
 
@@ -179,7 +176,7 @@ def test_dynamic_preparation_matches_materialized_zero_input() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_high_first_dynamic_preparation_swaps_only_packed_pairs() -> None:
     torch.manual_seed(606)
     input = torch.randn((65, 5_376), device="cuda", dtype=torch.bfloat16)  # noqa: A001
@@ -197,7 +194,7 @@ def test_high_first_dynamic_preparation_swaps_only_packed_pairs() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_preparation_runs_existing_nvfp4_gemm() -> None:
     torch.manual_seed(603)
     input = torch.randn((257, 256), device="cuda", dtype=torch.bfloat16)  # noqa: A001
@@ -228,7 +225,7 @@ def test_dynamic_preparation_runs_existing_nvfp4_gemm() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
 def test_swiglu_preparation_matches_materialized_activation(
