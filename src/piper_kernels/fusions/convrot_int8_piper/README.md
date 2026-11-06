@@ -96,3 +96,9 @@ Residual rows hold live data, so attention windows never borrow them: attention
 uses its separate window buffers (two when several windows overlap projection),
 and projection writes into a bounded scratch window before its gated add. The
 add runs in FP32 and rounds `base` once per window row.
+
+When its heads split into aligned halves, the fold runs this add in two head slices,
+calling `convrot_int8_piper_project_key`, `convrot_int8_piper_project_value`, and the add
+once per slice on head-sliced weights. `_HEAD_SLICING` in [`_compile.py`](_compile.py)
+names the arguments that split by head; the mechanism is
+[`attention/_head_slices.py`](../attention/_head_slices.py).

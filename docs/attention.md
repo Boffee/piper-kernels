@@ -268,6 +268,13 @@ buffer across attention. See the
 [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
 for numerical and storage details.
 
+A fused dense attention computed inside its add also runs in two head slices, one
+after another, so only half its K and V exist at a time. That applies when its query
+and K/V head counts are even and half the output projection's input is a whole number
+of ConvRot groups; otherwise it runs as one slice. Slicing keeps attention's speed but
+changes results slightly, because each slice quantizes its own share of the output
+projection's input.
+
 For installation and next steps, return to the [README](../README.md). See
 [weights](weights.md) for constructing projection weights and
 [benchmarks](../benchmarks/README.md) for reproducible quality and performance checks.

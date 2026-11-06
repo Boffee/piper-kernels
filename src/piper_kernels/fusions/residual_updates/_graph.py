@@ -58,17 +58,20 @@ def call_functional(
     return result
 
 
+type ComputeInside = Callable[[torch.fx.Graph, torch.fx.Node, dict[str, Argument]], torch.fx.Node]
+
+
 def compute_inside_adds(
     graph: torch.fx.Graph,
     producer: torch._ops.OpOverload,
-    residual_add: torch._ops.OpOverload,
-    arguments: Callable[[dict[str, Argument], dict[str, Argument]], dict[str, Argument]],
+    compute: ComputeInside,
 ) -> int:
     """Compute each ``producer`` output that only a residual add reads inside that add.
 
-    ``residual_add`` replaces the add; ``arguments(operands, add)`` maps the producer's
-    arguments and the add's ``base``, ``gate``, ``gate_indices``, and
-    ``python_indexing``, all by name, to its arguments. Returns how many adds it
+    For each such add, ``compute(graph, update, add)`` emits functional calls that add
+    the ``producer`` call ``update``'s output into ``base`` themselves, given the add's
+    ``base``, ``gate``, ``gate_indices``, and ``python_indexing`` by name, and returns
+    the new ``base``; the add and ``update`` are then removed. Returns how many adds it
     replaced, and logs each at debug level.
     """
     replaced = 0
@@ -85,7 +88,7 @@ def compute_inside_adds(
         ):
             continue
         with graph.inserting_before(call):
-            result = call_functional(graph, residual_add, arguments(bind_arguments(update), add))
+            result = compute(graph, update, add)
         for user in list(call.users):
             user.replace_all_uses_with(result)
             graph.erase_node(user)
@@ -98,6 +101,7 @@ def compute_inside_adds(
 
 __all__ = [
     "RESIDUAL_ADD",
+    "ComputeInside",
     "bind_arguments",
     "call_functional",
     "compute_inside_adds",
