@@ -35,6 +35,11 @@ _SPARSE_ATTENTION_RESIDUAL_ADD = (
 _FFN_UPDATES = _kernels.convrot_int8_swiglu_ffn_gated_updates_.default
 _FFN_RESIDUAL_ADD = _kernels.convrot_int8_swiglu_ffn_residual_add_.default
 _RESIDUAL_ADD = _kernels.residual_add_.default
+_HEAD_GROUPED_ATTENTION_ADD = (
+    _kernels.convrot_int8_piper_head_grouped_attention_residual_add_.default
+)
+_DENSE_KEY = _kernels.convrot_int8_piper_project_key.default
+_DENSE_VALUE = _kernels.convrot_int8_piper_project_value.default
 
 
 class _Ffn(SwiGluFfn):
@@ -173,11 +178,13 @@ class _SparseResidualBlock(torch.nn.Module):
         return residual + ffn_gate[gate_indices] * self.ffn(ffn_input)
 
 
-def _options(capture, *, fuse_output=True):
+def _options(capture, *, fuse_output=True, attention_head_groups=1):
     options = convrot_int8_piper_compile_options(
         convrot_int8_swiglu_ffn_compile_options(), fuse_output=fuse_output
     )
-    return capture.wrap_options(residual_updates_compile_options(options))
+    return capture.wrap_options(
+        residual_updates_compile_options(options, attention_head_groups=attention_head_groups)
+    )
 
 
 def _inputs(model, sequence):
@@ -359,3 +366,49 @@ def test_attention_residual_adds_take_the_add_then_the_output_arguments():
             "python_indexing",
             *output_names,
         ]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
+def test_head_grouped_attention_projects_each_groups_context_inside_its_add():
+    # Two groups of two query heads and one K/V head each.
+    model = _ResidualBlock()
+    capture = _FunctionalCapture()
+    compiled = _compile_copy_back(model, _options(capture, attention_head_groups=2))
+    _assert_updates_input_in_place(model, compiled)
+
+    assert capture.targets.count(_HEAD_GROUPED_ATTENTION_ADD) == 1
+    assert _ATTENTION_RESIDUAL_ADD not in capture.targets
+    # The grouped add projects K and V itself, so no sequence-wide K or V remains.
+    assert _DENSE_KEY not in capture.targets
+    assert _DENSE_VALUE not in capture.targets
+    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
+def test_head_groups_that_do_not_divide_the_heads_leave_attention_ungrouped(caplog):
+    model = _ResidualBlock()
+    capture = _FunctionalCapture()
+    compiled = _compile_copy_back(model, _options(capture, attention_head_groups=3))
+    with caplog.at_level("WARNING", logger=residual_compile.__name__):
+        _assert_updates_input_in_place(model, compiled)
+
+    assert "attention keeps one group" in caplog.text
+    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 1
+    assert _HEAD_GROUPED_ATTENTION_ADD not in capture.targets
+
+
+def test_each_head_group_setting_has_its_own_pass_and_cache_key():
+    ungrouped = residual_updates_compile_options()["post_grad_custom_pre_pass"][-1]
+    grouped = residual_updates_compile_options(attention_head_groups=2)
+    grouped_pass = grouped["post_grad_custom_pre_pass"][-1]
+
+    assert grouped_pass is not ungrouped
+    assert (
+        residual_updates_compile_options(attention_head_groups=2)["post_grad_custom_pre_pass"][-1]
+        is grouped_pass
+    )
+    assert grouped_pass.uuid() != ungrouped.uuid()
+    with pytest.raises(ValueError, match="must be positive"):
+        residual_updates_compile_options(attention_head_groups=0)
