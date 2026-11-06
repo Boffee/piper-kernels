@@ -20,6 +20,7 @@ from piper_kernels.fusions.gelu_ffn import _pattern as gelu_ffn_pattern
 from piper_kernels.fusions.nvfp4_ffn import _compile as ffn_compile_common
 from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
 from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
+from piper_kernels.fusions.residual_updates import _gates as residual_gates
 from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -157,11 +158,11 @@ for _with_source_high_first in (False, True):
             _down_projection_pattern,
             promote_input=True,
         )
-        for _use_aten_index in (False, True):
+        for _selection in residual_gates.GATE_SELECTIONS:
             register_graph_pattern(
                 ffn_pattern.indexed_gated_updates_pattern(
                     _semantic_ffn_pattern,
-                    use_aten_index=_use_aten_index,
+                    selection=_selection,
                 ),
                 extra_check=lambda match: ffn_compile.valid_indexed_gated_updates(
                     match,

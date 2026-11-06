@@ -39,7 +39,7 @@ from torch.fx.node import Argument
 
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _graph, _ops, triton
+from . import _gates, _graph, _ops, triton
 from ._graph import RESIDUAL_ADD, call_functional
 
 _log = logging.getLogger(__name__)
@@ -47,11 +47,6 @@ _COMPILE_PASS_VERSION = "residual-updates-compile-v4"
 
 _aten = torch.ops.aten
 _COPY = _aten.copy_.default
-# Each gate-row selection and whether it wraps negative indices, as Python indexing does.
-_GATE_SELECTIONS: dict[object, bool] = {
-    _aten.index.Tensor: True,
-    _aten.index_select.default: False,
-}
 
 
 def _source_files() -> tuple[str, ...]:
@@ -61,6 +56,7 @@ def _source_files() -> tuple[str, ...]:
         for path in (
             __file__,
             triton.__file__,
+            _gates.__file__,
             _graph.__file__,
             _ops.__file__,
             preparation_sharing.__file__,
@@ -73,27 +69,6 @@ def _metadata(value: Argument) -> torch.Tensor | None:
     return preparation_sharing.tensor_metadata(value) if isinstance(value, torch.fx.Node) else None
 
 
-def _selected_gate(node: Argument) -> tuple[torch.fx.Node, torch.fx.Node, bool] | None:
-    """Return ``(gate, indices, python_indexing)`` if ``node`` selects one gate row per index."""
-    if not isinstance(node, torch.fx.Node):
-        return None
-    python_indexing = _GATE_SELECTIONS.get(node.target)
-    if python_indexing is None:
-        return None
-    if python_indexing:
-        gate, indices = node.args
-        if not isinstance(indices, (list, tuple)) or len(indices) != 1:
-            return None
-        (indices,) = indices
-    else:
-        gate, dimension, indices = node.args
-        if dimension != 0:
-            return None
-    if not isinstance(gate, torch.fx.Node) or not isinstance(indices, torch.fx.Node):
-        return None
-    return gate, indices, python_indexing
-
-
 def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
     """Return ``residual_add_``'s arguments if ``node`` is ``base + gate[indices] * update``."""
     if node.target is not _aten.add.Tensor or len(node.args) != 2 or node.kwargs:
@@ -104,7 +79,7 @@ def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
     if len(product.args) != 2 or product.kwargs:
         return None
     for selection, update in (product.args, product.args[::-1]):
-        selected = _selected_gate(selection)
+        selected = _gates.selected_gate(selection)
         if selected is None:
             continue
         gate, indices, python_indexing = selected
@@ -115,7 +90,7 @@ def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
             or update_value is None
             or gate_value is None
             or indices_value is None
-            or not _graph.supports_residual_add(base_value, update_value, gate_value, indices_value)
+            or not _ops.supports_residual_add(base_value, update_value, gate_value, indices_value)
         ):
             return None
         return {

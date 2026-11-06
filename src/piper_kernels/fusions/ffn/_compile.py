@@ -1,4 +1,17 @@
-"""Projection-independent compiler rules for indexed FFN updates."""
+"""Projection-independent compiler rules for indexed FFN updates.
+
+Each FFN fusion registers three operators, and a block's form picks one:
+
+- ``<ffn>`` returns the FFN output, for an FFN its fusion matches without either of
+  the forms below.
+- ``<ffn>_gated_updates_`` serves a block that keeps its input and ends with
+  ``base + update_gate[i] * update + ffn_gate[i] * ffn(...)``: it stores that sum over
+  ``update``'s buffer, so neither sum allocates a new output.
+- ``<ffn>_residual_add_`` adds ``ffn_gate[i] * ffn(...)`` into ``base`` in place. In a
+  block that overwrites its input, the residual-update rewrite has already turned
+  both sums into residual adds, which the two-update pattern no longer matches;
+  :func:`fold_residual_adds` then computes the FFN inside its add.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +22,14 @@ import torch
 from torch._inductor.pattern_matcher import Match
 from torch.fx.node import Argument
 
+from piper_kernels.fusions.residual_updates import _gates as residual_gates
 from piper_kernels.fusions.residual_updates import _graph as residual_graph
+from piper_kernels.fusions.residual_updates import _ops as residual_ops
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 type FfnPatternValidator = Callable[[Match], bool]
 
-SOURCE_FILES = (__file__, residual_graph.__file__)
+SOURCE_FILES = (__file__, residual_gates.__file__, residual_graph.__file__, residual_ops.__file__)
 
 
 class UpDownChunkRows(Protocol):
@@ -79,8 +94,8 @@ def valid_indexed_gated_updates(
         _shape_matches(base, output)
         and base.dtype is input_value.dtype
         and base.device == input_value.device
-        and residual_graph.supports_residual_add(base, reusable_update, update_gate, gate_indices)
-        and residual_graph.supports_residual_add(base, None, ffn_gate, gate_indices)
+        and residual_ops.supports_residual_add(base, reusable_update, update_gate, gate_indices)
+        and residual_ops.supports_residual_add(base, None, ffn_gate, gate_indices)
         and preparation_sharing.operator_returns_fresh_tensor(reusable_update_node)
         and len(reusable_update_node.users) == 1
     )
@@ -127,10 +142,11 @@ def fold_residual_adds(
 
 
 def uses_python_indexing(match: Match) -> bool:
-    """Return whether a matched update uses Python indexing semantics."""
+    """Return whether a matched update's gate selection wraps negative indices."""
     return any(
-        node.op == "call_function" and node.target == torch.ops.aten.index.Tensor
+        selected[2]
         for node in match.nodes
+        if (selected := residual_gates.selected_gate(node)) is not None
     )
 
 
