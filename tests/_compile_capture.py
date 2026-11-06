@@ -40,3 +40,17 @@ class TargetCapturePass(CustomInferenceAwareGraphPass):
 
     def uuid(self) -> bytes | None:
         return self._cache_key
+
+
+class FunctionalTargetCapturePass(TargetCapturePass):
+    """Record call targets, naming each functional call by the mutating operator it wraps."""
+
+    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
+        super().__call__(graph, is_inference)
+        self.targets = [
+            node.args[0]
+            if node.target is torch.ops.higher_order.auto_functionalized
+            else node.target
+            for node in graph.nodes
+            if node.op == "call_function"
+        ]
