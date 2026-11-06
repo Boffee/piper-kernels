@@ -8,10 +8,12 @@ import torch
 from piper_kernels.fusions.convrot_int8_gelu_ffn.triton import (
     _chunked_gelu_ffn_gated_updates_op,
     _chunked_gelu_ffn_op,
+    _chunked_gelu_ffn_residual_add_op,
 )
 from piper_kernels.linear.convrot.int8 import _ops
 
 from .._convrot_int8 import Linear, make_linear
+from .._ffn_residual_add import assert_residual_add_matches_gated_updates
 
 pytestmark = [
     pytest.mark.gpu,
@@ -170,3 +172,21 @@ def test_chunked_ffn_runs_under_dynamic_fullgraph_compile() -> None:
         activation = torch.randn(rows, 256, dtype=torch.bfloat16, device="cuda")
         current = _Operands(activation, operands.up, operands.down)
         assert _relative_l2(run(activation), _materialized(current)) < 0.01
+
+
+@pytest.mark.parametrize("python_indexing", [False, True])
+@pytest.mark.parametrize("output_features", [384, 640])
+def test_residual_add_matches_gated_updates_without_reusable_update(
+    python_indexing, output_features
+) -> None:
+    torch.manual_seed(509)
+    operands = _operands(rows=129, output_features=output_features, bias_dtype=torch.float32)
+
+    assert_residual_add_matches_gated_updates(
+        _chunked_gelu_ffn_gated_updates_op,
+        _chunked_gelu_ffn_residual_add_op,
+        operands.arguments(64),
+        3,
+        output_features,
+        python_indexing=python_indexing,
+    )
