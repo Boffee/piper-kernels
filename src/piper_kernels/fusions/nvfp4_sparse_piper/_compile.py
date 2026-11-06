@@ -19,6 +19,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.kernels.sparse_piper import (
@@ -460,7 +461,7 @@ def nvfp4_sparse_piper_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Canonicalize repeated NVFP4 projections before sparse-attention fusion."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (nvfp4_compile.compile_pass, compile_pass),
     )

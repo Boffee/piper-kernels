@@ -14,6 +14,7 @@ from torch._inductor.custom_graph_pass import (
 from torch._inductor.pattern_matcher import Match, PatternMatcherPass, register_graph_pattern
 from torch.fx.node import Argument
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.gelu_ffn import _pattern as gelu_ffn_pattern
@@ -233,7 +234,7 @@ def nvfp4_gelu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install semantic GELU FFN folding before ordinary NVFP4 folding."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (compile_pass, nvfp4_compile.compile_pass),
     )

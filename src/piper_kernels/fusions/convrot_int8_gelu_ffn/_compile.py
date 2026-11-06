@@ -15,6 +15,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.fusions.convrot_int8_ffn import _compile as ffn_compile_common
 from piper_kernels.fusions.convrot_int8_ffn import _core as ffn_core
 from piper_kernels.fusions.ffn import _compile as ffn_compile
@@ -23,7 +24,6 @@ from piper_kernels.fusions.gelu_ffn import _pattern as gelu_ffn_pattern
 from piper_kernels.fusions.residual_updates import _gates as residual_gates
 from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
-from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
@@ -229,7 +229,7 @@ def convrot_int8_gelu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install semantic GELU FFN folding before ordinary ConvRot INT8 folding."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (compile_pass, convrot_int8_compile.compile_pass),
     )

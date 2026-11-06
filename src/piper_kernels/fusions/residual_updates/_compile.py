@@ -37,6 +37,7 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass, get_hash_for_files
 from torch.fx.node import Argument
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _gates, _graph, _ops, triton
@@ -156,7 +157,7 @@ def residual_updates_compile_options(
     Inductor's planner would otherwise keep a dead full-size buffer allocated across
     the in-place attention to reuse it afterward.
     """
-    combined = preparation_sharing.add_first_post_grad_pass(options, _compile_pass)
+    combined = inductor_options.add_first_post_grad_pass(options, _compile_pass)
     combined["allow_buffer_reuse"] = False
     return combined
 
