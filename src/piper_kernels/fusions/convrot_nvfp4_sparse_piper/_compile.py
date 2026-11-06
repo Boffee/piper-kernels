@@ -10,10 +10,10 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
 from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_sparse_compile
-from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
 from piper_kernels.linear.convrot.nvfp4 import _compile_fx as convrot_nvfp4_compile_fx
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_triton
@@ -57,7 +57,7 @@ def convrot_nvfp4_sparse_piper_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install sparse fusion immediately after ConvRot NVFP4 normalization."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (convrot_nvfp4_compile.compile_pass, compile_pass),
     )

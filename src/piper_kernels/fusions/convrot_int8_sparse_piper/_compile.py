@@ -19,6 +19,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx.node import Argument
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -620,7 +621,7 @@ def convrot_int8_sparse_piper_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install sparse fusion before ordinary ConvRot INT8 graph optimizations."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (compile_pass, convrot_int8_compile.compile_pass),
     )

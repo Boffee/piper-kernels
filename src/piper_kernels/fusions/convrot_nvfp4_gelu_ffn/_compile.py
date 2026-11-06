@@ -14,6 +14,7 @@ from torch._inductor.custom_graph_pass import (
 from torch._inductor.pattern_matcher import Match, PatternMatcherPass, register_graph_pattern
 from torch.fx.node import Argument
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.fusions.convrot_nvfp4_ffn import _compile as ffn_compile_common
 from piper_kernels.fusions.convrot_nvfp4_ffn import _preparation as convrot_source_preparation
 from piper_kernels.fusions.ffn import _compile as ffn_compile
@@ -226,7 +227,7 @@ def convrot_nvfp4_gelu_ffn_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install GELU FFN folding before standard and ConvRot NVFP4 normalization."""
-    return preparation_sharing.add_ordered_post_grad_passes(
+    return inductor_options.add_ordered_post_grad_passes(
         options,
         (
             compile_pass,
