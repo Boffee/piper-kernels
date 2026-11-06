@@ -337,7 +337,10 @@ def test_compile_options_append_the_rewrite_and_disable_buffer_reuse():
     assert isinstance(passes, tuple)
     assert passes[:-1] == options["post_grad_custom_pre_pass"]
     assert combined["allow_buffer_reuse"] is False
-    assert residual_updates_compile_options(options)["post_grad_custom_pre_pass"][-1] is passes[-1]
+    # Applying the rewrite again keeps one copy of it, in place.
+    again = residual_updates_compile_options(combined)["post_grad_custom_pre_pass"]
+    assert again[:-1] == passes[:-1]
+    assert again[-1].uuid() == passes[-1].uuid()
 
 
 def test_ffn_residual_adds_take_the_two_update_arguments_without_the_reusable_update():
@@ -387,6 +390,23 @@ def test_head_grouped_attention_projects_each_groups_context_inside_its_add():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
+def test_head_groups_apply_to_options_that_already_install_the_rewrite():
+    model = _ResidualBlock()
+    capture = _FunctionalCapture()
+    options = residual_updates_compile_options(
+        convrot_int8_piper_compile_options(
+            convrot_int8_swiglu_ffn_compile_options(), fuse_output=True
+        )
+    )
+    options = residual_updates_compile_options(options, attention_head_groups=2)
+    compiled = _compile_copy_back(model, capture.wrap_options(options))
+    _assert_updates_input_in_place(model, compiled)
+
+    assert capture.targets.count(_HEAD_GROUPED_ATTENTION_ADD) == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
 def test_head_groups_that_do_not_divide_the_heads_leave_attention_ungrouped(caplog):
     model = _ResidualBlock()
     capture = _FunctionalCapture()
@@ -399,16 +419,26 @@ def test_head_groups_that_do_not_divide_the_heads_leave_attention_ungrouped(capl
     assert _HEAD_GROUPED_ATTENTION_ADD not in capture.targets
 
 
-def test_each_head_group_setting_has_its_own_pass_and_cache_key():
-    ungrouped = residual_updates_compile_options()["post_grad_custom_pre_pass"][-1]
-    grouped = residual_updates_compile_options(attention_head_groups=2)
-    grouped_pass = grouped["post_grad_custom_pre_pass"][-1]
+def test_a_later_head_group_setting_replaces_the_earlier_rewrite_in_place():
+    options = convrot_int8_piper_compile_options(fuse_output=True)
+    ungrouped = residual_updates_compile_options(options)
+    grouped = residual_updates_compile_options(ungrouped, attention_head_groups=2)
 
-    assert grouped_pass is not ungrouped
-    assert (
-        residual_updates_compile_options(attention_head_groups=2)["post_grad_custom_pre_pass"][-1]
-        is grouped_pass
-    )
-    assert grouped_pass.uuid() != ungrouped.uuid()
-    with pytest.raises(ValueError, match="must be positive"):
-        residual_updates_compile_options(attention_head_groups=0)
+    passes = grouped["post_grad_custom_pre_pass"]
+    assert passes[:-1] == options["post_grad_custom_pre_pass"]
+    expected = residual_updates_compile_options(attention_head_groups=2)
+    assert passes[-1].uuid() == expected["post_grad_custom_pre_pass"][-1].uuid()
+    assert passes[-1].uuid() != ungrouped["post_grad_custom_pre_pass"][-1].uuid()
+
+
+@pytest.mark.parametrize(
+    ("attention_head_groups", "error", "message"),
+    [
+        (0, ValueError, "must be positive"),
+        (True, TypeError, "integer"),
+        (2.0, TypeError, "integer"),
+    ],
+)
+def test_head_group_counts_must_be_positive_integers(attention_head_groups, error, message):
+    with pytest.raises(error, match=message):
+        residual_updates_compile_options(attention_head_groups=attention_head_groups)

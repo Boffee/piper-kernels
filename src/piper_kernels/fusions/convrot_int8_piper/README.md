@@ -116,10 +116,9 @@ first group.
 
 A group's query windows may hold `head_groups` times the ungrouped row cap, so each
 attention launch keeps the ungrouped rows times heads and its Q and attention-output
-buffers keep their size. With the ungrouped cap, twice as many half-width launches
-cost MiniMax-H3's dense attention 1.4% on RDNA4; with the scaled cap, two groups cost
-0.2%. The output-projection scratch spans every output feature, so it grows with the
-rows; at H3's shape two groups' peak extra memory is 1.18 GiB instead of 1.08 GiB,
-against 2.13 GiB ungrouped. Per-token output-activation scales cover one group's features, and
+buffers keep their size. Otherwise groups would make proportionally more, narrower
+launches, each paying per-launch costs and adding a projection tail that attention
+doesn't hide. The output-projection scratch spans every output feature, so it grows
+with the rows. Per-token output-activation scales cover one group's features, and
 `base` rounds once per group, so results differ from one group by INT8 activation
 rounding. One group matches the separate producers and residual add exactly.

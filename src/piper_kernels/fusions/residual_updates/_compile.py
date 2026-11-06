@@ -30,16 +30,15 @@ Each FFN two-update operator and each attention output operator registers its
 residual-add counterpart. Unmatched graphs are unchanged; debug logging reports what
 was rewritten, and Inductor's reinplacing log reports any input it had to copy.
 
-With attention head groups, a dense attention residual add whose K and V producers
-feed only it becomes ``convrot_int8_piper_head_grouped_attention_residual_add_``, which
-takes the producers' inputs and projects each group's K and V itself. One operator
-keeps the groups in order: separate per-group nodes would let Inductor schedule every
-group's K and V before the first attention.
+With attention head groups, an attention residual add that registers a head-group fold,
+and whose K and V producers feed only it, becomes the fold's grouped add, which takes
+the producers' inputs and projects each group's K and V itself. One operator keeps the
+groups in order: separate per-group nodes would let Inductor schedule every group's K
+and V before the first attention. Dense Piper registers a fold; sparse doesn't yet.
 """
 
 from __future__ import annotations
 
-import functools
 import logging
 import operator
 from collections.abc import Mapping
@@ -91,15 +90,14 @@ _ATTENTION_RESIDUAL_ADDS: dict[object, torch._ops.OpOverload] = {
 }
 _REUSABLE_UPDATE_ARGUMENTS = ("reusable_update", "update_gate")
 
-# With head groups, a dense attention residual add whose K and V producers feed only it
-# becomes one operator that projects each group's K and V itself, so only one group's
+# Attention residual adds that can run in head groups. Each fold names the K and V
+# producers it absorbs and maps their arguments onto its grouped add, so only one group's
 # K and V are ever allocated.
-_DENSE_ATTENTION_ADD = _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
-_DENSE_HEAD_GROUPED_ADD = _kernels.convrot_int8_piper_head_grouped_attention_residual_add_.default
-_DENSE_KEY = _kernels.convrot_int8_piper_project_key.default
-_DENSE_VALUE = _kernels.convrot_int8_piper_project_value.default
-_DENSE_KEY_OUTPUTS = ("key", "key_scale")
-_DENSE_VALUE_OUTPUTS = ("value", "multiplier", "log_scale", "value_mean")
+_ATTENTION_HEAD_GROUP_FOLDS: dict[object, dense_head_groups.HeadGroupFold] = {
+    _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default: (
+        dense_head_groups.HEAD_GROUP_FOLD
+    ),
+}
 
 
 def _source_files() -> tuple[str, ...]:
@@ -148,63 +146,30 @@ def _exclusive_producer(
     return producer
 
 
-def _metadata(node: Argument) -> torch.Tensor:
-    value = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
-    if not isinstance(value, torch.Tensor):
-        raise ValueError("missing tensor metadata")
-    return value
-
-
-def _head_grouped_attention_add(
+def _fold_head_groups(
     update: torch.fx.Node,
+    attention_add: torch._ops.OpOverload,
     operands: dict[str, Argument],
     head_groups: int,
-) -> dict[str, Argument] | None:
-    """Return the grouped add's arguments for a dense attention output, if it can group."""
-    key_producer = _exclusive_producer(operands, _DENSE_KEY_OUTPUTS, _DENSE_KEY, update)
-    value_producer = _exclusive_producer(operands, _DENSE_VALUE_OUTPUTS, _DENSE_VALUE, update)
-    if key_producer is None or value_producer is None:
+) -> tuple[torch._ops.OpOverload, dict[str, Argument]] | None:
+    """Return the grouped add and its arguments for ``attention_add``, if it can group."""
+    fold = _ATTENTION_HEAD_GROUP_FOLDS.get(attention_add)
+    if fold is None:
+        return None
+    key = _exclusive_producer(operands, fold.key_outputs, fold.key_producer, update)
+    value = _exclusive_producer(operands, fold.value_outputs, fold.value_producer, update)
+    if key is None or value is None:
         _log.debug("%s: K or V has other consumers; attention keeps one group", update.name)
         return None
-    key_values = bind_arguments(key_producer)
-    value_values = bind_arguments(value_producer)
     try:
-        dense_head_groups.validate_head_groups(
-            _metadata(operands["query_weight"]),
-            _metadata(key_values["weight_qdata"]),
-            _metadata(value_values["weight_qdata"]),
-            _metadata(operands["weight_qdata"]),
-            cast(int, operands["group_size"]),
-            head_dim=cast(int, operands["head_dim"]),
-            head_groups=head_groups,
+        arguments = fold.build_arguments(
+            operands, bind_arguments(key), bind_arguments(value), head_groups
         )
     except ValueError as error:
         # The requested split doesn't fit this attention; it still compiles ungrouped.
         _log.warning("%s: %s; attention keeps one group", update.name, error)
         return None
-    shared = {
-        name: value
-        for name, value in operands.items()
-        if name not in (*_DENSE_KEY_OUTPUTS, *_DENSE_VALUE_OUTPUTS, "key_length")
-    }
-    return {
-        **shared,
-        "key_input_qdata": key_values["input_qdata"],
-        "key_input_scale": key_values["input_scale"],
-        "key_weight": key_values["weight_qdata"],
-        "key_weight_scale": key_values["weight_scale"],
-        "key_norm_weight": key_values["norm_weight"],
-        "key_cos": key_values["cos"],
-        "key_sin": key_values["sin"],
-        "key_norm_epsilon": key_values["norm_epsilon"],
-        "key_bias": key_values["bias"],
-        "value_input_qdata": value_values["input_qdata"],
-        "value_input_scale": value_values["input_scale"],
-        "value_weight": value_values["weight_qdata"],
-        "value_weight_scale": value_values["weight_scale"],
-        "value_bias": value_values["bias"],
-        "head_groups": head_groups,
-    }
+    return fold.grouped_add, arguments
 
 
 def _rewrite_ffn_updates(
@@ -249,15 +214,13 @@ def _rewrite_ffn_updates(
                 for name, value in bind_arguments(update).items()
                 if name != "output_dtype"
             }
-            grouped = (
-                _head_grouped_attention_add(update, operands, attention_head_groups)
-                if attention_add is _DENSE_ATTENTION_ADD and attention_head_groups > 1
-                else None
-            )
+            if attention_head_groups > 1:
+                grouped = _fold_head_groups(update, attention_add, operands, attention_head_groups)
             if grouped is None:
                 added = call_functional(graph, attention_add, {**update_add, **operands})
             else:
-                added = call_functional(graph, _DENSE_HEAD_GROUPED_ADD, {**update_add, **grouped})
+                grouped_add, arguments = grouped
+                added = call_functional(graph, grouped_add, {**update_add, **arguments})
     residual.replace_all_uses_with(added)
     ffn_add = {
         name: value for name, value in values.items() if name not in _REUSABLE_UPDATE_ARGUMENTS
@@ -304,12 +267,6 @@ class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
         )
 
 
-@functools.cache
-def _compile_pass(attention_head_groups: int) -> _ResidualUpdatePass:
-    # One instance per setting: passes combine by identity.
-    return _ResidualUpdatePass(attention_head_groups)
-
-
 def residual_updates_compile_options(
     options: Mapping[str, object] | None = None,
     *,
@@ -321,10 +278,16 @@ def residual_updates_compile_options(
     Inductor's planner would otherwise keep a dead full-size buffer allocated across
     the in-place attention to reuse it afterward.
     """
+    if not isinstance(attention_head_groups, int) or isinstance(attention_head_groups, bool):
+        raise TypeError("attention_head_groups must be an integer")
     if attention_head_groups < 1:
         raise ValueError("attention_head_groups must be positive")
+    # Passes combine by identity; the earlier rewrite would otherwise run first and leave
+    # nothing for this one to group.
     combined = preparation_sharing.add_ordered_post_grad_passes(
-        options, (_compile_pass(attention_head_groups),)
+        options,
+        (_ResidualUpdatePass(attention_head_groups),),
+        replaces=lambda compiler_pass: isinstance(compiler_pass, _ResidualUpdatePass),
     )
     combined["allow_buffer_reuse"] = False
     return combined

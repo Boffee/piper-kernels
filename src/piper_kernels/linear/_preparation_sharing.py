@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import Any, Protocol
 
 import torch
@@ -129,8 +129,15 @@ def add_post_grad_pass(
 def add_ordered_post_grad_passes(
     options: Mapping[str, object] | None,
     compiler_passes: Sequence[object],
+    *,
+    replaces: Callable[[object], bool] | None = None,
 ) -> dict[str, object]:
-    """Install an ordered pass group where its first existing member was located."""
+    """Install an ordered pass group where its first existing member was located.
+
+    Existing passes count as members when they are one of ``compiler_passes``, by
+    identity, or when ``replaces`` accepts them, such as the same rewrite installed
+    earlier with other settings; the group supersedes them.
+    """
     if not compiler_passes:
         return dict(options) if options is not None else {}
     combined = dict(options) if options is not None else {}
@@ -142,23 +149,17 @@ def add_ordered_post_grad_passes(
     else:
         passes = (existing,)
 
+    def is_member(compiler_pass: object) -> bool:
+        return any(compiler_pass is grouped for grouped in compiler_passes) or (
+            replaces is not None and replaces(compiler_pass)
+        )
+
     anchor_index = next(
-        (
-            index
-            for index, compiler_pass in enumerate(passes)
-            if any(compiler_pass is grouped for grouped in compiler_passes)
-        ),
+        (index for index, compiler_pass in enumerate(passes) if is_member(compiler_pass)),
         len(passes),
     )
-    unrelated = tuple(
-        compiler_pass
-        for compiler_pass in passes
-        if not any(compiler_pass is grouped for grouped in compiler_passes)
-    )
-    insertion_index = sum(
-        not any(compiler_pass is grouped for grouped in compiler_passes)
-        for compiler_pass in passes[:anchor_index]
-    )
+    unrelated = tuple(compiler_pass for compiler_pass in passes if not is_member(compiler_pass))
+    insertion_index = sum(not is_member(compiler_pass) for compiler_pass in passes[:anchor_index])
     combined[_POST_GRAD_PRE_PASS] = (
         *unrelated[:insertion_index],
         *compiler_passes,

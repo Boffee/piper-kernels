@@ -1,6 +1,10 @@
 """Dense Piper attention residual adds that hold one head group's K and V at a time."""
 
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+
 import torch
+from torch.fx.node import Argument
 
 from . import key, output, value
 from .output import DEFAULT_QUERY_CHUNK_ROWS
@@ -270,3 +274,92 @@ def _head_grouped_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
         head_dim=head_dim,
         query_chunk_rows=query_chunk_rows * head_groups,
     )
+
+
+@dataclass(frozen=True)
+class HeadGroupFold:
+    """How the residual rewrite runs an attention residual add in head groups.
+
+    The rewrite replaces the residual add with ``grouped_add`` when the add's
+    ``key_outputs`` and ``value_outputs`` operands come only from ``key_producer`` and
+    ``value_producer``. ``build_arguments`` maps the three calls' arguments, by name,
+    onto ``grouped_add``'s; it raises ``ValueError`` when the split doesn't fit.
+    """
+
+    grouped_add: torch._ops.OpOverload
+    key_producer: torch._ops.OpOverload
+    key_outputs: tuple[str, ...]
+    value_producer: torch._ops.OpOverload
+    value_outputs: tuple[str, ...]
+    build_arguments: Callable[
+        [Mapping[str, Argument], Mapping[str, Argument], Mapping[str, Argument], int],
+        dict[str, Argument],
+    ]
+
+
+def _require_metadata(node: Argument) -> torch.Tensor:
+    value = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
+    if not isinstance(value, torch.Tensor):
+        raise ValueError("missing tensor metadata")
+    return value
+
+
+def _require_int(value: Argument) -> int:
+    if not isinstance(value, int):
+        raise ValueError("expected a static integer argument")
+    return value
+
+
+_KEY_OUTPUTS = ("key", "key_scale")
+_VALUE_OUTPUTS = ("value", "multiplier", "log_scale", "value_mean")
+
+
+def _build_grouped_add_arguments(
+    attention: Mapping[str, Argument],
+    key_producer: Mapping[str, Argument],
+    value_producer: Mapping[str, Argument],
+    head_groups: int,
+) -> dict[str, Argument]:
+    validate_head_groups(
+        _require_metadata(attention["query_weight"]),
+        _require_metadata(key_producer["weight_qdata"]),
+        _require_metadata(value_producer["weight_qdata"]),
+        _require_metadata(attention["weight_qdata"]),
+        _require_int(attention["group_size"]),
+        head_dim=_require_int(attention["head_dim"]),
+        head_groups=head_groups,
+    )
+    shared = {
+        name: value
+        for name, value in attention.items()
+        if name not in (*_KEY_OUTPUTS, *_VALUE_OUTPUTS, "key_length")
+    }
+    return {
+        **shared,
+        "key_input_qdata": key_producer["input_qdata"],
+        "key_input_scale": key_producer["input_scale"],
+        "key_weight": key_producer["weight_qdata"],
+        "key_weight_scale": key_producer["weight_scale"],
+        "key_norm_weight": key_producer["norm_weight"],
+        "key_cos": key_producer["cos"],
+        "key_sin": key_producer["sin"],
+        "key_norm_epsilon": key_producer["norm_epsilon"],
+        "key_bias": key_producer["bias"],
+        "value_input_qdata": value_producer["input_qdata"],
+        "value_input_scale": value_producer["input_scale"],
+        "value_weight": value_producer["weight_qdata"],
+        "value_weight_scale": value_producer["weight_scale"],
+        "value_bias": value_producer["bias"],
+        "head_groups": head_groups,
+    }
+
+
+# Folds ``convrot_int8_piper_projected_query_attention_residual_add_``.
+HEAD_GROUP_FOLD = HeadGroupFold(
+    grouped_add=torch.ops.piper_kernels.convrot_int8_piper_head_grouped_attention_residual_add_.default,
+    key_producer=torch.ops.piper_kernels.convrot_int8_piper_project_key.default,
+    key_outputs=_KEY_OUTPUTS,
+    value_producer=torch.ops.piper_kernels.convrot_int8_piper_project_value.default,
+    value_outputs=_VALUE_OUTPUTS,
+    build_arguments=_build_grouped_add_arguments,
+)

@@ -174,20 +174,32 @@ def test_head_groups_validate_group_operands_from_metadata():
         _add_grouped(query, context, projection, residual, causal=True, head_groups=2, fake=True)
 
 
+def _bind(operator, arguments, keywords):
+    """Name a recorded call's arguments by the operator's schema."""
+    names = [argument.name for argument in operator._schema.arguments]
+    return {**dict(zip(names, arguments, strict=False)), **keywords}
+
+
 def test_each_group_projects_its_rows_and_adds_its_columns(monkeypatch):
     query, context, projection, residual = _attention("cpu", sequence=65, causal=False)
+    kernels = torch.ops.piper_kernels
     calls = {"key": [], "value": [], "add": []}
 
     def project_key(*arguments, **keywords):
-        calls["key"].append(arguments)
+        calls["key"].append(
+            _bind(kernels.convrot_int8_piper_project_key.default, arguments, keywords)
+        )
         return torch.zeros(1), torch.zeros(1)
 
     def project_value(*arguments, **keywords):
-        calls["value"].append(arguments)
+        calls["value"].append(
+            _bind(kernels.convrot_int8_piper_project_value.default, arguments, keywords)
+        )
         return torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
 
     def residual_add(*arguments, **keywords):
-        calls["add"].append((arguments, keywords))
+        operator = kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
+        calls["add"].append(_bind(operator, arguments, keywords))
 
     monkeypatch.setattr(key, "_project_key_op", project_key)
     monkeypatch.setattr(value, "_project_value_op", project_value)
@@ -199,16 +211,12 @@ def test_each_group_projects_its_rows_and_adds_its_columns(monkeypatch):
     weight, _, bias = projection
     for group in range(2):
         group_rows = slice(group * rows, (group + 1) * rows)
-        assert torch.equal(calls["key"][group][2], context[2][group_rows])
-        assert torch.equal(calls["value"][group][2], context[2][group_rows])
-        arguments, keywords = calls["add"][group]
-        assert torch.equal(arguments[6], query[2][group_rows])
-        # Positions follow the residual add's schema: base, gate, gate_indices,
-        # python_indexing, the 10 query operands, 2 key and 4 value outputs, key_length,
-        # is_causal, then the output projection.
-        output_weight = arguments[22]
-        assert output_weight.is_contiguous()
-        assert torch.equal(output_weight, weight[:, group_rows])
+        assert torch.equal(calls["key"][group]["weight_qdata"], context[2][group_rows])
+        assert torch.equal(calls["value"][group]["weight_qdata"], context[2][group_rows])
+        add = calls["add"][group]
+        assert torch.equal(add["query_weight"], query[2][group_rows])
+        assert add["weight_qdata"].is_contiguous()
+        assert torch.equal(add["weight_qdata"], weight[:, group_rows])
         # The bias is added once, and each group's windows hold twice the rows.
-        assert arguments[24] is (bias if group == 0 else None)
-        assert keywords["query_chunk_rows"] == 2 * 128
+        assert add["bias"] is (bias if group == 0 else None)
+        assert add["query_chunk_rows"] == 2 * 128

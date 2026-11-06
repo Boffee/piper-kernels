@@ -135,6 +135,24 @@ def test_ordered_pass_group_replaces_anchor_without_moving_unrelated_passes() ->
     assert repeated == combined
 
 
+def test_ordered_pass_group_supersedes_passes_it_replaces_in_place() -> None:
+    unrelated_before = object()
+    earlier = object()
+    unrelated_after = object()
+    replacement = object()
+    original = {"post_grad_custom_pre_pass": (unrelated_before, earlier, unrelated_after)}
+
+    combined = add_ordered_post_grad_passes(
+        original, (replacement,), replaces=lambda compiler_pass: compiler_pass is earlier
+    )
+
+    assert combined["post_grad_custom_pre_pass"] == (
+        unrelated_before,
+        replacement,
+        unrelated_after,
+    )
+
+
 def test_ordered_pass_group_anchors_on_first_installed_member() -> None:
     unrelated_before = object()
     first = object()

@@ -32,7 +32,8 @@ def residual_updates_compile_options(
     and K/V heads and give each group a multiple of the output projection's ConvRot
     group size; an attention it doesn't fit stays ungrouped with a logged warning.
     Grouping changes outputs slightly: each group's output-projection input gets its own
-    per-token scales, and the input rounds once per group.
+    per-token scales, and the input rounds once per group. Calling this again on options
+    that already install the rewrite replaces its earlier settings.
     """
     from ._compile import (  # noqa: PLC0415 - keep compiler integration lazy
         residual_updates_compile_options as compile_options,
