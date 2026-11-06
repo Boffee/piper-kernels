@@ -29,7 +29,7 @@ from lib.suite_attention import make_inputs
 from lib.timing import synchronized_wall_benchmark
 from triton.testing import do_bench, do_bench_cudagraph
 
-from piper_kernels import SparsePiperAttention, SparsePiperKeyRegion
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
@@ -53,7 +53,7 @@ def _positive_int(value: str) -> int:
     return result
 
 
-def _parse_key_regions(values: list[str] | None) -> tuple[SparsePiperKeyRegion, ...] | None:
+def _parse_key_layout(values: list[str] | None) -> SparsePiperKeyLayout | None:
     if values is None:
         return None
     regions = []
@@ -62,7 +62,7 @@ def _parse_key_regions(values: list[str] | None) -> tuple[SparsePiperKeyRegion, 
         if not separator or mode not in ("sparse", "dense"):
             raise ValueError("key regions use sparse:BLOCKS or dense:BLOCKS")
         regions.append(SparsePiperKeyRegion(int(count), sparse=mode == "sparse"))
-    return tuple(regions)
+    return SparsePiperKeyLayout(tuple(regions))
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:  # noqa: PLR0912
@@ -137,11 +137,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:  # noq
     ):
         parser.error("regional layouts are custom diagnostics; omit --case")
     try:
-        regions = _parse_key_regions(args.key_regions)
+        key_layout = _parse_key_layout(args.key_regions)
     except ValueError as error:
         parser.error(str(error))
-    if regions is not None and any(
-        sum(region.num_blocks for region in regions) * 64 != sequence for sequence in args.sequence
+    if key_layout is not None and any(
+        key_layout.num_blocks * 64 != sequence for sequence in args.sequence
     ):
         parser.error("key regions must cover exactly each sequence's complete K64 blocks")
     if args.sparse_key_blocks is not None and any(
@@ -168,18 +168,13 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     shape = tuple(query.shape)
     backend = require_attention_backend(query)
     attention = SparsePiperAttention([ratio] * args.heads, routing=args.routing)
-    regions = _parse_key_regions(args.key_regions)
+    key_layout = _parse_key_layout(args.key_regions)
     blocks = sequence // 64 if args.sparse_key_blocks is None else args.sparse_key_blocks
     ratio_units = _normalize_head_keep_ratios([ratio] * args.heads)
     layout = (
         _resolve_route_layout(ratio_units, blocks, device)
-        if regions is None
-        else resolve_region_route_layout(
-            ratio_units,
-            tuple(region.num_blocks for region in regions),
-            tuple(region.sparse for region in regions),
-            device,
-        )
+        if key_layout is None
+        else resolve_region_route_layout(ratio_units, key_layout, device)
     )
     route_call = partial(
         packed_routes_from_sequences,
@@ -215,8 +210,8 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     launch = partial(prepared.launch, prepared.query, output.transpose(1, 2))
 
     def public_call() -> torch.Tensor:
-        if regions is not None:
-            return attention(query, key, value, key_regions=regions)
+        if key_layout is not None:
+            return attention(query, key, value, key_layout=key_layout)
         return attention(query, key, value, sparse_key_blocks=blocks)
 
     launch()
@@ -279,7 +274,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
                 "input_source": "cpu_seeded_normal_cast_to_input_dtype",
                 "ratio": ratio,
                 "routing": args.routing,
-                "sparse_key_blocks": blocks if regions is None else None,
+                "sparse_key_blocks": blocks if key_layout is None else None,
                 "key_regions": args.key_regions,
                 "skip_dense_routing": skip_dense_routing,
                 "selected_blocks_per_head": selected_blocks,

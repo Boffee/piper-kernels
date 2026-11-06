@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from benchmark_sparse_piper import _parse_args, _parse_key_regions
+from benchmark_sparse_piper import _parse_args, _parse_key_layout
 from lib.sparse_piper import (
     assert_equal_finite,
     reference_prepared_query,
@@ -59,8 +59,8 @@ def test_region_diagnostic_retains_independent_budgets_and_dense_blocks():
             "0.1",
         ]
     )
-    regions = _parse_key_regions(args.key_regions)
-    budgets = SparsePiperAttention((0.1,)).resolve_region_keep_blocks(regions)
+    key_layout = _parse_key_layout(args.key_regions)
+    budgets = SparsePiperAttention((0.1,)).resolve_region_keep_blocks(key_layout)
     assert budgets == ((10,), (20,), (10,), (10,))
     assert sum(region[0] for region in budgets) == 50
 

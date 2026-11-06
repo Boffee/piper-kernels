@@ -1,7 +1,7 @@
 """Sparse Piper Attention with NVIDIA, AMD, and portable inference backends."""
 
 from . import _coarse_dispatch as _coarse_dispatch
-from ._regions import SparsePiperKeyRegion
+from ._regions import SparsePiperKeyLayout, SparsePiperKeyRegion
 from .coarse import (
     apply_coarse_attention_residual,
     coarse_attention,
@@ -13,6 +13,7 @@ from .residual import sparse_piper_coarse_residual
 
 __all__ = [
     "SparsePiperAttention",
+    "SparsePiperKeyLayout",
     "SparsePiperKeyRegion",
     "apply_coarse_attention_residual",
     "coarse_attention",

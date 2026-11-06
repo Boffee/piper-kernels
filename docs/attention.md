@@ -113,32 +113,43 @@ quality comparisons; it is not the fallback used by this API.
 
 ### Independent key regions (experimental)
 
-Use `key_regions` instead of `sparse_key_blocks` to reserve each head's keep ratio
+Use `key_layout` instead of `sparse_key_blocks` to reserve each head's keep ratio
 independently for several videos or other key groups. Sparse and dense regions
 may appear in any order. For example, this layout retains 10% of each video's
 blocks for head 0, 25% for head 1, and every text block for both heads:
 
 ```python
-from piper_kernels import SparsePiperAttention, SparsePiperKeyRegion
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 
 attention = SparsePiperAttention((0.1, 0.25))
-regions = (
-    SparsePiperKeyRegion(100),  # video 1: 6400 physical rows
-    SparsePiperKeyRegion(4, sparse=False),  # text: 256 physical rows
-    SparsePiperKeyRegion(100),  # video 2
-    SparsePiperKeyRegion(100),  # output video
+layout = SparsePiperKeyLayout(
+    (
+        SparsePiperKeyRegion(100),  # video 1: 6400 physical rows
+        SparsePiperKeyRegion(4, sparse=False),  # text: 256 physical rows
+        SparsePiperKeyRegion(100),  # video 2
+        SparsePiperKeyRegion(100),  # output video
+    )
 )
 # q/k/v have sequence length 304 * 64; Q has two heads.
-output = attention(q, k, v, key_regions=regions)
-budgets = attention.resolve_region_keep_blocks(regions)
+output = attention(q, k, v, key_layout=layout)
+budgets = attention.resolve_region_keep_blocks(layout)
 assert budgets == ((10, 25), (4, 4), (10, 25), (10, 25))
 ```
 
-Supply a nonempty tuple of `SparsePiperKeyRegion` values. Each region counts
+Construct an immutable `SparsePiperKeyLayout` from a nonempty tuple of
+`SparsePiperKeyRegion` values outside compiled forward calls. Each region counts
 consecutive physical K64 blocks, and together they must cover the entire sequence,
-up to 65,536 blocks. This prototype requires complete physical blocks, including
-the last one. Pad region boundaries when needed and use `block_lengths` to exclude
+up to 65,536 blocks. `layout.regions` exposes the partition and `layout.num_blocks`
+its total size. This prototype requires complete physical blocks, including the
+last one. Pad region boundaries when needed and use `block_lengths` to exclude
 padding. The partition is shared across batches, queries, and heads.
+
+Pass the layout as a forward argument or store it on the model. Replacing it with
+another layout of the same total block count reuses the compiled graph, including
+switching between one and two sparse regions, moving boundaries, or changing
+sparse/dense flags. Only the total block count is graph metadata; the partition
+is runtime configuration. Other tensor-shape and model guards still apply, and
+kernel policies can introduce their own variants.
 
 Budgets round across heads independently within each sparse region, with at least
 one block per head per region. Regions cannot borrow each other's budget; small
@@ -153,7 +164,8 @@ that region. IDs in dense regions are already included. These are numerical
 caller preconditions, as for prefix routing.
 
 Region calls support the portable reference, native backends, standalone
-`torch.compile`, and explicit CUDA graphs with a fixed ratio profile. The
+`torch.compile`, and explicit CUDA graphs with a fixed layout and ratio profile.
+Recapture an explicit graph when either configuration changes. The
 prototype uses a separate compiler operator boundary; projection/output and
 coarse-branch fusions currently recognize only the prefix API. A separately
 computed coarse residual can still be added. Existing prefix calls are unchanged.

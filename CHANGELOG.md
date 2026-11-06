@@ -7,10 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
-- Experimental `SparsePiperAttention` calls with `key_regions=...` partition key
-  storage with `SparsePiperKeyRegion` values. Each sparse region receives its own
-  per-head keep budget; dense regions can appear between sparse regions, within
-  one softmax. Regions must cover complete physical 64-token blocks.
+- Experimental `SparsePiperAttention` calls with `key_layout=...` partition key
+  storage with an immutable `SparsePiperKeyLayout` of `SparsePiperKeyRegion` values.
+  Construct layouts outside compiled forwards; changing region count, boundaries,
+  or sparse/dense flags at the same total block count reuses the compiled graph.
+  Each sparse region receives its own per-head keep budget; dense regions can
+  appear between sparse regions, within one softmax. Regions must cover complete
+  physical 64-token blocks.
   `resolve_region_keep_blocks()` reports exact regional budgets. Standalone
   compilation is supported; projection/output fusions still use the prefix API.
 

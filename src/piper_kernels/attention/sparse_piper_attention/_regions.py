@@ -7,10 +7,11 @@ head budgets and absolute block IDs, never region metadata.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
+from torch._custom_class_base import CustomClassBase
+from torch._library.opaque_object import MemberType, register_custom_class
 
 from ._budget import (
     _UINT16_ROUTE_CAPACITY,
@@ -43,40 +44,82 @@ class SparsePiperKeyRegion:
             raise TypeError("region sparse must be a bool")
 
 
-def validate_key_regions(regions: tuple[SparsePiperKeyRegion, ...]) -> int:
-    """Validate a caller's partition and return its physical key block count."""
-    if not isinstance(regions, tuple) or not regions:
-        raise ValueError("key_regions must be a nonempty tuple of SparsePiperKeyRegion values")
-    if any(not isinstance(region, SparsePiperKeyRegion) for region in regions):
-        raise TypeError("key_regions must contain SparsePiperKeyRegion values")
-    num_blocks = sum(region.num_blocks for region in regions)
-    if num_blocks > _UINT16_ROUTE_CAPACITY:
-        raise ValueError("key_regions must cover at most 65536 physical blocks")
-    return num_blocks
+@dataclass(frozen=True, slots=True)
+class SparsePiperKeyLayout(CustomClassBase):
+    """Partition key storage into independently budgeted sparse and dense regions.
+
+    ``regions`` is a nonempty tuple of ``SparsePiperKeyRegion`` values in physical
+    key order, covering at most 65536 complete 64-token blocks. The partition is
+    immutable and shared by every batch, query, and head. Attention checks that
+    its total block count covers the supplied sequence exactly.
+
+    Construct outside compiled forward calls. Replacing a layout with another
+    having the same ``num_blocks`` reuses the compiled graph, even when region
+    count, boundaries, or sparse/dense flags change. Tensor shapes and kernel
+    policies can still introduce other specializations. Explicit CUDA graphs
+    require a fixed layout and ratio profile; recapture when either changes.
+    """
+
+    regions: tuple[SparsePiperKeyRegion, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.regions, tuple):
+            raise TypeError("layout regions must be a tuple of SparsePiperKeyRegion values")
+        if not self.regions:
+            raise ValueError("layout regions must be nonempty")
+        if any(not isinstance(region, SparsePiperKeyRegion) for region in self.regions):
+            raise TypeError("layout regions must contain SparsePiperKeyRegion values")
+        if self.num_blocks > _UINT16_ROUTE_CAPACITY:
+            raise ValueError("key layout must cover at most 65536 physical blocks")
+
+    @property
+    def num_blocks(self) -> int:
+        """Return the total number of physical 64-token blocks in the partition."""
+        return sum(region.num_blocks for region in self.regions)
+
+
+def _layout_guards(layout: SparsePiperKeyLayout) -> list[int]:
+    return [layout.num_blocks]
+
+
+# Match the ratio profile's runtime boundary: only sequence coverage is graph
+# metadata. Region structure is read inside the operator, outside Dynamo tracing.
+# Consumers must remain cudagraph_unsafe because replay would retain the layout
+# and budgets used at capture, without running these custom-object guards.
+register_custom_class(
+    SparsePiperKeyLayout,
+    typ="symbolic",
+    guard_fn=_layout_guards,
+    members={"num_blocks": MemberType.USE_REAL},
+)
+
+
+def validate_key_layout(key_layout: SparsePiperKeyLayout) -> None:
+    """Check the public argument type; construction owns partition validation."""
+    if not isinstance(key_layout, SparsePiperKeyLayout):
+        raise TypeError("key_layout must be a SparsePiperKeyLayout")
 
 
 def resolve_region_keep_blocks(
     ratio_units: tuple[int, ...],
-    region_blocks: Sequence[int],
-    region_sparse: Sequence[bool],
+    key_layout: SparsePiperKeyLayout,
 ) -> tuple[tuple[int, ...], ...]:
     """Resolve validated configuration, rounding across heads within each region."""
     return tuple(
-        _resolve_head_keep_blocks(ratio_units, num_blocks)
-        if sparse
-        else (num_blocks,) * len(ratio_units)
-        for num_blocks, sparse in zip(region_blocks, region_sparse, strict=True)
+        _resolve_head_keep_blocks(ratio_units, region.num_blocks)
+        if region.sparse
+        else (region.num_blocks,) * len(ratio_units)
+        for region in key_layout.regions
     )
 
 
 def resolve_region_route_layout(
     ratio_units: tuple[int, ...],
-    region_blocks: Sequence[int],
-    region_sparse: Sequence[bool],
+    key_layout: SparsePiperKeyLayout,
     device: torch.device,
 ) -> _ResolvedRouteLayout:
     """Build total head budgets and region destinations with one metadata transfer."""
-    budgets = resolve_region_keep_blocks(ratio_units, region_blocks, region_sparse)
+    budgets = resolve_region_keep_blocks(ratio_units, key_layout)
     num_heads = len(ratio_units)
     totals = tuple(sum(counts[head] for counts in budgets) for head in range(num_heads))
     offsets = [0]
@@ -88,7 +131,8 @@ def resolve_region_route_layout(
     values = [*totals, *offsets]
     regions = []
     start_key_block = start_score_block = 0
-    for num_blocks, counts in zip(region_blocks, budgets, strict=True):
+    for key_region, counts in zip(key_layout.regions, budgets, strict=True):
+        num_blocks = key_region.num_blocks
         region = ResolvedRouteRegion(
             start_key_block=start_key_block,
             num_key_blocks=num_blocks,

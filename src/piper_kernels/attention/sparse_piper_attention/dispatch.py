@@ -23,10 +23,10 @@ from ._budget import (
 from ._dtype import SUPPORTED_DTYPES
 from ._force_tiles import validate_force_tiles
 from ._regions import (
-    SparsePiperKeyRegion,
+    SparsePiperKeyLayout,
     resolve_region_keep_blocks,
     resolve_region_route_layout,
-    validate_key_regions,
+    validate_key_layout,
 )
 from ._routing import packed_routes_from_sequences, packed_routes_from_summaries
 from ._routing_modes import (
@@ -82,7 +82,7 @@ class SparsePiperAttention(torch.nn.Module):
         return _resolve_head_keep_blocks(self._ratio_profile.units, sparse_key_blocks)
 
     def resolve_region_keep_blocks(
-        self, key_regions: tuple[SparsePiperKeyRegion, ...]
+        self, key_layout: SparsePiperKeyLayout
     ) -> tuple[tuple[int, ...], ...]:
         """Return per-head budgets in region order without accessing device state.
 
@@ -91,12 +91,8 @@ class SparsePiperAttention(torch.nn.Module):
         Call outside compiled forward calls. Forced IDs in each sparse region
         must fit every head's budget for that region.
         """
-        validate_key_regions(key_regions)
-        return resolve_region_keep_blocks(
-            self._ratio_profile.units,
-            tuple(region.num_blocks for region in key_regions),
-            tuple(region.sparse for region in key_regions),
-        )
+        validate_key_layout(key_layout)
+        return resolve_region_keep_blocks(self._ratio_profile.units, key_layout)
 
     def forward(
         self,
@@ -105,7 +101,7 @@ class SparsePiperAttention(torch.nn.Module):
         value: torch.Tensor,
         *,
         sparse_key_blocks: int | None = None,
-        key_regions: tuple[SparsePiperKeyRegion, ...] | None = None,
+        key_layout: SparsePiperKeyLayout | None = None,
         sparse_query_blocks: int | None = None,
         scale: float | None = None,
         block_lengths: torch.Tensor | None = None,
@@ -124,13 +120,16 @@ class SparsePiperAttention(torch.nn.Module):
         routes belong to query heads; K/V preparation and storage remain shared.
 
         Supply either ``sparse_key_blocks`` for the existing prefix layout or
-        experimental ``key_regions`` for a complete ordered partition of key
-        storage. Regions must cover exactly the sequence's complete K64 blocks
+        experimental ``key_layout`` for a complete ordered partition of key
+        storage. Construct a ``SparsePiperKeyLayout`` outside compiled forward
+        calls. Regions must cover exactly the sequence's complete K64 blocks
         (at most 65536); compact partial tails require padding. Sparse regions
         apply the head ratios independently, and dense regions keep all blocks,
         within one softmax. ``resolve_region_keep_blocks`` reports their budgets.
-        Region calls support standalone compilation; projection/output compiler
-        fusions currently recognize only the prefix form.
+        Layouts with the same total block count reuse compiled graphs when
+        region count, boundaries, or sparse/dense flags change. Projection/output
+        compiler fusions currently recognize only the prefix form. Explicit CUDA
+        graphs require a fixed layout and ratio profile.
 
         Experimental fixed-budget forced routing takes contiguous device INT32
         ``force_tile_ids[query_blocks, capacity]`` and ``force_tile_counts[query_blocks]``.
@@ -143,13 +142,13 @@ class SparsePiperAttention(torch.nn.Module):
         score. ID/count contents may change at fixed shapes without recompiling.
         Compatible projection/output fusions preserve these runtime inputs,
         including chunked query execution and the independent coarse residual.
-        With ``key_regions``, IDs lie within the complete physical block count. Forced IDs
+        With ``key_layout``, IDs lie within the complete physical block count. Forced IDs
         in each sparse region consume that region's budget independently; IDs
         in dense regions are already included. These counts must fit every head's
         regional budget, as a caller precondition.
         """
-        if (sparse_key_blocks is None) == (key_regions is None):
-            raise ValueError("supply exactly one of sparse_key_blocks or key_regions")
+        if (sparse_key_blocks is None) == (key_layout is None):
+            raise ValueError("supply exactly one of sparse_key_blocks or key_layout")
         converted_scale = _validate_inputs(
             query,
             key,
@@ -165,19 +164,16 @@ class SparsePiperAttention(torch.nn.Module):
             query_blocks=(query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
             device=query.device,
         )
-        if key_regions is not None:
-            num_key_blocks = validate_key_regions(key_regions)
-            if query.shape[1] != num_key_blocks * _BLOCK_ROWS:
-                raise ValueError(
-                    "key_regions must cover exactly the sequence's complete K64 blocks"
-                )
+        if key_layout is not None:
+            validate_key_layout(key_layout)
+            if query.shape[1] != key_layout.num_blocks * _BLOCK_ROWS:
+                raise ValueError("key_layout must cover exactly the sequence's complete K64 blocks")
             return _sparse_piper_region_attention_op(
                 query,
                 key,
                 value,
                 self._ratio_profile,
-                [region.num_blocks for region in key_regions],
-                [region.sparse for region in key_regions],
+                key_layout,
                 converted_scale,
                 self._routing_mode,
                 block_lengths,
@@ -465,8 +461,7 @@ def _sparse_piper_region_attention_op(  # noqa: PLR0913, PLR0917
     key: torch.Tensor,
     value: torch.Tensor,
     ratio_profile: _SparsePiperRatioProfile,
-    region_blocks: list[int],
-    region_sparse: list[bool],
+    key_layout: SparsePiperKeyLayout,
     scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
@@ -474,9 +469,7 @@ def _sparse_piper_region_attention_op(  # noqa: PLR0913, PLR0917
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    layout = resolve_region_route_layout(
-        ratio_profile.units, region_blocks, region_sparse, query.device
-    )
+    layout = resolve_region_route_layout(ratio_profile.units, key_layout, query.device)
     # The existing consumer already supports a complete absolute route list:
     # set its routeable extent to the entire sequence, leaving no implicit suffix.
     return _run_sparse_piper_attention(
@@ -484,7 +477,7 @@ def _sparse_piper_region_attention_op(  # noqa: PLR0913, PLR0917
         key,
         value,
         layout,
-        sparse_key_blocks=sum(region_blocks),
+        sparse_key_blocks=key_layout.num_blocks,
         sparse_query_blocks=sparse_query_blocks,
         scale=scale,
         routing_mode=routing_mode,
@@ -500,8 +493,7 @@ def _sparse_piper_region_attention_op_fake(
     _key: torch.Tensor,
     _value: torch.Tensor,
     _ratio_profile: _SparsePiperRatioProfile,
-    _region_blocks: list[int],
-    _region_sparse: list[bool],
+    _key_layout: SparsePiperKeyLayout,
     _scale: float,
     _routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
