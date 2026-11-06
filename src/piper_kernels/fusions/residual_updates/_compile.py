@@ -23,14 +23,14 @@ new full-size outputs are gone.
 The rewrite runs before every other custom pass and names no fusion. A fusion whose
 operator has a residual-add counterpart finds the adds that alone read its output with
 ``_graph.compute_inside_adds`` and computes that output inside the add, which also drops
-the full-size update. Unmatched graphs are unchanged; debug logging reports what was
+the full-size update. Unmatched graphs, including those on devices Triton doesn't
+support, are unchanged. Debug logging here and in ``_graph`` reports what was
 rewritten, and Inductor's reinplacing log reports any input it had to copy.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Mapping
 
 import torch
@@ -39,7 +39,7 @@ from torch.fx.node import Argument
 
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _graph, _ops, triton
+from . import _gates, _graph, _ops, triton
 from ._graph import RESIDUAL_ADD, call_functional
 
 _log = logging.getLogger(__name__)
@@ -47,11 +47,6 @@ _COMPILE_PASS_VERSION = "residual-updates-compile-v4"
 
 _aten = torch.ops.aten
 _COPY = _aten.copy_.default
-# Each gate-row selection and whether it wraps negative indices, as Python indexing does.
-_GATE_SELECTIONS: dict[object, bool] = {
-    _aten.index.Tensor: True,
-    _aten.index_select.default: False,
-}
 
 
 def _source_files() -> tuple[str, ...]:
@@ -61,6 +56,7 @@ def _source_files() -> tuple[str, ...]:
         for path in (
             __file__,
             triton.__file__,
+            _gates.__file__,
             _graph.__file__,
             _ops.__file__,
             preparation_sharing.__file__,
@@ -73,65 +69,6 @@ def _metadata(value: Argument) -> torch.Tensor | None:
     return preparation_sharing.tensor_metadata(value) if isinstance(value, torch.fx.Node) else None
 
 
-def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
-    return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
-
-
-def _selected_gate(node: Argument) -> tuple[torch.fx.Node, torch.fx.Node, bool] | None:
-    """Return ``(gate, indices, python_indexing)`` if ``node`` selects one gate row per index."""
-    if not isinstance(node, torch.fx.Node):
-        return None
-    python_indexing = _GATE_SELECTIONS.get(node.target)
-    if python_indexing is None:
-        return None
-    if python_indexing:
-        gate, indices = node.args
-        if not isinstance(indices, (list, tuple)) or len(indices) != 1:
-            return None
-        (indices,) = indices
-    else:
-        gate, dimension, indices = node.args
-        if dimension != 0:
-            return None
-    if not isinstance(gate, torch.fx.Node) or not isinstance(indices, torch.fx.Node):
-        return None
-    return gate, indices, python_indexing
-
-
-def _valid_add(values: Mapping[str, Argument]) -> bool:
-    """Whether ``residual_add_`` accepts these operands, from their metadata."""
-    base, update, gate, indices = (
-        _metadata(values[name]) for name in ("base", "update", "gate", "gate_indices")
-    )
-    if base is None or update is None or gate is None or indices is None or base.ndim < 1:
-        return False
-    rows = math.prod(base.shape[:-1])
-    return bool(
-        base.dtype.is_floating_point
-        and all(
-            value.ndim == base.ndim
-            and all(map(_same_dimension, value.shape, base.shape))
-            and value.dtype is base.dtype
-            and value.device == base.device
-            and value.layout is torch.strided
-            and value.is_contiguous()
-            for value in (base, update)
-        )
-        and gate.ndim == 2
-        and gate.dtype is base.dtype
-        and gate.device == base.device
-        and gate.layout is torch.strided
-        and gate.stride(-1) == 1
-        and _same_dimension(gate.shape[-1], base.shape[-1])
-        and indices.ndim == 1
-        and indices.dtype in (torch.int32, torch.int64)
-        and indices.device == base.device
-        and indices.layout is torch.strided
-        and indices.is_contiguous()
-        and _same_dimension(indices.numel(), rows)
-    )
-
-
 def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
     """Return ``residual_add_``'s arguments if ``node`` is ``base + gate[indices] * update``."""
     if node.target is not _aten.add.Tensor or len(node.args) != 2 or node.kwargs:
@@ -142,18 +79,27 @@ def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
     if len(product.args) != 2 or product.kwargs:
         return None
     for selection, update in (product.args, product.args[::-1]):
-        selected = _selected_gate(selection)
+        selected = _gates.selected_gate(selection)
         if selected is None:
             continue
         gate, indices, python_indexing = selected
-        values: dict[str, Argument] = {
+        operands = (_metadata(base), _metadata(update), _metadata(gate), _metadata(indices))
+        base_value, update_value, gate_value, indices_value = operands
+        if (
+            base_value is None
+            or update_value is None
+            or gate_value is None
+            or indices_value is None
+            or not _ops.supports_residual_add(base_value, update_value, gate_value, indices_value)
+        ):
+            return None
+        return {
             "base": base,
             "update": update,
             "gate": gate,
             "gate_indices": indices,
             "python_indexing": python_indexing,
         }
-        return values if _valid_add(values) else None
     return None
 
 

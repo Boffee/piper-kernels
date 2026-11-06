@@ -228,7 +228,7 @@ def _ffn_launch(
             for weight in packed
         )
         chunk_rows = (
-            gelu._default_chunk_rows(source, packed[0].qdata, packed[-1].qdata, gated_updates=False)
+            gelu._default_chunk_rows(source, packed[0].qdata, packed[-1].qdata, adds_residual=False)
             if case.activation == "gelu"
             else _core.DEFAULT_CHUNK_ROWS
         )
@@ -262,7 +262,7 @@ def _ffn_launch(
     if case.activation == "gelu":
         preparation = rotated_gelu._preparation_backends(groups[0], groups[-1], False, False)
         chunk_rows = nv_gelu._default_chunk_rows(
-            source, nv_weights[0].qdata, nv_weights[-1].qdata, gated_updates=False
+            source, nv_weights[0].qdata, nv_weights[-1].qdata, adds_residual=False
         )
     else:
         preparation = rotated_swiglu._preparation_backends(

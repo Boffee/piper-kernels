@@ -1,10 +1,68 @@
-"""Generic in-place residual add."""
+"""Generic in-place residual add, and the operand contract compiler rewrites check.
+
+``residual_add_`` validates its operands when it runs. :func:`supports_residual_add`
+checks the same contract, plus device support, from compile-time metadata, comparing
+symbolic sizes without adding shape guards; change both together.
+"""
 
 from __future__ import annotations
 
+import math
+
 import torch
 
+from piper_kernels._triton import runtime
+from piper_kernels.linear import _preparation_sharing as preparation_sharing
+
 from . import triton as residual_updates
+
+
+def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
+    return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
+
+
+def supports_residual_add(
+    base: torch.Tensor,
+    update: torch.Tensor | None,
+    gate: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    """Whether adding ``gate[indices] * update`` into ``base`` can run, from metadata.
+
+    ``base``, and ``update`` when given, must be contiguous floating-point tensors with
+    one shape and dtype, on a device Triton supports. ``gate`` is two-dimensional, with
+    unit-stride rows of ``base``'s features and dtype; ``indices`` holds one int32 or
+    int64 row index per ``base`` row. Symbolic sizes are compared without adding shape
+    guards.
+    """
+    if base.ndim < 1 or not base.dtype.is_floating_point:
+        return False
+    rows = math.prod(base.shape[:-1])
+    return bool(
+        all(
+            value.ndim == base.ndim
+            and all(map(_same_dimension, value.shape, base.shape))
+            and value.dtype is base.dtype
+            and value.device == base.device
+            and value.layout is torch.strided
+            and value.is_contiguous()
+            for value in (base, update)
+            if value is not None
+        )
+        and gate.ndim == 2
+        and gate.dtype is base.dtype
+        and gate.device == base.device
+        and gate.layout is torch.strided
+        and gate.stride(-1) == 1
+        and _same_dimension(gate.shape[-1], base.shape[-1])
+        and indices.ndim == 1
+        and indices.dtype in (torch.int32, torch.int64)
+        and indices.device == base.device
+        and indices.layout is torch.strided
+        and indices.is_contiguous()
+        and _same_dimension(indices.numel(), rows)
+        and runtime.supports_device(base.device)
+    )
 
 
 def _validate(

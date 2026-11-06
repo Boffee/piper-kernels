@@ -7,16 +7,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- `residual_updates_compile_options()` now rewrites every gated sum
-  `base + gate[indices] * update` that builds a copy-back block's result from its
-  input, whatever produced the update, instead of only a ConvRot INT8 SwiGLU FFN
-  update and the attention update before it. Blocks with another FFN fusion, more
-  than two updates, or no fused FFN now add their updates into the input in place.
-  An output of any FFN fusion (ConvRot INT8, NVFP4, or ConvRot NVFP4; SwiGLU or
-  GELU) is computed inside its add, as a fused ConvRot INT8 Piper attention output
-  already was. The rewrite now runs ahead of every other post-grad pass, so the
-  helper can be applied before or after the fusion helpers. Blocks it rewrote
-  before compute the same results.
+- `residual_updates_compile_options()` now rewrites each gated sum
+  `base + gate[indices] * update`, with `gate` rows selected per input row, that
+  builds a copy-back block's result from its input on a device Triton supports,
+  whatever produced the update. It previously required a ConvRot INT8 SwiGLU FFN
+  update, with the attention update before it. Blocks with another FFN fusion, more
+  than two updates, or no fused FFN now add their updates into the input in place;
+  blocks on other devices, or whose gates broadcast across rows, are unchanged. An
+  output of any FFN fusion (ConvRot INT8, NVFP4, or ConvRot NVFP4; SwiGLU or GELU)
+  is computed inside its add, as a fused ConvRot INT8 Piper attention output already
+  was; the NVFP4 and ConvRot NVFP4 cases are not yet validated on NVIDIA hardware.
+  The rewrite now runs ahead of every other post-grad pass, so the helper can be
+  applied before or after the fusion helpers. Blocks it rewrote before compute the
+  same results.
 
 ## [0.8.0rc2] - 2026-11-05
 
