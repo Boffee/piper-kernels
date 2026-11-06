@@ -179,6 +179,11 @@ for _source_convrot, _down_convrot in ((True, True), (True, False), (False, True
 def _fold_chunked_ffn(graph: torch.fx.Graph) -> bool:
     changes = _gated_updates_patterns.apply(graph)
     changes += _patterns.apply(graph)
+    changes += ffn_compile.fold_residual_adds(
+        graph,
+        torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn.default,
+        torch.ops.piper_kernels.convrot_nvfp4_swiglu_ffn_residual_add_.default,
+    )
     changed = changes > 0
     if changed:
         graph.eliminate_dead_code()
@@ -209,7 +214,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     _preparation.__file__,
                     convrot_preparation.__file__,
                     swiglu_backend.__file__,
-                    ffn_compile.__file__,
+                    *ffn_compile.SOURCE_FILES,
                     ffn_pattern.__file__,
                     residual_updates.__file__,
                     swiglu_ffn_pattern.__file__,

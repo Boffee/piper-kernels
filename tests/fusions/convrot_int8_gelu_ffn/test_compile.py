@@ -19,6 +19,8 @@ from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
+from .._ffn_residual_add import assert_copy_back_computes_ffn_inside_its_add
+
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 
@@ -284,6 +286,23 @@ def test_compile_options_fold_indexed_gated_updates(python_indexing: bool) -> No
         == 1
     )
     assert torch.ops.piper_kernels.convrot_int8_gelu_ffn.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+@pytest.mark.parametrize("python_indexing", [False, True])
+def test_copy_back_gated_updates_compute_the_ffn_inside_its_residual_add(
+    python_indexing: bool,
+) -> None:
+    torch.manual_seed(521)
+    assert_copy_back_computes_ffn_inside_its_add(
+        _GatedUpdates(python_indexing=python_indexing).eval(),
+        _gated_update_arguments(257),
+        "convrot_int8_gelu_ffn",
+        convrot_int8_compile_options(),
+        convrot_int8_gelu_ffn_compile_options(),
+        0.01,
+    )
 
 
 @pytest.mark.gpu
