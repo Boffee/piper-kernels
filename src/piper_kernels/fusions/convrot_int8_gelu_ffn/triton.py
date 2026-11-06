@@ -16,11 +16,13 @@ def _default_chunk_rows(
     up_weight_qdata: torch.Tensor,
     down_weight_qdata: torch.Tensor,
     *,
-    gated_updates: bool,
+    adds_residual: bool,
 ) -> int:
     """Bound reusable row scratch while amortizing per-chunk launches.
 
-    ConvRot backends independently choose their power-of-two feature chunks.
+    ConvRot backends independently choose their power-of-two feature chunks. An op
+    that ``adds_residual`` projects each chunk into scratch before adding it, which
+    takes its own buffer when the output is wider than the intermediate.
     """
     input_features = up_weight_qdata.shape[1]
     intermediate_features = up_weight_qdata.shape[0]
@@ -35,7 +37,7 @@ def _default_chunk_rows(
     scale_bytes = torch.float32.itemsize
     projected_output_bytes = (
         output_features * input.element_size()
-        if gated_updates and output_features > intermediate_features
+        if adds_residual and output_features > intermediate_features
         else 0
     )
     bytes_per_row = projection_bytes + preparation_bytes + scale_bytes + projected_output_bytes

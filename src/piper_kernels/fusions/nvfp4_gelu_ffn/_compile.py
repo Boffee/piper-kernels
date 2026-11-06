@@ -76,7 +76,7 @@ def _valid_semantic_ffn(match: Match) -> bool:
     )
 
 
-def _chunk_rows(match: Match, *, gated_updates: bool) -> int:
+def _chunk_rows(match: Match, *, adds_residual: bool) -> int:
     operands = _MatchedFfn.from_match(match)
     assert operands is not None
     input_value = preparation_sharing.tensor_metadata(operands.up.input)
@@ -89,7 +89,7 @@ def _chunk_rows(match: Match, *, gated_updates: bool) -> int:
         input_value,
         up_weight,
         down_weight,
-        gated_updates=gated_updates,
+        adds_residual=adds_residual,
     )
 
 
@@ -101,7 +101,7 @@ def _replace_semantic_ffn(match: Match, **_unused: object) -> None:
     with graph.inserting_before(original):
         replacement = graph.call_function(
             torch.ops.piper_kernels.nvfp4_gelu_ffn.default,
-            args=(*operands.arguments(), _chunk_rows(match, gated_updates=False)),
+            args=(*operands.arguments(), _chunk_rows(match, adds_residual=False)),
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -126,7 +126,7 @@ def _replace_semantic_ffn_gated_updates(match: Match, **_unused: object) -> None
                 match.kwargs["ffn_gate"],
                 match.kwargs["gate_indices"],
                 python_indexing,
-                _chunk_rows(match, gated_updates=True),
+                _chunk_rows(match, adds_residual=True),
             ),
         )
     mutation.meta["val"] = None

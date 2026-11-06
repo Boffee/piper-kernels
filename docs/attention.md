@@ -252,15 +252,16 @@ unchanged.
 
 Each gated sum `base + gate[indices] * update` that builds the copied-back result
 from the input becomes an add into the input, whatever produced its update, which
-removes the block's new output buffers. `gate` is two-dimensional, `indices` holds
-one row index per input row (`gate.index_select(0, indices)` also works), and
-`update` matches the input. An update from an FFN fusion,
-`{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn`, or from a fused ConvRot INT8
-Piper attention output, dense or sparse with fused Q projection, is computed inside
-its add, which also removes that full-size output. The rewritten graph stays
-functional, and Inductor adds an update in place only when the block reads none of
-the input's original values afterward, through any view; otherwise it copies the
-input first, which keeps the result correct but forgoes that update's saving.
+removes the block's new output buffers. The helper's docstring states which gates,
+updates, and devices qualify; per-token gates selected by index do, while blocks whose
+gates broadcast across rows are left unchanged. When an FFN fusion,
+`{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn`, or a fused ConvRot INT8 Piper
+attention output, dense or sparse with fused Q projection, produced the update, that
+fusion computes its output inside the add, which also removes that full-size output.
+The rewritten graph stays functional, and Inductor adds an update in place only when
+the block reads none of the input's original values afterward, through any view;
+otherwise it copies the input first, which keeps the result correct but forgoes that
+update's saving.
 Updates round the residual separately, so results can differ slightly. The helper
 also disables Inductor buffer reuse, which could otherwise hold a dead full-size
 buffer across attention. See the

@@ -40,7 +40,7 @@ def _valid_semantic_ffn(match: Match) -> bool:
     return match.kwargs["logical_dtype"] is input_value.dtype
 
 
-def _chunk_rows(match: Match, *, gated_updates: bool) -> int:
+def _chunk_rows(match: Match, *, adds_residual: bool) -> int:
     input_value = ffn_compile_common.argument_metadata(match, "ffn_input")
     up_weight = ffn_compile_common.argument_metadata(match, "up_weight_qdata")
     down_weight = ffn_compile_common.argument_metadata(match, "down_weight_qdata")
@@ -51,7 +51,7 @@ def _chunk_rows(match: Match, *, gated_updates: bool) -> int:
         input_value,
         up_weight,
         down_weight,
-        gated_updates=gated_updates,
+        adds_residual=adds_residual,
     )
 
 
@@ -85,7 +85,7 @@ def _replace_semantic_ffn(  # noqa: PLR0913, PLR0917
                 down_weight_scale,
                 down_bias,
                 down_group_size,
-                _chunk_rows(match, gated_updates=False),
+                _chunk_rows(match, adds_residual=False),
                 up_input_scale,
                 down_input_scale,
             ),
@@ -138,7 +138,7 @@ def _replace_semantic_ffn_gated_updates(  # noqa: PLR0913, PLR0917
                 ffn_gate,
                 gate_indices,
                 python_indexing,
-                _chunk_rows(match, gated_updates=True),
+                _chunk_rows(match, adds_residual=True),
                 up_input_scale,
                 down_input_scale,
             ),
