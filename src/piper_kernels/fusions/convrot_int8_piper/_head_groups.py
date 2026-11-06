@@ -98,6 +98,11 @@ def _head_grouped_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     adds its share of the output projection, over its columns of ``weight_qdata``, into
     ``base``; ``bias`` is added once. Per-token output-activation scales cover each
     group's features separately, and ``base`` rounds once per group.
+
+    ``query_chunk_rows`` caps an ungrouped window's rows. A group's windows may hold
+    ``head_groups`` times as many rows, so each attention launch keeps the ungrouped
+    rows times heads, and the query and attention-output buffers keep their size; only the
+    output-projection scratch, which spans every output feature, grows with the rows.
     """
     query_rows, key_rows = validate_head_groups(
         query_weight,
@@ -158,7 +163,7 @@ def _head_grouped_attention_residual_add_op(  # noqa: PLR0913, PLR0917
             group_size,
             output_input_scale,
             head_dim=head_dim,
-            query_chunk_rows=query_chunk_rows,
+            query_chunk_rows=query_chunk_rows * head_groups,
         )
         # Release this group's K and V before the next group allocates its own.
         del group_key, group_value
@@ -263,5 +268,5 @@ def _head_grouped_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
         group_size,
         output_input_scale,
         head_dim=head_dim,
-        query_chunk_rows=query_chunk_rows,
+        query_chunk_rows=query_chunk_rows * head_groups,
     )

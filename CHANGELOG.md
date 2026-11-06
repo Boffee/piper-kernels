@@ -9,8 +9,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - `residual_updates_compile_options(attention_head_groups=n)` runs a fused dense
   ConvRot INT8 Piper attention's residual add in `n` head groups, one after another,
-  so only one group's K and V are allocated; with four groups, its extra memory falls
-  to about a third. The count must divide the attention's query and K/V heads and
+  so only one group's K and V are allocated. At MiniMax-H3's shape, two groups cut the
+  attention's peak extra memory from 2.13 to 1.18 GiB at the same speed. The count must
+  divide the attention's query and K/V heads and
   give each group a multiple of the output projection's ConvRot group size; attention
   it doesn't fit, sparse attention, and attention whose K or V has other consumers
   stay ungrouped. Results differ slightly from one group, because each group

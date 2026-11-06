@@ -172,3 +172,43 @@ def test_head_groups_validate_group_operands_from_metadata():
     query, context, projection, residual = _attention("meta", sequence=65, causal=False)
     with pytest.raises(ValueError, match="square causal attention"):
         _add_grouped(query, context, projection, residual, causal=True, head_groups=2, fake=True)
+
+
+def test_each_group_projects_its_rows_and_adds_its_columns(monkeypatch):
+    query, context, projection, residual = _attention("cpu", sequence=65, causal=False)
+    calls = {"key": [], "value": [], "add": []}
+
+    def project_key(*arguments, **keywords):
+        calls["key"].append(arguments)
+        return torch.zeros(1), torch.zeros(1)
+
+    def project_value(*arguments, **keywords):
+        calls["value"].append(arguments)
+        return torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
+
+    def residual_add(*arguments, **keywords):
+        calls["add"].append((arguments, keywords))
+
+    monkeypatch.setattr(key, "_project_key_op", project_key)
+    monkeypatch.setattr(value, "_project_value_op", project_value)
+    monkeypatch.setattr(output, "_projected_query_attention_residual_add_op", residual_add)
+
+    _add_grouped(query, context, projection, residual, causal=False, head_groups=2)
+
+    rows = _HEADS // 2 * _HEAD_DIM
+    weight, _, bias = projection
+    for group in range(2):
+        group_rows = slice(group * rows, (group + 1) * rows)
+        assert torch.equal(calls["key"][group][2], context[2][group_rows])
+        assert torch.equal(calls["value"][group][2], context[2][group_rows])
+        arguments, keywords = calls["add"][group]
+        assert torch.equal(arguments[6], query[2][group_rows])
+        # Positions follow the residual add's schema: base, gate, gate_indices,
+        # python_indexing, the 10 query operands, 2 key and 4 value outputs, key_length,
+        # is_causal, then the output projection.
+        output_weight = arguments[22]
+        assert output_weight.is_contiguous()
+        assert torch.equal(output_weight, weight[:, group_rows])
+        # The bias is added once, and each group's windows hold twice the rows.
+        assert arguments[24] is (bias if group == 0 else None)
+        assert keywords["query_chunk_rows"] == 2 * 128

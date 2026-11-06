@@ -112,6 +112,14 @@ Groups split query and K/V heads evenly, so GQA keeps its ratio. Each group's
 features must be a multiple of the output projection's ConvRot group size, because
 the projector rotates each group's slice on its own. The output GEMM needs each
 group's columns contiguous, so it copies them per call. `bias` is added with the
-first group. Per-token output-activation scales cover one group's features, and
+first group.
+
+A group's query windows may hold `head_groups` times the ungrouped row cap, so each
+attention launch keeps the ungrouped rows times heads and its Q and attention-output
+buffers keep their size. With the ungrouped cap, twice as many half-width launches
+cost MiniMax-H3's dense attention 1.4% on RDNA4; with the scaled cap, two groups cost
+0.2%. The output-projection scratch spans every output feature, so it grows with the
+rows; at H3's shape two groups' peak extra memory is 1.18 GiB instead of 1.08 GiB,
+against 2.13 GiB ungrouped. Per-token output-activation scales cover one group's features, and
 `base` rounds once per group, so results differ from one group by INT8 activation
 rounding. One group matches the separate producers and residual add exactly.
