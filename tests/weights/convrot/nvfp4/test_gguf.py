@@ -2,16 +2,13 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from gguf_format._fixtures import dequantize_reference, finite_packed
 
 from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _materialized_reference(
@@ -25,7 +22,7 @@ def _materialized_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("quant_type", list(GGUFQuantizationType))
 def test_from_gguf_matches_materialized_reference(quant_type: GGUFQuantizationType) -> None:
     torch.manual_seed(840 + int(quant_type))
@@ -49,7 +46,7 @@ def test_from_gguf_matches_materialized_reference(quant_type: GGUFQuantizationTy
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_copy_from_gguf_refills_existing_storage_and_scale(dtype: torch.dtype) -> None:
     first = finite_packed(GGUFQuantizationType.IQ4_XS)
@@ -91,7 +88,7 @@ def test_copy_from_gguf_refills_existing_storage_and_scale(dtype: torch.dtype) -
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("is_swizzled_scales", [False, True])
 def test_from_gguf_without_global_scale_matches_from_hp(
     is_swizzled_scales: bool,

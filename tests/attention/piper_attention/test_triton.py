@@ -8,6 +8,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from _accelerators import exact_sm120_available
 from lib.triton_inspection import compiled_artifact
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -38,10 +39,6 @@ def _piper_gpu_available() -> bool:
         torch.cuda.is_available()
         and AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma
     )
-
-
-def _sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _qk_quantization() -> Literal["per_thread", "per_warp"]:
@@ -802,7 +799,7 @@ def test_biased_value_quality() -> None:
     assert mse < 1e-3
 
 
-@pytest.mark.skipif(not _sm120_available(), reason="test requires exact SM120 policy")
+@pytest.mark.skipif(not exact_sm120_available(), reason="test requires exact SM120 policy")
 @pytest.mark.parametrize("derive_value_log_bound", [False, True])
 def test_long_descriptor_path_matches_pointer_path(
     derive_value_log_bound: bool,
@@ -842,7 +839,7 @@ def test_long_descriptor_path_matches_pointer_path(
     torch.testing.assert_close(descriptor, pointer, atol=2**-9, rtol=0.0)
 
 
-@pytest.mark.skipif(not _sm120_available(), reason="test requires exact SM120 policy")
+@pytest.mark.skipif(not exact_sm120_available(), reason="test requires exact SM120 policy")
 def test_ragged_query_tail_falls_back_to_masked_pointer_load() -> None:
     torch.manual_seed(76)
     sequence = 129
@@ -1047,7 +1044,7 @@ def test_explicit_execution_plan_runs_native_loop_controls() -> None:
     assert error.max().item() < 0.12
 
 
-@pytest.mark.skipif(not _sm120_available(), reason="D64 descriptor policy requires SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="D64 descriptor policy requires SM120")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("contents", ["random", "zeros", "constant"])

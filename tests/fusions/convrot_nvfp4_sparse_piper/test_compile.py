@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -46,7 +47,6 @@ from .._nvfp4_sparse_piper_graphs import (
     build_quantized_attention_output_graph,
     run_convrot_passes,
 )
-from ..nvfp4_sparse_piper._helpers import exact_sm120_available
 from ..nvfp4_sparse_piper.test_compile import (
     _ProjectedGateCoarseSparseAttentionOutput,
     _SparseProjectionAttentionOutput,

@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 
 from piper_kernels.fusions.convrot_nvfp4_gelu_ffn.triton import (
     _chunked_gelu_ffn_gated_updates_op,
@@ -10,14 +11,9 @@ from piper_kernels.fusions.convrot_nvfp4_gelu_ffn.triton import (
 
 from ._helpers import make_operands, materialized
 
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
-
-
 pytestmark = [
     pytest.mark.gpu,
-    pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120"),
+    pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120"),
 ]
 
 

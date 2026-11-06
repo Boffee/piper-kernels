@@ -7,6 +7,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from _accelerators import exact_sm120_available
 from lib.triton_inspection import compiled_artifact
 
 import piper_kernels.attention.sage_attention_2pp.triton as sage_attention_2pp_backend
@@ -18,10 +19,6 @@ from piper_kernels.attention.sage_attention_2pp.triton import (
     _ptx_float32_to_e4m3x4,
     _run_sage_attention_2pp,
 )
-
-
-def _sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def _fp8_gpu_available() -> bool:
@@ -130,7 +127,7 @@ def test_triton_matches_quantized_reference(
 
 
 @pytest.mark.skipif(
-    not _sm120_available(),
+    not exact_sm120_available(),
     reason="raw-score reduction before scaling is tuned for SM120",
 )
 @pytest.mark.parametrize(
@@ -214,7 +211,7 @@ def test_sm89_d128_schedule_runs_at_short_sequence(is_causal: bool) -> None:
 
 
 @pytest.mark.skipif(
-    not _sm120_available(),
+    not exact_sm120_available(),
     reason="alternate execution-plan candidates are validated on SM120",
 )
 def test_explicit_execution_plan_runs_alternate_tuning_candidate() -> None:
@@ -304,7 +301,7 @@ def test_triton_supports_rectangular_and_strided_inputs(
 
 
 @pytest.mark.skipif(
-    not _sm120_available(),
+    not exact_sm120_available(),
     reason="tensor-descriptor schedule is tuned for SM120",
 )
 def test_triton_ragged_descriptor_storage_matches_pointer_path() -> None:

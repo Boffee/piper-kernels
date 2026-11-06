@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels import SparsePiperAttention
@@ -21,7 +22,7 @@ from .nvfp4_sparse_piper import test_compile as nvfp4_cases
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not exact_sm120_available(),
     reason="all three sparse projection families require NVIDIA SM120",
 )
 @pytest.mark.parametrize("cudagraphs", [False, True])

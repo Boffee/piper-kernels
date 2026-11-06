@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
@@ -19,12 +20,8 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 from ._helpers import make_operands, materialized
 
 
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
-
-
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("with_weight_global_scale", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -63,7 +60,7 @@ def test_source_affine_precision_in_strided_workspace(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [1, 127, 1536])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_compiled_swiglu_scale_matches_fp32_reference(rows: int, dtype: torch.dtype) -> None:
@@ -78,7 +75,7 @@ def test_compiled_swiglu_scale_matches_fp32_reference(rows: int, dtype: torch.dt
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("rows", [127, 385], ids=["short", "ragged-multi-chunk"])
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
@@ -108,7 +105,7 @@ def test_chunked_ffn_matches_materialized(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("high_first", [False, True])
 def test_static_chunked_ffn_supports_nibble_order_and_distinct_input_scales(
     high_first: bool,
@@ -129,7 +126,7 @@ def test_static_chunked_ffn_supports_nibble_order_and_distinct_input_scales(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_dynamic_source_preparation_uses_one_global_scale_and_bounded_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -179,7 +176,7 @@ def _materialized_gated_updates(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
 def test_chunked_ffn_gated_updates_matches_materialized(dynamic: bool) -> None:
     operands = make_operands(rows=385, output_features=384, dynamic=dynamic, seed=903 + dynamic)
@@ -217,7 +214,7 @@ def test_chunked_ffn_gated_updates_matches_materialized(dynamic: bool) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_chunked_ffn_rejects_misaligned_chunk_rows() -> None:
     operands = make_operands(rows=129, dynamic=False, seed=904)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -21,7 +22,6 @@ from piper_kernels.linear.nvfp4 import reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
 from .._accuracy import assert_fusion_output_close
-from ..nvfp4_sparse_piper._helpers import exact_sm120_available
 from ..nvfp4_sparse_piper.test_output import _arguments as standard_arguments
 
 _OUTPUT_FEATURES = 320

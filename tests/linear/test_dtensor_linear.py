@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _accelerators import exact_sm120_available
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
@@ -253,9 +254,7 @@ def _two_rank_linear(rank, store_path, device_type):
 def test_two_rank_replicated_and_sharded_linear(tmp_path, device_type):
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("requires distributed Gloo support")
-    if device_type == "cuda" and (
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
-    ):
+    if device_type == "cuda" and not exact_sm120_available():
         pytest.skip("requires an SM120 CUDA device")
     mp.spawn(_two_rank_linear, args=(str(tmp_path / "store"), device_type), nprocs=2, join=True)
 
@@ -277,7 +276,7 @@ def test_cuda_dtensor_linear_matches_local_quantized_weight(
     compiled,
     case,
 ):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+    if not exact_sm120_available():
         pytest.skip("requires an SM120 CUDA device")
     torch.manual_seed(19)
     weight = _weight(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels.fusions.nvfp4_gelu_ffn import nvfp4_gelu_ffn_compile_options
@@ -16,10 +17,6 @@ from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pa
 from ._helpers import GatedUpdates, GeluFfn, make_gated_update_arguments, make_operands, relative_l2
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
-
-
-def _exact_sm120_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 
 def test_compile_options_install_fusion_before_nvfp4() -> None:
@@ -52,7 +49,7 @@ def test_compile_pass_uuid_is_versioned_and_stable() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(
     ("up_dynamic", "down_dynamic", "bias_dtype", "high_first", "explicit_promotion"),
     [
@@ -102,7 +99,7 @@ def test_compile_options_fold_semantic_gelu_ffn(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compile_options_fail_closed_when_projection_escapes() -> None:
     operands = make_operands(rows=129, up_dynamic=False, down_dynamic=False, seed=1013)
     model = GeluFfn(operands, expose_up=True).eval()
@@ -125,7 +122,7 @@ def test_compile_options_fail_closed_when_projection_escapes() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compile_options_fail_closed_on_noncontiguous_input() -> None:
     operands = make_operands(rows=258, up_dynamic=False, down_dynamic=False, seed=1015)
     model = GeluFfn(operands).eval()
@@ -147,7 +144,7 @@ def test_compile_options_fail_closed_on_noncontiguous_input() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
     operands = make_operands(rows=257, up_dynamic=False, down_dynamic=False, seed=1019)
     model = GeluFfn(operands).eval()
@@ -170,7 +167,7 @@ def test_compiled_ffn_reuses_one_dynamic_row_graph() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("python_indexing", [False, True])
 def test_compile_options_fold_indexed_gated_updates(python_indexing: bool) -> None:
     operands = make_operands(
@@ -199,7 +196,7 @@ def test_compile_options_fold_indexed_gated_updates(python_indexing: bool) -> No
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_compiled_static_scales_are_runtime_values() -> None:
     operands = make_operands(rows=129, up_dynamic=False, down_dynamic=False, seed=1027)
     model = GeluFfn(operands).eval()

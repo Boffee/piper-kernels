@@ -4,11 +4,11 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import SparsePiperAttention, piper_attention
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _prepare_piper_attention,
     _run_piper_attention,
@@ -22,13 +22,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention._scores_triton import minmax_scores
-
-
-def _sm120_available():
-    # ROCm can also report capability (12, 0); include the accelerator backend.
-    return torch.cuda.is_available() and AcceleratorTarget.from_device(
-        torch.device("cuda")
-    ).is_cuda_capability(12, 0)
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -111,7 +104,7 @@ def test_gqa_invalid_heads_rejected_without_tensor_contents(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm120_available(), reason="requires NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires NVIDIA SM120")
 @pytest.mark.parametrize("query_length", [256, 257])
 def test_dense_gqa_compile_and_prepared_storage(query_length):
     # Keep semantic scalars inside the graph, as in an architecture processor.
@@ -225,7 +218,7 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _sm120_available(), reason="requires NVIDIA SM120")
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires NVIDIA SM120")
 @pytest.mark.parametrize("causal", [False, True])
 def test_dense_gqa_per_thread_preparation(causal):
     query = torch.randn(2, 6, 67, 128, device="cuda", dtype=torch.bfloat16)
