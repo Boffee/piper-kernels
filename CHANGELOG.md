@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Experimental `SparsePiperAttention` calls with `key_regions=...` partition key
+  storage with `SparsePiperKeyRegion` values. Each sparse region receives its own
+  per-head keep budget; dense regions can appear between sparse regions, within
+  one softmax. Regions must cover complete physical 64-token blocks.
+  `resolve_region_keep_blocks()` reports exact regional budgets. Standalone
+  compilation is supported; projection/output fusions still use the prefix API.
+
 ### Changed
 
 - On NVIDIA SM120, fused FP16/BF16 ConvRot INT8 dense/sparse attention output

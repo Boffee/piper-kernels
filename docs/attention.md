@@ -111,6 +111,55 @@ Native sparse backends cover NVIDIA SM89/SM120 and AMD RDNA4. Other devices run 
 portable quantized reference. There is a separate exact sparse reference for
 quality comparisons; it is not the fallback used by this API.
 
+### Independent key regions (experimental)
+
+Use `key_regions` instead of `sparse_key_blocks` to reserve each head's keep ratio
+independently for several videos or other key groups. Sparse and dense regions
+may appear in any order. For example, this layout retains 10% of each video's
+blocks for head 0, 25% for head 1, and every text block for both heads:
+
+```python
+from piper_kernels import SparsePiperAttention, SparsePiperKeyRegion
+
+attention = SparsePiperAttention((0.1, 0.25))
+regions = (
+    SparsePiperKeyRegion(100),  # video 1: 6400 physical rows
+    SparsePiperKeyRegion(4, sparse=False),  # text: 256 physical rows
+    SparsePiperKeyRegion(100),  # video 2
+    SparsePiperKeyRegion(100),  # output video
+)
+# q/k/v have sequence length 304 * 64; Q has two heads.
+output = attention(q, k, v, key_regions=regions)
+budgets = attention.resolve_region_keep_blocks(regions)
+assert budgets == ((10, 25), (4, 4), (10, 25), (10, 25))
+```
+
+Supply a nonempty tuple of `SparsePiperKeyRegion` values. Each region counts
+consecutive physical K64 blocks, and together they must cover the entire sequence,
+up to 65,536 blocks. This prototype requires complete physical blocks, including
+the last one. Pad region boundaries when needed and use `block_lengths` to exclude
+padding. The partition is shared across batches, queries, and heads.
+
+Budgets round across heads independently within each sparse region, with at least
+one block per head per region. Regions cannot borrow each other's budget; small
+regions can therefore retain more blocks than a single combined budget. Dense
+regions skip score computation and selection. All retained keys participate in
+one softmax. `sparse_query_blocks` still independently controls which queries use
+routing; later queries attend every key.
+
+Forced tile IDs are absolute physical key block indices. For each query row,
+the number of forced IDs in each sparse region must fit every head's budget for
+that region. IDs in dense regions are already included. These are numerical
+caller preconditions, as for prefix routing.
+
+Region calls support the portable reference, native backends, standalone
+`torch.compile`, and explicit CUDA graphs with a fixed ratio profile. The
+prototype uses a separate compiler operator boundary; projection/output and
+coarse-branch fusions currently recognize only the prefix API. A separately
+computed coarse residual can still be added. Existing prefix calls are unchanged.
+Regional performance requires workload measurements; see the
+[sparse diagnostic](../benchmarks/benchmark_sparse_piper.py) for layout controls.
+
 ### Caller-forced tiles (experimental)
 
 The experimental fixed-budget forced-routing path additionally accepts
@@ -118,9 +167,11 @@ The experimental fixed-budget forced-routing path additionally accepts
 `force_tile_counts` (contiguous device INT32 `[query_blocks]`). Active IDs in each
 row's counted prefix are shared across batches and heads. Every forced tile is
 included, and the remaining per-head budget is filled by ordinary score selection.
-Counts must lie in `[0, capacity]`; active IDs must be unique and lie in
-`[0, sparse_key_blocks)`, and each count must fit every affected head's resolved
-physical keep budget. These are caller preconditions, with metadata-only validation.
+Counts must lie in `[0, capacity]`, and active IDs must be unique. For prefix
+calls, IDs lie in `[0, sparse_key_blocks)` and each count must fit every affected
+head's resolved physical keep budget. For regional calls, apply the
+[regional ID and budget rules](#independent-key-regions-experimental) above.
+These are caller preconditions, with metadata-only validation.
 Supply rows for every physical query block; dense query suffixes already include
 every key and ignore route selection. Unused ID slots are ignored.
 

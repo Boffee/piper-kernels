@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from benchmark_sparse_piper import _parse_args
+from benchmark_sparse_piper import _parse_args, _parse_key_regions
 from lib.sparse_piper import (
     assert_equal_finite,
     reference_prepared_query,
@@ -10,6 +10,7 @@ from lib.sparse_piper import (
     useful_integer_operations,
 )
 
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperAttention,
@@ -42,6 +43,41 @@ def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
     assert args.ratios == [0.25, 1.0]
     assert args.sequence == [1024, 4096]
     assert args.samples == 3
+
+
+def test_region_diagnostic_retains_independent_budgets_and_dense_blocks():
+    args = _parse_args(
+        [
+            "--sequence",
+            "20480",
+            "--key-regions",
+            "sparse:100",
+            "dense:20",
+            "sparse:100",
+            "sparse:100",
+            "--ratios",
+            "0.1",
+        ]
+    )
+    regions = _parse_key_regions(args.key_regions)
+    budgets = SparsePiperAttention((0.1,)).resolve_region_keep_blocks(regions)
+    assert budgets == ((10,), (20,), (10,), (10,))
+    assert sum(region[0] for region in budgets) == 50
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--key-regions", "sparse:2"],
+        ["--key-regions", "unknown:16"],
+        ["--key-regions", "dense:16", "--sparse-key-blocks", "16"],
+        ["--sparse-key-blocks", "65"],
+        ["--case", "sparse-attention-video-high-eighth", "--key-regions", "sparse:1728"],
+    ],
+)
+def test_region_diagnostic_rejects_ambiguous_or_incomplete_layouts(options):
+    with pytest.raises(SystemExit):
+        _parse_args(options)
 
 
 def test_catalog_case_preserves_sparse_workload_and_rejects_overrides():

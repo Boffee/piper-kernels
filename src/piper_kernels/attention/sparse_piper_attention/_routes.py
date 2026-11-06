@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -69,22 +70,34 @@ class PackedRouteBuilder:
         self._force_tile_mask = force_tile_mask
         self._route_head_offsets = (
             None
-            if self._select_routes is not None
+            if self._select_routes is not None or layout.regions
             else layout.route_head_offsets.detach().cpu().tolist()
         )
         self._head_keep_block_values = (
             None
-            if self._select_routes is not None
+            if self._select_routes is not None or layout.regions
             else layout.head_keep_blocks.detach().cpu().tolist()
         )
+        if self._select_routes is None:
+            for region in layout.regions:
+                if region.keeps_all_blocks:
+                    blocks = torch.arange(
+                        region.start_key_block,
+                        region.start_key_block + region.num_key_blocks,
+                        device=device,
+                        dtype=torch.int32,
+                    ).to(torch.uint16)
+                    for start in region.route_head_offset_values:
+                        self.routes.indices[:, :, start : start + region.num_key_blocks] = blocks
 
     def write(
         self,
         scores: torch.Tensor,
         *,
         query_block_offset: int,
+        compact_scores: bool = False,
     ) -> None:
-        """Select stable top-k routes from one dense-key score chunk."""
+        """Select one score chunk; compact scores omit fully retained regions."""
         if self._full_keep:
             return
         if self._select_routes is not None:
@@ -95,7 +108,24 @@ class PackedRouteBuilder:
                 self._layout.route_head_offsets,
                 query_block_offset=query_block_offset,
                 force_tile_mask=self._force_tile_mask,
+                region_metadata=self._layout.region_metadata,
+                compact_scores=compact_scores,
             )
+            return
+        if self._layout.regions:
+            for region in self._layout.regions:
+                if region.keeps_all_blocks:
+                    continue
+                start = region.start_score_block if compact_scores else region.start_key_block
+                _select_portable_routes(
+                    scores[..., start : start + region.num_key_blocks],
+                    self.routes.indices,
+                    region.route_head_offset_values,
+                    region.head_keep_block_values,
+                    query_block_offset=query_block_offset,
+                    force_tile_mask=self._force_tile_mask,
+                    start_key_block=region.start_key_block,
+                )
             return
         assert self._route_head_offsets is not None
         assert self._head_keep_block_values is not None
@@ -216,16 +246,17 @@ def _validate_route_layout(
 def _select_portable_routes(
     scores: torch.Tensor,
     routes: torch.Tensor,
-    route_head_offsets: list[int],
-    head_keep_block_values: list[int],
+    route_head_offsets: Sequence[int],
+    head_keep_block_values: Sequence[int],
     *,
     query_block_offset: int,
     force_tile_mask: torch.Tensor | None = None,
+    start_key_block: int = 0,
 ) -> None:
     query_stop = query_block_offset + scores.shape[2]
     forced = None
     if force_tile_mask is not None:
-        key_ids = torch.arange(scores.shape[-1], device=scores.device)
+        key_ids = start_key_block + torch.arange(scores.shape[-1], device=scores.device)
         words = force_tile_mask[query_block_offset:query_stop, key_ids // 32]
         forced = ((words >> (key_ids % 32)) & 1).bool()
     for head, count in enumerate(head_keep_block_values):
@@ -242,11 +273,11 @@ def _select_portable_routes(
             priority_order = torch.argsort(priority.int(), dim=-1, descending=True, stable=True)
             selected = selected.gather(-1, priority_order)
         selected = selected[..., :count]
-        selected = selected.sort(dim=-1).values.to(torch.uint16)
+        selected = (start_key_block + selected.sort(dim=-1).values).to(torch.uint16)
         routes[
             :,
             query_block_offset:query_stop,
-            route_head_offsets[head] : route_head_offsets[head + 1],
+            route_head_offsets[head] : route_head_offsets[head] + count,
         ] = selected
 
 

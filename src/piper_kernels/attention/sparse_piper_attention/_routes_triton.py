@@ -124,6 +124,7 @@ def _tiled_radix_select_pass(  # noqa: ANN202
     selector_tile: tl.constexpr,
     force_mask_ptr,  # noqa: ANN001
     has_force: tl.constexpr,
+    start_key_block,  # noqa: ANN001
 ):
     """Select one radix byte while streaming a score row in fixed tiles."""
     histogram = tl.zeros([_RADIX_BINS], tl.int32)
@@ -131,7 +132,9 @@ def _tiled_radix_select_pass(  # noqa: ANN202
         key_offsets = tile_start + tl.arange(0, selector_tile)
         valid = key_offsets < sparse_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
-        ordered_bits = _route_priority_bits(scores, key_offsets, valid, force_mask_ptr, has_force)
+        ordered_bits = _route_priority_bits(
+            scores, start_key_block + key_offsets, valid, force_mask_ptr, has_force
+        )
         active = valid
         if shift < 24:
             active &= (ordered_bits >> (shift + 8)) == prefix
@@ -169,6 +172,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     head_keep_blocks_ptr: torch.Tensor,
     route_head_offsets_ptr: torch.Tensor,
     force_mask_ptr: torch.Tensor,
+    region_metadata_ptr: torch.Tensor,
     sparse_key_blocks: int,
     query_block_offset: int,
     score_batch_stride: int,
@@ -178,90 +182,124 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     route_query_stride: int,
     route_route_stride: int,
     force_mask_stride: int,
+    num_heads: tl.constexpr,
+    has_regions: tl.constexpr,
+    compact_scores: tl.constexpr,
     selector_tile: tl.constexpr,
     has_force: tl.constexpr,
 ) -> None:
     """Select exact stable FP32 top-k routes with runtime row dimensions."""
     query_block = tl.program_id(0)
-    head = tl.program_id(1)
+    head = tl.program_id(1) % num_heads
     batch = tl.program_id(2)
+    start_key_block = 0
+    start_score_block = 0
+    if has_regions:
+        region = tl.program_id(1) // num_heads
+        metadata = region_metadata_ptr + region * (2 * num_heads + 3)
+        start_key_block = tl.load(metadata)
+        sparse_key_blocks = tl.load(metadata + 1)
+        start_score_block = tl.load(metadata + 2) if compact_scores else start_key_block
+        head_keep_block_count = tl.load(metadata + 3 + head)
+        route_head_offset = tl.load(metadata + 3 + num_heads + head)
+    else:
+        route_head_offset = tl.load(route_head_offsets_ptr + head)
+        head_keep_block_count = tl.load(head_keep_blocks_ptr + head)
     score_base = (
-        batch * score_batch_stride + head * score_head_stride + query_block * score_query_stride
+        batch * score_batch_stride
+        + head * score_head_stride
+        + query_block * score_query_stride
+        + start_score_block
     )
-    route_head_offset = tl.load(route_head_offsets_ptr + head)
     output_base = (
         batch * route_batch_stride
         + (query_block_offset + query_block) * route_query_stride
         + route_head_offset * route_route_stride
     )
-    head_keep_block_count = tl.load(head_keep_blocks_ptr + head)
     force_row = force_mask_ptr + (query_block_offset + query_block) * force_mask_stride
 
-    prefix = 0
-    rank = head_keep_block_count
-    prefix, rank = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(24),
-        selector_tile,
-        force_row,
-        has_force,
-    )
-    prefix, rank = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(16),
-        selector_tile,
-        force_row,
-        has_force,
-    )
-    prefix, rank = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(8),
-        selector_tile,
-        force_row,
-        has_force,
-    )
-    threshold_bits, equal_keep = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(0),
-        selector_tile,
-        force_row,
-        has_force,
-    )
-
-    output_offset = 0
-    equal_offset = 0
-    for tile_start in range(0, sparse_key_blocks, selector_tile):
-        key_offsets = tile_start + tl.arange(0, selector_tile)
-        valid = key_offsets < sparse_key_blocks
-        scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
-        ordered_bits = _route_priority_bits(scores, key_offsets, valid, force_row, has_force)
-        equal = valid & (ordered_bits == threshold_bits)
-        equal_rank = equal_offset + tl.cumsum(equal.to(tl.int32), axis=0)
-        selected = valid & ((ordered_bits > threshold_bits) | (equal & (equal_rank <= equal_keep)))
-        local_output_rank = tl.cumsum(selected.to(tl.int32), axis=0) - 1
-        tl.store(
-            routes_ptr + output_base + (output_offset + local_output_rank) * route_route_stride,
-            key_offsets,
-            mask=selected,
+    if has_regions and head_keep_block_count == sparse_key_blocks:
+        for tile_start in range(0, sparse_key_blocks, selector_tile):
+            keys = tile_start + tl.arange(0, selector_tile)
+            tl.store(
+                routes_ptr + output_base + keys * route_route_stride,
+                start_key_block + keys,
+                keys < sparse_key_blocks,
+            )
+    else:
+        prefix = 0
+        rank = head_keep_block_count
+        prefix, rank = _tiled_radix_select_pass(
+            scores_ptr,
+            score_base,
+            sparse_key_blocks,
+            prefix,
+            rank,
+            tl.constexpr(24),
+            selector_tile,
+            force_row,
+            has_force,
+            start_key_block,
         )
-        output_offset += tl.sum(selected.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
-        equal_offset += tl.sum(equal.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
+        prefix, rank = _tiled_radix_select_pass(
+            scores_ptr,
+            score_base,
+            sparse_key_blocks,
+            prefix,
+            rank,
+            tl.constexpr(16),
+            selector_tile,
+            force_row,
+            has_force,
+            start_key_block,
+        )
+        prefix, rank = _tiled_radix_select_pass(
+            scores_ptr,
+            score_base,
+            sparse_key_blocks,
+            prefix,
+            rank,
+            tl.constexpr(8),
+            selector_tile,
+            force_row,
+            has_force,
+            start_key_block,
+        )
+        threshold_bits, equal_keep = _tiled_radix_select_pass(
+            scores_ptr,
+            score_base,
+            sparse_key_blocks,
+            prefix,
+            rank,
+            tl.constexpr(0),
+            selector_tile,
+            force_row,
+            has_force,
+            start_key_block,
+        )
+
+        output_offset = 0
+        equal_offset = 0
+        for tile_start in range(0, sparse_key_blocks, selector_tile):
+            key_offsets = tile_start + tl.arange(0, selector_tile)
+            valid = key_offsets < sparse_key_blocks
+            scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
+            ordered_bits = _route_priority_bits(
+                scores, start_key_block + key_offsets, valid, force_row, has_force
+            )
+            equal = valid & (ordered_bits == threshold_bits)
+            equal_rank = equal_offset + tl.cumsum(equal.to(tl.int32), axis=0)
+            selected = valid & (
+                (ordered_bits > threshold_bits) | (equal & (equal_rank <= equal_keep))
+            )
+            local_output_rank = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+            tl.store(
+                routes_ptr + output_base + (output_offset + local_output_rank) * route_route_stride,
+                start_key_block + key_offsets,
+                mask=selected,
+            )
+            output_offset += tl.sum(selected.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
+            equal_offset += tl.sum(equal.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
 
 
 def tiled_radix_select_packed_routes(
@@ -272,6 +310,8 @@ def tiled_radix_select_packed_routes(
     *,
     query_block_offset: int,
     force_tile_mask: torch.Tensor | None = None,
+    region_metadata: torch.Tensor | None = None,
+    compact_scores: bool = False,
 ) -> None:
     """Write exact stable FP32 top-k routes directly into packed UINT16 storage."""
     if scores.ndim != 4 or scores.stride(-1) != 1 or scores.dtype != torch.float32:
@@ -302,20 +342,35 @@ def tiled_radix_select_packed_routes(
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled scores and packed routes must share the batch dimension")
     batch, heads, query_blocks, sparse_key_blocks = scores.shape
+    num_regions = 1 if region_metadata is None else region_metadata.shape[0]
+    if region_metadata is not None and (
+        region_metadata.ndim != 2
+        or region_metadata.shape[1] != 2 * heads + 3
+        or region_metadata.dtype is not torch.int32
+        or region_metadata.device != scores.device
+        or not region_metadata.is_contiguous()
+    ):
+        raise ValueError("region metadata must use contiguous INT32 [regions, 2 * heads + 3]")
     if force_tile_mask is not None and (
-        force_tile_mask.shape != (routes.shape[1], triton.cdiv(sparse_key_blocks, 32))
+        force_tile_mask.ndim != 2
+        or force_tile_mask.shape[0] != routes.shape[1]
+        or (
+            region_metadata is None
+            and force_tile_mask.shape[1] != triton.cdiv(sparse_key_blocks, 32)
+        )
         or force_tile_mask.dtype is not torch.int32
         or force_tile_mask.device != scores.device
         or not force_tile_mask.is_contiguous()
     ):
         raise ValueError("forced membership must use contiguous INT32 [query_blocks,key_words]")
     with device_context(scores.device):
-        _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
+        _tiled_radix_select_packed_routes_kernel[(query_blocks, heads * num_regions, batch)](
             scores,
             routes,
             head_keep_blocks,
             route_head_offsets,
             head_keep_blocks if force_tile_mask is None else force_tile_mask,
+            head_keep_blocks if region_metadata is None else region_metadata,
             sparse_key_blocks,
             query_block_offset,
             scores.stride(0),
@@ -325,6 +380,9 @@ def tiled_radix_select_packed_routes(
             routes.stride(1),
             routes.stride(2),
             0 if force_tile_mask is None else force_tile_mask.stride(0),
+            num_heads=heads,
+            has_regions=region_metadata is not None,
+            compact_scores=compact_scores,
             selector_tile=_SELECTOR_TILE,
             has_force=force_tile_mask is not None,
             num_warps=4,

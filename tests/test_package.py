@@ -20,6 +20,7 @@ import piper_kernels.linear.convrot.int8
 import piper_kernels.linear.convrot.nvfp4
 from piper_kernels import (
     SparsePiperAttention,
+    SparsePiperKeyRegion,
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
@@ -224,6 +225,7 @@ def test_public_packages_import() -> None:
     assert piper_kernels.piper_attention is piper_attention
     assert piper_kernels.sage_attention_2pp is sage_attention_2pp
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
+    assert piper_kernels.SparsePiperKeyRegion is SparsePiperKeyRegion
     assert piper_kernels.apply_coarse_attention_residual is apply_coarse_attention_residual
     assert piper_kernels.coarse_attention is coarse_attention
     assert piper_kernels.coarse_attention_residual is coarse_attention_residual
@@ -231,6 +233,7 @@ def test_public_packages_import() -> None:
     assert piper_kernels.sparse_piper_coarse_residual is sparse_piper_coarse_residual
     assert piper_kernels.__all__ == [
         "SparsePiperAttention",
+        "SparsePiperKeyRegion",
         "apply_coarse_attention_residual",
         "coarse_attention",
         "coarse_attention_residual",

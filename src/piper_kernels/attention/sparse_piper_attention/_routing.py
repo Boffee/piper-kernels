@@ -191,13 +191,33 @@ def packed_routes_from_summaries(
     )
     if layout.keeps_all_blocks(key_primary.shape[2]):
         return builder.routes
+    if layout.regions and any(region.keeps_all_blocks for region in layout.regions):
+        intervals = [
+            slice(region.start_key_block, region.start_key_block + region.num_key_blocks)
+            for region in layout.regions
+            if not region.keeps_all_blocks
+        ]
+        # Score all sparse regions together; dense regions occupy no score columns.
+        # A single sparse interval needs only a view, otherwise concatenate the
+        # small block summaries once before processing the query chunks.
+        key_primary = (
+            key_primary[:, :, intervals[0]]
+            if len(intervals) == 1
+            else torch.cat([key_primary[:, :, interval] for interval in intervals], dim=2)
+        )
+        if key_aux.shape[2]:
+            key_aux = (
+                key_aux[:, :, intervals[0]]
+                if len(intervals) == 1
+                else torch.cat([key_aux[:, :, interval] for interval in intervals], dim=2)
+            )
     for start, scores in score_chunks(
         query_summary,
         key_primary,
         key_aux,
         routing_mode,
     ):
-        builder.write(scores, query_block_offset=start)
+        builder.write(scores, query_block_offset=start, compact_scores=bool(layout.regions))
     return builder.routes
 
 

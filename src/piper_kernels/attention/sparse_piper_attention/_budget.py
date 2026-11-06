@@ -13,12 +13,34 @@ _UINT16_ROUTE_CAPACITY = 1 << 16
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedRouteRegion:
+    """One key interval and its destinations in the complete packed route list."""
+
+    start_key_block: int
+    num_key_blocks: int
+    start_score_block: int
+    head_keep_block_values: tuple[int, ...]
+    route_head_offset_values: tuple[int, ...]
+
+    @property
+    def keeps_all_blocks(self) -> bool:
+        return all(count == self.num_key_blocks for count in self.head_keep_block_values)
+
+
+@dataclass(frozen=True, slots=True)
 class _ResolvedRouteLayout:
-    """Layout-specific integer metadata consumed by sparse routing and attention."""
+    """Layout-specific integer metadata consumed by sparse routing and attention.
+
+    Regional layouts also hold host intervals and packed device selector rows,
+    produced together by ``resolve_region_route_layout``. Attention consumes only
+    the aggregate counts and offsets; it never reads region metadata.
+    """
 
     head_keep_blocks: torch.Tensor
     route_head_offsets: torch.Tensor
     routes_per_query: int
+    regions: tuple[ResolvedRouteRegion, ...] = ()
+    region_metadata: torch.Tensor | None = None
 
     def keeps_all_blocks(self, sparse_key_blocks: int) -> bool:
         """Recognize a full physical budget without inspecting device values."""

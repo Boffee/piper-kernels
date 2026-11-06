@@ -88,6 +88,8 @@ class SelectRoutes(Protocol):
         *,
         query_block_offset: int,
         force_tile_mask: torch.Tensor | None = None,
+        region_metadata: torch.Tensor | None = None,
+        compact_scores: bool = False,
     ) -> None: ...
 
 

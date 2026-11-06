@@ -29,7 +29,7 @@ from lib.suite_attention import make_inputs
 from lib.timing import synchronized_wall_benchmark
 from triton.testing import do_bench, do_bench_cudagraph
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyRegion
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
@@ -37,6 +37,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperAttention
+from piper_kernels.attention.sparse_piper_attention._regions import resolve_region_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
@@ -52,7 +53,19 @@ def _positive_int(value: str) -> int:
     return result
 
 
-def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def _parse_key_regions(values: list[str] | None) -> tuple[SparsePiperKeyRegion, ...] | None:
+    if values is None:
+        return None
+    regions = []
+    for value in values:
+        mode, separator, count = value.partition(":")
+        if not separator or mode not in ("sparse", "dense"):
+            raise ValueError("key regions use sparse:BLOCKS or dense:BLOCKS")
+        regions.append(SparsePiperKeyRegion(int(count), sparse=mode == "sparse"))
+    return tuple(regions)
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:  # noqa: PLR0912
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--case", help="shared sparse attention case")
     parser.add_argument("--sequence", type=_positive_int, nargs="+")
@@ -62,6 +75,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch", type=_positive_int)
     parser.add_argument("--ratios", type=float, nargs="+")
     parser.add_argument("--routing", choices=["minmax", "mean"])
+    parser.add_argument(
+        "--sparse-key-blocks",
+        type=_positive_int,
+        help="route this prefix; include remaining keys densely",
+    )
+    parser.add_argument(
+        "--key-regions",
+        nargs="+",
+        metavar="MODE:BLOCKS",
+        help="experimental ordered regions, e.g. sparse:80 dense:8 sparse:80",
+    )
     parser.add_argument("--dtype", choices=["bfloat16", "float16"])
     parser.add_argument("--rep-ms", type=_positive_int, default=100)
     parser.add_argument("--samples", type=_positive_int, default=3)
@@ -106,6 +130,24 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("benchmark sequence lengths must be at least 64")
     if any(not 0 < ratio <= 1 for ratio in args.ratios):
         parser.error("ratios must be in (0, 1]")
+    if args.sparse_key_blocks is not None and args.key_regions is not None:
+        parser.error("--sparse-key-blocks and --key-regions are mutually exclusive")
+    if args.case is not None and (
+        args.sparse_key_blocks is not None or args.key_regions is not None
+    ):
+        parser.error("regional layouts are custom diagnostics; omit --case")
+    try:
+        regions = _parse_key_regions(args.key_regions)
+    except ValueError as error:
+        parser.error(str(error))
+    if regions is not None and any(
+        sum(region.num_blocks for region in regions) * 64 != sequence for sequence in args.sequence
+    ):
+        parser.error("key regions must cover exactly each sequence's complete K64 blocks")
+    if args.sparse_key_blocks is not None and any(
+        args.sparse_key_blocks > sequence // 64 for sequence in args.sequence
+    ):
+        parser.error("sparse key prefix must fit each sequence")
     return args
 
 
@@ -126,9 +168,18 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     shape = tuple(query.shape)
     backend = require_attention_backend(query)
     attention = SparsePiperAttention([ratio] * args.heads, routing=args.routing)
-    blocks = sequence // 64
-    layout = _resolve_route_layout(
-        _normalize_head_keep_ratios([ratio] * args.heads), blocks, device
+    regions = _parse_key_regions(args.key_regions)
+    blocks = sequence // 64 if args.sparse_key_blocks is None else args.sparse_key_blocks
+    ratio_units = _normalize_head_keep_ratios([ratio] * args.heads)
+    layout = (
+        _resolve_route_layout(ratio_units, blocks, device)
+        if regions is None
+        else resolve_region_route_layout(
+            ratio_units,
+            tuple(region.num_blocks for region in regions),
+            tuple(region.sparse for region in regions),
+            device,
+        )
     )
     route_call = partial(
         packed_routes_from_sequences,
@@ -164,6 +215,8 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     launch = partial(prepared.launch, prepared.query, output.transpose(1, 2))
 
     def public_call() -> torch.Tensor:
+        if regions is not None:
+            return attention(query, key, value, key_regions=regions)
         return attention(query, key, value, sparse_key_blocks=blocks)
 
     launch()
@@ -203,7 +256,9 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     preparation = synchronized_wall_benchmark(
         prepare_execution, 60, args.rep_ms, synchronize=torch.cuda.synchronize
     )
-    selected_blocks = routes.head_keep_blocks.cpu().tolist()
+    selected_blocks = [
+        count + sequence // 64 - blocks for count in routes.head_keep_blocks.cpu().tolist()
+    ]
     operations = useful_integer_operations(sequence, selected_blocks, args.batch, args.head_dim)
     # Measure real public-call memory with no extra prepared benchmark state or
     # output retained. This matters at 100k tokens on a 16-GB accelerator.
@@ -224,6 +279,8 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
                 "input_source": "cpu_seeded_normal_cast_to_input_dtype",
                 "ratio": ratio,
                 "routing": args.routing,
+                "sparse_key_blocks": blocks if regions is None else None,
+                "key_regions": args.key_regions,
                 "skip_dense_routing": skip_dense_routing,
                 "selected_blocks_per_head": selected_blocks,
                 "relative_l2_vs_quantized_reference": error,
