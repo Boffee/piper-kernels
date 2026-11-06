@@ -19,7 +19,7 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.attention.piper_attention import _quantized_dispatch
-from piper_kernels.fusions.attention import _head_groups as head_groups
+from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _output as output_pipeline
 from piper_kernels.fusions.attention import _residual as attention_residual
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
@@ -526,8 +526,8 @@ compile_pass = _CompilePass()
 
 
 _kernels = torch.ops.piper_kernels
-# Which residual-add and K/V projection arguments hold rows per head, for head groups.
-_HEAD_SPLIT = head_groups.HeadSplit(
+# Which residual-add and K/V projection arguments hold rows per head, for head slices.
+_HEAD_SLICING = head_slices.HeadSlicing(
     producers=(
         (_kernels.convrot_int8_piper_project_key.default, ("key", "key_scale")),
         (
@@ -557,7 +557,7 @@ class _OutputCompilePass(CustomInferenceAwareGraphPass):
                 graph,
                 _kernels.convrot_int8_piper_projected_query_attention_output.default,
                 _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default,
-                _HEAD_SPLIT,
+                _HEAD_SLICING,
             )
             or changed
         )

@@ -1,4 +1,4 @@
-"""A fused dense attention computed inside its residual add runs in two head groups."""
+"""A fused dense attention computed inside its residual add runs in two head slices."""
 
 import re
 
@@ -30,7 +30,7 @@ class _MultiQueryResidualBlock(_ResidualBlock):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_each_head_group_projects_its_context_before_its_add():
+def test_each_head_slice_projects_its_context_before_its_add():
     model = _ResidualBlock()
     capture = FunctionalTargetCapturePass()
     compiled = _compile_copy_back(model, _options(capture))
@@ -43,7 +43,7 @@ def test_each_head_group_projects_its_context_before_its_add():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_each_head_group_projects_its_context_after_the_previous_group_adds():
+def test_each_head_slice_projects_its_context_after_the_previous_slice_adds():
     model = _ResidualBlock()
     compiled = _compile_copy_back(model, _options(FunctionalTargetCapturePass()))
     with torch.no_grad():
@@ -54,7 +54,7 @@ def test_each_head_group_projects_its_context_after_the_previous_group_adds():
         r"(project_key|project_value|projected_query_attention_residual_add_)\.default\(",
         code,
     )
-    # Inductor frees the first group's K and V before the second group allocates its own.
+    # Inductor frees the first slice's K and V before the second slice allocates its own.
     first_add = calls.index("projected_query_attention_residual_add_")
     assert sorted(calls[:first_add]) == ["project_key", "project_value"]
     assert sorted(calls[first_add + 1 :]) == [
@@ -66,7 +66,7 @@ def test_each_head_group_projects_its_context_after_the_previous_group_adds():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires dense fused projection support")
-def test_attention_whose_heads_do_not_split_evenly_stays_one_group():
+def test_attention_whose_heads_do_not_split_evenly_stays_one_slice():
     model = _MultiQueryResidualBlock()
     capture = FunctionalTargetCapturePass()
     compiled = _compile_copy_back(model, _options(capture))
@@ -76,14 +76,23 @@ def test_attention_whose_heads_do_not_split_evenly_stays_one_group():
     assert capture.targets.count(_KEY) == 1
 
 
-def test_head_split_names_arguments_its_operators_take():
-    split = dense_compile._HEAD_SPLIT
+def test_head_slicing_names_arguments_its_operators_take():
+    slicing = dense_compile._HEAD_SLICING
 
     def names(operator):
         return {argument.name for argument in operator._schema.arguments}
 
-    assert {*split.rows, split.columns, *split.once, split.alignment} <= names(_RESIDUAL_ADD)
-    for producer, outputs in split.producers:
-        assert set(split.producer_rows) <= names(producer)
+    assert {
+        # HeadSlicing requires these of every add.
+        "base",
+        "head_dim",
+        "query_chunk_rows",
+        *slicing.rows,
+        slicing.columns,
+        *slicing.once,
+        slicing.alignment,
+    } <= names(_RESIDUAL_ADD)
+    for producer, outputs in slicing.producers:
+        assert set(slicing.producer_rows) <= names(producer)
         assert set(outputs) <= names(_RESIDUAL_ADD)
         assert len(outputs) == len(producer._schema.returns)

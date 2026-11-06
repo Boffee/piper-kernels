@@ -1,18 +1,16 @@
-"""Run an attention residual add in two head groups, so only one group's K and V exist.
+"""Run an attention residual add in two head slices, so only one slice's K and V exist.
 
 A fused attention residual add reads K and V for every head, projected before it runs.
 When those projections feed nothing else, the attention's fold emits the three calls
-once per head group instead: each group projects its own K and V rows, then adds
+once per head slice instead: each slice projects its own K and V rows, then adds
 attention over its heads into ``base`` through its share of the output projection's
-input columns. Inductor frees a group's K and V after its add, before the next group
+input columns. Inductor frees a slice's K and V after its add, before the next slice
 projects, and its peak-memory scheduling keeps that order.
 
 The calls are the attention's own operators on head-sliced weights, so an attention
-joins by describing which of its arguments split by head in a :class:`HeadSplit`,
-kept beside its operators. Each group quantizes its own output-projection input per
-token and ``base`` rounds once per group, so results differ slightly from one group.
-Each group's query windows hold twice the rows, so every attention launch keeps its
-ungrouped rows times heads.
+joins by describing its arguments in a :class:`HeadSlicing`, kept beside its operators.
+Each slice quantizes its own output-projection input per token and ``base`` rounds once
+per slice, so results differ slightly from one slice.
 """
 
 from __future__ import annotations
@@ -27,20 +25,25 @@ from torch.fx.node import Argument
 
 from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
 
-# Two groups halve K and V at no measured speed cost; past that, other buffers dominate.
-HEAD_GROUPS = 2
+# Two slices halve K and V at no measured speed cost; past that, other buffers dominate.
+NUM_HEAD_SLICES = 2
 
 
 @dataclass(frozen=True)
-class HeadSplit:
+class HeadSlicing:
     """Which arguments of an attention residual add, and of its producers, split by head.
 
     ``producers`` pairs each K or V producer with the add arguments it supplies, in output
     order; its ``producer_rows`` arguments hold one block of rows per head. In the add,
     ``rows`` hold one block of rows per query head, ``columns`` names the output
     projection's weight, whose input columns follow the query heads, and ``once`` is
-    added by the first group only. Each group's columns must be a multiple of the add's
+    added by the first slice only. Each slice's columns must be a multiple of the add's
     ``alignment`` argument, such as a ConvRot group size.
+
+    The add must also take ``base``, ``head_dim``, and ``query_chunk_rows`` as dense
+    Piper's does. Each slice adds into the previous slice's ``base``, and its
+    ``query_chunk_rows`` is ``NUM_HEAD_SLICES`` times the add's, so each attention launch
+    keeps its unsliced rows times heads.
     """
 
     producers: tuple[tuple[torch._ops.OpOverload, tuple[str, ...]], ...]
@@ -51,7 +54,7 @@ class HeadSplit:
     alignment: str
 
 
-def _exclusive_producer(
+def _find_exclusive_producer(
     operands: Mapping[str, Argument],
     names: tuple[str, ...],
     target: torch._ops.OpOverload,
@@ -105,46 +108,47 @@ def _call(
     return node
 
 
-def _group_slice(graph: torch.fx.Graph, value: Argument, group: int, dim: int) -> Argument:
-    """Slice one head group's share of ``value`` along ``dim``; None stays None."""
+def _slice_share(graph: torch.fx.Graph, value: Argument, slice_index: int, dim: int) -> Argument:
+    """Slice one head slice's share of ``value`` along ``dim``; None stays None."""
     metadata = _metadata(value)
     if not isinstance(metadata, torch.Tensor):
         return None
-    size = metadata.shape[dim] // HEAD_GROUPS
-    bounds = {"dim": dim, "start": group * size, "end": (group + 1) * size}
+    size = metadata.shape[dim] // NUM_HEAD_SLICES
+    bounds = {"dim": dim, "start": slice_index * size, "end": (slice_index + 1) * size}
     return _call(graph, torch.ops.aten.slice.Tensor, {"self": value, **bounds})
 
 
-def add_in_head_groups(
+def add_in_head_slices(
     graph: torch.fx.Graph,
     residual_add: torch._ops.OpOverload,
     update: torch.fx.Node,
     values: dict[str, Argument],
-    split: HeadSplit,
+    slicing: HeadSlicing,
 ) -> torch.fx.Node | None:
-    """Emit ``residual_add`` once per head group and return the updated ``base``.
+    """Emit ``residual_add`` once per head slice and return the updated ``base``.
 
     ``values`` are the add's arguments by name, and ``update`` is the attention output it
     replaces, whose K and V operands must feed nothing else. Emits nothing and returns
     None when K or V has other consumers or the heads don't split evenly into aligned
-    groups.
+    slices.
     """
     producers: list[tuple[torch._ops.OpOverload, dict[str, Argument], tuple[str, ...]]] = []
-    for target, names in split.producers:
-        producer = _exclusive_producer(values, names, target, update)
+    for target, names in slicing.producers:
+        producer = _find_exclusive_producer(values, names, target, update)
         if producer is None:
             return None
         producers.append((target, bind_arguments(producer), names))
 
-    head_rows = HEAD_GROUPS * cast(int, values["head_dim"])
+    head_dim = cast(int, values["head_dim"])
     row_counts = [
-        _rows(values[split.rows[0]]),
-        *(_rows(arguments[split.producer_rows[0]]) for _, arguments, _ in producers),
+        _rows(values[slicing.rows[0]]),
+        *(_rows(arguments[slicing.producer_rows[0]]) for _, arguments, _ in producers),
     ]
-    if any(rows is None or rows % head_rows for rows in row_counts):
+    # Each slice takes whole query, K, and V heads.
+    if any(rows is None or rows % (NUM_HEAD_SLICES * head_dim) for rows in row_counts):
         return None
-    group_columns = cast(int, row_counts[0]) // HEAD_GROUPS
-    if group_columns % cast(int, values[split.alignment]):
+    slice_columns = cast(int, row_counts[0]) // NUM_HEAD_SLICES
+    if slice_columns % cast(int, values[slicing.alignment]):
         return None
 
     chunk_rows = values.get("query_chunk_rows")
@@ -155,35 +159,36 @@ def add_in_head_groups(
             if argument.name == "query_chunk_rows"
         )
     base = cast(torch.fx.Node, values["base"])
-    for group in range(HEAD_GROUPS):
-        group_values = {
+    for slice_index in range(NUM_HEAD_SLICES):
+        slice_values = {
             **values,
             "base": base,
-            "query_chunk_rows": cast(int, chunk_rows) * HEAD_GROUPS,
-            **{name: _group_slice(graph, values[name], group, 0) for name in split.rows},
-            # The output GEMM needs each group's input columns contiguous.
-            split.columns: _call(
+            "query_chunk_rows": cast(int, chunk_rows) * NUM_HEAD_SLICES,
+            **{name: _slice_share(graph, values[name], slice_index, 0) for name in slicing.rows},
+            # The output GEMM needs each slice's input columns contiguous.
+            slicing.columns: _call(
                 graph,
                 torch.ops.aten.clone.default,
                 {
-                    "self": _group_slice(graph, values[split.columns], group, 1),
+                    "self": _slice_share(graph, values[slicing.columns], slice_index, 1),
                     "memory_format": torch.contiguous_format,
                 },
             ),
         }
-        if group:
-            group_values.update(dict.fromkeys(split.once))
+        if slice_index:
+            slice_values.update(dict.fromkeys(slicing.once))
         for target, arguments, names in producers:
             sliced = {
-                name: _group_slice(graph, arguments[name], group, 0) for name in split.producer_rows
+                name: _slice_share(graph, arguments[name], slice_index, 0)
+                for name in slicing.producer_rows
             }
             produced = _call(graph, target, {**arguments, **sliced})
             for index, name in enumerate(names):
                 item = graph.call_function(operator.getitem, (produced, index))
                 item.meta["val"] = produced.meta["val"][index]
-                group_values[name] = item
-        base = call_functional(graph, residual_add, group_values)
+                slice_values[name] = item
+        base = call_functional(graph, residual_add, slice_values)
     return base
 
 
-__all__ = ["HEAD_GROUPS", "HeadSplit", "add_in_head_groups"]
+__all__ = ["NUM_HEAD_SLICES", "HeadSlicing", "add_in_head_slices"]

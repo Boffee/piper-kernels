@@ -230,7 +230,7 @@ def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
     )
     _assert_updates_input_in_place(model, compiled)
 
-    # Dense attention adds in two head groups; see convrot_int8_piper/test_head_groups.py.
+    # Dense attention adds in two head slices; see convrot_int8_piper/test_head_slices.py.
     assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
     assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
     assert _ATTENTION_OUTPUT not in capture.targets
