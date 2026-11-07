@@ -7,17 +7,21 @@ import torch
 import triton
 
 from piper_kernels._input_activations import input_activation_width
+from piper_kernels._residual import ResidualAdd
 from piper_kernels._triton.convrot_int8 import quantize_rows_kernel, rotate_quantize_rows_kernel
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
-from .._kernels.triton import int8_matmul_kernel
+from .._kernels.triton import int8_matmul_kernel, int8_residual_matmul_kernel
 from . import policy
 from ._plan import NvidiaExecutionPlan
 
 # A runtime M and per-tile tail branch keep one compiled kernel per schedule.
 dynamic_m_int8_matmul_kernel = triton.jit(do_not_specialize=["m"])(int8_matmul_kernel.fn)
+dynamic_m_int8_residual_matmul_kernel = triton.jit(do_not_specialize=["m"])(
+    int8_residual_matmul_kernel.fn
+)
 
 
 def quantize_input(
@@ -145,6 +149,72 @@ def launch_int8_matmul(
             group_m=group_m,
             explicit_bias_fma=plan.matmul_explicit_bias_fma,
             per_tile_tail=bool(group_m) or not plan.matmul_specialize_m,
+            num_stages=plan.matmul_num_stages,
+            num_warps=plan.matmul_num_warps,
+        )
+
+
+def launch_int8_residual_matmul(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    output: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual_add: ResidualAdd,
+    *,
+    row_offset: int,
+    execution_plan: NvidiaExecutionPlan,
+) -> None:
+    """Project into validated residual storage under a native-epilogue plan."""
+    plan = execution_plan
+    m, k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    num_n_tiles = triton.cdiv(n, plan.matmul_block_n)
+    row_block_count = triton.cdiv(m, plan.matmul_block_m)
+    group_m = plan.matmul_group_m
+    grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+    kernel = (
+        int8_residual_matmul_kernel
+        if plan.matmul_specialize_m
+        else dynamic_m_int8_residual_matmul_kernel
+    )
+    gate = residual_add.gate
+    reusable = residual_add.reusable
+    reusable_gate = None if reusable is None else reusable.gate
+    with device_context(input_qdata.device):
+        kernel[grid](
+            input_qdata,
+            weight_qdata,
+            output,
+            input_scale,
+            weight_scale,
+            bias if bias is not None else output,
+            m,
+            n,
+            k,
+            block_m=plan.matmul_block_m,
+            block_n=plan.matmul_block_n,
+            block_k=plan.matmul_block_k,
+            has_bias=bias is not None,
+            aligned_m=plan.matmul_specialize_m and m % plan.matmul_block_m == 0,
+            aligned_nk=n % plan.matmul_block_n == 0 and k % plan.matmul_block_k == 0,
+            group_m=group_m,
+            explicit_bias_fma=plan.matmul_explicit_bias_fma,
+            per_tile_tail=bool(group_m) or not plan.matmul_specialize_m,
+            residual_base_ptr=residual_add.base.view(-1, n)[row_offset:],
+            residual_gate_ptr=gate,
+            residual_indices_ptr=residual_add.gate_indices,
+            residual_reusable_gate_ptr=reusable_gate,
+            residual_row_offset=row_offset,
+            residual_gate_row_stride=gate.stride(0),
+            residual_gate_rows=gate.shape[0],
+            residual_reusable_gate_row_stride=0
+            if reusable_gate is None
+            else reusable_gate.stride(0),
+            residual_reusable_gate_rows=0 if reusable_gate is None else reusable_gate.shape[0],
+            residual_has_reusable_update=reusable is not None,
+            residual_python_indexing=residual_add.python_indexing,
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
         )

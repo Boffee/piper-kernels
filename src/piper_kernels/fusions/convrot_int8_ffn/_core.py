@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._input_activations import InputActivation, input_activation_width
-from piper_kernels.fusions.residual_updates import triton as residual_updates
+from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels.linear import _bias
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.convrot.int8 import _backend
@@ -126,7 +126,7 @@ def run_chunked_ffn(
     activation_fn: InputActivation,
     chunk_rows: int,
     *,
-    residual_add: residual_updates.ResidualAdd | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     input_features, intermediate_features, output_features = validate_ffn(
@@ -141,42 +141,27 @@ def run_chunked_ffn(
     rows = math.prod(leading_shape)
     capacity = min(rows, chunk_rows)
     input_2d = input.view(rows, input_features)
-    update_layout = (
-        None
-        if residual_add is None
-        else residual_updates.validate_residual_add(
-            input,
-            residual_add,
-            output_features,
-        )
-    )
+    if residual_add is not None:
+        validate_residual_add(input, residual_add, output_features)
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
         if residual_add is None
         else residual_add.output
     )
     output_2d = output.view(rows, output_features)
-    base_2d = None if residual_add is None else residual_add.base.view(rows, output_features)
     projection_features = len(sources) * intermediate_features
     projection_workspace = torch.empty(
         (capacity, projection_features),
         device=input.device,
         dtype=input.dtype,
     )
-    projected = None
-    if residual_add is not None:
-        projected = (
-            projection_workspace.reshape(-1)[: capacity * output_features].view(
-                capacity,
-                output_features,
-            )
-            if output_features <= projection_features
-            else torch.empty(
-                (capacity, output_features),
-                device=input.device,
-                dtype=input.dtype,
-            )
-        )
+    # Reuse dead up-projection storage if the backend needs a materialized down
+    # projection. A fused residual epilogue ignores this view and allocates none.
+    projection_scratch = (
+        projection_workspace.view(-1)[: capacity * output_features].view(capacity, output_features)
+        if residual_add is not None and output_features <= projection_features
+        else None
+    )
     prepared_storage = torch.empty(
         capacity * max(input_features, intermediate_features),
         device=input.device,
@@ -263,26 +248,28 @@ def run_chunked_ffn(
             input_scale=down.input_scale,
             out=(prepared_activation, prepared_scale),
         )
-        output_chunk = output_2d[start:stop] if projected is None else projected[:chunk_row_count]
-        backend.linear_prepared(
-            prepared_activation,
-            prepared_scale,
-            down.weight_qdata,
-            down.weight_scale,
-            down.bias,
-            input.dtype,
-            out=output_chunk,
-        )
-        if residual_add is not None:
-            assert base_2d is not None
-            assert update_layout is not None
-            residual_updates.apply_residual_add(
-                output_chunk,
-                base_2d[start:stop],
-                output_2d[start:stop],
+        if residual_add is None:
+            backend.linear_prepared(
+                prepared_activation,
+                prepared_scale,
+                down.weight_qdata,
+                down.weight_scale,
+                down.bias,
+                input.dtype,
+                out=output_2d[start:stop],
+            )
+        else:
+            backend.linear_prepared_residual(
+                prepared_activation,
+                prepared_scale,
+                down.weight_qdata,
+                down.weight_scale,
+                down.bias,
                 residual_add,
-                update_layout,
-                start,
+                row_offset=start,
+                projection_scratch=None
+                if projection_scratch is None
+                else projection_scratch[:chunk_row_count],
             )
     return output
 

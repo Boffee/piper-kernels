@@ -1,10 +1,12 @@
 """Portable INT8 arithmetic shared by accelerator-owned launchers."""
 
-# Triton constexpr defaults are Python constants before JIT specialization.
+# Triton specializes Python literals as constexpr arguments inside JIT functions.
 # pyright: reportArgumentType=false
 
 import triton
 import triton.language as tl
+
+from piper_kernels._residual.triton import add_residual
 
 
 @triton.jit
@@ -185,10 +187,9 @@ def _int8_matmul_with_bias(
 
 
 @triton.jit
-def int8_matmul_kernel(
+def _project_tile(
     input_ptr,
     weight_ptr,
-    output_ptr,
     input_scale_ptr,
     weight_scale_ptr,
     bias_ptr,
@@ -198,7 +199,6 @@ def int8_matmul_kernel(
     m,
     n,
     k,
-    output_row_stride,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -277,6 +277,22 @@ def int8_matmul_kernel(
             False,
             explicit_bias_fma,
         )
+    return result, offsets_m, offsets_n, second, tile_aligned
+
+
+@triton.jit
+def _store_tile(
+    output_ptr,
+    result,
+    offsets_m,
+    offsets_n,
+    m,
+    n,
+    output_row_stride,
+    second,
+    paired: tl.constexpr,
+    tile_aligned,
+):
     output_pointers = (
         output_ptr
         + offsets_m.to(tl.int64)[:, None] * output_row_stride
@@ -292,3 +308,163 @@ def int8_matmul_kernel(
             result,
             mask=(offsets_m[:, None] < m) & (offsets_n[None, :] < n),
         )
+
+
+@triton.jit
+def int8_matmul_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    second_weight_ptr,
+    second_scale_ptr,
+    second_bias_ptr,
+    m,
+    n,
+    k,
+    output_row_stride,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    has_bias: tl.constexpr,
+    paired: tl.constexpr,
+    second_has_bias: tl.constexpr,
+    aligned_m: tl.constexpr,
+    aligned_nk: tl.constexpr,
+    group_m: tl.constexpr,
+    explicit_bias_fma: tl.constexpr,
+    per_tile_tail: tl.constexpr,
+):
+    """Project to a logical-dtype tensor without residual launch arguments."""
+    result, offsets_m, offsets_n, second, tile_aligned = _project_tile(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        second_weight_ptr,
+        second_scale_ptr,
+        second_bias_ptr,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        has_bias,
+        paired,
+        second_has_bias,
+        aligned_m,
+        aligned_nk,
+        group_m,
+        explicit_bias_fma,
+        per_tile_tail,
+    )
+    _store_tile(
+        output_ptr,
+        result,
+        offsets_m,
+        offsets_n,
+        m,
+        n,
+        output_row_stride,
+        second,
+        paired,
+        tile_aligned,
+    )
+
+
+@triton.jit
+def int8_residual_matmul_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    m,
+    n,
+    k,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    has_bias: tl.constexpr,
+    aligned_m: tl.constexpr,
+    aligned_nk: tl.constexpr,
+    group_m: tl.constexpr,
+    explicit_bias_fma: tl.constexpr,
+    per_tile_tail: tl.constexpr,
+    residual_base_ptr,
+    residual_gate_ptr,
+    residual_indices_ptr,
+    residual_reusable_gate_ptr,
+    residual_row_offset,
+    residual_gate_row_stride: tl.constexpr,
+    residual_gate_rows,
+    residual_reusable_gate_row_stride: tl.constexpr,
+    residual_reusable_gate_rows,
+    residual_has_reusable_update: tl.constexpr,
+    residual_python_indexing: tl.constexpr,
+):
+    """Project and add a validated residual without a materialized projection."""
+    result, offsets_m, offsets_n, _, tile_aligned = _project_tile(
+        input_ptr,
+        weight_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        weight_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        has_bias,
+        False,
+        False,
+        aligned_m,
+        aligned_nk,
+        group_m,
+        explicit_bias_fma,
+        per_tile_tail,
+    )
+    # Preserve materialized-projection rounding. On SM120 this also lets the
+    # compiler pack the tile before residual loads; retaining FP32 spills.
+    result = result.to(output_ptr.dtype.element_ty).to(tl.float32)
+    result = add_residual(
+        result,
+        residual_base_ptr,
+        output_ptr,
+        residual_gate_ptr,
+        residual_reusable_gate_ptr,
+        residual_indices_ptr,
+        offsets_m[:, None],
+        offsets_n[None, :],
+        (offsets_m[:, None] < m) & (offsets_n[None, :] < n),
+        offsets_m[:, None] < m,
+        n,
+        residual_row_offset,
+        residual_gate_row_stride,
+        residual_gate_rows,
+        residual_reusable_gate_row_stride,
+        residual_reusable_gate_rows,
+        residual_has_reusable_update,
+        residual_python_indexing,
+    )
+    _store_tile(
+        output_ptr,
+        result,
+        offsets_m,
+        offsets_n,
+        m,
+        n,
+        n,
+        0,
+        False,
+        tile_aligned,
+    )

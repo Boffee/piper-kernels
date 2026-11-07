@@ -7,7 +7,8 @@ from typing import ClassVar, Protocol, cast
 
 import torch
 
-from piper_kernels.fusions.residual_updates import triton as residual_updates
+from piper_kernels._residual import ResidualAdd, validate_residual_add
+from piper_kernels._residual.triton import apply_residual_add
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -237,7 +238,7 @@ def run_chunked_ffn(
     source_preparation: SourcePreparationBackend,
     activation_preparation: ActivationPreparationBackend,
     *,
-    residual_add: residual_updates.ResidualAdd | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Project, activate, and down-project row chunks with topology-sized workspaces."""
     dimensions = validate_ffn(
@@ -262,22 +263,14 @@ def run_chunked_ffn(
             for per_tensor_scale in source_per_tensor_scales[1:]
         )
     )
-    update_layout = (
-        None
-        if residual_add is None
-        else residual_updates.validate_residual_add(
-            input,
-            residual_add,
-            output_features,
-        )
-    )
+    if residual_add is not None:
+        validate_residual_add(input, residual_add, output_features)
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
         if residual_add is None
         else residual_add.output
     )
     output_2d = output.view(rows, output_features)
-    base_2d = None if residual_add is None else residual_add.base.view(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
     source_storage = prepare_activation_storage(
         input,
@@ -354,8 +347,6 @@ def run_chunked_ffn(
             )
             continue
         assert projected_workspace is not None
-        assert base_2d is not None
-        assert update_layout is not None
         projected = projected_workspace[:chunk_row_count]
         _project_affine_chunk(
             down_qdata,
@@ -365,14 +356,7 @@ def run_chunked_ffn(
             chunk_row_count,
             projected,
         )
-        residual_updates.apply_residual_add(
-            projected,
-            base_2d[start:stop],
-            output_2d[start:stop],
-            residual_add,
-            update_layout,
-            start,
-        )
+        apply_residual_add(projected, residual_add, start)
     return output
 
 

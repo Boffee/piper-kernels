@@ -238,7 +238,9 @@ separate gate/value/down projections; GELU matches an exclusive
 When a block adds a gated update and then the gated FFN output to its residual
 stream, the FFN fusion stores that sum over the update's buffer, so neither sum
 allocates; to add both into a block input the block overwrites instead, see
-[residual updates](attention.md#update-a-residual-stream-in-place).
+[residual updates](attention.md#update-a-residual-stream-in-place). Eligible ConvRot INT8
+down projections perform either sum in the GEMM epilogue; see
+[backend support and rounding](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues).
 See [attention](attention.md#compile-and-fuse-projections) for attention-region
 helpers, and the [specializations](../src/piper_kernels/specializations) for
 model-specific compile options.

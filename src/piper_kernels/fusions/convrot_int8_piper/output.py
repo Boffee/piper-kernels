@@ -1,10 +1,10 @@
 """Bounded Q projection, dense attention, and ConvRot INT8 output projection."""
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels.attention.piper_attention import _quantized_dispatch as attention
 from piper_kernels.fusions.attention import _output as pipeline
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
@@ -12,12 +12,6 @@ from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.weights.convrot.int8._quantization import validate_activation_scale
 
 from . import _backend, _schedule, query
-
-if TYPE_CHECKING:
-    from piper_kernels.fusions.residual_updates.triton import (
-        ResidualAdd,
-        ResidualAddLayout,
-    )
 
 # Share the storage cap with sparse; dense scheduling may select smaller windows.
 DEFAULT_QUERY_CHUNK_ROWS = pipeline.DEFAULT_QUERY_CHUNK_ROWS
@@ -380,11 +374,8 @@ def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int,
     query_chunk_rows: int,
-) -> tuple[tuple[int, int, int, int], "ResidualAdd", "ResidualAddLayout"]:
+) -> tuple[tuple[int, int, int, int], ResidualAdd]:
     """Check attention-output and residual metadata without tensor work."""
-    # Triton loads only when the residual add runs.
-    from piper_kernels.fusions.residual_updates import triton as residual_updates  # noqa: PLC0415
-
     shape = _validate_inputs(
         input_qdata,
         input_scale,
@@ -416,14 +407,14 @@ def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
     batch, _, sequence, _ = shape
     if base.ndim != 3 or base.shape[:2] != (batch, sequence):
         raise ValueError("dense Piper residual base must have one row per query token")
-    residual_add = residual_updates.ResidualAdd(
+    residual_add = ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    layout = residual_updates.validate_residual_add(base, residual_add, weight_qdata.shape[0])
-    return shape, residual_add, layout
+    validate_residual_add(base, residual_add, weight_qdata.shape[0])
+    return shape, residual_add
 
 
 @torch.library.custom_op(
@@ -465,10 +456,11 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     """Add ``gate[gate_indices] * attention_output`` into ``base`` without a full-size output.
 
     The attention operands match ``convrot_int8_piper_projected_query_attention_output``;
-    the output dtype is ``base``'s. Each window is projected into bounded scratch and
-    added into its ``base`` rows in FP32 with one rounding.
+    the output dtype is ``base``'s. The linear backend adds each window's projection
+    into its ``base`` rows in FP32. The native epilogue preserves projection rounding
+    without scratch.
     """
-    shape, residual_add, layout = _validate_residual_add_inputs(
+    shape, residual_add = _validate_residual_add_inputs(
         base,
         gate,
         gate_indices,
@@ -506,17 +498,16 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     def build_projector(
         chunk_rows: int,
     ) -> tuple[pipeline.ChunkProjector, tuple[torch.Tensor, ...]]:
-        return projection_output.prepare_residual_add_projector(
+        return projection_output.prepare_chunk_projector(
             shape[2],
             chunk_rows,
             weight_qdata,
             weight_scale,
             bias,
             group_size,
-            residual_add,
-            layout,
             backend=output_backend,
             output_input_scale=output_input_scale,
+            residual_add=residual_add,
         )
 
     _run_projected_query_attention(

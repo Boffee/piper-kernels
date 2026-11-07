@@ -41,3 +41,32 @@ retaining preparation choices. Neither implementation scans tensor contents;
 follow the [validation contract](../../../../../../docs/development.md#validation-contract).
 For candidate comparisons and workload coverage, see the
 [benchmark guide](../../../../../../benchmarks/README.md#workloads).
+
+## Residual epilogues
+
+Dense/sparse attention output projections and GELU/SwiGLU FFN down projections
+pass a validated [`ResidualAdd`](../../../../_residual/__init__.py) to
+[`LinearBackend.linear_prepared_residual`](../_interfaces.py), whose docstrings own
+the operand, storage, and chunking contract. Ordinary and paired projections retain
+their separate `linear_prepared` operation.
+
+For FP16/BF16 outputs on SM120, the Triton GEMM adds the residual before storing
+the final output. There is no materialized projection or separate residual launch.
+The projection rounds to its logical dtype in registers before FP32
+residual arithmetic, preserving the materialized projection's rounding boundary.
+FP32 multiply-add contraction may still change last bits. The final store rounds
+to the residual's dtype; no full-size FP32 tensor is allocated.
+
+Retaining the projection in FP32 increased register pressure enough to spill in
+the current 128x256 SM120 tile. RTX 5090 measurements found full attention blocks
+up to about 1.6% slower and 1–5% slower FFNs versus the rounded epilogue. Splitting the
+epilogue into smaller pieces removed spills but remained slower. Keep the rounding
+until a different schedule demonstrates a benefit across representative workloads.
+
+Plain and residual kernels share projection and store helpers. Their separate
+entry points keep residual arguments out of ordinary GEMM launches. Backend policy
+owns the epilogue choice. FP32 outputs, other NVIDIA targets, and AMD retain the
+materialized projection plus standalone residual kernel, and NVFP4 fusions retain
+their existing path. The same [Triton residual arithmetic](../../../../_residual/triton.py)
+serves native and standalone epilogues; fusion code does not select a GEMM kernel
+or reproduce its arithmetic. The native path has been validated on RTX 5090.

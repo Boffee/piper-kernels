@@ -262,8 +262,10 @@ The rewritten graph stays functional, and Inductor adds an update in place only 
 the block reads none of the input's original values afterward, through any view;
 otherwise it copies the input first, which keeps the result correct but forgoes that
 update's saving.
-Updates round the residual separately, so results can differ slightly. The helper
-also disables Inductor buffer reuse, which could otherwise hold a dead full-size
+Updates round the residual separately, so results can differ slightly. Eligible
+ConvRot INT8 projections perform the addition in the GEMM epilogue; see
+[backend support and rounding](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues).
+The helper also disables Inductor buffer reuse, which could otherwise hold a dead full-size
 buffer across attention. See the
 [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
 for numerical and storage details.

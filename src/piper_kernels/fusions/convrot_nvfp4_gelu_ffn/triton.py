@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
 from piper_kernels.fusions.convrot_nvfp4_ffn._preparation import ConvRotSourcePreparation
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
 from piper_kernels.fusions.nvfp4_gelu_ffn import _operands
 from piper_kernels.fusions.nvfp4_gelu_ffn._preparation import StandardGELUPreparation
-from piper_kernels.fusions.residual_updates import triton as residual_updates
 
 from ._preparation import ConvRotGELUPreparation
 
@@ -53,7 +53,7 @@ def _run_chunked_gelu_ffn(
     down_high_first: bool,
     chunk_rows: int,
     *,
-    residual_add: residual_updates.ResidualAdd | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> torch.Tensor:
     up, down = _operands.linear_operands(
         up_weight_qdata,
@@ -277,12 +277,12 @@ def _chunked_gelu_ffn_gated_updates_op(
         down_group_size,
         down_high_first,
         chunk_rows,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
-            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
+            reusable=ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -334,14 +334,14 @@ def _chunked_gelu_ffn_gated_updates_op_fake(
         down_high_first,
         chunk_rows,
     )
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(
+        ResidualAdd(
             base,
             ffn_gate,
             gate_indices,
             python_indexing,
-            residual_updates.ReusableUpdate(reusable_update, update_gate),
+            ReusableUpdate(reusable_update, update_gate),
         ),
         output_features,
     )
@@ -395,7 +395,7 @@ def _chunked_gelu_ffn_residual_add_op(
         down_group_size,
         down_high_first,
         chunk_rows,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
@@ -449,9 +449,9 @@ def _chunked_gelu_ffn_residual_add_op_fake(
         down_high_first,
         chunk_rows,
     )
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
+        ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
         output_features,
     )
 

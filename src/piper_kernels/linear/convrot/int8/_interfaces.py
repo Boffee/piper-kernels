@@ -5,6 +5,8 @@ from typing import Protocol
 
 import torch
 
+from piper_kernels._residual import ResidualAdd
+
 from ._plan import LinearExecutionPlan
 
 type PreparedInput = tuple[torch.Tensor, torch.Tensor]
@@ -66,6 +68,32 @@ class LinearBackend(PreparationBackend, Protocol):
         out: torch.Tensor | None = None,
         second_projection: SecondProjection | None = None,
     ) -> torch.Tensor: ...
+
+    def linear_prepared_residual(
+        self,
+        input_qdata: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_qdata: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+        residual_add: ResidualAdd,
+        *,
+        row_offset: int = 0,
+        projection_scratch: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Project one chunk and update the corresponding residual output rows.
+
+        The owning fusion validates ``residual_add`` once. ``row_offset`` locates
+        this chunk in its flattened rows; the result has the input's leading shape
+        and aliases ``residual_add.output``. The residual owns the output dtype.
+        Both native and standalone epilogues preserve projection rounding before
+        FP32 residual arithmetic and the final cast.
+
+        Optional ``projection_scratch`` is a column-contiguous chunk buffer with
+        the projection's shape, dtype, and device, disjoint from live operands.
+        Only the standalone fallback uses it; the backend owns that decision.
+        """
+        ...
 
     def default_execution_plan(
         self,

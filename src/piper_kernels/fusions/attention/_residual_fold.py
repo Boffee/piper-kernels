@@ -9,7 +9,11 @@ from piper_kernels.fusions.residual_updates import _graph as residual_graph
 
 from . import _head_slices as head_slices
 
-SOURCE_FILES = (__file__, head_slices.__file__, residual_graph.__file__)
+SOURCE_FILES = (
+    *residual_graph.SOURCE_FILES,
+    __file__,
+    head_slices.__file__,
+)
 
 
 def fold_residual_adds(

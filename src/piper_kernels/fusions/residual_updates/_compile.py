@@ -40,7 +40,7 @@ from torch.fx.node import Argument
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _gates, _graph, _ops, triton
+from . import _gates, _graph, _ops
 from ._graph import RESIDUAL_ADD, call_functional
 
 _log = logging.getLogger(__name__)
@@ -48,22 +48,6 @@ _COMPILE_PASS_VERSION = "residual-updates-compile-v4"
 
 _aten = torch.ops.aten
 _COPY = _aten.copy_.default
-
-
-def _source_files() -> tuple[str, ...]:
-    """Invalidate cached rewrites when matched or emitted operator contracts change."""
-    return tuple(
-        path
-        for path in (
-            __file__,
-            triton.__file__,
-            _gates.__file__,
-            _graph.__file__,
-            _ops.__file__,
-            preparation_sharing.__file__,
-        )
-        if path is not None
-    )
 
 
 def _metadata(value: Argument) -> torch.Tensor | None:
@@ -142,7 +126,19 @@ class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
             graph.lint()
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(_source_files(), extra=_COMPILE_PASS_VERSION)
+        return get_hash_for_files(
+            tuple(
+                path
+                for path in (
+                    __file__,
+                    *_graph.SOURCE_FILES,
+                    _gates.__file__,
+                    preparation_sharing.__file__,
+                )
+                if path is not None
+            ),
+            extra=_COMPILE_PASS_VERSION,
+        )
 
 
 _compile_pass = _ResidualUpdatePass()

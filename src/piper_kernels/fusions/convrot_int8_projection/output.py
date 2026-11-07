@@ -2,20 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
+from piper_kernels._residual import ResidualAdd
 from piper_kernels.fusions.attention._output import ChunkProjector
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 from piper_kernels.weights.convrot.int8._quantization import validate_storage
-
-if TYPE_CHECKING:
-    from piper_kernels.fusions.residual_updates.triton import (
-        ResidualAdd,
-        ResidualAddLayout,
-    )
 
 
 def validate_output_projection(
@@ -52,72 +45,6 @@ def validate_output_projection(
     return output_features
 
 
-def _project_batch_rows(
-    attention_rows: torch.Tensor,
-    output_rows: torch.Tensor,
-    prepared_input: torch.Tensor,
-    prepared_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    backend: LinearBackend,
-    output_input_scale: torch.Tensor | None,
-) -> None:
-    """Prepare one batch's attention rows, then project them into ``output_rows``.
-
-    All attention reads finish in prepare_input before linear_prepared writes, so
-    the two views may share storage; the INT8 preparation buffers are separate.
-    """
-    backend.prepare_input(
-        attention_rows,
-        group_size,
-        activation_fn=None,
-        input_scale=output_input_scale,
-        out=(prepared_input, prepared_scale),
-    )
-    backend.linear_prepared(
-        prepared_input,
-        prepared_scale,
-        weight_qdata,
-        weight_scale,
-        bias,
-        output_rows.dtype,
-        out=output_rows,
-    )
-
-
-def _project_attention_chunk(  # noqa: PLR0913, PLR0917
-    attention_chunk: torch.Tensor,
-    output: torch.Tensor,
-    start: int,
-    rows: int,
-    prepared_input: torch.Tensor,
-    prepared_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    backend: LinearBackend,
-    output_input_scale: torch.Tensor | None = None,
-) -> None:
-    """Project each batch into its final output rows, which attention may occupy."""
-    input_features = weight_qdata.shape[1]
-    for batch_index in range(attention_chunk.shape[0]):
-        _project_batch_rows(
-            attention_chunk[batch_index, :rows].reshape(rows, input_features),
-            output[batch_index, start : start + rows],
-            prepared_input[:rows],
-            prepared_scale[:rows],
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend,
-            output_input_scale,
-        )
-
-
 def prepare_chunk_projector(
     sequence_length: int,
     query_chunk_rows: int,
@@ -128,88 +55,22 @@ def prepare_chunk_projector(
     *,
     backend: LinearBackend,
     output_input_scale: torch.Tensor | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> tuple[ChunkProjector, tuple[torch.Tensor, ...]]:
-    """Allocate bounded scratch for validated projection inputs on a consumer stream."""
-    input_features = weight_qdata.shape[1]
-    capacity = min(sequence_length, query_chunk_rows)
-    prepared_input = torch.empty(
-        (capacity, input_features),
-        device=weight_qdata.device,
-        dtype=torch.int8,
-    )
-    prepared_scale = torch.empty(
-        capacity,
-        device=weight_qdata.device,
-        dtype=torch.float32,
-    )
+    """Allocate bounded preparation scratch and project each batch of a chunk.
 
-    def project_chunk(
-        attention_chunk: torch.Tensor,
-        output: torch.Tensor,
-        start: int,
-        rows: int,
-    ) -> None:
-        _project_attention_chunk(
-            attention_chunk,
-            output,
-            start,
-            rows,
-            prepared_input,
-            prepared_scale,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend,
-            output_input_scale,
-        )
-
-    retained = tuple(
-        tensor
-        for tensor in (
-            prepared_input,
-            prepared_scale,
-            weight_qdata,
-            weight_scale,
-            bias,
-            output_input_scale,
-        )
-        if tensor is not None
-    )
-    return project_chunk, retained
-
-
-def prepare_residual_add_projector(
-    sequence_length: int,
-    query_chunk_rows: int,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    residual_add: ResidualAdd,
-    layout: ResidualAddLayout,
-    *,
-    backend: LinearBackend,
-    output_input_scale: torch.Tensor | None = None,
-) -> tuple[ChunkProjector, tuple[torch.Tensor, ...]]:
-    """Project each chunk into bounded scratch, then add its gated rows into the output.
-
-    ``residual_add`` has no reusable update: the pipeline output is ``residual_add.base``, and each
-    row becomes ``base + residual_add.gate[index] * projection`` with one rounding.
-    Output rows hold live data, so attention must not share their storage.
+    Without ``residual_add``, each batch projects into its final output rows, which
+    attention may occupy: preparation reads the whole batch into separate INT8
+    storage before the projection writes. A validated ``residual_add`` has no
+    reusable update, and the pipeline output is its base: the linear backend adds
+    ``residual_add.gate[index] * projection`` into each row with one rounding.
+    Those rows hold live data, so attention must not share their storage.
     """
-    # Triton loads only when the gated update runs.
-    from piper_kernels.fusions.residual_updates import triton as residual_updates  # noqa: PLC0415
-
     input_features = weight_qdata.shape[1]
-    output_features = weight_qdata.shape[0]
     capacity = min(sequence_length, query_chunk_rows)
     device = weight_qdata.device
     prepared_input = torch.empty((capacity, input_features), device=device, dtype=torch.int8)
     prepared_scale = torch.empty(capacity, device=device, dtype=torch.float32)
-    projected = torch.empty(
-        (capacity, output_features), device=device, dtype=residual_add.base.dtype
-    )
 
     def project_chunk(
         attention_chunk: torch.Tensor,
@@ -217,42 +78,46 @@ def prepare_residual_add_projector(
         start: int,
         rows: int,
     ) -> None:
-        chunk_projected = projected[:rows]
+        prepared = (prepared_input[:rows], prepared_scale[:rows])
         for batch_index in range(attention_chunk.shape[0]):
-            _project_batch_rows(
+            backend.prepare_input(
                 attention_chunk[batch_index, :rows].reshape(rows, input_features),
-                chunk_projected,
-                prepared_input[:rows],
-                prepared_scale[:rows],
-                weight_qdata,
-                weight_scale,
-                bias,
                 group_size,
-                backend,
-                output_input_scale,
+                input_scale=output_input_scale,
+                out=prepared,
             )
-            output_rows = output[batch_index, start : start + rows]
-            residual_updates.apply_residual_add(
-                chunk_projected,
-                output_rows,
-                output_rows,
-                residual_add,
-                layout,
-                batch_index * sequence_length + start,
-            )
+            if residual_add is None:
+                backend.linear_prepared(
+                    *prepared,
+                    weight_qdata,
+                    weight_scale,
+                    bias,
+                    output.dtype,
+                    out=output[batch_index, start : start + rows],
+                )
+            else:
+                backend.linear_prepared_residual(
+                    *prepared,
+                    weight_qdata,
+                    weight_scale,
+                    bias,
+                    residual_add,
+                    row_offset=batch_index * sequence_length + start,
+                )
 
+    residual_tensors = (
+        () if residual_add is None else (residual_add.gate, residual_add.gate_indices)
+    )
     retained = tuple(
         tensor
         for tensor in (
             prepared_input,
             prepared_scale,
-            projected,
             weight_qdata,
             weight_scale,
             bias,
             output_input_scale,
-            residual_add.gate,
-            residual_add.gate_indices,
+            *residual_tensors,
         )
         if tensor is not None
     )

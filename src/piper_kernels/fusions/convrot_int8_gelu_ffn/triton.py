@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
 from piper_kernels.fusions.convrot_int8_ffn import _core
-from piper_kernels.fusions.residual_updates import triton as residual_updates
 
 _WORKSPACE_LIMIT_BYTES = 1_024 * 1_024 * 1_024
 _CHUNK_ROW_GRANULARITY = 128
@@ -21,8 +21,8 @@ def _default_chunk_rows(
     """Bound reusable row scratch while amortizing per-chunk launches.
 
     ConvRot backends independently choose their power-of-two feature chunks. An op
-    that ``adds_residual`` projects each chunk into scratch before adding it, which
-    takes its own buffer when the output is wider than the intermediate.
+    that ``adds_residual`` budgets projection scratch for the standalone fallback,
+    which needs its own buffer when the output is wider than the intermediate.
     """
     input_features = up_weight_qdata.shape[1]
     intermediate_features = up_weight_qdata.shape[0]
@@ -59,7 +59,7 @@ def _run_chunked_gelu_ffn(
     up_input_scale: torch.Tensor | None = None,
     down_input_scale: torch.Tensor | None = None,
     *,
-    residual_add: residual_updates.ResidualAdd | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Run the public up/down topology through the shared bounded runner."""
     up = _core.LinearOperands(
@@ -218,12 +218,12 @@ def _chunked_gelu_ffn_gated_updates_op(
         chunk_rows,
         up_input_scale,
         down_input_scale,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
-            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
+            reusable=ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -263,14 +263,14 @@ def _chunked_gelu_ffn_gated_updates_op_fake(
         up_input_scale,
         down_input_scale,
     )
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(
+        ResidualAdd(
             base,
             ffn_gate,
             gate_indices,
             python_indexing,
-            residual_updates.ReusableUpdate(reusable_update, update_gate),
+            ReusableUpdate(reusable_update, update_gate),
         ),
         output_features,
     )
@@ -312,7 +312,7 @@ def _chunked_gelu_ffn_residual_add_op(
         chunk_rows,
         up_input_scale,
         down_input_scale,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
@@ -354,9 +354,9 @@ def _chunked_gelu_ffn_residual_add_op_fake(
         up_input_scale,
         down_input_scale,
     )
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
+        ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
         output_features,
     )
 

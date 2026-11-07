@@ -7,6 +7,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- On NVIDIA SM120, fused FP16/BF16 ConvRot INT8 dense/sparse attention output
+  projections and GELU/SwiGLU FFN down projections add gated residuals in the GEMM
+  epilogue, including the FFN case with a previously computed gated update. This avoids
+  materializing the projection and launching a separate residual kernel, while
+  preserving the projection's logical-dtype rounding before FP32 residual
+  arithmetic. On an RTX 5090 in BF16, the attention output-projection step ran
+  15–26% faster and the FFN residual operators 1.5–8% faster at the benchmark
+  catalog's video, image, and decoder shapes. FP32 outputs and other backends retain
+  their materialized projection and separate residual add.
+
 - `residual_updates_compile_options()` now rewrites each gated sum
   `base + gate[indices] * update`, with `gate` rows selected per input row, that
   builds a copy-back block's result from its input on a device Triton supports,
