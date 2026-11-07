@@ -529,17 +529,26 @@ _kernels = torch.ops.piper_kernels
 # Which residual-add and K/V projection arguments hold rows per head, for head slices.
 _HEAD_SLICING = head_slices.HeadSlicing(
     producers=(
-        (_kernels.convrot_int8_piper_project_key.default, ("key", "key_scale")),
-        (
-            _kernels.convrot_int8_piper_project_value.default,
-            ("value", "multiplier", "log_scale", "value_mean"),
-        ),
+        {_kernels.convrot_int8_piper_project_key.default: ("key", "key_scale")},
+        {
+            _kernels.convrot_int8_piper_project_value.default: (
+                "value",
+                "multiplier",
+                "log_scale",
+                "value_mean",
+            )
+        },
     ),
     producer_rows=("weight_qdata", "weight_scale", "bias"),
     rows=("query_weight", "query_weight_scale", "query_bias"),
     columns="weight_qdata",
     once=("bias",),
     alignment="group_size",
+    unsliceable=(),
+    # Dense launches lose efficiency at half the heads, and at H3's shape the add has
+    # room below the K projection's peak, so full-size windows add little peak.
+    widened_window_rows="query_chunk_rows",
+    slice_position=None,
 )
 
 

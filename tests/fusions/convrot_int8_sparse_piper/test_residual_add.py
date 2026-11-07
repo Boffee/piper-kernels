@@ -158,3 +158,43 @@ def test_residual_add_fake_accepts_the_padded_output_rows() -> None:
 def test_residual_add_requires_one_base_row_per_output_row(base: torch.Tensor) -> None:
     with pytest.raises(ValueError, match="one row per output row"):
         output_fusion._projected_query_attention_residual_add_op_fake(*_fake_arguments(base))
+
+
+def _fake_slice_arguments(profile_heads: int) -> tuple[object, ...]:
+    """The padded fake arguments with a profile of ``profile_heads`` 50% heads."""
+    base = torch.empty((2, 192, _OUTPUT_FEATURES), device="meta", dtype=torch.bfloat16)
+    arguments = list(_fake_arguments(base))
+    arguments[20] = _SparsePiperRatioProfile((500_000,) * profile_heads)
+    return tuple(arguments)
+
+
+def test_residual_add_fake_accepts_one_of_several_head_slices() -> None:
+    # Three query heads per slice, so two slices cover a six-head profile.
+    arguments = _fake_slice_arguments(6)
+
+    for head_slice_index in range(2):
+        assert (
+            output_fusion._projected_query_attention_residual_add_op_fake(
+                *arguments, head_slice_index=head_slice_index, num_head_slices=2
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_heads", "head_slice_index", "message"),
+    [
+        (3, 0, "cover every head slice"),
+        (6, 2, "head slice index"),
+    ],
+    ids=["profile-heads", "slice-index"],
+)
+def test_residual_add_requires_a_profile_over_every_head_slice(
+    profile_heads: int, head_slice_index: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        output_fusion._projected_query_attention_residual_add_op_fake(
+            *_fake_slice_arguments(profile_heads),
+            head_slice_index=head_slice_index,
+            num_head_slices=2,
+        )

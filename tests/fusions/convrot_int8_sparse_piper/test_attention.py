@@ -51,7 +51,9 @@ class _Operands:
     sin: torch.Tensor
 
 
-def _operands(*, batch: int = _BATCH, sequence_length: int = _SEQUENCE) -> _Operands:
+def _operands(
+    *, batch: int = _BATCH, sequence_length: int = _SEQUENCE, heads: int = _HEADS
+) -> _Operands:
     torch.manual_seed(199)
     input_qdata = torch.randint(
         -127,
@@ -73,7 +75,7 @@ def _operands(*, batch: int = _BATCH, sequence_length: int = _SEQUENCE) -> _Oper
         torch.randint(
             -127,
             128,
-            (_HEADS * _HEAD_DIM, _INPUT_FEATURES),
+            (heads * _HEAD_DIM, _INPUT_FEATURES),
             device="cuda",
             dtype=torch.int8,
         )
@@ -81,7 +83,7 @@ def _operands(*, batch: int = _BATCH, sequence_length: int = _SEQUENCE) -> _Oper
     )
     weight_scales = tuple(
         torch.rand(
-            (_HEADS * _HEAD_DIM, 1),
+            (heads * _HEAD_DIM, 1),
             device="cuda",
             dtype=torch.float32,
         )

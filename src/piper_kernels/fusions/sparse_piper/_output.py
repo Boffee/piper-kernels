@@ -109,8 +109,13 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     has_projected_coarse_gate: bool = False,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    start_head: int = 0,
+    end_head: int | None = None,
 ) -> _PreparedAttentionContext:
-    """Prepare global K/V state for bounded, independently projected Q chunks."""
+    """Prepare global K/V state for bounded, independently projected Q chunks.
+
+    The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``.
+    """
     if coarse_gate is not None and has_projected_coarse_gate:
         raise ValueError("coarse gate cannot be both materialized and projected")
     has_coarse_gate = coarse_gate is not None or has_projected_coarse_gate
@@ -135,6 +140,8 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        start_head=start_head,
+        end_head=end_head,
     )
     return _PreparedAttentionContext(
         quantized_context=quantized_context,

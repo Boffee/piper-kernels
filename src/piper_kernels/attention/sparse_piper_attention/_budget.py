@@ -94,11 +94,19 @@ def _resolve_route_layout(
     head_keep_ratio_units: tuple[int, ...],
     sparse_key_blocks: int,
     device: torch.device,
+    *,
+    start_head: int = 0,
+    end_head: int | None = None,
 ) -> _ResolvedRouteLayout:
+    """Lay out routes for profile heads ``[start_head, end_head)``.
+
+    Rounding distributes blocks across every profile head, so a range keeps the
+    blocks its heads keep when all heads run together.
+    """
     head_keep_block_values = _resolve_head_keep_blocks(
         head_keep_ratio_units,
         sparse_key_blocks,
-    )
+    )[start_head:end_head]
     route_head_offset_values = [0]
     for count in head_keep_block_values:
         route_head_offset_values.append(route_head_offset_values[-1] + count)
