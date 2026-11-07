@@ -766,15 +766,6 @@ def test_compile_options_preserve_unrelated_pass_order() -> None:
     assert convrot_int8_sparse_piper_compile_options(options) == options
 
 
-def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    first = fusion_compile_pass.uuid()
-    second = fusion_compile_pass.uuid()
-
-    assert isinstance(first, bytes)
-    assert first
-    assert first == second
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not projection_available(),

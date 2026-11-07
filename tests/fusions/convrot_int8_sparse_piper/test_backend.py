@@ -19,16 +19,12 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.attention import _output as attention_output
-from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
-from piper_kernels.fusions.convrot_int8_piper._amd import policy as dense_amd_policy
-from piper_kernels.fusions.convrot_int8_piper._nvidia import policy as dense_nvidia_policy
 from piper_kernels.fusions.convrot_int8_sage_qk import _key_kernels as key_kernels
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
 from piper_kernels.fusions.convrot_int8_sage_qk import key as key_projection
@@ -45,10 +41,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
-from piper_kernels.fusions.nvfp4_sparse_piper import _compile as nvfp4_compile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
-from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
-from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
 from piper_kernels.fusions.sparse_piper import _output as output_common
 
 
@@ -483,25 +476,6 @@ def test_shared_fusion_does_not_inspect_targets_or_launch_kernels(module):
 @pytest.mark.parametrize("module", [projection, key_projection])
 def test_shared_projection_launcher_does_not_own_target_policy(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
-
-
-def test_compiler_cache_keys_include_projection_validation_and_attention_policy():
-    assert dense_amd_policy.__file__ in dense_compile._source_files()
-    assert dense_nvidia_policy.__file__ in dense_compile._source_files()
-    assert qk_validation.__file__ in _compile._source_files()
-    assert projection.__file__ in _compile._source_files()
-    for compiler in (_compile, dense_compile):
-        assert key_projection.__file__ in compiler._source_files()
-        assert key_kernels.__file__ in compiler._source_files()
-        assert set(key_projection.centered_projection.source_files()) <= set(
-            compiler._source_files()
-        )
-        assert key_projection.qk_quantization.__file__ in compiler._source_files()
-    for compiler in (_compile, nvfp4_compile):
-        assert attention_policy.__file__ in compiler._source_files()
-        assert attention_output.__file__ in compiler._source_files()
-        assert projected_qk_compile.__file__ in compiler._source_files()
-        assert projected_qk_pattern.__file__ in compiler._source_files()
 
 
 @pytest.mark.parametrize("vendor", ["_nvidia", "_amd"])

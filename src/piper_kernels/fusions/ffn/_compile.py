@@ -29,12 +29,6 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 type FfnPatternValidator = Callable[[Match], bool]
 
-SOURCE_FILES = (
-    *residual_graph.SOURCE_FILES,
-    __file__,
-    residual_gates.__file__,
-)
-
 
 class UpDownChunkRows(Protocol):
     """An up/down FFN's chunk-size policy, from its input and weight metadata."""
@@ -157,7 +151,6 @@ def uses_python_indexing(match: Match) -> bool:
 
 
 __all__ = [
-    "SOURCE_FILES",
     "FfnPatternValidator",
     "UpDownChunkRows",
     "fold_residual_adds",

@@ -5,27 +5,21 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import (
-    CustomInferenceAwareGraphPass,
-    get_hash_for_files,
-)
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
 from piper_kernels import _inductor_options as inductor_options
-from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
-from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
-from piper_kernels.linear.nvfp4 import _storage as nvfp4_storage
-from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
-from piper_kernels.weights.convrot import _rotation as convrot_rotation
-from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
+from piper_kernels.linear.nvfp4 import (
+    _ops as nvfp4_ops,  # noqa: F401 - registers nvfp4_linear_prepared
+)
 
-from . import _compile_fx, _ops
-from . import triton as convrot_nvfp4_triton
+from . import (
+    _compile_fx,
+    _ops,  # noqa: F401 - registers convrot_nvfp4_linear
+)
 
-_COMPILE_PASS_VERSION = "convrot-nvfp4-compile-v4"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -94,25 +88,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(
-            (
-                __file__,
-                preparation_sharing.__file__,
-                projection_views.__file__,
-                convrot_rotation.__file__,
-                _compile_fx.__file__,
-                _ops.__file__,
-                convrot_nvfp4_triton.__file__,
-                nvfp4_primitives.__file__,
-                convrot_nvfp4_primitives.__file__,
-                nvfp4_compile_fx.__file__,
-                nvfp4_layout.__file__,
-                nvfp4_ops.__file__,
-                nvfp4_storage.__file__,
-                nvfp4_validation.__file__,
-            ),
-            extra=_COMPILE_PASS_VERSION,
-        )
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

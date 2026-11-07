@@ -174,9 +174,12 @@ be `plan`); independently selected stages use `schedule` or `<stage>_schedule`.
 Benchmark metadata uses the same distinction. Document changes to serialized
 fields so saved measurements remain interpretable.
 
-Type and policy modules must import without Triton. Compiler passes include
-implementation source files in their cache keys; keep that tracking complete
-when definitions move, including plan and policy modules.
+Type and policy modules must import without Triton. Every compiler pass's
+`uuid()` returns `compute_compile_pass_uuid(self)` from
+[`_inductor_options.py`](../src/piper_kernels/_inductor_options.py), which hashes
+the whole package source, so moving or adding modules needs no cache-key
+bookkeeping. A pass keeps its configuration out of instance state, because the
+key identifies a pass by its class.
 
 ## Performance tuning
 

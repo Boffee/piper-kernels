@@ -45,6 +45,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   from 2.17 to 1.09 GiB, and it runs 1.4% slower. Results differ slightly, as with dense
   head slices.
 
+### Fixed
+
+- Inductor's FX graph cache no longer reuses a graph that an earlier Piper Kernels
+  source compiled. Each compiler pass's cache key now hashes the whole package, so a
+  change to any module, such as the accelerator targets that decide whether a fusion
+  applies, invalidates cached graphs. Keys previously covered only a hand-listed subset.
+
 ## [0.8.0rc2] - 2026-11-05
 
 ### Added

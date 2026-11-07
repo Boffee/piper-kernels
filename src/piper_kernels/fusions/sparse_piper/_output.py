@@ -218,11 +218,6 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     )
 
 
-def source_files() -> tuple[str, ...]:
-    """Include the shared pipeline in compiler-pass cache invalidation."""
-    return tuple(path for path in (__file__, output_pipeline.__file__) if path is not None)
-
-
 def _run_chunked_attention_pipeline(  # noqa: PLR0913
     attention_storage: torch.Tensor,
     sequence_length: int,
@@ -382,7 +377,6 @@ __all__ = [
     "prepare_attention_context",
     "run_chunked_attention_output",
     "run_chunked_projected_query_attention_output",
-    "source_files",
     "validate_attention_output",
     "validate_output_metadata",
 ]

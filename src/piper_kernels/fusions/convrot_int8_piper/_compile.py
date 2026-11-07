@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from itertools import product
 
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass, get_hash_for_files
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch._inductor.pattern_matcher import (
     CallFunction,
     KeywordArg,
@@ -18,60 +18,22 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from piper_kernels import _inductor_options as inductor_options
-from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.attention import _head_slices as head_slices
-from piper_kernels.fusions.attention import _output as output_pipeline
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
-from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.projected_qk import _compile as projected_compile
 from piper_kernels.fusions.projected_qk import _pattern as projected_pattern
 from piper_kernels.linear import _bias, _projection_views
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _compile as linear_compile
-from piper_kernels.linear.convrot.int8 import _compile_fx, _ops
+from piper_kernels.linear.convrot.int8 import _compile_fx
 from piper_kernels.weights.convrot import _rotation
 
-from . import _backend, _output_compile, _schedule, _validation, output, query
-from . import key as key_projection
-from . import value as value_projection
+from . import _backend, _output_compile
+from . import key as key_operators  # noqa: F401 - registers the K projection
+from . import value as value_operators  # noqa: F401 - registers the V projection
 
-_COMPILE_PASS_VERSION = "convrot-int8-piper-output-compile-v7"
 _ACTIVATION_DTYPES = (torch.float16, torch.bfloat16)
-
-
-def _source_files() -> tuple[str, ...]:
-    """Invalidate cached rewrites when their metadata or execution contracts change."""
-    return tuple(
-        path
-        for path in (
-            __file__,
-            _output_compile.__file__,
-            *residual_fold.SOURCE_FILES,
-            _schedule.__file__,
-            output.__file__,
-            output_pipeline.__file__,
-            projection_output.__file__,
-            _validation.__file__,
-            *_backend.source_files(),
-            *linear_backend.source_files(),
-            *_quantized_dispatch.source_files(),
-            query.__file__,
-            key_projection.__file__,
-            value_projection.__file__,
-            projected_compile.__file__,
-            projected_pattern.__file__,
-            _bias.__file__,
-            _projection_views.__file__,
-            linear_compile_fx.__file__,
-            preparation_sharing.__file__,
-            _compile_fx.__file__,
-            _ops.__file__,
-            _rotation.__file__,
-        )
-        if path is not None
-    )
 
 
 def _projected_pattern(
@@ -521,7 +483,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             graph.lint()
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(_source_files(), extra=_COMPILE_PASS_VERSION)
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()
@@ -577,7 +539,7 @@ class _OutputCompilePass(CustomInferenceAwareGraphPass):
             graph.lint()
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(_source_files(), extra=f"{_COMPILE_PASS_VERSION}-output")
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 output_compile_pass = _OutputCompilePass()

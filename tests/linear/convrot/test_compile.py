@@ -129,15 +129,6 @@ def test_compile_options_install_the_convrot_pass() -> None:
     assert options["post_grad_custom_pre_pass"] is compile_pass
 
 
-def test_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    first = compile_pass.uuid()
-    second = compile_pass.uuid()
-
-    assert isinstance(first, bytes)
-    assert first
-    assert first == second
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("static", [False, True])

@@ -14,10 +14,11 @@ import operator
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
+from torch._inductor.custom_graph_pass import CustomGraphPass
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.nn import functional
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.conv3d.convrot.int8 import _compile as convolution_compile
 from piper_kernels.conv3d.convrot.int8 import _validation
 from piper_kernels.conv3d.convrot.int8._compile import get_tensor_metadata
@@ -190,11 +191,7 @@ class _CompilePass(CustomGraphPass):
         fuse_conv3d(graph)
 
     def uuid(self) -> bytes:
-        files = [__file__, *convolution_compile.source_files()]
-        return get_hash_for_files(
-            tuple(files),
-            extra="minimax-h3-convrot-int8-conv3d-v2",
-        )
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

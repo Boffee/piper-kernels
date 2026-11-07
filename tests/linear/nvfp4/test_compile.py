@@ -160,14 +160,12 @@ def test_pass_fails_closed_for_malformed_semantic_linears(case: str) -> None:
     assert str(graph) == original
 
 
-def test_compile_options_install_versioned_idempotent_pass() -> None:
+def test_compile_options_install_idempotent_pass() -> None:
     options = nvfp4_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
     assert options["post_grad_custom_pre_pass"] is compile_pass
     assert nvfp4_compile_options(options) == options
-    assert compile_pass.uuid() == compile_pass.uuid()
-    assert compile_pass.uuid()
 
 
 @pytest.mark.parametrize("difference", [None, "source", "dtype", "external-consumer"])

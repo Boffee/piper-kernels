@@ -94,11 +94,6 @@ def test_compile_options_compose_with_standard_gelu() -> None:
     )
 
 
-def test_compile_pass_uuid_is_versioned_and_stable() -> None:
-    assert convrot_gelu_compile_pass.uuid() == convrot_gelu_compile_pass.uuid()
-    assert convrot_gelu_compile_pass.uuid()
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(

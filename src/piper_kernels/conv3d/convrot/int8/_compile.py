@@ -5,14 +5,14 @@ from typing import cast
 
 import torch
 from torch._C._nn import pad as torch_pad
-from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
+from torch._inductor.custom_graph_pass import CustomGraphPass
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.nn import functional
 
+from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8 import tensor as weight_tensor
 
-from . import _arguments, _backend, _functional, _ops, _padding, _validation, dispatch, reference
+from . import _arguments, _functional
 from ._padding import Padding
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
@@ -221,28 +221,12 @@ def fuse_padding(graph: torch.fx.Graph) -> None:
         graph.lint()
 
 
-def source_files() -> tuple[str, ...]:
-    """Track semantic dispatch and padding as well as backend implementation."""
-    return (
-        __file__,
-        _arguments.__file__,
-        _functional.__file__,
-        dispatch.__file__,
-        weight_tensor.__file__,
-        _ops.__file__,
-        _padding.__file__,
-        _validation.__file__,
-        reference.__file__,
-        *_backend.source_files(),
-    )
-
-
 class _CompilePass(CustomGraphPass):
     def __call__(self, graph: torch.fx.Graph) -> None:
         fuse_padding(graph)
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(source_files(), extra="convrot-int8-conv3d-padding-v1")
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

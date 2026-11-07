@@ -908,8 +908,6 @@ schedule = policy.select_sm120_attention_schedule(
 )
 assert isinstance(schedule, AttentionSchedule)
 assert (schedule.block_m, schedule.num_warps) == (128, 4)
-import piper_kernels.attention.sparse_piper_attention._plan as schedule_types
-assert schedule_types.__file__ in _backend.source_files()
 assert torch.equal(SparsePiperAttention((0.5,))(query, query, query, sparse_key_blocks=2), query)
 # Even a supported target cannot select absent optional implementations.
 AcceleratorTarget.from_device = lambda device: AcceleratorTarget("cuda", "sm120")

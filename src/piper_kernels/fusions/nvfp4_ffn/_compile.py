@@ -5,27 +5,8 @@ from __future__ import annotations
 import torch
 from torch._inductor.pattern_matcher import CallFunction, KeywordArg, Match
 
-from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
-from piper_kernels.linear.nvfp4 import _storage as nvfp4_storage
-from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
-
-
-def source_files() -> tuple[str, ...]:
-    """Return source files whose changes invalidate format-level matching."""
-    return tuple(
-        file_name
-        for file_name in (
-            __file__,
-            _bias.__file__,
-            preparation_sharing.__file__,
-            nvfp4_compile_fx.__file__,
-            nvfp4_storage.__file__,
-            nvfp4_validation.__file__,
-        )
-        if file_name is not None
-    )
 
 
 def semantic_linear_pattern(
@@ -185,6 +166,5 @@ __all__ = [
     "matched_projections",
     "projection_call_matches",
     "semantic_linear_pattern",
-    "source_files",
     "valid_semantic_ffn",
 ]

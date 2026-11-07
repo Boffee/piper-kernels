@@ -309,8 +309,3 @@ def test_compile_options_are_idempotent() -> None:
         convrot_int8_compile_pass,
         specialization_compile_pass,
     )
-
-
-def test_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    assert specialization_compile_pass.uuid()
-    assert specialization_compile_pass.uuid() == specialization_compile_pass.uuid()
