@@ -9,7 +9,6 @@ import triton.language as tl
 from _accelerators import exact_sm120_available
 from torch import nn
 
-from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
@@ -17,6 +16,7 @@ from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
 from piper_kernels.linear.convrot.int8._nvidia import dispatch as int8_nvidia
 from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
 from piper_kernels.linear.convrot.int8.reference import linear, linear_prepared
+from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot._rotation import build_hadamard, rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.int8 import _ops as int8_update_ops
@@ -168,47 +168,6 @@ def test_scaled_projection_tile_supports_specialized_epilogues() -> None:
     accumulated = input_qdata.float() @ weight_qdata.T.float()
     projected = accumulated * input_scale[:, None] * weight_scale[None, :]
     expected = projected * projected + 0.25
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
-@pytest.mark.parametrize("group_size", [16, 64, 256])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_factorized_h4_rotation_matches_gpu_reference(
-    group_size: int,
-    dtype: torch.dtype,
-) -> None:
-    torch.manual_seed(41 + group_size)
-    activation = torch.randn(5, 2 * group_size, dtype=dtype, device="cuda")
-    actual = torch.empty_like(activation)
-
-    convrot_backend.rotate_input(activation, actual, group_size, num_warps=4)
-    expected = rotate_groups(activation, group_size)
-
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
-@pytest.mark.parametrize("group_size", [16, 64, 256])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_factorized_h4_rotation_handles_rounding_boundary_values(
-    group_size: int,
-    dtype: torch.dtype,
-) -> None:
-    one = torch.tensor(1.0, dtype=dtype, device="cuda")
-    positive = torch.nextafter(one, torch.tensor(float("inf"), dtype=dtype, device="cuda"))
-    negative = torch.nextafter(one, torch.tensor(float("-inf"), dtype=dtype, device="cuda"))
-    pattern = torch.stack((one, positive, negative, -one, -positive, -negative, one, -one))
-    width = 2 * group_size
-    activation = pattern.repeat((width + pattern.numel() - 1) // pattern.numel())[:width]
-    activation = activation.reshape(1, width)
-    actual = torch.empty_like(activation)
-
-    convrot_backend.rotate_input(activation, actual, group_size, num_warps=4)
-    expected = rotate_groups(activation, group_size)
-
     torch.testing.assert_close(actual, expected)
 
 

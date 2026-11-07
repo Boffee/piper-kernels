@@ -9,9 +9,9 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from piper_kernels._triton import convrot as rotation_backend
-from piper_kernels._triton import convrot_int8 as int8_kernels
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.weights.convrot import triton as rotation_backend
+from piper_kernels.weights.convrot.int8 import triton as int8_kernels
 
 from ._plan import ConvolutionExecutionPlan, PreparationSchedule
 from ._validation import _output_shape

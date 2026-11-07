@@ -32,7 +32,7 @@ def test_int8_normalization_avoids_bfloat16_double_rounding(device) -> None:
     actual, scale = dynamic_quantize_rows(values)
     assert torch.equal(actual, expected)
     if device == "cuda":
-        from piper_kernels._triton.convrot_int8 import quantize_rows_kernel  # noqa: PLC0415
+        from piper_kernels.weights.convrot.int8.triton import quantize_rows_kernel  # noqa: PLC0415
 
         output = torch.empty_like(expected)
         output_scale = torch.empty_like(scale)

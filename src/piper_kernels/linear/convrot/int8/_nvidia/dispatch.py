@@ -7,8 +7,8 @@ import torch
 from piper_kernels._input_activations import apply_input_activation, input_activation_width
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._residual.triton import apply_residual_add
-from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.weights.convrot import triton as convrot_backend
 
 from .._plan import LinearExecutionPlan
 from . import gluon_async_copy, policy

@@ -11,7 +11,11 @@ import triton.language as tl
 
 from piper_kernels import _input_activations as input_activations
 from piper_kernels._input_activations import triton as triton_input_activations
-from piper_kernels._triton.nvfp4 import (
+from piper_kernels._triton.runtime import device_context
+from piper_kernels.linear import _bias
+from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
+from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4.triton import (
     _decode_fp4,
     _decode_fp4_code,
     dynamic_scale,
@@ -19,10 +23,6 @@ from piper_kernels._triton.nvfp4 import (
     pack_e2m1_pairs,
     swizzled_scale_offsets,
 )
-from piper_kernels._triton.runtime import device_context
-from piper_kernels.linear import _bias
-from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
-from piper_kernels.weights.nvfp4 import _layout
 
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
 _NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE

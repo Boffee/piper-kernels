@@ -341,6 +341,7 @@ def test_updates_preserve_storage_and_replay(monkeypatch, device, operation, fal
 def test_addmm_matches_full_product(
     monkeypatch, dtype, autocast_dtype, seed, width, group_size, batched
 ):
+    from piper_kernels.weights.convrot import triton as rotation_triton  # noqa: PLC0415
     from piper_kernels.weights.convrot.int8 import triton as int8_triton  # noqa: PLC0415
 
     torch.manual_seed(674)
@@ -357,7 +358,7 @@ def test_addmm_matches_full_product(
     right = (torch.randint(-4, 5, (3, width * 2), device="cuda").to(dtype) / 8)[:, ::2]
     expected = weight.clone()
     rotated_right = torch.empty_like(right.contiguous())
-    int8_triton.rotate_input(right.contiguous(), rotated_right, group_size, num_warps=4)
+    rotation_triton.rotate_input(right.contiguous(), rotated_right, group_size, num_warps=4)
     qdata, scale = weight.qdata, weight.scale
     monkeypatch.setattr(int8_triton, "_UPDATE_WORKSPACE_BYTES", 7 * width * left.element_size())
     if batched:

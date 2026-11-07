@@ -13,16 +13,16 @@ from piper_kernels._input_activations import apply_input_activation, input_activ
 from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._residual.triton import apply_residual_add
-from piper_kernels._triton import convrot as convrot_backend
-from piper_kernels._triton.convrot_int8 import (
+from piper_kernels._triton.runtime import device_context
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.weights.convrot import triton as convrot_backend
+from piper_kernels.weights.convrot.int8.triton import (
     _quantize_int8,
     int8_scale_from_max,
     normalize_for_int8,
     quantize_rows_kernel,
     round_to_int8,
 )
-from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
 
 from .._kernels.triton import int8_matmul_kernel
 from .._plan import LinearExecutionPlan

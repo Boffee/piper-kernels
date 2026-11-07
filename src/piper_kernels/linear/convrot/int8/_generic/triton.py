@@ -5,9 +5,9 @@
 import torch
 import triton
 
-from piper_kernels._triton.convrot import rotate_input
-from piper_kernels._triton.convrot_int8 import quantize_rows_kernel
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.weights.convrot.int8.triton import quantize_rows_kernel
+from piper_kernels.weights.convrot.triton import rotate_input
 
 
 def _reciprocal_scale(value: torch.Tensor) -> bool:

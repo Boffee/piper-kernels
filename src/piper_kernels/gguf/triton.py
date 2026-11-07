@@ -9,8 +9,6 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from piper_kernels._triton import convrot as convrot_backend
-
 from ._types import GGUFQuantizationType
 
 _F32 = tl.constexpr(int(GGUFQuantizationType.F32))
@@ -286,31 +284,4 @@ def load_values(
     return scale * subscale * _iq4_value(code)
 
 
-@triton.jit
-def load_rotated_chunk(
-    data_ptr,
-    row_byte_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    chunk_size: tl.constexpr,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-    quant_type: tl.constexpr,
-):
-    """Decode and rotate one group-aligned slice without global dense storage."""
-    offsets = chunk_start + chunk_offsets
-    mask = offsets < row_width
-    values = load_values(
-        data_ptr,
-        row_byte_offset,
-        offsets,
-        mask,
-        quant_type,
-    )
-    values = convrot_backend.rotate_hadamard_groups(values, chunk_size, group_size)
-    values *= inverse_sqrt_group
-    return values
-
-
-__all__ = ["load_rotated_chunk", "load_values", "packed_row_size"]
+__all__ = ["load_values", "packed_row_size"]

@@ -6,12 +6,12 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.experimental.gluon._runtime import GluonASTSource
 
-from piper_kernels._triton import convrot_int8 as kernels_weights
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as gluon
 from piper_kernels.linear.convrot.int8._nvidia import policy
 from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
+from piper_kernels.weights.convrot.int8 import triton as kernels_weights
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
 
