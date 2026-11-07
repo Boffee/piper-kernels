@@ -5,10 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import (
-    CustomInferenceAwareGraphPass,
-    get_hash_for_files,
-)
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch._inductor.pattern_matcher import (
     CallFunction,
     KeywordArg,
@@ -18,14 +15,12 @@ from torch._inductor.pattern_matcher import (
 )
 
 from piper_kernels import _inductor_options as inductor_options
-from piper_kernels._triton import convrot as convrot_triton
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 
 from . import _compile_fx
 
-_COMPILE_PASS_VERSION = "convrot-compile-v7"
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
 
@@ -241,17 +236,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(
-            (
-                __file__,
-                input_activation_compile.__file__,
-                preparation_sharing.__file__,
-                projection_views.__file__,
-                convrot_triton.__file__,
-                _compile_fx.__file__,
-            ),
-            extra=_COMPILE_PASS_VERSION,
-        )
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

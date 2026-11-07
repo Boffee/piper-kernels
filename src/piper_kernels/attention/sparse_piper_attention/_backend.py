@@ -6,10 +6,8 @@ from functools import partial
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
-from . import _force_tiles, _interfaces, _launch, _plan, _prepared
 from ._amd import policy as amd_policy
 from ._dtype import SUPPORTED_DTYPES
 from ._force_tiles import build_portable_force_tile_bitmask
@@ -37,14 +35,11 @@ except ModuleNotFoundError as error:
     nvidia_tma_gluon = None
 
 try:
-    from piper_kernels.attention.kernels.piper._nvidia import fragments as nvidia_fragments
-
     from ._nvidia import gluon_async_copy as nvidia_async_copy_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
     nvidia_async_copy_gluon = None
-    nvidia_fragments = None
 
 try:
     from ._amd import gluon as amd_gluon
@@ -144,33 +139,6 @@ def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
     if backend is not None and nvidia_policy.skip_dense_routing(head_dim):
         return full_keep_backend
     return backend
-
-
-def source_files() -> tuple[str, ...]:
-    """Sources governing backend selection, policy, and shared NVIDIA arithmetic."""
-    paths = [
-        __file__,
-        _plan.__file__,
-        _interfaces.__file__,
-        _force_tiles.__file__,
-        _prepared.__file__,
-        _launch.__file__,
-        layout.__file__,
-        nvidia_policy.__file__,
-        amd_policy.__file__,
-    ]
-    if amd_gluon is not None:
-        from piper_kernels._triton import amd_compiler_workarounds  # noqa: PLC0415
-
-        from ._amd import _parameters  # noqa: PLC0415
-
-        paths.extend((amd_gluon.__file__, _parameters.__file__, amd_compiler_workarounds.__file__))
-    for implementation in (preparation, nvidia_tma_gluon, nvidia_async_copy_gluon, _route_backend):
-        if implementation is not None:
-            paths.append(implementation.__file__)
-    if nvidia_fragments is not None:
-        paths.append(nvidia_fragments.__file__)
-    return tuple(path for path in paths if path is not None)
 
 
 def require_attention_backend(query: torch.Tensor) -> AttentionBackend:

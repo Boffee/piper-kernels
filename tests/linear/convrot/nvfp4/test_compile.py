@@ -221,14 +221,12 @@ def test_pass_does_not_rewrite_training_graph() -> None:
     assert str(graph) == original
 
 
-def test_compile_options_install_versioned_idempotent_pass() -> None:
+def test_compile_options_install_idempotent_pass() -> None:
     options = convrot_nvfp4_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
     assert options["post_grad_custom_pre_pass"] is compile_pass
     assert convrot_nvfp4_compile_options(options) == options
-    assert compile_pass.uuid() == compile_pass.uuid()
-    assert compile_pass.uuid()
 
 
 def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:

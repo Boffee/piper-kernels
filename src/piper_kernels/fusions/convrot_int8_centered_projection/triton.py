@@ -16,12 +16,6 @@ from piper_kernels._triton.runtime import device_context
 from . import _kernels
 
 
-def source_files() -> tuple[str, ...]:
-    return tuple(
-        path for path in (__file__, _kernels.__file__, reductions.__file__) if path is not None
-    )
-
-
 def allocate_workspace(
     input: torch.Tensor,  # noqa: A002
     shape: tuple[int, int, int, int],

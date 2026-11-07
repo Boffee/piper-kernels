@@ -159,11 +159,6 @@ def test_compile_options_compose_with_swiglu(gelu_first: bool) -> None:
     assert passes.index(swiglu_compile_pass) < passes.index(convrot_int8_compile_pass)
 
 
-def test_compile_pass_uuid_is_versioned_and_stable() -> None:
-    assert gelu_compile_pass.uuid() == gelu_compile_pass.uuid()
-    assert gelu_compile_pass.uuid()
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])

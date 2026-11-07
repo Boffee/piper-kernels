@@ -490,7 +490,7 @@ def _run_explicit_attention_output(
     return result.view(model.batch, model.sequence_length, model.output_features)
 
 
-def test_compile_options_install_versioned_idempotent_passes() -> None:
+def test_compile_options_install_idempotent_passes() -> None:
     options = nvfp4_sparse_piper_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
@@ -498,8 +498,6 @@ def test_compile_options_install_versioned_idempotent_passes() -> None:
     assert isinstance(passes, tuple)
     assert passes == (nvfp4_compile_pass, compile_pass)
     assert nvfp4_sparse_piper_compile_options(options) == options
-    assert compile_pass.uuid() == compile_pass.uuid()
-    assert compile_pass.uuid()
 
 
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])

@@ -34,17 +34,16 @@ import logging
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass, get_hash_for_files
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.fx.node import Argument
 
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
-from . import _gates, _graph, _ops
+from . import _gates, _ops
 from ._graph import RESIDUAL_ADD, call_functional
 
 _log = logging.getLogger(__name__)
-_COMPILE_PASS_VERSION = "residual-updates-compile-v4"
 
 _aten = torch.ops.aten
 _COPY = _aten.copy_.default
@@ -126,19 +125,7 @@ class _ResidualUpdatePass(CustomInferenceAwareGraphPass):
             graph.lint()
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(
-            tuple(
-                path
-                for path in (
-                    __file__,
-                    *_graph.SOURCE_FILES,
-                    _gates.__file__,
-                    preparation_sharing.__file__,
-                )
-                if path is not None
-            ),
-            extra=_COMPILE_PASS_VERSION,
-        )
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 _compile_pass = _ResidualUpdatePass()

@@ -3,48 +3,15 @@
 import torch
 
 from piper_kernels._triton import (
-    amd_compiler_workarounds,
     mixed_int8,
-    reductions,
     runtime,
-    targets,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.kernels.piper._amd import _wmma, fragments
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import _rotation as qk_rotation
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 
-from . import _quantization, _validation
 from ._amd import gluon as amd_backend
 from ._amd import policy as amd_policy
-from ._amd import triton as amd_preparation
-from ._nvidia import _plan as nvidia_plan
 from ._nvidia import policy as nvidia_policy
 from ._nvidia import triton as nvidia_backend
-
-
-def source_files() -> tuple[str, ...]:
-    """Include preparation, dispatch, and launch semantics in compiler cache keys."""
-    modules = (
-        amd_compiler_workarounds,
-        mixed_int8,
-        reductions,
-        runtime,
-        targets,
-        _wmma,
-        fragments,
-        qk_rotation,
-        qk_quantization,
-        _quantization,
-        _validation,
-        amd_backend,
-        amd_policy,
-        amd_preparation,
-        nvidia_policy,
-        nvidia_plan,
-        nvidia_backend,
-    )
-    return (__file__, *(module.__file__ for module in modules if module.__file__ is not None))
 
 
 def supports_quantized_query(target: AcceleratorTarget) -> bool:

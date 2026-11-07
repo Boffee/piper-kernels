@@ -10,25 +10,9 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
-from piper_kernels.fusions.convrot_int8_projection import _plan as projection_plan
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from . import _key_kernels
-
-
-def source_files() -> tuple[str, ...]:
-    """Track the shared K producer, mean reduction, and quantization sources."""
-    return tuple(
-        path
-        for path in (
-            __file__,
-            projection_plan.__file__,
-            _key_kernels.__file__,
-            *centered_projection.source_files(),
-            qk_quantization.__file__,
-        )
-        if path is not None
-    )
 
 
 def project_key(  # noqa: PLR0913

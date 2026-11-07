@@ -6,22 +6,15 @@ import math
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import (
-    CustomInferenceAwareGraphPass,
-    get_hash_for_files,
-)
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx as convrot_int8_compile_fx
-from piper_kernels.linear.convrot.int8._amd import triton as amd_convrot_int8_backend
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia_convrot_int8_backend
 
-from . import _ops
-
-_COMPILE_PASS_VERSION = "minimax-h3-vae-convrot-int8-compile-v4"
+from . import _ops  # noqa: F401 - registers the prepared H3 linear
 
 type _LinearShape = tuple[int, int, int]
 type _MatmulSchedule = tuple[int, int, int, int, int]
@@ -187,16 +180,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             _specialize_linears(graph)
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(
-            (
-                __file__,
-                _ops.__file__,
-                amd_convrot_int8_backend.__file__,
-                nvidia_convrot_int8_backend.__file__,
-                convrot_int8_compile_fx.__file__,
-            ),
-            extra=_COMPILE_PASS_VERSION,
-        )
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

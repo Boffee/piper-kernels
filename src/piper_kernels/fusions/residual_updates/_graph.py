@@ -15,12 +15,7 @@ from typing import cast
 import torch
 from torch.fx.node import Argument
 
-from piper_kernels import _residual
-from piper_kernels._residual import triton as residual_kernels
-
-from . import _ops
-
-SOURCE_FILES = (__file__, _ops.__file__, _residual.__file__, residual_kernels.__file__)
+from . import _ops  # noqa: F401 - registers residual_add_
 
 _log = logging.getLogger(__name__)
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
@@ -106,7 +101,6 @@ def compute_inside_adds(
 
 __all__ = [
     "RESIDUAL_ADD",
-    "SOURCE_FILES",
     "ComputeInside",
     "bind_arguments",
     "call_functional",

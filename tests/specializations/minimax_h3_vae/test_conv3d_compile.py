@@ -213,7 +213,6 @@ def test_compile_options_preserve_existing_pre_grad_pass_and_are_idempotent():
     options = minimax_h3_vae_convrot_int8_conv3d_compile_options({"pre_grad_custom_pass": existing})
     options = minimax_h3_vae_convrot_int8_conv3d_compile_options(options)
     assert options["pre_grad_custom_pass"] == (existing, compile_pass)
-    assert compile_pass.uuid() == compile_pass.uuid()
 
 
 def test_encoder_and_decoder_options_are_independent_and_composable():

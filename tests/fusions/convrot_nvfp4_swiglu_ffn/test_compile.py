@@ -173,11 +173,6 @@ def test_compile_options_run_mixed_fusion_before_both_linear_families() -> None:
     )
 
 
-def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    assert fusion_compile_pass.uuid() == fusion_compile_pass.uuid()
-    assert fusion_compile_pass.uuid()
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize(

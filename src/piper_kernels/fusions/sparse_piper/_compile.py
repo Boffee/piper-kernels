@@ -9,25 +9,15 @@ from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
-from piper_kernels.attention.sparse_piper_attention import (
-    _backend,
-    _budget,
-    _dtype,
-    _profile,
-    _routes,
-    _routing,
-)
+from piper_kernels.attention.sparse_piper_attention import _dtype
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
-from piper_kernels.fusions.projected_qk import _pattern as projected_qk_pattern
-from piper_kernels.fusions.projected_qk import _validation as projected_qk_validation
 from piper_kernels.fusions.projected_qk._compile import (
     integer_scalar_argument,
     integer_scalar_metadata,
     static_int,
 )
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
-from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear._compile_fx import (
     ordered_tuple_output_producer as ordered_tuple_output_producer,  # noqa: PLC0414 - shared export
@@ -49,27 +39,6 @@ def unwrap_shape_only_views(value: object) -> torch.fx.Node | None:
             return None
         node = node.args[0]
     return node
-
-
-def source_files() -> tuple[str, ...]:
-    """Return sources that affect shared sparse-attention validation and policy."""
-    return tuple(
-        file_name
-        for file_name in (
-            __file__,
-            linear_compile_fx.__file__,
-            _dtype.__file__,
-            _budget.__file__,
-            _profile.__file__,
-            _routes.__file__,
-            _routing.__file__,
-            projected_qk_validation.__file__,
-            projected_qk_compile.__file__,
-            projected_qk_pattern.__file__,
-            *_backend.source_files(),
-        )
-        if file_name is not None
-    )
 
 
 def valid_sparse_piper_coarse_residual(match: Match) -> bool:
@@ -303,7 +272,6 @@ __all__ = [
     "emit_quantized_sparse_piper_attention",
     "integer_scalar_argument",
     "integer_scalar_metadata",
-    "source_files",
     "static_int",
     "valid_sparse_piper_attention",
     "valid_sparse_piper_coarse_residual",

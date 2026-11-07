@@ -2,7 +2,6 @@
 
 import sys
 from functools import partial
-from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -14,7 +13,6 @@ from piper_kernels.conv3d.convrot.int8._amd import policy as amd
 from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
 from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia
 from piper_kernels.conv3d.convrot.int8._plan import ConvolutionSchedule
-from piper_kernels.specializations.minimax_h3_vae.conv3d import _compile
 
 _nvidia_plan = partial(
     nvidia.select_execution_plan,
@@ -245,30 +243,6 @@ def test_tuning_tile_recomputes_descriptor_eligibility(architecture, aligned, bl
     assert candidate.use_weight_descriptor is (
         architecture == "sm120" and aligned and block_n == 64
     )
-
-
-def test_compiler_cache_tracks_backend_sources(monkeypatch):
-    files = _backend.source_files()
-    root = Path(_backend.__file__).parent
-    assert {
-        str(root / path)
-        for path in (
-            "_backend.py",
-            "_interfaces.py",
-            "_dispatch.py",
-            "_plan.py",
-            "_nvidia/policy.py",
-            "_amd/policy.py",
-        )
-    } <= set(files)
-    if _backend._shared is not None:
-        assert {
-            str(root / path) for path in ("triton.py", "_nvidia/dispatch.py", "_amd/dispatch.py")
-        } <= set(files)
-    capture = Mock(return_value=b"cache-key")
-    monkeypatch.setattr(_compile, "get_hash_for_files", capture)
-    assert _compile.compile_pass.uuid() == b"cache-key"
-    assert set(files) <= set(capture.call_args.args[0])
 
 
 def test_amd_policy_rejects_unsupported_platform(monkeypatch):

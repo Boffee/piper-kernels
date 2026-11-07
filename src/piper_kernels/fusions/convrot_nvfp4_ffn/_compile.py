@@ -13,19 +13,6 @@ from piper_kernels.linear.convrot.nvfp4 import _compile_fx as convrot_nvfp4_comp
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 
 
-def source_files() -> tuple[str, ...]:
-    """Return source files whose changes invalidate mixed-format matching."""
-    return tuple(
-        file_name
-        for file_name in (
-            __file__,
-            *nvfp4_ffn_compile.source_files(),
-            convrot_nvfp4_compile_fx.__file__,
-        )
-        if file_name is not None
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class MatchedProjection:
     """One standard or ConvRot semantic NVFP4 projection."""
@@ -147,6 +134,5 @@ __all__ = [
     "MatchedProjection",
     "matched_projections",
     "semantic_linear_pattern",
-    "source_files",
     "valid_semantic_ffn",
 ]

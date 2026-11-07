@@ -4,27 +4,19 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
-from piper_kernels.fusions.convrot_int8_projection import _validation as projection_validation
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
 
-from . import _interfaces
 from ._amd import policy as amd_policy
 from ._interfaces import ProjectionBackend
-from ._nvidia import _plan as nvidia_plan
 from ._nvidia import policy as nvidia_policy
 
 try:
-    from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as _linear_async_copy
-
     from ._nvidia import dispatch as _nvidia_projection
-    from ._nvidia import gluon_async_copy as _nvidia_async_copy_gluon
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _nvidia_projection = None
-    _nvidia_async_copy_gluon = None
-    _linear_async_copy = None
 
 
 try:
@@ -33,42 +25,6 @@ except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _amd_projection = None
-
-
-def source_files() -> tuple[str, ...]:
-    """Include selection and execution policy in the compiler-pass cache key."""
-    shared_projection_file = None
-    key_files: tuple[str, ...] = ()
-    if _nvidia_projection is not None or _amd_projection is not None:
-        from piper_kernels.fusions.convrot_int8_projection import (  # noqa: PLC0415
-            triton as shared_projection,
-        )
-        from piper_kernels.fusions.convrot_int8_sage_qk import (  # noqa: PLC0415
-            key as key_projection,
-        )
-
-        shared_projection_file = shared_projection.__file__
-        key_files = key_projection.source_files()
-    return tuple(
-        path
-        for path in (
-            __file__,
-            shared_projection_file,
-            *key_files,
-            projection_validation.__file__,
-            _interfaces.__file__,
-            nvidia_policy.__file__,
-            nvidia_plan.__file__,
-            None if _linear_async_copy is None else _linear_async_copy.__file__,
-            amd_policy.__file__,
-            None if _nvidia_projection is None else _nvidia_projection.__file__,
-            None if _nvidia_async_copy_gluon is None else _nvidia_async_copy_gluon.__file__,
-            None if _amd_projection is None else _amd_projection.__file__,
-            linear_backend.__file__,
-            attention_backend.__file__,
-        )
-        if path is not None
-    )
 
 
 def select_projection_backend(

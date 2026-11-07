@@ -9,12 +9,6 @@ from piper_kernels.fusions.residual_updates import _graph as residual_graph
 
 from . import _head_slices as head_slices
 
-SOURCE_FILES = (
-    *residual_graph.SOURCE_FILES,
-    __file__,
-    head_slices.__file__,
-)
-
 
 def fold_residual_adds(
     graph: torch.fx.Graph,
@@ -48,4 +42,4 @@ def fold_residual_adds(
     return residual_graph.compute_inside_adds(graph, output, compute) > 0
 
 
-__all__ = ["SOURCE_FILES", "fold_residual_adds"]
+__all__ = ["fold_residual_adds"]

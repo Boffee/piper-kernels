@@ -7,34 +7,23 @@ from dataclasses import dataclass
 from functools import partial
 
 import torch
-from torch._inductor.custom_graph_pass import (
-    CustomInferenceAwareGraphPass,
-    get_hash_for_files,
-)
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch._inductor.pattern_matcher import Match, PatternMatcherPass, register_graph_pattern
 from torch.fx.node import Argument
 
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.fusions.convrot_nvfp4_ffn import _compile as ffn_compile_common
-from piper_kernels.fusions.convrot_nvfp4_ffn import _preparation as convrot_source_preparation
 from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _pattern as ffn_pattern
 from piper_kernels.fusions.gelu_ffn import _pattern as gelu_ffn_pattern
-from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
-from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
-from piper_kernels.fusions.nvfp4_gelu_ffn import _operands, _preparation
 from piper_kernels.fusions.nvfp4_gelu_ffn import triton as standard_gelu_backend
 from piper_kernels.fusions.residual_updates import _gates as residual_gates
-from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 
-from . import _preparation as convrot_preparation
-from . import triton as gelu_backend
-
-_COMPILE_PASS_VERSION = "convrot-nvfp4-gelu-ffn-compile-v2"
+from . import triton  # noqa: F401 - registers the fused FFN operators
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,30 +181,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             _fold_chunked_ffn(graph)
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(
-            tuple(
-                file_name
-                for file_name in (
-                    __file__,
-                    projection_views.__file__,
-                    *ffn_compile_common.source_files(),
-                    ffn_core.__file__,
-                    source_preparation.__file__,
-                    convrot_source_preparation.__file__,
-                    _operands.__file__,
-                    _preparation.__file__,
-                    convrot_preparation.__file__,
-                    gelu_backend.__file__,
-                    standard_gelu_backend.__file__,
-                    *ffn_compile.SOURCE_FILES,
-                    ffn_pattern.__file__,
-                    gelu_ffn_pattern.__file__,
-                    input_activation_compile.__file__,
-                )
-                if file_name is not None
-            ),
-            extra=_COMPILE_PASS_VERSION,
-        )
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

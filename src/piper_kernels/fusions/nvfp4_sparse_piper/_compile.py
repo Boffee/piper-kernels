@@ -6,10 +6,7 @@ from collections.abc import Mapping
 from itertools import product
 
 import torch
-from torch._inductor.custom_graph_pass import (
-    CustomInferenceAwareGraphPass,
-    get_hash_for_files,
-)
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch._inductor.pattern_matcher import (
     CallFunction,
     KeywordArg,
@@ -20,77 +17,26 @@ from torch._inductor.pattern_matcher import (
 from torch.fx.node import Argument
 
 from piper_kernels import _inductor_options as inductor_options
-from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.attention.kernels.sparse_piper import layout
-from piper_kernels.attention.kernels.sparse_piper import (
-    triton as sparse_piper_triton,
-)
-from piper_kernels.attention.sparse_piper_attention import (
-    _quantized_dispatch,
-    dispatch,
-)
 from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     is_valid_routing_mode,
 )
-from piper_kernels.fusions.projected_qk import triton as projected_qk_triton
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
-from piper_kernels.fusions.sparse_piper import _output as sparse_piper_output
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
-from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _chunking as nvfp4_chunking
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx
-from piper_kernels.linear.nvfp4 import _projection as nvfp4_projection
-from piper_kernels.linear.nvfp4 import _storage as nvfp4_storage
-from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
-from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
-from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
-from . import _epilogue, _output, _output_compile, _validation, key, output, query, value
+from . import _output_compile, _validation
+from . import key as key_operators  # noqa: F401 - registers the K projection
+from . import value as value_operators  # noqa: F401 - registers the V projections
 
-_COMPILE_PASS_VERSION = "nvfp4-sparse-piper-compile-v10"
 _TILE_ROWS = layout.TILE_ROWS
 _QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
-
-
-def _source_files() -> tuple[str, ...]:
-    return tuple(
-        file_name
-        for file_name in (
-            __file__,
-            _bias.__file__,
-            nvfp4_chunking.__file__,
-            _epilogue.__file__,
-            _output.__file__,
-            _validation.__file__,
-            _output_compile.__file__,
-            key.__file__,
-            output.__file__,
-            query.__file__,
-            value.__file__,
-            layout.__file__,
-            sparse_piper_triton.__file__,
-            *sparse_piper_compile.source_files(),
-            *sparse_piper_output.source_files(),
-            sparse_piper_pattern.__file__,
-            linear_compile_fx.__file__,
-            nvfp4_layout.__file__,
-            projected_qk_triton.__file__,
-            nvfp4_projection.__file__,
-            nvfp4_storage.__file__,
-            nvfp4_validation.__file__,
-            nvfp4_triton.__file__,
-            nvfp4_primitives.__file__,
-            _quantized_dispatch.__file__,
-            dispatch.__file__,
-            _compile_fx.__file__,
-        )
-        if file_name is not None
-    )
 
 
 def _linear_pattern(prefix: str) -> CallFunction:
@@ -451,7 +397,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             _output_compile._fold_attention_output(graph)
 
     def uuid(self) -> bytes:
-        return get_hash_for_files(_source_files(), extra=_COMPILE_PASS_VERSION)
+        return inductor_options.compute_compile_pass_uuid(self)
 
 
 compile_pass = _CompilePass()

@@ -18,8 +18,7 @@ The functional and storage boundaries follow ConvRot INT8 linear's conventions:
 
 Convolution custom operators retain a portable reference runtime because the
 pre-grad padding pass emits them on CPU as well as GPU. Compiler integration is
-loaded only when compile options are requested. Its cache keys track each of
-these boundaries and the backend implementations.
+loaded only when compile options are requested.
 
 ## Arithmetic
 

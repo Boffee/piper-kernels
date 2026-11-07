@@ -70,11 +70,6 @@ def test_compile_options_compose_with_sparse_piper(ffn_first: bool) -> None:
     assert passes.index(sparse_piper_compile_pass) < passes.index(convrot_int8_compile_pass)
 
 
-def test_fusion_compiler_pass_uuid_is_versioned_and_stable() -> None:
-    assert fusion_compile_pass.uuid() == fusion_compile_pass.uuid()
-    assert fusion_compile_pass.uuid()
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 @pytest.mark.parametrize(

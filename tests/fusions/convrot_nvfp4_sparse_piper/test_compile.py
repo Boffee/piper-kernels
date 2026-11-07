@@ -56,7 +56,7 @@ _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _GROUP_SIZE = 16
 
 
-def test_compile_options_install_versioned_idempotent_passes() -> None:
+def test_compile_options_install_idempotent_passes() -> None:
     options = convrot_nvfp4_sparse_piper_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
@@ -65,8 +65,6 @@ def test_compile_options_install_versioned_idempotent_passes() -> None:
         fusion_compile_pass,
     )
     assert convrot_nvfp4_sparse_piper_compile_options(options) == options
-    assert fusion_compile_pass.uuid() == fusion_compile_pass.uuid()
-    assert fusion_compile_pass.uuid()
 
 
 @pytest.mark.parametrize("sparse_first", [False, True])

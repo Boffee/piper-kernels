@@ -16,11 +16,9 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.fusions.convrot_int8_projection import _plan as projection_plan
-from piper_kernels.fusions.convrot_int8_sparse_piper import _compile, _kernels
+from piper_kernels.fusions.convrot_int8_sparse_piper import _kernels
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import _plan as nvidia_plan
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
     dispatch,
     gluon_async_copy,
@@ -198,14 +196,6 @@ def test_sm89_uses_gluon_only_for_supported_projections(
             head_dim=128,
             operands_aligned=True,
         )
-
-
-def test_compiler_cache_keys_include_the_sm89_projection_kernels():
-    assert dispatch.__file__ in _compile._source_files()
-    assert gluon_async_copy.__file__ in _compile._source_files()
-    assert dispatch.linear_gluon.__file__ in _compile._source_files()
-    assert nvidia_plan.__file__ in _compile._source_files()
-    assert projection_plan.__file__ in _compile._source_files()
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
