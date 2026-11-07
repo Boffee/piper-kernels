@@ -1,1 +1,1 @@
-"""Shared Triton compiler extensions and language helpers."""
+"""Triton runtime and target facts, compiler extensions, and primitives shared across areas."""

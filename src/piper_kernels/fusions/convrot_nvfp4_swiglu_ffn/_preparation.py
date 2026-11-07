@@ -13,12 +13,12 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._input_activations.triton import swiglu
 from piper_kernels._triton import convrot as rotation
 from piper_kernels._triton.convrot_nvfp4 import (
     _preparation_num_warps,
     _rotated_row_amax_kernel,
 )
-from piper_kernels._triton.input_activations import swiglu
 from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
 from piper_kernels._triton.nvfp4 import encode_nvfp4_blocks, swizzled_scale_offsets
 from piper_kernels._triton.runtime import device_context

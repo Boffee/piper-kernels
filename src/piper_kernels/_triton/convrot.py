@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._triton.input_activations import gelu_tanh, swiglu
+from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._triton.runtime import device_context
 
 

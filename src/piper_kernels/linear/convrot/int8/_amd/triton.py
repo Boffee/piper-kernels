@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._input_activations import apply_input_activation, input_activation_width
+from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._residual.triton import apply_residual_add
 from piper_kernels._triton import convrot as convrot_backend
@@ -20,7 +21,6 @@ from piper_kernels._triton.convrot_int8 import (
     quantize_rows_kernel,
     round_to_int8,
 )
-from piper_kernels._triton.input_activations import gelu_tanh, swiglu
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 
