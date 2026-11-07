@@ -21,8 +21,17 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels).
 | `linear/`, `conv3d/` | Operators that consume weight formats, references, and backend dispatch |
 | `fusions/` | Composed operations and compiler rewrites that share preparation or intermediates |
 | `specializations/` | Explicitly enabled model/workload integrations built from reusable kernels |
-| `_triton/`, `attention/kernels/` | Shared GPU primitives and target descriptions |
+| `_residual/`, `_input_activations/`, `_inductor_options.py` | Private contracts and compiler options that several areas share |
+| `_triton/`, `attention/kernels/` | Triton runtime and target facts, compiler extensions, and shared GPU primitives |
 | `gguf/`, `trellis/`, `stochastic_quantization/` | Packed GGUF decoding, trellis-coded encoding and decoding, and reusable rounding arithmetic |
+
+Code lives in the area that owns its concept. A concept that several areas share
+and none owns, such as residual adds, is a private package at the package root:
+its `__init__.py` holds the contract and imports without Triton, and its
+`triton.py` holds the Triton code, as in operator packages and
+`stochastic_quantization/`. `_triton/` holds code about Triton itself (device
+probing, compiler targets, and compiler extensions) and Triton primitives that
+weights and operators share. It imports no operator, fusion, or compiler code.
 
 Weight representation and execution are separate concerns: `weights/` owns
 storage and its lifecycle; linear and convolution operators own execution.

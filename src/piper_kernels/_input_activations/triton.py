@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from piper_kernels._input_activations import (
+from . import (
     GELU_TANH_CUBIC_COEFFICIENT,
     GELU_TANH_SCALE_COEFFICIENT,
 )

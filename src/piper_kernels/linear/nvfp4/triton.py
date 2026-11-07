@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels import _input_activations as input_activations
-from piper_kernels._triton import input_activations as triton_input_activations
+from piper_kernels._input_activations import triton as triton_input_activations
 from piper_kernels._triton.nvfp4 import (
     _decode_fp4,
     _decode_fp4_code,
