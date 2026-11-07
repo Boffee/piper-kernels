@@ -5,9 +5,9 @@ import torch
 from _accelerators import exact_sm120_available
 from gguf_format._fixtures import dequantize_reference, finite_packed
 
-from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
 

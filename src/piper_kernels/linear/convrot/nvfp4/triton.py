@@ -8,18 +8,18 @@ from __future__ import annotations
 import torch
 
 from piper_kernels._input_activations import input_activation_width
-from piper_kernels._triton.convrot_nvfp4 import (
+from piper_kernels._triton.runtime import device_context
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
+from piper_kernels.weights.convrot._rotation import validate_group_size
+from piper_kernels.weights.convrot.nvfp4.triton import (
     _preparation_num_warps,
     _rotate_quantize_nvfp4_kernel,
     _rotated_row_amax_kernel,
     _rotation_chunk_sizes,
 )
-from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
-from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
-from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
+from piper_kernels.weights.nvfp4.triton import dynamic_scale as nvfp4_dynamic_scale
 
 _NVFP4_BLOCK_SIZE = nvfp4_layout.BLOCK_SIZE
 

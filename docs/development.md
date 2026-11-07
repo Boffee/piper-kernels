@@ -17,7 +17,7 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels).
 | Area | Responsibility |
 |---|---|
 | `attention/` | Dense, sparse, and SageAttention2++ APIs, references, and backends |
-| `weights/` | Packed storage, tensor subclasses, quantization, updates, and sharding |
+| `weights/` | Weight formats and their quantization arithmetic, packed storage, tensor subclasses, updates, and sharding |
 | `linear/`, `conv3d/` | Operators that consume weight formats, references, and backend dispatch |
 | `fusions/` | Composed operations and compiler rewrites that share preparation or intermediates |
 | `specializations/` | Explicitly enabled model/workload integrations built from reusable kernels |
@@ -30,11 +30,16 @@ and none owns, such as residual adds, is a private package at the package root:
 its `__init__.py` holds the contract and imports without Triton, and its
 `triton.py` holds the Triton code, as in operator packages and
 `stochastic_quantization/`. `_triton/` holds code about Triton itself (device
-probing, compiler targets, and compiler extensions) and Triton primitives that
-weights and operators share. It imports no operator, fusion, or compiler code.
+probing, compiler targets, and compiler extensions) and format-independent
+primitives such as reductions. It imports nothing else from the package.
 
-Weight representation and execution are separate concerns: `weights/` owns
-storage and its lifecycle; linear and convolution operators own execution.
+`weights/` owns each weight format and the lifecycle of its storage. A format
+package keeps its Triton-free contract in private modules such as `_layout.py`,
+`_rotation.py`, and `_quantization.py`, and all of its Triton code in `triton.py`:
+the encoding, decoding, and rotation arithmetic, and the weight conversion and
+update kernels built on it. Linear and convolution operators own execution and
+use that arithmetic to prepare activations in the format of their weights.
+`gguf/` decodes packed blocks without depending on the formats it feeds.
 The package consumes supplied GGUF blocks, trellis streams, and their metadata
 rather than parsing model repositories. Backend-specific modules own launch
 policy; public operators and compiler rewrites use those choices rather than

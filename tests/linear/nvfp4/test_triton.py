@@ -8,11 +8,11 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
 
 
 @pytest.mark.gpu

@@ -11,8 +11,6 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._residual import triton as residual_kernels
-from piper_kernels._triton import convrot as rotation
-from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
@@ -22,11 +20,13 @@ from piper_kernels.linear.convrot.int8._amd import triton as amd
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic
 from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
+from piper_kernels.weights.convrot import triton as rotation
 from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import _gguf
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 from piper_kernels.weights.convrot.nvfp4 import triton as convrot_nvfp4_weight_triton
+from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
 
 
 @pytest.fixture

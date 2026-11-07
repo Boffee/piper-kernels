@@ -8,10 +8,13 @@ import triton
 
 from piper_kernels._input_activations import input_activation_width
 from piper_kernels._residual import ResidualAdd
-from piper_kernels._triton.convrot_int8 import quantize_rows_kernel, rotate_quantize_rows_kernel
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
+from piper_kernels.weights.convrot.int8.triton import (
+    quantize_rows_kernel,
+    rotate_quantize_rows_kernel,
+)
 
 from .._kernels.triton import int8_matmul_kernel, int8_residual_matmul_kernel
 from . import policy

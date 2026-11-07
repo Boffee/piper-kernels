@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
+from piper_kernels.weights.nvfp4.triton import dynamic_scale as nvfp4_dynamic_scale
 
 from . import _output
 

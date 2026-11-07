@@ -20,6 +20,9 @@ features, and major releases contain breaking changes.
 Public compatibility includes exported names, tensor constructors and methods, documented
 storage attributes, accepted shapes and dtypes, mutation and dispatch behavior, and serialized
 packed-storage conventions. Modules and names beginning with an underscore are internal.
+`triton.py` implementation modules are internal too, unless their package's documentation
+presents them as public, as `stochastic_quantization` does for
+`stochastic_quantization.triton`.
 
 ## Release process
 

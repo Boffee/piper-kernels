@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention
@@ -15,6 +14,7 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
+from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
 
 pytestmark = [
     pytest.mark.gpu,

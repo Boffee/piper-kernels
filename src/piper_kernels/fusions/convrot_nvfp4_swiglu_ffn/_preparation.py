@@ -14,18 +14,18 @@ import triton
 import triton.language as tl
 
 from piper_kernels._input_activations.triton import swiglu
-from piper_kernels._triton import convrot as rotation
-from piper_kernels._triton.convrot_nvfp4 import (
-    _preparation_num_warps,
-    _rotated_row_amax_kernel,
-)
-from piper_kernels._triton.nvfp4 import dynamic_scale as nvfp4_dynamic_scale
-from piper_kernels._triton.nvfp4 import encode_nvfp4_blocks, swizzled_scale_offsets
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
+from piper_kernels.weights.convrot import triton as rotation
 from piper_kernels.weights.convrot._rotation import validate_group_size
+from piper_kernels.weights.convrot.nvfp4.triton import (
+    _preparation_num_warps,
+    _rotated_row_amax_kernel,
+)
+from piper_kernels.weights.nvfp4.triton import dynamic_scale as nvfp4_dynamic_scale
+from piper_kernels.weights.nvfp4.triton import encode_nvfp4_blocks, swizzled_scale_offsets
 
 # RTX 5090 measurements favored reuse up to 32 MiB; larger buffers added enough
 # memory traffic to favor recomputation.

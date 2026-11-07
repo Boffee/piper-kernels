@@ -1,4 +1,8 @@
-"""Reusable Triton rotation primitives shared by ConvRot storage formats."""
+"""ConvRot rotation in Triton and the row loaders that feed it.
+
+The portable contract is in ``_rotation``. ConvRot INT8 and NVFP4 weight
+conversion and activation preparation share these primitives.
+"""
 
 # Triton's JIT launcher accepts compile-time options outside its Python signature.
 # pyright: reportCallIssue=false
@@ -11,6 +15,7 @@ import triton.language as tl
 
 from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.gguf import triton as gguf_triton
 
 
 @triton.jit
@@ -101,6 +106,33 @@ def load_activated_rotated_chunk(
 
 
 @triton.jit
+def load_gguf_rotated_chunk(
+    data_ptr,
+    row_byte_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    chunk_size: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    quant_type: tl.constexpr,
+):
+    """Decode and rotate one group-aligned packed GGUF row slice without dense storage."""
+    offsets = chunk_start + chunk_offsets
+    mask = offsets < row_width
+    values = gguf_triton.load_values(
+        data_ptr,
+        row_byte_offset,
+        offsets,
+        mask,
+        quant_type,
+    )
+    values = rotate_hadamard_groups(values, chunk_size, group_size)
+    values *= inverse_sqrt_group
+    return values
+
+
+@triton.jit
 def rotate_groups_kernel(
     input_ptr,
     output_ptr,
@@ -144,6 +176,7 @@ def rotate_input(
 
 __all__ = [
     "load_activated_rotated_chunk",
+    "load_gguf_rotated_chunk",
     "rotate_groups_kernel",
     "rotate_hadamard_groups",
     "rotate_hadamard_stage",

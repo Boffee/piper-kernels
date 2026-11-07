@@ -5,12 +5,12 @@ import torch
 from _accelerators import exact_sm120_available
 
 from piper_kernels._input_activations import apply_input_activation
-from piper_kernels._triton import convrot as convrot_backend
-from piper_kernels._triton import convrot_nvfp4 as convrot_nvfp4_primitives
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
+from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.nvfp4 import triton as convrot_nvfp4_primitives
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 

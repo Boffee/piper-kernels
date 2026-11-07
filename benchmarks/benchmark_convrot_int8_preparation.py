@@ -40,13 +40,13 @@ from lib.triton_inspection import (
 from piper_kernels._input_activations import (
     apply_input_activation,
 )
-from piper_kernels._triton import convrot as convrot_backend
-from piper_kernels._triton import convrot_int8 as int8_kernels_weights
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._amd import policy as amd_policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd_backend
 from piper_kernels.linear.convrot.int8._nvidia import policy as convrot_int8_policy
 from piper_kernels.linear.convrot.int8._nvidia import triton as triton_backend
+from piper_kernels.weights.convrot import triton as convrot_backend
+from piper_kernels.weights.convrot.int8 import triton as int8_kernels_weights
 
 COMFY_KITCHEN_ADAPTER_CONTRACT_VERSION = "0.2.28"
 PIPER_TRITON_PROVIDER = "piper-triton"
@@ -78,7 +78,7 @@ class PreparationPhaseResult:
 
 
 _PHASE_PROVENANCE = {
-    "rotate": "piper_kernels._triton.convrot.rotate_input",
+    "rotate": "piper_kernels.weights.convrot.triton.rotate_input",
     "quantize": "piper_kernels.linear.convrot.int8._nvidia.triton.quantize_input",
     "split": "Piper rotate_input followed by quantize_input",
     "fused": "piper_kernels.linear.convrot.int8._nvidia.triton.fused_rotate_quantize_input",

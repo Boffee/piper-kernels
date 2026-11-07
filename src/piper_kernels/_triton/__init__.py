@@ -1,1 +1,1 @@
-"""Triton runtime and target facts, compiler extensions, and primitives shared across areas."""
+"""Triton runtime and target facts, compiler extensions, and format-independent primitives."""

@@ -8,11 +8,11 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-from piper_kernels._triton import convrot_int8 as kernels_weights
-from piper_kernels._triton.convrot import rotate_groups_kernel
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
+from piper_kernels.weights.convrot.int8 import triton as kernels_weights
 from piper_kernels.weights.convrot.int8._policy import select_addmm_plan
+from piper_kernels.weights.convrot.triton import rotate_groups_kernel
 
 # Triton 3.9 removed RDNA2 (gfx103x) compile targets.
 _TARGETS = [

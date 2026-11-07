@@ -6,7 +6,6 @@ from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels._triton import nvfp4 as nvfp4_primitives
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _preparation
 from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
@@ -17,6 +16,7 @@ from piper_kernels.fusions.nvfp4_swiglu_ffn.triton import (
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
+from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
 
 from .._ffn_residual_add import assert_residual_add_matches_gated_updates
 from ._helpers import make_operands, materialized
