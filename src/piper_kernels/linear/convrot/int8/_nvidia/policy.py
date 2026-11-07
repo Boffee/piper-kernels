@@ -6,6 +6,8 @@ are measured on SM89; other supported NVIDIA targets retain the baseline schedul
 
 from dataclasses import replace
 
+import torch
+
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
@@ -58,6 +60,20 @@ _SM8X_GLUON_LARGE = MatmulSchedule(
 def supports_target(target: AcceleratorTarget) -> bool:
     """Return whether the NVIDIA INT8 linear and update implementation is supported."""
     return target.cuda_capability_at_least(7, 5)
+
+
+def supports_residual_epilogue(
+    target: AcceleratorTarget, plan: NvidiaExecutionPlan, logical_dtype: torch.dtype
+) -> bool:
+    """Use the measured SM120 epilogue when the tile can pack to 16-bit values.
+
+    FP32 reusable-update epilogues spill and can be slower than a separate add.
+    """
+    return (
+        target.is_cuda_capability(12, 0)
+        and plan.matmul_kernel == "triton"
+        and logical_dtype in (torch.float16, torch.bfloat16)
+    )
 
 
 def supports_preparation_target(target: AcceleratorTarget) -> bool:

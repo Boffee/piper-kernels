@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
 from piper_kernels.fusions.convrot_nvfp4_ffn._preparation import ConvRotSourcePreparation
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
 from piper_kernels.fusions.nvfp4_swiglu_ffn import _operands
 from piper_kernels.fusions.nvfp4_swiglu_ffn._preparation import StandardSwiGLUPreparation
-from piper_kernels.fusions.residual_updates import triton as residual_updates
 
 from ._preparation import ConvRotSwiGLUPreparation
 
@@ -260,12 +260,12 @@ def _chunked_swiglu_ffn_gated_updates_op(
         chunk_rows,
         source_preparation,
         activation_preparation,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
-            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
+            reusable=ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -344,14 +344,14 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
         source_preparation,
         activation_preparation,
     )[2]
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(
+        ResidualAdd(
             base,
             ffn_gate,
             gate_indices,
             python_indexing,
-            residual_updates.ReusableUpdate(reusable_update, update_gate),
+            ReusableUpdate(reusable_update, update_gate),
         ),
         output_features,
     )
@@ -432,7 +432,7 @@ def _chunked_swiglu_ffn_residual_add_op(
         chunk_rows,
         source_preparation,
         activation_preparation,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
@@ -513,9 +513,9 @@ def _chunked_swiglu_ffn_residual_add_op_fake(
         source_preparation,
         activation_preparation,
     )[2]
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
+        ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
         output_features,
     )
 

@@ -42,7 +42,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     is_valid_routing_mode,
 )
 from piper_kernels.fusions.attention import _head_slices as head_slices
-from piper_kernels.fusions.attention import _residual as attention_residual
+from piper_kernels.fusions.attention import _residual_fold as residual_fold
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as convrot_int8_qk_validation
 from piper_kernels.fusions.convrot_int8_sage_qk import triton as convrot_int8_sage_qk
@@ -84,10 +84,11 @@ def _source_files() -> tuple[str, ...]:
             projection_views.__file__,
             _layout.__file__,
             *_backend.source_files(),
+            *linear_backend.source_files(),
             _kernels.__file__,
             projection.__file__,
             _output_compile.__file__,
-            *attention_residual.SOURCE_FILES,
+            *residual_fold.SOURCE_FILES,
             qk_quantization.__file__,
             sparse_piper_kernels.__file__,
             convrot_int8_sage_qk.__file__,
@@ -646,7 +647,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             projection_views.normalize_projection_views(graph)
             _fold_sparse_piper_projection(graph)
             _output_compile._fold_attention_output(graph)
-            if attention_residual.fold_residual_adds(
+            if residual_fold.fold_residual_adds(
                 graph,
                 _ops.convrot_int8_sparse_piper_projected_query_attention_output.default,
                 _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default,

@@ -22,7 +22,6 @@ from piper_kernels.fusions.nvfp4_ffn import _compile as ffn_compile_common
 from piper_kernels.fusions.nvfp4_ffn import _core as ffn_core
 from piper_kernels.fusions.nvfp4_ffn import _preparation as source_preparation
 from piper_kernels.fusions.residual_updates import _gates as residual_gates
-from piper_kernels.fusions.residual_updates import triton as residual_updates
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
@@ -217,7 +216,6 @@ class _CompilePass(CustomInferenceAwareGraphPass):
                     gelu_backend.__file__,
                     *ffn_compile.SOURCE_FILES,
                     ffn_pattern.__file__,
-                    residual_updates.__file__,
                     gelu_ffn_pattern.__file__,
                     input_activation_compile.__file__,
                 )

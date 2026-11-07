@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
 from piper_kernels.fusions.nvfp4_ffn import _core
 from piper_kernels.fusions.nvfp4_ffn._preparation import StandardSourcePreparation
-from piper_kernels.fusions.residual_updates import triton as residual_updates
 
 from . import _operands
 from ._preparation import StandardSwiGLUPreparation
@@ -198,12 +198,12 @@ def _chunked_swiglu_ffn_gated_updates_op(
         chunk_rows,
         StandardSourcePreparation(gate_high_first),
         StandardSwiGLUPreparation(down_high_first),
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
-            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
+            reusable=ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -271,14 +271,14 @@ def _chunked_swiglu_ffn_gated_updates_op_fake(
         StandardSourcePreparation(gate_high_first),
         StandardSwiGLUPreparation(down_high_first),
     )[2]
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(
+        ResidualAdd(
             base,
             ffn_gate,
             gate_indices,
             python_indexing,
-            residual_updates.ReusableUpdate(reusable_update, update_gate),
+            ReusableUpdate(reusable_update, update_gate),
         ),
         output_features,
     )
@@ -348,7 +348,7 @@ def _chunked_swiglu_ffn_residual_add_op(
         chunk_rows,
         StandardSourcePreparation(gate_high_first),
         StandardSwiGLUPreparation(down_high_first),
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
@@ -418,9 +418,9 @@ def _chunked_swiglu_ffn_residual_add_op_fake(
         StandardSourcePreparation(gate_high_first),
         StandardSwiGLUPreparation(down_high_first),
     )[2]
-    residual_updates.validate_residual_add(
+    validate_residual_add(
         input,
-        residual_updates.ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
+        ResidualAdd(base, ffn_gate, gate_indices, python_indexing),
         output_features,
     )
 

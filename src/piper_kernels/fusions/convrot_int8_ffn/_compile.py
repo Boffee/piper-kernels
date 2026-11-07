@@ -21,7 +21,7 @@ def source_files() -> tuple[str, ...]:
             __file__,
             _bias.__file__,
             preparation_sharing.__file__,
-            _backend.__file__,
+            *_backend.source_files(),
             _compile_fx.__file__,
         )
         if file_name is not None

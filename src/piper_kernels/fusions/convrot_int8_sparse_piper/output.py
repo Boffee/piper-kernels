@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
@@ -21,12 +21,6 @@ from piper_kernels.weights.convrot.int8._quantization import (
 from . import _backend as fusion_backend
 from . import query as query_projection
 from ._layout import TILE_ROWS
-
-if TYPE_CHECKING:
-    from piper_kernels.fusions.residual_updates.triton import (
-        ResidualAdd,
-        ResidualAddLayout,
-    )
 
 _DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
 
@@ -238,7 +232,7 @@ def _prepare_output_chunk_projector(  # noqa: PLR0913
     backend: LinearBackend,
     output_dtype: torch.dtype = torch.bfloat16,
     output_input_scale: torch.Tensor | None = None,
-    residual_add: tuple[ResidualAdd, ResidualAddLayout] | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> tuple[int, output_common.ChunkProjector, tuple[torch.Tensor, ...]]:
     """Prepare output-chunk buffers using the fusion's already-selected backend.
 
@@ -256,29 +250,17 @@ def _prepare_output_chunk_projector(  # noqa: PLR0913
         query_chunk_rows,
         output_dtype=output_dtype,
     )
-    if residual_add is None:
-        project_chunk, retained = projection_output.prepare_chunk_projector(
-            sequence_length,
-            query_chunk_rows,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend=backend,
-            output_input_scale=output_input_scale,
-        )
-    else:
-        project_chunk, retained = projection_output.prepare_residual_add_projector(
-            sequence_length,
-            query_chunk_rows,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            *residual_add,
-            backend=backend,
-            output_input_scale=output_input_scale,
-        )
+    project_chunk, retained = projection_output.prepare_chunk_projector(
+        sequence_length,
+        query_chunk_rows,
+        weight_qdata,
+        weight_scale,
+        bias,
+        group_size,
+        backend=backend,
+        output_input_scale=output_input_scale,
+        residual_add=residual_add,
+    )
     return output_features, project_chunk, retained
 
 
@@ -408,7 +390,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     output_input_scale: torch.Tensor | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
-    residual_add: tuple[ResidualAdd, ResidualAddLayout] | None = None,
+    residual_add: ResidualAdd | None = None,
     start_head: int = 0,
     end_head: int | None = None,
 ) -> torch.Tensor:
@@ -532,7 +514,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         projector_tensors,
         project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
         output_dtype=output_dtype,
-        out=out if residual_add is None else residual_add[0].base,
+        out=out if residual_add is None else residual_add.base,
         reuse_output_for_attention=residual_add is None,
     )
 
@@ -887,11 +869,8 @@ def _validate_residual_add(
     weight_qdata: torch.Tensor,
     force_tile_ids: torch.Tensor | None,
     force_tile_counts: torch.Tensor | None,
-) -> tuple[ResidualAdd, ResidualAddLayout]:
+) -> ResidualAdd:
     """Check from metadata that ``base`` has the projected output's rows and dtype."""
-    # Triton loads only when the residual add runs.
-    from piper_kernels.fusions.residual_updates import triton as residual_updates  # noqa: PLC0415
-
     sequence_length = output_common.validate_output_metadata(
         key,
         logical_sequence_length,
@@ -902,14 +881,14 @@ def _validate_residual_add(
     )
     if base.ndim != 3 or base.shape[:2] != (key.shape[0], sequence_length):
         raise ValueError("sparse Piper residual base must have one row per output row")
-    residual_add = residual_updates.ResidualAdd(
+    residual_add = ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    layout = residual_updates.validate_residual_add(base, residual_add, weight_qdata.shape[0])
-    return residual_add, layout
+    validate_residual_add(base, residual_add, weight_qdata.shape[0])
+    return residual_add
 
 
 def _resolve_head_slice(
@@ -989,8 +968,8 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     The attention operands match
     ``convrot_int8_sparse_piper_projected_query_attention_output``, whose ``gate_*``
     operands project the coarse gate; ``gate`` is the residual gate, and the output
-    dtype is ``base``'s. Each window is projected into bounded scratch and added into
-    its ``base`` rows in FP32 with one rounding.
+    dtype is ``base``'s. The linear backend adds each window's projection into its
+    ``base`` rows in FP32; its native epilogue preserves projection rounding without scratch.
 
     To add attention in ``num_head_slices`` equal head slices, call once per slice:
     the Q, K, V, and coarse-gate operands hold slice ``head_slice_index``'s heads, the

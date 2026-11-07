@@ -78,6 +78,13 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
+from piper_kernels._residual import ResidualAdd, validate_residual_add
+residual_input = torch.ones(2, 32)
+validate_residual_add(
+    residual_input,
+    ResidualAdd(residual_input, torch.ones(1, 32), torch.zeros(2, dtype=torch.int64), False),
+    32,
+)
 
 weight = ConvRotInt8Tensor.from_quantized(
     torch.ones(7, 32, dtype=torch.int8), torch.ones(7, 1),

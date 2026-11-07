@@ -21,13 +21,14 @@ from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _output as output_pipeline
-from piper_kernels.fusions.attention import _residual as attention_residual
+from piper_kernels.fusions.attention import _residual_fold as residual_fold
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.projected_qk import _compile as projected_compile
 from piper_kernels.fusions.projected_qk import _pattern as projected_pattern
 from piper_kernels.linear import _bias, _projection_views
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _compile as linear_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx, _ops
 from piper_kernels.weights.convrot import _rotation
@@ -47,13 +48,14 @@ def _source_files() -> tuple[str, ...]:
         for path in (
             __file__,
             _output_compile.__file__,
-            *attention_residual.SOURCE_FILES,
+            *residual_fold.SOURCE_FILES,
             _schedule.__file__,
             output.__file__,
             output_pipeline.__file__,
             projection_output.__file__,
             _validation.__file__,
             *_backend.source_files(),
+            *linear_backend.source_files(),
             *_quantized_dispatch.source_files(),
             query.__file__,
             key_projection.__file__,
@@ -562,7 +564,7 @@ class _OutputCompilePass(CustomInferenceAwareGraphPass):
             # Drop the replaced attention, so the fused output alone reads its K and V.
             graph.eliminate_dead_code()
         changed = (
-            attention_residual.fold_residual_adds(
+            residual_fold.fold_residual_adds(
                 graph,
                 _kernels.convrot_int8_piper_projected_query_attention_output.default,
                 _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default,

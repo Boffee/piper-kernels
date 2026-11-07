@@ -11,10 +11,10 @@ import math
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, validate_residual_add
+from piper_kernels._residual.triton import apply_residual_add
 from piper_kernels._triton import runtime
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-
-from . import triton as residual_updates
 
 
 def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
@@ -71,7 +71,7 @@ def _validate(
     gate: torch.Tensor,
     gate_indices: torch.Tensor,
     python_indexing: bool,
-) -> tuple[residual_updates.ResidualAdd, residual_updates.ResidualAddLayout]:
+) -> ResidualAdd:
     if base.ndim < 1 or not base.dtype.is_floating_point:
         raise ValueError("residual add base must be a floating-point tensor with features")
     if (
@@ -82,13 +82,14 @@ def _validate(
         or not update.is_contiguous()
     ):
         raise ValueError("residual add update must be contiguous and match base")
-    residual_add = residual_updates.ResidualAdd(
+    residual_add = ResidualAdd(
         base=base,
         gate=gate,
         gate_indices=gate_indices,
         python_indexing=python_indexing,
     )
-    return residual_add, residual_updates.validate_residual_add(base, residual_add, base.shape[-1])
+    validate_residual_add(base, residual_add, base.shape[-1])
+    return residual_add
 
 
 @torch.library.custom_op("piper_kernels::residual_add_", mutates_args=("base",))
@@ -104,13 +105,10 @@ def _residual_add_op(
     Rows are ``base``'s leading positions; ``gate_indices`` selects one ``gate`` row
     for each, wrapping negative values under ``python_indexing``.
     """
-    residual_add, layout = _validate(base, update, gate, gate_indices, python_indexing)
+    residual_add = _validate(base, update, gate, gate_indices, python_indexing)
     if base.numel() == 0:
         return
-    rows = base.view(-1, base.shape[-1])
-    residual_updates.apply_residual_add(
-        update.view(-1, base.shape[-1]), rows, rows, residual_add, layout, 0
-    )
+    apply_residual_add(update, residual_add)
 
 
 @_residual_add_op.register_fake

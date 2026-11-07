@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels.fusions.convrot_int8_ffn import _core
-from piper_kernels.fusions.residual_updates import triton as residual_updates
 
 _DEFAULT_CHUNK_ROWS = _core.DEFAULT_CHUNK_ROWS
 
@@ -29,7 +29,7 @@ def _run_chunked_swiglu_ffn(
     value_input_scale: torch.Tensor | None = None,
     down_input_scale: torch.Tensor | None = None,
     *,
-    residual_add: residual_updates.ResidualAdd | None = None,
+    residual_add: ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Run the public gate/value topology through the shared bounded runner."""
     gate = _core.LinearOperands(
@@ -174,12 +174,12 @@ def _chunked_swiglu_ffn_gated_updates_op(
         gate_input_scale,
         value_input_scale,
         down_input_scale,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,
             python_indexing=python_indexing,
-            reusable=residual_updates.ReusableUpdate(reusable_update, update_gate),
+            reusable=ReusableUpdate(reusable_update, update_gate),
         ),
     )
 
@@ -259,7 +259,7 @@ def _chunked_swiglu_ffn_residual_add_op(
         gate_input_scale,
         value_input_scale,
         down_input_scale,
-        residual_add=residual_updates.ResidualAdd(
+        residual_add=ResidualAdd(
             base=base,
             gate=ffn_gate,
             gate_indices=gate_indices,

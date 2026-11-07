@@ -5,6 +5,8 @@ import math
 import torch
 
 from piper_kernels._input_activations import apply_input_activation, input_activation_width
+from piper_kernels._residual import ResidualAdd
+from piper_kernels._residual.triton import apply_residual_add
 from piper_kernels._triton import convrot as convrot_backend
 from piper_kernels._triton.targets import AcceleratorTarget
 
@@ -284,3 +286,47 @@ def linear_prepared(
         out=out,
         second_projection=second_projection,
     )
+
+
+def linear_prepared_residual(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual_add: ResidualAdd,
+    *,
+    row_offset: int = 0,
+    projection_scratch: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Use a measured native epilogue when supported, or the standalone add."""
+    m = math.prod(input_qdata.shape[:-1])
+    target = AcceleratorTarget.from_device(input_qdata.device)
+    plan = default_execution_plan(weight_qdata, target=target, rows=m)
+    if policy.supports_residual_epilogue(target, plan, residual_add.base.dtype):
+        n, k = weight_qdata.shape
+        output = residual_add.output.view(-1, n)[row_offset : row_offset + m]
+        if m and n:
+            triton_kernels.launch_int8_residual_matmul(
+                input_qdata.reshape(m, k),
+                weight_qdata,
+                output,
+                input_scale.reshape(m),
+                weight_scale,
+                bias,
+                residual_add,
+                row_offset=row_offset,
+                execution_plan=plan,
+            )
+        return output.view(*input_qdata.shape[:-1], n)
+    projection = execute_prepared_linear(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        residual_add.base.dtype,
+        plan,
+        out=projection_scratch,
+    )
+    return apply_residual_add(projection, residual_add, row_offset)
