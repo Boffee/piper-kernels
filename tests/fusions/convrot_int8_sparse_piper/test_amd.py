@@ -97,6 +97,7 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
             torch.testing.assert_close(actual_metadata, expected_metadata, rtol=3e-5, atol=2e-5)
 
 
+@pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires Linux RDNA4 ROCm")
 @pytest.mark.parametrize("sequence", [193, 8192, 100_000])
@@ -198,6 +199,7 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
     assert v[0].shape == ValueFormat.AMD_WMMA.shape(1, heads, storage, head_dim)
 
 
+@pytest.mark.usefixtures("large_device_memory")
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires Linux RDNA4 ROCm")
 @pytest.mark.parametrize("sequence", [193, 8193, 100_000])

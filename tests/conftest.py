@@ -49,7 +49,13 @@ def large_device_memory(tmp_path_factory: pytest.TempPathFactory) -> Iterator[No
     Such tests check free device memory and then allocate. On different xdist
     workers, two of them could both pass the check and then run out of memory
     together. Every worker's base temporary directory shares one parent, which
-    scopes the lock to the test session.
+    scopes the lock to the test session. Each test returns its worker's cached
+    device memory before releasing the lock: no other process can use memory
+    that a worker's caching allocator keeps reserved.
     """
     with FileLock(tmp_path_factory.getbasetemp().parent / "large_device_memory.lock"):
         yield
+        import torch  # noqa: PLC0415 - deferred like _accelerator_visible's import.
+
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
