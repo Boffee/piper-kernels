@@ -545,8 +545,8 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     once=("bias",),
     alignment="group_size",
     unsliceable=(),
-    # Dense launches lose efficiency at half the heads; keeping their size costs only a
-    # larger output-projection scratch window.
+    # Dense launches lose efficiency at half the heads, and at H3's shape the add has
+    # room below the K projection's peak, so full-size windows add little peak.
     widened_window_rows="query_chunk_rows",
     slice_position=None,
 )

@@ -630,8 +630,8 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     alignment="group_size",
     # A materialized coarse gate holds heads along its third dimension.
     unsliceable=("coarse_gate",),
-    # Sparse windows also hold Q, attention, and routing-score buffers that grow with
-    # rows times heads, so full-size launches would keep those whole for little speed.
+    # At H3's shape, the add's routing scores and coarse-gate windows bring it up to the
+    # K projection's peak, so full-size windows would raise the peak for little speed.
     widened_window_rows=None,
     # Keep budgets are rounded across all heads, so each slice takes its heads' share.
     slice_position=("head_slice_index", "num_head_slices"),

@@ -72,7 +72,12 @@ class HeadSlicing:
     """The add's query-window row cap, which each slice multiplies by
     ``NUM_HEAD_SLICES`` so its attention launches keep their unsliced rows times heads.
     With None, each slice keeps the cap, and its launches and window buffers cover half
-    as many heads."""
+    as many heads.
+
+    Widening keeps the add's window buffers at their unsliced size instead of halving
+    them, and doubles those that span the output features. That costs no peak memory
+    while the add stays below its slice's K projection, the other peak. Widen when
+    full-size launches recover speed for little or no added peak."""
 
     slice_position: tuple[str, str] | None
     """The add's arguments for a slice's index and the number of slices, for an add that
