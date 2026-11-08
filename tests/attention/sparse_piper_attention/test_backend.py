@@ -555,7 +555,7 @@ def _quantized_context_arguments(head_dim=128):
 def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeypatch, coarse):
     arguments = _quantized_context_arguments()
     if coarse:
-        arguments.update(block_mean=torch.ones(1, 1, 2, 128), coarse_scale=0.1)
+        arguments.update(block_mean=torch.ones(1, 1, 2, 128), coarse_scale=0.1, coarse_key_blocks=2)
     launch = Mock()
     select = Mock(
         return_value=AttentionBackend(

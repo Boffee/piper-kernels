@@ -32,7 +32,7 @@ from ._routing import (
 from ._routing_modes import (
     validate_routing_mode,
 )
-from .coarse import _resolve_coarse_key_blocks
+from .coarse import _validate_coarse_key_blocks
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,13 +99,14 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
             raise ValueError("coarse output metadata requires block means")
         route_key_blocks = layout.num_key_blocks
     else:
-        if coarse_scale is None:
-            raise ValueError("coarse output requires a scale")
-        route_key_blocks = _resolve_coarse_key_blocks(
+        if coarse_scale is None or coarse_key_blocks is None:
+            raise ValueError("coarse output requires a scale and a key block scope")
+        _validate_coarse_key_blocks(
             layout.num_key_blocks,
             coarse_key_blocks,
             available_coarse_key_blocks=block_mean.shape[2],
         )
+        route_key_blocks = coarse_key_blocks
         pooled_value = block_mean[:, :, :route_key_blocks]
     kernel_context = _prepare_sparse_piper_context_from_quantized(
         key,

@@ -1,4 +1,4 @@
-"""Shared traversal of routed blocks, then the dense suffix, for Gluon attention kernels."""
+"""Shared traversal of routed K64 tiles, then a compact ragged tile, for Gluon kernels."""
 
 # Gluon device parameters are not Python runtime values.
 # ruff: noqa: ANN001, ANN201
@@ -9,12 +9,21 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
+def complete_tile_count(storage_sequence_length, logical_sequence_length, padded: gl.constexpr):
+    """Count the complete K64 tiles, which routes cover; a compact ragged tile follows them."""
+    if padded:
+        return storage_sequence_length // 64
+    else:
+        return logical_sequence_length // 64
+
+
+@gluon.jit
 def tile_offset(
     routes,
     position,
     routed_count,
     selected_count,
-    num_routed_key_blocks,
+    num_key_blocks,
     route_stride,
     use_routes,
     skip_dense_routing: gl.constexpr = False,
@@ -28,8 +37,8 @@ def tile_offset(
         route = gl.load(routes + safe_position * route_stride).to(gl.int32)
         routed_tile = gl.where(use_routes, route, position)
         routed_start = routed_tile * tile_stride
-        # Dense-suffix tiles follow the routed blocks in traversal order.
-        dense_start = (num_routed_key_blocks + position - selected_count) * tile_stride
+        # A compact ragged tile follows the complete tiles in traversal order.
+        dense_start = (num_key_blocks + position - selected_count) * tile_stride
         return gl.where(position < selected_count, routed_start, dense_start)
 
 
@@ -40,7 +49,7 @@ def pair_tile_offsets(
     tile_count,
     routed_count,
     selected_count,
-    num_routed_key_blocks,
+    num_key_blocks,
     route_stride,
     use_routes,
     skip_dense_routing: gl.constexpr = False,
@@ -54,7 +63,7 @@ def pair_tile_offsets(
         position_0,
         routed_count,
         selected_count,
-        num_routed_key_blocks,
+        num_key_blocks,
         route_stride,
         use_routes,
         skip_dense_routing,
@@ -65,7 +74,7 @@ def pair_tile_offsets(
         position_1,
         routed_count,
         selected_count,
-        num_routed_key_blocks,
+        num_key_blocks,
         route_stride,
         use_routes,
         skip_dense_routing,

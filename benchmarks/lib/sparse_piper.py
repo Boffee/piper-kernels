@@ -63,10 +63,8 @@ def reference_prepared_query(
         start, stop = context.route_head_offsets[head : head + 2].tolist()
         tiles = query.routes[batch, query_block, start:stop].long()
     else:
-        tiles = torch.arange(context.num_routed_key_blocks, device=device)
-    tiles = torch.cat(
-        (tiles, torch.arange(context.num_routed_key_blocks, stored_blocks, device=device))
-    )
+        tiles = torch.arange(context.num_key_blocks, device=device)
+    tiles = torch.cat((tiles, torch.arange(context.num_key_blocks, stored_blocks, device=device)))
     tile_count = tiles.numel()
     if tile_count % 2:
         tiles = torch.cat((tiles, tiles[-1:]))

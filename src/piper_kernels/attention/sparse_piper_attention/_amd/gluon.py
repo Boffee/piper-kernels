@@ -26,7 +26,7 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     softmax_fragment,
     split_columns,
 )
-from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
+from piper_kernels.attention.kernels.sparse_piper.gluon import complete_tile_count, tile_offset
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
 from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
@@ -76,7 +76,6 @@ def _sparse_piper_attention_kernel(
     query_storage_sequence_length,
     storage_sequence_length,
     logical_sequence_length,
-    num_routed_key_blocks,
     sparse_query_blocks,
     stride_rb,
     stride_rq,
@@ -122,15 +121,19 @@ def _sparse_piper_attention_kernel(
         + query_blocks.to(gl.int64) * stride_rq
         + route_head_offset * stride_rr
     )
+    # Routes cover the complete tiles; a compact ragged tile follows them.
+    num_key_blocks = complete_tile_count(
+        storage_sequence_length, logical_sequence_length, mask_block_lengths
+    )
     routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
     use_sparse_routes = global_query_block < sparse_query_blocks if has_dense_query_suffix else True
     selected_sparse_tile_count = gl.where(
         use_sparse_routes,
         routed_sparse_tile_count,
-        num_routed_key_blocks,
+        num_key_blocks,
     )
     sequence_tiles = storage_sequence_length // 64
-    dense_tile_count = sequence_tiles - num_routed_key_blocks
+    dense_tile_count = sequence_tiles - num_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
     query = query_fragments(
@@ -160,7 +163,7 @@ def _sparse_piper_attention_kernel(
             pair * 2,
             routed_sparse_tile_count,
             selected_sparse_tile_count,
-            num_routed_key_blocks,
+            num_key_blocks,
             stride_rr,
             use_sparse_routes,
         )
@@ -169,7 +172,7 @@ def _sparse_piper_attention_kernel(
             gl.minimum(pair * 2 + 1, tile_count - 1),
             routed_sparse_tile_count,
             selected_sparse_tile_count,
-            num_routed_key_blocks,
+            num_key_blocks,
             stride_rr,
             use_sparse_routes,
         )
@@ -369,7 +372,6 @@ class _ContextLauncher:
                 launch.query_storage_sequence_length,
                 launch.storage_sequence_length,
                 launch.logical_sequence_length,
-                launch.num_routed_key_blocks,
                 launch.sparse_query_blocks,
                 *launch.route_strides,
                 *launch.output_strides,

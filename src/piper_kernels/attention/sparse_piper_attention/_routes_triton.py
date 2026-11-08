@@ -85,20 +85,20 @@ def _route_priority_bits(  # noqa: ANN202
 def _fill_full_keep_routes_kernel(  # noqa: ANN202
     routes_ptr,  # noqa: ANN001
     count,  # noqa: ANN001
-    num_routed_key_blocks: tl.constexpr,
+    num_key_blocks: tl.constexpr,
     block: tl.constexpr,
 ):
     offsets = tl.program_id(0) * block + tl.arange(0, block)
-    tl.store(routes_ptr + offsets, offsets % num_routed_key_blocks, offsets < count)
+    tl.store(routes_ptr + offsets, offsets % num_key_blocks, offsets < count)
 
 
-def fill_full_keep_routes(routes: torch.Tensor, num_routed_key_blocks: int) -> None:
+def fill_full_keep_routes(routes: torch.Tensor, num_key_blocks: int) -> None:
     """Write canonical routes directly, without summaries or top-k selection."""
     with device_context(routes.device):
         _fill_full_keep_routes_kernel[(triton.cdiv(routes.numel(), 1024),)](
             routes,
             routes.numel(),
-            num_routed_key_blocks,  # pyright: ignore[reportArgumentType]
+            num_key_blocks,  # pyright: ignore[reportArgumentType]
             1024,  # pyright: ignore[reportArgumentType]
         )
 
@@ -117,7 +117,7 @@ def _ordered_float_bits(scores):  # noqa: ANN001, ANN202
 def _tiled_radix_select_pass(  # noqa: ANN202
     scores_ptr,  # noqa: ANN001
     score_base,  # noqa: ANN001
-    num_routed_key_blocks,  # noqa: ANN001
+    num_region_key_blocks,  # noqa: ANN001
     prefix,  # noqa: ANN001
     rank,  # noqa: ANN001
     shift: tl.constexpr,
@@ -128,9 +128,9 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 ):
     """Select one radix byte while streaming a score row in fixed tiles."""
     histogram = tl.zeros([_RADIX_BINS], tl.int32)
-    for tile_start in range(0, num_routed_key_blocks, selector_tile):
+    for tile_start in range(0, num_region_key_blocks, selector_tile):
         key_offsets = tile_start + tl.arange(0, selector_tile)
-        valid = key_offsets < num_routed_key_blocks
+        valid = key_offsets < num_region_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
         ordered_bits = _route_priority_bits(
             scores, start_key_block + key_offsets, valid, force_mask_ptr, has_force

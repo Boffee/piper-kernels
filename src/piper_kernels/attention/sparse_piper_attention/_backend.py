@@ -197,13 +197,13 @@ def select_minmax_scores(
     return _score_backend.minmax_scores if amd_policy.supports_target(target) else None
 
 
-def fill_full_keep_routes(routes: torch.Tensor, num_routed_key_blocks: int) -> None:
+def fill_full_keep_routes(routes: torch.Tensor, num_key_blocks: int) -> None:
     """Materialize the known all-block route list on the selected device."""
     if _route_backend is not None and select_route_selector(routes) is not None:
-        _route_backend.fill_full_keep_routes(routes, num_routed_key_blocks)
+        _route_backend.fill_full_keep_routes(routes, num_key_blocks)
     else:
-        blocks = torch.arange(num_routed_key_blocks, device=routes.device, dtype=torch.int32)
-        routes.unflatten(-1, (-1, num_routed_key_blocks)).copy_(blocks.to(torch.uint16))
+        blocks = torch.arange(num_key_blocks, device=routes.device, dtype=torch.int32)
+        routes.unflatten(-1, (-1, num_key_blocks)).copy_(blocks.to(torch.uint16))
 
 
 def use_fused_operand_preparation(

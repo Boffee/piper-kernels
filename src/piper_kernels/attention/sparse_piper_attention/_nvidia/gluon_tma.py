@@ -17,7 +17,10 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.gluon import pair_tile_offsets
+from piper_kernels.attention.kernels.sparse_piper.gluon import (
+    complete_tile_count,
+    pair_tile_offsets,
+)
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
@@ -72,7 +75,6 @@ def _sparse_piper_attention_kernel(
     query_storage_sequence_length,
     storage_sequence_length,
     logical_sequence_length,
-    num_routed_key_blocks,
     sparse_query_blocks,
     stride_rb,
     stride_rq,
@@ -153,9 +155,14 @@ def _sparse_piper_attention_kernel(
     mbarrier.init(value_barrier, count=1)
     gl.barrier()
 
+    # Routes cover the complete tiles; a compact ragged tile follows them.
+    sequence_tiles = storage_sequence_length // _GL_BLOCK_N
+    num_key_blocks = complete_tile_count(
+        storage_sequence_length, logical_sequence_length, mask_block_lengths
+    )
     if skip_dense_routing:
-        routed_sparse_tile_count = num_routed_key_blocks
-        selected_sparse_tile_count = num_routed_key_blocks
+        routed_sparse_tile_count = num_key_blocks
+        selected_sparse_tile_count = num_key_blocks
         use_sparse_routes = False
     else:
         routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
@@ -164,13 +171,12 @@ def _sparse_piper_attention_kernel(
             selected_sparse_tile_count = gl.where(
                 use_sparse_routes,
                 routed_sparse_tile_count,
-                num_routed_key_blocks,
+                num_key_blocks,
             )
         else:
             use_sparse_routes = True
             selected_sparse_tile_count = routed_sparse_tile_count
-    sequence_tiles = storage_sequence_length // _GL_BLOCK_N
-    dense_tile_count = sequence_tiles - num_routed_key_blocks
+    dense_tile_count = sequence_tiles - num_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
     initial_n_0, initial_n_1 = pair_tile_offsets(
@@ -179,7 +185,7 @@ def _sparse_piper_attention_kernel(
         tile_count,
         routed_sparse_tile_count,
         selected_sparse_tile_count,
-        num_routed_key_blocks,
+        num_key_blocks,
         stride_rr,
         use_sparse_routes,
         skip_dense_routing,
@@ -271,7 +277,7 @@ def _sparse_piper_attention_kernel(
             tile_count,
             routed_sparse_tile_count,
             selected_sparse_tile_count,
-            num_routed_key_blocks,
+            num_key_blocks,
             stride_rr,
             use_sparse_routes,
             skip_dense_routing,
@@ -449,8 +455,7 @@ class _ContextLauncher:
             has_coarse_residual=launch.apply_coarse_residual,
             selected_key_rows=(
                 context.routes_per_query // launch.heads * _BLOCK_N
-                + launch.storage_sequence_length
-                - launch.num_routed_key_blocks * _BLOCK_N
+                + (_BLOCK_N if launch.mask_ragged_tail else 0)
             ),
         )
         query_desc = _descriptor(
@@ -485,7 +490,6 @@ class _ContextLauncher:
                 launch.query_storage_sequence_length,
                 launch.storage_sequence_length,
                 launch.logical_sequence_length,
-                launch.num_routed_key_blocks,
                 launch.sparse_query_blocks,
                 *launch.route_strides,
                 *launch.output_strides,

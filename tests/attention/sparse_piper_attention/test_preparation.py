@@ -77,7 +77,7 @@ def test_fused_preparation_matches_separate_passes(preparation, head_dim, dtype,
     rows = 17 * 64 if padded else 17 * 64 + 5
     storage = (rows + 63) // 64 * 64
     # Key summaries cover the complete blocks; a compact partial tile has none.
-    num_routed_key_blocks = rows // 64
+    num_key_blocks = rows // 64
     generator = torch.Generator(device="cuda").manual_seed(606)
     query = (
         torch.randn(2, rows, 4, head_dim, device="cuda", generator=generator)
@@ -119,7 +119,7 @@ def test_fused_preparation_matches_separate_passes(preparation, head_dim, dtype,
     )
     expected_summaries = _summaries_triton.sequence_block_summaries(
         masked_query,
-        masked_key[:, :, : num_routed_key_blocks * 64],
+        masked_key[:, :, : num_key_blocks * 64],
         _routing_modes._MINMAX_ROUTING,
         lengths,
     )
@@ -145,7 +145,7 @@ def test_fused_preparation_matches_separate_passes(preparation, head_dim, dtype,
     ):
         torch.testing.assert_close(getattr(fused, name), expected, atol=0, rtol=0, msg=name)
     for summary in (fused.key_summary, fused.key_aux):
-        assert summary.shape == (2, 2, num_routed_key_blocks, head_dim)
+        assert summary.shape == (2, 2, num_key_blocks, head_dim)
         # A prefix view of a full-sequence allocation would retain the wasted storage.
         assert summary.untyped_storage().nbytes() == summary.numel() * summary.element_size()
     torch.testing.assert_close(fused.value_mean, value_mean, atol=0, rtol=0)
@@ -243,13 +243,7 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
     )
     for kernel in kernels:
         kernel.device_caches.clear()
-    for batch, heads, rows, num_routed_key_blocks in (
-        (1, 4, 1024, 16),
-        (1, 4, 1024, 1),
-        (1, 4, 1024, 3),
-        (2, 8, 2048, 32),
-        (1, 4, 4096, 5),
-    ):
+    for batch, heads, rows in ((1, 4, 1024), (2, 8, 2048), (1, 4, 4096)):
         query = torch.zeros(
             batch, rows, heads, head_dim, device="cuda", dtype=torch.bfloat16
         ).transpose(1, 2)
@@ -263,7 +257,6 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
             key_mean,
             head_dim**-0.5,
             storage_sequence_length=rows,
-            num_routed_key_blocks=num_routed_key_blocks,
             block_lengths=None,
         )
         # The new producer must retain the all-zero quantization guards.

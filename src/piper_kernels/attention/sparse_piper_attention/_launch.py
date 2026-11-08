@@ -15,7 +15,6 @@ _DO_NOT_SPECIALIZE_ARGUMENTS = (
     "query_block_offset",
     "global_query_block_offset",
     "logical_sequence_length",
-    "num_routed_key_blocks",
     "sparse_query_blocks",
     "stride_rb",
     "stride_rq",
@@ -36,7 +35,6 @@ class _ValidatedAttentionLaunch:
     storage_sequence_length: int
     output_sequence_length: int
     logical_sequence_length: int
-    num_routed_key_blocks: int
     sparse_query_blocks: int
     route_strides: tuple[int, int, int]
     output_strides: tuple[int, int, int]
@@ -172,7 +170,6 @@ def validate_attention_launch(
         storage_sequence_length=storage_sequence_length,
         output_sequence_length=output_sequence_length,
         logical_sequence_length=logical_sequence_length,
-        num_routed_key_blocks=context.num_routed_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         route_strides=(
             query_state.routes.stride(0),

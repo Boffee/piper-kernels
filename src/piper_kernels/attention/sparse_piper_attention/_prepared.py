@@ -14,7 +14,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     ValueFormat,
 )
 
-from ._block_layout import compute_num_routed_key_blocks, validate_sparse_query_blocks
+from ._block_layout import validate_sparse_query_blocks
 
 if TYPE_CHECKING:
     from ._interfaces import BindAttention, LaunchAttention
@@ -48,9 +48,11 @@ class _PreparedSparsePiperContext:
     logical_sequence_length: int
 
     @property
-    def num_routed_key_blocks(self) -> int:
-        """Complete K64 key blocks, which routes cover; a compact partial tile follows."""
-        return compute_num_routed_key_blocks(self.logical_sequence_length, self.block_lengths)
+    def num_key_blocks(self) -> int:
+        """Complete K64 key blocks, which routes cover; a compact ragged tile follows."""
+        if self.block_lengths is not None:
+            return self.block_lengths.numel()
+        return self.logical_sequence_length // TILE_ROWS
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,11 +101,6 @@ class _PreparedSparsePiperOperands:
     query_summary: torch.Tensor | None = None
     key_summary: torch.Tensor | None = None
     key_aux: torch.Tensor | None = None
-
-    @property
-    def num_routed_key_blocks(self) -> int:
-        """Complete K64 key blocks, which routes cover; a compact partial tile follows."""
-        return compute_num_routed_key_blocks(self.logical_sequence_length, self.block_lengths)
 
     def with_routes(
         self,

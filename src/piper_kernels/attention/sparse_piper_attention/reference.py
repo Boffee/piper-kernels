@@ -9,7 +9,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
-from ._block_layout import compute_num_routed_key_blocks, valid_block_rows
+from ._block_layout import valid_block_rows
 from ._routes import PackedRoutes
 
 _RECURRENCE_ROWS = 128
@@ -24,13 +24,14 @@ def _active_indices(
     batch: int,
     head: int,
     query_block: int,
-    num_routed_key_blocks: int,
     sequence_length: int,
     route_head_offsets: list[int],
     block_lengths: torch.Tensor | None,
     use_sparse_routes: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     route_start, route_stop = route_head_offsets[head : head + 2]
+    # Routes cover the complete blocks; a compact ragged tile follows them.
+    num_key_blocks = sequence_length // _BLOCK_ROWS
     selected_blocks = (
         routes.indices[
             batch,
@@ -38,11 +39,11 @@ def _active_indices(
             route_start:route_stop,
         ].long()
         if use_sparse_routes and routes.indices.shape[-1] != 0
-        else torch.arange(num_routed_key_blocks, device=routes.indices.device)
+        else torch.arange(num_key_blocks, device=routes.indices.device)
     )
     row_offsets = torch.arange(_BLOCK_ROWS, device=routes.indices.device)
     sparse_rows = (selected_blocks[:, None] * _BLOCK_ROWS + row_offsets).flatten()
-    routed_key_rows = num_routed_key_blocks * _BLOCK_ROWS
+    routed_key_rows = num_key_blocks * _BLOCK_ROWS
     suffix_rows = torch.arange(
         routed_key_rows,
         sequence_length,
@@ -51,7 +52,7 @@ def _active_indices(
     key_indices = torch.cat((sparse_rows, suffix_rows))
 
     suffix_tiles = torch.arange(
-        num_routed_key_blocks,
+        num_key_blocks,
         (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
         device=routes.indices.device,
     )
@@ -119,7 +120,6 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     """
     batch, sequence, heads, head_dim = query.shape
     query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-    num_routed_key_blocks = compute_num_routed_key_blocks(sequence, block_lengths)
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
@@ -151,7 +151,6 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     batch=batch_index,
                     head=head,
                     query_block=query_block,
-                    num_routed_key_blocks=num_routed_key_blocks,
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
@@ -253,7 +252,6 @@ def reference_exact_sparse_attention(
     """Apply the same routes with exact BF16 inputs and FP32 attention math."""
     batch, sequence, heads, _head_dim = query.shape
     query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-    num_routed_key_blocks = compute_num_routed_key_blocks(sequence, block_lengths)
     output = torch.empty_like(query)
     route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 
@@ -266,7 +264,6 @@ def reference_exact_sparse_attention(
                     batch=batch_index,
                     head=head,
                     query_block=query_block,
-                    num_routed_key_blocks=num_routed_key_blocks,
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
