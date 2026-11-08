@@ -1,15 +1,18 @@
 """SM89 Gluon kernels for the fused ConvRot INT8 dense-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
-fragments. Q quantizes its RMSNorm/RoPE tile after the signed Hadamard, with
-per-thread or Q32 scales. Per-thread groups (rows 32b + 8i + t) lie in one
-thread's registers, so their scales need no data exchange and are stored per row
-from that layout. K stores BF16 rows and FP32 tile sums for the shared encoder,
-which centers K by its global mean.
+fragments. Programs run at the 255-register limit, so every kernel multiplies K32
+operand slices: K64 slices spill inside the K loop at production widths.
 
-V keeps a 2x2 warp grid and quantizes each token. Its epilogue spreads rows
-across lanes, so the transposed code stores and per-token metadata stores are
-coalesced.
+Q quantizes its RMSNorm/RoPE tile after the signed Hadamard, with per-thread or
+Q32 scales. Per-thread groups (rows 32b + 8i + t) lie in one thread's registers,
+so their scales need no data exchange and are stored per row from that layout.
+K stores BF16 rows and FP32 tile sums for the shared encoder, which centers K by
+its global mean.
+
+V keeps a 2x2 warp grid and quantizes each token. Its epilogue gives each thread
+8 consecutive rows of 16 features, so the transposed code stores write 8 contiguous
+bytes and per-feature vectors take 16 registers.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
@@ -112,7 +115,7 @@ def _query_kernel(
         rotary_dim,
         norm_epsilon,
         mask_rows,
-        fragments.K64_SLICE,
+        fragments.K32_SLICE,
     )
     if mask_rows:
         rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
@@ -214,7 +217,7 @@ def _key_kernel(
         rotary_dim,
         norm_epsilon,
         mask_rows,
-        fragments.K64_SLICE,
+        fragments.K32_SLICE,
     )
     if mask_rows:
         rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
@@ -277,13 +280,14 @@ def _value_kernel(
         head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, fragments.COPY_ROWS),
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
         input_features,
-        fragments.K64_SLICE,
+        fragments.K32_SLICE,
     )
 
-    # [K64 tiles, rows, features] with lanes along rows for the transposed V stores.
+    # [K64 tiles, rows, features]: each thread holds 8 consecutive rows of 16 features,
+    # so row reductions run mostly in registers.
     tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
     layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 4], [1, 32, 1], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
+        [1, 8, 1], [1, 8, 4], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
     )
     tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
     tile_offsets = row_block * tiles + gl.arange(0, tiles, gl.SliceLayout(1, tile_rows_layout))

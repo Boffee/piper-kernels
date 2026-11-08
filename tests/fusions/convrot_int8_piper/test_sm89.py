@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
-import triton
+from _nvidia_resources import PROJECTION_SPILL_STORE_BUDGET_BYTES, compile_with_spill_stores
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
@@ -265,6 +265,10 @@ def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
         encode_key.assert_not_called()
 
 
+# Register allocation depends on the specialized input width, and small widths can
+# hide spills that production widths show, so kernels compile at H3's 5376 features.
+_INPUT_FEATURES = 5376
+
 _POINTER_TYPES = {
     "input_ptr": "*i8",
     "weight_ptr": "*i8",
@@ -280,7 +284,7 @@ _POINTER_TYPES = {
 def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     constants = {
-        "input_features": 256,
+        "input_features": _INPUT_FEATURES,
         "heads": 3,
         "rotary_dim": 96,
         "norm_epsilon": 1e-5,
@@ -304,14 +308,15 @@ def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
             attributes[(index,)] = [["tt.divisibility", 16]]
         else:
             signature[name] = "i32"
-    compiled = triton.compile(
+    compiled, spill_stores = compile_with_spill_stores(
         GluonASTSource(function, signature, constexprs=constants, attrs=attributes),
-        target=GPUTarget("cuda", 89, 32),
-        options={"num_warps": 4},
+        GPUTarget("cuda", 89, 32),
+        {"num_warps": 4},
     )
     assert compiled.asm["cubin"]
     # Two programs share each SM's 99 KiB of shared memory.
     assert compiled.metadata.shared <= 99 * 1024 // 2
+    assert spill_stores <= PROJECTION_SPILL_STORE_BUDGET_BYTES
     truncations = [line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line]
     # K rounds its transformed rows to BF16 for the centered encoder; V rounds log scales to FP16.
     assert bool(truncations) is (operation != "query")
