@@ -150,7 +150,7 @@ class Pipeline(torch.nn.Module):
         """Use the fused projection arithmetic, retaining a complete attention output."""
         from piper_kernels.attention.piper_attention._quantized_dispatch import (
             _piper_attention_from_quantized_op,
-            qk_quantization_granularity,
+            select_qk_quantization,
         )
         from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
             _sparse_piper_attention_from_quantized_op,
@@ -176,9 +176,7 @@ class Pipeline(torch.nn.Module):
 
             # Emit the Q/K scale granularity the target's dense attention reads, as the
             # compiler pass does.
-            qk_quantization = qk_quantization_granularity(
-                AcceleratorTarget.from_device(hidden.device)
-            )
+            qk_quantization = select_qk_quantization(AcceleratorTarget.from_device(hidden.device))
             q = dense_query._project_query_op(
                 data,
                 scale,

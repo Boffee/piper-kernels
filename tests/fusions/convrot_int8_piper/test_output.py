@@ -23,7 +23,7 @@ def _arguments(
     k = _operands(device, sequence=sequence if causal else sequence + 17, head_dim=head_dim)
     if device == "meta":
         context = (
-            *key._project_key_op_fake(*k, 1e-6, head_dim=head_dim),
+            *key._project_key_op_fake(*k, 1e-6, head_dim=head_dim, qk_quantization="per_warp"),
             *value._project_value_op_fake(*k[:4], head_dim=head_dim, is_causal=causal),
         )
     else:

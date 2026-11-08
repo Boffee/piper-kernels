@@ -4,8 +4,8 @@ import math
 
 import torch
 
-from piper_kernels.attention.piper_attention._validation import (
-    query_scale_length,
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    count_query_scales,
     validate_qk_quantization,
 )
 
@@ -52,10 +52,10 @@ def _new_outputs(
 ) -> QueryOutput:
     batch, sequence_length, heads, head_dim = shape
     storage_length = (sequence_length + 63) // 64 * 64
-    scales = query_scale_length(storage_length, validate_qk_quantization(qk_quantization))
+    num_scales = count_query_scales(storage_length, validate_qk_quantization(qk_quantization))
     return (
         input_qdata.new_empty((batch, heads, storage_length, head_dim)),
-        input_qdata.new_empty((batch, heads, scales), dtype=torch.float32),
+        input_qdata.new_empty((batch, heads, num_scales), dtype=torch.float32),
     )
 
 
@@ -72,7 +72,7 @@ def _launch_query_projection(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
-    qk_quantization: str = "per_warp",
+    qk_quantization: str,
 ) -> QueryOutput:
     """Project the complete Q sequence into padded INT8 data and base-2 scales."""
     shape = _validate_inputs(
@@ -122,12 +122,14 @@ def _project_query_op(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
-    qk_quantization: str = "per_warp",
+    qk_quantization: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse projection, FP32 RMSNorm/RoPE, and signed-Hadamard Q quantization.
 
     ``qk_quantization`` selects Q32 scales (``per_warp``) or per-thread groups
-    stored per row (``per_thread``), matching the target's quantized attention.
+    stored per row (``per_thread``). Pass the granularity the target's quantized attention
+    reads, ``_quantized_dispatch.select_qk_quantization(target)``; there is no default,
+    because the wrong one produces scales that attention rejects.
     """
     return _launch_query_projection(
         input_qdata,
@@ -159,7 +161,7 @@ def _project_query_op_fake(  # noqa: PLR0913
     bias: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
-    qk_quantization: str = "per_warp",
+    qk_quantization: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shape = _validate_inputs(
         input_qdata,

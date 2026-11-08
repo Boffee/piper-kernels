@@ -263,8 +263,8 @@ def test_native_quantized_query_target_gate(architecture):
         (AcceleratorTarget("hip", "gfx1201"), "per_warp"),
     ],
 )
-def test_qk_quantization_granularity_follows_the_target_plans(target, granularity):
-    assert dispatch.qk_quantization_granularity(target) == granularity
+def test_select_qk_quantization_follows_the_target_plans(target, granularity):
+    assert dispatch.select_qk_quantization(target) == granularity
     if target.is_nvidia_cuda:
         plan = nvidia_policy.select_execution_plan(
             target, head_dim=64, is_causal=False, query_length=65
@@ -325,7 +325,7 @@ _native_only = pytest.mark.skipif(
 
 
 def _granularity():
-    return dispatch.qk_quantization_granularity(AcceleratorTarget.from_device(torch.device("cuda")))
+    return dispatch.select_qk_quantization(AcceleratorTarget.from_device(torch.device("cuda")))
 
 
 def _quantized_query(query, scale, granularity=None):
@@ -476,7 +476,9 @@ def _pad_keys(metadata, storage):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None, reason="requires NVIDIA"
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).cuda_capability_at_least(8),
+    reason="requires NVIDIA SM80 or newer",
 )
 @pytest.mark.parametrize("query_length", [65, 257, 320])
 @pytest.mark.parametrize("head_dim", [64, 128])

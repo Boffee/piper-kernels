@@ -7,7 +7,9 @@ import torch
 import triton
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.piper_attention._validation import scale_granularity
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    resolve_qk_quantization,
+)
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 from piper_kernels.fusions.convrot_int8_projection.triton import (
     project_prepared_input_mean_kernel,
@@ -44,7 +46,7 @@ def project_query(
     """
     query, query_scale = out
     batch, heads, storage_length, head_dim = query.shape
-    per_thread_scales = scale_granularity(query_scale, storage_length) == "per_thread"
+    per_thread_scales = resolve_qk_quantization(query_scale, storage_length) == "per_thread"
     sequence_length = input_qdata.shape[1]
     chunk_rows = sequence_length if chunk_rows is None else chunk_rows
     if batch == 0:

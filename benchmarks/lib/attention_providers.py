@@ -19,7 +19,7 @@ from piper_kernels.attention.piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.piper_attention._amd import triton as amd_preparation
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
 from piper_kernels.attention.piper_attention._quantized_dispatch import (
-    qk_quantization_granularity,
+    select_qk_quantization,
 )
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
@@ -156,7 +156,7 @@ def _load_canonical_sage_attention(capability: tuple[int, int]) -> CanonicalSage
 
 
 def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
-    if qk_quantization_granularity(target) == "per_warp":
+    if select_qk_quantization(target) == "per_warp":
         return {
             "quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel,
             "quantize-key-per-block": qk_backend.quantize_key_per_block_kernel,
@@ -246,7 +246,7 @@ def _make_piper_attention_provider(
             "implementation": "pure_triton",
             "algorithm": "piper_attention",
             **plan.as_dict(),
-            "qk_quantization": qk_quantization_granularity(target),
+            "qk_quantization": select_qk_quantization(target),
             "probability_dtype": "uint8",
             "value_dtype": "int8",
             "value_scale": "per_key",
@@ -331,7 +331,7 @@ def _make_sage_attention_2pp_provider(
             **config.as_dict(),
             "implementation": "pure_triton",
             "algorithm": "sage_attention_2pp",
-            "qk_quantization": qk_quantization_granularity(target),
+            "qk_quantization": select_qk_quantization(target),
             "pv_accumulation": "fp32+fp16",
             "block_n": int(sage_attention_2pp_backend._BLOCK_N),
             **plan.as_dict(),
@@ -384,7 +384,7 @@ def _make_canonical_sage_attention_providers(
     if capability is None:
         raise SystemExit("canonical SageAttention providers require NVIDIA CUDA")
     canonical_sage_attention = _load_canonical_sage_attention(capability)
-    qk_granularity = qk_quantization_granularity(target)
+    qk_granularity = select_qk_quantization(target)
     common_configuration = {
         **config.as_dict(),
         "implementation": "canonical_cuda",

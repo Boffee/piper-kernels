@@ -280,7 +280,10 @@ def test_dense_and_sparse_keys_share_centering_and_cuda_graph_results(head_dim, 
     )
     bias = torch.randn(3 * head_dim, device="cuda")
     arguments = operands.as_tuple()
-    dense = dense_key_fusion._project_key_op(*arguments, 1e-5, bias, head_dim=head_dim)
+    # Sparse K always scales K64 groups.
+    dense = dense_key_fusion._project_key_op(
+        *arguments, 1e-5, bias, head_dim=head_dim, qk_quantization="per_warp"
+    )
     sparse = key_fusion._project_key_op(*arguments, 1e-5, _MINMAX_ROUTING, bias=bias)
     # Different projection tile layouts can straddle BF16/INT8 rounding boundaries.
     assert (sparse[0].short() - dense[0].short()).abs().max() <= 1

@@ -60,11 +60,16 @@ def test_key_uses_global_post_transform_mean(head_dim, sequence, affine, granula
         grouped=granularity == "per_warp",
         storage_key_length=actual.shape[2],
     )
-    # Projection/reduction ordering can straddle BF16 and INT8 rounding boundaries;
-    # one BF16 step at a group maximum moves its scale by up to 2**-8.
+    # SM89's Gluon K orders its projection and reductions differently, which can
+    # straddle BF16 and INT8 rounding boundaries; one BF16 step at a group maximum
+    # moves its scale by up to 2**-8. The other targets keep the tight bound.
+    sm89 = AcceleratorTarget.from_device(actual.device).is_cuda_capability(8, 9)
     assert (actual.int() - expected.int()).abs().max() <= 1
     torch.testing.assert_close(
-        scales[:, :, : expected_scale.shape[2]], expected_scale, atol=2e-7, rtol=3e-3
+        scales[:, :, : expected_scale.shape[2]],
+        expected_scale,
+        atol=2e-7,
+        rtol=3e-3 if sm89 else 3e-5,
     )
     assert torch.count_nonzero(actual[:, :, sequence:]) == 0
 
@@ -76,7 +81,7 @@ def test_key_storage_preserves_values_above_fp16_range():
     operands[4].fill_(131072)
     reference = _key_reference(operands, None, 64).bfloat16()
     assert reference.abs().max() > torch.finfo(torch.float16).max
-    actual, scales = key._project_key_op(*operands, 1e-6, head_dim=64)
+    actual, scales = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
     expected, expected_scales = quantization.prepare_key(
         reference, reference.float().mean(2), grouped=True, storage_key_length=actual.shape[2]
     )
@@ -176,7 +181,7 @@ def test_padded_quantized_boundary_matches_native_dense(head_dim, causal, dtype,
     target = AcceleratorTarget.from_device(q.device)
     if not dispatch.supports_quantized_query(target):
         pytest.skip("requires native quantized-Q Piper")
-    grouped = dispatch.qk_quantization_granularity(target) == "per_warp"
+    grouped = dispatch.select_qk_quantization(target) == "per_warp"
     plan = policy.select_execution_plan(
         target, head_dim=head_dim, is_causal=causal, query_length=sequence
     )
@@ -226,7 +231,7 @@ def test_context_fake_paths_do_not_probe_hardware(monkeypatch, batch):
         operands = list(_operands("cpu"))
         operands[0] = torch.empty((batch, 65, 272), dtype=torch.int8)
         operands[1] = torch.empty((batch, 65))
-        k, ks = key._project_key_op(*operands, 1e-6, head_dim=64)
+        k, ks = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
         v, mult, logs, mean = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
         q = torch.empty((batch, 6, 128, 64), dtype=torch.int8)
         qs = torch.empty((batch, 6, 4))
@@ -243,7 +248,7 @@ def test_context_fake_paths_do_not_probe_hardware(monkeypatch, batch):
 def test_zero_projection_retains_usable_scales_and_opcheck(causal):
     operands = _operands("cuda", sequence=65)
     operands[0].zero_()
-    k, ks = key._project_key_op(*operands, 1e-6, head_dim=64)
+    k, ks = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
     v, mult, logs, mean = value._project_value_op(*operands[:4], head_dim=64, is_causal=causal)
     assert torch.count_nonzero(k) == 0
     assert torch.count_nonzero(v) == 0
@@ -251,7 +256,11 @@ def test_zero_projection_retains_usable_scales_and_opcheck(causal):
     assert (ks > 0).all()
     assert (mult > 0).all()
     assert torch.isfinite(logs).all()
-    torch.library.opcheck(key._project_key_op, (*operands, 1e-6), kwargs={"head_dim": 64})
+    torch.library.opcheck(
+        key._project_key_op,
+        (*operands, 1e-6),
+        kwargs={"head_dim": 64, "qk_quantization": "per_warp"},
+    )
     torch.library.opcheck(
         value._project_value_op, tuple(operands[:4]), kwargs={"head_dim": 64, "is_causal": causal}
     )

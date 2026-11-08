@@ -28,7 +28,9 @@ from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
-from piper_kernels.attention.piper_attention._validation import scale_granularity
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    resolve_qk_quantization,
+)
 from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
@@ -354,7 +356,8 @@ def project_query(
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
-                per_thread_scales=scale_granularity(query_scale, storage_length) == "per_thread",
+                per_thread_scales=resolve_qk_quantization(query_scale, storage_length)
+                == "per_thread",
                 mask_rows=mask_rows,
                 num_warps=execution_plan.num_warps,
             )
@@ -416,7 +419,7 @@ def project_key(
         qk_quantization.prepare_key(
             stored.narrow(2, 0, sequence_length),
             mean,
-            grouped=scale_granularity(key_scale, storage_length) == "per_warp",
+            grouped=resolve_qk_quantization(key_scale, storage_length) == "per_warp",
             storage_key_length=storage_length,
             out=out,
         )

@@ -21,12 +21,10 @@ from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     QKQuantizationGranularity,
+    count_key_scales,
+    count_query_scales,
 )
 from piper_kernels.attention.piper_attention import _quantized_dispatch
-from piper_kernels.attention.piper_attention._validation import (
-    key_scale_length,
-    query_scale_length,
-)
 from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
 from piper_kernels.fusions.projected_qk import _compile as projected_compile
@@ -104,7 +102,7 @@ def _projection_pattern(
 
 def _qk_quantization(device: torch.device) -> QKQuantizationGranularity:
     """Emit Q/K scales in the granularity the device's quantized attention reads."""
-    return _quantized_dispatch.qk_quantization_granularity(AcceleratorTarget.from_device(device))
+    return _quantized_dispatch.select_qk_quantization(AcceleratorTarget.from_device(device))
 
 
 def _same_shape(left: Sequence[int | torch.SymInt], right: Sequence[int | torch.SymInt]) -> bool:
@@ -274,7 +272,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
     batch, heads, sequence_length, head_dim = query_value.shape
     storage_rows = (sequence_length + 63) // 64 * 64
     qk_quantization = _qk_quantization(input_value.device)
-    scale_rows = query_scale_length(storage_rows, qk_quantization)
+    num_scales = count_query_scales(storage_rows, qk_quantization)
     with graph.inserting_before(original):
         query_length = graph.call_function(torch.ops.aten.sym_size.int, args=(projection_input, 1))
         query_length.meta["val"] = sequence_length
@@ -298,7 +296,7 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             ),
             (
                 input_value.new_empty((batch, heads, storage_rows, head_dim), dtype=torch.int8),
-                input_value.new_empty((batch, heads, scale_rows), dtype=torch.float32),
+                input_value.new_empty((batch, heads, num_scales), dtype=torch.float32),
             ),
             kwargs={"head_dim": head_dim, "qk_quantization": qk_quantization},
         )
@@ -413,7 +411,7 @@ def _emit_context_projection(
             (
                 input_value.new_empty((batch, heads, storage, head_dim), dtype=torch.int8),
                 input_value.new_empty(
-                    (batch, heads, key_scale_length(storage, qk_quantization)),
+                    (batch, heads, count_key_scales(storage, qk_quantization)),
                     dtype=torch.float32,
                 ),
             ),

@@ -9,13 +9,15 @@ from piper_kernels._triton import (
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     QKQuantizationGranularity,
+    count_key_scales,
+    count_query_scales,
+    resolve_qk_quantization,
 )
 
 from ._amd import gluon as amd_backend
 from ._amd import policy as amd_policy
 from ._nvidia import policy as nvidia_policy
 from ._nvidia import triton as nvidia_backend
-from ._validation import key_scale_length, query_scale_length, scale_granularity
 
 
 def supports_quantized_query(target: AcceleratorTarget) -> bool:
@@ -27,7 +29,7 @@ def supports_quantized_query(target: AcceleratorTarget) -> bool:
     )
 
 
-def qk_quantization_granularity(target: AcceleratorTarget) -> QKQuantizationGranularity:
+def select_qk_quantization(target: AcceleratorTarget) -> QKQuantizationGranularity:
     """Return the Q/K scale granularity that quantized operands must use on target.
 
     ``per_warp`` stores FP32 scales per Q32/K64 group; ``per_thread`` stores the
@@ -42,8 +44,8 @@ def _require_granularity(
     target: AcceleratorTarget, scales: torch.Tensor, rows: torch.Tensor
 ) -> None:
     """Reject Q/K scales whose layout the target's attention kernels do not read."""
-    granularity = scale_granularity(scales, rows.shape[2])
-    if qk_quantization_granularity(target) != granularity:
+    granularity = resolve_qk_quantization(scales, rows.shape[2])
+    if select_qk_quantization(target) != granularity:
         raise RuntimeError(
             f"quantized Piper {granularity} Q/K scales are unavailable on {rows.device}"
         )
@@ -71,11 +73,11 @@ def _validate_query(
         raise ValueError("quantized Piper query requires positive heads and head_dim 64 or 128")
     if storage_length != (query_length + 63) // 64 * 64:
         raise ValueError("quantized Piper query storage must pad its logical length to Q64")
-    scale_length = query_scale_length(
-        storage_length, scale_granularity(query_scale, storage_length)
+    num_scales = count_query_scales(
+        storage_length, resolve_qk_quantization(query_scale, storage_length)
     )
     if (
-        query_scale.shape != (batch, heads, scale_length)
+        query_scale.shape != (batch, heads, num_scales)
         or query_scale.dtype is not torch.float32
         or query_scale.layout is not torch.strided
         or not query_scale.is_contiguous()
@@ -138,7 +140,7 @@ def _piper_attention_from_quantized_query_op(
     Q and its FP32 scales, per Q32 group or per row, have Q64-padded contiguous storage. Scales
     already include the attention scale and log2(e); padded rows and scale
     groups must be initialized by the producer. The scale layout must match
-    ``qk_quantization_granularity`` for the target. Numerical codes/scales are
+    ``select_qk_quantization`` for the target. Numerical codes/scales are
     caller preconditions. K is centered using its global post-transform mean; V
     retains per-token scaling and causal centering rules.
     """
@@ -228,7 +230,9 @@ def _validate_quantized(  # noqa: PLR0913, PLR0917
         is_causal=is_causal,
         output_dtype=output_dtype,
     )
-    if scale_granularity(query_scale, query.shape[2]) != scale_granularity(key_scale, key.shape[2]):
+    if resolve_qk_quantization(query_scale, query.shape[2]) != resolve_qk_quantization(
+        key_scale, key.shape[2]
+    ):
         raise ValueError("quantized Piper Q and K scales must share one granularity")
     return shape
 
@@ -264,10 +268,10 @@ def validate_quantized_context(  # noqa: PLR0913
     if key.ndim != 4 or key.shape[1] < 1 or heads % key.shape[1]:
         raise ValueError("quantized Piper key must have compatible GQA heads")
     kv_heads = key.shape[1]
-    key_scales = key_scale_length(storage, scale_granularity(key_scale, storage))
+    num_key_scales = count_key_scales(storage, resolve_qk_quantization(key_scale, storage))
     expected = (
         (key, (batch, kv_heads, storage, head_dim), torch.int8),
-        (key_scale, (batch, kv_heads, key_scales), torch.float32),
+        (key_scale, (batch, kv_heads, num_key_scales), torch.float32),
         (value, (batch, kv_heads, head_dim, storage), torch.int8),
         (multiplier, (batch, kv_heads, storage), torch.float32),
         (log_scale, (batch, kv_heads, storage), torch.float32),
@@ -303,7 +307,7 @@ def _piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     """Consume native Q/K and dense per-token V without repeating preparation.
 
     K/V use K64-padded storage, including V metadata. Q/K scales follow
-    ``qk_quantization_granularity`` for the target, and V codes the producer's
+    ``select_qk_quantization`` for the target, and V codes the producer's
     target-native layout. Numerical codes, scales, and centering are caller
     preconditions; all checks here inspect host metadata only.
     """

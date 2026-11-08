@@ -35,7 +35,7 @@ _NATIVE = pytest.mark.skipif(not _available(), reason="requires exact SM120, SM8
 def _qk_quantization(device="cuda"):
     """Return the Q/K scale granularity that the device's quantized attention reads."""
     target = AcceleratorTarget.from_device(torch.device(device))
-    return _quantized_dispatch.qk_quantization_granularity(target)
+    return _quantized_dispatch.select_qk_quantization(target)
 
 
 def _operands(
@@ -156,7 +156,9 @@ def test_query_matches_independent_projection_norm_rope_and_quantization_referen
 def test_zero_input_keeps_usable_real_group_scales_and_neutral_padding(head_dim):
     operands = _operands("cuda", head_dim=head_dim)
     operands[0].zero_()
-    codes, scales = query._project_query_op(*operands, 1e-6, head_dim**-0.5)
+    codes, scales = query._project_query_op(
+        *operands, 1e-6, head_dim**-0.5, qk_quantization="per_warp"
+    )
     assert torch.count_nonzero(codes) == 0
     torch.testing.assert_close(
         scales[:, :, :3],
@@ -170,18 +172,20 @@ def test_zero_input_keeps_usable_real_group_scales_and_neutral_padding(head_dim)
 def test_query_boundary_opcheck_compile_and_cuda_graph_replay():
     operands = _operands("cuda")
     arguments = (*operands, 1e-6, 64**-0.5)
-    assert set(torch.library.opcheck(query._project_query_op, arguments).values()) == {"SUCCESS"}
+    options = {"qk_quantization": "per_warp"}
+    checks = torch.library.opcheck(query._project_query_op, arguments, kwargs=options)
+    assert set(checks.values()) == {"SUCCESS"}
     compiled = torch.compile(query._project_query_op, backend="eager", fullgraph=True)
-    expected = query._project_query_op(*arguments)
-    actual = compiled(*arguments)
+    expected = query._project_query_op(*arguments, **options)
+    actual = compiled(*arguments, **options)
     for left, right in zip(actual, expected, strict=True):
         torch.testing.assert_close(left, right, rtol=0, atol=0)
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        captured = query._project_query_op(*arguments)
+        captured = query._project_query_op(*arguments, **options)
     operands[0].zero_()
-    updated = query._project_query_op(*arguments)
+    updated = query._project_query_op(*arguments, **options)
     graph.replay()
     for left, right in zip(captured, updated, strict=True):
         torch.testing.assert_close(left, right, rtol=0, atol=0)
@@ -219,9 +223,11 @@ def test_empty_batch_skips_target_probe_and_accepts_learned_norm_under_no_grad(m
     operands[1] = operands[1][:0]
     operands[4].requires_grad_()
     with pytest.raises(RuntimeError, match="inference-only"):
-        query._launch_query_projection(*operands, 1e-6, 64**-0.5)
+        query._launch_query_projection(*operands, 1e-6, 64**-0.5, qk_quantization="per_warp")
     with torch.no_grad():
-        codes, scales = query._launch_query_projection(*operands, 1e-6, 64**-0.5)
+        codes, scales = query._launch_query_projection(
+            *operands, 1e-6, 64**-0.5, qk_quantization="per_warp"
+        )
     assert codes.shape == (0, 3, 128, 64)
     assert scales.shape == (0, 3, 4)
     assert codes.dtype is torch.int8
@@ -305,7 +311,9 @@ def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", arch))
     operands = _operands("meta", sequence=193, head_dim=head_dim, affine=affine)
     bias = torch.empty(3 * head_dim, device="meta", dtype=torch.bfloat16) if affine else None
-    query._launch_query_projection(*operands, 1e-6, head_dim**-0.5, bias, head_dim=head_dim)
+    query._launch_query_projection(
+        *operands, 1e-6, head_dim**-0.5, bias, head_dim=head_dim, qk_quantization="per_warp"
+    )
     calls = kernel.__getitem__.return_value.call_args_list
     assert len(calls) == 2
     assert [call.args[0] for call in kernel.__getitem__.call_args_list] == [(3, 3, 2), (1, 3, 2)]
