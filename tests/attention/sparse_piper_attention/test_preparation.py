@@ -146,7 +146,7 @@ def test_fused_preparation_matches_separate_passes(preparation, head_dim, dtype,
         torch.testing.assert_close(getattr(fused, name), expected, atol=0, rtol=0, msg=name)
     for summary in (fused.key_summary, fused.key_aux):
         assert summary.shape == (2, 2, num_key_blocks, head_dim)
-        # A prefix view of a full-sequence allocation would retain the wasted storage.
+        # A view into a full-sequence allocation would retain the wasted storage.
         assert summary.untyped_storage().nbytes() == summary.numel() * summary.element_size()
     torch.testing.assert_close(fused.value_mean, value_mean, atol=0, rtol=0)
 
@@ -174,7 +174,7 @@ def test_public_fused_preparation_matches_separate_and_graph(
     lengths = (
         torch.tensor([64, 17, 1, 64] * 8, device="cuda", dtype=torch.int32) if padded else None
     )
-    # Mix per-head budgets and route a small prefix before a long dense suffix.
+    # Mix per-head budgets, with a small sparse region before a long dense one.
     attention = SparsePiperAttention((0.25, 0.5, 1.0, 0.25))
     options = {
         "key_layout": SparsePiperKeyLayout.prefix(4, rows // 64),

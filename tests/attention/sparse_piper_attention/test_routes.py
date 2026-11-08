@@ -60,7 +60,7 @@ def test_stable_routes_match_portable_policy(route_selector, key_blocks, strided
         [1, max(1, key_blocks // 4), max(1, key_blocks - 1), key_blocks], key_blocks, "cuda"
     )
     expected = _expected_routes(scores, layout, query_block_offset=2)
-    # Preserve noncontiguous batch/head/query strides and a dense key prefix on GPU.
+    # Preserve noncontiguous batch/head/query strides and a view of wider key storage.
     gpu_storage = storage.cuda()
     gpu_scores = gpu_storage[:, :, 1:7:2, :key_blocks] if strided else scores.cuda()
     actual = torch.full_like(expected, 0xA5A5, device="cuda")

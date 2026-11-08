@@ -49,7 +49,7 @@ def validate_coarse_residual_inputs(
     *,
     routing_label: str,
 ) -> int:
-    """Validate the shared contract and resolve the coarse K64 prefix length."""
+    """Validate the shared contract and resolve the coarse scope's K64 block count."""
     tensors = (query, key, value, coarse_gate)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError(

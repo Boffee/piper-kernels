@@ -280,7 +280,7 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor]:
-    """Prepare fine routes and a potentially wider coarse K/V prefix."""
+    """Prepare fine routes and the coarse branch over its key block scope."""
     context = _prepare_quantized_sparse_piper_context(
         key,
         key_scale,

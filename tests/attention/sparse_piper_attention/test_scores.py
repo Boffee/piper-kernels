@@ -32,7 +32,7 @@ def generator():
 @pytest.fixture
 def summaries(generator):
     def make(rows, keys, *, heads=3, kv_heads=None):
-        # Dense features, strided query rows and padded key-prefix views.
+        # Dense features, strided query rows and views of padded key storage.
         query = torch.randn((2, heads, rows * 2, 136), device="cuda", generator=generator)
         primary = torch.randn(
             (2, heads if kv_heads is None else kv_heads, keys + 3, 144),

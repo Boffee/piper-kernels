@@ -113,8 +113,8 @@ def _selected_key_rows(
         tiles = routes.indices[batch, block, start:stop].long()
     else:
         tiles = torch.arange(sequence // 64, device=device)
-    prefix = (tiles[:, None] * 64 + torch.arange(64, device=device)).flatten()
-    return torch.cat((prefix, torch.arange(sequence // 64 * 64, sequence, device=device)))
+    routed_rows = (tiles[:, None] * 64 + torch.arange(64, device=device)).flatten()
+    return torch.cat((routed_rows, torch.arange(sequence // 64 * 64, sequence, device=device)))
 
 
 def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:

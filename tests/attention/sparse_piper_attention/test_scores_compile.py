@@ -37,7 +37,7 @@ def test_minmax_scoring_stays_fp32_without_spills(
     signature["score_scale"] = "fp32"
     attrs = {}
     if specialization != "generic":
-        # H3 D128 prefix views retain aligned pointers and strides. Q64 also
+        # H3 D128 views of padded storage retain aligned pointers and strides. Q64 also
         # specializes on divisibility; the Q27 tail, K1562, and H56 do not.
         aligned = [name for name in signature if name.endswith(("_ptr", "_stride"))]
         if specialization == "h3_full_chunk":

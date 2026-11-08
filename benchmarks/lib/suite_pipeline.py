@@ -346,7 +346,7 @@ def _unsupported_reason(case: PipelineCase, device: torch.device) -> str | None:
     if case.rotary_dim % 2 or not 0 < case.rotary_dim <= case.head_dim:
         return "rotary dimension must be positive, even, and at most head dimension"
     if case.keep_ratio is not None and (case.sequence < 64 or case.sequence // 64 > 65536):
-        return "sparse pipeline requires 1 through 65536 complete K64 prefix blocks"
+        return "sparse pipeline requires 1 through 65536 complete K64 blocks"
     from piper_kernels.fusions.convrot_int8_piper import _backend as dense_backend
     from piper_kernels.fusions.convrot_int8_sparse_piper import _backend as sparse_backend
     from piper_kernels.linear.convrot.int8 import _backend as linear_backend

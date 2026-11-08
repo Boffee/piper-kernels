@@ -143,9 +143,9 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
             kv_head = head // (2 // kv_heads)
             for block in range(4 - global_offset):
                 global_block = block + global_offset
-                prefix = [1] if head == 0 and global_block < 2 else [0, 1]
+                selected = [1] if head == 0 and global_block < 2 else [0, 1]
                 indices = [
-                    tile * 64 + row for tile in [*prefix, 2, 3] for row in range(lengths[tile])
+                    tile * 64 + row for tile in [*selected, 2, 3] for row in range(lengths[tile])
                 ]
                 expected = (
                     value[batch, kv_head, :, indices].double().mean(dim=1)

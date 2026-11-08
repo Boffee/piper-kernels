@@ -106,7 +106,7 @@ class PackedRouteBuilder:
 
 
 class PackedRouteAndCoarseBuilder:
-    """Route over the layout's routed blocks while attending coarsely over a wider prefix."""
+    """Route the complete key blocks while attending coarsely over the coarse scope."""
 
     def __init__(
         self,
@@ -153,7 +153,7 @@ class PackedRouteAndCoarseBuilder:
         *,
         query_block_offset: int,
     ) -> None:
-        """Route over each score prefix without retaining the full coarse matrix."""
+        """Route from each chunk's complete-block scores without retaining the coarse matrix."""
         if scores.ndim != 4:
             raise ValueError("coarse route scores must use rank-four block tensors")
         if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
