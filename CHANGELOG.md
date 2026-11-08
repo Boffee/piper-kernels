@@ -5,6 +5,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: `SparsePiperAttention` takes `sparse_key_blocks=n` again, as in 0.8.0rc2.
+  `key_layout`, `SparsePiperKeyLayout`, `SparsePiperKeyRegion`, and
+  `resolve_keep_blocks()` from 0.8.0rc3 are removed. The first `n` complete K64 blocks
+  share each head's keep budget, and later keys, including a compact partial final
+  block, are attended densely. Replace a layout of `SparsePiperKeyRegion(n)` and a
+  dense remainder with `sparse_key_blocks=n`; layouts with several sparse regions have
+  no equivalent. `resolve_head_keep_blocks(n)` returns per-head budgets. A changed
+  `sparse_key_blocks` integer can recompile a compiled graph unless it comes from a
+  dynamic tensor shape. Fused coarse branches whose scope covers the sparse prefix,
+  but not every key block, fuse again.
+
 ## [0.8.0rc3] - 2026-11-07
 
 ### Changed

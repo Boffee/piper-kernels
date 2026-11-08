@@ -27,7 +27,7 @@ _QUANTIZED_ATTENTION_OPERAND_NAMES = (
 )
 _QUANTIZED_ATTENTION_POLICY_NAMES = (
     "output_ratio_profile",
-    "output_key_layout",
+    "output_sparse_key_blocks",
     "output_logical_sequence_length",
     "output_routing_mode",
 )
@@ -107,6 +107,7 @@ def sparse_piper_projection_pattern(
         KeywordArg("sparse_attention_shape"),
         _users=operand_users,
     )
+    sparse_key_blocks = KeywordArg("sparse_key_blocks")
     block_lengths = KeywordArg("sparse_block_lengths") if with_block_lengths else None
     sparse_query_blocks = KeywordArg("sparse_query_blocks") if with_sparse_query_blocks else None
     optional_arguments = optional_attention_layout_arguments(
@@ -121,7 +122,7 @@ def sparse_piper_projection_pattern(
         key,
         value,
         KeywordArg("sparse_ratio_profile"),
-        KeywordArg("sparse_key_layout"),
+        sparse_key_blocks,
         KeywordArg("sparse_softmax_scale"),
         KeywordArg("sparse_routing_mode"),
         *optional_arguments,

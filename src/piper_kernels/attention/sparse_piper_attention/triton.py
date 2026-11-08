@@ -29,6 +29,7 @@ _BLOCK_N = 64
 _FUSED_DO_NOT_SPECIALIZE = (
     "logical_sequence_length",
     "storage_sequence_length",
+    "sparse_key_blocks",
     "stride_qb",
     "stride_qh",
     "stride_qn",
@@ -234,6 +235,7 @@ def _quantize_key_with_summary_kernel(
     block_lengths_ptr,
     logical_sequence_length,
     storage_sequence_length,
+    sparse_key_blocks,
     stride_kb,
     stride_kh,
     stride_kn,
@@ -262,18 +264,16 @@ def _quantize_key_with_summary_kernel(
     )
     head_block = (batch * heads + head).to(tl.int64)
 
-    # Only the complete blocks, which routes cover, need routing summaries. A compact
-    # ragged tile still needs quantization, but every query attends to it unrouted.
-    # Padded storage has a multiple of 64 rows, so every block is complete.
-    num_key_blocks = logical_sequence_length // block_n
-    if key_block < num_key_blocks:
+    # Only the sparse prefix needs routing summaries; the dense suffix still
+    # needs quantization, but every query attends to it without routing.
+    if key_block < sparse_key_blocks:
         summary, auxiliary = sparse_piper_kernels.summarize_block_tiles(
             tl.reshape(values, (1, 1, block_n, head_dim)),
             tl.reshape(valid_rows, (1, block_n)),
             tl.constexpr(False),
             tl.constexpr(False),
         )
-        summary_offsets = (head_block * num_key_blocks + key_block) * head_dim + features
+        summary_offsets = (head_block * sparse_key_blocks + key_block) * head_dim + features
         tl.store(key_summary_ptr + summary_offsets, tl.reshape(summary, (head_dim,)))
         tl.store(key_aux_ptr + summary_offsets, tl.reshape(auxiliary, (head_dim,)))
 
@@ -309,6 +309,7 @@ def _prepare_query_key_with_summaries(
     scale: float,
     *,
     storage_sequence_length: int,
+    sparse_key_blocks: int,
     block_lengths: torch.Tensor | None,
 ) -> tuple[qk_quantization.PreparedInt8QueryKey, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize Q/K and emit their min/max K64 summaries in one pass over each operand.
@@ -336,9 +337,7 @@ def _prepare_query_key_with_summaries(
         (batch, heads, blocks, head_dim), device=query.device, dtype=torch.float32
     )
     key_primary = torch.empty(
-        (batch, kv_heads, sequence_length // _BLOCK_N, head_dim),
-        device=key.device,
-        dtype=torch.float32,
+        (batch, kv_heads, sparse_key_blocks, head_dim), device=key.device, dtype=torch.float32
     )
     key_aux = torch.empty_like(key_primary)
     lengths_or_placeholder = block_lengths if block_lengths is not None else key_mean
@@ -372,6 +371,7 @@ def _prepare_query_key_with_summaries(
             lengths_or_placeholder,
             sequence_length,
             storage_sequence_length,
+            sparse_key_blocks,
             key.stride(0),
             key.stride(1),
             key.stride(2),
@@ -394,6 +394,7 @@ def _prepare_sparse_piper_operands(
     query: torch.Tensor,
     scale: float,
     *,
+    sparse_key_blocks: int,
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
@@ -412,8 +413,9 @@ def _prepare_sparse_piper_operands(
         or combined_key.shape[1] < 1
         or query.shape[1] % combined_key.shape[1]
         or combined_value.shape != combined_key.shape
+        or not 1 <= sparse_key_blocks <= query.shape[2] // _BLOCK_N
     ):
-        raise ValueError("combined Q/K/V shapes must agree")
+        raise ValueError("combined Q/K/V and the sparse-prefix K64 count must agree")
     if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
@@ -453,6 +455,7 @@ def _prepare_sparse_piper_operands(
             key_mean,
             scale,
             storage_sequence_length=storage_sequence_length,
+            sparse_key_blocks=sparse_key_blocks,
             block_lengths=block_lengths,
         )
     else:
@@ -504,6 +507,7 @@ def _prepare_sparse_piper_operands(
         query=prepared_qk.query,
         query_scale=prepared_qk.query_scale,
         block_lengths=block_lengths,
+        sparse_key_blocks=sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
         query_summary=query_summary,

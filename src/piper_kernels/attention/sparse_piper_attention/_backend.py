@@ -197,13 +197,13 @@ def select_minmax_scores(
     return _score_backend.minmax_scores if amd_policy.supports_target(target) else None
 
 
-def fill_full_keep_routes(routes: torch.Tensor, num_key_blocks: int) -> None:
+def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
     """Materialize the known all-block route list on the selected device."""
     if _route_backend is not None and select_route_selector(routes) is not None:
-        _route_backend.fill_full_keep_routes(routes, num_key_blocks)
+        _route_backend.fill_full_keep_routes(routes, sparse_key_blocks)
     else:
-        blocks = torch.arange(num_key_blocks, device=routes.device, dtype=torch.int32)
-        routes.unflatten(-1, (-1, num_key_blocks)).copy_(blocks.to(torch.uint16))
+        blocks = torch.arange(sparse_key_blocks, device=routes.device, dtype=torch.int32)
+        routes.unflatten(-1, (-1, sparse_key_blocks)).copy_(blocks.to(torch.uint16))
 
 
 def use_fused_operand_preparation(
@@ -255,9 +255,9 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
 
 
 def build_force_tile_bitmask(
-    ids: torch.Tensor, counts: torch.Tensor, key_blocks: int
+    ids: torch.Tensor, counts: torch.Tensor, sparse_key_blocks: int
 ) -> torch.Tensor:
     """Build call-local membership once, then share it across heads and score chunks."""
     if _route_backend is not None and select_route_selector(ids) is not None:
-        return _route_backend.build_force_tile_bitmask(ids, counts, key_blocks)
-    return build_portable_force_tile_bitmask(ids, counts, key_blocks)
+        return _route_backend.build_force_tile_bitmask(ids, counts, sparse_key_blocks)
+    return build_portable_force_tile_bitmask(ids, counts, sparse_key_blocks)

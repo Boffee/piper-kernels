@@ -11,7 +11,6 @@ import torch
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._dtype import validate_output_dtype
-from piper_kernels.attention.sparse_piper_attention._key_layout import SparsePiperKeyLayout
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.attention import _output as output_pipeline
 
@@ -97,7 +96,7 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     ratio_profile: _SparsePiperRatioProfile,
-    key_layout: SparsePiperKeyLayout,
+    sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
@@ -131,7 +130,7 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
         value_scale_multiplier,
         value_mean,
         ratio_profile,
-        key_layout,
+        sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
         block_lengths,
@@ -167,7 +166,7 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     ratio_profile: _SparsePiperRatioProfile,
-    key_layout: SparsePiperKeyLayout,
+    sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
@@ -191,7 +190,7 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
         value_scale_multiplier,
         value_mean,
         ratio_profile,
-        key_layout,
+        sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
         block_lengths,

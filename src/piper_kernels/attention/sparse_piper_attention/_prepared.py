@@ -44,6 +44,7 @@ class _PreparedSparsePiperContext:
     head_keep_blocks: torch.Tensor
     routes_per_query: int
     block_lengths: torch.Tensor | None
+    sparse_key_blocks: int
     sparse_query_blocks: int | None
     logical_sequence_length: int
 
@@ -77,7 +78,7 @@ class _PreparedSparsePiperOperands:
 
     ``query_summary``/``key_summary``/``key_aux`` are the min/max routing
     summaries, present only when preparation was asked to emit them.
-    Key summaries cover the routed blocks; query summaries cover all blocks.
+    Key summaries cover only the sparse prefix; query summaries cover all blocks.
     """
 
     key: torch.Tensor
@@ -89,6 +90,7 @@ class _PreparedSparsePiperOperands:
     query: torch.Tensor
     query_scale: torch.Tensor
     block_lengths: torch.Tensor | None
+    sparse_key_blocks: int
     sparse_query_blocks: int | None
     logical_sequence_length: int
     query_summary: torch.Tensor | None = None
@@ -115,6 +117,7 @@ class _PreparedSparsePiperOperands:
             head_keep_blocks=head_keep_blocks,
             routes_per_query=routes.shape[2],
             block_lengths=self.block_lengths,
+            sparse_key_blocks=self.sparse_key_blocks,
             sparse_query_blocks=self.sparse_query_blocks,
             logical_sequence_length=self.logical_sequence_length,
         )
@@ -134,6 +137,7 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     route_head_offsets: torch.Tensor,
     *,
     value_format: ValueFormat,
+    sparse_key_blocks: int,
     routes_per_query: int,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None = None,
@@ -202,6 +206,8 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         raise ValueError("quantized sparse Piper operands must share a device")
     if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
+    if not 1 <= sparse_key_blocks <= tile_count:
+        raise ValueError("quantized sparse Piper prefix must fit the K64 tile count")
     total_query_blocks = (
         tile_count
         if block_lengths is not None
@@ -239,6 +245,7 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         head_keep_blocks=head_keep_blocks,
         routes_per_query=routes_per_query,
         block_lengths=block_lengths,
+        sparse_key_blocks=sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
     )

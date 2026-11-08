@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from _key_layouts import sparse_layout, sparse_then_dense
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import SparsePiperAttention
@@ -61,14 +60,14 @@ def _arguments(
     operands = _operands(batch=batch, sequence_length=sequence_length)
     prepared_query, prepared_key, prepared_value = _prepare(operands)
     attention = SparsePiperAttention((0.5, 1.0))
-    key_layout = sparse_layout(sequence_length // 64)
+    sparse_key_blocks = max(1, sequence_length // 64)
     weight, scale, projected_bias = _projection(bias=bias, bias_dtype=bias_dtype)
     arguments = (
         *prepared_query,
         *prepared_key,
         *prepared_value,
         attention._ratio_profile,
-        key_layout,
+        sparse_key_blocks,
         sequence_length,
         attention._routing_mode,
         weight,
@@ -83,7 +82,7 @@ def _arguments(
             prepared_value,
             attention,
             logical_sequence_length=sequence_length,
-            key_layout=key_layout,
+            sparse_key_blocks=sparse_key_blocks,
         )
         expected = linear_backend.require_linear_backend(materialized_attention).linear(
             materialized_attention.reshape(batch, sequence_length, _HEADS * _HEAD_DIM),
@@ -231,13 +230,13 @@ def test_projected_query_attention_output_matches_multiple_materialized_q_window
     operands = _operands(batch=1, sequence_length=sequence_length)
     prepared_query, prepared_key, prepared_value = _prepare(operands)
     attention = SparsePiperAttention((0.5, 1.0))
-    key_layout = sparse_layout(sequence_length // 64)
+    sparse_key_blocks = sequence_length // 64
     weight, scale, bias = _projection(bias=True)
     attention_tail = (
         *prepared_key,
         *prepared_value,
         attention._ratio_profile,
-        key_layout,
+        sparse_key_blocks,
         sequence_length,
         attention._routing_mode,
         weight,
@@ -442,7 +441,7 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 128), device="meta", dtype=torch.float32),
         _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
-        sparse_layout(2),
+        2,
         191,
         0,
         torch.empty((_OUTPUT_FEATURES, 3 * 128), device="meta", dtype=torch.int8),
@@ -472,7 +471,7 @@ def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:
         torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 128), device="meta", dtype=torch.float32),
         _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
-        sparse_then_dense(2, 3),
+        2,
         132,
         0,
         torch.empty((_OUTPUT_FEATURES, 3 * 128), device="meta", dtype=torch.int8),
@@ -517,7 +516,7 @@ def test_inplace_fake_validates_forced_metadata_without_tensor_operations() -> N
         torch.empty((1, 1, 2, 1), device="meta"),
         torch.empty((1, 1, 64), device="meta"),
         _SparsePiperRatioProfile((500_000,)),
-        sparse_layout(1),
+        1,
         65,
         0,
         weight,

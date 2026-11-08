@@ -17,12 +17,7 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import (
-    SparsePiperAttention,
-    SparsePiperKeyLayout,
-    SparsePiperKeyRegion,
-    piper_attention,
-)
+from piper_kernels import SparsePiperAttention, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend as dense_attention_backend
 from piper_kernels.attention.sparse_piper_attention import _backend as sparse_attention_backend
@@ -144,8 +139,9 @@ class Pipeline(torch.nn.Module):
             attended = piper_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
             attended = attended.transpose(1, 2)
         else:
-            key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(sequence // 64),))
-            attended = self.sparse(q.contiguous(), k.contiguous(), v, key_layout=key_layout)
+            attended = self.sparse(
+                q.contiguous(), k.contiguous(), v, sparse_key_blocks=sequence // 64
+            )
         return self.output(attended.reshape(batch, sequence, self.heads * self.head_dim))
 
     def materialized(
@@ -346,7 +342,7 @@ def _unsupported_reason(case: PipelineCase, device: torch.device) -> str | None:
     if case.rotary_dim % 2 or not 0 < case.rotary_dim <= case.head_dim:
         return "rotary dimension must be positive, even, and at most head dimension"
     if case.keep_ratio is not None and (case.sequence < 64 or case.sequence // 64 > 65536):
-        return "sparse pipeline requires 1 through 65536 complete K64 blocks"
+        return "sparse pipeline requires 1 through 65536 complete K64 prefix blocks"
     from piper_kernels.fusions.convrot_int8_piper import _backend as dense_backend
     from piper_kernels.fusions.convrot_int8_sparse_piper import _backend as sparse_backend
     from piper_kernels.linear.convrot.int8 import _backend as linear_backend

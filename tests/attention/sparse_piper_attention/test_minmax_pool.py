@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-from _key_layouts import counted_route_layout
 
 import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
@@ -11,6 +10,10 @@ from piper_kernels import (
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._budget import (
+    _normalize_head_keep_ratios,
+    _resolve_route_layout,
+)
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_and_coarse_from_summaries,
@@ -61,6 +64,7 @@ def packed_minmax_pool_routes_and_coarse_from_summaries(
     pooled_value,
     layout,
     *,
+    sparse_key_blocks,
     coarse_scale,
 ):
     return packed_routes_and_coarse_from_summaries(
@@ -69,8 +73,22 @@ def packed_minmax_pool_routes_and_coarse_from_summaries(
         key_min,
         pooled_value,
         layout,
+        sparse_key_blocks=sparse_key_blocks,
         coarse_scale=coarse_scale,
         routing_mode=_MINMAX_ROUTING,
+    )
+
+
+def _layout(
+    head_keep_block_values: tuple[int, ...],
+    sparse_key_blocks: int,
+    device: torch.device | str = "cpu",
+):
+    ratios = tuple(value / sparse_key_blocks for value in head_keep_block_values)
+    return _resolve_route_layout(
+        _normalize_head_keep_ratios(ratios),
+        sparse_key_blocks,
+        torch.device(device),
     )
 
 
@@ -78,7 +96,7 @@ def test_packed_routes_store_only_active_uint16_indices() -> None:
     generator = torch.Generator().manual_seed(53)
     query = torch.randn((1, 3, 2 * 64, 128), generator=generator)
     key = torch.randn((1, 3, 5 * 64, 128), generator=generator)
-    layout = counted_route_layout((1, 3, 2), 5)
+    layout = _layout((1, 3, 2), 5)
 
     routes = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
@@ -91,7 +109,7 @@ def test_packed_routes_store_only_active_uint16_indices() -> None:
 def test_exact_score_ties_prefer_lower_key_index() -> None:
     query = torch.zeros((1, 1, 2 * 64, 128))
     key = torch.zeros((1, 1, 4 * 64, 128))
-    layout = counted_route_layout((2,), 4)
+    layout = _layout((2,), 4)
 
     routes = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
@@ -102,7 +120,7 @@ def test_existing_summaries_select_the_same_routes_as_sequence_inputs() -> None:
     generator = torch.Generator().manual_seed(55)
     query = torch.randn((1, 3, 4 * 64, 128), generator=generator)
     key = torch.randn((1, 3, 6 * 64, 128), generator=generator)
-    layout = counted_route_layout((1, 4, 2), 6)
+    layout = _layout((1, 4, 2), 6)
     query_float = query.unflatten(2, (4, 64)).float()
     key_float = key.unflatten(2, (6, 64)).float()
     query_summary = query_float.amax(dim=3) + query_float.amin(dim=3)
@@ -122,7 +140,7 @@ def test_existing_summaries_accept_sparse_prefix_views() -> None:
     full_key_min = torch.randn((1, 2, 6, 128), generator=generator)
     key_max = full_key_max[:, :, :4]
     key_min = full_key_min[:, :, :4]
-    layout = counted_route_layout((2, 3), 4)
+    layout = _layout((2, 3), 4)
 
     expected = packed_minmax_pool_routes_from_summaries(
         query_summary,
@@ -140,7 +158,7 @@ def test_ragged_query_sequence_produces_a_final_route_row() -> None:
     generator = torch.Generator().manual_seed(64)
     query = torch.randn((1, 2, 65, 128), generator=generator)
     key = torch.randn((1, 2, 3 * 64, 128), generator=generator)
-    layout = counted_route_layout((1, 2), 3)
+    layout = _layout((1, 2), 3)
 
     routes = packed_minmax_pool_routes_from_sequences(query, key, layout)
 
@@ -186,7 +204,7 @@ def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
     )
     valid_query_rows = torch.arange(64)[None, :] < block_lengths[:, None]
     valid_key_rows = torch.arange(64)[None, :] < block_lengths[:2, None]
-    layout = counted_route_layout((1, 2), 2)
+    layout = _layout((1, 2), 2)
     expected_routes = packed_minmax_pool_routes_from_summaries(
         expected_query,
         expected_key_max,
@@ -345,8 +363,8 @@ def test_route_and_coarse_path_reuses_chunked_minmax_pool_scores() -> None:
     key_max = torch.randn((1, 2, 5, 8), generator=generator)
     key_min = torch.randn((1, 2, 5, 8), generator=generator)
     pooled_value = torch.randn((1, 2, 5, 6), generator=generator)
-    num_sparse_blocks = 3
-    layout = counted_route_layout((1, 2), num_sparse_blocks)
+    sparse_key_blocks = 3
+    layout = _layout((1, 2), sparse_key_blocks)
     coarse_scale = 8**-0.5
 
     actual = packed_minmax_pool_routes_and_coarse_from_summaries(
@@ -355,12 +373,13 @@ def test_route_and_coarse_path_reuses_chunked_minmax_pool_scores() -> None:
         key_min,
         pooled_value,
         layout,
+        sparse_key_blocks=sparse_key_blocks,
         coarse_scale=coarse_scale,
     )
     expected_routes = packed_minmax_pool_routes_from_summaries(
         query_summary,
-        key_max[:, :, :num_sparse_blocks],
-        key_min[:, :, :num_sparse_blocks],
+        key_max[:, :, :sparse_key_blocks],
+        key_min[:, :, :sparse_key_blocks],
         layout,
     )
     expected_scores = _minmax_pool_scores(query_summary, key_max, key_min) * coarse_scale
@@ -380,8 +399,8 @@ def test_nvidia_packed_routes_match_the_portable_exact_policy() -> None:
     generator = torch.Generator().manual_seed(54)
     query = torch.randn((1, 3, 5 * 64, 128), dtype=torch.bfloat16, generator=generator)
     key = torch.randn((1, 3, 7 * 64, 128), dtype=torch.bfloat16, generator=generator)
-    cpu_layout = counted_route_layout((1, 4, 6), 7)
-    cuda_layout = counted_route_layout((1, 4, 6), 7, "cuda")
+    cpu_layout = _layout((1, 4, 6), 7)
+    cuda_layout = _layout((1, 4, 6), 7, "cuda")
 
     expected = packed_minmax_pool_routes_from_sequences(query, key, cpu_layout)
     actual = packed_minmax_pool_routes_from_sequences(query.cuda(), key.cuda(), cuda_layout)
@@ -468,7 +487,7 @@ def test_nvidia_ragged_routes_ignore_invalid_query_storage() -> None:
         generator=generator,
         device="cuda",
     )
-    layout = counted_route_layout((1, 3), 4, "cuda")
+    layout = _layout((1, 3), 4, "cuda")
 
     query_storage[:, :, 65:] = 10_000
     positive_summary, _key_max, _key_min = _sequence_block_summaries(query, key)

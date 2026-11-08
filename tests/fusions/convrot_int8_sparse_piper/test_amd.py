@@ -6,7 +6,6 @@ from dataclasses import replace
 import pytest
 import torch
 
-from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
@@ -235,8 +234,7 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
         value_format=int(ValueFormat.AMD_WMMA),
     )
     profile = _SparsePiperRatioProfile((250_000,) * heads)
-    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(sequence // 64),))
-    attention_tail = *k, *v, profile, key_layout, sequence, 0
+    attention_tail = *k, *v, profile, sequence // 64, sequence, 0
     attention = _quantized_dispatch._sparse_piper_attention_from_quantized_op(*q, *attention_tail)
     out_weight = torch.randint(
         -128, 128, (width, heads * head_dim), device="cuda", dtype=torch.int8

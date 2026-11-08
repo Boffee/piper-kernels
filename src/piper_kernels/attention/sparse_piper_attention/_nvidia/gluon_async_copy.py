@@ -22,10 +22,7 @@ from triton.experimental.gluon.language.nvidia.ampere import async_copy
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.gluon import (
-    complete_tile_count,
-    pair_tile_offsets,
-)
+from piper_kernels.attention.kernels.sparse_piper.gluon import pair_tile_offsets
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
@@ -121,6 +118,7 @@ def _sparse_piper_attention_kernel(
     query_storage_sequence_length,
     storage_sequence_length,
     logical_sequence_length,
+    sparse_key_blocks,
     sparse_query_blocks,
     stride_rb,
     stride_rq,
@@ -141,6 +139,7 @@ def _sparse_piper_attention_kernel(
     mask_ragged_tail: gl.constexpr,
     has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
+    ragged_tail_is_routed: gl.constexpr,
     skip_dense_routing: gl.constexpr,
     mask_output_tail: gl.constexpr,
     output_sequence_length,
@@ -215,14 +214,9 @@ def _sparse_piper_attention_kernel(
         gl.int8, [2, head_dim, _GL_BLOCK_N], value_shared_layout
     )
 
-    # Routes cover the complete tiles; a compact ragged tile follows them.
-    sequence_tiles = storage_sequence_length // _GL_BLOCK_N
-    num_key_blocks = complete_tile_count(
-        storage_sequence_length, logical_sequence_length, mask_block_lengths
-    )
     if skip_dense_routing:
-        routed_sparse_tile_count = num_key_blocks
-        selected_sparse_tile_count = num_key_blocks
+        routed_sparse_tile_count = sparse_key_blocks
+        selected_sparse_tile_count = sparse_key_blocks
         use_sparse_routes = False
     else:
         routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
@@ -231,12 +225,13 @@ def _sparse_piper_attention_kernel(
             selected_sparse_tile_count = gl.where(
                 use_sparse_routes,
                 routed_sparse_tile_count,
-                num_key_blocks,
+                sparse_key_blocks,
             )
         else:
             use_sparse_routes = True
             selected_sparse_tile_count = routed_sparse_tile_count
-    dense_tile_count = sequence_tiles - num_key_blocks
+    sequence_tiles = storage_sequence_length // _GL_BLOCK_N
+    dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
 
@@ -248,7 +243,7 @@ def _sparse_piper_attention_kernel(
         tile_count,
         routed_sparse_tile_count,
         selected_sparse_tile_count,
-        num_key_blocks,
+        sparse_key_blocks,
         stride_rr,
         use_sparse_routes,
         skip_dense_routing,
@@ -311,7 +306,7 @@ def _sparse_piper_attention_kernel(
             key_layout,
             probability_layout,
             mask_block_lengths,
-            False,
+            mask_ragged_tail and ragged_tail_is_routed,
             False,
         )
         next_n_0, next_n_1 = pair_tile_offsets(
@@ -320,7 +315,7 @@ def _sparse_piper_attention_kernel(
             tile_count,
             routed_sparse_tile_count,
             selected_sparse_tile_count,
-            num_key_blocks,
+            sparse_key_blocks,
             stride_rr,
             use_sparse_routes,
             skip_dense_routing,
@@ -495,6 +490,7 @@ class _ContextLauncher:
                 launch.query_storage_sequence_length,
                 launch.storage_sequence_length,
                 launch.logical_sequence_length,
+                launch.sparse_key_blocks,
                 launch.sparse_query_blocks,
                 *launch.route_strides,
                 *launch.output_strides,
@@ -507,6 +503,7 @@ class _ContextLauncher:
                 launch.mask_ragged_tail,
                 launch.has_dense_query_suffix,
                 launch.apply_coarse_residual,
+                launch.ragged_tail_is_routed,
                 launch.skip_dense_routing,
                 # Only a ragged final Q64 tile needs masked stores. Padded storage keeps
                 # writing every row, exactly as SM120 does at Q64.
