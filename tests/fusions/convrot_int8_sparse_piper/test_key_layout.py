@@ -219,7 +219,7 @@ def test_regional_residual_reuses_graph_for_layouts_and_sequence_lengths():
         SparsePiperKeyLayout((SparsePiperKeyRegion(8), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(2, sparse=False), SparsePiperKeyRegion(16))),
         SparsePiperKeyLayout.prefix(4, 16),
-        # Compact scores skip the middle dense region; the dense tail takes no routes.
+        # Compact scores skip both dense regions.
         SparsePiperKeyLayout(
             (
                 SparsePiperKeyRegion(6),

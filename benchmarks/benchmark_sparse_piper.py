@@ -157,7 +157,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
         _normalize_head_keep_ratios([ratio] * args.heads), key_layout, device
     )
     # Routed blocks; later keys form the attention kernels' dense suffix.
-    blocks = layout.num_routed_key_blocks
+    blocks = layout.num_key_blocks
     route_call = partial(
         packed_routes_from_sequences,
         query.transpose(1, 2),

@@ -31,19 +31,19 @@ class ResolvedRouteRegion:
 class _ResolvedRouteLayout:
     """Route metadata for one key layout and query-head range.
 
-    Routes cover key blocks ``[0, num_routed_key_blocks)``; later blocks, including a
-    compact partial tail, form the attention kernels' implicit dense suffix.
-    ``num_key_blocks`` counts the layout's complete blocks, the domain of forced
-    IDs. ``regions`` partitions the routed blocks, and ``selector_metadata`` holds
-    one device row per region: start block, length, compact score start, H keep
-    counts, and H packed destinations. Compact scores omit regions that keep
-    every block. Attention consumes only the aggregate counts and offsets.
+    Routes cover the layout's ``num_key_blocks`` complete key blocks, which the
+    attention kernels receive as their routed range. Only a compact partial final
+    tile follows them without a route, so kernels mask that tile alone. Forced
+    IDs share the same domain. ``regions`` partitions the blocks, and
+    ``selector_metadata`` holds one device row per region: start block, length,
+    compact score start, H keep counts, and H packed destinations. Compact scores
+    omit regions that keep every block. Attention consumes only the aggregate
+    counts and offsets.
     """
 
     head_keep_blocks: torch.Tensor
     route_head_offsets: torch.Tensor
     routes_per_query: int
-    num_routed_key_blocks: int
     num_key_blocks: int
     regions: tuple[ResolvedRouteRegion, ...]
     selector_metadata: torch.Tensor

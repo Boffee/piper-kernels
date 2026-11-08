@@ -78,7 +78,7 @@ def test_budget_rounding_is_independent_per_region():
     assert layout.route_head_offsets.tolist() == [0, 6, 10]
 
 
-def test_prefix_layout_folds_its_dense_remainder_into_the_suffix():
+def test_prefix_layout_routes_every_complete_block():
     assert SparsePiperKeyLayout.prefix(3, 5) == SparsePiperKeyLayout(
         (SparsePiperKeyRegion(3), SparsePiperKeyRegion(2, sparse=False))
     )
@@ -92,12 +92,16 @@ def test_prefix_layout_folds_its_dense_remainder_into_the_suffix():
         SparsePiperKeyRegion(5, sparse=False),
     )
     layout = route_layout((0.5,), SparsePiperKeyLayout(regions), torch.device("cpu"))
-    # Routes stop after the last sparse region; the dense tail takes no route slots.
-    assert layout.num_routed_key_blocks == 7
+    # Dense regions take routes wherever they sit; compact scores cover only region 2.
     assert layout.num_key_blocks == 14
-    assert [region.num_key_blocks for region in layout.regions] == [4, 3]
-    assert layout.routes_per_query == 6
-    assert layout.selector_metadata.tolist() == [[0, 4, 0, 4, 0], [4, 3, 0, 2, 4]]
+    assert [region.num_key_blocks for region in layout.regions] == [4, 3, 2, 5]
+    assert layout.routes_per_query == 13
+    assert layout.selector_metadata.tolist() == [
+        [0, 4, 0, 4, 0],
+        [4, 3, 0, 2, 4],
+        [7, 2, 3, 2, 6],
+        [9, 5, 3, 5, 8],
+    ]
 
 
 def test_each_video_retains_its_own_ten_percent(device):
@@ -171,7 +175,7 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
         SparsePiperKeyRegion(1),  # Rounding retains this region without scoring it.
         SparsePiperKeyRegion(3, sparse=False),
         SparsePiperKeyRegion(513),  # Selection crosses a radix tile boundary.
-        SparsePiperKeyRegion(2, sparse=False),  # Joins the dense suffix without routes.
+        SparsePiperKeyRegion(2, sparse=False),
     )
     ratios = (0.2, 0.5, 1.0, 0.75)
     budgets = SparsePiperAttention(ratios).resolve_keep_blocks(SparsePiperKeyLayout(regions))
@@ -179,7 +183,7 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
     # Integer-valued FP32 summaries make the score oracle exact on both devices.
     # 385 query blocks also crosses the routing chunk boundary.
     query = torch.randint(-8, 9, (2, 4, 385, 64), generator=generator).float()
-    primary = torch.randint(-8, 9, (2, 2, 524, 64), generator=generator).float()
+    primary = torch.randint(-8, 9, (2, 2, 526, 64), generator=generator).float()
     auxiliary = (
         primary - torch.randint(0, 9, primary.shape, generator=generator)
         if routing == "minmax"
@@ -194,7 +198,7 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
     for head in range(4):
         start = 0
         selected_regions = []
-        for region, counts in zip(regions[:-1], budgets, strict=False):
+        for region, counts in zip(regions, budgets, strict=True):
             selected = scores[:, head, :, start : start + region.num_blocks].argsort(
                 dim=-1, descending=True, stable=True
             )[..., : counts[head]]
@@ -219,7 +223,7 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
     "regions",
     [
         (SparsePiperKeyRegion(2), SparsePiperKeyRegion(1, sparse=False), SparsePiperKeyRegion(4)),
-        # A trailing dense region joins the attention kernels' dense suffix.
+        # A trailing dense region is routed like any other.
         (
             SparsePiperKeyRegion(2),
             SparsePiperKeyRegion(1, sparse=False),
@@ -409,7 +413,6 @@ def test_region_compile_reuses_dynamic_lengths_and_layouts(device, layout_source
         SparsePiperKeyLayout((SparsePiperKeyRegion(3), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(10))),
-        # Trailing dense regions take no routes, which changes the routed extent.
         SparsePiperKeyLayout.prefix(9, 13),
         SparsePiperKeyLayout(
             (

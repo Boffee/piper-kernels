@@ -138,8 +138,6 @@ attended. Pad region boundaries that do not fall on a multiple of 64 rows and
 use `block_lengths` to exclude the padding. The partition is shared across
 batches, queries, and heads. `SparsePiperKeyLayout.prefix(num_sparse_blocks,
 num_blocks)` builds the common case of one sparse region followed by dense keys.
-Dense regions after the last sparse region need no routes; attention reads them
-directly.
 
 Budgets round across heads independently within each sparse region, with at least
 one block per head per region. Regions cannot borrow each other's budget; small

@@ -9,14 +9,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Breaking: `SparsePiperAttention` partitions keys with a required
   `key_layout=SparsePiperKeyLayout(...)` of ordered `SparsePiperKeyRegion` values
-  instead of `num_routed_key_blocks`. Each sparse region keeps its own per-head budget,
+  instead of `sparse_key_blocks`. Each sparse region keeps its own per-head budget,
   so several videos no longer compete for one pooled budget; dense regions may sit
-  between them, within one softmax. Replace `num_routed_key_blocks=n` with
-  `key_layout=SparsePiperKeyLayout.prefix(n, sequence_length // 64)`, which keeps
-  the same routes and dense suffix. `resolve_keep_blocks(layout)` replaces
+  between them, within one softmax. Replace `sparse_key_blocks=n` with
+  `key_layout=SparsePiperKeyLayout.prefix(n, sequence_length // 64)`, which attends
+  the same keys. `resolve_keep_blocks(layout)` replaces
   `resolve_head_keep_blocks()` and returns per-region budgets. Construct layouts
   outside compiled forwards: changing a layout, including its block count, reuses
-  the compiled graph, where a changed `num_routed_key_blocks` integer could recompile.
+  the compiled graph, where a changed `sparse_key_blocks` integer could recompile.
   Forced tile IDs are absolute block indices in `[0, layout.num_blocks)`. ConvRot
   INT8, NVFP4, and ConvRot NVFP4 projection/output fusions accept any layout; a
   coarse branch now fuses only when its scope covers every complete key block, as

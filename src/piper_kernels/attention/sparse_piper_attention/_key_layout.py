@@ -149,7 +149,6 @@ class _RoutePlan:
 
     num_heads: int
     routes_per_query: int
-    num_routed_key_blocks: int
     regions: tuple[ResolvedRouteRegion, ...]
     metadata_values: tuple[int, ...]
 
@@ -164,11 +163,8 @@ def _build_route_plan(
     start_head: int,
     end_head: int | None,
 ) -> _RoutePlan:
-    last_sparse = max(index for index, region in enumerate(key_layout.regions) if region.sparse)
-    routed = key_layout.regions[: last_sparse + 1]
     budgets = [
-        counts[start_head:end_head]
-        for counts in resolve_keep_blocks(ratio_units, key_layout)[: last_sparse + 1]
+        counts[start_head:end_head] for counts in resolve_keep_blocks(ratio_units, key_layout)
     ]
     totals = [sum(column) for column in zip(*budgets, strict=True)]
     offsets = list(accumulate(totals, initial=0))
@@ -179,7 +175,7 @@ def _build_route_plan(
     selector_values: list[int] = []
     next_offsets = tuple(offsets[:-1])
     start_key_block = start_score_block = 0
-    for key_region, counts in zip(routed, budgets, strict=True):
+    for key_region, counts in zip(key_layout.regions, budgets, strict=True):
         region = ResolvedRouteRegion(
             start_key_block=start_key_block,
             num_key_blocks=key_region.num_blocks,
@@ -198,7 +194,6 @@ def _build_route_plan(
     return _RoutePlan(
         num_heads=len(totals),
         routes_per_query=offsets[-1],
-        num_routed_key_blocks=start_key_block,
         regions=tuple(regions),
         metadata_values=(*totals, *offsets, *selector_values),
     )
@@ -216,8 +211,7 @@ def resolve_route_layout(
 
     Each region rounds across every profile head before the slice, so a head range
     keeps the blocks its heads keep when all heads run together. Routes cover
-    blocks through the last sparse region; trailing dense regions join the
-    attention kernels' implicit dense suffix and take no routes.
+    every complete block, dense regions included.
     """
     plan = _build_route_plan(ratio_units, key_layout, start_head, end_head)
     # Pinned staging makes the metadata copy legal during CUDA graph capture.
@@ -233,7 +227,6 @@ def resolve_route_layout(
         head_keep_blocks=metadata[:num_heads],
         route_head_offsets=metadata[num_heads:selector_start],
         routes_per_query=plan.routes_per_query,
-        num_routed_key_blocks=plan.num_routed_key_blocks,
         num_key_blocks=key_layout.num_blocks,
         regions=plan.regions,
         selector_metadata=metadata[selector_start:].view(len(plan.regions), selector_start + 2),

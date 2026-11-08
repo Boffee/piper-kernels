@@ -43,6 +43,8 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     mean_pool_block_values,
 )
 
+from ._layouts import sparse_layout
+
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
@@ -559,7 +561,8 @@ def _block_length_case(routing_mode: int, head_dim: int):
     num_sparse_blocks = 2
     key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, storage_sequence_length // 64)
     ratio_units = _normalize_head_keep_ratios((1.0, 1.0))
-    layout = resolve_route_layout(ratio_units, key_layout, query.device)
+    # The prepared operands only need placeholder routes over a shorter routed range.
+    layout = resolve_route_layout(ratio_units, sparse_layout(num_sparse_blocks), query.device)
     routes = packed_minmax_pool_routes_from_sequences(
         query_head_major,
         key_head_major[:, :, : num_sparse_blocks * 64],
@@ -790,7 +793,8 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
     num_sparse_blocks = 2
     key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, shape[1] // 64)
     ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
-    layout = resolve_route_layout(ratio_units, key_layout, query.device)
+    # The prepared operands only need placeholder routes over a shorter routed range.
+    layout = resolve_route_layout(ratio_units, sparse_layout(num_sparse_blocks), query.device)
     placeholder_routes = packed_minmax_pool_routes_from_sequences(
         query_head_major,
         key_head_major[:, :, : num_sparse_blocks * 64],

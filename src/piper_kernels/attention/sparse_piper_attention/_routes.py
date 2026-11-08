@@ -62,7 +62,7 @@ class PackedRouteBuilder:
         )
         if self._full_keep:
             if not skip_dense_routing:
-                _backend.fill_full_keep_routes(self.routes.indices, layout.num_routed_key_blocks)
+                _backend.fill_full_keep_routes(self.routes.indices, layout.num_key_blocks)
             return
         self._select_routes = _backend.select_route_selector(self.routes.indices)
         self._force_tile_mask = force_tile_mask
@@ -125,7 +125,7 @@ class PackedRouteAndCoarseBuilder:
         if pooled_value.shape[:2] != (batch, heads):
             raise ValueError("pooled V must match the routing batch and heads")
         coarse_key_blocks = pooled_value.shape[2]
-        if not layout.num_routed_key_blocks <= coarse_key_blocks:
+        if not layout.num_key_blocks <= coarse_key_blocks:
             raise ValueError("coarse attention must include every routed key block")
         if pooled_value.dtype is not torch.float32:
             raise ValueError("pooled V must use FP32")
@@ -141,7 +141,7 @@ class PackedRouteAndCoarseBuilder:
             force_tile_mask=force_tile_mask,
         )
         self._pooled_value = pooled_value
-        self._num_routed_key_blocks = layout.num_routed_key_blocks
+        self._num_key_blocks = layout.num_key_blocks
         self._coarse_output = pooled_value.new_empty(
             (batch, heads, query_blocks, pooled_value.shape[-1])
         )
@@ -168,7 +168,7 @@ class PackedRouteAndCoarseBuilder:
         ):
             raise ValueError("coarse score query-block ranges must not overlap")
         self._route_builder.write(
-            scores[..., : self._num_routed_key_blocks],
+            scores[..., : self._num_key_blocks],
             query_block_offset=query_block_offset,
         )
         self._coarse_output[:, :, query_block_offset:query_block_stop] = coarse_attention(

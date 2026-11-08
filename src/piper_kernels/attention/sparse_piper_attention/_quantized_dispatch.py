@@ -92,7 +92,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         start_head=start_head,
         end_head=end_head,
     )
-    num_routed_key_blocks = layout.num_routed_key_blocks
+    num_routed_key_blocks = layout.num_key_blocks
     validate_routing_mode(routing_mode)
     pooled_value = None
     if block_mean is None:

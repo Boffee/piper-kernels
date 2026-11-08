@@ -134,7 +134,7 @@ def packed_routes_from_sequences(
     force_tile_mask: torch.Tensor | None = None,
 ) -> PackedRoutes:
     """Select routes for compact or valid-front padded Q and the layout's routed K."""
-    if key.ndim == 4 and key.shape[2] != layout.num_routed_key_blocks * _BLOCK_ROWS:
+    if key.ndim == 4 and key.shape[2] != layout.num_key_blocks * _BLOCK_ROWS:
         raise ValueError("sparse routing keys must cover exactly the routed K64 blocks")
     if layout.keeps_all_blocks:
         validate_routing_mode(routing_mode)
@@ -177,7 +177,7 @@ def packed_routes_from_summaries(
 ) -> PackedRoutes:
     """Select routes from summaries of the layout's routed key blocks."""
     _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
-    if key_primary.shape[2] != layout.num_routed_key_blocks:
+    if key_primary.shape[2] != layout.num_key_blocks:
         raise ValueError("routing key summaries must cover exactly the routed key blocks")
     batch, heads, query_blocks, _head_dim = query_summary.shape
     builder = PackedRouteBuilder(

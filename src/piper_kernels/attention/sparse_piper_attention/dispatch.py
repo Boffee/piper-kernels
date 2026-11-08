@@ -225,7 +225,7 @@ def _run_sparse_piper_attention(
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
     backend = _backend.select_attention_backend(query)
-    num_routed_key_blocks = layout.num_routed_key_blocks
+    num_routed_key_blocks = layout.num_key_blocks
     routed_key_rows = num_routed_key_blocks * _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
