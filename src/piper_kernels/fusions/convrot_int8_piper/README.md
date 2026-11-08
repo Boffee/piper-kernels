@@ -67,11 +67,9 @@ Dense V's per-token quantization remains distinct from sparse V's tile scales.
 Typed backend methods operate on caller-owned buffers; target launch choices
 live in separate NVIDIA/RDNA4 modules. On SM89, D128 dense and sparse
 projections run Gluon kernels built from the shared
-`convrot_int8_projection/_nvidia/fragments.py`: the SM8x ConvRot INT8 GEMM
-pipeline, the register-layout RMSNorm/RoPE/Hadamard tile, and the centered-K
-stores. As in sparse Piper, the NVIDIA policy resolves each projection's plan;
-other SM89 shapes and unaligned operands use the Triton launchers with one-head
-64-row tiles. [_backend.py](_backend.py) provides optional selection for
+[fragments](../convrot_int8_projection/_nvidia/fragments.py), and one shared
+[SM89 policy](../convrot_int8_projection/_nvidia/policy.py) decides when they
+apply. [_backend.py](_backend.py) provides optional selection for
 matching and required selection for validated execution.
 
 K/V remain global. Q uses one reusable buffer with global RoPE positions and

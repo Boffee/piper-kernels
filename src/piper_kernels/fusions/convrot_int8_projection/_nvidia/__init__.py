@@ -1,1 +1,1 @@
-"""Shared NVIDIA fragments for fused ConvRot INT8 projection kernels."""
+"""NVIDIA plans, SM89 policy, and Gluon fragments shared by fused ConvRot INT8 projections."""

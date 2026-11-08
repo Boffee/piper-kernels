@@ -11,7 +11,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   on NVIDIA SM89, as on SM120 and RDNA4. On an RTX 4070 Ti SUPER with Triton 3.9, the
   compiled H3 attention block runs 1.01-1.14x faster than without the fusion at 16K-100K
   tokens and needs 56-57% less peak memory, and its attention error against FP64 is 3-12%
-  lower. SM120 and RDNA4 kernels are unchanged.
+  lower than without it. SM120 and RDNA4 kernels are unchanged.
 
 ### Fixed
 

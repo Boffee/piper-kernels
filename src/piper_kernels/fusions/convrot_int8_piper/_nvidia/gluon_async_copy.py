@@ -10,21 +10,17 @@ so their scales need no data exchange and are stored per row from that layout.
 K stores BF16 rows and FP32 tile sums for the shared encoder, which centers K by
 its global mean.
 
-V keeps a 2x2 warp grid and quantizes each token. Its epilogue gives each thread
-8 consecutive rows of 16 features, so the transposed code stores write 8 contiguous
-bytes and per-feature vectors take 16 registers.
+V projects its tiles through the shared value-tile fragment and quantizes each token.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
-# ruff: noqa: ANN001, ANN202, PLR0913, PLR0915, PLR0917
+# ruff: noqa: ANN001, ANN202, PLR0913, PLR0917
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
 
 from __future__ import annotations
-
-from collections.abc import Callable
 
 import torch
 from triton.experimental import gluon
@@ -36,20 +32,16 @@ from piper_kernels.attention.piper_attention._validation import scale_granularit
 from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
-from piper_kernels.fusions.convrot_int8_projection.triton import project_prepared_input_mean_kernel
-from piper_kernels.linear.convrot.int8 import _ops
 
+from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 
-_BLOCK_M = fragments.BLOCK_M
-_NUM_WARPS = fragments.NUM_WARPS
 # K/V storage and K tile sums use K64 tiles.
 _TILE_ROWS = 64
 _MEAN_BLOCK_K = 128
 
 _GL_HEAD_DIM = gl.constexpr(fragments.HEAD_DIM)
-_GL_BLOCK_M = gl.constexpr(_BLOCK_M)
-_GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
+_GL_BLOCK_M = gl.constexpr(fragments.BLOCK_M)
 _GL_TILE_ROWS = gl.constexpr(_TILE_ROWS)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(32)
 _GL_SCALE_EPSILON = gl.constexpr(1e-7)
@@ -231,7 +223,6 @@ def _key_kernel(
         heads,
         head,
         row_block,
-        first_row,
         storage_tiles,
         _GL_TILE_ROWS,
         mask_rows,
@@ -265,53 +256,26 @@ def _value_kernel(
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
-    first_row = row_block * _GL_BLOCK_M
-    input_row_start = batch * logical_sequence_length
-    copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, fragments.COPY_ROWS)
-    if mask_rows:
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
-    mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
-        version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
-    )
-    accumulator = fragments.project_int8(
+    value, sequence, tile_offsets, _rows_in_tile, features = fragments.project_value_tiles(
         input_ptr,
+        input_scale_ptr,
         weight_ptr,
-        input_row_start + copy_positions,
-        head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, fragments.COPY_ROWS),
-        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        weight_scale_ptr,
+        bias_ptr,
+        batch,
+        head,
+        row_block,
+        logical_sequence_length,
         input_features,
-        fragments.K32_SLICE,
+        _GL_TILE_ROWS,
+        mask_rows,
     )
-
-    # [K64 tiles, rows, features]: each thread holds 8 consecutive rows of 16 features,
-    # so row reductions run mostly in registers.
-    tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
-    layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8, 1], [1, 8, 4], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
-    )
-    tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
-    tile_offsets = row_block * tiles + gl.arange(0, tiles, gl.SliceLayout(1, tile_rows_layout))
-    rows_in_tile = gl.arange(0, _GL_TILE_ROWS, gl.SliceLayout(0, tile_rows_layout))
-    sequence = tile_offsets[:, None] * _GL_TILE_ROWS + rows_in_tile[None, :]
-    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, gl.SliceLayout(1, layout)))
-    positions = sequence
-    if mask_rows:
-        positions = gl.minimum(positions, logical_sequence_length - 1)
-    input_scale = gl.load(input_scale_ptr + input_row_start + positions)
-    weight_scale = gl.load(weight_scale_ptr + head * _GL_HEAD_DIM + features)
-    accumulator = gl.convert_layout(
-        gl.reshape(accumulator, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]), layout
-    )
-    value = accumulator.to(gl.float32) * input_scale[:, :, None] * weight_scale[None, None, :]
-    if bias_ptr is not None:
-        bias = gl.load(bias_ptr + head * _GL_HEAD_DIM + features).to(gl.float32)
-        value += bias[None, None, :]
 
     batch_head = batch * heads + head
     mean_pointers = mean_ptr + batch_head * _GL_HEAD_DIM + features
     if is_causal:
         if row_block == 0:
-            gl.store(mean_pointers, gl.zeros_like(weight_scale))
+            gl.store(mean_pointers, gl.zeros(features.shape, gl.float32, features.type.layout))
     else:
         value -= gl.load(mean_pointers)[None, None, :]
     if mask_rows:
@@ -322,36 +286,24 @@ def _value_kernel(
     log_scale = gl.log2(value_scale).to(gl.float16).to(gl.float32)
 
     storage_rows = storage_tiles * _GL_TILE_ROWS
-    value_pointers = (
-        value_ptr
-        + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_rows
-        + features[None, None, :].to(gl.int64) * storage_rows
-        + sequence[:, :, None]
+    fragments.store_value_codes(
+        value_ptr + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_rows,
+        quantized,
+        sequence,
+        features,
+        tile_offsets,
+        storage_tiles,
+        mask_rows,
     )
     metadata = batch_head * storage_rows + sequence
     multiplier = value_scale * _GL_P_UINT8_RANGE
     if mask_rows:
         in_storage = (tile_offsets < storage_tiles)[:, None]
-        gl.store(value_pointers, quantized, mask=in_storage[:, :, None])
         gl.store(multiplier_ptr + metadata, multiplier, mask=in_storage)
         gl.store(log_ptr + metadata, log_scale, mask=in_storage)
     else:
-        gl.store(value_pointers, quantized)
         gl.store(multiplier_ptr + metadata, multiplier)
         gl.store(log_ptr + metadata, log_scale)
-
-
-def _launch_rows(sequence_rows: int, launch: Callable[..., None]) -> None:
-    """Launch full 128-row tiles, then one masked tile for the remainder.
-
-    Launch grids put heads on the fastest axis, so the programs that run together
-    share their input rows in L2.
-    """
-    full_row_blocks = sequence_rows // _BLOCK_M
-    if full_row_blocks:
-        launch(full_row_blocks, 0, mask_rows=False)
-    if sequence_rows % _BLOCK_M:
-        launch(1, full_row_blocks, mask_rows=True)
 
 
 def project_query(
@@ -407,7 +359,7 @@ def project_query(
                 num_warps=execution_plan.num_warps,
             )
 
-        _launch_rows(chunk_rows, launch)
+        fragments.launch_row_blocks(chunk_rows, launch, mask_full_tiles=False)
 
 
 def project_key(
@@ -459,7 +411,7 @@ def project_key(
                 num_warps=execution_plan.num_warps,
             )
 
-        _launch_rows(sequence_length, launch)
+        fragments.launch_row_blocks(sequence_length, launch, mask_full_tiles=False)
         centered_projection.finalize_mean(partials, sequence_length, out=mean)
         qk_quantization.prepare_key(
             stored.narrow(2, 0, sequence_length),
@@ -484,25 +436,23 @@ def project_value(
 ) -> None:
     """Fill transposed per-token INT8 values, multipliers, logs, and the V mean."""
     value, multiplier, log_scale, mean = out
-    batch, heads, head_dim, storage_length = value.shape
+    batch, heads, _head_dim, storage_length = value.shape
     sequence_length = input_qdata.shape[1]
     if batch == 0:
         return
 
     with device_context(input_qdata.device):
         if not is_causal:
-            represented_mean = _ops.dequantized_input_mean(input_qdata, input_scale)
-            project_prepared_input_mean_kernel[(heads * head_dim // mean_block_n, batch)](
-                represented_mean,
+            # Gluon plans tile K by 64 for the GEMM; the one-row mean keeps K128 tiles.
+            projection.project_value_mean(
+                input_qdata,
+                input_scale,
                 weight_qdata,
                 weight_scale,
-                mean,
-                input_features=input_qdata.shape[2],
-                output_features=heads * head_dim,
+                bias,
                 block_n=mean_block_n,
                 block_k=_MEAN_BLOCK_K,
-                bias_ptr=bias,
-                num_warps=4,
+                out=mean,
             )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
@@ -526,4 +476,4 @@ def project_value(
                 num_warps=execution_plan.num_warps,
             )
 
-        _launch_rows(sequence_length, launch)
+        fragments.launch_row_blocks(sequence_length, launch, mask_full_tiles=False)

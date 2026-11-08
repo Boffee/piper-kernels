@@ -10,6 +10,9 @@ registers or its lane quad. Loads of cos/sin are then 16 bytes wide, and RoPE
 pairs stay in registers. The signed Hadamard runs five of its seven stages in
 registers and the other two as butterfly shuffles. K stores BF16 rows and FP32
 tile sums for the shared encoder, which centers K by its global mean.
+
+V keeps a 2x2 warp grid; ``project_value_tiles`` owns its epilogue layout, and
+``store_value_codes`` its transposed ``[D128, S]`` code storage.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -18,6 +21,8 @@ tile sums for the shared encoder, which centers K by its global mean.
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -350,12 +355,11 @@ def store_centered_key(
     heads: gl.constexpr,
     head,
     row_block,
-    first_row,
     storage_tiles,
     tile_rows: gl.constexpr,
     mask_rows: gl.constexpr,
 ):
-    """Store K tile ``row_block``, whose first row is ``first_row``, for the centered encoder.
+    """Store the 128-row K tile ``row_block`` for the centered encoder.
 
     Rows are stored as BF16, with FP32 sums of each stored tile's values; the shared
     encoder reduces the sums to the global mean that centers K.
@@ -369,7 +373,7 @@ def store_centered_key(
     store_rows(
         stored_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
         stored,
-        first_row,
+        row_block * _GL_BLOCK_M,
         storage_rows,
         mask_rows,
     )
@@ -380,3 +384,104 @@ def store_centered_key(
         storage_tiles,
         mask_rows,
     )
+
+
+@gluon.jit
+def project_value_tiles(
+    input_ptr,
+    input_scale_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    batch,
+    head,
+    row_block,
+    logical_sequence_length,
+    input_features: gl.constexpr,
+    tile_rows: gl.constexpr,
+    mask_rows: gl.constexpr,
+):
+    """Project 128 V rows onto a D128 head as FP32 ``[tiles, tile_rows, D128]`` values.
+
+    V keeps a 2x2 warp grid and multiplies K32 operand slices, which keep every V tile
+    below the register limit and run full tiles 1-2% faster than K64 slices. Each thread
+    then holds 8 consecutive rows of 16 features in one K64 tile: per-feature scales,
+    biases, and means take 16 registers each, row reductions run mostly in registers,
+    and the transposed stores write 8 contiguous bytes.
+
+    Returns the values with their sequence positions ``[tiles, tile_rows]``, their tile
+    indices ``[tiles]``, rows within each tile ``[tile_rows]``, and features ``[D128]``.
+    With ``mask_rows``, rows past the sequence end repeat its last row; callers mask
+    their outputs.
+    """
+    gl.static_assert(tile_rows == 64, "the V epilogue layout covers K64 tiles")
+    tiles: gl.constexpr = _GL_BLOCK_M // tile_rows
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 8, 1], [1, 8, 4], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
+    )
+    input_row_start = batch * logical_sequence_length
+    copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, COPY_ROWS)
+    if mask_rows:
+        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+    mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
+        version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
+    )
+    accumulator = project_int8(
+        input_ptr,
+        weight_ptr,
+        input_row_start + copy_positions,
+        head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, COPY_ROWS),
+        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        input_features,
+        K32_SLICE,
+    )
+
+    tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
+    tile_offsets = row_block * tiles + gl.arange(0, tiles, gl.SliceLayout(1, tile_rows_layout))
+    rows_in_tile = gl.arange(0, tile_rows, gl.SliceLayout(0, tile_rows_layout))
+    sequence = tile_offsets[:, None] * tile_rows + rows_in_tile[None, :]
+    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, gl.SliceLayout(1, layout)))
+    positions = sequence
+    if mask_rows:
+        positions = gl.minimum(positions, logical_sequence_length - 1)
+    input_scale = gl.load(input_scale_ptr + input_row_start + positions)
+    weight_scale = gl.load(weight_scale_ptr + head * _GL_HEAD_DIM + features)
+    accumulator = gl.convert_layout(
+        gl.reshape(accumulator, [tiles, tile_rows, _GL_HEAD_DIM]), layout
+    )
+    values = accumulator.to(gl.float32) * input_scale[:, :, None] * weight_scale[None, None, :]
+    if bias_ptr is not None:
+        bias = gl.load(bias_ptr + head * _GL_HEAD_DIM + features).to(gl.float32)
+        values += bias[None, None, :]
+    return values, sequence, tile_offsets, rows_in_tile, features
+
+
+@gluon.jit
+def store_value_codes(
+    pointer, codes, sequence, features, tile_offsets, storage_tiles, mask_rows: gl.constexpr
+):
+    """Store a V tile's INT8 codes into one head's transposed ``[D128, S]`` storage."""
+    storage_rows = storage_tiles * codes.shape[1]
+    pointers = pointer + features[None, None, :].to(gl.int64) * storage_rows + sequence[:, :, None]
+    if mask_rows:
+        gl.store(pointers, codes, mask=(tile_offsets < storage_tiles)[:, None, None])
+    else:
+        gl.store(pointers, codes)
+
+
+def launch_row_blocks(
+    sequence_rows: int, launch: Callable[..., None], *, mask_full_tiles: bool
+) -> None:
+    """Launch full 128-row tiles, then one masked tile for the remainder.
+
+    ``launch(row_blocks, row_block_offset, mask_rows=...)`` runs one grid. Callers mask
+    full tiles too when their validity can end inside a tile, as block lengths do.
+    Launch grids put heads on the fastest axis, so the programs that run together share
+    their input rows in L2; grouping several row blocks per head, as the Triton kernels
+    do, measured 1-3% slower for the sparse projections.
+    """
+    full_row_blocks = sequence_rows // BLOCK_M
+    if full_row_blocks:
+        launch(full_row_blocks, 0, mask_rows=mask_full_tiles)
+    if sequence_rows % BLOCK_M:
+        launch(1, full_row_blocks, mask_rows=True)

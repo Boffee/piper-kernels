@@ -209,9 +209,8 @@ def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     kernel = MagicMock()
     monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
-    mean_kernel = MagicMock()
-    monkeypatch.setattr(gluon_async_copy, "project_prepared_input_mean_kernel", mean_kernel)
-    monkeypatch.setattr(gluon_async_copy._ops, "dequantized_input_mean", Mock())
+    project_value_mean = Mock()
+    monkeypatch.setattr(gluon_async_copy.projection, "project_value_mean", project_value_mean)
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(gluon_async_copy, "device_context", guard)
     finalize_mean, encode_key = Mock(), Mock()
@@ -243,12 +242,13 @@ def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
             assert arguments["per_thread_scales"] is (granularity == "per_thread")
         if operation == "value":
             assert arguments["is_causal"] is causal
+    # The shared Triton launcher projects the V mean that non-causal V subtracts.
     if operation == "value" and not causal:
-        block_n = policy.VALUE_MEAN_BLOCK_N
-        mean_kernel.__getitem__.assert_called_once_with((3 * 128 // block_n, 2))
-        assert mean_kernel.__getitem__.return_value.call_args.kwargs["block_n"] == block_n
+        project_value_mean.assert_called_once()
+        assert project_value_mean.call_args.kwargs["block_n"] == policy.VALUE_MEAN_BLOCK_N
+        assert project_value_mean.call_args.kwargs["out"] is out[3]
     else:
-        mean_kernel.__getitem__.assert_not_called()
+        project_value_mean.assert_not_called()
     if operation == "key":
         stored, partials = calls[0].args[8:10]
         assert stored.dtype is torch.bfloat16

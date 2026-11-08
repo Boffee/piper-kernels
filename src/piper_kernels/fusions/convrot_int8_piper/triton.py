@@ -99,6 +99,34 @@ def project_query(
             launch(1, full_blocks, mask_ragged_tail=True)
 
 
+def project_value_mean(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    block_n: int,
+    block_k: int,
+    out: torch.Tensor,
+) -> None:
+    """Project the dequantized input mean into ``out``, the mean non-causal V subtracts."""
+    output_features = weight_qdata.shape[0]
+    with device_context(input_qdata.device):
+        project_prepared_input_mean_kernel[(triton.cdiv(output_features, block_n), out.shape[0])](
+            _ops.dequantized_input_mean(input_qdata, input_scale),
+            weight_qdata,
+            weight_scale,
+            out,
+            input_features=input_qdata.shape[2],
+            output_features=output_features,
+            block_n=block_n,
+            block_k=block_k,
+            bias_ptr=bias,
+            num_warps=4,
+        )
+
+
 def project_value(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -121,20 +149,15 @@ def project_value(
     )
     with device_context(input_qdata.device):
         if not is_causal:
-            represented_mean = _ops.dequantized_input_mean(input_qdata, input_scale)
-            project_prepared_input_mean_kernel[
-                (triton.cdiv(heads * head_dim, mean_block_n), batch)
-            ](
-                represented_mean,
+            project_value_mean(
+                input_qdata,
+                input_scale,
                 weight_qdata,
                 weight_scale,
-                mean,
-                input_features=input_qdata.shape[2],
-                output_features=heads * head_dim,
+                bias,
                 block_n=mean_block_n,
                 block_k=execution_plan.block_k,
-                bias_ptr=bias,
-                num_warps=4,
+                out=mean,
             )
         for count, offset, aligned in (
             (sequence // 64, 0, True),

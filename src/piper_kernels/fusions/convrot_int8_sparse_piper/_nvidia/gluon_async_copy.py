@@ -5,18 +5,15 @@ fragments. Q and K permute the weight rows so RoPE and the signed Hadamard stay
 in registers; Q emits Q32 INT8 rows with routing summaries, and K stores BF16
 rows and FP32 tile sums for the shared encoder, which centers K by its global mean.
 Q/K programs run at the 255-register limit. Masked Q/K tiles keep row clamps live
-through the K loop, so they and all V tiles multiply K32 operand slices; full
-Q/K tiles fit with K64 slices, which run them 1-2% faster. The epilogues keep
-per-thread vectors small.
-
-V keeps a 2x2 warp grid. Its epilogue gives each thread 8 consecutive rows of 16
-features, so the transposed stores are coalesced 8-byte writes.
+through the K loop, so they multiply K32 operand slices; full Q/K tiles fit with
+K64 slices, which run them 1-2% faster. V projects its tiles through the shared
+value-tile fragment, then centers them by the projected V mean and scales each K64 tile.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
-# ruff: noqa: ANN001, ANN202, PLR0913, PLR0915, PLR0917
+# ruff: noqa: ANN001, ANN202, PLR0913, PLR0917
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
 
@@ -39,14 +36,11 @@ from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from .._layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 _HEAD_DIM = fragments.HEAD_DIM
-_BLOCK_M = fragments.BLOCK_M
-_NUM_WARPS = fragments.NUM_WARPS
 # The projected V mean is one row per head; its launcher reuses the Triton kernel.
 _MEAN_BLOCK_K = 128
 
 _GL_HEAD_DIM = gl.constexpr(_HEAD_DIM)
-_GL_BLOCK_M = gl.constexpr(_BLOCK_M)
-_GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
+_GL_BLOCK_M = gl.constexpr(fragments.BLOCK_M)
 _GL_TILE_ROWS = gl.constexpr(TILE_ROWS)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
 _GL_SCALE_EPSILON = gl.constexpr(1e-7)
@@ -54,7 +48,6 @@ _GL_INT8_RANGE = gl.constexpr(127.0)
 _GL_P_UINT8_RANGE = gl.constexpr(255.0)
 _GL_LOG2_E = gl.constexpr(1.4426950408889634)
 _GL_FEATURE_LAYOUT = fragments.FEATURE_LAYOUT
-_GL_COPY_ROWS = fragments.COPY_ROWS
 
 # Sequence lengths and offsets vary per call; specializing them would compile one
 # kernel per divisibility class. Storage extents arrive as K64 tile counts, so the
@@ -327,7 +320,6 @@ def _key_kernel(
         heads,
         head,
         row_block,
-        first_row,
         storage_tiles,
         _GL_TILE_ROWS,
         mask_rows,
@@ -370,51 +362,22 @@ def _value_kernel(
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
-    first_row = row_block * _GL_BLOCK_M
-    input_row_start = batch * logical_sequence_length
-    copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, _GL_COPY_ROWS)
-    if mask_rows:
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
-    mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
-        version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
-    )
-    # K32 slices keep every V tile below the register limit, and run full tiles 1-2%
-    # faster than K64 slices.
-    accumulator = fragments.project_int8(
+    projection, sequence, tile_offsets, rows_in_tile, features = fragments.project_value_tiles(
         input_ptr,
+        input_scale_ptr,
         weight_ptr,
-        input_row_start + copy_positions,
-        head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, _GL_COPY_ROWS),
-        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+        weight_scale_ptr,
+        bias_ptr,
+        batch,
+        head,
+        row_block,
+        logical_sequence_length,
         input_features,
-        fragments.K32_SLICE,
+        _GL_TILE_ROWS,
+        mask_rows,
     )
-
-    # [K64 tiles, rows, features]: each thread holds 8 consecutive rows of 16 features.
-    # Per-feature scales, biases, and means then take 16 registers each, row reductions
-    # are mostly in registers, and the transposed stores write 8 contiguous bytes.
     tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
-    layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8, 1], [1, 8, 4], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
-    )
-    tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
     first_tile = row_block * tiles
-    tile_offsets = first_tile + gl.arange(0, tiles, gl.SliceLayout(1, tile_rows_layout))
-    rows_in_tile = gl.arange(0, _GL_TILE_ROWS, gl.SliceLayout(0, tile_rows_layout))
-    sequence = tile_offsets[:, None] * _GL_TILE_ROWS + rows_in_tile[None, :]
-    features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, gl.SliceLayout(1, layout)))
-    positions = sequence
-    if mask_rows:
-        positions = gl.minimum(positions, logical_sequence_length - 1)
-    input_scale = gl.load(input_scale_ptr + input_row_start + positions)
-    weight_scale = gl.load(weight_scale_ptr + head * _GL_HEAD_DIM + features)
-    accumulator = gl.convert_layout(
-        gl.reshape(accumulator, [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]), layout
-    )
-    projection = accumulator.to(gl.float32) * input_scale[:, :, None] * weight_scale[None, None, :]
-    if bias_ptr is not None:
-        bias = gl.load(bias_ptr + head * _GL_HEAD_DIM + features).to(gl.float32)
-        projection += bias[None, None, :]
 
     if mask_block_lengths:
         tile_length = gl.load(
@@ -427,10 +390,12 @@ def _value_kernel(
     tile_row = batch_head * storage_tiles
     if emit_block_mean:
         if mask_rows:
-            valid_count = gl.maximum(gl.sum(valid.to(gl.int32), axis=1), 1)
-            count_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, layout))
             block_sum = gl.sum(gl.where(valid[:, :, None], projection, 0.0), axis=1)
-            block_mean = block_sum / gl.convert_layout(valid_count, count_layout)[:, None]
+            valid_count = gl.convert_layout(
+                gl.maximum(gl.sum(valid.to(gl.int32), axis=1), 1),
+                gl.SliceLayout(1, block_sum.type.layout),
+            )
+            block_mean = block_sum / valid_count[:, None]
         else:
             block_mean = gl.sum(projection, axis=1) / _GL_TILE_ROWS
         fragments.store_summaries(
@@ -451,16 +416,15 @@ def _value_kernel(
     quantized = fragments.round_to_int8(centered / value_scale[:, None, None])
 
     storage_rows = storage_tiles * _GL_TILE_ROWS
-    value_pointers = (
-        value_ptr
-        + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_rows
-        + features[None, None, :].to(gl.int64) * storage_rows
-        + sequence[:, :, None]
+    fragments.store_value_codes(
+        value_ptr + batch_head.to(gl.int64) * _GL_HEAD_DIM * storage_rows,
+        quantized,
+        sequence,
+        features,
+        tile_offsets,
+        storage_tiles,
+        mask_rows,
     )
-    if mask_rows:
-        gl.store(value_pointers, quantized, mask=(tile_offsets < storage_tiles)[:, None, None])
-    else:
-        gl.store(value_pointers, quantized)
     fragments.store_scales(
         value_scale_ptr + tile_row,
         value_scale * _GL_P_UINT8_RANGE,
@@ -468,21 +432,6 @@ def _value_kernel(
         storage_tiles,
         mask_rows,
     )
-
-
-def _launch_rows(sequence_rows: int, launch, *, mask_block_lengths: bool) -> None:
-    """Launch full 128-row tiles, then one masked tile for the remainder.
-
-    Block lengths can end any K64 block early, so they mask every tile. Launch grids put
-    heads on the fastest axis, so the programs that run together share their input rows
-    in L2; grouping several row blocks per head, as the Triton kernels do, measured 1-3%
-    slower.
-    """
-    full_row_blocks = sequence_rows // _BLOCK_M
-    if full_row_blocks:
-        launch(full_row_blocks, 0, mask_rows=mask_block_lengths)
-    if sequence_rows % _BLOCK_M:
-        launch(1, full_row_blocks, mask_rows=True)
 
 
 def project_query(
@@ -541,7 +490,7 @@ def project_query(
                 num_warps=execution_plan.num_warps,
             )
 
-        _launch_rows(chunk_rows, launch, mask_block_lengths=mask_block_lengths)
+        fragments.launch_row_blocks(chunk_rows, launch, mask_full_tiles=mask_block_lengths)
 
 
 def project_key(
@@ -601,7 +550,7 @@ def project_key(
                 num_warps=execution_plan.num_warps,
             )
 
-        _launch_rows(sequence_length, launch, mask_block_lengths=mask_block_lengths)
+        fragments.launch_row_blocks(sequence_length, launch, mask_full_tiles=mask_block_lengths)
         # Zeroed internal padding stays in the logical denominator, as in the shared path.
         centered_projection.finalize_mean(partials, sequence_length, out=mean)
         qk_quantization.prepare_key(
@@ -671,4 +620,6 @@ def project_value(
             block_k=_MEAN_BLOCK_K,
             num_warps=execution_plan.num_warps,
         )
-        _launch_rows(input_qdata.shape[1], launch, mask_block_lengths=mask_block_lengths)
+        fragments.launch_row_blocks(
+            input_qdata.shape[1], launch, mask_full_tiles=mask_block_lengths
+        )
