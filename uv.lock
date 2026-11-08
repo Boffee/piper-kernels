@@ -647,7 +647,7 @@ wheels = [
 
 [[package]]
 name = "piper-kernels"
-version = "0.8.0rc2"
+version = "0.8.0rc3"
 source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },

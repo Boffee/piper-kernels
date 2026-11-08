@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.8.0rc3] - 2026-11-07
+
 ### Changed
 
 - Breaking: `SparsePiperAttention` partitions keys with a required
@@ -22,6 +24,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   INT8, NVFP4, and ConvRot NVFP4 projection/output fusions accept any layout; a
   coarse branch now fuses only when its scope covers every complete key block, as
   the default scope does.
+
+- Breaking: `piper_kernels.fusions.residual_updates.triton` is removed. Its residual-add
+  epilogue (`ResidualAdd`, `ReusableUpdate`, `apply_residual_add`, and
+  `validate_residual_add`) is now internal, and `ResidualAddLayout` is gone. Built-in
+  operators and `residual_updates_compile_options()` are unchanged.
 
 - On NVIDIA SM120, fused FP16/BF16 ConvRot INT8 dense/sparse attention output
   projections and GELU/SwiGLU FFN down projections add gated residuals in the GEMM
@@ -995,7 +1002,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc2...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc3...HEAD
+[0.8.0rc3]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc2...v0.8.0rc3
 [0.8.0rc2]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc1...v0.8.0rc2
 [0.8.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.7.10...v0.8.0rc1
 [0.7.10]: https://github.com/Boffee/piper-kernels/compare/v0.7.9...v0.7.10
