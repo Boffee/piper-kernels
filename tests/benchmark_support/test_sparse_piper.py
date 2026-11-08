@@ -110,6 +110,11 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         -127, 128, (2, kv_heads, head_dim, 256), dtype=torch.int8, generator=generator
     )
     mean = torch.randn((2, kv_heads, head_dim), generator=generator)
+    # Routes cover the complete blocks: all four padded blocks, or the first three of
+    # the 193-row compact sequence, whose one-row final tile is read after them.
+    dense_routes = [2, 3] if internal_padding else [2]
+    head_routes = ([1, *dense_routes], [0, 1, *dense_routes])
+    counts = [len(routes) for routes in head_routes]
     context = _PreparedSparsePiperContext(
         key=torch.zeros((2, kv_heads, 256, head_dim), dtype=torch.int8),
         value=reference_value_storage(value, value_format),
@@ -117,18 +122,19 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         key_scale=torch.ones((2, kv_heads, 4)),
         value_scale_multiplier=torch.full((2, kv_heads, 4, 1), 255.0),
         value_mean=mean,
-        route_head_offsets=torch.tensor([0, 1, 3], dtype=torch.int32),
-        head_keep_blocks=torch.tensor([1, 2], dtype=torch.int32),
-        routes_per_query=3,
+        route_head_offsets=torch.tensor([0, counts[0], sum(counts)], dtype=torch.int32),
+        head_keep_blocks=torch.tensor(counts, dtype=torch.int32),
+        routes_per_query=sum(counts),
         block_lengths=torch.tensor(lengths, dtype=torch.int32) if internal_padding else None,
-        num_routed_key_blocks=2,
         sparse_query_blocks=2,
         logical_sequence_length=256 if internal_padding else 193,
     )
     query = _PreparedSparsePiperQuery(
         data=torch.zeros((2, 2, (4 - global_offset) * 64, head_dim), dtype=torch.int8),
         scale=torch.ones((2, 2, (4 - global_offset) * 2)),
-        routes=torch.tensor([1, 1, 0], dtype=torch.uint16).repeat(2, 4 - global_offset, 1),
+        routes=torch.tensor([*head_routes[0], *head_routes[1]], dtype=torch.uint16).repeat(
+            2, 4 - global_offset, 1
+        ),
         global_block_offset=global_offset,
     )
     prepared = _PreparedSparsePiperAttention(Mock(context=context), query)

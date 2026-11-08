@@ -1,4 +1,4 @@
-"""Shared sparse-prefix/dense-suffix traversal for Gluon attention kernels."""
+"""Shared traversal of routed blocks, then the dense suffix, for Gluon attention kernels."""
 
 # Gluon device parameters are not Python runtime values.
 # ruff: noqa: ANN001, ANN201

@@ -276,8 +276,8 @@ code at rounding boundaries.
 Sparse integrations carry the opaque key layout through every fused operator and
 additionally recognize compatible coarse branches and padded storage. A coarse
 branch fuses only when its scope covers every complete key block, as the default
-scope does, because routing shares its block scores and the compiler does not read
-the layout. Exact matchers live beside the helper in each package. Do not infer
+scope does, because routing scores those blocks with the coarse branch's scores.
+Exact matchers live beside the helper in each package. Do not infer
 fusion eligibility from the standalone attention API alone.
 
 ### Update a residual stream in place

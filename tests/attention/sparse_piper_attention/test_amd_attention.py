@@ -4,7 +4,7 @@ import pytest
 import torch
 from lib.sparse_piper import reference_prepared_query, reference_value_storage
 
-from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
+from piper_kernels import SparsePiperKeyLayout
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
@@ -47,10 +47,11 @@ def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
         torch.randn((2, sequence, 2, head_dim), dtype=dtype, device="cuda", generator=generator)
         for _ in range(3)
     ]
-    blocks = max(1, sequence // 64 - 1)
+    # Routes cover every complete block; a trailing dense block is routed too.
+    blocks = sequence // 64
     layout = resolve_route_layout(
         _normalize_head_keep_ratios((0.5, 1.0)),
-        SparsePiperKeyLayout((SparsePiperKeyRegion(blocks),)),
+        SparsePiperKeyLayout.prefix(max(1, blocks - 1), blocks),
         q.device,
     )
     routes = packed_routes_from_sequences(
@@ -60,7 +61,6 @@ def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
     prepared = backend.prepare(
         q.transpose(1, 2),
         head_dim**-0.5,
-        num_routed_key_blocks=blocks,
         combined_key=k.transpose(1, 2),
         combined_value=v.transpose(1, 2),
     ).with_routes(
@@ -69,9 +69,7 @@ def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
         routes.route_head_offsets,
         bind=backend.bind_context,
     )
-    expected = reference_sparse_piper_attention(
-        q, k, v, routes, num_routed_key_blocks=blocks, scale=head_dim**-0.5
-    )
+    expected = reference_sparse_piper_attention(q, k, v, routes, scale=head_dim**-0.5)
     storage = torch.full((q.numel() + 16,), -123, device=q.device, dtype=q.dtype)
     actual = storage[8:-8].view(q.shape)
     prepared.launch(prepared.query, actual.transpose(1, 2))
@@ -114,7 +112,6 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
         torch.randn((1, heads, head_dim), device="cuda", generator=generator),
         torch.tensor(keep, device="cuda", dtype=torch.int32),
         torch.tensor([0, 391, 781, 782], device="cuda", dtype=torch.int32),
-        num_routed_key_blocks=sequence // 64,
         routes_per_query=sum(keep),
         logical_sequence_length=sequence,
         value_format=ValueFormat.AMD_WMMA,

@@ -225,11 +225,8 @@ def _run_sparse_piper_attention(
 ) -> torch.Tensor:
     """Execute validated sparse routing outside Dynamo tracing."""
     backend = _backend.select_attention_backend(query)
-    num_routed_key_blocks = layout.num_key_blocks
-    routed_key_rows = num_routed_key_blocks * _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
-    routed_key = key_head_major[:, :, :routed_key_rows]
     validate_routing_mode(routing_mode)
     force_tile_mask = None
     if force_tile_ids is not None and not layout.keeps_all_blocks:
@@ -247,7 +244,7 @@ def _run_sparse_piper_attention(
     if not fuse_summaries:
         routes = packed_routes_from_sequences(
             query_head_major,
-            routed_key,
+            key_head_major,
             layout,
             routing_mode,
             block_lengths,
@@ -260,7 +257,6 @@ def _run_sparse_piper_attention(
                 key,
                 value,
                 routes,
-                num_routed_key_blocks=num_routed_key_blocks,
                 scale=scale,
                 block_lengths=block_lengths,
                 sparse_query_blocks=sparse_query_blocks,
@@ -270,7 +266,6 @@ def _run_sparse_piper_attention(
         prepared = backend.prepare(
             query_head_major,
             scale,
-            num_routed_key_blocks=num_routed_key_blocks,
             combined_key=key_head_major,
             combined_value=value_head_major,
             block_lengths=block_lengths,
@@ -286,7 +281,6 @@ def _run_sparse_piper_attention(
         operands = backend.prepare(
             query_head_major,
             scale,
-            num_routed_key_blocks=num_routed_key_blocks,
             combined_key=key_head_major,
             combined_value=value.transpose(1, 2),
             block_lengths=block_lengths,

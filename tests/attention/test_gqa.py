@@ -173,7 +173,6 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
     prepared = backend.prepare(
         query,
         scale,
-        num_routed_key_blocks=4,
         combined_key=key,
         combined_value=value,
     ).with_routes(

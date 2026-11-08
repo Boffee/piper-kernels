@@ -14,7 +14,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     ValueFormat,
 )
 
-from ._block_layout import validate_sparse_query_blocks
+from ._block_layout import compute_num_routed_key_blocks, validate_sparse_query_blocks
 
 if TYPE_CHECKING:
     from ._interfaces import BindAttention, LaunchAttention
@@ -44,9 +44,13 @@ class _PreparedSparsePiperContext:
     head_keep_blocks: torch.Tensor
     routes_per_query: int
     block_lengths: torch.Tensor | None
-    num_routed_key_blocks: int
     sparse_query_blocks: int | None
     logical_sequence_length: int
+
+    @property
+    def num_routed_key_blocks(self) -> int:
+        """Complete K64 key blocks, which routes cover; a compact partial tile follows."""
+        return compute_num_routed_key_blocks(self.logical_sequence_length, self.block_lengths)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +82,7 @@ class _PreparedSparsePiperOperands:
 
     ``query_summary``/``key_summary``/``key_aux`` are the min/max routing
     summaries, present only when preparation was asked to emit them.
-    Key summaries cover only the sparse prefix; query summaries cover all blocks.
+    Key summaries cover the routed blocks; query summaries cover all blocks.
     """
 
     key: torch.Tensor
@@ -90,12 +94,16 @@ class _PreparedSparsePiperOperands:
     query: torch.Tensor
     query_scale: torch.Tensor
     block_lengths: torch.Tensor | None
-    num_routed_key_blocks: int
     sparse_query_blocks: int | None
     logical_sequence_length: int
     query_summary: torch.Tensor | None = None
     key_summary: torch.Tensor | None = None
     key_aux: torch.Tensor | None = None
+
+    @property
+    def num_routed_key_blocks(self) -> int:
+        """Complete K64 key blocks, which routes cover; a compact partial tile follows."""
+        return compute_num_routed_key_blocks(self.logical_sequence_length, self.block_lengths)
 
     def with_routes(
         self,
@@ -117,7 +125,6 @@ class _PreparedSparsePiperOperands:
             head_keep_blocks=head_keep_blocks,
             routes_per_query=routes.shape[2],
             block_lengths=self.block_lengths,
-            num_routed_key_blocks=self.num_routed_key_blocks,
             sparse_query_blocks=self.sparse_query_blocks,
             logical_sequence_length=self.logical_sequence_length,
         )
@@ -137,7 +144,6 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     route_head_offsets: torch.Tensor,
     *,
     value_format: ValueFormat,
-    num_routed_key_blocks: int,
     routes_per_query: int,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None = None,
@@ -206,8 +212,6 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         raise ValueError("quantized sparse Piper operands must share a device")
     if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
-    if not 1 <= num_routed_key_blocks <= tile_count:
-        raise ValueError("quantized sparse Piper prefix must fit the K64 tile count")
     total_query_blocks = (
         tile_count
         if block_lengths is not None
@@ -245,7 +249,6 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         head_keep_blocks=head_keep_blocks,
         routes_per_query=routes_per_query,
         block_lengths=block_lengths,
-        num_routed_key_blocks=num_routed_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
     )

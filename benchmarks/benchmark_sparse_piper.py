@@ -156,12 +156,10 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     layout = resolve_route_layout(
         _normalize_head_keep_ratios([ratio] * args.heads), key_layout, device
     )
-    # Routed blocks; later keys form the attention kernels' dense suffix.
-    blocks = layout.num_key_blocks
     route_call = partial(
         packed_routes_from_sequences,
         query.transpose(1, 2),
-        key.transpose(1, 2)[:, :, : blocks * 64],
+        key.transpose(1, 2),
         layout,
         routing_mode_from_name(args.routing),
         skip_dense_routing=backend.skip_dense_routing,
@@ -175,7 +173,6 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
         state = backend.prepare(
             query.transpose(1, 2),
             args.head_dim**-0.5,
-            num_routed_key_blocks=blocks,
             combined_key=key.transpose(1, 2),
             combined_value=value.transpose(1, 2),
         ).with_routes(
@@ -205,7 +202,6 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
             key,
             value,
             routes,
-            num_routed_key_blocks=blocks,
             scale=args.head_dim**-0.5,
         )
 
@@ -231,9 +227,7 @@ def _benchmark(args: argparse.Namespace, sequence: int, ratio: float) -> None:
     preparation = synchronized_wall_benchmark(
         prepare_execution, 60, args.rep_ms, synchronize=torch.cuda.synchronize
     )
-    selected_blocks = [
-        count + sequence // 64 - blocks for count in routes.head_keep_blocks.cpu().tolist()
-    ]
+    selected_blocks = routes.head_keep_blocks.cpu().tolist()
     operations = useful_integer_operations(sequence, selected_blocks, args.batch, args.head_dim)
     # Measure real public-call memory with no extra prepared benchmark state or
     # output retained. This matters at 100k tokens on a 16-GB accelerator.

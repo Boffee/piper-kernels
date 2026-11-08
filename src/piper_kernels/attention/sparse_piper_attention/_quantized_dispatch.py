@@ -82,7 +82,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     query block. Build their membership once here; Q windows take row views.
     The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``,
     which keep the blocks they keep when every profile head runs together.
-    A fused coarse branch must cover at least the layout's routed key blocks.
+    A fused coarse branch must cover every complete key block, which routing scores.
     """
     backend = _backend.require_attention_backend(key)
     layout = resolve_route_layout(
@@ -92,18 +92,17 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         start_head=start_head,
         end_head=end_head,
     )
-    num_routed_key_blocks = layout.num_key_blocks
     validate_routing_mode(routing_mode)
     pooled_value = None
     if block_mean is None:
         if coarse_scale is not None or coarse_key_blocks is not None:
             raise ValueError("coarse output metadata requires block means")
-        route_key_blocks = num_routed_key_blocks
+        route_key_blocks = layout.num_key_blocks
     else:
         if coarse_scale is None:
             raise ValueError("coarse output requires a scale")
         route_key_blocks = _resolve_coarse_key_blocks(
-            num_routed_key_blocks,
+            layout.num_key_blocks,
             coarse_key_blocks,
             available_coarse_key_blocks=block_mean.shape[2],
         )
@@ -117,7 +116,6 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         layout.head_keep_blocks,
         layout.route_head_offsets,
         value_format=backend.value_format,
-        num_routed_key_blocks=num_routed_key_blocks,
         routes_per_query=(
             0 if backend.skip_dense_routing and layout.keeps_all_blocks else layout.routes_per_query
         ),

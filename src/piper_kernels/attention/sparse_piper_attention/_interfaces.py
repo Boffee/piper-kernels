@@ -20,7 +20,6 @@ class PrepareOperands(Protocol):
         query: torch.Tensor,
         scale: float,
         *,
-        num_routed_key_blocks: int,
         combined_key: torch.Tensor,
         combined_value: torch.Tensor,
         block_lengths: torch.Tensor | None = None,

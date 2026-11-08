@@ -37,6 +37,19 @@ def validate_block_lengths(
     return block_lengths.numel()
 
 
+def compute_num_routed_key_blocks(
+    logical_sequence_length: int, block_lengths: torch.Tensor | None
+) -> int:
+    """Return the complete K64 key blocks, which routes cover.
+
+    Padded storage holds only complete physical blocks. Compact storage ends with
+    at most one partial tile, which attention reads after the routes.
+    """
+    if block_lengths is not None:
+        return block_lengths.numel()
+    return logical_sequence_length // TILE_ROWS
+
+
 def valid_block_rows(block_lengths: torch.Tensor) -> torch.Tensor:
     """Return the valid-prefix mask ``[blocks, 64]`` described by lengths."""
     return torch.arange(TILE_ROWS, device=block_lengths.device)[None, :] < block_lengths[:, None]

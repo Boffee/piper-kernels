@@ -42,7 +42,6 @@ def _prepared(sequence, ratios, *, block_lengths=None, sparse_query_blocks=None)
     prepared = backend.prepare(
         query,
         64**-0.5,
-        num_routed_key_blocks=blocks,
         combined_key=key,
         combined_value=value,
         block_lengths=block_lengths,

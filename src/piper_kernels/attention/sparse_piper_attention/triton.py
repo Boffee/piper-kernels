@@ -19,7 +19,11 @@ from piper_kernels.attention.kernels.sparse_piper import (
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, ValueFormat
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
-from ._block_layout import valid_block_rows, validate_sparse_query_blocks
+from ._block_layout import (
+    compute_num_routed_key_blocks,
+    valid_block_rows,
+    validate_sparse_query_blocks,
+)
 from ._prepared import _PreparedSparsePiperOperands
 
 _BLOCK_N = 64
@@ -264,8 +268,8 @@ def _quantize_key_with_summary_kernel(
     )
     head_block = (batch * heads + head).to(tl.int64)
 
-    # Only the sparse prefix needs routing summaries; the dense suffix still
-    # needs quantization, but every query attends to it without routing.
+    # Only routed blocks need routing summaries; a compact partial tile still needs
+    # quantization, but every query attends to it without a route.
     if key_block < num_routed_key_blocks:
         summary, auxiliary = sparse_piper_kernels.summarize_block_tiles(
             tl.reshape(values, (1, 1, block_n, head_dim)),
@@ -394,7 +398,6 @@ def _prepare_sparse_piper_operands(
     query: torch.Tensor,
     scale: float,
     *,
-    num_routed_key_blocks: int,
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
@@ -413,9 +416,8 @@ def _prepare_sparse_piper_operands(
         or combined_key.shape[1] < 1
         or query.shape[1] % combined_key.shape[1]
         or combined_value.shape != combined_key.shape
-        or not 1 <= num_routed_key_blocks <= query.shape[2] // _BLOCK_N
     ):
-        raise ValueError("combined Q/K/V and the sparse-prefix K64 count must agree")
+        raise ValueError("combined Q/K/V shapes must agree")
     if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
@@ -455,7 +457,9 @@ def _prepare_sparse_piper_operands(
             key_mean,
             scale,
             storage_sequence_length=storage_sequence_length,
-            num_routed_key_blocks=num_routed_key_blocks,
+            num_routed_key_blocks=compute_num_routed_key_blocks(
+                logical_sequence_length, block_lengths
+            ),
             block_lengths=block_lengths,
         )
     else:
@@ -507,7 +511,6 @@ def _prepare_sparse_piper_operands(
         query=prepared_qk.query,
         query_scale=prepared_qk.query_scale,
         block_lengths=block_lengths,
-        num_routed_key_blocks=num_routed_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         logical_sequence_length=logical_sequence_length,
         query_summary=query_summary,

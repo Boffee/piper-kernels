@@ -133,9 +133,13 @@ def packed_routes_from_sequences(
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
 ) -> PackedRoutes:
-    """Select routes for compact or valid-front padded Q and the layout's routed K."""
-    if key.ndim == 4 and key.shape[2] != layout.num_key_blocks * _BLOCK_ROWS:
-        raise ValueError("sparse routing keys must cover exactly the routed K64 blocks")
+    """Select routes for compact or valid-front padded Q/K sequences.
+
+    Routes cover the layout's complete key blocks; a compact partial tail takes none.
+    """
+    key = key[:, :, : layout.num_key_blocks * _BLOCK_ROWS]
+    if key.shape[2] != layout.num_key_blocks * _BLOCK_ROWS:
+        raise ValueError("sparse routing keys must contain the layout's complete K64 blocks")
     if layout.keeps_all_blocks:
         validate_routing_mode(routing_mode)
         _validate_sequences(query, key, block_lengths)

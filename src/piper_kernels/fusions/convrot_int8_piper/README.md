@@ -118,6 +118,6 @@ attention, and routing-score buffers then halve with the heads, at a small speed
 Sparse calls carry their opaque key layout through the projection, output, and
 residual operators. A head slice resolves each region's budgets across the full
 profile before taking its heads, so it keeps the blocks those heads keep when every
-head runs together. A fused coarse branch shares its block scores with routing, so
-the pass fuses one only when its scope covers every complete key block; layout
-contents stay opaque to the compiler.
+head runs together. Routing covers every complete key block and shares a fused
+coarse branch's block scores, so the pass fuses a coarse branch only when its scope
+covers those blocks.

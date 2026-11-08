@@ -465,7 +465,6 @@ def test_dense_orchestration_uses_selected_operations(
     assert operands.with_routes.call_args.args[0].shape[-1] == route_count
     assert prepare.call_args.kwargs["combined_key"].data_ptr() == key.data_ptr()
     assert prepare.call_args.kwargs["combined_value"].data_ptr() == value.data_ptr()
-    assert prepare.call_args.kwargs["num_routed_key_blocks"] == 2
     assert prepare.call_args.kwargs.get("emit_summaries", False) is (
         fuse_summaries and keep_ratio < 1.0
     )
@@ -639,7 +638,6 @@ def test_shared_quantized_validation_rejects_cross_device_query():
         arguments["value_mean"],
         torch.ones(1, dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
-        num_routed_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=1,
         logical_sequence_length=128,
@@ -663,7 +661,6 @@ def test_prepared_query_must_match_context_head_width():
         arguments["value_mean"],
         torch.ones(1, dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
-        num_routed_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=1,
         logical_sequence_length=128,
@@ -781,7 +778,6 @@ def _prepared_attention(head_dim, routes_per_query):
         arguments["value_mean"],
         torch.tensor([2], dtype=torch.int32),
         torch.tensor([0, 2], dtype=torch.int32),
-        num_routed_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=routes_per_query,
         logical_sequence_length=128,

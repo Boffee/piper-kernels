@@ -2,7 +2,7 @@
 
 import torch
 
-from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
+from piper_kernels import SparsePiperKeyLayout
 from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
 from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import (
@@ -29,17 +29,14 @@ def _inputs() -> tuple[
     query = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
     key = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
     value = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
-    # Reference attention routes the first two blocks and reads the third densely.
     layout = resolve_route_layout(
         _normalize_head_keep_ratios((0.5, 1.0)),
-        SparsePiperKeyLayout((SparsePiperKeyRegion(2),)),
+        SparsePiperKeyLayout.prefix(2, 3),
         torch.device("cpu"),
     )
-    query_sequence = query.transpose(1, 2)
-    sparse_key = key[:, :128].transpose(1, 2)
     routes = packed_routes_from_sequences(
-        query_sequence,
-        sparse_key,
+        query.transpose(1, 2),
+        key.transpose(1, 2),
         layout,
         _MINMAX_ROUTING,
     )
@@ -54,7 +51,6 @@ def test_quantized_reference_stays_within_the_selected_exact_quality_gate() -> N
         key,
         value,
         routes,
-        num_routed_key_blocks=2,
         scale=128**-0.5,
     )
     exact = reference_exact_sparse_attention(
@@ -62,7 +58,6 @@ def test_quantized_reference_stays_within_the_selected_exact_quality_gate() -> N
         key,
         value,
         routes,
-        num_routed_key_blocks=2,
         scale=128**-0.5,
     )
 
@@ -80,7 +75,6 @@ def test_quantized_reference_restores_constant_value_exactly() -> None:
         key,
         value,
         routes,
-        num_routed_key_blocks=2,
         scale=128**-0.5,
     )
 

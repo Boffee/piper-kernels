@@ -136,7 +136,7 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
         layout = resolve_route_layout(_normalize_head_keep_ratios(ratios), key_layout, device)
         routes = packed_routes_from_sequences(
             query,
-            key[:, :, : blocks * 64],
+            key,
             layout,
             routing_mode_from_name("minmax"),
             skip_dense_routing=backend.skip_dense_routing,
@@ -144,7 +144,6 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
         prepared = backend.prepare(
             query,
             case.head_dim**-0.5,
-            num_routed_key_blocks=blocks,
             combined_key=key,
             combined_value=value,
         ).with_routes(

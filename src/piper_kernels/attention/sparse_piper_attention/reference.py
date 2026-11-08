@@ -9,7 +9,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
-from ._block_layout import valid_block_rows
+from ._block_layout import compute_num_routed_key_blocks, valid_block_rows
 from ._routes import PackedRoutes
 
 _RECURRENCE_ROWS = 128
@@ -106,7 +106,6 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     value: torch.Tensor,
     routes: PackedRoutes,
     *,
-    num_routed_key_blocks: int,
     scale: float,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
@@ -120,6 +119,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     """
     batch, sequence, heads, head_dim = query.shape
     query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    num_routed_key_blocks = compute_num_routed_key_blocks(sequence, block_lengths)
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
@@ -246,7 +246,6 @@ def reference_exact_sparse_attention(
     value: torch.Tensor,
     routes: PackedRoutes,
     *,
-    num_routed_key_blocks: int,
     scale: float,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
@@ -254,6 +253,7 @@ def reference_exact_sparse_attention(
     """Apply the same routes with exact BF16 inputs and FP32 attention math."""
     batch, sequence, heads, _head_dim = query.shape
     query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    num_routed_key_blocks = compute_num_routed_key_blocks(sequence, block_lengths)
     output = torch.empty_like(query)
     route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 

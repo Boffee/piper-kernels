@@ -287,7 +287,6 @@ def _constant_context(batch, heads, sequence, head_dim=128):
         torch.zeros((batch, heads, head_dim), device="cuda"),
         torch.ones(heads, dtype=torch.int32, device="cuda"),
         torch.arange(heads + 1, dtype=torch.int32, device="cuda"),
-        num_routed_key_blocks=storage // 64,
         routes_per_query=heads,
         value_format=ValueFormat.AMD_WMMA,
         logical_sequence_length=sequence,

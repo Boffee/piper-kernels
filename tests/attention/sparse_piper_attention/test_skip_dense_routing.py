@@ -70,7 +70,6 @@ def test_skip_dense_routing_matches_portable_reference(head_dim):
             reference_sparse_piper_attention(
                 *operands,
                 routes,
-                num_routed_key_blocks=3,
                 scale=head_dim**-0.5,
             )
         )

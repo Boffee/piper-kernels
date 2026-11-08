@@ -83,7 +83,6 @@ def _prepare(
     prepared = backend.prepare(
         head_major[0],
         head_dim**-0.5,
-        num_routed_key_blocks=blocks,
         combined_key=head_major[1],
         combined_value=head_major[2],
         block_lengths=block_lengths,
@@ -483,7 +482,6 @@ def test_last_head_addresses_beyond_signed_32_bit_offsets(head_dim):
         torch.zeros((1, kv_heads, head_dim), device="cuda"),
         torch.ones(kv_heads, device="cuda", dtype=torch.int32),
         torch.arange(kv_heads + 1, device="cuda", dtype=torch.int32),
-        num_routed_key_blocks=tiles,
         routes_per_query=kv_heads,
         logical_sequence_length=storage,
         value_format=ValueFormat.TRANSPOSED,
