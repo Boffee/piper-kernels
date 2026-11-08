@@ -93,7 +93,6 @@ def _sparse_piper_attention_kernel(
     mask_ragged_tail: gl.constexpr,
     has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
-    ragged_tail_is_routed: gl.constexpr,
     block_m: gl.constexpr,
     mma_warps: gl.constexpr,
     skip_dense_routing: gl.constexpr,
@@ -262,7 +261,7 @@ def _sparse_piper_attention_kernel(
             key_layout,
             probability_layout,
             mask_block_lengths,
-            mask_ragged_tail and ragged_tail_is_routed,
+            False,
             False,
         )
 
@@ -499,7 +498,6 @@ class _ContextLauncher:
                 launch.mask_ragged_tail,
                 launch.has_dense_query_suffix,
                 launch.apply_coarse_residual,
-                launch.ragged_tail_is_routed,
                 block_m,
                 num_warps,
                 launch.skip_dense_routing,

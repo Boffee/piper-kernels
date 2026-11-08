@@ -138,8 +138,8 @@ def _padded_arguments(
             coarse_gate,
             *attention_arguments[10:],
             coarse_scale,
-            block_lengths,
             coarse_key_blocks,
+            block_lengths,
             sparse_query_blocks,
         )
     else:
@@ -374,9 +374,7 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         coarse_gate,
         *attention_arguments[10:],
         coarse_scale,
-        None,
         coarse_key_blocks,
-        None,
     )
     output_weight, output_scale, output_bias, output_group_size = output_arguments
     expected = linear_backend.require_linear_backend(materialized_attention).linear(

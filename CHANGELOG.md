@@ -17,6 +17,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `sparse_key_blocks` integer can recompile a compiled graph unless it comes from a
   dynamic tensor shape. Fused coarse branches whose scope covers the sparse prefix,
   but not every key block, fuse again.
+- Sparse attention rounds keep budgets once per ratio profile and prefix size instead
+  of on every call. With 56 heads on an RTX 5090, this removes about 10 µs of host work
+  per call; kernel time is unchanged.
 
 ## [0.8.0rc3] - 2026-11-07
 

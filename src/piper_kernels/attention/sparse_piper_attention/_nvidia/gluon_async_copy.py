@@ -139,7 +139,6 @@ def _sparse_piper_attention_kernel(
     mask_ragged_tail: gl.constexpr,
     has_dense_query_suffix: gl.constexpr,
     apply_coarse_residual: gl.constexpr,
-    ragged_tail_is_routed: gl.constexpr,
     skip_dense_routing: gl.constexpr,
     mask_output_tail: gl.constexpr,
     output_sequence_length,
@@ -306,7 +305,7 @@ def _sparse_piper_attention_kernel(
             key_layout,
             probability_layout,
             mask_block_lengths,
-            mask_ragged_tail and ragged_tail_is_routed,
+            False,
             False,
         )
         next_n_0, next_n_1 = pair_tile_offsets(
@@ -503,7 +502,6 @@ class _ContextLauncher:
                 launch.mask_ragged_tail,
                 launch.has_dense_query_suffix,
                 launch.apply_coarse_residual,
-                launch.ragged_tail_is_routed,
                 launch.skip_dense_routing,
                 # Only a ragged final Q64 tile needs masked stores. Padded storage keeps
                 # writing every row, exactly as SM120 does at Q64.

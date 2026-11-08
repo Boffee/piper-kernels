@@ -381,8 +381,8 @@ def build_quantized_attention_output_graph(
                     192,
                     _MINMAX_ROUTING,
                     0.125,
-                    block_lengths,
                     3,
+                    block_lengths,
                     *((2,) if with_sparse_query_blocks else ()),
                 ),
             )

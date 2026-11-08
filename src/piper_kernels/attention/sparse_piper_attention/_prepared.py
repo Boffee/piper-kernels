@@ -206,8 +206,13 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         raise ValueError("quantized sparse Piper operands must share a device")
     if any(tensor.layout is not torch.strided or not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("quantized sparse Piper operands must be contiguous strided tensors")
-    if not 1 <= sparse_key_blocks <= tile_count:
-        raise ValueError("quantized sparse Piper prefix must fit the K64 tile count")
+    # The sparse prefix holds complete blocks, so a compact ragged tile is always
+    # attended after the routes and never routed itself.
+    complete_blocks = (
+        tile_count if block_lengths is not None else logical_sequence_length // TILE_ROWS
+    )
+    if not 1 <= sparse_key_blocks <= complete_blocks:
+        raise ValueError("quantized sparse Piper prefix must fit the complete K64 blocks")
     total_query_blocks = (
         tile_count
         if block_lengths is not None

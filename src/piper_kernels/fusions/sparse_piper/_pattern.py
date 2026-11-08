@@ -171,8 +171,8 @@ def reshaped_quantized_attention_pattern(
             KeywordArg("output_coarse_gate"),
             *policy,
             KeywordArg("output_coarse_scale"),
-            KeywordArg("output_block_lengths") if with_block_lengths else None,
             KeywordArg("output_coarse_key_blocks"),
+            KeywordArg("output_block_lengths") if with_block_lengths else None,
             *(
                 (KeywordArg("output_sparse_query_blocks") if with_sparse_query_blocks else None,)
                 if with_sparse_query_blocks or with_force_tiles

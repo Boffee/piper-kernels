@@ -27,7 +27,7 @@ from ._routing import (
 from ._routing_modes import (
     validate_routing_mode,
 )
-from .coarse import _resolve_coarse_key_blocks
+from .coarse import _validate_coarse_key_blocks
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,13 +93,14 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
             raise ValueError("coarse output metadata requires block means")
         route_key_blocks = sparse_key_blocks
     else:
-        if coarse_scale is None:
-            raise ValueError("coarse output requires a scale")
-        route_key_blocks = _resolve_coarse_key_blocks(
+        if coarse_scale is None or coarse_key_blocks is None:
+            raise ValueError("coarse output requires a scale and a key block scope")
+        _validate_coarse_key_blocks(
             sparse_key_blocks,
             coarse_key_blocks,
             available_coarse_key_blocks=block_mean.shape[2],
         )
+        route_key_blocks = coarse_key_blocks
         pooled_value = block_mean[:, :, :route_key_blocks]
     kernel_context = _prepare_sparse_piper_context_from_quantized(
         key,
@@ -265,8 +266,8 @@ def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR
     logical_sequence_length: int,
     routing_mode: int,
     coarse_scale: float,
+    coarse_key_blocks: int,
     block_lengths: torch.Tensor | None = None,
-    coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
     *,
     force_tile_ids: torch.Tensor | None = None,
@@ -461,8 +462,8 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     logical_sequence_length: int,
     routing_mode: int,
     coarse_scale: float,
+    coarse_key_blocks: int,
     block_lengths: torch.Tensor | None = None,
-    coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
@@ -492,8 +493,8 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         logical_sequence_length,
         routing_mode,
         coarse_scale,
-        block_lengths,
         coarse_key_blocks,
+        block_lengths,
         sparse_query_blocks,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
@@ -560,8 +561,8 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     logical_sequence_length: int,
     _routing_mode: int,
     _coarse_scale: float,
+    _coarse_key_blocks: int,
     _block_lengths: torch.Tensor | None = None,
-    _coarse_key_blocks: int | None = None,
     _sparse_query_blocks: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,

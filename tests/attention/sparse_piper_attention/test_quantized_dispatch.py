@@ -18,7 +18,6 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._prepared import (
-    _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
@@ -44,61 +43,6 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     coarse_attention,
     mean_pool_block_values,
 )
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or select_attention_backend(torch.empty((), device="cuda")) is None,
-    reason="requires a native sparse-attention backend",
-)
-@pytest.mark.parametrize("sequence_length", [129, 193, 257])
-@pytest.mark.parametrize("tail_position", [0, 1, -1])
-def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_length, tail_position):
-    tiles = (sequence_length + 63) // 64
-    storage_length = tiles * 64
-    query = torch.zeros((1, 1, storage_length, 128), device="cuda", dtype=torch.int8)
-    key = torch.zeros_like(query)
-    value = torch.full((1, 1, 128, storage_length), 64, device="cuda", dtype=torch.int8)
-    value[..., sequence_length:] = 0
-    backend = require_attention_backend(key)
-    context = _prepare_sparse_piper_context_from_quantized(
-        key,
-        torch.ones((1, 1, tiles), device="cuda"),
-        reference_value_storage(value, backend.value_format),
-        torch.ones((1, 1, tiles, 1), device="cuda"),
-        torch.zeros((1, 1, 128), device="cuda"),
-        torch.tensor([tiles], device="cuda", dtype=torch.int32),
-        torch.tensor([0, tiles], device="cuda", dtype=torch.int32),
-        sparse_key_blocks=tiles,
-        routes_per_query=tiles,
-        logical_sequence_length=sequence_length,
-        value_format=backend.value_format,
-    )
-    order = list(range(tiles - 1))
-    order.insert(tiles - 1 if tail_position == -1 else tail_position, tiles - 1)
-    routes = (
-        torch.tensor(order, device="cuda", dtype=torch.uint16)[None, None, :]
-        .expand(1, tiles, tiles)
-        .contiguous()
-    )
-    query_state = _prepare_sparse_piper_query_from_quantized(
-        query,
-        torch.ones((1, 1, storage_length // QUERY_SCALE_ROWS), device="cuda"),
-        routes,
-        context,
-    )
-    prepared = _PreparedSparsePiperAttention(backend.bind_context(context), query_state)
-    expected = torch.empty((1, 1, sequence_length, 128), device="cuda", dtype=torch.bfloat16)
-    actual = torch.empty_like(expected)
-    prepared.launch(prepared.query, expected)
-    # Padding is not part of the attention sequence, even when its physical
-    # block occurs in the middle of a caller-supplied sparse route.
-    value[..., sequence_length:] = -128
-    context.value.copy_(reference_value_storage(value, backend.value_format))
-    prepared = _PreparedSparsePiperAttention(backend.bind_context(context), query_state)
-    prepared.launch(prepared.query, actual)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _sequence_block_means(sequence, block_lengths=None):
@@ -387,7 +331,6 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         coarse_gate,
         *fine_arguments[10:],
         coarse_scale,
-        None,
         coarse_key_blocks,
     )
 
@@ -739,8 +682,8 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         coarse_gate,
         *fine_arguments[10:],
         coarse_scale,
-        block_lengths,
         coarse_key_blocks,
+        block_lengths,
         2,
     )
 
