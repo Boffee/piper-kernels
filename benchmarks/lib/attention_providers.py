@@ -331,7 +331,7 @@ def _make_sage_attention_2pp_provider(
             **config.as_dict(),
             "implementation": "pure_triton",
             "algorithm": "sage_attention_2pp",
-            "qk_quantization": select_qk_quantization(target),
+            "qk_quantization": "per_warp" if plan.grouped_qk else "per_thread",
             "pv_accumulation": "fp32+fp16",
             "block_n": int(sage_attention_2pp_backend._BLOCK_N),
             **plan.as_dict(),
