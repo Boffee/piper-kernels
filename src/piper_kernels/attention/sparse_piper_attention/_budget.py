@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
@@ -90,6 +91,29 @@ def _resolve_head_keep_blocks(
     return tuple(head_keep_blocks)
 
 
+# Ratio profiles and prefix sizes are immutable configuration that models reuse on
+# every layer and step, so round each combination once. Each call still stages its
+# own device metadata, as explicit CUDA graph capture requires.
+@lru_cache(maxsize=256)
+def _build_route_layout_values(
+    head_keep_ratio_units: tuple[int, ...],
+    sparse_key_blocks: int,
+    start_head: int,
+    end_head: int | None,
+) -> tuple[int, ...]:
+    """Return per-head keep counts followed by their packed route offsets."""
+    head_keep_block_values = _resolve_head_keep_blocks(
+        head_keep_ratio_units,
+        sparse_key_blocks,
+    )[start_head:end_head]
+    route_head_offset_values = [0]
+    for count in head_keep_block_values:
+        route_head_offset_values.append(route_head_offset_values[-1] + count)
+    if route_head_offset_values[-1] > torch.iinfo(torch.int32).max:
+        raise ValueError("sparse Piper packed routes exceed INT32 offset capacity")
+    return (*head_keep_block_values, *route_head_offset_values)
+
+
 def _resolve_route_layout(
     head_keep_ratio_units: tuple[int, ...],
     sparse_key_blocks: int,
@@ -103,26 +127,19 @@ def _resolve_route_layout(
     Rounding distributes blocks across every profile head, so a range keeps the
     blocks its heads keep when all heads run together.
     """
-    head_keep_block_values = _resolve_head_keep_blocks(
-        head_keep_ratio_units,
-        sparse_key_blocks,
-    )[start_head:end_head]
-    route_head_offset_values = [0]
-    for count in head_keep_block_values:
-        route_head_offset_values.append(route_head_offset_values[-1] + count)
-    if route_head_offset_values[-1] > torch.iinfo(torch.int32).max:
-        raise ValueError("sparse Piper packed routes exceed INT32 offset capacity")
-
+    values = _build_route_layout_values(
+        head_keep_ratio_units, sparse_key_blocks, start_head, end_head
+    )
     # Pinned staging makes the metadata copy legal during CUDA graph capture.
     metadata = torch.tensor(
-        (*head_keep_block_values, *route_head_offset_values),
+        values,
         device="cpu",
         dtype=torch.int32,
         pin_memory=device.type == "cuda",
     ).to(device, non_blocking=True)
-    heads = len(head_keep_block_values)
+    heads = len(values) // 2
     return _ResolvedRouteLayout(
         head_keep_blocks=metadata[:heads],
         route_head_offsets=metadata[heads:],
-        routes_per_query=route_head_offset_values[-1],
+        routes_per_query=values[-1],
     )

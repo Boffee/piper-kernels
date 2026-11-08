@@ -50,7 +50,6 @@ class _ValidatedAttentionLaunch:
     has_dense_query_suffix: bool
     apply_coarse_residual: bool
     skip_dense_routing: bool
-    ragged_tail_is_routed: bool
 
     @property
     def query_rows(self) -> int:
@@ -161,11 +160,8 @@ def validate_attention_launch(
     block_lengths_operand = (
         context.head_keep_blocks if context.block_lengths is None else context.block_lengths
     )
-    # The dense suffix visits a compact ragged tile last. Caller-provided routes
-    # can also place that tile in the sparse prefix, which needs an ordinary-loop mask.
-    ragged_tail_is_routed = (
-        mask_ragged_tail and context.sparse_key_blocks * TILE_ROWS > logical_sequence_length
-    )
+    # The sparse prefix holds complete blocks; the dense suffix visits a compact
+    # ragged tile last.
     return _ValidatedAttentionLaunch(
         batch=batch,
         heads=heads,
@@ -207,5 +203,4 @@ def validate_attention_launch(
         has_dense_query_suffix=has_dense_query_suffix,
         apply_coarse_residual=has_coarse_residual,
         skip_dense_routing=context.routes_per_query == 0,
-        ragged_tail_is_routed=ragged_tail_is_routed,
     )

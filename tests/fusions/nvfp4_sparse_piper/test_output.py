@@ -198,8 +198,8 @@ def _padded_arguments(
             coarse_gate,
             *attention_arguments[10:],
             coarse_scale,
-            block_lengths,
             coarse_key_blocks,
+            block_lengths,
             sparse_query_blocks,
         )
     else:

@@ -503,8 +503,8 @@ def _run_explicit_projected_gate_output(
         model.sequence_length,
         model.sparse_attention._routing_mode,
         model.coarse_scale,
-        block_lengths,
         model.coarse_key_blocks,
+        block_lengths,
         sparse_query_blocks,
         output_dtype=input.dtype,
     )
