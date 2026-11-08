@@ -18,6 +18,9 @@ from piper_kernels.attention.piper_attention._amd import gluon as amd_piper
 from piper_kernels.attention.piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.piper_attention._amd import triton as amd_preparation
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
+from piper_kernels.attention.piper_attention._quantized_dispatch import (
+    qk_quantization_granularity,
+)
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 
@@ -49,15 +52,6 @@ TRITON_PROVIDERS = (PIPER_ATTENTION, SAGE_ATTENTION_2PP)
 
 type AttentionProvider = BenchmarkProvider[object, torch.Tensor]
 type CanonicalSageAttention = Callable[..., torch.Tensor]
-
-
-def qk_quantization_granularity(target: AcceleratorTarget) -> str:
-    """Return the Q/K granularity used by the selected attention backend."""
-    return (
-        "per_warp"
-        if target.is_cuda_capability(12) or amd_policy.supports_target(target)
-        else "per_thread"
-    )
 
 
 def default_provider_names(
