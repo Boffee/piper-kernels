@@ -4,13 +4,14 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _key_layouts import counted_route_layout
 
-from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend
-from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
-from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
+from piper_kernels.attention.sparse_piper_attention._budget import (
+    _normalize_head_keep_ratios,
+    _resolve_route_layout,
+    _ResolvedRouteLayout,
+)
 from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteBuilder,
     _select_portable_routes,
@@ -35,14 +36,30 @@ def route_selector():
     return selector
 
 
-def _expected_routes(scores, layout, *, query_block_offset=0):
+def _layout(counts, device):
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    return _ResolvedRouteLayout(
+        head_keep_blocks=torch.tensor(counts, device=device, dtype=torch.int32),
+        route_head_offsets=torch.tensor(offsets, device=device, dtype=torch.int32),
+        routes_per_query=offsets[-1],
+    )
+
+
+def _expected_routes(scores, counts, *, query_block_offset=0):
+    layout = _layout(counts, "cpu")
     routes = torch.full(
         (scores.shape[0], query_block_offset + scores.shape[2] + 2, layout.routes_per_query),
         0xA5A5,
         dtype=torch.uint16,
     )
     _select_portable_routes(
-        scores.cpu(), routes, layout.regions[0], query_block_offset=query_block_offset
+        scores.cpu(),
+        routes,
+        layout.route_head_offsets.tolist(),
+        counts,
+        query_block_offset=query_block_offset,
     )
     return routes
 
@@ -55,15 +72,20 @@ def test_stable_routes_match_portable_policy(route_selector, key_blocks, strided
     scores = storage[:, :, 1:7:2, :key_blocks]
     if not strided:
         scores = scores.contiguous()
-    layout = counted_route_layout(
-        [1, max(1, key_blocks // 4), max(1, key_blocks - 1), key_blocks], key_blocks, "cuda"
-    )
-    expected = _expected_routes(scores, layout, query_block_offset=2)
-    # Preserve noncontiguous batch/head/query strides and a view of wider key storage.
+    counts = [1, max(1, key_blocks // 4), max(1, key_blocks - 1), key_blocks]
+    expected = _expected_routes(scores, counts, query_block_offset=2)
+    # Preserve noncontiguous batch/head/query strides and a dense key prefix on GPU.
     gpu_storage = storage.cuda()
     gpu_scores = gpu_storage[:, :, 1:7:2, :key_blocks] if strided else scores.cuda()
+    layout = _layout(counts, "cuda")
     actual = torch.full_like(expected, 0xA5A5, device="cuda")
-    route_selector(gpu_scores, actual, layout.selector_metadata, query_block_offset=2)
+    route_selector(
+        gpu_scores,
+        actual,
+        layout.head_keep_blocks,
+        layout.route_head_offsets,
+        query_block_offset=2,
+    )
     # Compare guard rows as well as all retained indices, including key65535.
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
@@ -82,10 +104,17 @@ def test_fp32_ordering_and_ties_across_selector_tiles(route_selector, pattern):
         limit = torch.finfo(torch.float32)
         values = torch.tensor([-limit.max, -limit.tiny, limit.tiny, limit.max])
     scores = values.repeat(513)[:1025].expand(2, 4, 3, -1).contiguous()
-    layout = counted_route_layout([1, 511, 512, 1025], 1025, "cuda")
-    expected = _expected_routes(scores, layout, query_block_offset=1)
+    counts = [1, 511, 512, 1025]
+    expected = _expected_routes(scores, counts, query_block_offset=1)
+    layout = _layout(counts, "cuda")
     actual = torch.full_like(expected, 0xA5A5, device="cuda")
-    route_selector(scores.cuda(), actual, layout.selector_metadata, query_block_offset=1)
+    route_selector(
+        scores.cuda(),
+        actual,
+        layout.head_keep_blocks,
+        layout.route_head_offsets,
+        query_block_offset=1,
+    )
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
@@ -95,12 +124,9 @@ def test_h3_chunk_routes_avoid_host_readback(route_selector, monkeypatch, query_
     scores = torch.randint(
         -32, 33, (1, 56, query_blocks, 1562), device="cuda", generator=generator
     ).float()
-    layout = resolve_route_layout(
-        _normalize_head_keep_ratios((0.25,) * 56),
-        SparsePiperKeyLayout((SparsePiperKeyRegion(1562),)),
-        scores.device,
-    )
-    expected = _expected_routes(scores, layout)[:, :query_blocks]
+    layout = _resolve_route_layout(_normalize_head_keep_ratios((0.25,) * 56), 1562, scores.device)
+    counts = layout.head_keep_blocks.cpu().tolist()
+    expected = _expected_routes(scores, counts)[:, :query_blocks]
     # A selected builder must not take the portable CPU-metadata or per-head-sort path.
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("host readback")))
@@ -111,6 +137,7 @@ def test_h3_chunk_routes_avoid_host_readback(route_selector, monkeypatch, query_
             batch=1,
             heads=56,
             query_blocks=query_blocks,
+            sparse_key_blocks=1562,
             device=scores.device,
         )
         builder.write(scores, query_block_offset=0)
@@ -121,21 +148,33 @@ def test_route_selector_uses_nondefault_stream(route_selector):
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         scores = torch.randn((2, 3, 5, 1562), device="cuda")
-        layout = counted_route_layout([1, 390, 1562], 1562, "cuda")
+        layout = _layout([1, 390, 1562], "cuda")
         actual = torch.empty((2, 5, layout.routes_per_query), device="cuda", dtype=torch.uint16)
-        route_selector(scores, actual, layout.selector_metadata, query_block_offset=0)
+        route_selector(
+            scores,
+            actual,
+            layout.head_keep_blocks,
+            layout.route_head_offsets,
+            query_block_offset=0,
+        )
     torch.cuda.current_stream().wait_stream(stream)
-    expected = _expected_routes(scores, layout)[:, :5]
+    expected = _expected_routes(scores, [1, 390, 1562])[:, :5]
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
 def test_route_selector_graph_replay_uses_updated_scores(route_selector):
     scores = torch.randn((1, 3, 5, 513), device="cuda")
-    layout = counted_route_layout([1, 129, 513], 513, "cuda")
+    layout = _layout([1, 129, 513], "cuda")
     actual = torch.empty((1, 5, layout.routes_per_query), device="cuda", dtype=torch.uint16)
 
     def launch():
-        route_selector(scores, actual, layout.selector_metadata, query_block_offset=0)
+        route_selector(
+            scores,
+            actual,
+            layout.head_keep_blocks,
+            layout.route_head_offsets,
+            query_block_offset=0,
+        )
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -148,5 +187,5 @@ def test_route_selector_graph_replay_uses_updated_scores(route_selector):
     for _ in range(3):
         scores.normal_()
         graph.replay()
-        expected = _expected_routes(scores, layout)[:, :5]
+        expected = _expected_routes(scores, [1, 129, 513])[:, :5]
         torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)

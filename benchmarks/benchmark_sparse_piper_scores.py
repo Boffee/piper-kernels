@@ -2,7 +2,7 @@
 
 Uses the shared lower video case by default. --case selects another attention
 or pipeline workload; custom shape flags are standalone diagnostics.
---query-blocks measures explicit routing chunks. K retains the routed-block view of the padded
+--query-blocks measures explicit routing chunks. K retains the sparse-prefix view of the padded
 sequence allocation. Scores are checked against FP64 before timing. Timings
 include score allocation and the maximum epilogue, but not summary generation
 or route selection. These are FP32 operations, not INT8 TOPS.

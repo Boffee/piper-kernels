@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._key_layout import SparsePiperKeyLayout
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.sparse_piper import _output as output_common
@@ -68,7 +67,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     ratio_profile: _SparsePiperRatioProfile,
-    key_layout: SparsePiperKeyLayout,
+    sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
     weight_qdata: torch.Tensor,
@@ -131,7 +130,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         value_scale_multiplier,
         value_mean,
         ratio_profile,
-        key_layout,
+        sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
         weight_qdata,
@@ -156,7 +155,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
 
 
 @_projected_query_attention_output_op.register_fake
-def _projected_query_attention_output_op_fake(  # noqa: PLR0913
+def _projected_query_attention_output_op_fake(
     _query_input_qdata: torch.Tensor,
     _query_input_scale: torch.Tensor,
     _query_input_per_tensor_scale: torch.Tensor,
@@ -177,7 +176,7 @@ def _projected_query_attention_output_op_fake(  # noqa: PLR0913
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
     _ratio_profile: _SparsePiperRatioProfile,
-    key_layout: SparsePiperKeyLayout,
+    _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,
     weight_qdata: torch.Tensor,
@@ -219,7 +218,6 @@ def _projected_query_attention_output_op_fake(  # noqa: PLR0913
         key,
         logical_sequence_length,
         block_lengths,
-        key_layout=key_layout,
         output_dtype=output_dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
@@ -246,7 +244,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     ratio_profile: _SparsePiperRatioProfile,
-    key_layout: SparsePiperKeyLayout,
+    sparse_key_blocks: int,
     logical_sequence_length: int,
     routing_mode: int,
     weight_qdata: torch.Tensor,
@@ -300,7 +298,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         value_scale_multiplier,
         value_mean,
         ratio_profile,
-        key_layout,
+        sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
         weight_qdata,
@@ -325,7 +323,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
 
 
 @_attention_output_op.register_fake
-def _attention_output_op_fake(  # noqa: PLR0913
+def _attention_output_op_fake(
     query: torch.Tensor,
     _query_scale: torch.Tensor,
     _query_summary: torch.Tensor,
@@ -337,7 +335,7 @@ def _attention_output_op_fake(  # noqa: PLR0913
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
     _ratio_profile: _SparsePiperRatioProfile,
-    key_layout: SparsePiperKeyLayout,
+    _sparse_key_blocks: int,
     logical_sequence_length: int,
     _routing_mode: int,
     weight_qdata: torch.Tensor,
@@ -379,7 +377,6 @@ def _attention_output_op_fake(  # noqa: PLR0913
         query,
         logical_sequence_length,
         block_lengths,
-        key_layout=key_layout,
         output_dtype=output_dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,

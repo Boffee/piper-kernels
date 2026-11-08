@@ -5,11 +5,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend
-from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
-from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
+from piper_kernels.attention.sparse_piper_attention._budget import (
+    _normalize_head_keep_ratios,
+    _resolve_route_layout,
+)
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_summaries,
     routing_scores,
@@ -32,7 +33,7 @@ def generator():
 @pytest.fixture
 def summaries(generator):
     def make(rows, keys, *, heads=3, kv_heads=None):
-        # Dense features, strided query rows and views of padded key storage.
+        # Dense features, strided query rows and padded key-prefix views.
         query = torch.randn((2, heads, rows * 2, 136), device="cuda", generator=generator)
         primary = torch.randn(
             (2, heads if kv_heads is None else kv_heads, keys + 3, 144),
@@ -109,10 +110,8 @@ def test_large_query_routes_preserve_exact_ties_across_chunks(summaries, monkeyp
     auxiliary[:, :, 64] = auxiliary[:, :, 63]
     query[:, :, [0, 383, 384]] = 0
     counts = (1, 129, 513)
-    layout = resolve_route_layout(
-        _normalize_head_keep_ratios(tuple(count / 513 for count in counts)),
-        SparsePiperKeyLayout((SparsePiperKeyRegion(513),)),
-        query.device,
+    layout = _resolve_route_layout(
+        _normalize_head_keep_ratios(tuple(count / 513 for count in counts)), 513, query.device
     )
     expected_scores = _fp64_scores(query, primary, auxiliary).cpu()
     expected_routes = torch.cat(

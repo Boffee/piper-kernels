@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-from _key_layouts import sparse_layout, sparse_then_dense
 from lib.sparse_piper import reference_value_storage
 
 from piper_kernels import SparsePiperAttention
@@ -14,9 +13,12 @@ from piper_kernels.attention.sparse_piper_attention._backend import (
     require_attention_backend,
     select_attention_backend,
 )
-from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
-from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
+from piper_kernels.attention.sparse_piper_attention._budget import (
+    _normalize_head_keep_ratios,
+    _resolve_route_layout,
+)
 from piper_kernels.attention.sparse_piper_attention._prepared import (
+    _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
@@ -42,6 +44,61 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     coarse_attention,
     mean_pool_block_values,
 )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
+)
+@pytest.mark.parametrize("sequence_length", [129, 193, 257])
+@pytest.mark.parametrize("tail_position", [0, 1, -1])
+def test_routed_ragged_tile_ignores_padding_at_every_route_position(sequence_length, tail_position):
+    tiles = (sequence_length + 63) // 64
+    storage_length = tiles * 64
+    query = torch.zeros((1, 1, storage_length, 128), device="cuda", dtype=torch.int8)
+    key = torch.zeros_like(query)
+    value = torch.full((1, 1, 128, storage_length), 64, device="cuda", dtype=torch.int8)
+    value[..., sequence_length:] = 0
+    backend = require_attention_backend(key)
+    context = _prepare_sparse_piper_context_from_quantized(
+        key,
+        torch.ones((1, 1, tiles), device="cuda"),
+        reference_value_storage(value, backend.value_format),
+        torch.ones((1, 1, tiles, 1), device="cuda"),
+        torch.zeros((1, 1, 128), device="cuda"),
+        torch.tensor([tiles], device="cuda", dtype=torch.int32),
+        torch.tensor([0, tiles], device="cuda", dtype=torch.int32),
+        sparse_key_blocks=tiles,
+        routes_per_query=tiles,
+        logical_sequence_length=sequence_length,
+        value_format=backend.value_format,
+    )
+    order = list(range(tiles - 1))
+    order.insert(tiles - 1 if tail_position == -1 else tail_position, tiles - 1)
+    routes = (
+        torch.tensor(order, device="cuda", dtype=torch.uint16)[None, None, :]
+        .expand(1, tiles, tiles)
+        .contiguous()
+    )
+    query_state = _prepare_sparse_piper_query_from_quantized(
+        query,
+        torch.ones((1, 1, storage_length // QUERY_SCALE_ROWS), device="cuda"),
+        routes,
+        context,
+    )
+    prepared = _PreparedSparsePiperAttention(backend.bind_context(context), query_state)
+    expected = torch.empty((1, 1, sequence_length, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty_like(expected)
+    prepared.launch(prepared.query, expected)
+    # Padding is not part of the attention sequence, even when its physical
+    # block occurs in the middle of a caller-supplied sparse route.
+    value[..., sequence_length:] = -128
+    context.value.copy_(reference_value_storage(value, backend.value_format))
+    prepared = _PreparedSparsePiperAttention(backend.bind_context(context), query_state)
+    prepared.launch(prepared.query, actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _sequence_block_means(sequence, block_lengths=None):
@@ -105,15 +162,11 @@ def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_
     value[..., :64] = 1.0
     value[:, :, 1::2, :64] += 1.0 / 128
     blocks = sequence_length // 64
-    layout = resolve_route_layout(
-        _normalize_head_keep_ratios((1.0,)),
-        sparse_layout(blocks),
-        query.device,
-    )
+    layout = _resolve_route_layout(_normalize_head_keep_ratios((1.0,)), blocks, query.device)
     routes = packed_routes_from_sequences(query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING)
     backend = require_attention_backend(query)
     prepared = backend.prepare(
-        query, 128**-0.5, combined_key=key, combined_value=value
+        query, 128**-0.5, sparse_key_blocks=blocks, combined_key=key, combined_value=value
     ).with_routes(
         routes.indices,
         routes.head_keep_blocks,
@@ -151,13 +204,12 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
     value = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
     ratios = (0.5, 1.0)
     ratio_units = _normalize_head_keep_ratios(ratios)
-    num_sparse_blocks = sequence_length // 64
+    sparse_key_blocks = sequence_length // 64
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
-    sparse_key = key_head_major[:, :, : num_sparse_blocks * 64]
-    key_layout = sparse_layout(num_sparse_blocks)
-    layout = resolve_route_layout(ratio_units, key_layout, query.device)
+    sparse_key = key_head_major[:, :, : sparse_key_blocks * 64]
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
     routes = packed_minmax_pool_routes_from_sequences(query_head_major, sparse_key, layout)
     query_summary, key_max, key_min = _minmax_pool_block_summaries(
         query_head_major,
@@ -167,6 +219,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
     prepared = backend.prepare(
         query_head_major,
         128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
     ).with_routes(
@@ -188,7 +241,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
         _SparsePiperRatioProfile(ratio_units),
-        key_layout,
+        sparse_key_blocks,
         sequence_length,
         _MINMAX_ROUTING,
     )
@@ -196,7 +249,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
         {
             "force_tile_ids": torch.full(
                 ((sequence_length + 63) // 64, 1),
-                num_sparse_blocks - 1,
+                sparse_key_blocks - 1,
                 device="cuda",
                 dtype=torch.int32,
             ),
@@ -212,7 +265,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
             query,
             key,
             value,
-            key_layout=key_layout,
+            sparse_key_blocks=sparse_key_blocks,
             **force_tiles,
         )
         actual = _sparse_piper_attention_from_quantized_op(*quantized_arguments, **force_tiles)
@@ -276,12 +329,11 @@ def test_quantized_coarse_residual_matches_fp32_composition(
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
-    num_sparse_blocks = shape[1] // 64
+    sparse_key_blocks = shape[1] // 64
     coarse_key_blocks = (shape[1] + 63) // 64
-    sparse_key = key_head_major[:, :, : num_sparse_blocks * 64]
+    sparse_key = key_head_major[:, :, : sparse_key_blocks * 64]
     ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
-    key_layout = sparse_layout(num_sparse_blocks)
-    layout = resolve_route_layout(ratio_units, key_layout, query.device)
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
     placeholder_routes = packed_minmax_pool_routes_from_sequences(
         query_head_major,
         sparse_key,
@@ -291,6 +343,7 @@ def test_quantized_coarse_residual_matches_fp32_composition(
     prepared = backend.prepare(
         query_head_major,
         128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
     ).with_routes(
@@ -322,7 +375,7 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
         _SparsePiperRatioProfile(ratio_units),
-        key_layout,
+        sparse_key_blocks,
         shape[1],
         routing_mode,
     )
@@ -382,15 +435,15 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
-    num_sparse_blocks = sequence_length // 64
-    layout = resolve_route_layout(
+    sparse_key_blocks = sequence_length // 64
+    layout = _resolve_route_layout(
         _normalize_head_keep_ratios((0.5, 1.0)),
-        sparse_layout(num_sparse_blocks),
+        sparse_key_blocks,
         query.device,
     )
     routes = packed_minmax_pool_routes_from_sequences(
         query_head_major,
-        key_head_major[:, :, : num_sparse_blocks * 64],
+        key_head_major[:, :, : sparse_key_blocks * 64],
         layout,
     )
     query_block_count = (sequence_length + 63) // 64
@@ -399,6 +452,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     prepared = backend.prepare(
         query_head_major,
         128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
         sparse_query_blocks=sparse_query_blocks,
@@ -498,12 +552,13 @@ def _block_length_case(routing_mode: int, head_dim: int):
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
-    num_sparse_blocks = 2
-    key_layout = sparse_then_dense(num_sparse_blocks, storage_sequence_length // 64)
+    sparse_key_blocks = 2
     ratio_units = _normalize_head_keep_ratios((1.0, 1.0))
-    layout = resolve_route_layout(ratio_units, key_layout, query.device)
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
     routes = packed_minmax_pool_routes_from_sequences(
-        query_head_major, key_head_major[:, :, : key_layout.num_blocks * 64], layout
+        query_head_major,
+        key_head_major[:, :, : sparse_key_blocks * 64],
+        layout,
     )
     if routing_mode == _MEAN_ROUTING:
         query_summary = _sequence_block_means(query_head_major)
@@ -518,6 +573,7 @@ def _block_length_case(routing_mode: int, head_dim: int):
     prepared = backend.prepare(
         query_head_major,
         head_dim**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
     ).with_routes(
@@ -538,7 +594,7 @@ def _block_length_case(routing_mode: int, head_dim: int):
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
         _SparsePiperRatioProfile(ratio_units),
-        key_layout,
+        sparse_key_blocks,
         storage_sequence_length,
         routing_mode,
     )
@@ -726,17 +782,19 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
-    num_sparse_blocks = 2
-    key_layout = sparse_then_dense(num_sparse_blocks, shape[1] // 64)
+    sparse_key_blocks = 2
     ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
-    layout = resolve_route_layout(ratio_units, key_layout, query.device)
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
     placeholder_routes = packed_minmax_pool_routes_from_sequences(
-        query_head_major, key_head_major[:, :, : key_layout.num_blocks * 64], layout
+        query_head_major,
+        key_head_major[:, :, : sparse_key_blocks * 64],
+        layout,
     )
     backend = require_attention_backend(query_head_major)
     prepared = backend.prepare(
         query_head_major,
         128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
         combined_key=key_head_major,
         combined_value=value_head_major,
     ).with_routes(
@@ -759,7 +817,7 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
         prepared.context.value_scale_multiplier,
         prepared.context.value_mean,
         _SparsePiperRatioProfile(ratio_units),
-        key_layout,
+        sparse_key_blocks,
         shape[1],
         _MEAN_ROUTING,
     )
@@ -769,7 +827,7 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
             query,
             key,
             value,
-            key_layout=key_layout,
+            sparse_key_blocks=sparse_key_blocks,
         )
         actual = _sparse_piper_attention_from_quantized_op(*arguments)
         opcheck = torch.library.opcheck(

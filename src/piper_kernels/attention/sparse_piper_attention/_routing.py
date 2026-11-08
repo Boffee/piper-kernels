@@ -133,14 +133,10 @@ def packed_routes_from_sequences(
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
 ) -> PackedRoutes:
-    """Select routes for compact or valid-front padded Q/K sequences.
-
-    Routes cover the layout's complete key blocks; a compact partial tail takes none.
-    """
-    key = key[:, :, : layout.num_key_blocks * _BLOCK_ROWS]
-    if key.shape[2] != layout.num_key_blocks * _BLOCK_ROWS:
-        raise ValueError("sparse routing keys must contain the layout's complete K64 blocks")
-    if layout.keeps_all_blocks:
+    """Select routes for compact or valid-front padded Q and K64 sequences."""
+    if key.ndim == 4 and (key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS):
+        raise ValueError("sparse routing requires complete sparse-prefix K64 blocks")
+    if key.ndim == 4 and layout.keeps_all_blocks(key.shape[2] // _BLOCK_ROWS):
         validate_routing_mode(routing_mode)
         _validate_sequences(query, key, block_lengths)
         return PackedRouteBuilder(
@@ -148,6 +144,7 @@ def packed_routes_from_sequences(
             batch=query.shape[0],
             heads=query.shape[1],
             query_blocks=(query.shape[2] + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
+            sparse_key_blocks=key.shape[2] // _BLOCK_ROWS,
             device=query.device,
             skip_dense_routing=skip_dense_routing,
             force_tile_mask=force_tile_mask,
@@ -179,49 +176,29 @@ def packed_routes_from_summaries(
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
 ) -> PackedRoutes:
-    """Select routes from summaries of the layout's routed key blocks."""
+    """Select routes through the fixed policy-independent summary contract."""
     _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
-    if key_primary.shape[2] != layout.num_key_blocks:
-        raise ValueError("routing key summaries must cover exactly the routed key blocks")
     batch, heads, query_blocks, _head_dim = query_summary.shape
     builder = PackedRouteBuilder(
         layout,
         batch=batch,
         heads=heads,
         query_blocks=query_blocks,
+        sparse_key_blocks=key_primary.shape[2],
         device=query_summary.device,
         skip_dense_routing=skip_dense_routing,
         force_tile_mask=force_tile_mask,
     )
-    if layout.keeps_all_blocks:
+    if layout.keeps_all_blocks(key_primary.shape[2]):
         return builder.routes
-    compact_scores = any(region.keeps_all_blocks for region in layout.regions)
-    if compact_scores:
-        # Score only regions that select; retained regions occupy no score columns.
-        # A single selecting interval needs only a view, otherwise concatenate the
-        # small block summaries once before processing the query chunks.
-        intervals = [
-            slice(region.start_key_block, region.start_key_block + region.num_key_blocks)
-            for region in layout.regions
-            if not region.keeps_all_blocks
-        ]
-        key_primary = _key_block_intervals(key_primary, intervals)
-        if key_aux.shape[2]:
-            key_aux = _key_block_intervals(key_aux, intervals)
     for start, scores in score_chunks(
         query_summary,
         key_primary,
         key_aux,
         routing_mode,
     ):
-        builder.write(scores, query_block_offset=start, compact_scores=compact_scores)
+        builder.write(scores, query_block_offset=start)
     return builder.routes
-
-
-def _key_block_intervals(summary: torch.Tensor, intervals: list[slice]) -> torch.Tensor:
-    if len(intervals) == 1:
-        return summary[:, :, intervals[0]]
-    return torch.cat([summary[:, :, interval] for interval in intervals], dim=2)
 
 
 def packed_routes_and_coarse_from_summaries(
@@ -231,6 +208,7 @@ def packed_routes_and_coarse_from_summaries(
     pooled_value: torch.Tensor,
     layout: _ResolvedRouteLayout,
     *,
+    sparse_key_blocks: int,
     coarse_scale: float,
     routing_mode: int,
     skip_dense_routing: bool = False,
@@ -246,6 +224,7 @@ def packed_routes_and_coarse_from_summaries(
         batch=batch,
         heads=heads,
         query_blocks=query_blocks,
+        sparse_key_blocks=sparse_key_blocks,
         device=query_summary.device,
         skip_dense_routing=skip_dense_routing,
         force_tile_mask=force_tile_mask,

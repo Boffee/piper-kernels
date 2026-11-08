@@ -15,6 +15,7 @@ _DO_NOT_SPECIALIZE_ARGUMENTS = (
     "query_block_offset",
     "global_query_block_offset",
     "logical_sequence_length",
+    "sparse_key_blocks",
     "sparse_query_blocks",
     "stride_rb",
     "stride_rq",
@@ -35,6 +36,7 @@ class _ValidatedAttentionLaunch:
     storage_sequence_length: int
     output_sequence_length: int
     logical_sequence_length: int
+    sparse_key_blocks: int
     sparse_query_blocks: int
     route_strides: tuple[int, int, int]
     output_strides: tuple[int, int, int]
@@ -48,6 +50,7 @@ class _ValidatedAttentionLaunch:
     has_dense_query_suffix: bool
     apply_coarse_residual: bool
     skip_dense_routing: bool
+    ragged_tail_is_routed: bool
 
     @property
     def query_rows(self) -> int:
@@ -158,7 +161,11 @@ def validate_attention_launch(
     block_lengths_operand = (
         context.head_keep_blocks if context.block_lengths is None else context.block_lengths
     )
-    # Routes cover complete blocks; the dense suffix visits a compact ragged tile last.
+    # The dense suffix visits a compact ragged tile last. Caller-provided routes
+    # can also place that tile in the sparse prefix, which needs an ordinary-loop mask.
+    ragged_tail_is_routed = (
+        mask_ragged_tail and context.sparse_key_blocks * TILE_ROWS > logical_sequence_length
+    )
     return _ValidatedAttentionLaunch(
         batch=batch,
         heads=heads,
@@ -170,6 +177,7 @@ def validate_attention_launch(
         storage_sequence_length=storage_sequence_length,
         output_sequence_length=output_sequence_length,
         logical_sequence_length=logical_sequence_length,
+        sparse_key_blocks=context.sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         route_strides=(
             query_state.routes.stride(0),
@@ -199,4 +207,5 @@ def validate_attention_launch(
         has_dense_query_suffix=has_dense_query_suffix,
         apply_coarse_residual=has_coarse_residual,
         skip_dense_routing=context.routes_per_query == 0,
+        ragged_tail_is_routed=ragged_tail_is_routed,
     )

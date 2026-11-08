@@ -31,14 +31,14 @@ def validate_force_tiles(
 
 
 def build_portable_force_tile_bitmask(
-    ids: torch.Tensor, counts: torch.Tensor, key_blocks: int
+    ids: torch.Tensor, counts: torch.Tensor, sparse_key_blocks: int
 ) -> torch.Tensor:
     """Pack unique active IDs into 32-bit words without reading them on the host."""
     active = torch.arange(ids.shape[1], device=ids.device)[None, :] < counts[:, None]
     safe_ids = torch.where(active, ids, 0).long()
     bits = (1 << (safe_ids % 32)) * active
     words = torch.zeros(
-        (ids.shape[0], (key_blocks + 31) // 32), dtype=torch.int64, device=ids.device
+        (ids.shape[0], (sparse_key_blocks + 31) // 32), dtype=torch.int64, device=ids.device
     )
     words.scatter_add_(1, safe_ids // 32, bits)
     return words.to(torch.int32)
