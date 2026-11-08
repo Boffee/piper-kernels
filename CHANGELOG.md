@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.8.0rc4] - 2026-11-08
+
 ### Changed
 
 - Breaking: `SparsePiperAttention` takes `sparse_key_blocks=n` again, as in 0.8.0rc2.
@@ -13,10 +15,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   share each head's keep budget, and later keys, including a compact partial final
   block, are attended densely. Replace a layout of `SparsePiperKeyRegion(n)` and a
   dense remainder with `sparse_key_blocks=n`; layouts with several sparse regions have
-  no equivalent. `resolve_head_keep_blocks(n)` returns per-head budgets. A changed
-  `sparse_key_blocks` integer can recompile a compiled graph unless it comes from a
-  dynamic tensor shape. Fused coarse branches whose scope covers the sparse prefix,
-  but not every key block, fuse again.
+  no equivalent. `resolve_head_keep_blocks(n)` returns per-head budgets, and forced
+  tile IDs lie in `[0, n)`. A changed `sparse_key_blocks` integer can recompile a
+  compiled graph unless it comes from a dynamic tensor shape. Fused coarse branches
+  whose scope covers the sparse prefix, but not every key block, fuse again.
 - Sparse attention rounds keep budgets once per ratio profile and prefix size instead
   of on every call. With 56 heads on an RTX 5090, this removes about 10 µs of host work
   per call; kernel time is unchanged.
@@ -1018,7 +1020,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc3...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc4...HEAD
+[0.8.0rc4]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc3...v0.8.0rc4
 [0.8.0rc3]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc2...v0.8.0rc3
 [0.8.0rc2]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc1...v0.8.0rc2
 [0.8.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.7.10...v0.8.0rc1
