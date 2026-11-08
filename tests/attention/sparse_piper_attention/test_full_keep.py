@@ -2,13 +2,12 @@
 
 import pytest
 import torch
+from _key_layouts import route_layout
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention import _backend, _routes, _routing
 from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-    _ResolvedRouteLayout,
+    ResolvedRouteRegion,
 )
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
@@ -33,7 +32,7 @@ def test_full_keep_skips_summaries_and_scores(monkeypatch, routing_mode, head_di
     query = torch.randn(2, 3, 193, head_dim)
     key = torch.randn(2, 3, 192, head_dim)
     # A rounded physical budget can be full even if its semantic ratio is not 1.
-    layout = _resolve_route_layout(_normalize_head_keep_ratios([ratio] * 3), 3, query.device)
+    layout = route_layout([ratio] * 3, 3, query.device)
     monkeypatch.setattr(_routing, "sequence_block_summaries", _unexpected)
     monkeypatch.setattr(_routing, "score_chunks", _unexpected)
     result = _routing.packed_routes_from_sequences(query, key, layout, routing_mode)
@@ -47,7 +46,7 @@ def test_full_keep_from_summaries_skips_score_chunks(monkeypatch, routing_mode, 
     query = torch.randn(1, 2, 4, head_dim)
     key = torch.randn(1, 2, 3, head_dim)
     auxiliary = key[:, :, :0] if routing_mode == _MEAN_ROUTING else torch.randn_like(key)
-    layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 2), 3, query.device)
+    layout = route_layout([1.0] * 2, 3, query.device)
     monkeypatch.setattr(_routing, "score_chunks", _unexpected)
     result = _routing.packed_routes_from_summaries(query, key, auxiliary, layout, routing_mode)
     expected = torch.tensor([0, 1, 2] * 2, dtype=torch.uint16).expand(1, 4, 6)
@@ -59,7 +58,7 @@ def test_full_keep_preserves_coarse_scores_and_output(monkeypatch, head_dim):
     query = torch.randn(1, 2, 4, head_dim)
     key = torch.randn(1, 2, 3, head_dim)
     value = torch.randn(1, 2, 3, head_dim)
-    layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 2), 2, query.device)
+    layout = route_layout([1.0] * 2, 2, query.device)
     monkeypatch.setattr(_routes, "_select_portable_routes", _unexpected)
     result = _routing.packed_routes_and_coarse_from_summaries(
         query,
@@ -67,7 +66,6 @@ def test_full_keep_preserves_coarse_scores_and_output(monkeypatch, head_dim):
         key[:, :, :0],
         value,
         layout,
-        sparse_key_blocks=2,
         coarse_scale=0.125,
         routing_mode=_MEAN_ROUTING,
     )
@@ -79,7 +77,7 @@ def test_full_keep_preserves_coarse_scores_and_output(monkeypatch, head_dim):
 
 def test_full_keep_keeps_input_validation():
     query = torch.randn(1, 3, 64, 128)
-    layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 3), 1, query.device)
+    layout = route_layout([1.0] * 3, 1, query.device)
     with pytest.raises(ValueError, match="batch/head/feature"):
         _routing.packed_routes_from_sequences(query, query[:, :2], layout, _MEAN_ROUTING)
 
@@ -114,10 +112,12 @@ def test_full_keep_attention_matches_score_selected_routes(
         torch.randn(1, sequence, 2, head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(3)
     ]
     attention = SparsePiperAttention((1.0, 1.0), routing=routing)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(sequence // 64),))
     with monkeypatch.context() as control:
-        control.setattr(_ResolvedRouteLayout, "keeps_all_blocks", lambda *_: False)
-        expected = attention(*operands, sparse_key_blocks=sequence // 64)
+        # The layout's full keep derives from its regions; patching them routes by score.
+        control.setattr(ResolvedRouteRegion, "keeps_all_blocks", property(lambda _: False))
+        expected = attention(*operands, key_layout=key_layout)
     monkeypatch.setattr(_routing, "sequence_block_summaries", _unexpected)
     monkeypatch.setattr(_routing, "score_chunks", _unexpected)
-    actual = attention(*operands, sparse_key_blocks=sequence // 64)
+    actual = attention(*operands, key_layout=key_layout)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -6,16 +6,22 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
+from _key_layouts import sparse_then_dense
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels import SparsePiperAttention, piper_attention
+from piper_kernels import (
+    SparsePiperAttention,
+    SparsePiperKeyLayout,
+    SparsePiperKeyRegion,
+    piper_attention,
+)
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _prepare_piper_attention,
     _run_piper_attention,
     default_execution_plan,
 )
 from piper_kernels.attention.sparse_piper_attention import _backend
-from piper_kernels.attention.sparse_piper_attention._budget import _resolve_route_layout
+from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
@@ -70,7 +76,11 @@ def test_sparse_gqa_matches_repeated_kv(device, kv_heads, groups, head_dim, rout
         if layout == "padded"
         else None
     )
-    kwargs = {"sparse_key_blocks": 3, "sparse_query_blocks": 2, "block_lengths": lengths}
+    kwargs = {
+        "key_layout": sparse_then_dense(3, sequence // 64),
+        "sparse_query_blocks": 2,
+        "block_lengths": lengths,
+    }
     actual = attention(query, key, value, **kwargs)
     expected = attention(
         query, key.repeat_interleave(groups, 2), value.repeat_interleave(groups, 2), **kwargs
@@ -97,7 +107,10 @@ def test_gqa_invalid_heads_rejected_without_tensor_contents(
         if sparse:
             attention = SparsePiperAttention([0.5] * max(query_heads, 1))
             with pytest.raises(ValueError, match="head"):
-                attention(*(x.transpose(1, 2) for x in tensors), sparse_key_blocks=2)
+                attention(
+                    *(x.transpose(1, 2) for x in tensors),
+                    key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(2),)),
+                )
         else:
             with pytest.raises(ValueError, match="head"):
                 piper_attention(*tensors)
@@ -154,13 +167,13 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
         pytest.skip("requires a native sparse-attention backend")
     scale = head_dim**-0.5
     attention = SparsePiperAttention([0.5] * heads, routing=routing)
-    layout = _resolve_route_layout(attention._ratio_profile.units, 4, query.device)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(4),))
+    layout = resolve_route_layout(attention._ratio_profile.units, key_layout, query.device)
     routing_mode = _MEAN_ROUTING if routing == "mean" else _MINMAX_ROUTING
     routes = packed_routes_from_sequences(query, key, layout, routing_mode)
     prepared = backend.prepare(
         query,
         scale,
-        sparse_key_blocks=4,
         combined_key=key,
         combined_value=value,
     ).with_routes(
@@ -182,17 +195,17 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
     local_output = torch.empty((2, heads, 64, head_dim), device="cuda", dtype=query.dtype)
     prepared.launch(prepared.query, local_output, query_block_offset=1, query_block_count=1)
     expected = attention(
-        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), sparse_key_blocks=4
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), key_layout=key_layout
     )
     torch.testing.assert_close(local_output, expected[:, 64:128].transpose(1, 2), rtol=0, atol=0)
 
-    def sparse_attention(query, key, value, sparse_key_blocks):
+    def sparse_attention(query, key, value, key_layout):
         # Keep the structural scale constant inside the graph, as in the dense test.
         return attention(
             query,
             key,
             value,
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
             scale=64**-0.5 if head_dim == 64 else 128**-0.5,
         )
 
@@ -204,13 +217,14 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
         options={"post_grad_custom_pre_pass": capture},
     )
     with torch.inference_mode():
-        for sequence, sparse_key_blocks in ((193, 2), (257, 3), (320, 4)):
+        for sequence, num_sparse_blocks in ((193, 2), (257, 3), (320, 4)):
             query = torch.randn(2, sequence, heads, head_dim, device="cuda", dtype=query.dtype)
             key = torch.randn(2, sequence, kv_heads, head_dim, device="cuda", dtype=query.dtype)
             value = torch.randn_like(key)
+            key_layout = sparse_then_dense(num_sparse_blocks, sequence // 64)
             torch.testing.assert_close(
-                compiled(query, key, value, sparse_key_blocks),
-                attention(query, key, value, sparse_key_blocks=sparse_key_blocks),
+                compiled(query, key, value, key_layout),
+                attention(query, key, value, key_layout=key_layout),
                 rtol=0,
                 atol=0,
             )

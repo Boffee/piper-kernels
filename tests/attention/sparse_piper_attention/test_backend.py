@@ -11,10 +11,13 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _key_layouts import sparse_then_dense
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import (
+    SparsePiperKeyLayout,
+    SparsePiperKeyRegion,
     _backend,
     _quantized_dispatch,
     _routes,
@@ -23,11 +26,9 @@ from piper_kernels.attention.sparse_piper_attention import (
     _summaries,
     dispatch,
 )
-from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-)
+from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
 from piper_kernels.attention.sparse_piper_attention._interfaces import AttentionBackend
+from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
@@ -419,6 +420,7 @@ def test_dense_orchestration_uses_selected_operations(
 ):
     query = torch.zeros(1, 128, 1, head_dim, dtype=torch.bfloat16)
     key, value = torch.zeros_like(query), torch.zeros_like(query)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(2),))
     state = Mock()
     operands = Mock(with_routes=Mock(return_value=state))
     prepare = Mock(return_value=operands)
@@ -441,13 +443,15 @@ def test_dense_orchestration_uses_selected_operations(
             return_value=_routing.packed_routes_from_sequences(
                 query.transpose(1, 2),
                 key.transpose(1, 2),
-                _resolve_route_layout(_normalize_head_keep_ratios((keep_ratio,)), 2, query.device),
+                resolve_route_layout(
+                    _normalize_head_keep_ratios((keep_ratio,)), key_layout, query.device
+                ),
                 _routing_modes._MINMAX_ROUTING,
                 skip_dense_routing=backend.skip_dense_routing,
             )
         ),
     )
-    result = dispatch.SparsePiperAttention((keep_ratio,))(query, key, value, sparse_key_blocks=2)
+    result = dispatch.SparsePiperAttention((keep_ratio,))(query, key, value, key_layout=key_layout)
     assert result.shape == query.shape
     assert result.is_contiguous()
     assert (result == 3).all()
@@ -462,7 +466,6 @@ def test_dense_orchestration_uses_selected_operations(
     assert operands.with_routes.call_args.args[0].shape[-1] == route_count
     assert prepare.call_args.kwargs["combined_key"].data_ptr() == key.data_ptr()
     assert prepare.call_args.kwargs["combined_value"].data_ptr() == value.data_ptr()
-    assert prepare.call_args.kwargs["sparse_key_blocks"] == 2
     assert prepare.call_args.kwargs.get("emit_summaries", False) is (
         fuse_summaries and keep_ratio < 1.0
     )
@@ -476,21 +479,27 @@ def test_unsupported_attention_uses_reference_without_native_preparation(monkeyp
     reference = Mock(wraps=dispatch.reference_sparse_piper_attention)
     monkeypatch.setattr(_backend, "select_attention_backend", select)
     monkeypatch.setattr(dispatch, "reference_sparse_piper_attention", reference)
-    result = dispatch.SparsePiperAttention((0.5,))(query, query, query, sparse_key_blocks=2)
+    result = dispatch.SparsePiperAttention((0.5,))(
+        query, query, query, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(2),))
+    )
     assert torch.equal(result, torch.zeros_like(query))
     reference.assert_called_once()
     select.assert_called_once()
 
 
 def test_route_builder_uses_selected_operation_once_and_preserves_offsets(monkeypatch):
-    layout = _resolve_route_layout(_normalize_head_keep_ratios((0.5,)), 2, torch.device("cpu"))
+    layout = resolve_route_layout(
+        _normalize_head_keep_ratios((0.5,)),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(2),)),
+        torch.device("cpu"),
+    )
     selector = Mock()
     select = Mock(return_value=selector)
     monkeypatch.setattr(_backend, "select_route_selector", select)
     monkeypatch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("host readback")))
     monkeypatch.setattr(torch.Tensor, "tolist", Mock(side_effect=AssertionError("host readback")))
     builder = _routes.PackedRouteBuilder(
-        layout, batch=1, heads=1, query_blocks=3, sparse_key_blocks=2, device=torch.device("cpu")
+        layout, batch=1, heads=1, query_blocks=3, device=torch.device("cpu")
     )
     scores = torch.ones(1, 1, 1, 2)
     builder.write(scores, query_block_offset=2)
@@ -498,13 +507,11 @@ def test_route_builder_uses_selected_operation_once_and_preserves_offsets(monkey
     selector.assert_called_once_with(
         scores,
         builder.routes.indices,
-        layout.head_keep_blocks,
-        layout.route_head_offsets,
+        layout.selector_metadata,
         query_block_offset=2,
         force_tile_mask=None,
+        compact_scores=False,
     )
-    assert builder._route_head_offsets is None
-    assert builder._head_keep_block_values is None
 
 
 def test_summaries_use_selected_operation_after_validation(monkeypatch):
@@ -539,7 +546,7 @@ def _quantized_context_arguments(head_dim=128):
         "value_scale_multiplier": torch.ones(1, 1, 2, 1),
         "value_mean": torch.zeros(1, 1, head_dim),
         "ratio_profile": _SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
-        "sparse_key_blocks": 2,
+        "key_layout": SparsePiperKeyLayout((SparsePiperKeyRegion(2),)),
         "logical_sequence_length": 128,
         "routing_mode": _routing_modes._MINMAX_ROUTING,
     }
@@ -549,7 +556,7 @@ def _quantized_context_arguments(head_dim=128):
 def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeypatch, coarse):
     arguments = _quantized_context_arguments()
     if coarse:
-        arguments.update(block_mean=torch.ones(1, 1, 2, 128), coarse_scale=0.1)
+        arguments.update(block_mean=torch.ones(1, 1, 2, 128), coarse_scale=0.1, coarse_key_blocks=2)
     launch = Mock()
     select = Mock(
         return_value=AttentionBackend(
@@ -614,7 +621,7 @@ def test_backend_context_binding_is_once_per_context_not_per_query(monkeypatch):
 def test_quantized_unsupported_backend_rejects_before_allocating_routes(monkeypatch):
     monkeypatch.setattr(_backend, "select_attention_backend", lambda query: None)
     monkeypatch.setattr(
-        _quantized_dispatch, "_resolve_route_layout", Mock(side_effect=AssertionError("allocated"))
+        _quantized_dispatch, "resolve_route_layout", Mock(side_effect=AssertionError("allocated"))
     )
     with pytest.raises(RuntimeError, match="unavailable on cpu"):
         _quantized_dispatch._prepare_quantized_sparse_piper_context(
@@ -632,7 +639,6 @@ def test_shared_quantized_validation_rejects_cross_device_query():
         arguments["value_mean"],
         torch.ones(1, dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
-        sparse_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=1,
         logical_sequence_length=128,
@@ -656,7 +662,6 @@ def test_prepared_query_must_match_context_head_width():
         arguments["value_mean"],
         torch.ones(1, dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
-        sparse_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=1,
         logical_sequence_length=128,
@@ -712,7 +717,9 @@ def test_context_rejects_invalid_storage_before_binding(monkeypatch, defect, mes
     elif defect == "rows":
         arguments["key"] = torch.zeros(1, 1, 65, 128, dtype=torch.int8)
     elif defect == "logical_length":
+        # Cover the logical sequence so only the storage check can reject it.
         arguments["logical_sequence_length"] = 64
+        arguments["key_layout"] = SparsePiperKeyLayout((SparsePiperKeyRegion(1),))
     else:
         arguments["value_scale_multiplier"] = torch.ones(1, 1, 2, 2)
     bind = Mock(side_effect=AssertionError("invalid storage reached binding"))
@@ -772,7 +779,6 @@ def _prepared_attention(head_dim, routes_per_query):
         arguments["value_mean"],
         torch.tensor([2], dtype=torch.int32),
         torch.tensor([0, 2], dtype=torch.int32),
-        sparse_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=routes_per_query,
         logical_sequence_length=128,
@@ -894,7 +900,9 @@ class WithoutTriton(importlib.abc.MetaPathFinder):
             raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
 
 sys.meta_path.insert(0, WithoutTriton())
-from piper_kernels.attention.sparse_piper_attention import SparsePiperAttention, _backend
+from piper_kernels.attention.sparse_piper_attention import (
+    SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion, _backend,
+)
 from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperQuery
 from piper_kernels._triton.targets import AcceleratorTarget
 query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
@@ -908,7 +916,8 @@ schedule = policy.select_sm120_attention_schedule(
 )
 assert isinstance(schedule, AttentionSchedule)
 assert (schedule.block_m, schedule.num_warps) == (128, 4)
-assert torch.equal(SparsePiperAttention((0.5,))(query, query, query, sparse_key_blocks=2), query)
+key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(2),))
+assert torch.equal(SparsePiperAttention((0.5,))(query, query, query, key_layout=key_layout), query)
 # Even a supported target cannot select absent optional implementations.
 AcceleratorTarget.from_device = lambda device: AcceleratorTarget("cuda", "sm120")
 assert _backend.select_route_selector(torch.empty(1, 2, 1, dtype=torch.uint16)) is None
@@ -933,10 +942,11 @@ def test_unsupported_gpu_retains_portable_attention(monkeypatch, routing, sequen
     if _backend.select_attention_backend(device_operands[0]) is not None:
         pytest.skip("this test exercises devices without a native sparse-attention backend")
     attention = dispatch.SparsePiperAttention((0.5,), routing=routing)
-    expected = attention(*operands, sparse_key_blocks=2, sparse_query_blocks=1)
+    key_layout = sparse_then_dense(2, sequence_length // 64)
+    expected = attention(*operands, key_layout=key_layout, sparse_query_blocks=1)
     reference = Mock(wraps=dispatch.reference_sparse_piper_attention)
     monkeypatch.setattr(dispatch, "reference_sparse_piper_attention", reference)
-    actual = attention(*device_operands, sparse_key_blocks=2, sparse_query_blocks=1)
+    actual = attention(*device_operands, key_layout=key_layout, sparse_query_blocks=1)
     reference.assert_called_once()
     assert actual.device == device_operands[0].device
     assert actual.is_contiguous()

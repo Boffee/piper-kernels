@@ -20,7 +20,6 @@ class PrepareOperands(Protocol):
         query: torch.Tensor,
         scale: float,
         *,
-        sparse_key_blocks: int,
         combined_key: torch.Tensor,
         combined_value: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
@@ -83,11 +82,11 @@ class SelectRoutes(Protocol):
         self,
         scores: torch.Tensor,
         routes: torch.Tensor,
-        head_keep_blocks: torch.Tensor,
-        route_head_offsets: torch.Tensor,
+        region_metadata: torch.Tensor,
         *,
         query_block_offset: int,
         force_tile_mask: torch.Tensor | None = None,
+        compact_scores: bool = False,
     ) -> None: ...
 
 

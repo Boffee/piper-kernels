@@ -4,6 +4,8 @@ from .attention.piper_attention import piper_attention
 from .attention.sage_attention_2pp import sage_attention_2pp
 from .attention.sparse_piper_attention import (
     SparsePiperAttention,
+    SparsePiperKeyLayout,
+    SparsePiperKeyRegion,
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
@@ -13,6 +15,8 @@ from .attention.sparse_piper_attention import (
 
 __all__ = [
     "SparsePiperAttention",
+    "SparsePiperKeyLayout",
+    "SparsePiperKeyRegion",
     "apply_coarse_attention_residual",
     "coarse_attention",
     "coarse_attention_residual",

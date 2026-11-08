@@ -6,7 +6,13 @@ from functools import partial
 
 import torch
 
-from piper_kernels import SparsePiperAttention, piper_attention, sage_attention_2pp
+from piper_kernels import (
+    SparsePiperAttention,
+    SparsePiperKeyLayout,
+    SparsePiperKeyRegion,
+    piper_attention,
+    sage_attention_2pp,
+)
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention.dispatch import _supports_triton as supports_piper
 from piper_kernels.attention.sage_attention_2pp.dispatch import _supports_triton as supports_sage
@@ -14,10 +20,8 @@ from piper_kernels.attention.sparse_piper_attention._backend import (
     require_attention_backend,
     select_attention_backend,
 )
-from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-)
+from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
+from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
@@ -109,8 +113,8 @@ def _selected_key_rows(
         tiles = routes.indices[batch, block, start:stop].long()
     else:
         tiles = torch.arange(sequence // 64, device=device)
-    prefix = (tiles[:, None] * 64 + torch.arange(64, device=device)).flatten()
-    return torch.cat((prefix, torch.arange(sequence // 64 * 64, sequence, device=device)))
+    routed_rows = (tiles[:, None] * 64 + torch.arange(64, device=device)).flatten()
+    return torch.cat((routed_rows, torch.arange(sequence // 64 * 64, sequence, device=device)))
 
 
 def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
@@ -121,17 +125,18 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
     sequence_major = tuple(tensor.transpose(1, 2) for tensor in inputs)
     attention = SparsePiperAttention(ratios, routing="minmax")
     blocks = case.sequence // 64
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(blocks),))
 
     def run() -> torch.Tensor:
-        return attention(*sequence_major, sparse_key_blocks=blocks)
+        return attention(*sequence_major, key_layout=key_layout)
 
     def check(output: torch.Tensor) -> QualityCheck:
         validate_output_metadata(output, sequence_major[0].shape, query.dtype)
         backend = require_attention_backend(query)
-        layout = _resolve_route_layout(_normalize_head_keep_ratios(ratios), blocks, device)
+        layout = resolve_route_layout(_normalize_head_keep_ratios(ratios), key_layout, device)
         routes = packed_routes_from_sequences(
             query,
-            key[:, :, : blocks * 64],
+            key,
             layout,
             routing_mode_from_name("minmax"),
             skip_dense_routing=backend.skip_dense_routing,
@@ -139,7 +144,6 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
         prepared = backend.prepare(
             query,
             case.head_dim**-0.5,
-            sparse_key_blocks=blocks,
             combined_key=key,
             combined_value=value,
         ).with_routes(
@@ -184,7 +188,7 @@ def _sparse_operation(case: AttentionCase, device: torch.device) -> Operation:
     return Operation(
         run=run,
         check=check,
-        configuration={"layout": "BSHD", "routing": "minmax", "sparse_key_blocks": blocks},
+        configuration={"layout": "BSHD", "routing": "minmax", "key_regions": [f"sparse:{blocks}"]},
     )
 
 

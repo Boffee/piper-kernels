@@ -8,7 +8,7 @@ from torch._library.fake_class_registry import FakeScriptObject
 from torch.fx.experimental.symbolic_shapes import guard_or_false
 from torch.fx.node import Argument
 
-from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
+from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _dtype
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
@@ -51,7 +51,6 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
     gate = preparation_sharing.tensor_metadata(gate_node)
     output = preparation_sharing.tensor_metadata(match.output_node())
     coarse_scale = projected_qk_compile.positive_float(match.kwargs["coarse_scale"])
-    sparse_key_blocks = integer_scalar_metadata(match.kwargs["sparse_key_blocks"])
     coarse_key_blocks = integer_scalar_metadata(match.kwargs["coarse_key_blocks"])
     return bool(
         gate is not None
@@ -68,9 +67,10 @@ def valid_sparse_piper_coarse_residual(match: Match) -> bool:
             for gate_dimension, output_dimension in zip(gate.shape, output.shape, strict=True)
         )
         and coarse_scale is not None
-        and sparse_key_blocks is not None
         and coarse_key_blocks is not None
-        and guard_or_false(coarse_key_blocks >= sparse_key_blocks)
+        # Layout contents stay opaque to compilation. Routing shares the coarse
+        # scores, so the scope must cover every complete key block any layout routes.
+        and guard_or_false(coarse_key_blocks >= output.shape[1] // TILE_ROWS)
     )
 
 
@@ -79,7 +79,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     attention_arguments: tuple[Argument, ...],
     *,
     ratio_profile: Argument,
-    sparse_key_blocks: Argument,
+    key_layout: Argument,
     logical_sequence_length: Argument,
     routing_mode: Argument,
     block_lengths: Argument | None = None,
@@ -106,7 +106,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
                 block_mean,
                 coarse_gate,
                 ratio_profile,
-                sparse_key_blocks,
+                key_layout,
                 logical_sequence_length,
                 routing_mode,
                 coarse_scale,
@@ -122,7 +122,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
         args=(
             *attention_arguments,
             ratio_profile,
-            sparse_key_blocks,
+            key_layout,
             logical_sequence_length,
             routing_mode,
             *sparse_piper_pattern.optional_attention_layout_arguments(
@@ -211,18 +211,6 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
     ):
         return False
 
-    sparse_key_blocks = integer_scalar_argument(match.kwargs["sparse_key_blocks"])
-    static_sparse_key_blocks = static_int(sparse_key_blocks)
-    if (
-        sparse_key_blocks is None
-        or (static_sparse_key_blocks is not None and static_sparse_key_blocks < 1)
-        or (
-            static_sparse_key_blocks is not None
-            and isinstance(sequence_length, int)
-            and static_sparse_key_blocks > sequence_length // tile_rows
-        )
-    ):
-        return False
     block_lengths_node = match.kwargs.get("sparse_block_lengths")
     if block_lengths_node is not None:
         if not isinstance(block_lengths_node, torch.fx.Node):

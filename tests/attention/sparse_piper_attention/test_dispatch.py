@@ -3,9 +3,10 @@
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
+from _key_layouts import sparse_then_dense
 
 import piper_kernels
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention._backend import select_attention_backend
 
 
@@ -38,13 +39,14 @@ def test_attention_preserves_dtype_and_accuracy(device, head_dim, ratio, dtype):
         pytest.skip("requires a native sparse-attention backend")
     operands = tuple(tensor.to(dtype) for tensor in _inputs(device, 193, head_dim))
     attention = SparsePiperAttention((ratio, ratio))
-    actual = attention(*operands, sparse_key_blocks=3)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
+    actual = attention(*operands, key_layout=key_layout)
     assert actual.dtype is dtype
     assert actual.shape == operands[0].shape
     assert torch.isfinite(actual).all()
     if device == "cuda":
         # Compare native quantized attention with the portable unquantized path.
-        expected = attention(*(tensor.cpu() for tensor in operands), sparse_key_blocks=3)
+        expected = attention(*(tensor.cpu() for tensor in operands), key_layout=key_layout)
         relative_error = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
         assert relative_error < 0.03
 
@@ -52,14 +54,16 @@ def test_attention_preserves_dtype_and_accuracy(device, head_dim, ratio, dtype):
     increment = 2**-10 if dtype is torch.float16 else 2**-20
     constant = torch.full_like(operands[2], 1 + increment)
     zeros = torch.zeros_like(operands[0])
-    actual = attention(zeros, zeros, constant, sparse_key_blocks=3)
+    actual = attention(zeros, zeros, constant, key_layout=key_layout)
     torch.testing.assert_close(actual, constant, atol=0, rtol=0)
 
 
 def test_sparse_attention_rejects_mixed_activation_dtypes():
     query, key, value = _inputs()
     with pytest.raises(ValueError, match="share float16, bfloat16, or float32"):
-        SparsePiperAttention((1.0, 1.0))(query.half(), key, value, sparse_key_blocks=3)
+        SparsePiperAttention((1.0, 1.0))(
+            query.half(), key, value, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
+        )
 
 
 def test_backend_owns_only_an_immutable_semantic_ratio_profile() -> None:
@@ -87,7 +91,7 @@ def test_dense_suffix_is_included_for_prefix_and_suffix_queries(routing: str) ->
     attention = SparsePiperAttention((0.5, 1.0), routing=routing)
 
     with torch.no_grad():
-        output = attention(query, key, value, sparse_key_blocks=2)
+        output = attention(query, key, value, key_layout=sparse_then_dense(2, 3))
 
     expected_by_head = torch.tensor([5.5, 13 / 3], dtype=torch.bfloat16)
     assert output.shape == query.shape
@@ -121,7 +125,7 @@ def test_dense_query_suffix_bypasses_sparse_routes(
             query,
             key,
             value,
-            sparse_key_blocks=2,
+            key_layout=sparse_then_dense(2, 3),
             sparse_query_blocks=sparse_query_blocks,
         )
 
@@ -140,7 +144,7 @@ def test_sparse_query_block_boundary_is_validated(sparse_query_blocks: object) -
             query,
             key,
             value,
-            sparse_key_blocks=2,
+            key_layout=sparse_then_dense(2, 3),
             sparse_query_blocks=sparse_query_blocks,  # type: ignore[arg-type]
         )
 
@@ -150,8 +154,8 @@ def test_backend_accepts_sparse_prefix_length_changes_without_derived_state() ->
     attention = SparsePiperAttention((0.5, 0.5))
 
     with torch.no_grad():
-        one_block = attention(query, key, value, sparse_key_blocks=1)
-        two_blocks = attention(query, key, value, sparse_key_blocks=2)
+        one_block = attention(query, key, value, key_layout=sparse_then_dense(1, 3))
+        two_blocks = attention(query, key, value, key_layout=sparse_then_dense(2, 3))
 
     assert one_block.shape == two_blocks.shape == query.shape
 
@@ -169,7 +173,7 @@ def test_public_contract_accepts_ragged_logical_lengths(
             query,
             key,
             value,
-            sparse_key_blocks=sequence_length // 64,
+            key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(sequence_length // 64),)),
         )
 
     assert output.shape == query.shape
@@ -187,7 +191,9 @@ def test_partial_dense_suffix_attends_only_valid_rows() -> None:
     attention = SparsePiperAttention((1.0, 1.0))
 
     with torch.no_grad():
-        output = attention(query, key, value, sparse_key_blocks=1)
+        output = attention(
+            query, key, value, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(1),))
+        )
 
     expected = torch.full_like(output, (64 + 10) / sequence_length)
     torch.testing.assert_close(output, expected, atol=0.015625, rtol=0)
@@ -214,18 +220,19 @@ def test_internal_block_lengths_make_padded_values_unobservable(
     for tensor in corrupted:
         tensor[:, ~valid_rows] = torch.randn_like(tensor[:, ~valid_rows]).mul_(100)
     attention = SparsePiperAttention((0.5, 1.0), routing=routing)
+    key_layout = sparse_then_dense(2, 3)
 
     with torch.no_grad():
         expected = attention(
             query,
             key,
             value,
-            sparse_key_blocks=2,
+            key_layout=key_layout,
             block_lengths=block_lengths,
         )
         actual = attention(
             *corrupted,
-            sparse_key_blocks=2,
+            key_layout=key_layout,
             block_lengths=block_lengths,
         )
 
@@ -249,17 +256,9 @@ def test_internal_block_lengths_reject_invalid_metadata(block_lengths: torch.Ten
             query,
             key,
             value,
-            sparse_key_blocks=2,
+            key_layout=sparse_then_dense(2, 3),
             block_lengths=block_lengths,
         )
-
-
-def test_contract_rejects_sparse_prefix_larger_than_the_sequence() -> None:
-    query, key, value = _inputs()
-    attention = SparsePiperAttention((0.5, 0.5))
-
-    with pytest.raises(ValueError, match="sparse_key_blocks"):
-        attention(query, key, value, sparse_key_blocks=4)
 
 
 @pytest.mark.gpu
@@ -276,7 +275,9 @@ def test_native_path_returns_contiguous_output_for_noncontiguous_inputs() -> Non
     attention = SparsePiperAttention((0.5, 1.0))
 
     with torch.no_grad():
-        output = attention(query, key, value, sparse_key_blocks=3)
+        output = attention(
+            query, key, value, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
+        )
 
     assert not query.is_contiguous()
     assert output.is_contiguous()
@@ -305,7 +306,7 @@ def test_native_custom_op_passes_opcheck(sequence_length: int, head_dim: int) ->
             key,
             value,
             attention._ratio_profile,
-            sequence_length // 64,
+            SparsePiperKeyLayout((SparsePiperKeyRegion(sequence_length // 64),)),
             head_dim**-0.5,
             attention._routing_mode,
         ),
@@ -321,31 +322,32 @@ def test_native_custom_op_passes_opcheck(sequence_length: int, head_dim: int) ->
     reason="requires a native sparse-attention backend",
 )
 @pytest.mark.parametrize(
-    ("sparse_key_blocks", "ratios"),
+    ("num_sparse_blocks", "ratios"),
     [(1, (1.0, 1.0)), (2, (0.5, 1.0)), (3, (1 / 3, 2 / 3))],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_native_matches_the_portable_quantized_reference(
     head_dim: int,
-    sparse_key_blocks: int,
+    num_sparse_blocks: int,
     ratios: tuple[float, float],
 ) -> None:
     query, key, value = _inputs(head_dim=head_dim)
     cpu_attention = SparsePiperAttention(ratios)
     cuda_attention = SparsePiperAttention(ratios)
+    key_layout = sparse_then_dense(num_sparse_blocks, 3)
 
     with torch.no_grad():
         reference = cpu_attention(
             query,
             key,
             value,
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
         )
         actual = cuda_attention(
             query.cuda(),
             key.cuda(),
             value.cuda(),
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
         )
 
     assert actual.shape == query.shape
@@ -368,20 +370,20 @@ def test_native_ragged_lengths_match_the_portable_reference(
 ) -> None:
     query, key, value = _inputs(sequence_length=sequence_length, head_dim=head_dim)
     attention = SparsePiperAttention((0.5, 1.0))
-    sparse_key_blocks = sequence_length // 64
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(sequence_length // 64),))
 
     with torch.no_grad():
         expected = attention(
             query,
             key,
             value,
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
         )
         actual = attention(
             query.cuda(),
             key.cuda(),
             value.cuda(),
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
         ).cpu()
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
@@ -401,9 +403,10 @@ def test_native_ragged_lengths_match_the_portable_reference(
 def test_operator_is_opaque_to_a_full_compile_graph(routing: str) -> None:
     query, key, value = _inputs("cuda", sequence_length=193)
     attention = SparsePiperAttention((0.5, 1.0), routing=routing)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
 
     def run(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        return attention(query, key, value, sparse_key_blocks=3)
+        return attention(query, key, value, key_layout=key_layout)
 
     compiled = torch.compile(run, fullgraph=True)
     with torch.no_grad():
@@ -415,6 +418,8 @@ def test_operator_is_opaque_to_a_full_compile_graph(routing: str) -> None:
 
 @pytest.mark.parametrize("forced", [False, True])
 def test_compiled_attention_reuses_ratio_profiles(forced: bool) -> None:
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
+
     class Model(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -422,7 +427,7 @@ def test_compiled_attention_reuses_ratio_profiles(forced: bool) -> None:
 
         def forward(self, query, key, value, **force_tiles):
             return self.attention(
-                query, key, value, sparse_key_blocks=3, scale=128**-0.5, **force_tiles
+                query, key, value, key_layout=key_layout, scale=128**-0.5, **force_tiles
             )
 
     model = Model()
@@ -457,6 +462,8 @@ def test_compiled_attention_reuses_ratio_profiles(forced: bool) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 @pytest.mark.parametrize("forced", [False, True])
 def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile(forced: bool) -> None:
+    key_layout = sparse_then_dense(12, 16)
+
     class Model(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -464,7 +471,7 @@ def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile(forced: bo
 
         def forward(self, query, key, value, **force_tiles):
             return self.attention(
-                query, key, value, sparse_key_blocks=12, scale=128**-0.5, **force_tiles
+                query, key, value, key_layout=key_layout, scale=128**-0.5, **force_tiles
             )
 
     model = Model().eval()

@@ -42,7 +42,7 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
         model_type = convrot_cases._ConvRotSparseProjectionAttentionOutput
         options = convrot_nvfp4_sparse_piper_compile_options()
     monkeypatch.setattr(model_type, "sequence_length", 1024)
-    monkeypatch.setattr(model_type, "sparse_key_blocks", 12)
+    monkeypatch.setattr(model_type, "num_sparse_blocks", 12)
     model = (model_type(dynamic=False) if weight_format == "convrot_nvfp4" else model_type()).eval()
     inputs = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
@@ -65,7 +65,7 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
             model.sparse_attention = SparsePiperAttention(profile, routing="mean")
             if weight_format == "convrot_int8":
                 expected, _attention = int8_cases._run_explicit_attention_output(
-                    model, inputs, model.cos, model.sin, model.sparse_key_blocks
+                    model, inputs, model.cos, model.sin, model.key_layout
                 )
             elif weight_format == "nvfp4":
                 expected = nvfp4_cases._run_explicit_attention_output(model, inputs)

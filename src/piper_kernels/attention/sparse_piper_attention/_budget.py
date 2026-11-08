@@ -1,4 +1,4 @@
-"""Semantic head budgets and private packed-route layout resolution."""
+"""Semantic head budgets and the resolved packed-route layout."""
 
 from __future__ import annotations
 
@@ -13,16 +13,45 @@ _UINT16_ROUTE_CAPACITY = 1 << 16
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedRouteRegion:
+    """One routed key interval and its destinations in the packed route list."""
+
+    start_key_block: int
+    num_key_blocks: int
+    start_score_block: int
+    head_keep_block_values: tuple[int, ...]
+    route_head_offset_values: tuple[int, ...]
+
+    @property
+    def keeps_all_blocks(self) -> bool:
+        return min(self.head_keep_block_values) == self.num_key_blocks
+
+
+@dataclass(frozen=True, slots=True)
 class _ResolvedRouteLayout:
-    """Layout-specific integer metadata consumed by sparse routing and attention."""
+    """Route metadata for one key layout and query-head range.
+
+    Routes cover the layout's ``num_key_blocks`` complete key blocks, which the
+    attention kernels receive as their routed range. Only a compact partial final
+    tile follows them without a route, so kernels mask that tile alone. Forced
+    IDs share the same domain. ``regions`` partitions the blocks, and
+    ``selector_metadata`` holds one device row per region: start block, length,
+    compact score start, H keep counts, and H packed destinations. Compact scores
+    omit regions that keep every block. Attention consumes only the aggregate
+    counts and offsets.
+    """
 
     head_keep_blocks: torch.Tensor
     route_head_offsets: torch.Tensor
     routes_per_query: int
+    num_key_blocks: int
+    regions: tuple[ResolvedRouteRegion, ...]
+    selector_metadata: torch.Tensor
 
-    def keeps_all_blocks(self, sparse_key_blocks: int) -> bool:
-        """Recognize a full physical budget without inspecting device values."""
-        return self.routes_per_query == self.head_keep_blocks.numel() * sparse_key_blocks
+    @property
+    def keeps_all_blocks(self) -> bool:
+        """Recognize a full routed budget without inspecting device values."""
+        return all(region.keeps_all_blocks for region in self.regions)
 
 
 def _normalize_head_keep_ratios(
@@ -51,9 +80,9 @@ def _normalize_head_keep_ratios(
 
 def _resolve_head_keep_blocks(
     head_keep_ratio_units: tuple[int, ...],
-    sparse_key_blocks: int,
+    num_blocks: int,
 ) -> tuple[int, ...]:
-    """Round ratios to the nearest feasible aggregate without reducing any floor."""
+    """Round one region's ratios to the nearest feasible total without reducing any floor."""
     if not head_keep_ratio_units:
         raise ValueError("sparse Piper ratio profile must be nonempty")
     if any(
@@ -62,16 +91,12 @@ def _resolve_head_keep_blocks(
         raise TypeError("sparse Piper ratio profile must use integer fixed-point values")
     if any(not 1 <= units <= _RATIO_SCALE for units in head_keep_ratio_units):
         raise ValueError("sparse Piper ratio profile contains an invalid fixed-point value")
-    if isinstance(sparse_key_blocks, bool) or not isinstance(sparse_key_blocks, int):
-        raise TypeError("sparse Piper sparse key block count must be an integer")
-    if not 1 <= sparse_key_blocks <= _UINT16_ROUTE_CAPACITY:
-        raise ValueError("sparse Piper sparse key block count must lie in [1, 65,536]")
 
-    numerators = tuple(sparse_key_blocks * units for units in head_keep_ratio_units)
+    numerators = tuple(num_blocks * units for units in head_keep_ratio_units)
     head_keep_blocks = [max(1, numerator // _RATIO_SCALE) for numerator in numerators]
     target_total = (sum(numerators) + _RATIO_SCALE // 2) // _RATIO_SCALE
     target_total = min(
-        len(head_keep_blocks) * sparse_key_blocks,
+        len(head_keep_blocks) * num_blocks,
         max(sum(head_keep_blocks), target_total),
     )
     remaining = target_total - sum(head_keep_blocks)
@@ -82,47 +107,9 @@ def _resolve_head_keep_blocks(
     for head in fractional_order:
         if remaining == 0:
             break
-        if head_keep_blocks[head] < sparse_key_blocks:
+        if head_keep_blocks[head] < num_blocks:
             head_keep_blocks[head] += 1
             remaining -= 1
     if remaining:
         raise RuntimeError("sparse Piper could not realize the requested physical head budget")
     return tuple(head_keep_blocks)
-
-
-def _resolve_route_layout(
-    head_keep_ratio_units: tuple[int, ...],
-    sparse_key_blocks: int,
-    device: torch.device,
-    *,
-    start_head: int = 0,
-    end_head: int | None = None,
-) -> _ResolvedRouteLayout:
-    """Lay out routes for profile heads ``[start_head, end_head)``.
-
-    Rounding distributes blocks across every profile head, so a range keeps the
-    blocks its heads keep when all heads run together.
-    """
-    head_keep_block_values = _resolve_head_keep_blocks(
-        head_keep_ratio_units,
-        sparse_key_blocks,
-    )[start_head:end_head]
-    route_head_offset_values = [0]
-    for count in head_keep_block_values:
-        route_head_offset_values.append(route_head_offset_values[-1] + count)
-    if route_head_offset_values[-1] > torch.iinfo(torch.int32).max:
-        raise ValueError("sparse Piper packed routes exceed INT32 offset capacity")
-
-    # Pinned staging makes the metadata copy legal during CUDA graph capture.
-    metadata = torch.tensor(
-        (*head_keep_block_values, *route_head_offset_values),
-        device="cpu",
-        dtype=torch.int32,
-        pin_memory=device.type == "cuda",
-    ).to(device, non_blocking=True)
-    heads = len(head_keep_block_values)
-    return _ResolvedRouteLayout(
-        head_keep_blocks=metadata[:heads],
-        route_head_offsets=metadata[heads:],
-        routes_per_query=route_head_offset_values[-1],
-    )

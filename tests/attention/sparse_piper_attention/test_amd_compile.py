@@ -128,8 +128,7 @@ def test_output_dtype_amd_compilation(architecture, dtype, head_dim, apply_coars
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_runtime_lengths_support_wide_query_and_context_offsets(architecture, head_dim):
-    # Compile only: a small UINT16 sparse prefix does not bound dense storage.
-    # This also exceeds the signed-32-bit Q uint64-word-offset range.
+    # Compile only: this storage exceeds the signed-32-bit Q uint64-word-offset range.
     storage_sequence_length = (1 << 31) // (head_dim // 8) + 64
     compiled = _compile_attention(
         architecture,

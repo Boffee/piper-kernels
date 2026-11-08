@@ -130,6 +130,16 @@ Device-event timing measures stream work; graph replay removes per-call host
 work. Neither should be compared directly with the suite's synchronized wall
 time. Compiler resource counts describe limits, not achieved occupancy.
 
+The sparse diagnostic routes every complete key block by default. With
+`--sequence 20480`, `--key-regions sparse:100 dense:10 sparse:100 dense:10
+sparse:100` selects a three-video layout, and `--key-regions sparse:300 dense:20`
+pools the same videos into one region. At `--ratios 0.1` both retain 50 blocks per
+head. Use custom layouts without `--case`; saved records include the regions and
+retained complete blocks (the work estimate separately includes valid rows of any
+compact final block). Compare `public_call_wall` for full-call overhead and
+`kernel_graph_median_ms` for prepared attention traversal. Regional and pooled
+selection have different semantics even when their retained block counts match.
+
 The [Piper Attention](tune_piper_attention.py),
 [SageAttention2++](tune_sage_attention_2pp.py), and
 [INT8 linear](tune_convrot_int8_linear.py) tuners accept the same cases and search

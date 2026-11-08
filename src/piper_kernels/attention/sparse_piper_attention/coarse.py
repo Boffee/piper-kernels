@@ -25,32 +25,17 @@ def validate_coarse_scale(coarse_scale: float) -> None:
         raise ValueError("coarse attention scale must be finite and positive")
 
 
-def _resolve_coarse_key_blocks(
-    sparse_key_blocks: int,
-    coarse_key_blocks: int | None,
+def _validate_coarse_key_blocks(
+    num_key_blocks: int,
+    coarse_key_blocks: int,
     *,
     available_coarse_key_blocks: int,
-) -> int:
-    """Resolve a coarse prefix that contains the sparse-routing prefix."""
-    resolved = sparse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
-    if isinstance(resolved, bool):
-        raise TypeError("coarse_key_blocks must be an integer")
-    if torch.compiler.is_compiling():
-        torch._check(
-            resolved >= sparse_key_blocks,
-            lambda: "coarse_key_blocks cannot exclude sparse key blocks",
-        )
-        torch._check(
-            resolved <= available_coarse_key_blocks,
-            lambda: "coarse_key_blocks cannot exceed the available K64 blocks",
-        )
-    elif not isinstance(resolved, int):
-        raise TypeError("coarse_key_blocks must be an integer")
-    elif not sparse_key_blocks <= resolved <= available_coarse_key_blocks:
+) -> None:
+    """Check that a fused coarse scope covers the complete key blocks routing scores."""
+    if not num_key_blocks <= coarse_key_blocks <= available_coarse_key_blocks:
         raise ValueError(
-            "coarse_key_blocks must include the sparse prefix and fit the available K64 blocks"
+            "coarse_key_blocks must cover the complete K64 blocks and fit the available blocks"
         )
-    return resolved
 
 
 def validate_coarse_residual_inputs(
@@ -64,7 +49,7 @@ def validate_coarse_residual_inputs(
     *,
     routing_label: str,
 ) -> int:
-    """Validate the shared contract and resolve the coarse K64 prefix length."""
+    """Validate the shared contract and resolve the coarse scope's K64 block count."""
     tensors = (query, key, value, coarse_gate)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError(

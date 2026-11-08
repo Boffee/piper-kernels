@@ -2,12 +2,9 @@
 
 import pytest
 import torch
+from _key_layouts import counted_route_layout
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-)
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteAndCoarseBuilder,
@@ -52,7 +49,6 @@ def packed_mean_pool_routes_and_coarse_from_summaries(
     pooled_value,
     layout,
     *,
-    sparse_key_blocks,
     coarse_scale,
 ):
     return packed_routes_and_coarse_from_summaries(
@@ -61,22 +57,8 @@ def packed_mean_pool_routes_and_coarse_from_summaries(
         key_mean[:, :, :0],
         pooled_value,
         layout,
-        sparse_key_blocks=sparse_key_blocks,
         coarse_scale=coarse_scale,
         routing_mode=_MEAN_ROUTING,
-    )
-
-
-def _layout(
-    head_keep_block_values: tuple[int, ...],
-    sparse_key_blocks: int,
-    device: torch.device | str = "cpu",
-):
-    ratios = tuple(value / sparse_key_blocks for value in head_keep_block_values)
-    return _resolve_route_layout(
-        _normalize_head_keep_ratios(ratios),
-        sparse_key_blocks,
-        torch.device(device),
     )
 
 
@@ -94,7 +76,7 @@ def test_summary_routes_use_per_head_mean_dot_products() -> None:
         ],
         dtype=torch.float32,
     )
-    layout = _layout((1, 2), 3)
+    layout = counted_route_layout((1, 2), 3)
 
     routes = packed_mean_pool_routes_from_summaries(query_mean, key_mean, layout)
 
@@ -109,7 +91,7 @@ def test_exact_score_ties_prefer_lower_key_index() -> None:
     routes = packed_mean_pool_routes_from_summaries(
         query_mean,
         key_mean,
-        _layout((2,), 4),
+        counted_route_layout((2,), 4),
     )
 
     assert routes.indices.tolist() == [[[0, 1], [0, 1]]]
@@ -119,7 +101,7 @@ def test_sequence_routes_match_explicit_compact_block_means() -> None:
     generator = torch.Generator().manual_seed(71)
     query = torch.randn((1, 2, 2 * 64 + 17, 128), dtype=torch.bfloat16, generator=generator)
     key = torch.randn((1, 2, 3 * 64, 128), dtype=torch.bfloat16, generator=generator)
-    layout = _layout((1, 2), 3)
+    layout = counted_route_layout((1, 2), 3)
 
     actual = packed_mean_pool_routes_from_sequences(query, key, layout)
     query_blocks = query[:, :, : 2 * 64].unflatten(2, (2, 64)).float()
@@ -141,7 +123,7 @@ def test_ragged_query_mean_uses_only_logical_rows() -> None:
     key = torch.zeros((1, 1, 64, 128), dtype=torch.bfloat16)
 
     query_mean = _sequence_block_means(query)
-    routes = packed_mean_pool_routes_from_sequences(query, key, _layout((1,), 1))
+    routes = packed_mean_pool_routes_from_sequences(query, key, counted_route_layout((1,), 1))
 
     torch.testing.assert_close(query_mean[:, :, 0], torch.full_like(query_mean[:, :, 0], 2))
     torch.testing.assert_close(query_mean[:, :, 1], torch.full_like(query_mean[:, :, 1], 7))
@@ -153,8 +135,8 @@ def test_route_and_coarse_path_reuses_chunked_mean_scores() -> None:
     query_mean = torch.randn((1, 2, 385, 8), generator=generator)
     key_mean = torch.randn((1, 2, 5, 8), generator=generator)
     pooled_value = torch.randn((1, 2, 5, 6), generator=generator)
-    sparse_key_blocks = 3
-    layout = _layout((1, 2), sparse_key_blocks)
+    num_sparse_blocks = 3
+    layout = counted_route_layout((1, 2), num_sparse_blocks)
     coarse_scale = 8**-0.5
 
     actual = packed_mean_pool_routes_and_coarse_from_summaries(
@@ -162,12 +144,11 @@ def test_route_and_coarse_path_reuses_chunked_mean_scores() -> None:
         key_mean,
         pooled_value,
         layout,
-        sparse_key_blocks=sparse_key_blocks,
         coarse_scale=coarse_scale,
     )
     expected_routes = packed_mean_pool_routes_from_summaries(
         query_mean,
-        key_mean[:, :, :sparse_key_blocks],
+        key_mean[:, :, :num_sparse_blocks],
         layout,
     )
     expected_output = torch.softmax((query_mean @ key_mean.mT) * coarse_scale, dim=-1)
@@ -180,12 +161,11 @@ def test_route_and_coarse_path_reuses_chunked_mean_scores() -> None:
 def test_route_and_coarse_builder_places_out_of_order_query_chunks_by_offset() -> None:
     pooled_value = torch.tensor([[[[1.0], [3.0]]]])
     builder = PackedRouteAndCoarseBuilder(
-        _layout((1,), 2),
+        counted_route_layout((1,), 2),
         pooled_value,
         batch=1,
         heads=1,
         query_blocks=2,
-        sparse_key_blocks=2,
         device=torch.device("cpu"),
     )
     first_scores = torch.tensor([[[[2.0, 0.0]]]])

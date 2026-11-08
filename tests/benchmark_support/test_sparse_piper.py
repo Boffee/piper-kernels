@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from benchmark_sparse_piper import _parse_args
+from benchmark_sparse_piper import _parse_args, _parse_key_layout
 from lib.sparse_piper import (
     assert_equal_finite,
     reference_prepared_query,
@@ -10,6 +10,7 @@ from lib.sparse_piper import (
     useful_integer_operations,
 )
 
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperAttention,
@@ -44,6 +45,46 @@ def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
     assert args.samples == 3
 
 
+def test_default_diagnostic_layout_routes_every_complete_block():
+    assert _parse_key_layout(None, 100000) == SparsePiperKeyLayout((SparsePiperKeyRegion(1562),))
+    assert _parse_args(["--sequence", "1100", "--key-regions", "sparse:17"]).sequence == [1100]
+
+
+def test_region_diagnostic_retains_independent_budgets_and_dense_blocks():
+    args = _parse_args(
+        [
+            "--sequence",
+            "20480",
+            "--key-regions",
+            "sparse:100",
+            "dense:20",
+            "sparse:100",
+            "sparse:100",
+            "--ratios",
+            "0.1",
+        ]
+    )
+    key_layout = _parse_key_layout(args.key_regions, args.sequence[0])
+    budgets = SparsePiperAttention((0.1,)).resolve_keep_blocks(key_layout)
+    assert budgets == ((10,), (20,), (10,), (10,))
+    assert sum(region[0] for region in budgets) == 50
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--key-regions", "sparse:2"],
+        ["--key-regions", "unknown:16"],
+        ["--sequence", "1024", "--key-regions", "dense:16"],
+        ["--sequence", "1100", "--key-regions", "sparse:18"],
+        ["--case", "sparse-attention-video-high-eighth", "--key-regions", "sparse:1728"],
+    ],
+)
+def test_region_diagnostic_rejects_invalid_or_incomplete_layouts(options):
+    with pytest.raises(SystemExit):
+        _parse_args(options)
+
+
 def test_catalog_case_preserves_sparse_workload_and_rejects_overrides():
     args = _parse_args(["--case", "sparse-attention-video-high-eighth"])
     assert args.sequence == [110592]
@@ -69,6 +110,11 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         -127, 128, (2, kv_heads, head_dim, 256), dtype=torch.int8, generator=generator
     )
     mean = torch.randn((2, kv_heads, head_dim), generator=generator)
+    # Routes cover the complete blocks: all four padded blocks, or the first three of
+    # the 193-row compact sequence, whose one-row final tile is read after them.
+    dense_routes = [2, 3] if internal_padding else [2]
+    head_routes = ([1, *dense_routes], [0, 1, *dense_routes])
+    counts = [len(routes) for routes in head_routes]
     context = _PreparedSparsePiperContext(
         key=torch.zeros((2, kv_heads, 256, head_dim), dtype=torch.int8),
         value=reference_value_storage(value, value_format),
@@ -76,18 +122,19 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         key_scale=torch.ones((2, kv_heads, 4)),
         value_scale_multiplier=torch.full((2, kv_heads, 4, 1), 255.0),
         value_mean=mean,
-        route_head_offsets=torch.tensor([0, 1, 3], dtype=torch.int32),
-        head_keep_blocks=torch.tensor([1, 2], dtype=torch.int32),
-        routes_per_query=3,
+        route_head_offsets=torch.tensor([0, counts[0], sum(counts)], dtype=torch.int32),
+        head_keep_blocks=torch.tensor(counts, dtype=torch.int32),
+        routes_per_query=sum(counts),
         block_lengths=torch.tensor(lengths, dtype=torch.int32) if internal_padding else None,
-        sparse_key_blocks=2,
         sparse_query_blocks=2,
         logical_sequence_length=256 if internal_padding else 193,
     )
     query = _PreparedSparsePiperQuery(
         data=torch.zeros((2, 2, (4 - global_offset) * 64, head_dim), dtype=torch.int8),
         scale=torch.ones((2, 2, (4 - global_offset) * 2)),
-        routes=torch.tensor([1, 1, 0], dtype=torch.uint16).repeat(2, 4 - global_offset, 1),
+        routes=torch.tensor([*head_routes[0], *head_routes[1]], dtype=torch.uint16).repeat(
+            2, 4 - global_offset, 1
+        ),
         global_block_offset=global_offset,
     )
     prepared = _PreparedSparsePiperAttention(Mock(context=context), query)
@@ -96,9 +143,9 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
             kv_head = head // (2 // kv_heads)
             for block in range(4 - global_offset):
                 global_block = block + global_offset
-                prefix = [1] if head == 0 and global_block < 2 else [0, 1]
+                selected = [1] if head == 0 and global_block < 2 else [0, 1]
                 indices = [
-                    tile * 64 + row for tile in [*prefix, 2, 3] for row in range(lengths[tile])
+                    tile * 64 + row for tile in [*selected, 2, 3] for row in range(lengths[tile])
                 ]
                 expected = (
                     value[batch, kv_head, :, indices].double().mean(dim=1)

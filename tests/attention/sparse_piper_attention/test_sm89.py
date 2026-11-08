@@ -6,14 +6,13 @@ from dataclasses import replace
 import pytest
 import torch
 
+from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
-from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-)
+from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
+from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -67,7 +66,11 @@ def _prepare(
     )
     blocks = sequence // 64
     head_major = [tensor.transpose(1, 2) for tensor in (query, key, value)]
-    layout = _resolve_route_layout(_normalize_head_keep_ratios(ratios), blocks, query.device)
+    layout = resolve_route_layout(
+        _normalize_head_keep_ratios(ratios),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(blocks),)),
+        query.device,
+    )
     routes = packed_routes_from_sequences(
         head_major[0],
         head_major[1][:, :, : blocks * 64],
@@ -80,7 +83,6 @@ def _prepare(
     prepared = backend.prepare(
         head_major[0],
         head_dim**-0.5,
-        sparse_key_blocks=blocks,
         combined_key=head_major[1],
         combined_value=head_major[2],
         block_lengths=block_lengths,
@@ -119,10 +121,8 @@ def _fp64_query_block(prepared, head, query_block):
         start, stop = context.route_head_offsets[head : head + 2].tolist()
         tiles = query.routes[0, query_block, start:stop].long()
     else:
-        tiles = torch.arange(context.sparse_key_blocks, device=device)
-    tiles = torch.cat(
-        (tiles, torch.arange(context.sparse_key_blocks, stored_blocks, device=device))
-    )
+        tiles = torch.arange(context.num_key_blocks, device=device)
+    tiles = torch.cat((tiles, torch.arange(context.num_key_blocks, stored_blocks, device=device)))
     tile_count = tiles.numel()
     if tile_count % 2:
         tiles = torch.cat((tiles, tiles[-1:]))
@@ -480,7 +480,6 @@ def test_last_head_addresses_beyond_signed_32_bit_offsets(head_dim):
         torch.zeros((1, kv_heads, head_dim), device="cuda"),
         torch.ones(kv_heads, device="cuda", dtype=torch.int32),
         torch.arange(kv_heads + 1, device="cuda", dtype=torch.int32),
-        sparse_key_blocks=tiles,
         routes_per_query=kv_heads,
         logical_sequence_length=storage,
         value_format=ValueFormat.TRANSPOSED,

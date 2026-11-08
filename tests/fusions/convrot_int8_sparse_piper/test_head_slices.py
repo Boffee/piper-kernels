@@ -5,6 +5,7 @@ import re
 import pytest
 import torch
 from _compile_capture import FunctionalTargetCapturePass
+from _key_layouts import sparse_layout
 from torch._dynamo.utils import ReinplaceCounters
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F  # noqa: N812
@@ -48,7 +49,7 @@ class _Attention(_SparseProjectionAttentionOutput):
 
     heads = _HEADS
     sequence_length = _SEQUENCE
-    sparse_key_blocks = _KEY_BLOCKS
+    num_sparse_blocks = _KEY_BLOCKS
     output_features = _WIDTH
 
     def __init__(self) -> None:
@@ -62,8 +63,7 @@ class _CoarseAttention(_ProjectedGateCoarseSparseAttentionOutput):
 
     heads = _HEADS
     sequence_length = _SEQUENCE
-    sparse_key_blocks = _KEY_BLOCKS
-    coarse_key_blocks = _KEY_BLOCKS
+    num_sparse_blocks = _KEY_BLOCKS
     output_features = _WIDTH
 
     def __init__(self) -> None:
@@ -76,8 +76,7 @@ class _MaterializedGateAttention(_CoarseSparseProjectionAttentionOutput):
 
     heads = _HEADS
     sequence_length = _SEQUENCE
-    sparse_key_blocks = _KEY_BLOCKS
-    coarse_key_blocks = _KEY_BLOCKS
+    num_sparse_blocks = _KEY_BLOCKS
     output_features = _WIDTH
 
     def __init__(self) -> None:
@@ -244,7 +243,7 @@ def test_head_slices_add_what_one_add_does():
             _HEAD_DIM**-0.5,
             *context,
             attention._ratio_profile,
-            _KEY_BLOCKS,
+            sparse_layout(_KEY_BLOCKS),
             _SEQUENCE,
             attention._routing_mode,
             output_weight[:, rows].contiguous(),
