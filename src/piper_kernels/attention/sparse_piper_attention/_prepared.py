@@ -47,13 +47,6 @@ class _PreparedSparsePiperContext:
     sparse_query_blocks: int | None
     logical_sequence_length: int
 
-    @property
-    def num_key_blocks(self) -> int:
-        """Complete K64 key blocks, which routes cover; a compact ragged tile follows."""
-        if self.block_lengths is not None:
-            return self.block_lengths.numel()
-        return self.logical_sequence_length // TILE_ROWS
-
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperQuery:

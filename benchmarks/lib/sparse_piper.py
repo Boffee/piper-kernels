@@ -38,7 +38,7 @@ def assert_equal_finite(actual: torch.Tensor, expected: torch.Tensor) -> None:
         torch.testing.assert_close(left, right, rtol=0, atol=0)
 
 
-def reference_prepared_query(
+def reference_prepared_query(  # noqa: PLR0915
     prepared: _PreparedSparsePiperAttention,
     batch: int,
     head: int,
@@ -58,13 +58,19 @@ def reference_prepared_query(
     device = query.data.device
     global_block = query.global_block_offset + query_block
     stored_blocks = context.key.shape[2] // 64
+    # Routes cover the complete blocks; a compact ragged tile follows them.
+    num_key_blocks = (
+        stored_blocks
+        if context.block_lengths is not None
+        else context.logical_sequence_length // 64
+    )
     use_routes = context.sparse_query_blocks is None or global_block < context.sparse_query_blocks
     if use_routes and context.routes_per_query != 0:
         start, stop = context.route_head_offsets[head : head + 2].tolist()
         tiles = query.routes[batch, query_block, start:stop].long()
     else:
-        tiles = torch.arange(context.num_key_blocks, device=device)
-    tiles = torch.cat((tiles, torch.arange(context.num_key_blocks, stored_blocks, device=device)))
+        tiles = torch.arange(num_key_blocks, device=device)
+    tiles = torch.cat((tiles, torch.arange(num_key_blocks, stored_blocks, device=device)))
     tile_count = tiles.numel()
     if tile_count % 2:
         tiles = torch.cat((tiles, tiles[-1:]))
