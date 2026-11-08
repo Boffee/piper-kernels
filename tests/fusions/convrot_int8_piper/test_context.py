@@ -158,7 +158,8 @@ def test_causal_value_does_not_reduce_or_depend_on_future_rows(monkeypatch):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
+    not torch.cuda.is_available()
+    or not AcceleratorTarget.from_device(torch.device("cuda")).is_nvidia_cuda,
     reason="NVIDIA native comparison",
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
