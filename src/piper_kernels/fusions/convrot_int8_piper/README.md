@@ -65,7 +65,12 @@ projection storage and FP32 statistics. `convrot_int8_sage_qk.key` owns K
 transforms and centered K encoding, with optional sparse routing summaries.
 Dense V's per-token quantization remains distinct from sparse V's tile scales.
 Typed backend methods operate on caller-owned buffers; target launch choices
-live in separate NVIDIA/RDNA4 modules, and SM89's Triton launchers use one-head
+live in separate NVIDIA/RDNA4 modules. On SM89, D128 dense and sparse
+projections run Gluon kernels built from the shared
+`convrot_int8_projection/_nvidia/fragments.py`: the SM8x ConvRot INT8 GEMM
+pipeline, the register-layout RMSNorm/RoPE/Hadamard tile, and the centered-K
+stores. As in sparse Piper, the NVIDIA policy resolves each projection's plan;
+other SM89 shapes and unaligned operands use the Triton launchers with one-head
 64-row tiles. [_backend.py](_backend.py) provides optional selection for
 matching and required selection for validated execution.
 

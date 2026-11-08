@@ -3,9 +3,7 @@
 from dataclasses import replace
 
 from piper_kernels._triton.targets import AcceleratorTarget
-
-from .._layout import TILE_ROWS
-from ._plan import (
+from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import (
     GLUON_BLOCK_K,
     GLUON_BLOCK_M,
     GLUON_NUM_STAGES,
@@ -13,6 +11,8 @@ from ._plan import (
     NvidiaExecutionPlan,
     ProjectionOperation,
 )
+
+from .._layout import TILE_ROWS
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
