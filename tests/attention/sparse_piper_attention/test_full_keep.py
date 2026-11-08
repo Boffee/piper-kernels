@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _key_layouts import route_layout
 
 from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention import _backend, _routes, _routing
@@ -12,8 +13,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-
-from ._layouts import route_layout
 
 requires_native = pytest.mark.skipif(
     not torch.cuda.is_available()

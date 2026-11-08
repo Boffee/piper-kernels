@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _key_layouts import counted_route_layout, sparse_then_dense
 
 from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention import _backend
@@ -11,8 +12,6 @@ from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteBuilder,
 )
 from piper_kernels.attention.sparse_piper_attention.coarse import coarse_attention
-
-from ._layouts import counted_route_layout
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -118,7 +117,7 @@ def test_public_forced_routes_and_dense_query_suffix(device, routing):
         q,
         q,
         v,
-        key_layout=SparsePiperKeyLayout.prefix(8, 9),
+        key_layout=sparse_then_dense(8, 9),
         sparse_query_blocks=8,
         force_tile_ids=ids,
         force_tile_counts=counts,

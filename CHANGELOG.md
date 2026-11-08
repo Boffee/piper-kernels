@@ -11,9 +11,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `key_layout=SparsePiperKeyLayout(...)` of ordered `SparsePiperKeyRegion` values
   instead of `sparse_key_blocks`. Each sparse region keeps its own per-head budget,
   so several videos no longer compete for one pooled budget; dense regions may sit
-  between them, within one softmax. Replace `sparse_key_blocks=n` with
-  `key_layout=SparsePiperKeyLayout.prefix(n, sequence_length // 64)`, which attends
-  the same keys. `resolve_keep_blocks(layout)` replaces
+  between them, within one softmax. Replace `sparse_key_blocks=n` with a layout of
+  `SparsePiperKeyRegion(n)` followed, when blocks remain, by a dense region over the
+  rest of the sequence's `sequence_length // 64` complete blocks; it attends the same
+  keys. `resolve_keep_blocks(layout)` replaces
   `resolve_head_keep_blocks()` and returns per-region budgets. Construct layouts
   outside compiled forwards: changing a layout, including its block count, reuses
   the compiled graph, where a changed `sparse_key_blocks` integer could recompile.

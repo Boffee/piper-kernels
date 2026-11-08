@@ -65,14 +65,15 @@ uses sequence-major tensors and one keep ratio per **query** head.
 
 ```python
 import torch
-from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 q = torch.randn(1, 193, 4, 64, device=device, dtype=torch.bfloat16)
 k = torch.randn(1, 193, 2, 64, device=device, dtype=torch.bfloat16)
 v = torch.randn_like(k)
 attention = SparsePiperAttention((0.5, 0.5, 1.0, 1.0), routing="minmax")
-key_layout = SparsePiperKeyLayout.prefix(2, 193 // 64)  # 2 sparse blocks, then dense
+# 193 rows hold three complete K64 blocks: two sparse, then one dense.
+key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(2), SparsePiperKeyRegion(1, sparse=False)))
 
 with torch.inference_mode():
     output = attention(q, k, v, key_layout=key_layout, sparse_query_blocks=2)
@@ -136,8 +137,7 @@ The regions must cover the sequence's complete K64 blocks exactly, at most 65,53
 and include at least one sparse region. A compact partial final block is always
 attended. Pad region boundaries that do not fall on a multiple of 64 rows and
 use `block_lengths` to exclude the padding. The partition is shared across
-batches, queries, and heads. `SparsePiperKeyLayout.prefix(num_sparse_blocks,
-num_blocks)` builds the common case of one sparse region followed by dense keys.
+batches, queries, and heads.
 
 Budgets round across heads independently within each sparse region, with at least
 one block per head per region. Regions cannot borrow each other's budget; small

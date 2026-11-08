@@ -9,12 +9,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
+from _key_layouts import sparse_then_dense
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
-from piper_kernels import SparsePiperKeyLayout
 from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
@@ -417,7 +417,7 @@ def test_dtensor_attention_reuses_symbolic_sequence_length(mesh, format_name):
         torch._dynamo.mark_dynamic(value, 1)
         torch._dynamo.mark_dynamic(cos, 0)
         torch._dynamo.mark_dynamic(sin, 0)
-        inputs.append((value, cos, sin, SparsePiperKeyLayout.prefix(2, rows // 64)))
+        inputs.append((value, cos, sin, sparse_then_dense(2, rows // 64)))
     with torch.no_grad():
         local, local_capture = _compile_with_capture(model, _ATTENTION_OPTIONS[format_name])
         expected = [local(*values) for values in inputs]

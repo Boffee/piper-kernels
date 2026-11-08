@@ -13,11 +13,11 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 import triton
+from _key_layouts import sparse_layout
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-from piper_kernels import SparsePiperKeyLayout
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
@@ -307,7 +307,7 @@ def _run_output_fusion(projected_query, operands, storage):
         "value_scale_multiplier": storage,
         "value_mean": storage,
         "ratio_profile": _SparsePiperRatioProfile((2, 2, 2)),
-        "key_layout": SparsePiperKeyLayout.prefix(3, 3),
+        "key_layout": sparse_layout(3),
         "logical_sequence_length": 193,
         "routing_mode": _MINMAX_ROUTING,
         "weight_qdata": storage,

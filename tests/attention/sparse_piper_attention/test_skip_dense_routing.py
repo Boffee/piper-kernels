@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _key_layouts import route_layout
 
 from piper_kernels.attention.sparse_piper_attention import _routing
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
@@ -11,8 +12,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_sparse_piper_attention,
 )
-
-from ._layouts import route_layout
 
 
 def _unexpected(*args, **kwargs):

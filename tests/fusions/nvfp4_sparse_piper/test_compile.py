@@ -6,6 +6,7 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
+from _key_layouts import sparse_then_dense
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -128,9 +129,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         self.register_buffer("cos", angles.cos().contiguous())
         self.register_buffer("sin", angles.sin().contiguous())
         self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
-        self.key_layout = SparsePiperKeyLayout.prefix(
-            self.num_sparse_blocks, self.sequence_length // 64
-        )
+        self.key_layout = sparse_then_dense(self.num_sparse_blocks, self.sequence_length // 64)
 
     def set_activation_dtype(self, dtype: torch.dtype) -> None:
         for projection in self.modules():
@@ -899,7 +898,7 @@ def test_cuda_compile_fuses_regional_layouts_into_one_graph(monkeypatch) -> None
             )
         ),
         SparsePiperKeyLayout((SparsePiperKeyRegion(5), SparsePiperKeyRegion(5))),
-        SparsePiperKeyLayout.prefix(6, 10),
+        sparse_then_dense(6, 10),
     )
     capture = TargetCapturePass()
     torch._dynamo.reset()

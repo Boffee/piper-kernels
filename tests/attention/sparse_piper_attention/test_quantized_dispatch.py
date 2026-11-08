@@ -2,9 +2,10 @@
 
 import pytest
 import torch
+from _key_layouts import sparse_layout, sparse_then_dense
 from lib.sparse_piper import reference_value_storage
 
-from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.kernels.sparse_piper.layout import (
     QUERY_SCALE_ROWS,
     TILE_ROWS,
@@ -106,7 +107,7 @@ def test_coarse_epilogue_rounds_only_after_combining_fine_and_residual(sequence_
     blocks = sequence_length // 64
     layout = resolve_route_layout(
         _normalize_head_keep_ratios((1.0,)),
-        SparsePiperKeyLayout.prefix(blocks, blocks),
+        sparse_layout(blocks),
         query.device,
     )
     routes = packed_routes_from_sequences(query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING)
@@ -155,7 +156,7 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
     sparse_key = key_head_major[:, :, : num_sparse_blocks * 64]
-    key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, num_sparse_blocks)
+    key_layout = sparse_layout(num_sparse_blocks)
     layout = resolve_route_layout(ratio_units, key_layout, query.device)
     routes = packed_minmax_pool_routes_from_sequences(query_head_major, sparse_key, layout)
     query_summary, key_max, key_min = _minmax_pool_block_summaries(
@@ -279,7 +280,7 @@ def test_quantized_coarse_residual_matches_fp32_composition(
     coarse_key_blocks = (shape[1] + 63) // 64
     sparse_key = key_head_major[:, :, : num_sparse_blocks * 64]
     ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
-    key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, num_sparse_blocks)
+    key_layout = sparse_layout(num_sparse_blocks)
     layout = resolve_route_layout(ratio_units, key_layout, query.device)
     placeholder_routes = packed_minmax_pool_routes_from_sequences(
         query_head_major,
@@ -384,7 +385,7 @@ def test_query_block_ranges_match_full_launch_and_preserve_guards(
     num_sparse_blocks = sequence_length // 64
     layout = resolve_route_layout(
         _normalize_head_keep_ratios((0.5, 1.0)),
-        SparsePiperKeyLayout.prefix(num_sparse_blocks, num_sparse_blocks),
+        sparse_layout(num_sparse_blocks),
         query.device,
     )
     routes = packed_minmax_pool_routes_from_sequences(
@@ -498,7 +499,7 @@ def _block_length_case(routing_mode: int, head_dim: int):
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
     num_sparse_blocks = 2
-    key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, storage_sequence_length // 64)
+    key_layout = sparse_then_dense(num_sparse_blocks, storage_sequence_length // 64)
     ratio_units = _normalize_head_keep_ratios((1.0, 1.0))
     layout = resolve_route_layout(ratio_units, key_layout, query.device)
     routes = packed_minmax_pool_routes_from_sequences(
@@ -726,7 +727,7 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
     num_sparse_blocks = 2
-    key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, shape[1] // 64)
+    key_layout = sparse_then_dense(num_sparse_blocks, shape[1] // 64)
     ratio_units = _normalize_head_keep_ratios((0.5, 1.0))
     layout = resolve_route_layout(ratio_units, key_layout, query.device)
     placeholder_routes = packed_minmax_pool_routes_from_sequences(

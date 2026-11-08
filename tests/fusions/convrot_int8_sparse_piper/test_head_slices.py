@@ -5,11 +5,12 @@ import re
 import pytest
 import torch
 from _compile_capture import FunctionalTargetCapturePass
+from _key_layouts import sparse_layout
 from torch._dynamo.utils import ReinplaceCounters
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
@@ -242,7 +243,7 @@ def test_head_slices_add_what_one_add_does():
             _HEAD_DIM**-0.5,
             *context,
             attention._ratio_profile,
-            SparsePiperKeyLayout.prefix(_KEY_BLOCKS, _KEY_BLOCKS),
+            sparse_layout(_KEY_BLOCKS),
             _SEQUENCE,
             attention._routing_mode,
             output_weight[:, rows].contiguous(),

@@ -1,8 +1,8 @@
 """Portable Sparse Piper reference tests."""
 
 import torch
+from _key_layouts import sparse_then_dense
 
-from piper_kernels import SparsePiperKeyLayout
 from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
 from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import (
@@ -31,7 +31,7 @@ def _inputs() -> tuple[
     value = torch.randn(shape, dtype=torch.bfloat16, generator=generator)
     layout = resolve_route_layout(
         _normalize_head_keep_ratios((0.5, 1.0)),
-        SparsePiperKeyLayout.prefix(2, 3),
+        sparse_then_dense(2, 3),
         torch.device("cpu"),
     )
     routes = packed_routes_from_sequences(

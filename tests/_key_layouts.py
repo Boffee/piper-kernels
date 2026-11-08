@@ -1,4 +1,4 @@
-"""Resolved route layouts shared by sparse Piper routing tests."""
+"""Key layouts and resolved route layouts shared by sparse Piper tests."""
 
 from __future__ import annotations
 
@@ -17,6 +17,18 @@ from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_r
 def sparse_layout(num_blocks: int) -> SparsePiperKeyLayout:
     """Return one sparse region over every block."""
     return SparsePiperKeyLayout((SparsePiperKeyRegion(num_blocks),))
+
+
+def sparse_then_dense(num_sparse_blocks: int, num_blocks: int) -> SparsePiperKeyLayout:
+    """Return ``num_sparse_blocks`` sparse blocks, then dense blocks through ``num_blocks``."""
+    if num_sparse_blocks == num_blocks:
+        return sparse_layout(num_blocks)
+    return SparsePiperKeyLayout(
+        (
+            SparsePiperKeyRegion(num_sparse_blocks),
+            SparsePiperKeyRegion(num_blocks - num_sparse_blocks, sparse=False),
+        )
+    )
 
 
 def route_layout(

@@ -86,16 +86,6 @@ class SparsePiperKeyLayout(CustomClassBase):
         if self.num_blocks > _UINT16_ROUTE_CAPACITY:
             raise ValueError("key layout must cover at most 65536 physical blocks")
 
-    @classmethod
-    def prefix(cls, num_sparse_blocks: int, num_blocks: int) -> SparsePiperKeyLayout:
-        """Return ``num_sparse_blocks`` sparse blocks followed by a dense remainder."""
-        sparse = SparsePiperKeyRegion(num_sparse_blocks)
-        if num_blocks == num_sparse_blocks:
-            return cls((sparse,))
-        if num_blocks < num_sparse_blocks:
-            raise ValueError("sparse key blocks cannot exceed the layout's block count")
-        return cls((sparse, SparsePiperKeyRegion(num_blocks - num_sparse_blocks, sparse=False)))
-
     @property
     def num_blocks(self) -> int:
         """Return the total number of physical 64-token blocks in the partition."""

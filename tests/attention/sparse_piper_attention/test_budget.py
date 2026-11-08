@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _key_layouts import sparse_layout
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import SparsePiperAttention
@@ -10,8 +11,6 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_head_keep_blocks,
 )
 from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
-
-from ._layouts import sparse_layout
 
 
 def test_h3_ratio_profile_resolves_exact_physical_budget() -> None:

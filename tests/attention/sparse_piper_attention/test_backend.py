@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _key_layouts import sparse_then_dense
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
@@ -941,7 +942,7 @@ def test_unsupported_gpu_retains_portable_attention(monkeypatch, routing, sequen
     if _backend.select_attention_backend(device_operands[0]) is not None:
         pytest.skip("this test exercises devices without a native sparse-attention backend")
     attention = dispatch.SparsePiperAttention((0.5,), routing=routing)
-    key_layout = SparsePiperKeyLayout.prefix(2, sequence_length // 64)
+    key_layout = sparse_then_dense(2, sequence_length // 64)
     expected = attention(*operands, key_layout=key_layout, sparse_query_blocks=1)
     reference = Mock(wraps=dispatch.reference_sparse_piper_attention)
     monkeypatch.setattr(dispatch, "reference_sparse_piper_attention", reference)

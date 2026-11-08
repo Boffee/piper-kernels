@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _key_layouts import counted_route_layout
 
 from piper_kernels import SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -14,8 +15,6 @@ from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteBuilder,
     _select_portable_routes,
 )
-
-from ._layouts import counted_route_layout
 
 pytestmark = pytest.mark.gpu
 

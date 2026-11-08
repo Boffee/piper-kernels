@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 from _accelerators import exact_sm120_available
+from _key_layouts import sparse_layout
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -12,7 +13,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout
+from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -101,7 +102,7 @@ def _arguments(
     )
     attention = SparsePiperAttention((0.5, 1.0))
     key_blocks = sequence_length // 64
-    key_layout = SparsePiperKeyLayout.prefix(key_blocks, key_blocks)
+    key_layout = sparse_layout(key_blocks)
 
     dense_weight = torch.randn(
         (_OUTPUT_FEATURES, _HEADS * _HEAD_DIM),
@@ -524,7 +525,7 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         torch.empty((1, 2, 3, 1), device="meta", dtype=torch.float32),
         torch.empty((1, 2, 128), device="meta", dtype=torch.float32),
         _SparsePiperRatioProfile((500_000, 1_000_000)),
-        SparsePiperKeyLayout.prefix(2, 2),
+        sparse_layout(2),
         191,
         0,
         torch.empty((_OUTPUT_FEATURES, 128), device="meta", dtype=torch.uint8),

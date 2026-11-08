@@ -3,6 +3,7 @@
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
+from _key_layouts import sparse_layout, sparse_then_dense
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import (
@@ -143,7 +144,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         self.register_buffer("cos", cos)
         self.register_buffer("sin", sin)
         self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
-        self.key_layout = SparsePiperKeyLayout.prefix(
+        self.key_layout = sparse_then_dense(
             self.num_sparse_blocks, self.sequence_length // TILE_ROWS
         )
 
@@ -1541,7 +1542,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
             (1024, 9),
         )
         for sequence, num_sparse_blocks in cases:
-            key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, sequence // TILE_ROWS)
+            key_layout = sparse_then_dense(num_sparse_blocks, sequence // TILE_ROWS)
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -1604,7 +1605,7 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     cases = ((193, 2), (256, 3), (257, 3))
     with torch.no_grad():
         for sequence, num_sparse_blocks in cases:
-            key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, sequence // TILE_ROWS)
+            key_layout = sparse_then_dense(num_sparse_blocks, sequence // TILE_ROWS)
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -1690,8 +1691,8 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
     ).mul_(2 * torch.pi)
     cos = angles.cos().contiguous()
     sin = angles.sin().contiguous()
-    wide_layout = SparsePiperKeyLayout.prefix(2, sequence // TILE_ROWS)
-    narrow_layout = SparsePiperKeyLayout.prefix(3, sequence // TILE_ROWS)
+    wide_layout = sparse_then_dense(2, sequence // TILE_ROWS)
+    narrow_layout = sparse_then_dense(3, sequence // TILE_ROWS)
     capture = TargetCapturePass()
     options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
@@ -1753,7 +1754,7 @@ def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
         # Cross two default chunk boundaries without retracing.
         long_sequence = 2 * output_fusion._DEFAULT_QUERY_CHUNK_ROWS + 1
         for sequence, num_sparse_blocks in ((193, 2), (256, 3), (257, 3), (long_sequence, 120)):
-            key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, sequence // TILE_ROWS)
+            key_layout = sparse_then_dense(num_sparse_blocks, sequence // TILE_ROWS)
             hidden_states = torch.randn(
                 model.batch,
                 sequence,
@@ -1857,7 +1858,7 @@ def test_forced_output_fusion_reuses_dynamic_shapes_and_runtime_contents(monkeyp
             angles = torch.randn(sequence, model.rotary_dim, device="cuda")
             cos, sin = angles.cos(), angles.sin()
             blocks = sequence // 64
-            key_layout = SparsePiperKeyLayout.prefix(blocks, blocks)
+            key_layout = sparse_layout(blocks)
             ids = (
                 (
                     torch.arange(blocks, device="cuda")[:, None]

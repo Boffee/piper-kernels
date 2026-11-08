@@ -3,6 +3,7 @@
 import pytest
 import torch
 from _compile_capture import FunctionalTargetCapturePass
+from _key_layouts import sparse_then_dense
 
 from piper_kernels import (
     SparsePiperAttention,
@@ -218,7 +219,7 @@ def test_regional_residual_reuses_graph_for_layouts_and_sequence_lengths():
         SparsePiperKeyLayout((SparsePiperKeyRegion(8), SparsePiperKeyRegion(8))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(8), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(2, sparse=False), SparsePiperKeyRegion(16))),
-        SparsePiperKeyLayout.prefix(4, 16),
+        sparse_then_dense(4, 16),
         # Compact scores skip both dense regions.
         SparsePiperKeyLayout(
             (

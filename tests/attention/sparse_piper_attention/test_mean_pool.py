@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _key_layouts import counted_route_layout
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
@@ -22,8 +23,6 @@ from piper_kernels.attention.sparse_piper_attention._summaries import (
 from piper_kernels.attention.sparse_piper_attention.coarse import (
     _mean_pool_head_major_blocks,
 )
-
-from ._layouts import counted_route_layout
 
 
 def _sequence_block_means(sequence, block_lengths=None):

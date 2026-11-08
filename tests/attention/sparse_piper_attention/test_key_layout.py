@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
+from _key_layouts import route_layout, sparse_then_dense
 
 from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention import _backend, _routing
@@ -13,8 +14,6 @@ from piper_kernels.attention.sparse_piper_attention._budget import _normalize_he
 from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRouteBuilder
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
-
-from ._layouts import route_layout
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -78,13 +77,7 @@ def test_budget_rounding_is_independent_per_region():
     assert layout.route_head_offsets.tolist() == [0, 6, 10]
 
 
-def test_prefix_layout_routes_every_complete_block():
-    assert SparsePiperKeyLayout.prefix(3, 5) == SparsePiperKeyLayout(
-        (SparsePiperKeyRegion(3), SparsePiperKeyRegion(2, sparse=False))
-    )
-    assert SparsePiperKeyLayout.prefix(5, 5) == SparsePiperKeyLayout((SparsePiperKeyRegion(5),))
-    with pytest.raises(ValueError, match="cannot exceed"):
-        SparsePiperKeyLayout.prefix(6, 5)
+def test_routes_cover_every_complete_block():
     regions = (
         SparsePiperKeyRegion(4, sparse=False),
         SparsePiperKeyRegion(3),
@@ -413,7 +406,7 @@ def test_region_compile_reuses_dynamic_lengths_and_layouts(device, layout_source
         SparsePiperKeyLayout((SparsePiperKeyRegion(3), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(10))),
-        SparsePiperKeyLayout.prefix(9, 13),
+        sparse_then_dense(9, 13),
         SparsePiperKeyLayout(
             (
                 SparsePiperKeyRegion(4),

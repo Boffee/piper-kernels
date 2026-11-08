@@ -6,6 +6,7 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
+from _key_layouts import sparse_then_dense
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import (
@@ -76,7 +77,7 @@ def test_sparse_gqa_matches_repeated_kv(device, kv_heads, groups, head_dim, rout
         else None
     )
     kwargs = {
-        "key_layout": SparsePiperKeyLayout.prefix(3, sequence // 64),
+        "key_layout": sparse_then_dense(3, sequence // 64),
         "sparse_query_blocks": 2,
         "block_lengths": lengths,
     }
@@ -220,7 +221,7 @@ def test_sparse_gqa_compile_and_prepared_storage(head_dim, kv_heads, groups, rou
             query = torch.randn(2, sequence, heads, head_dim, device="cuda", dtype=query.dtype)
             key = torch.randn(2, sequence, kv_heads, head_dim, device="cuda", dtype=query.dtype)
             value = torch.randn_like(key)
-            key_layout = SparsePiperKeyLayout.prefix(num_sparse_blocks, sequence // 64)
+            key_layout = sparse_then_dense(num_sparse_blocks, sequence // 64)
             torch.testing.assert_close(
                 compiled(query, key, value, key_layout),
                 attention(query, key, value, key_layout=key_layout),

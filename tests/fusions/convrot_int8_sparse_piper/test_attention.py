@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from _key_layouts import sparse_layout, sparse_then_dense
 from lib.sparse_piper import reference_value_storage
 from torch.nn import functional as F  # noqa: N812
 
@@ -28,7 +29,7 @@ _INPUT_FEATURES = 256
 _HEADS = 2
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
-_KEY_LAYOUT = SparsePiperKeyLayout.prefix(2, _SEQUENCE // 64)
+_KEY_LAYOUT = sparse_then_dense(2, _SEQUENCE // 64)
 
 type _QuantizedQueryOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type _QuantizedKeyOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -315,7 +316,7 @@ def test_ragged_fused_projection_matches_materialized_attention(
     )
     materialized_value = _materialize_value(operands)
 
-    key_layout = SparsePiperKeyLayout.prefix(sequence_length // 64, sequence_length // 64)
+    key_layout = sparse_layout(sequence_length // 64)
     attention = SparsePiperAttention((1.0, 1.0))
     with torch.no_grad():
         expected = attention(

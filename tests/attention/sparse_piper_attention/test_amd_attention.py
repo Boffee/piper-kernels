@@ -2,9 +2,9 @@
 
 import pytest
 import torch
+from _key_layouts import sparse_then_dense
 from lib.sparse_piper import reference_prepared_query, reference_value_storage
 
-from piper_kernels import SparsePiperKeyLayout
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
@@ -51,7 +51,7 @@ def test_fused_amd_matches_reference(sequence, routing_mode, head_dim, dtype):
     blocks = sequence // 64
     layout = resolve_route_layout(
         _normalize_head_keep_ratios((0.5, 1.0)),
-        SparsePiperKeyLayout.prefix(max(1, blocks - 1), blocks),
+        sparse_then_dense(max(1, blocks - 1), blocks),
         q.device,
     )
     routes = packed_routes_from_sequences(

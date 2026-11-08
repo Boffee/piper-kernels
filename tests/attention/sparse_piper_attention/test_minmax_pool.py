@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from _key_layouts import counted_route_layout
 
 import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
@@ -23,8 +24,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
 )
-
-from ._layouts import counted_route_layout
 
 
 def _sequence_block_summaries(query, key, block_lengths=None):

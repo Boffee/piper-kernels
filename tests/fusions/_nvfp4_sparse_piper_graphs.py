@@ -6,9 +6,9 @@ import operator
 
 import pytest
 import torch
+from _key_layouts import sparse_then_dense
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels import SparsePiperKeyLayout
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
@@ -41,7 +41,7 @@ def _profile_placeholder(graph: torch.fx.Graph) -> torch.fx.Node:
 def _key_layout_placeholder(graph: torch.fx.Graph) -> torch.fx.Node:
     node = graph.placeholder("key_layout")
     # Two sparse blocks, then the dense remainder of the 192-row graph.
-    node.meta["val"] = SparsePiperKeyLayout.prefix(2, 3)
+    node.meta["val"] = sparse_then_dense(2, 3)
     return node
 
 

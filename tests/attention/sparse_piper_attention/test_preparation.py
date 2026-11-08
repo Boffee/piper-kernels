@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _key_layouts import sparse_then_dense
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend, _routing_modes
@@ -157,7 +158,7 @@ def test_fused_preparation_matches_separate_passes(preparation, head_dim, dtype,
 def test_public_fused_preparation_matches_separate_and_graph(
     preparation, monkeypatch, head_dim, padded
 ):
-    from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout  # noqa: PLC0415
+    from piper_kernels import SparsePiperAttention  # noqa: PLC0415
 
     rows = 2048 if padded else 2051
     query = torch.randn(1, rows, 4, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -177,7 +178,7 @@ def test_public_fused_preparation_matches_separate_and_graph(
     # Mix per-head budgets, with a small sparse region before a long dense one.
     attention = SparsePiperAttention((0.25, 0.5, 1.0, 0.25))
     options = {
-        "key_layout": SparsePiperKeyLayout.prefix(4, rows // 64),
+        "key_layout": sparse_then_dense(4, rows // 64),
         "block_lengths": lengths,
         "sparse_query_blocks": 16,
     }
