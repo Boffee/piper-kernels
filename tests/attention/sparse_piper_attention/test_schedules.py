@@ -6,12 +6,10 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
-from piper_kernels.attention.sparse_piper_attention._budget import (
-    _normalize_head_keep_ratios,
-    _resolve_route_layout,
-)
+from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
+from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_query_from_quantized,
@@ -32,7 +30,11 @@ def _prepared(sequence, ratios, *, block_lengths=None, sparse_query_blocks=None)
     ]
     query, key, value = (x.transpose(1, 2) for x in operands)
     blocks = sequence // 64
-    layout = _resolve_route_layout(_normalize_head_keep_ratios(ratios), blocks, query.device)
+    layout = resolve_route_layout(
+        _normalize_head_keep_ratios(ratios),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(blocks),)),
+        query.device,
+    )
     routes = packed_routes_from_sequences(
         query, key[:, :, : blocks * 64], layout, _MINMAX_ROUTING, block_lengths
     )
@@ -40,7 +42,7 @@ def _prepared(sequence, ratios, *, block_lengths=None, sparse_query_blocks=None)
     prepared = backend.prepare(
         query,
         64**-0.5,
-        sparse_key_blocks=blocks,
+        num_routed_key_blocks=blocks,
         combined_key=key,
         combined_value=value,
         block_lengths=block_lengths,
@@ -63,7 +65,8 @@ def test_skip_dense_routing_matches_materialized_routes(monkeypatch, sequence):
     with monkeypatch.context() as patch:
         patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
         prepared.launch(prepared.query, expected.transpose(1, 2))
-    actual = SparsePiperAttention([1.0, 1.0])(*operands, sparse_key_blocks=sequence // 64)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(sequence // 64),))
+    actual = SparsePiperAttention([1.0, 1.0])(*operands, key_layout=key_layout)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     graph = torch.cuda.CUDAGraph()
     # Prepared operands also exercise replay without rebuilding CPU metadata.
@@ -150,7 +153,9 @@ def test_large_tile_preserves_internally_padded_blocks(monkeypatch):
         patch.setattr(policy, "select_sm120_attention_schedule", lambda *args, **kwargs: (64, 4))
         prepared.launch(prepared.query, expected.transpose(1, 2))
     actual = SparsePiperAttention([1.0, 1.0])(
-        *operands, sparse_key_blocks=sequence // 64, block_lengths=lengths
+        *operands,
+        key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(sequence // 64),)),
+        block_lengths=lengths,
     )
     valid = torch.arange(sequence, device="cuda") % 64 < lengths.repeat_interleave(64)
     torch.testing.assert_close(actual[:, valid], expected[:, valid], atol=0, rtol=0)

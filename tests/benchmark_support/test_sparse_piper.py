@@ -10,7 +10,7 @@ from lib.sparse_piper import (
     useful_integer_operations,
 )
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperAttention,
@@ -45,6 +45,11 @@ def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
     assert args.samples == 3
 
 
+def test_default_diagnostic_layout_routes_every_complete_block():
+    assert _parse_key_layout(None, 100000) == SparsePiperKeyLayout((SparsePiperKeyRegion(1562),))
+    assert _parse_args(["--sequence", "1100", "--key-regions", "sparse:17"]).sequence == [1100]
+
+
 def test_region_diagnostic_retains_independent_budgets_and_dense_blocks():
     args = _parse_args(
         [
@@ -59,8 +64,8 @@ def test_region_diagnostic_retains_independent_budgets_and_dense_blocks():
             "0.1",
         ]
     )
-    key_layout = _parse_key_layout(args.key_regions)
-    budgets = SparsePiperAttention((0.1,)).resolve_region_keep_blocks(key_layout)
+    key_layout = _parse_key_layout(args.key_regions, args.sequence[0])
+    budgets = SparsePiperAttention((0.1,)).resolve_keep_blocks(key_layout)
     assert budgets == ((10,), (20,), (10,), (10,))
     assert sum(region[0] for region in budgets) == 50
 
@@ -70,12 +75,12 @@ def test_region_diagnostic_retains_independent_budgets_and_dense_blocks():
     [
         ["--key-regions", "sparse:2"],
         ["--key-regions", "unknown:16"],
-        ["--key-regions", "dense:16", "--sparse-key-blocks", "16"],
-        ["--sparse-key-blocks", "65"],
+        ["--sequence", "1024", "--key-regions", "dense:16"],
+        ["--sequence", "1100", "--key-regions", "sparse:18"],
         ["--case", "sparse-attention-video-high-eighth", "--key-regions", "sparse:1728"],
     ],
 )
-def test_region_diagnostic_rejects_ambiguous_or_incomplete_layouts(options):
+def test_region_diagnostic_rejects_invalid_or_incomplete_layouts(options):
     with pytest.raises(SystemExit):
         _parse_args(options)
 
@@ -116,7 +121,7 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
         head_keep_blocks=torch.tensor([1, 2], dtype=torch.int32),
         routes_per_query=3,
         block_lengths=torch.tensor(lengths, dtype=torch.int32) if internal_padding else None,
-        sparse_key_blocks=2,
+        num_routed_key_blocks=2,
         sparse_query_blocks=2,
         logical_sequence_length=256 if internal_padding else 193,
     )

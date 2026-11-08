@@ -14,6 +14,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
+from piper_kernels import SparsePiperKeyLayout
 from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
@@ -393,13 +394,13 @@ class _DynamicAttention(torch.nn.Module):
         rotary = rotary + rotated * sin.to(torch.bfloat16)[None, :, None, :]
         return torch.cat((rotary, normalized[..., model.rotary_dim :]), dim=-1).contiguous()
 
-    def forward(self, value, cos, sin):
+    def forward(self, value, cos, sin, key_layout):
         model = self.attention
         batch, rows, _ = value.shape
         query = self._norm_rope(model.query(value), model.query_norm, cos, sin)
         key = self._norm_rope(model.key(value), model.key_norm, cos, sin)
         projected_value = model.value(value).view(batch, rows, model.heads, model.head_dim)
-        attention = model.sparse_attention(query, key, projected_value, sparse_key_blocks=2)
+        attention = model.sparse_attention(query, key, projected_value, key_layout=key_layout)
         return model.output(attention.flatten(2))
 
 
@@ -416,7 +417,7 @@ def test_dtensor_attention_reuses_symbolic_sequence_length(mesh, format_name):
         torch._dynamo.mark_dynamic(value, 1)
         torch._dynamo.mark_dynamic(cos, 0)
         torch._dynamo.mark_dynamic(sin, 0)
-        inputs.append((value, cos, sin))
+        inputs.append((value, cos, sin, SparsePiperKeyLayout.prefix(2, rows // 64)))
     with torch.no_grad():
         local, local_capture = _compile_with_capture(model, _ATTENTION_OPTIONS[format_name])
         expected = [local(*values) for values in inputs]

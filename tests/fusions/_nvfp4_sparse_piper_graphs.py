@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from piper_kernels import SparsePiperKeyLayout
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
@@ -34,6 +35,13 @@ def _placeholder(
 def _profile_placeholder(graph: torch.fx.Graph) -> torch.fx.Node:
     node = graph.placeholder("ratio_profile")
     node.meta["val"] = _SparsePiperRatioProfile((5000, 10000))
+    return node
+
+
+def _key_layout_placeholder(graph: torch.fx.Graph) -> torch.fx.Node:
+    node = graph.placeholder("key_layout")
+    # Two sparse blocks, then the dense remainder of the 192-row graph.
+    node.meta["val"] = SparsePiperKeyLayout.prefix(2, 3)
     return node
 
 
@@ -253,7 +261,7 @@ def build_attention_graph(  # noqa: PLR0913
                 key,
                 value,
                 _profile_placeholder(graph),
-                2,
+                _key_layout_placeholder(graph),
                 128**-0.5,
                 routing_mode,
                 *optional_attention_arguments,

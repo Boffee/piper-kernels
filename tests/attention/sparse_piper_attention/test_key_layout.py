@@ -1,4 +1,4 @@
-"""Independent regional budgets and one shared softmax over interleaved keys."""
+"""Key layouts: independent regional budgets and one softmax over interleaved keys."""
 
 from dataclasses import FrozenInstanceError
 from unittest.mock import Mock
@@ -10,9 +10,11 @@ from _compile_capture import TargetCapturePass
 from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention import _backend, _routing
 from piper_kernels.attention.sparse_piper_attention._budget import _normalize_head_keep_ratios
-from piper_kernels.attention.sparse_piper_attention._regions import resolve_region_route_layout
+from piper_kernels.attention.sparse_piper_attention._key_layout import resolve_route_layout
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRouteBuilder
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
+
+from ._layouts import route_layout
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -29,12 +31,34 @@ def device(request):
     )
 
 
-def _layout(ratios, regions, device):
-    return resolve_region_route_layout(
-        _normalize_head_keep_ratios(ratios),
-        SparsePiperKeyLayout(regions),
-        device,
+def test_head_slices_preserve_every_regions_full_profile_rounding():
+    ratios = _normalize_head_keep_ratios((0.3,) * 4)
+    layout = SparsePiperKeyLayout(
+        (
+            SparsePiperKeyRegion(8),
+            SparsePiperKeyRegion(1, sparse=False),
+            SparsePiperKeyRegion(8),
+        )
     )
+    for start, expected in ((0, (3, 3)), (2, (2, 2))):
+        resolved = resolve_route_layout(
+            ratios,
+            layout,
+            torch.device("cpu"),
+            start_head=start,
+            end_head=start + 2,
+        )
+        assert tuple(region.head_keep_block_values for region in resolved.regions) == (
+            expected,
+            (1, 1),
+            expected,
+        )
+        assert resolved.head_keep_blocks.tolist() == [2 * value + 1 for value in expected]
+        assert resolved.route_head_offsets.tolist() == [
+            0,
+            2 * expected[0] + 1,
+            2 * sum(expected) + 2,
+        ]
 
 
 def test_budget_rounding_is_independent_per_region():
@@ -44,24 +68,44 @@ def test_budget_rounding_is_independent_per_region():
         SparsePiperKeyRegion(2, sparse=False),
         SparsePiperKeyRegion(3),
     )
-    assert attention.resolve_region_keep_blocks(SparsePiperKeyLayout(regions)) == (
+    assert attention.resolve_keep_blocks(SparsePiperKeyLayout(regions)) == (
         (2, 1),
         (2, 2),
         (2, 1),
     )
-    layout = _layout((0.5, 0.5), regions, torch.device("cpu"))
+    layout = route_layout((0.5, 0.5), SparsePiperKeyLayout(regions), torch.device("cpu"))
     assert layout.head_keep_blocks.tolist() == [6, 4]
     assert layout.route_head_offsets.tolist() == [0, 6, 10]
 
 
+def test_prefix_layout_folds_its_dense_remainder_into_the_suffix():
+    assert SparsePiperKeyLayout.prefix(3, 5) == SparsePiperKeyLayout(
+        (SparsePiperKeyRegion(3), SparsePiperKeyRegion(2, sparse=False))
+    )
+    assert SparsePiperKeyLayout.prefix(5, 5) == SparsePiperKeyLayout((SparsePiperKeyRegion(5),))
+    with pytest.raises(ValueError, match="cannot exceed"):
+        SparsePiperKeyLayout.prefix(6, 5)
+    regions = (
+        SparsePiperKeyRegion(4, sparse=False),
+        SparsePiperKeyRegion(3),
+        SparsePiperKeyRegion(2, sparse=False),
+        SparsePiperKeyRegion(5, sparse=False),
+    )
+    layout = route_layout((0.5,), SparsePiperKeyLayout(regions), torch.device("cpu"))
+    # Routes stop after the last sparse region; the dense tail takes no route slots.
+    assert layout.num_routed_key_blocks == 7
+    assert layout.num_key_blocks == 14
+    assert [region.num_key_blocks for region in layout.regions] == [4, 3]
+    assert layout.routes_per_query == 6
+    assert layout.selector_metadata.tolist() == [[0, 4, 0, 4, 0], [4, 3, 0, 2, 4]]
+
+
 def test_each_video_retains_its_own_ten_percent(device):
     regions = (SparsePiperKeyRegion(10),) * 3
-    layout = _layout((0.1, 0.1), regions, device)
+    layout = route_layout((0.1, 0.1), SparsePiperKeyLayout(regions), device)
     # Every score in video 3 exceeds every score in videos 1 and 2.
     scores = torch.arange(30, device=device, dtype=torch.float32).expand(2, 2, 3, -1).clone()
-    builder = PackedRouteBuilder(
-        layout, batch=2, heads=2, query_blocks=3, sparse_key_blocks=30, device=device
-    )
+    builder = PackedRouteBuilder(layout, batch=2, heads=2, query_blocks=3, device=device)
     builder.write(scores, query_block_offset=0)
     expected = torch.tensor([9, 19, 29, 9, 19, 29], dtype=torch.uint16, device=device)
     torch.testing.assert_close(builder.routes.indices, expected.expand(2, 3, -1), atol=0, rtol=0)
@@ -74,27 +118,19 @@ def test_regional_forcing_and_ties_use_absolute_ids(device):
         SparsePiperKeyRegion(2, sparse=False),
         SparsePiperKeyRegion(35),
     )
-    layout = _layout((0.2, 0.5), regions, device)
+    layout = route_layout((0.2, 0.5), SparsePiperKeyLayout(regions), device)
     ids = torch.tensor([[2, 39], [1, 34]], dtype=torch.int32, device=device)
     counts = torch.tensor([2, 2], dtype=torch.int32, device=device)
-    mask = _backend.build_force_tile_bitmask(ids, counts, 40)
+    mask = _backend.build_force_tile_bitmask(ids, counts, layout.num_key_blocks)
     builder = PackedRouteBuilder(
-        layout,
-        batch=2,
-        heads=2,
-        query_blocks=2,
-        sparse_key_blocks=40,
-        device=device,
-        force_tile_mask=mask,
+        layout, batch=2, heads=2, query_blocks=2, device=device, force_tile_mask=mask
     )
     scores = torch.zeros((2, 2, 2, 40), device=device)
     # Exercise chunk offsets while preserving guard rows from the other chunk.
     builder.write(scores[:, :, 1:], query_block_offset=1)
     builder.write(scores[:, :, :1], query_block_offset=0)
     actual = builder.routes.indices.cpu().long()
-    budgets = SparsePiperAttention((0.2, 0.5)).resolve_region_keep_blocks(
-        SparsePiperKeyLayout(regions)
-    )
+    budgets = SparsePiperAttention((0.2, 0.5)).resolve_keep_blocks(SparsePiperKeyLayout(regions))
     for query in range(2):
         expected = []
         forced = [2, 39] if query == 0 else [1, 34]
@@ -106,10 +142,8 @@ def test_regional_forcing_and_ties_use_absolute_ids(device):
 
 def test_absolute_routes_cover_uint16_limit(device):
     regions = (SparsePiperKeyRegion(65534, sparse=False), SparsePiperKeyRegion(2))
-    layout = _layout((0.5,), regions, device)
-    builder = PackedRouteBuilder(
-        layout, batch=1, heads=1, query_blocks=1, sparse_key_blocks=65536, device=device
-    )
+    layout = route_layout((0.5,), SparsePiperKeyLayout(regions), device)
+    builder = PackedRouteBuilder(layout, batch=1, heads=1, query_blocks=1, device=device)
     # Only the final sparse region occupies score storage.
     builder.write(
         torch.tensor([[[[0.0, 1.0]]]], device=device), query_block_offset=0, compact_scores=True
@@ -121,10 +155,8 @@ def test_absolute_routes_cover_uint16_limit(device):
 @pytest.mark.parametrize("device", [pytest.param("cuda", marks=pytest.mark.gpu)], indirect=True)
 def test_many_regions_do_not_exceed_native_grid_limits(device):
     regions = (SparsePiperKeyRegion(2),) * 32768
-    layout = _layout((0.5, 0.5), regions, device)
-    builder = PackedRouteBuilder(
-        layout, batch=1, heads=2, query_blocks=1, sparse_key_blocks=65536, device=device
-    )
+    layout = route_layout((0.5, 0.5), SparsePiperKeyLayout(regions), device)
+    builder = PackedRouteBuilder(layout, batch=1, heads=2, query_blocks=1, device=device)
     scores = torch.arange(65536, device=device, dtype=torch.float32).expand(1, 2, 1, -1)
     builder.write(scores, query_block_offset=0)
     expected = torch.arange(1, 65536, 2).repeat(2)
@@ -139,15 +171,15 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
         SparsePiperKeyRegion(1),  # Rounding retains this region without scoring it.
         SparsePiperKeyRegion(3, sparse=False),
         SparsePiperKeyRegion(513),  # Selection crosses a radix tile boundary.
-        SparsePiperKeyRegion(2, sparse=False),
+        SparsePiperKeyRegion(2, sparse=False),  # Joins the dense suffix without routes.
     )
     ratios = (0.2, 0.5, 1.0, 0.75)
-    budgets = SparsePiperAttention(ratios).resolve_region_keep_blocks(SparsePiperKeyLayout(regions))
+    budgets = SparsePiperAttention(ratios).resolve_keep_blocks(SparsePiperKeyLayout(regions))
     generator = torch.Generator().manual_seed(298)
     # Integer-valued FP32 summaries make the score oracle exact on both devices.
     # 385 query blocks also crosses the routing chunk boundary.
     query = torch.randint(-8, 9, (2, 4, 385, 64), generator=generator).float()
-    primary = torch.randint(-8, 9, (2, 2, 526, 64), generator=generator).float()
+    primary = torch.randint(-8, 9, (2, 2, 524, 64), generator=generator).float()
     auxiliary = (
         primary - torch.randint(0, 9, primary.shape, generator=generator)
         if routing == "minmax"
@@ -162,7 +194,7 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
     for head in range(4):
         start = 0
         selected_regions = []
-        for region, counts in zip(regions, budgets, strict=True):
+        for region, counts in zip(regions[:-1], budgets, strict=False):
             selected = scores[:, head, :, start : start + region.num_blocks].argsort(
                 dim=-1, descending=True, stable=True
             )[..., : counts[head]]
@@ -174,7 +206,7 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
         query.to(device),
         primary.to(device),
         auxiliary.to(device),
-        _layout(ratios, regions, device),
+        route_layout(ratios, SparsePiperKeyLayout(regions), device),
         routing_mode_from_name(routing),
     )
     torch.testing.assert_close(actual.indices.cpu().long(), expected, atol=0, rtol=0)
@@ -183,14 +215,22 @@ def test_compact_summary_routes_match_independent_region_selection(device, routi
 @pytest.mark.parametrize(
     ("head_dim", "routing", "padded"), [(64, "mean", False), (128, "minmax", True)]
 )
+@pytest.mark.parametrize(
+    "regions",
+    [
+        (SparsePiperKeyRegion(2), SparsePiperKeyRegion(1, sparse=False), SparsePiperKeyRegion(4)),
+        # A trailing dense region joins the attention kernels' dense suffix.
+        (
+            SparsePiperKeyRegion(2),
+            SparsePiperKeyRegion(1, sparse=False),
+            SparsePiperKeyRegion(3),
+            SparsePiperKeyRegion(1, sparse=False),
+        ),
+    ],
+)
 def test_interleaved_regions_share_softmax_and_preserve_dense_queries(
-    device, head_dim, routing, padded
+    device, head_dim, routing, padded, regions
 ):
-    regions = (
-        SparsePiperKeyRegion(2),
-        SparsePiperKeyRegion(1, sparse=False),
-        SparsePiperKeyRegion(4),
-    )
     attention = SparsePiperAttention((0.5, 1.0), routing=routing)
     q = torch.zeros((1, 448, 2, head_dim), device=device)
     k = torch.zeros((1, 448, 1, head_dim), device=device)
@@ -212,7 +252,15 @@ def test_interleaved_regions_share_softmax_and_preserve_dense_queries(
         sparse_query_blocks=2,
         block_lengths=lengths if padded else None,
     )
-    selected = torch.tensor([0, 2, 3, 4], device=device)
+    # Equal scores keep each region's leading blocks.
+    region_starts = torch.tensor([0, *(region.num_blocks for region in regions)]).cumsum(0)
+    budgets = attention.resolve_keep_blocks(SparsePiperKeyLayout(regions))
+    selected = torch.cat(
+        [
+            torch.arange(start, start + counts[0])
+            for start, counts in zip(region_starts.tolist(), budgets, strict=False)
+        ]
+    ).to(device)
     sparse_mean = (block_values[selected] * lengths[selected]).sum() / lengths[selected].sum()
     dense_mean = (block_values * lengths).sum() / lengths.sum()
     expected = torch.full_like(actual, dense_mean)
@@ -243,8 +291,27 @@ def test_dense_regions_skip_scoring_and_full_keep_skips_all_routing(device, monk
     )
     full = SparsePiperAttention((1.0, 1.0))
     torch.testing.assert_close(
-        full(q, q, q, key_layout=key_layout), full(q, q, q, sparse_key_blocks=6), atol=0, rtol=0
+        full(q, q, q, key_layout=key_layout),
+        full(q, q, q, key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(6),))),
+        atol=0,
+        rtol=0,
     )
+
+
+def test_compact_partial_final_block_is_attended_by_every_query(device):
+    attention = SparsePiperAttention((0.5,))
+    key_layout = SparsePiperKeyLayout(
+        (SparsePiperKeyRegion(2), SparsePiperKeyRegion(1, sparse=False), SparsePiperKeyRegion(2))
+    )
+    rows = 5 * 64 + 20
+    q = torch.zeros((1, rows, 1, 64), device=device)
+    block_values = torch.tensor([1, 3, 10, 20, 30, 40], dtype=torch.float32, device=device)
+    v = block_values.repeat_interleave(64)[:rows, None, None].expand(1, rows, 1, 64).contiguous()
+    actual = attention(q, q, v, key_layout=key_layout)
+    # Each sparse region keeps its leading block; the dense block and 20-row tail stay.
+    expected = (64 * (1 + 10 + 20) + 20 * 40) / (3 * 64 + 20)
+    # Native backends quantize V; a misrouted block would move the mean by over 4%.
+    torch.testing.assert_close(actual, torch.full_like(actual, expected), atol=0.01, rtol=0.005)
 
 
 @pytest.mark.parametrize(
@@ -252,7 +319,7 @@ def test_dense_regions_skip_scoring_and_full_keep_skips_all_routing(device, monk
     [
         ((SparsePiperKeyRegion(1),), 128),
         ((SparsePiperKeyRegion(3),), 128),
-        ((SparsePiperKeyRegion(2),), 129),
+        ((SparsePiperKeyRegion(3),), 129),
     ],
 )
 @pytest.mark.parametrize("device", ["cpu", "meta"])
@@ -264,7 +331,13 @@ def test_region_partition_rejects_invalid_storage(regions, sequence, device):
 
 @pytest.mark.parametrize(
     ("num_blocks", "sparse", "error"),
-    [(0, True, ValueError), (True, True, TypeError), (2, 1, TypeError)],
+    [
+        (0, True, ValueError),
+        (65537, True, ValueError),
+        (True, True, TypeError),
+        (1.5, True, TypeError),
+        (2, 1, TypeError),
+    ],
 )
 def test_region_configuration_validation(num_blocks, sparse, error):
     with pytest.raises(error, match="region"):
@@ -278,6 +351,7 @@ def test_region_configuration_validation(num_blocks, sparse, error):
         ([SparsePiperKeyRegion(1)], TypeError),
         ((1,), TypeError),
         ((SparsePiperKeyRegion(65536), SparsePiperKeyRegion(1)), ValueError),
+        ((SparsePiperKeyRegion(2, sparse=False),), ValueError),
     ],
 )
 def test_key_layout_validates_configuration_at_construction(regions, error):
@@ -300,25 +374,10 @@ def test_region_entry_points_require_a_layout_object():
     regions = (SparsePiperKeyRegion(2),)
     attention = SparsePiperAttention((0.5,))
     with pytest.raises(TypeError, match="SparsePiperKeyLayout"):
-        attention.resolve_region_keep_blocks(regions)
+        attention.resolve_keep_blocks(regions)
     q = torch.empty((1, 128, 1, 64))
     with pytest.raises(TypeError, match="SparsePiperKeyLayout"):
         attention(q, q, q, key_layout=regions)
-
-
-def test_exactly_one_layout_is_required():
-    q = torch.empty((1, 128, 1, 64))
-    attention = SparsePiperAttention((0.5,))
-    with pytest.raises(ValueError, match="exactly one"):
-        attention(q, q, q)
-    with pytest.raises(ValueError, match="exactly one"):
-        attention(
-            q,
-            q,
-            q,
-            sparse_key_blocks=2,
-            key_layout=SparsePiperKeyLayout((SparsePiperKeyRegion(2),)),
-        )
 
 
 def test_compiled_layout_rechecks_total_block_count():
@@ -350,7 +409,16 @@ def test_region_compile_reuses_dynamic_lengths_and_layouts(device, layout_source
         SparsePiperKeyLayout((SparsePiperKeyRegion(3), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(9))),
         SparsePiperKeyLayout((SparsePiperKeyRegion(3, sparse=False), SparsePiperKeyRegion(10))),
-        SparsePiperKeyLayout((SparsePiperKeyRegion(16, sparse=False),)),
+        # Trailing dense regions take no routes, which changes the routed extent.
+        SparsePiperKeyLayout.prefix(9, 13),
+        SparsePiperKeyLayout(
+            (
+                SparsePiperKeyRegion(4),
+                SparsePiperKeyRegion(2, sparse=False),
+                SparsePiperKeyRegion(5),
+                SparsePiperKeyRegion(5, sparse=False),
+            )
+        ),
     )
 
     class Model(torch.nn.Module):
@@ -407,7 +475,7 @@ def test_region_compile_reuses_dynamic_lengths_and_layouts(device, layout_source
         argument = key_layout if layout_source == "argument" else None
         torch.compiler.cudagraph_mark_step_begin()
         actual = compiled(q, k, v, argument, lengths, ids, counts).clone()
-        budgets = model.attention.resolve_region_keep_blocks(key_layout)
+        budgets = model.attention.resolve_keep_blocks(key_layout)
         expected = torch.empty_like(q)
         for head in range(2):
             start = 0

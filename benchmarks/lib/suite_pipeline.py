@@ -17,7 +17,12 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention, piper_attention
+from piper_kernels import (
+    SparsePiperAttention,
+    SparsePiperKeyLayout,
+    SparsePiperKeyRegion,
+    piper_attention,
+)
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend as dense_attention_backend
 from piper_kernels.attention.sparse_piper_attention import _backend as sparse_attention_backend
@@ -139,9 +144,8 @@ class Pipeline(torch.nn.Module):
             attended = piper_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
             attended = attended.transpose(1, 2)
         else:
-            attended = self.sparse(
-                q.contiguous(), k.contiguous(), v, sparse_key_blocks=sequence // 64
-            )
+            key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(sequence // 64),))
+            attended = self.sparse(q.contiguous(), k.contiguous(), v, key_layout=key_layout)
         return self.output(attended.reshape(batch, sequence, self.heads * self.head_dim))
 
     def materialized(

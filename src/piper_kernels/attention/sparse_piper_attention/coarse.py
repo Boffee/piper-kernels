@@ -26,19 +26,19 @@ def validate_coarse_scale(coarse_scale: float) -> None:
 
 
 def _resolve_coarse_key_blocks(
-    sparse_key_blocks: int,
+    num_routed_key_blocks: int,
     coarse_key_blocks: int | None,
     *,
     available_coarse_key_blocks: int,
 ) -> int:
-    """Resolve a coarse prefix that contains the sparse-routing prefix."""
-    resolved = sparse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
+    """Resolve a coarse prefix that contains the routed key blocks it scores for routing."""
+    resolved = num_routed_key_blocks if coarse_key_blocks is None else coarse_key_blocks
     if isinstance(resolved, bool):
         raise TypeError("coarse_key_blocks must be an integer")
     if torch.compiler.is_compiling():
         torch._check(
-            resolved >= sparse_key_blocks,
-            lambda: "coarse_key_blocks cannot exclude sparse key blocks",
+            resolved >= num_routed_key_blocks,
+            lambda: "coarse_key_blocks cannot exclude routed key blocks",
         )
         torch._check(
             resolved <= available_coarse_key_blocks,
@@ -46,9 +46,9 @@ def _resolve_coarse_key_blocks(
         )
     elif not isinstance(resolved, int):
         raise TypeError("coarse_key_blocks must be an integer")
-    elif not sparse_key_blocks <= resolved <= available_coarse_key_blocks:
+    elif not num_routed_key_blocks <= resolved <= available_coarse_key_blocks:
         raise ValueError(
-            "coarse_key_blocks must include the sparse prefix and fit the available K64 blocks"
+            "coarse_key_blocks must include the routed key blocks and fit the available K64 blocks"
         )
     return resolved
 

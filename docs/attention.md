@@ -65,39 +65,33 @@ uses sequence-major tensors and one keep ratio per **query** head.
 
 ```python
 import torch
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 q = torch.randn(1, 193, 4, 64, device=device, dtype=torch.bfloat16)
 k = torch.randn(1, 193, 2, 64, device=device, dtype=torch.bfloat16)
 v = torch.randn_like(k)
 attention = SparsePiperAttention((0.5, 0.5, 1.0, 1.0), routing="minmax")
+key_layout = SparsePiperKeyLayout.prefix(2, 193 // 64)  # 2 sparse blocks, then dense
 
 with torch.inference_mode():
-    output = attention(q, k, v, sparse_key_blocks=2, sparse_query_blocks=2)
+    output = attention(q, k, v, key_layout=key_layout, sparse_query_blocks=2)
 assert output.shape == q.shape
 ```
 
-Here, the first 128 key rows form two routeable K64 blocks. Routed queries select
-blocks from that prefix; they also attend **every** key in the remaining 65 rows,
-within the same softmax. Only the first 128 query rows are routed; later queries
-attend all keys densely. Omitting `sparse_query_blocks` routes every query block;
-zero makes every query dense.
-
-Keep ratios lie in `(0, 1]` and belong to immutable model configuration. Physical
-budgets round to whole blocks across heads, with at least one retained block per
-head. `attention.resolve_head_keep_blocks(sparse_key_blocks)` returns the exact
-per-query-head budgets as a tuple of Python integers. Routes are recomputed from
-the current Q/K values on every call. The default `"minmax"`
-policy scores extrema summaries; `"mean"` scores block means. The application owns
-the ratio profile and its quality validation. Even a full keep budget uses sparse
-Piper's quantized arithmetic, which differs from dense Piper's V quantization.
-
-`sparse_key_blocks` counts complete physical blocks in the leading key prefix and
-must be between 1 and `min(sequence_length // 64, 65536)`. A compact partial final
-block therefore belongs to the dense suffix. `sparse_query_blocks` may range from
-zero through `ceil(sequence_length / 64)`. `scale` has the same contract as dense
+Here, the first 128 key rows form one sparse region of two K64 blocks. Routed
+queries select blocks from it; they also attend **every** key in the remaining 65
+rows, within the same softmax. Only the first 128 query rows are routed; later
+queries attend all keys densely. Omitting `sparse_query_blocks` routes every query
+block; zero makes every query dense. `sparse_query_blocks` may range from zero
+through `ceil(sequence_length / 64)`. `scale` has the same contract as dense
 attention.
+
+Keep ratios lie in `(0, 1]` and belong to immutable model configuration. Routes are
+recomputed from the current Q/K values on every call. The default `"minmax"` policy
+scores extrema summaries; `"mean"` scores block means. The application owns the
+ratio profile and its quality validation. Even a full keep budget uses sparse
+Piper's quantized arithmetic, which differs from dense Piper's V quantization.
 
 For a layout with padding **inside** blocks, pass `block_lengths`: a contiguous
 INT32 tensor on the input device containing one length in `[1, 64]` per physical
@@ -111,12 +105,14 @@ Native sparse backends cover NVIDIA SM89/SM120 and AMD RDNA4. Other devices run 
 portable quantized reference. There is a separate exact sparse reference for
 quality comparisons; it is not the fallback used by this API.
 
-### Independent key regions (experimental)
+### Key layouts
 
-Use `key_layout` instead of `sparse_key_blocks` to reserve each head's keep ratio
-independently for several videos or other key groups. Sparse and dense regions
-may appear in any order. For example, this layout retains 10% of each video's
-blocks for head 0, 25% for head 1, and every text block for both heads:
+A `SparsePiperKeyLayout` partitions the key sequence into consecutive regions of
+physical K64 blocks. Each sparse region applies the head ratios to its own blocks,
+so several videos or other key groups keep their budgets independently; dense
+regions keep every block. Regions may appear in any order, and all retained keys
+share one softmax. For example, this layout retains 10% of each video's blocks for
+head 0, 25% for head 1, and every text block for both heads:
 
 ```python
 from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
@@ -132,60 +128,54 @@ layout = SparsePiperKeyLayout(
 )
 # q/k/v have sequence length 304 * 64; Q has two heads.
 output = attention(q, k, v, key_layout=layout)
-budgets = attention.resolve_region_keep_blocks(layout)
+budgets = attention.resolve_keep_blocks(layout)
 assert budgets == ((10, 25), (4, 4), (10, 25), (10, 25))
 ```
 
-Construct an immutable `SparsePiperKeyLayout` from a nonempty tuple of
-`SparsePiperKeyRegion` values outside compiled forward calls. Each region counts
-consecutive physical K64 blocks, and together they must cover the entire sequence,
-up to 65,536 blocks. Outside compiled code, `layout.regions` exposes the partition
-and `layout.num_blocks` its total size. Compiled code passes layouts opaquely to
-attention and derives sequence dimensions from tensors. This prototype requires
-complete physical blocks, including the last one. Pad region boundaries when
-needed and use `block_lengths` to exclude padding. The partition is shared across
-batches, queries, and heads.
-
-Pass the layout as a forward argument or store it on the model. The entire
-partition is runtime configuration, including its total block count. Changing
-region count, boundaries, or sparse/dense flags does not specialize the graph.
-Exact sequence coverage is checked inside the operator on every execution.
-
-To reuse a graph across sequence lengths, mark Q/K/V's sequence dimensions dynamic
-before calling the compiled model. Mark the block dimension of `block_lengths`
-and the query-block dimension of any forced-tile inputs when using those options:
-
-```python
-for tensor in (q, k, v):
-    torch._dynamo.mark_dynamic(tensor, 1)  # [batch, sequence, heads, features]
-```
-
-For each supplied `block_lengths`, `force_tile_ids`, or `force_tile_counts` tensor,
-likewise call `torch._dynamo.mark_dynamic(tensor, 0)`. Supply a layout covering the
-new sequence on each call. Without dynamic shape annotations, ordinary
-tensor-shape guards can still cause recompilation. Other model guards and kernel
-policies also retain their own specialization rules.
+The regions must cover the sequence's complete K64 blocks exactly, at most 65,536,
+and include at least one sparse region. A compact partial final block is always
+attended. Pad region boundaries that do not fall on a multiple of 64 rows and
+use `block_lengths` to exclude the padding. The partition is shared across
+batches, queries, and heads. `SparsePiperKeyLayout.prefix(num_sparse_blocks,
+num_blocks)` builds the common case of one sparse region followed by dense keys.
+Dense regions after the last sparse region need no routes; attention reads them
+directly.
 
 Budgets round across heads independently within each sparse region, with at least
 one block per head per region. Regions cannot borrow each other's budget; small
-regions can therefore retain more blocks than a single combined budget. Dense
-regions skip score computation and selection. All retained keys participate in
-one softmax. `sparse_query_blocks` still independently controls which queries use
-routing; later queries attend every key.
+regions can therefore retain more blocks than a single combined budget.
+`attention.resolve_keep_blocks(layout)` returns each region's exact per-query-head
+budgets as Python integers, without allocating tensors or accessing device state.
+Dense regions skip selection; fine-only attention also skips their score
+computation.
 
-Forced tile IDs are absolute physical key block indices. For each query row,
-the number of forced IDs in each sparse region must fit every head's budget for
-that region. IDs in dense regions are already included. These are numerical
-caller preconditions, as for prefix routing.
+Layouts are runtime configuration. Construct them outside compiled forward calls,
+where the sequence length is known, and pass them as a forward argument or store
+them on the model or another object it reads. Compiled code passes them opaquely
+to attention: changing region count, sizes, sparse/dense flags, or total block
+count reuses the graph, and coverage is checked inside the operator on every call.
+A layout built inside a compiled function, for example from `q.shape`, fails under
+`fullgraph=True`; without it, compilation breaks the graph there and recompiles
+for each new sequence length. Explicit CUDA graphs require fixed shapes, layout,
+and ratio profile; recapture when any of these change.
 
-Region calls support the portable reference, native backends, standalone
-`torch.compile`, and explicit CUDA graphs with fixed shapes, layout, and ratio
-profile. Recapture an explicit graph when any of these change. The
-prototype uses a separate compiler operator boundary; projection/output and
-coarse-branch fusions currently recognize only the prefix API. A separately
-computed coarse residual can still be added. Existing prefix calls are unchanged.
-Regional performance requires workload measurements; see the
-[sparse diagnostic](../benchmarks/benchmark_sparse_piper.py) for layout controls.
+Changing sequence length can also reuse a graph when the caller marks the
+sequence-shaped inputs dynamic before the compiled call and supplies a layout
+covering each new sequence. Mark the model input's sequence dimension and the
+block dimension of any `block_lengths`:
+
+```python
+torch._dynamo.mark_dynamic(hidden_states, 1)  # [batch, sequence, features]
+torch._dynamo.mark_dynamic(block_lengths, 0)
+```
+
+Other sequence-shaped model inputs, such as rotary tables, need matching dynamic
+dimensions. Changing a Python integer argument such as `sparse_query_blocks` can
+still recompile; derive it from dynamic tensor shapes inside the compiled
+function when applicable. Keep model head count and head dimension fixed.
+Shape guards and GPU kernel policies still apply: one Torch graph does not
+promise one kernel variant across every layout, alignment, or backend. Zero and
+singleton dimensions may also receive separate compiler specializations.
 
 ### Caller-forced tiles (experimental)
 
@@ -194,11 +184,10 @@ The experimental fixed-budget forced-routing path additionally accepts
 `force_tile_counts` (contiguous device INT32 `[query_blocks]`). Active IDs in each
 row's counted prefix are shared across batches and heads. Every forced tile is
 included, and the remaining per-head budget is filled by ordinary score selection.
-Counts must lie in `[0, capacity]`, and active IDs must be unique. For prefix
-calls, IDs lie in `[0, sparse_key_blocks)` and each count must fit every affected
-head's resolved physical keep budget. For regional calls, apply the
-[regional ID and budget rules](#independent-key-regions-experimental) above.
-These are caller preconditions, with metadata-only validation.
+Counts must lie in `[0, capacity]`. Active IDs must be unique absolute block
+indices in `[0, layout.num_blocks)`. In each sparse region, the number of forced
+IDs must fit every head's budget for that region; IDs in dense regions are already
+retained. These are caller preconditions, with metadata-only validation.
 Supply rows for every physical query block; dense query suffixes already include
 every key and ignore route selection. Unused ID slots are ignored.
 
@@ -206,40 +195,31 @@ Query the budgets outside the compiled forward call when preparing forced lists:
 
 ```python
 attention = SparsePiperAttention((0.5, 0.5))
-budgets = attention.resolve_head_keep_blocks(sparse_key_blocks=3)  # (2, 1)
+layout = SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
+budgets = attention.resolve_keep_blocks(layout)  # ((2, 1),)
 capacity = 2  # padded ID slots per query block
-max_force_count = min(capacity, min(budgets))  # 1
+max_force_count = min(capacity, min(budgets[0]))  # 1
 ```
 
 Rounding is shared across heads, so independently rounding each ratio can
 overestimate a head's budget. Here, each row may force at most one tile even
-though the first head keeps two. The query allocates no tensors and accesses no
-device state; recompute the limit when the ratio profile or sparse prefix size changes.
+though the first head keeps two. Recompute the limit when the ratio profile or
+layout changes.
 
 ID and count contents can change at fixed tensor shapes without recompiling; zero
 counts disable forcing without changing the compiled call. Explicit graph replay
-with a fixed ratio profile uses updated contents in the captured input buffers.
-Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 projection/output fusions
-preserve forced routing. The coarse residual is unaffected.
+with a fixed ratio profile and layout uses updated contents in the captured input
+buffers. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 projection/output
+fusions preserve forced routing. The coarse residual is unaffected.
 
-Changing sequence length or force capacity can also reuse a Torch graph when
-the caller marks the corresponding input dimensions dynamic before the compiled
-call. Mark the model input's sequence dimension and the query-row dimension of
-both force tensors; mark the IDs' capacity dimension if it varies. For example:
+When sequence length or force capacity changes under a compiled call, also mark
+the query-row dimension of both force tensors dynamic, and the IDs' capacity
+dimension if it varies, alongside the [sequence-shaped inputs](#key-layouts):
 
 ```python
-torch._dynamo.mark_dynamic(hidden_states, 1)  # [batch, sequence, features]
 torch._dynamo.mark_dynamic(force_tile_ids, (0, 1))
 torch._dynamo.mark_dynamic(force_tile_counts, 0)
 ```
-
-Other sequence-shaped model inputs, such as rotary tables, need matching dynamic
-dimensions. Changing a Python integer argument such as `sparse_key_blocks` can
-still recompile; derive it from dynamic tensor shapes inside the compiled
-function when applicable. Keep model head count and head dimension fixed.
-Shape guards and GPU kernel policies still apply: one Torch graph does not
-promise one kernel variant across every layout, alignment, or backend. Zero and
-singleton dimensions may also receive separate compiler specializations.
 
 ### Coarse residual
 
@@ -295,8 +275,11 @@ to off. Supported patterns and numerical/storage contracts live in the
 ConvRot INT8 sparse fusion supports NVIDIA SM89/SM120 and AMD RDNA4. SM89 D128
 projection kernels preserve the shared FP32 stages but can differ by one INT8
 code at rounding boundaries.
-Sparse integrations additionally recognize compatible coarse branches and padded
-layouts; their exact matchers live beside the helper in each package. Do not infer
+Sparse integrations carry the opaque key layout through every fused operator and
+additionally recognize compatible coarse branches and padded storage. A coarse
+branch fuses only when its scope covers every complete key block, as the default
+scope does, because routing shares its block scores and the compiler does not read
+the layout. Exact matchers live beside the helper in each package. Do not infer
 fusion eligibility from the standalone attention API alone.
 
 ### Update a residual stream in place

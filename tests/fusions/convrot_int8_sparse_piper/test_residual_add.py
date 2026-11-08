@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 
@@ -63,7 +63,7 @@ def test_residual_add_matches_materialized_projected_query_output(
         *prepared_key,
         *prepared_value,
         attention._ratio_profile,
-        sequence_length // 64,
+        SparsePiperKeyLayout((SparsePiperKeyRegion(sequence_length // 64),)),
         sequence_length,
         attention._routing_mode,
         weight,
@@ -126,7 +126,7 @@ def _fake_arguments(base: torch.Tensor) -> tuple[object, ...]:
         torch.empty((2, 3, 3, 1), dtype=torch.float32, **meta),
         torch.empty((2, 3, 128), dtype=torch.float32, **meta),
         _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
-        2,
+        SparsePiperKeyLayout.prefix(2, 3),  # The three padded physical blocks.
         132,
         0,
         torch.empty((_OUTPUT_FEATURES, 384), dtype=torch.int8, **meta),

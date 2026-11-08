@@ -76,7 +76,7 @@ def _sparse_piper_attention_kernel(
     query_storage_sequence_length,
     storage_sequence_length,
     logical_sequence_length,
-    sparse_key_blocks,
+    num_routed_key_blocks,
     sparse_query_blocks,
     stride_rb,
     stride_rq,
@@ -127,10 +127,10 @@ def _sparse_piper_attention_kernel(
     selected_sparse_tile_count = gl.where(
         use_sparse_routes,
         routed_sparse_tile_count,
-        sparse_key_blocks,
+        num_routed_key_blocks,
     )
     sequence_tiles = storage_sequence_length // 64
-    dense_tile_count = sequence_tiles - sparse_key_blocks
+    dense_tile_count = sequence_tiles - num_routed_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
     pair_count = gl.cdiv(tile_count, 2)
     query = query_fragments(
@@ -160,7 +160,7 @@ def _sparse_piper_attention_kernel(
             pair * 2,
             routed_sparse_tile_count,
             selected_sparse_tile_count,
-            sparse_key_blocks,
+            num_routed_key_blocks,
             stride_rr,
             use_sparse_routes,
         )
@@ -169,7 +169,7 @@ def _sparse_piper_attention_kernel(
             gl.minimum(pair * 2 + 1, tile_count - 1),
             routed_sparse_tile_count,
             selected_sparse_tile_count,
-            sparse_key_blocks,
+            num_routed_key_blocks,
             stride_rr,
             use_sparse_routes,
         )
@@ -369,7 +369,7 @@ class _ContextLauncher:
                 launch.query_storage_sequence_length,
                 launch.storage_sequence_length,
                 launch.logical_sequence_length,
-                launch.sparse_key_blocks,
+                launch.num_routed_key_blocks,
                 launch.sparse_query_blocks,
                 *launch.route_strides,
                 *launch.output_strides,

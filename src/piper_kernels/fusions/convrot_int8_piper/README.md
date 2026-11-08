@@ -114,3 +114,10 @@ rounded across all heads, so each slice's add takes its position and covers its 
 share of the whole profile's budget. A coarse gate the fusion receives whole holds every
 head, so that add runs as one slice. Sparse windows keep their unsliced row cap: their Q,
 attention, and routing-score buffers then halve with the heads, at a small speed cost.
+
+Sparse calls carry their opaque key layout through the projection, output, and
+residual operators. A head slice resolves each region's budgets across the full
+profile before taking its heads, so it keeps the blocks those heads keep when every
+head runs together. A fused coarse branch shares its block scores with routing, so
+the pass fuses one only when its scope covers every complete key block; layout
+contents stay opaque to the compiler.

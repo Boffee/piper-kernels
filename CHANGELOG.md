@@ -5,20 +5,22 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
-### Added
-
-- Experimental `SparsePiperAttention` calls with `key_layout=...` partition key
-  storage with an immutable `SparsePiperKeyLayout` of `SparsePiperKeyRegion` values.
-  Construct layouts outside compiled forwards; the entire partition is runtime
-  configuration. Dynamic sequence dimensions can reuse a compiled graph when
-  sequence length, region count, boundaries, or sparse/dense flags change.
-  Each sparse region receives its own per-head keep budget; dense regions can
-  appear between sparse regions, within one softmax. Regions must cover complete
-  physical 64-token blocks.
-  `resolve_region_keep_blocks()` reports exact regional budgets. Standalone
-  compilation is supported; projection/output fusions still use the prefix API.
-
 ### Changed
+
+- Breaking: `SparsePiperAttention` partitions keys with a required
+  `key_layout=SparsePiperKeyLayout(...)` of ordered `SparsePiperKeyRegion` values
+  instead of `num_routed_key_blocks`. Each sparse region keeps its own per-head budget,
+  so several videos no longer compete for one pooled budget; dense regions may sit
+  between them, within one softmax. Replace `num_routed_key_blocks=n` with
+  `key_layout=SparsePiperKeyLayout.prefix(n, sequence_length // 64)`, which keeps
+  the same routes and dense suffix. `resolve_keep_blocks(layout)` replaces
+  `resolve_head_keep_blocks()` and returns per-region budgets. Construct layouts
+  outside compiled forwards: changing a layout, including its block count, reuses
+  the compiled graph, where a changed `num_routed_key_blocks` integer could recompile.
+  Forced tile IDs are absolute block indices in `[0, layout.num_blocks)`. ConvRot
+  INT8, NVFP4, and ConvRot NVFP4 projection/output fusions accept any layout; a
+  coarse branch now fuses only when its scope covers every complete key block, as
+  the default scope does.
 
 - On NVIDIA SM120, fused FP16/BF16 ConvRot INT8 dense/sparse attention output
   projections and GELU/SwiGLU FFN down projections add gated residuals in the GEMM

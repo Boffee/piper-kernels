@@ -14,7 +14,7 @@ def tile_offset(
     position,
     routed_count,
     selected_count,
-    sparse_blocks,
+    num_routed_key_blocks,
     route_stride,
     use_routes,
     skip_dense_routing: gl.constexpr = False,
@@ -26,10 +26,11 @@ def tile_offset(
     else:
         safe_position = gl.minimum(position, routed_count - 1)
         route = gl.load(routes + safe_position * route_stride).to(gl.int32)
-        sparse_tile = gl.where(use_routes, route, position)
-        sparse_start = sparse_tile * tile_stride
-        dense_start = sparse_blocks * tile_stride + (position - selected_count) * tile_stride
-        return gl.where(position < selected_count, sparse_start, dense_start)
+        routed_tile = gl.where(use_routes, route, position)
+        routed_start = routed_tile * tile_stride
+        # Dense-suffix tiles follow the routed blocks in traversal order.
+        dense_start = (num_routed_key_blocks + position - selected_count) * tile_stride
+        return gl.where(position < selected_count, routed_start, dense_start)
 
 
 @gluon.jit
@@ -39,7 +40,7 @@ def pair_tile_offsets(
     tile_count,
     routed_count,
     selected_count,
-    sparse_blocks,
+    num_routed_key_blocks,
     route_stride,
     use_routes,
     skip_dense_routing: gl.constexpr = False,
@@ -53,7 +54,7 @@ def pair_tile_offsets(
         position_0,
         routed_count,
         selected_count,
-        sparse_blocks,
+        num_routed_key_blocks,
         route_stride,
         use_routes,
         skip_dense_routing,
@@ -64,7 +65,7 @@ def pair_tile_offsets(
         position_1,
         routed_count,
         selected_count,
-        sparse_blocks,
+        num_routed_key_blocks,
         route_stride,
         use_routes,
         skip_dense_routing,

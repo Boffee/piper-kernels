@@ -3,15 +3,16 @@
 import pytest
 import torch
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout, SparsePiperKeyRegion
 from piper_kernels.attention.sparse_piper_attention import _backend
-from piper_kernels.attention.sparse_piper_attention._budget import _ResolvedRouteLayout
 from piper_kernels.attention.sparse_piper_attention._force_tiles import validate_force_tiles
 from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
 )
 from piper_kernels.attention.sparse_piper_attention.coarse import coarse_attention
+
+from ._layouts import counted_route_layout
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -22,17 +23,6 @@ def device(request):
     ):
         pytest.skip("requires native sparse routing")
     return torch.device("cuda", 0) if request.param == "cuda" else torch.device("cpu")
-
-
-def _layout(counts, device):
-    offsets = [0]
-    for count in counts:
-        offsets.append(offsets[-1] + count)
-    return _ResolvedRouteLayout(
-        torch.tensor(counts, dtype=torch.int32, device=device),
-        torch.tensor(offsets, dtype=torch.int32, device=device),
-        offsets[-1],
-    )
 
 
 def _oracle(scores, ids, counts, budgets):
@@ -73,11 +63,10 @@ def test_forced_routes_keep_exact_budget_and_scores(device, ties, num_key_blocks
     counts = torch.tensor([0, 1, 3, 2, 3, 0], dtype=torch.int32)
     expected = _oracle(scores, ids, counts, budgets)
     builder = PackedRouteBuilder(
-        _layout(budgets, device),
+        counted_route_layout(budgets, num_key_blocks, device),
         batch=2,
         heads=3,
         query_blocks=6,
-        sparse_key_blocks=num_key_blocks,
         device=device,
         force_tile_mask=_backend.build_force_tile_bitmask(
             ids.to(device), counts.to(device), num_key_blocks
@@ -96,13 +85,13 @@ def test_forced_routes_leave_coarse_attention_unchanged(device):
     ids = torch.tensor([[7, 6]] * 4, device=device, dtype=torch.int32)
     counts = torch.full((4,), 2, dtype=torch.int32, device=device)
     expected = coarse_attention(scores.clone(), values)
+    # Coarse attention covers one block beyond the eight routed blocks.
     builder = PackedRouteAndCoarseBuilder(
-        _layout([2, 4], device),
+        counted_route_layout([2, 4], 8, device),
         values,
         batch=1,
         heads=2,
         query_blocks=4,
-        sparse_key_blocks=8,
         device=device,
         force_tile_mask=_backend.build_force_tile_bitmask(ids, counts, 8),
     )
@@ -129,7 +118,7 @@ def test_public_forced_routes_and_dense_query_suffix(device, routing):
         q,
         q,
         v,
-        sparse_key_blocks=8,
+        key_layout=SparsePiperKeyLayout.prefix(8, 9),
         sparse_query_blocks=8,
         force_tile_ids=ids,
         force_tile_counts=counts,
@@ -153,6 +142,7 @@ def test_changing_forced_data_reuses_one_compiled_graph(device):
         .contiguous()
         .float()
     )
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(8),))
     ids = torch.zeros((8, 2), dtype=torch.int32, device=device)
     counts = torch.zeros(8, dtype=torch.int32, device=device)
     graphs = []
@@ -166,10 +156,10 @@ def test_changing_forced_data_reuses_one_compiled_graph(device):
         ids[:, 0], ids[:, 1] = first, second
         counts.fill_(active)
         actual = compiled(
-            q, q, v, sparse_key_blocks=8, force_tile_ids=ids, force_tile_counts=counts
+            q, q, v, key_layout=key_layout, force_tile_ids=ids, force_tile_counts=counts
         )
         expected = attention(
-            q, q, v, sparse_key_blocks=8, force_tile_ids=ids, force_tile_counts=counts
+            q, q, v, key_layout=key_layout, force_tile_ids=ids, force_tile_counts=counts
         )
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert len(graphs) == 1
@@ -187,8 +177,9 @@ def test_empty_forces_and_full_keep_match_baseline_with_gqa(device, routing, rat
         ids[:, 0] = 2
         counts.fill_(1)
     attention = SparsePiperAttention((ratio, ratio), routing=routing)
-    expected = attention(q, k, v, sparse_key_blocks=3)
-    actual = attention(q, k, v, sparse_key_blocks=3, force_tile_ids=ids, force_tile_counts=counts)
+    key_layout = SparsePiperKeyLayout((SparsePiperKeyRegion(3),))
+    expected = attention(q, k, v, key_layout=key_layout)
+    actual = attention(q, k, v, key_layout=key_layout, force_tile_ids=ids, force_tile_counts=counts)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -216,7 +207,7 @@ def test_graph_replay_reads_mutated_forced_ids_and_counts():
     scores = torch.arange(65, device=device).float().expand(1, 2, 4, 65).contiguous()
     ids = torch.tensor([[0, 31, 32]] * 4, device=device, dtype=torch.int32)
     counts = torch.ones(4, device=device, dtype=torch.int32)
-    layout = _layout([3, 17], device)
+    layout = counted_route_layout([3, 17], 65, device)
 
     def run():
         builder = PackedRouteBuilder(
@@ -224,7 +215,6 @@ def test_graph_replay_reads_mutated_forced_ids_and_counts():
             batch=1,
             heads=2,
             query_blocks=4,
-            sparse_key_blocks=65,
             device=device,
             force_tile_mask=_backend.build_force_tile_bitmask(ids, counts, 65),
         )

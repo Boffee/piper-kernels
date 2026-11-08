@@ -41,12 +41,12 @@ def _scatter_force_tile_bits(
 
 
 def build_force_tile_bitmask(
-    ids: torch.Tensor, counts: torch.Tensor, sparse_key_blocks: int
+    ids: torch.Tensor, counts: torch.Tensor, key_blocks: int
 ) -> torch.Tensor:
     """Pack active IDs; membership is shared by every batch and query head."""
     with device_context(ids.device):
         mask = torch.zeros(
-            (ids.shape[0], triton.cdiv(sparse_key_blocks, 32)),
+            (ids.shape[0], triton.cdiv(key_blocks, 32)),
             dtype=torch.int32,
             device=ids.device,
         )
@@ -85,20 +85,20 @@ def _route_priority_bits(  # noqa: ANN202
 def _fill_full_keep_routes_kernel(  # noqa: ANN202
     routes_ptr,  # noqa: ANN001
     count,  # noqa: ANN001
-    sparse_key_blocks: tl.constexpr,
+    num_routed_key_blocks: tl.constexpr,
     block: tl.constexpr,
 ):
     offsets = tl.program_id(0) * block + tl.arange(0, block)
-    tl.store(routes_ptr + offsets, offsets % sparse_key_blocks, offsets < count)
+    tl.store(routes_ptr + offsets, offsets % num_routed_key_blocks, offsets < count)
 
 
-def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
+def fill_full_keep_routes(routes: torch.Tensor, num_routed_key_blocks: int) -> None:
     """Write canonical routes directly, without summaries or top-k selection."""
     with device_context(routes.device):
         _fill_full_keep_routes_kernel[(triton.cdiv(routes.numel(), 1024),)](
             routes,
             routes.numel(),
-            sparse_key_blocks,  # pyright: ignore[reportArgumentType]
+            num_routed_key_blocks,  # pyright: ignore[reportArgumentType]
             1024,  # pyright: ignore[reportArgumentType]
         )
 
@@ -117,7 +117,7 @@ def _ordered_float_bits(scores):  # noqa: ANN001, ANN202
 def _tiled_radix_select_pass(  # noqa: ANN202
     scores_ptr,  # noqa: ANN001
     score_base,  # noqa: ANN001
-    sparse_key_blocks,  # noqa: ANN001
+    num_routed_key_blocks,  # noqa: ANN001
     prefix,  # noqa: ANN001
     rank,  # noqa: ANN001
     shift: tl.constexpr,
@@ -128,9 +128,9 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 ):
     """Select one radix byte while streaming a score row in fixed tiles."""
     histogram = tl.zeros([_RADIX_BINS], tl.int32)
-    for tile_start in range(0, sparse_key_blocks, selector_tile):
+    for tile_start in range(0, num_routed_key_blocks, selector_tile):
         key_offsets = tile_start + tl.arange(0, selector_tile)
-        valid = key_offsets < sparse_key_blocks
+        valid = key_offsets < num_routed_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
         ordered_bits = _route_priority_bits(
             scores, start_key_block + key_offsets, valid, force_mask_ptr, has_force
@@ -155,7 +155,7 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 
 @triton.jit(
     do_not_specialize=[
-        "sparse_key_blocks",
+        "num_heads",
         "query_blocks",
         "query_block_offset",
         "score_batch_stride",
@@ -170,11 +170,9 @@ def _tiled_radix_select_pass(  # noqa: ANN202
 def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     scores_ptr: torch.Tensor,
     routes_ptr: torch.Tensor,
-    head_keep_blocks_ptr: torch.Tensor,
-    route_head_offsets_ptr: torch.Tensor,
     force_mask_ptr: torch.Tensor,
     region_metadata_ptr: torch.Tensor,
-    sparse_key_blocks: int,
+    num_heads: int,
     query_blocks: int,
     query_block_offset: int,
     score_batch_stride: int,
@@ -184,30 +182,22 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     route_query_stride: int,
     route_route_stride: int,
     force_mask_stride: int,
-    num_heads: tl.constexpr,
-    has_regions: tl.constexpr,
     compact_scores: tl.constexpr,
     selector_tile: tl.constexpr,
     has_force: tl.constexpr,
 ) -> None:
-    """Select exact stable FP32 top-k routes with runtime row dimensions."""
-    query_block = tl.program_id(0)
+    """Select one query block, region, head, and batch into its packed route slots."""
+    region = tl.program_id(0) // query_blocks
+    query_block = tl.program_id(0) % query_blocks
     head = tl.program_id(1)
     batch = tl.program_id(2)
-    start_key_block = 0
-    start_score_block = 0
-    if has_regions:
-        region = query_block // query_blocks
-        query_block = query_block % query_blocks
-        metadata = region_metadata_ptr + region * (2 * num_heads + 3)
-        start_key_block = tl.load(metadata)
-        sparse_key_blocks = tl.load(metadata + 1)
-        start_score_block = tl.load(metadata + 2) if compact_scores else start_key_block
-        head_keep_block_count = tl.load(metadata + 3 + head)
-        route_head_offset = tl.load(metadata + 3 + num_heads + head)
-    else:
-        route_head_offset = tl.load(route_head_offsets_ptr + head)
-        head_keep_block_count = tl.load(head_keep_blocks_ptr + head)
+    # Row: start block, length, compact score start, H keep counts, H destinations.
+    metadata = region_metadata_ptr + region * (2 * num_heads + 3)
+    start_key_block = tl.load(metadata)
+    region_key_blocks = tl.load(metadata + 1)
+    start_score_block = tl.load(metadata + 2) if compact_scores else start_key_block
+    head_keep_block_count = tl.load(metadata + 3 + head)
+    route_head_offset = tl.load(metadata + 3 + num_heads + head)
     score_base = (
         batch * score_batch_stride
         + head * score_head_stride
@@ -221,13 +211,14 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     )
     force_row = force_mask_ptr + (query_block_offset + query_block) * force_mask_stride
 
-    if has_regions and head_keep_block_count == sparse_key_blocks:
-        for tile_start in range(0, sparse_key_blocks, selector_tile):
+    if head_keep_block_count == region_key_blocks:
+        # Regions that keep every block have no score columns in compact scores.
+        for tile_start in range(0, region_key_blocks, selector_tile):
             keys = tile_start + tl.arange(0, selector_tile)
             tl.store(
                 routes_ptr + output_base + keys * route_route_stride,
                 start_key_block + keys,
-                keys < sparse_key_blocks,
+                keys < region_key_blocks,
             )
     else:
         prefix = 0
@@ -235,7 +226,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         prefix, rank = _tiled_radix_select_pass(
             scores_ptr,
             score_base,
-            sparse_key_blocks,
+            region_key_blocks,
             prefix,
             rank,
             tl.constexpr(24),
@@ -247,7 +238,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         prefix, rank = _tiled_radix_select_pass(
             scores_ptr,
             score_base,
-            sparse_key_blocks,
+            region_key_blocks,
             prefix,
             rank,
             tl.constexpr(16),
@@ -259,7 +250,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         prefix, rank = _tiled_radix_select_pass(
             scores_ptr,
             score_base,
-            sparse_key_blocks,
+            region_key_blocks,
             prefix,
             rank,
             tl.constexpr(8),
@@ -271,7 +262,7 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         threshold_bits, equal_keep = _tiled_radix_select_pass(
             scores_ptr,
             score_base,
-            sparse_key_blocks,
+            region_key_blocks,
             prefix,
             rank,
             tl.constexpr(0),
@@ -283,9 +274,9 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
 
         output_offset = 0
         equal_offset = 0
-        for tile_start in range(0, sparse_key_blocks, selector_tile):
+        for tile_start in range(0, region_key_blocks, selector_tile):
             key_offsets = tile_start + tl.arange(0, selector_tile)
-            valid = key_offsets < sparse_key_blocks
+            valid = key_offsets < region_key_blocks
             scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
             ordered_bits = _route_priority_bits(
                 scores, start_key_block + key_offsets, valid, force_row, has_force
@@ -308,44 +299,32 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
 def tiled_radix_select_packed_routes(
     scores: torch.Tensor,
     routes: torch.Tensor,
-    head_keep_blocks: torch.Tensor,
-    route_head_offsets: torch.Tensor,
+    region_metadata: torch.Tensor,
     *,
     query_block_offset: int,
     force_tile_mask: torch.Tensor | None = None,
-    region_metadata: torch.Tensor | None = None,
     compact_scores: bool = False,
 ) -> None:
-    """Write exact stable FP32 top-k routes directly into packed UINT16 storage."""
+    """Write exact stable FP32 top-k routes for every routed region into packed storage.
+
+    ``region_metadata`` is the resolved layout's contiguous INT32 selector table,
+    one row per region. Scores hold each region's columns at its key start, or at
+    its compact score start when ``compact_scores`` omits fully retained regions.
+    """
     if scores.ndim != 4 or scores.stride(-1) != 1 or scores.dtype != torch.float32:
         raise ValueError("tiled radix selection requires rank-four FP32 scores with dense keys")
     if routes.ndim != 3 or routes.dtype != torch.uint16 or not routes.is_contiguous():
         raise ValueError(
             "packed tiled radix selection requires contiguous rank-three uint16 routes"
         )
-    if (
-        head_keep_blocks.ndim != 1
-        or head_keep_blocks.shape[0] != scores.shape[1]
-        or head_keep_blocks.dtype != torch.int32
-        or head_keep_blocks.device != routes.device
-        or not head_keep_blocks.is_contiguous()
-    ):
-        raise ValueError("tiled head keep blocks must be a contiguous device int32 head vector")
-    if (
-        route_head_offsets.shape != (scores.shape[1] + 1,)
-        or route_head_offsets.dtype != torch.int32
-        or route_head_offsets.device != routes.device
-        or not route_head_offsets.is_contiguous()
-    ):
-        raise ValueError("packed tiled route head offsets must be a contiguous device int32 vector")
     if scores.device != routes.device or scores.device.type != "cuda":
         raise ValueError("tiled scores and routes must share a CUDA device")
     if not 0 <= query_block_offset <= routes.shape[1] - scores.shape[2]:
         raise ValueError("tiled query range must fit the packed route output")
     if routes.shape[0] != scores.shape[0]:
         raise ValueError("tiled scores and packed routes must share the batch dimension")
-    batch, heads, query_blocks, sparse_key_blocks = scores.shape
-    if region_metadata is not None and (
+    batch, heads, query_blocks, _score_blocks = scores.shape
+    if (
         region_metadata.ndim != 2
         or region_metadata.shape[1] != 2 * heads + 3
         or region_metadata.dtype is not torch.int32
@@ -353,30 +332,25 @@ def tiled_radix_select_packed_routes(
         or not region_metadata.is_contiguous()
     ):
         raise ValueError("region metadata must use contiguous INT32 [regions, 2 * heads + 3]")
-    num_regions = 1 if region_metadata is None else region_metadata.shape[0]
     if force_tile_mask is not None and (
         force_tile_mask.ndim != 2
         or force_tile_mask.shape[0] != routes.shape[1]
-        or (
-            region_metadata is None
-            and force_tile_mask.shape[1] != triton.cdiv(sparse_key_blocks, 32)
-        )
         or force_tile_mask.dtype is not torch.int32
         or force_tile_mask.device != scores.device
         or not force_tile_mask.is_contiguous()
     ):
         raise ValueError("forced membership must use contiguous INT32 [query_blocks,key_words]")
     with device_context(scores.device):
-        # Regions can exceed CUDA's 65,535 limit on the second grid dimension
-        # when combined with heads. Keep them on the larger first dimension.
-        _tiled_radix_select_packed_routes_kernel[(query_blocks * num_regions, heads, batch)](
+        # Many regions times heads can exceed CUDA's 65,535 limit on the second
+        # grid dimension. Keep regions on the larger first dimension.
+        _tiled_radix_select_packed_routes_kernel[
+            (query_blocks * region_metadata.shape[0], heads, batch)
+        ](
             scores,
             routes,
-            head_keep_blocks,
-            route_head_offsets,
-            head_keep_blocks if force_tile_mask is None else force_tile_mask,
-            head_keep_blocks if region_metadata is None else region_metadata,
-            sparse_key_blocks,
+            region_metadata if force_tile_mask is None else force_tile_mask,
+            region_metadata,
+            heads,
             query_blocks,
             query_block_offset,
             scores.stride(0),
@@ -386,8 +360,6 @@ def tiled_radix_select_packed_routes(
             routes.stride(1),
             routes.stride(2),
             0 if force_tile_mask is None else force_tile_mask.stride(0),
-            num_heads=heads,
-            has_regions=region_metadata is not None,
             compact_scores=compact_scores,
             selector_tile=_SELECTOR_TILE,
             has_force=force_tile_mask is not None,

@@ -24,7 +24,7 @@ def _active_indices(
     batch: int,
     head: int,
     query_block: int,
-    sparse_key_blocks: int,
+    num_routed_key_blocks: int,
     sequence_length: int,
     route_head_offsets: list[int],
     block_lengths: torch.Tensor | None,
@@ -38,20 +38,20 @@ def _active_indices(
             route_start:route_stop,
         ].long()
         if use_sparse_routes and routes.indices.shape[-1] != 0
-        else torch.arange(sparse_key_blocks, device=routes.indices.device)
+        else torch.arange(num_routed_key_blocks, device=routes.indices.device)
     )
     row_offsets = torch.arange(_BLOCK_ROWS, device=routes.indices.device)
     sparse_rows = (selected_blocks[:, None] * _BLOCK_ROWS + row_offsets).flatten()
-    sparse_key_rows = sparse_key_blocks * _BLOCK_ROWS
+    routed_key_rows = num_routed_key_blocks * _BLOCK_ROWS
     suffix_rows = torch.arange(
-        sparse_key_rows,
+        routed_key_rows,
         sequence_length,
         device=routes.indices.device,
     )
     key_indices = torch.cat((sparse_rows, suffix_rows))
 
     suffix_tiles = torch.arange(
-        sparse_key_blocks,
+        num_routed_key_blocks,
         (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
         device=routes.indices.device,
     )
@@ -106,7 +106,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     value: torch.Tensor,
     routes: PackedRoutes,
     *,
-    sparse_key_blocks: int,
+    num_routed_key_blocks: int,
     scale: float,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
@@ -151,7 +151,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     batch=batch_index,
                     head=head,
                     query_block=query_block,
-                    sparse_key_blocks=sparse_key_blocks,
+                    num_routed_key_blocks=num_routed_key_blocks,
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
@@ -246,7 +246,7 @@ def reference_exact_sparse_attention(
     value: torch.Tensor,
     routes: PackedRoutes,
     *,
-    sparse_key_blocks: int,
+    num_routed_key_blocks: int,
     scale: float,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
@@ -266,7 +266,7 @@ def reference_exact_sparse_attention(
                     batch=batch_index,
                     head=head,
                     query_block=query_block,
-                    sparse_key_blocks=sparse_key_blocks,
+                    num_routed_key_blocks=num_routed_key_blocks,
                     sequence_length=sequence,
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,

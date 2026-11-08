@@ -15,7 +15,7 @@ _DO_NOT_SPECIALIZE_ARGUMENTS = (
     "query_block_offset",
     "global_query_block_offset",
     "logical_sequence_length",
-    "sparse_key_blocks",
+    "num_routed_key_blocks",
     "sparse_query_blocks",
     "stride_rb",
     "stride_rq",
@@ -36,7 +36,7 @@ class _ValidatedAttentionLaunch:
     storage_sequence_length: int
     output_sequence_length: int
     logical_sequence_length: int
-    sparse_key_blocks: int
+    num_routed_key_blocks: int
     sparse_query_blocks: int
     route_strides: tuple[int, int, int]
     output_strides: tuple[int, int, int]
@@ -164,7 +164,7 @@ def validate_attention_launch(
     # The dense suffix visits a compact ragged tile last. Caller-provided routes
     # can also place that tile in the sparse prefix, which needs an ordinary-loop mask.
     ragged_tail_is_routed = (
-        mask_ragged_tail and context.sparse_key_blocks * TILE_ROWS > logical_sequence_length
+        mask_ragged_tail and context.num_routed_key_blocks * TILE_ROWS > logical_sequence_length
     )
     return _ValidatedAttentionLaunch(
         batch=batch,
@@ -177,7 +177,7 @@ def validate_attention_launch(
         storage_sequence_length=storage_sequence_length,
         output_sequence_length=output_sequence_length,
         logical_sequence_length=logical_sequence_length,
-        sparse_key_blocks=context.sparse_key_blocks,
+        num_routed_key_blocks=context.num_routed_key_blocks,
         sparse_query_blocks=sparse_query_blocks,
         route_strides=(
             query_state.routes.stride(0),

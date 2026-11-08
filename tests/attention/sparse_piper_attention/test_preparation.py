@@ -63,9 +63,9 @@ def preparation():
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("sparse_key_blocks", [1, None])
+@pytest.mark.parametrize("num_sparse_blocks", [1, None])
 def test_fused_preparation_matches_separate_passes(
-    preparation, head_dim, dtype, padded, sparse_key_blocks
+    preparation, head_dim, dtype, padded, num_sparse_blocks
 ):
     from piper_kernels.attention.kernels.qk_quantization.int8.sage import (  # noqa: PLC0415
         triton as qk_quantization,
@@ -79,7 +79,7 @@ def test_fused_preparation_matches_separate_passes(
     # Cross a mean-reduction chunk boundary, with GQA and non-contiguous head strides.
     rows = 17 * 64 if padded else 17 * 64 + 5
     storage = (rows + 63) // 64 * 64
-    sparse_key_blocks = rows // 64 if sparse_key_blocks is None else sparse_key_blocks
+    num_sparse_blocks = rows // 64 if num_sparse_blocks is None else num_sparse_blocks
     generator = torch.Generator(device="cuda").manual_seed(606)
     query = (
         torch.randn(2, rows, 4, head_dim, device="cuda", generator=generator)
@@ -121,12 +121,12 @@ def test_fused_preparation_matches_separate_passes(
     )
     expected_summaries = _summaries_triton.sequence_block_summaries(
         masked_query,
-        masked_key[:, :, : sparse_key_blocks * 64],
+        masked_key[:, :, : num_sparse_blocks * 64],
         _routing_modes._MINMAX_ROUTING,
         lengths,
     )
     options = {
-        "sparse_key_blocks": sparse_key_blocks,
+        "num_routed_key_blocks": num_sparse_blocks,
         "combined_key": key,
         "combined_value": value,
         "block_lengths": lengths,
@@ -148,7 +148,7 @@ def test_fused_preparation_matches_separate_passes(
     ):
         torch.testing.assert_close(getattr(fused, name), expected, atol=0, rtol=0, msg=name)
     for summary in (fused.key_summary, fused.key_aux):
-        assert summary.shape == (2, 2, sparse_key_blocks, head_dim)
+        assert summary.shape == (2, 2, num_sparse_blocks, head_dim)
         # A prefix view of a full-sequence allocation would retain the wasted storage.
         assert summary.untyped_storage().nbytes() == summary.numel() * summary.element_size()
     torch.testing.assert_close(fused.value_mean, value_mean, atol=0, rtol=0)
@@ -160,7 +160,7 @@ def test_fused_preparation_matches_separate_passes(
 def test_public_fused_preparation_matches_separate_and_graph(
     preparation, monkeypatch, head_dim, padded
 ):
-    from piper_kernels import SparsePiperAttention  # noqa: PLC0415
+    from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout  # noqa: PLC0415
 
     rows = 2048 if padded else 2051
     query = torch.randn(1, rows, 4, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -179,7 +179,11 @@ def test_public_fused_preparation_matches_separate_and_graph(
     )
     # Mix per-head budgets and route a small prefix before a long dense suffix.
     attention = SparsePiperAttention((0.25, 0.5, 1.0, 0.25))
-    options = {"sparse_key_blocks": 4, "block_lengths": lengths, "sparse_query_blocks": 16}
+    options = {
+        "key_layout": SparsePiperKeyLayout.prefix(4, rows // 64),
+        "block_lengths": lengths,
+        "sparse_query_blocks": 16,
+    }
     fused = attention(query, key, value, **options)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -242,7 +246,7 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
     )
     for kernel in kernels:
         kernel.device_caches.clear()
-    for batch, heads, rows, sparse_key_blocks in (
+    for batch, heads, rows, num_sparse_blocks in (
         (1, 4, 1024, 16),
         (1, 4, 1024, 1),
         (1, 4, 1024, 3),
@@ -262,7 +266,7 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
             key_mean,
             head_dim**-0.5,
             storage_sequence_length=rows,
-            sparse_key_blocks=sparse_key_blocks,
+            num_routed_key_blocks=num_sparse_blocks,
             block_lengths=None,
         )
         # The new producer must retain the all-zero quantization guards.

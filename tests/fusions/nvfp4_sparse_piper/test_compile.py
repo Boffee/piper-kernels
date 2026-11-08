@@ -17,6 +17,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels import (
     SparsePiperAttention,
+    SparsePiperKeyLayout,
+    SparsePiperKeyRegion,
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -55,7 +57,7 @@ class _SparseProjectionAttention(torch.nn.Module):
     """Small canonical H3 attention region used to exercise the fusion pass."""
 
     sequence_length = 192
-    sparse_key_blocks = 2
+    num_sparse_blocks = 2
     input_features = 256
     heads = 2
     head_dim = 128
@@ -126,6 +128,9 @@ class _SparseProjectionAttention(torch.nn.Module):
         self.register_buffer("cos", angles.cos().contiguous())
         self.register_buffer("sin", angles.sin().contiguous())
         self.sparse_attention = SparsePiperAttention((0.5, 1.0), routing=routing)
+        self.key_layout = SparsePiperKeyLayout.prefix(
+            self.num_sparse_blocks, self.sequence_length // 64
+        )
 
     def set_activation_dtype(self, dtype: torch.dtype) -> None:
         for projection in self.modules():
@@ -180,7 +185,7 @@ class _SparseProjectionAttention(torch.nn.Module):
             query,
             key,
             value,
-            sparse_key_blocks=self.sparse_key_blocks,
+            key_layout=self.key_layout,
             force_tile_ids=force_tile_ids,
             force_tile_counts=force_tile_counts,
         )
@@ -246,11 +251,12 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
     """NVFP4 projection with padding, coarse attention, and a mixed query scope."""
 
     coarse_scale = 0.125
-    coarse_key_blocks = 3
 
     def __init__(self, *, dynamic: bool, routing: str, output_dynamic: bool = False) -> None:
         super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
         self.routing = routing
+        # Coarse branches fuse only when they cover every complete key block.
+        self.coarse_key_blocks = self.sequence_length // 64
 
     def forward(
         self,
@@ -271,7 +277,7 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
             query,
             key,
             value,
-            sparse_key_blocks=self.sparse_key_blocks,
+            key_layout=self.key_layout,
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
         )
@@ -430,7 +436,7 @@ def _run_explicit_attention_output(
         attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
             *attention_arguments,
             model.sparse_attention._ratio_profile,
-            model.sparse_key_blocks,
+            model.key_layout,
             model.sequence_length,
             model.sparse_attention._routing_mode,
             *optional_arguments,
@@ -448,7 +454,7 @@ def _run_explicit_attention_output(
             value[2],
             coarse_gate,
             model.sparse_attention._ratio_profile,
-            model.sparse_key_blocks,
+            model.key_layout,
             model.sequence_length,
             model.sparse_attention._routing_mode,
             model.coarse_scale,
@@ -870,6 +876,52 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
         capture.targets
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_compile_fuses_regional_layouts_into_one_graph(monkeypatch) -> None:
+    monkeypatch.setattr(_SparseProjectionAttention, "sequence_length", 640)
+    torch.manual_seed(1913)
+    model = _SparseProjectionAttentionOutput().eval()
+    hidden_states = torch.randn(
+        (model.batch, model.sequence_length, model.input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    layouts = (
+        SparsePiperKeyLayout(
+            (
+                SparsePiperKeyRegion(3),
+                SparsePiperKeyRegion(1, sparse=False),
+                SparsePiperKeyRegion(4),
+                SparsePiperKeyRegion(2, sparse=False),
+            )
+        ),
+        SparsePiperKeyLayout((SparsePiperKeyRegion(5), SparsePiperKeyRegion(5))),
+        SparsePiperKeyLayout.prefix(6, 10),
+    )
+    capture = TargetCapturePass()
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
+    )
+    with torch.no_grad():
+        for key_layout in layouts:
+            model.key_layout = key_layout
+            expected = _run_explicit_attention_output(model, hidden_states)
+            assert_fusion_output_close(compiled(hidden_states), expected)
+    # Layouts are runtime operator inputs: every layout reuses the fused graph.
+    assert capture.calls == 1
+    assert (
+        capture.targets.count(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        )
+        == 1
+    )
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
 
 
 @pytest.mark.gpu

@@ -71,7 +71,7 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
             hidden_states,
             model.cos,
             model.sin,
-            model.sparse_key_blocks,
+            model.key_layout,
             coarse_gate=coarse_gate,
             coarse_scale=model.coarse_scale,
             coarse_key_blocks=model.coarse_key_blocks,
@@ -134,7 +134,7 @@ def test_static_sparse_scales_can_change_without_recompilation(monkeypatch, proj
         first = compiled(hidden_states)
         getattr(model, projection).weight.act_per_tensor_scale.mul_(0.5)
         expected, _ = _run_explicit_attention_output(
-            model, hidden_states, model.cos, model.sin, model.sparse_key_blocks
+            model, hidden_states, model.cos, model.sin, model.key_layout
         )
         second = compiled(hidden_states)
     assert_fusion_output_close(second, expected)
@@ -164,7 +164,7 @@ def test_static_coarse_gate_keeps_valid_metadata_when_attention_escapes():
             hidden,
             model.cos,
             model.sin,
-            model.sparse_key_blocks,
+            model.key_layout,
             coarse_gate=gate,
             coarse_scale=model.coarse_scale,
             coarse_key_blocks=model.coarse_key_blocks,
@@ -220,7 +220,7 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
                 hidden,
                 model.cos,
                 model.sin,
-                model.sparse_key_blocks,
+                model.key_layout,
                 coarse_gate=gate,
                 coarse_scale=model.coarse_scale,
                 coarse_key_blocks=model.coarse_key_blocks,
@@ -279,7 +279,7 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
             intermediate,
             model.cos,
             model.sin,
-            model.sparse_key_blocks,
+            model.key_layout,
             coarse_gate=gate,
             coarse_scale=model.coarse_scale,
             coarse_key_blocks=model.coarse_key_blocks,

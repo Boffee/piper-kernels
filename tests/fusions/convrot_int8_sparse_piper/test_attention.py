@@ -9,7 +9,7 @@ import torch
 from lib.sparse_piper import reference_value_storage
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, SparsePiperKeyLayout
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -28,7 +28,7 @@ _INPUT_FEATURES = 256
 _HEADS = 2
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
-_SPARSE_KEY_BLOCKS = 2
+_KEY_LAYOUT = SparsePiperKeyLayout.prefix(2, _SEQUENCE // 64)
 
 type _QuantizedQueryOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type _QuantizedKeyOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -159,14 +159,14 @@ def _run_sparse_piper_attention_from_quantized(
     attention: SparsePiperAttention,
     *,
     logical_sequence_length: int,
-    sparse_key_blocks: int,
+    key_layout: SparsePiperKeyLayout,
 ) -> torch.Tensor:
     return _sparse_piper_attention_from_quantized_op(
         *prepared_query,
         *prepared_key,
         *prepared_value,
         attention._ratio_profile,
-        sparse_key_blocks,
+        key_layout,
         logical_sequence_length,
         attention._routing_mode,
     )
@@ -225,7 +225,7 @@ def test_quantized_sparse_piper_writes_engine_layout() -> None:
             value,
             attention,
             logical_sequence_length=_SEQUENCE,
-            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+            key_layout=_KEY_LAYOUT,
         )
 
     assert output.shape == (_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)
@@ -259,7 +259,7 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
             materialized_query,
             materialized_key,
             materialized_value,
-            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+            key_layout=_KEY_LAYOUT,
         )
         actual = _run_sparse_piper_attention_from_quantized(
             query,
@@ -267,7 +267,7 @@ def test_quantized_sparse_piper_matches_the_materialized_path() -> None:
             value,
             attention,
             logical_sequence_length=_SEQUENCE,
-            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+            key_layout=_KEY_LAYOUT,
         )
 
     difference = actual.float() - expected.float()
@@ -315,14 +315,14 @@ def test_ragged_fused_projection_matches_materialized_attention(
     )
     materialized_value = _materialize_value(operands)
 
-    sparse_key_blocks = sequence_length // 64
+    key_layout = SparsePiperKeyLayout.prefix(sequence_length // 64, sequence_length // 64)
     attention = SparsePiperAttention((1.0, 1.0))
     with torch.no_grad():
         expected = attention(
             materialized_query,
             materialized_key,
             materialized_value,
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
         )
         actual = _run_sparse_piper_attention_from_quantized(
             prepared_query,
@@ -330,7 +330,7 @@ def test_ragged_fused_projection_matches_materialized_attention(
             prepared_value,
             attention,
             logical_sequence_length=sequence_length,
-            sparse_key_blocks=sparse_key_blocks,
+            key_layout=key_layout,
         )
 
     assert actual.shape == (batch, sequence_length, _HEADS, _HEAD_DIM)
@@ -367,7 +367,7 @@ def test_full_fused_sparse_piper_pipeline_compiles_as_one_graph() -> None:
             value,
             attention,
             logical_sequence_length=_SEQUENCE,
-            sparse_key_blocks=_SPARSE_KEY_BLOCKS,
+            key_layout=_KEY_LAYOUT,
         )
 
     compiled = torch.compile(run, fullgraph=True)
