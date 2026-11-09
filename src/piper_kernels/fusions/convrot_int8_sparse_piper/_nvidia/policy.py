@@ -45,8 +45,6 @@ def select_execution_plan(
     """
     if not supports_target(target):
         raise ValueError(f"Sparse projections have no NVIDIA policy for {target}")
-    if operation not in ("query", "key", "value"):
-        raise ValueError("projection operation must be query, key, or value")
     # On an RTX 5090 at 1K-32K rows and 8-56 heads, Gluon projects Q 1.3-1.4x and V
     # 1.0-1.3x faster than SM120's Triton plans. K ranges from 5% slower, for 12 heads
     # at 2.8K rows, to 1.2x faster.

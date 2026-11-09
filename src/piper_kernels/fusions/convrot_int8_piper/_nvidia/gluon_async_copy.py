@@ -1,4 +1,4 @@
-"""SM89 Gluon kernels for the fused ConvRot INT8 dense-Piper Q/K/V projections.
+"""SM89 and SM120 Gluon kernels for the fused ConvRot INT8 dense-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
 fragments. Programs run at the 255-register limit.
@@ -45,8 +45,6 @@ _GL_HEAD_DIM = gl.constexpr(fragments.HEAD_DIM)
 _GL_BLOCK_M = gl.constexpr(fragments.BLOCK_M)
 _GL_TILE_ROWS = gl.constexpr(_TILE_ROWS)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(32)
-_GL_SCALE_EPSILON = gl.constexpr(1e-7)
-_GL_INT8_RANGE = gl.constexpr(127.0)
 _GL_P_UINT8_RANGE = gl.constexpr(255.0)
 _GL_LOG2_E = gl.constexpr(1.4426950408889634)
 _GL_FEATURE_LAYOUT = fragments.FEATURE_LAYOUT
@@ -120,9 +118,7 @@ def _query_kernel(
     if per_thread_scales:
         grouped = gl.reshape(smoothed, [_GL_BLOCK_M // 32, 4, 8, _GL_HEAD_DIM])
         row_maximum = gl.max(gl.abs(grouped), axis=3)
-        raw_scale = (
-            gl.expand_dims(gl.max(row_maximum, axis=1), 1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
-        )
+        raw_scale = fragments.int8_scale(gl.expand_dims(gl.max(row_maximum, axis=1), 1))
         quantized = fragments.round_to_int8(grouped / gl.expand_dims(raw_scale, 3))
         row_scale, _ = gl.broadcast(raw_scale, row_maximum)
         row_scale = gl.reshape(row_scale, [_GL_BLOCK_M]) * (softmax_scale * _GL_LOG2_E)
@@ -137,9 +133,7 @@ def _query_kernel(
     else:
         groups: gl.constexpr = _GL_BLOCK_M // _GL_QUERY_SCALE_ROWS
         grouped = gl.reshape(smoothed, [groups, _GL_QUERY_SCALE_ROWS, _GL_HEAD_DIM])
-        raw_scale = (
-            gl.max(gl.max(gl.abs(grouped), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
-        )
+        raw_scale = fragments.int8_scale(gl.max(gl.max(gl.abs(grouped), axis=2), axis=1))
         if mask_rows:
             group_layout: gl.constexpr = raw_scale.type.layout  # pyright: ignore[reportAttributeAccessIssue]
             group_starts = first_row + gl.arange(0, groups, group_layout) * _GL_QUERY_SCALE_ROWS
@@ -279,7 +273,7 @@ def _value_kernel(
         value -= gl.load(mean_pointers)[None, None, :]
     if mask_rows:
         value = gl.where((sequence < logical_sequence_length)[:, :, None], value, 0.0)
-    value_scale = gl.max(gl.abs(value), axis=2) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
+    value_scale = fragments.int8_scale(gl.max(gl.abs(value), axis=2))
     quantized = fragments.round_to_int8(value / value_scale[:, :, None])
     # NVIDIA attention reads FP16-rounded log scales.
     log_scale = gl.log2(value_scale).to(gl.float16).to(gl.float32)

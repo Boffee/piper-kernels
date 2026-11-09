@@ -65,9 +65,9 @@ projection storage and FP32 statistics. `convrot_int8_sage_qk.key` owns K
 transforms and centered K encoding, with optional sparse routing summaries.
 Dense V's per-token quantization remains distinct from sparse V's tile scales.
 Typed backend methods operate on caller-owned buffers; target launch choices
-live in separate NVIDIA/RDNA4 modules. D128 dense projections on SM89, and
-sparse projections on SM8x and SM120, run Gluon kernels built from the shared
-[fragments](../convrot_int8_projection/_nvidia/fragments.py), and one shared
+live in separate NVIDIA/RDNA4 modules. D128 projections run Gluon kernels built
+from the shared [fragments](../convrot_int8_projection/_nvidia/fragments.py): dense
+projections on SM89 and SM120, sparse projections on SM8x and SM120. One shared
 [policy](../convrot_int8_projection/_nvidia/policy.py) decides which operands they
 cover. [_backend.py](_backend.py) provides optional selection for
 matching and required selection for validated execution.
