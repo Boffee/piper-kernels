@@ -214,9 +214,9 @@ Dense ConvRot INT8 fusion supports MHA/GQA. Its optional `fuse_output=True` also
 enables bounded attention-to-output-projection execution; output fusion defaults
 to off. Supported patterns and numerical/storage contracts live in the
 [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md).
-ConvRot INT8 sparse fusion supports NVIDIA SM89/SM120 and AMD RDNA4. SM89 D128
-projection kernels preserve the shared FP32 stages but can differ by one INT8
-code at rounding boundaries.
+Dense and sparse ConvRot INT8 fusion support NVIDIA SM89/SM120 and AMD RDNA4.
+SM89 D128 projection kernels preserve the shared FP32 stages but can differ by
+one INT8 code at rounding boundaries.
 Sparse integrations additionally recognize compatible coarse branches and padded
 layouts; their exact matchers live beside the helper in each package. Do not infer
 fusion eligibility from the standalone attention API alone.

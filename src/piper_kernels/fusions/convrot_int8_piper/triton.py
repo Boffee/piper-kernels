@@ -7,6 +7,9 @@ import torch
 import triton
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    resolve_qk_quantization,
+)
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 from piper_kernels.fusions.convrot_int8_projection.triton import (
     project_prepared_input_mean_kernel,
@@ -37,9 +40,13 @@ def project_query(
     chunk_start: int = 0,
     chunk_rows: int | None = None,
 ) -> None:
-    """Emit Q32 INT8 directly from the shared FP32 Q/K projection."""
+    """Emit INT8 Q directly from the shared FP32 Q/K projection.
+
+    ``out`` holds Q32 scales, or per-row scales for per-thread quantization.
+    """
     query, query_scale = out
     batch, heads, storage_length, head_dim = query.shape
+    per_thread_scales = resolve_qk_quantization(query_scale, storage_length) == "per_thread"
     sequence_length = input_qdata.shape[1]
     chunk_rows = sequence_length if chunk_rows is None else chunk_rows
     if batch == 0:
@@ -82,6 +89,7 @@ def project_query(
                     and heads % execution_plan.heads_per_program == 0
                 ),
                 mask_ragged_tail=mask_ragged_tail,
+                per_thread_scales=per_thread_scales,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
             )
@@ -91,6 +99,34 @@ def project_query(
             launch(full_blocks, 0, mask_ragged_tail=False)
         if chunk_rows % 64:
             launch(1, full_blocks, mask_ragged_tail=True)
+
+
+def project_value_mean(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    block_n: int,
+    block_k: int,
+    out: torch.Tensor,
+) -> None:
+    """Project the dequantized input mean into ``out``, the mean non-causal V subtracts."""
+    output_features = weight_qdata.shape[0]
+    with device_context(input_qdata.device):
+        project_prepared_input_mean_kernel[(triton.cdiv(output_features, block_n), out.shape[0])](
+            _ops.dequantized_input_mean(input_qdata, input_scale),
+            weight_qdata,
+            weight_scale,
+            out,
+            input_features=input_qdata.shape[2],
+            output_features=output_features,
+            block_n=block_n,
+            block_k=block_k,
+            bias_ptr=bias,
+            num_warps=4,
+        )
 
 
 def project_value(
@@ -115,20 +151,15 @@ def project_value(
     )
     with device_context(input_qdata.device):
         if not is_causal:
-            represented_mean = _ops.dequantized_input_mean(input_qdata, input_scale)
-            project_prepared_input_mean_kernel[
-                (triton.cdiv(heads * head_dim, mean_block_n), batch)
-            ](
-                represented_mean,
+            project_value_mean(
+                input_qdata,
+                input_scale,
                 weight_qdata,
                 weight_scale,
-                mean,
-                input_features=input_qdata.shape[2],
-                output_features=heads * head_dim,
+                bias,
                 block_n=mean_block_n,
                 block_k=execution_plan.block_k,
-                bias_ptr=bias,
-                num_warps=4,
+                out=mean,
             )
         for count, offset, aligned in (
             (sequence // 64, 0, True),

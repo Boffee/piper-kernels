@@ -1,1 +1,1 @@
-"""NVIDIA dense projection configuration."""
+"""NVIDIA execution for fused ConvRot INT8 dense projections."""

@@ -19,7 +19,7 @@ ATTENTION_STACK_BUDGET_BYTES = 128
 
 # Gluon projection programs also run at the 255-register limit. Their epilogues may
 # spill a few words outside the K loop; spills inside it, or of whole epilogue vectors,
-# made masked SM89 projections 6-41% slower at 32K H3 rows.
+# made SM89 projections 4-41% slower at 32K H3 rows.
 PROJECTION_SPILL_STORE_BUDGET_BYTES = 32
 
 

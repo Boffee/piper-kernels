@@ -17,7 +17,6 @@ from lib.attention import (
     make_attention_inputs,
     run_sdpa,
 )
-from lib.attention_providers import qk_quantization_granularity
 from lib.attention_tuning import (
     add_attention_tuning_arguments,
     validate_attention_tuning_arguments,
@@ -192,7 +191,7 @@ def _make_candidate(
                 **config.as_dict(),
                 "implementation": "pure_triton",
                 "algorithm": "sage_attention_2pp",
-                "qk_quantization": qk_quantization_granularity(target),
+                "qk_quantization": "per_warp" if plan.grouped_qk else "per_thread",
                 "pv_accumulation": "fp32+fp16",
                 "block_n": int(sage_attention_2pp_backend._BLOCK_N),
                 **plan.as_dict(),

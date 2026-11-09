@@ -28,8 +28,8 @@ from lib.attention_providers import (
     SAGE_ATTENTION_2PP,
     _load_canonical_sage_attention,
     make_attention_providers,
-    qk_quantization_granularity,
     resolve_provider_names,
+    select_qk_quantization,
     validate_provider_support,
 )
 
@@ -90,7 +90,7 @@ def test_qk_granularity_matches_architecture(
         backend="cuda",
         architecture=f"sm{capability[0]}{capability[1]}",
     )
-    assert qk_quantization_granularity(target) == expected
+    assert select_qk_quantization(target) == expected
 
 
 def test_provider_metadata_distinguishes_algorithms_and_controls() -> None:
@@ -144,7 +144,7 @@ def test_sm89_piper_provider_registers_separate_quantization_kernels() -> None:
 def test_rdna4_provider_uses_dense_preparation_and_shared_benchmark_phases(architecture):
     target = AcceleratorTarget("hip", architecture)
     validate_provider_support((PIPER_ATTENTION, PYTORCH_SDPA), target)
-    assert qk_quantization_granularity(target) == "per_warp"
+    assert select_qk_quantization(target) == "per_warp"
     query = torch.empty((1, 6, 65, 128), device="meta", dtype=torch.bfloat16)
     key = torch.empty((1, 2, 131, 128), device="meta", dtype=query.dtype)
     providers = make_attention_providers(

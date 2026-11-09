@@ -55,6 +55,8 @@ through `cp.async` commit groups. It retains per-thread Q/K scales, derives the
 V log-scale bound, and masks the final K tile plus the causal diagonal when
 needed. D64 quantizes Q in the prologue; D128 uses a smaller query tile and a
 register cap to retain occupancy. Ragged lengths reuse one compiled kernel.
+Q quantized by a fused producer skips the prologue. Q128 tiles zero-fill rows past
+Q64-padded storage, and producer K scales and V multipliers span K64-padded storage.
 
 The plan's `attention_kernel` explicitly selects `triton` or `gluon_async_copy`.
 Capability checks belong to the plan. Exact thresholds and launch choices live

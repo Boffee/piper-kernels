@@ -137,6 +137,14 @@ def test_quantized_context_rejects_bad_metadata_without_tensor_operations(invali
         dispatch._validate_quantized(*operands)
 
 
+def test_quantized_context_rejects_mixed_qk_granularities():
+    operands = _native_inputs()
+    # Per-row Q scales beside K64-group K scales.
+    operands[1] = torch.empty(2, 4, 128)
+    with _MetadataOnly(), pytest.raises(ValueError, match="share one granularity"):
+        dispatch._validate_quantized(*operands)
+
+
 @pytest.mark.parametrize("number", [0.0, -1.0, float("nan"), float("inf")])
 def test_tensor_contents_remain_caller_preconditions(number):
     operands = _native_inputs()
@@ -162,7 +170,9 @@ def test_fake_outputs_only_and_empty_execution_skips_target(monkeypatch, batch):
     cos = torch.empty(65, 48)
     norm = torch.empty(64, requires_grad=True)
     with torch.no_grad(), _OutputOnly():
-        prepared_key = key._project_key_op_fake(*operands, norm, cos, cos, 1e-5, head_dim=64)
+        prepared_key = key._project_key_op_fake(
+            *operands, norm, cos, cos, 1e-5, head_dim=64, qk_quantization="per_warp"
+        )
         prepared_value = value._project_value_op_fake(*operands, head_dim=64, is_causal=False)
         assert prepared_key[0].shape == (batch, 2, 128, 64)
         assert prepared_value[0].shape == (batch, 2, 64, 128)
@@ -171,6 +181,11 @@ def test_fake_outputs_only_and_empty_execution_skips_target(monkeypatch, batch):
         assert dispatch._piper_attention_from_quantized_fake(*native).shape == (batch, 4, 65, 64)
     if batch == 0:
         with torch.no_grad():
-            assert key._project_key_op(*operands, norm, cos, cos, 1e-5, head_dim=64)[0].numel() == 0
+            assert (
+                key._project_key_op(
+                    *operands, norm, cos, cos, 1e-5, head_dim=64, qk_quantization="per_warp"
+                )[0].numel()
+                == 0
+            )
             assert value._project_value_op(*operands, head_dim=64, is_causal=False)[0].numel() == 0
             assert dispatch._piper_attention_from_quantized_op(*native).numel() == 0

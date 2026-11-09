@@ -14,8 +14,9 @@ class ProjectionBackend(Protocol):
 
     All storage is contiguous on one device. Q is local to its aligned global
     input window; K/V cover the complete sequence. Q/K storage is padded to 64
-    rows with Q32/K64 FP32 scales. V uses target-native codes and per-token
-    FP32 multipliers/logs, plus a per-head mean.
+    rows, with FP32 scales per Q32/K64 group or per row as ``out`` is sized; see
+    ``count_query_scales`` and ``count_key_scales``. V uses target-native codes
+    and per-token FP32 multipliers/logs, plus a per-head mean.
     """
 
     def project_query(  # noqa: PLR0913

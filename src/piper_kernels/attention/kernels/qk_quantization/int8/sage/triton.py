@@ -135,6 +135,40 @@ def quantize_query_tile(
 
 
 @triton.jit
+def quantize_query_per_thread_tile(
+    values,
+    row_valid,
+    softmax_scale: tl.constexpr,
+    heads_per_program: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+):
+    """Return per-thread INT8 Q and per-row base-2 recurrence scales for one tile.
+
+    As in the per-thread Q kernel, rows 32b + 8i + t (i = 0..3) share a scale.
+    Every row stores its group's scale; rows outside ``row_valid`` store zero.
+    """
+    smoothed = rotate_signed_hadamard_heads(
+        tl.reshape(values, (block_m * heads_per_program, head_dim)),
+        head_dim,
+    )
+    smoothed = tl.permute(
+        tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
+        (1, 0, 2),
+    )
+    grouped = tl.reshape(smoothed, (heads_per_program, block_m // 32, 4, 8, head_dim))
+    maximum = tl.max(tl.max(tl.abs(grouped), axis=4), axis=2)
+    raw_scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
+    quantized = round_to_int8(grouped / raw_scale[:, :, None, :, None])
+    row_scale = tl.reshape(
+        tl.broadcast_to(raw_scale[:, :, None, :], (heads_per_program, block_m // 32, 4, 8)),
+        (heads_per_program, block_m),
+    )
+    stored_scale = tl.where(row_valid, row_scale * (softmax_scale * _LOG2_E), 0.0)
+    return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), stored_scale
+
+
+@triton.jit
 def quantize_key_tile(
     values,
     heads_per_program: tl.constexpr,

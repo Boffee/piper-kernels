@@ -12,6 +12,30 @@ SCALE_EPSILON = 1e-7
 type QKQuantizationGranularity = Literal["per_thread", "per_warp"]
 
 
+def validate_qk_quantization(qk_quantization: str) -> QKQuantizationGranularity:
+    """Accept a Sage Q/K scale granularity name."""
+    if qk_quantization == "per_thread":
+        return "per_thread"
+    if qk_quantization == "per_warp":
+        return "per_warp"
+    raise ValueError(f"unknown Q/K quantization granularity: {qk_quantization}")
+
+
+def count_query_scales(storage_length: int, qk_quantization: QKQuantizationGranularity) -> int:
+    """Count FP32 scales per head of Q64-padded Q: one per Q32 group or per row."""
+    return storage_length if qk_quantization == "per_thread" else storage_length // QUERY_BLOCK
+
+
+def count_key_scales(storage_length: int, qk_quantization: QKQuantizationGranularity) -> int:
+    """Count FP32 scales per head of K64-padded K: one per K64 group or per key."""
+    return storage_length if qk_quantization == "per_thread" else storage_length // KEY_BLOCK
+
+
+def resolve_qk_quantization(scales: torch.Tensor, storage_length: int) -> QKQuantizationGranularity:
+    """Read Q/K granularity from scale metadata: one scale per stored row is per thread."""
+    return "per_thread" if scales.ndim == 3 and scales.shape[2] == storage_length else "per_warp"
+
+
 def _pad_sequence(value: torch.Tensor, multiple: int) -> tuple[torch.Tensor, int]:
     length = value.shape[2]
     padded_length = (length + multiple - 1) // multiple * multiple
