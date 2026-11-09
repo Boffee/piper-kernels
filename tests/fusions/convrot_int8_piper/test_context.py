@@ -60,16 +60,18 @@ def test_key_uses_global_post_transform_mean(head_dim, sequence, affine, granula
         grouped=granularity == "per_warp",
         storage_key_length=actual.shape[2],
     )
-    # SM89's Gluon K orders its projection and reductions differently, which can
-    # straddle BF16 and INT8 rounding boundaries; one BF16 step at a group maximum
-    # moves its scale by up to 2**-8. The other targets keep the tight bound.
-    sm89 = AcceleratorTarget.from_device(actual.device).is_cuda_capability(8, 9)
+    # Projection ordering can round a K value to the other BF16 neighbor, a step of
+    # at most 2**-7 of it. That moves a per-warp scale only at its group's maximum,
+    # and no rounded value here is one. Per-thread K applies a normalized Hadamard
+    # transform to each key, which spreads the step over every channel of the key, so
+    # a value in the key holding its group's maximum moves the scale by up to
+    # 2**-7 / sqrt(64), under 1e-3 for values no larger than the maximum.
     assert (actual.int() - expected.int()).abs().max() <= 1
     torch.testing.assert_close(
         scales[:, :, : expected_scale.shape[2]],
         expected_scale,
         atol=2e-7,
-        rtol=3e-3 if sm89 else 3e-5,
+        rtol=1e-3 if granularity == "per_thread" else 3e-5,
     )
     assert torch.count_nonzero(actual[:, :, sequence:]) == 0
 
