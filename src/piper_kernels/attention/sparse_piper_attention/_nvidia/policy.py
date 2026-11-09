@@ -73,8 +73,9 @@ _SM8X_D64_MAX_REGISTERS = 168
 def select_sm8x_max_registers(head_dim: int) -> int | None:
     """Return the per-thread register cap for SM8x's Q64 four-warp launch, if any.
 
-    ``cp.async`` addressing lifts the D64 kernel to 179-183 registers on SM89,
-    which fits two CTAs per SM; capping it at 168, where SM120's kernel already
-    sits, fits three. Shared memory holds D128 to two CTAs on SM86 and SM89 anyway.
+    Uncapped, ``cp.async`` addressing lifts the D64 kernel to 181-187 registers on
+    sm_86 and sm_89 with Triton 3.9, which fits two CTAs per SM. Capping it at 168
+    fits three, at the cost of 36-44 bytes of spill stores. Shared memory holds D128
+    to two CTAs on SM86 and SM89 anyway.
     """
     return _SM8X_D64_MAX_REGISTERS if head_dim == 64 else None

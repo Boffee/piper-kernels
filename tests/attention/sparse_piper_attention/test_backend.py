@@ -812,7 +812,9 @@ def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, m
 @pytest.mark.skipif(_backend.nvidia_async_copy_gluon is None, reason="requires Triton import")
 @pytest.mark.parametrize("operand", ["query", "key", "value"])
 @pytest.mark.parametrize("defect", ["noncontiguous", "misaligned"])
-def test_sm89_rejects_uncopyable_storage_before_device_execution(monkeypatch, operand, defect):
+def test_async_copy_rejects_uncopyable_storage_before_device_execution(
+    monkeypatch, operand, defect
+):
     native = _backend.nvidia_async_copy_gluon
     prepared = _prepared_attention(128, 2)
     tensor = {
