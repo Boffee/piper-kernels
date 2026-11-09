@@ -49,6 +49,7 @@ _GL_BLOCK_K = gl.constexpr(_BLOCK_K)
 _GL_NUM_STAGES = gl.constexpr(_NUM_STAGES)
 _GL_NUM_WARPS = gl.constexpr(NUM_WARPS)
 _GL_INT8_RANGE = gl.constexpr(127.0)
+_GL_SCALE_EPSILON = gl.constexpr(1e-7)
 _GL_HADAMARD_NORM = gl.constexpr(0.08838834764831845)
 _GL_HADAMARD_WORD_0 = gl.constexpr(SIGNED_HADAMARD_MASK[0])
 _GL_HADAMARD_WORD_1 = gl.constexpr(SIGNED_HADAMARD_MASK[1])
@@ -109,6 +110,12 @@ def project_int8(
         False,
         _GL_MMA_K,
     )
+
+
+@gluon.jit
+def int8_scale(maximum):
+    """Scale a group's absolute maximum onto the INT8 range, as the Triton launchers do."""
+    return maximum / _GL_INT8_RANGE + _GL_SCALE_EPSILON
 
 
 @gluon.jit

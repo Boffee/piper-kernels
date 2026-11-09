@@ -41,8 +41,6 @@ _GL_HEAD_DIM = gl.constexpr(_HEAD_DIM)
 _GL_BLOCK_M = gl.constexpr(fragments.BLOCK_M)
 _GL_TILE_ROWS = gl.constexpr(TILE_ROWS)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
-_GL_SCALE_EPSILON = gl.constexpr(1e-7)
-_GL_INT8_RANGE = gl.constexpr(127.0)
 _GL_P_UINT8_RANGE = gl.constexpr(255.0)
 _GL_LOG2_E = gl.constexpr(1.4426950408889634)
 _GL_FEATURE_LAYOUT = fragments.FEATURE_LAYOUT
@@ -197,9 +195,7 @@ def _query_kernel(
     smoothed = gl.reshape(
         fragments.signed_hadamard(values, features), [groups, _GL_QUERY_SCALE_ROWS, _GL_HEAD_DIM]
     )
-    raw_scale = (
-        gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
-    )
+    raw_scale = fragments.int8_scale(gl.max(gl.max(gl.abs(smoothed), axis=2), axis=1))
     if mask_rows:
         group_layout: gl.constexpr = raw_scale.type.layout  # pyright: ignore[reportAttributeAccessIssue]
         group_starts = first_row + gl.arange(0, groups, group_layout) * _GL_QUERY_SCALE_ROWS
@@ -406,9 +402,7 @@ def _value_kernel(
     centered = projection - value_mean[None, None, :]
     if mask_rows:
         centered = gl.where(valid[:, :, None], centered, 0.0)
-    value_scale = (
-        gl.max(gl.max(gl.abs(centered), axis=2), axis=1) / _GL_INT8_RANGE + _GL_SCALE_EPSILON
-    )
+    value_scale = fragments.int8_scale(gl.max(gl.max(gl.abs(centered), axis=2), axis=1))
     quantized = fragments.round_to_int8(centered / value_scale[:, None, None])
 
     storage_rows = storage_tiles * _GL_TILE_ROWS

@@ -1,4 +1,4 @@
-"""SM89 projects dense D128 heads with Gluon kernels and other shapes with the Triton launchers."""
+"""SM89 and SM120 project dense D128 heads with Gluon kernels, and other shapes with Triton."""
 
 from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock
@@ -16,6 +16,7 @@ from piper_kernels.fusions.convrot_int8_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_piper._nvidia import dispatch, gluon_async_copy, policy
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
+_NVIDIA_TARGETS = [AcceleratorTarget("cuda", architecture) for architecture in ("sm89", "sm120")]
 # Only Q and K produce Q/K scales, so V runs once.
 _OPERATION_GRANULARITIES = [
     ("query", "per_warp"),
@@ -72,7 +73,16 @@ def _outputs(operation, device, *, rows, batch=2, heads=3, head_dim=128, granula
 
 
 def _launch(
-    module, operation, operands, out, *, bias=None, window=(64, 129), causal=False, **options
+    module,
+    operation,
+    operands,
+    out,
+    *,
+    bias=None,
+    window=(64, 129),
+    causal=False,
+    target=_SM89_TARGET,
+    **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
     if module is gluon_async_copy and operation == "value":
@@ -84,12 +94,10 @@ def _launch(
             "rotary_dim": 0 if operation == "value" else operands[5].shape[1],
         }
         options["execution_plan"] = (
-            dispatch.default_execution_plan(
-                input_qdata, weight_qdata, target=_SM89_TARGET, **metadata
-            )
+            dispatch.default_execution_plan(input_qdata, weight_qdata, target=target, **metadata)
             if module is dispatch
             else policy.select_execution_plan(
-                _SM89_TARGET, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
+                target, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
             )
         )
     if operation == "query":
@@ -132,8 +140,9 @@ def _launch(
     ],
 )
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-def test_sm89_uses_gluon_only_for_supported_projections(
-    monkeypatch, operation, head_dim, input_features, rotary_dim, supported
+@pytest.mark.parametrize("target", _NVIDIA_TARGETS, ids=str)
+def test_every_target_uses_gluon_only_for_supported_projections(
+    monkeypatch, target, operation, head_dim, input_features, rotary_dim, supported
 ):
     monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
@@ -144,7 +153,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
             "cuda:1", input_features=input_features, head_dim=head_dim, rotary_dim=rotary_dim
         )
         out = _outputs(operation, "cuda:1", rows=193, head_dim=head_dim)
-        _launch(dispatch, operation, operands, out)
+        _launch(dispatch, operation, operands, out, target=target)
     # V has no RoPE, so only its head and input widths matter.
     uses_gluon = supported or (
         operation == "value" and head_dim == 128 and input_features % 64 == 0
@@ -157,36 +166,37 @@ def test_sm89_uses_gluon_only_for_supported_projections(
     assert plan.kernel == ("gluon_async_copy" if uses_gluon else "triton")
     if not uses_gluon:
         assert plan is policy.select_execution_plan(
-            _SM89_TARGET,
+            target,
             operation=operation,
             input_features=272,
             head_dim=128,
             operands_aligned=True,
         )
-        assert plan.heads_per_program == 1
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-def test_sm89_unaligned_operands_use_the_triton_launchers(operation):
+@pytest.mark.parametrize(
+    ("architecture", "heads_per_program", "num_warps"),
+    # SM120's two-head tiles exceed SM89's shared memory.
+    [("sm89", 1, 4), ("sm120", 2, 8)],
+)
+def test_unaligned_operands_use_the_target_triton_schedule(
+    operation, architecture, heads_per_program, num_warps
+):
     plan = policy.select_execution_plan(
-        _SM89_TARGET, operation=operation, input_features=256, head_dim=128, operands_aligned=False
-    )
-    assert plan.kernel == "triton"
-
-
-@pytest.mark.parametrize("operation", ["query", "key", "value"])
-@pytest.mark.parametrize("aligned", [False, True])
-def test_sm120_keeps_its_two_head_triton_plan(operation, aligned):
-    plan = policy.select_execution_plan(
-        AcceleratorTarget("cuda", "sm120"),
+        AcceleratorTarget("cuda", architecture),
         operation=operation,
         input_features=5376,
         head_dim=128,
         rotary_dim=96,
-        operands_aligned=aligned,
+        operands_aligned=False,
     )
     assert plan.kernel == "triton"
-    assert (plan.heads_per_program, plan.num_warps, plan.block_k) == (2, 8, 128)
+    assert (plan.heads_per_program, plan.num_warps, plan.block_k) == (
+        heads_per_program,
+        num_warps,
+        128,
+    )
 
 
 @pytest.mark.parametrize("architecture", ["sm80", "sm86", "sm90", "sm121"])
@@ -203,7 +213,7 @@ def test_other_nvidia_targets_have_no_dense_projection_policy(architecture):
     ("operation", "granularity", "causal"),
     [(*case, False) for case in _OPERATION_GRANULARITIES] + [("value", "per_warp", True)],
 )
-def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
+def test_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
     monkeypatch, operation, granularity, causal
 ):
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
@@ -280,8 +290,9 @@ _POINTER_TYPES = {
 }
 
 
+@pytest.mark.parametrize("architecture", [89, 120])
 @pytest.mark.parametrize(("operation", "variant"), _COMPILE_VARIANTS)
-def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
+def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, variant):
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     constants = {
         "input_features": _INPUT_FEATURES,
@@ -310,7 +321,7 @@ def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
             signature[name] = "i32"
     compiled, spill_stores = compile_with_spill_stores(
         GluonASTSource(function, signature, constexprs=constants, attrs=attributes),
-        GPUTarget("cuda", 89, 32),
+        GPUTarget("cuda", architecture, 32),
         {"num_warps": 4},
     )
     assert compiled.asm["cubin"]
@@ -354,7 +365,7 @@ def _assert_matches(operation, actual, expected):
         {"batch": 1, "sequence": 200, "rotary_dim": 32, "affine": False, "window": (0, 77)},
     ],
 )
-def test_sm89_gluon_projections_match_the_triton_launchers(operation, granularity, case):
+def test_gluon_projections_match_the_triton_launchers(operation, granularity, case):
     torch.manual_seed(1113)
     batch, sequence = case["batch"], case["sequence"]
     operands = _operands(

@@ -11,7 +11,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   on NVIDIA SM89, as on SM120 and RDNA4. On an RTX 4070 Ti SUPER with Triton 3.9, the
   compiled H3 attention block runs 1.01-1.14x faster than without the fusion at 16K-100K
   tokens and needs 56-57% less peak memory. At 1K-8K tokens its attention error against
-  FP64 is 3-6% lower than without it. SM120 and RDNA4 kernels are unchanged.
+  FP64 is 3-6% lower than without it.
 - Sparse Piper attention and the ConvRot INT8 sparse-Piper fusion run natively on NVIDIA
   SM80, SM86, and SM87 with SM89's `cp.async` kernels and launch choices. Sparse attention
   previously ran the portable quantized reference on these GPUs, and the fusion did not
@@ -19,15 +19,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- On NVIDIA SM120, the ConvRot INT8 sparse-Piper fusion projects D128 Q/K/V heads with
-  the Gluon kernels that SM8x uses, when the input width is a multiple of 64, the rotary
-  width a multiple of 32, and operands are 16-byte aligned. Other shapes keep SM120's
-  Triton kernels. On an RTX 5090 with 8-56 heads at 1K-32K tokens, Q projects 1.3-1.4x
-  faster, V 1.0-1.3x, and K between 5% slower and 1.2x faster. The compiled attention
-  block of the benchmark suite's sparse video cases (56 heads; Q/K/V projections, sparse
-  attention, and the output projection) runs 1.02-1.10x faster at 20K-110K tokens. INT8
-  codes can differ by one at rounding boundaries, which changes that block's output by
-  0.3-0.4% relative L2.
+- On NVIDIA SM120, the ConvRot INT8 dense- and sparse-Piper fusions project D128 Q/K/V
+  heads with the Gluon kernels that SM89 uses, when the input width is a multiple of 64,
+  the rotary width a multiple of 32, and operands are 16-byte aligned. Other shapes keep
+  SM120's Triton kernels. On an RTX 5090 at 1K-32K tokens, dense Q/K/V projections run
+  1.15-1.42x faster; sparse Q runs 1.3-1.4x faster, V 1.0-1.3x, and K between 5% slower
+  and 1.2x faster. The compiled attention blocks of the benchmark suite's cases (Q/K/V
+  projections, attention, and the output projection) run 1.02-1.07x faster for dense
+  video and image attention at 2.8K-110K tokens, and 1.02-1.10x faster for sparse video
+  attention at 20K-110K tokens. INT8 codes can differ by one at rounding boundaries,
+  which changes those blocks' output by 0.3-0.4% relative L2.
 - On NVIDIA SM89, the sparse-Piper fusion's full Q/K projection tiles use the same
   narrower operand slices as its masked tiles, so every target shares one kernel. Those
   tiles run up to 2.3% slower, an estimated 0.1-0.6% of the compiled attention block;
