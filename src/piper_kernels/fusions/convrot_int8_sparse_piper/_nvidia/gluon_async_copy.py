@@ -2,7 +2,9 @@
 
 Each program projects 128 rows onto one D128 head through the SM8x ConvRot INT8
 GEMM's pipeline: ``cp.async`` copies stage K64 slices of the INT8 operands in shared
-memory, and ``mma_v2`` accumulates exact INT32 products.
+memory, and ``mma_v2`` accumulates exact INT32 products. Q/K programs run at the
+255-register limit, so their masked tiles multiply K32 operand slices. V multiplies
+K32 slices on every tile, and the epilogues keep per-thread vectors small.
 
 Q and K split warps only across rows and permute the weight rows, so each thread
 holds 4 consecutive features of every row it owns, with the other feature bits in
@@ -11,8 +13,8 @@ pairs stay in registers. Q applies the signed Hadamard with five of its seven
 stages in registers and the other two as butterfly shuffles. K stores BF16 rows
 and FP32 tile sums for the shared encoder, which centers K by its global mean.
 
-V keeps a 2x2 warp grid. Its epilogue spreads rows across lanes, so the
-transposed stores are coalesced.
+V keeps a 2x2 warp grid. Its epilogue gives each thread 8 consecutive rows of 16
+features, so the transposed stores are coalesced 8-byte writes.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
@@ -63,6 +65,8 @@ _MEAN_BLOCK_K = 128
 _GL_HEAD_DIM = gl.constexpr(_HEAD_DIM)
 _GL_BLOCK_M = gl.constexpr(_BLOCK_M)
 _GL_BLOCK_K = gl.constexpr(_BLOCK_K)
+# One m16n8k32 INT8 MMA step; see _project_int8.
+_GL_MMA_K = gl.constexpr(32)
 _GL_NUM_STAGES = gl.constexpr(_NUM_STAGES)
 _GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
 _GL_TILE_ROWS = gl.constexpr(TILE_ROWS)
@@ -100,8 +104,14 @@ def _project_int8(
     weight_rows,
     accumulator,
     input_features: gl.constexpr,
+    mma_k: gl.constexpr,
 ):
-    """Accumulate ``input[rows] @ weight[weight_rows].T`` in the SM8x GEMM's copy pipeline."""
+    """Accumulate ``input[rows] @ weight[weight_rows].T`` in the SM8x GEMM's copy pipeline.
+
+    Operands load and multiply in ``mma_k``-wide slices of each K64 tile. The 128x128
+    accumulator already takes 128 of the 255 registers per thread, so K32 slices leave
+    the K loop room where K64 slices spill.
+    """
     mma_layout: gl.constexpr = accumulator.type.layout
     features = gl.arange(0, _GL_BLOCK_K, gl.SliceLayout(0, _GL_COPY_LAYOUT))
     input_pointers = (
@@ -125,6 +135,7 @@ def _project_int8(
         gl.DotOperandLayout(0, mma_layout, k_width=4),
         gl.DotOperandLayout(1, mma_layout, k_width=4),
         False,
+        mma_k,
     )
 
 
@@ -298,6 +309,9 @@ def _project_rmsnorm_rope(
         version=[2, 0], warps_per_cta=[_GL_NUM_WARPS, 1], instr_shape=[16, 8]
     )
     columns = gl.arange(0, _GL_HEAD_DIM, _GL_COPY_ROWS)
+    # Each Q/K warp multiplies all 128 weight rows, so a K64 slice of them takes 64
+    # registers. Full tiles fit, and K64 slices run them 1-2% faster. Masked tiles keep
+    # row clamps live through the K loop, which spilled there with K64 slices.
     accumulator = _project_int8(
         input_ptr,
         weight_ptr,
@@ -305,6 +319,7 @@ def _project_rmsnorm_rope(
         head * _GL_HEAD_DIM + _column_features(columns),
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
         input_features,
+        _GL_MMA_K if mask_rows else _GL_BLOCK_K,
     )
     accumulator = _by_feature(accumulator)
 
@@ -360,17 +375,22 @@ def _summarize_blocks(
     """
     blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
     rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
-    valid = _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths)
-    valid = valid[:, None] & (features >= 0)[None, :]
+    row_valid = _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths)
+    valid = row_valid[:, None] & (features >= 0)[None, :]
     if mask_rows:
         values = gl.where(valid, values, 0.0)
     block_values = gl.reshape(values, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
     block_valid = gl.reshape(valid, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
     if mean_pool_summary:
         if mask_rows:
-            valid_count = gl.sum(block_valid.to(gl.int32), axis=1)
             block_sum = gl.sum(gl.where(block_valid, block_values, 0.0), axis=1)
-            mean = block_sum / valid_count  # pyright: ignore[reportOperatorIssue]
+            # Count rows, not row-feature pairs: a per-feature count would hold 32 more
+            # registers per thread through the reduction.
+            row_counts = gl.reshape(row_valid.to(gl.int32), [blocks, _GL_TILE_ROWS])
+            valid_count = gl.convert_layout(
+                gl.sum(row_counts, axis=1), gl.SliceLayout(1, block_sum.type.layout)
+            )
+            mean = block_sum / valid_count[:, None]
         else:
             mean = gl.sum(block_values, axis=1) / _GL_TILE_ROWS
         return values, mean, mean
@@ -670,6 +690,8 @@ def _value_kernel(
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
     )
+    # K32 slices keep every V tile below the register limit, and run full tiles 1-2%
+    # faster than K64 slices.
     accumulator = _project_int8(
         input_ptr,
         weight_ptr,
@@ -677,12 +699,15 @@ def _value_kernel(
         head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, _GL_COPY_ROWS),
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
         input_features,
+        _GL_MMA_K,
     )
 
-    # [K64 tiles, rows, features] with lanes along rows for the transposed V stores.
+    # [K64 tiles, rows, features]: each thread holds 8 consecutive rows of 16 features.
+    # Per-feature scales, biases, and means then take 16 registers each, row reductions
+    # are mostly in registers, and the transposed stores write 8 contiguous bytes.
     tiles: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
     layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 4], [1, 32, 1], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
+        [1, 8, 1], [1, 8, 4], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
     )
     tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
     first_tile = row_block * tiles

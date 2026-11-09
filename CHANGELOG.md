@@ -5,6 +5,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- On NVIDIA SM89, the ConvRot INT8 sparse-Piper fusion's Q/K/V projections no longer spill
+  registers inside their K loop on masked tiles: a sequence's partial last tile, and every
+  tile when `block_lengths` is passed. On an RTX 4070 Ti SUPER at 32K tokens with 56 D128
+  heads and `block_lengths`, V runs 1.4x faster, and Q 1.08x faster with mean routing,
+  which Triton 3.9 had made 9% slower than Triton 3.8; Q with min-max routing is 1.3%
+  slower. Without `block_lengths`, Q and K are unchanged and V is 1-2% faster. V block
+  means, and Q mean-routing summaries from masked tiles, differ by FP32 summation
+  rounding; INT8 codes and scales are unchanged.
+
 ## [0.8.0rc4] - 2026-11-08
 
 ### Changed

@@ -82,8 +82,14 @@ def _accumulate(
     input_layout: gl.constexpr,
     weight_layout: gl.constexpr,
     masked: gl.constexpr,
+    mma_k: gl.constexpr,
 ):
-    """Accumulate the exact INT32 tile product through a ``stages``-deep copy pipeline."""
+    """Accumulate the exact INT32 tile product through a ``stages``-deep copy pipeline.
+
+    Each K tile's operands load and multiply in ``mma_k``-wide slices. Slices narrower
+    than ``block_k`` hold fewer operand registers at once, for callers whose warp tiles
+    leave little room beside the accumulator.
+    """
     # Buffers allocated here end before the epilogue, which reuses their shared memory.
     input_buffers = _stage_buffers(accumulator.shape[0], block_k, stages)
     weight_buffers = _stage_buffers(accumulator.shape[1], block_k, stages)
@@ -142,9 +148,10 @@ def _accumulate(
                 masked,
             )
             async_copy.commit_group()
-            values = input_buffers[stage].load(input_layout)
-            weight = weight_buffers[stage].permute([1, 0]).load(weight_layout)
-            accumulator = mma_v2(values, weight, accumulator)
+            for first_column in gl.static_range(0, block_k, mma_k):
+                values = input_buffers[stage].slice(first_column, mma_k, dim=1).load(input_layout)
+                weight = weight_buffers[stage].slice(first_column, mma_k, dim=1).permute([1, 0])
+                accumulator = mma_v2(values, weight.load(weight_layout), accumulator)
     async_copy.wait_group(0)
     return accumulator
 
@@ -230,6 +237,7 @@ def _int8_matmul_kernel(
             input_layout,
             weight_layout,
             False,
+            block_k,
         )
     else:
         accumulator = _accumulate(
@@ -246,6 +254,7 @@ def _int8_matmul_kernel(
             input_layout,
             weight_layout,
             True,
+            block_k,
         )
 
     offsets_m = pid_m * block_m + gl.arange(0, block_m, gl.SliceLayout(1, mma_layout))
