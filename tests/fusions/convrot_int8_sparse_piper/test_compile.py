@@ -44,7 +44,7 @@ def _reset_attention_kernel_cache():
     target = AcceleratorTarget.from_device(torch.device("cuda"))
     if target.is_amd_hip:
         module = attention_backend.amd_gluon
-    elif target.is_cuda_capability(8, 9):
+    elif attention_backend.nvidia_policy.uses_async_copies(target):
         module = attention_backend.nvidia_async_copy_gluon
     else:
         module = attention_backend.nvidia_tma_gluon

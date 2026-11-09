@@ -97,6 +97,9 @@ def _call(
         AcceleratorTarget("cuda", "sm120"),
         AcceleratorTarget("cuda", "sm121"),
         AcceleratorTarget("cuda", "sm89"),
+        AcceleratorTarget("cuda", "sm86"),
+        AcceleratorTarget("cuda", "sm80"),
+        AcceleratorTarget("cuda", "sm90"),
         AcceleratorTarget("hip", "gfx1201"),
         AcceleratorTarget("hip", "gfx1200"),
         AcceleratorTarget("hip", "gfx1100"),
@@ -116,7 +119,7 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
     )
     operand = SimpleNamespace(device=torch.device("cuda:1"))
     expected = None
-    if target.is_cuda_capability(12, 0) or target.is_cuda_capability(8, 9):
+    if target.is_cuda_capability(12, 0) or target.is_cuda_capability(8):
         expected = nvidia
     elif (
         platform in ("linux", "win32")
@@ -271,8 +274,8 @@ def test_output_support_is_independent_of_qkv_projection_support(
     [
         ("linux", AcceleratorTarget("hip", "gfx1100")),
         ("linux", AcceleratorTarget("cuda", "sm121")),
-        ("linux", AcceleratorTarget("cuda", "sm86")),
-        ("win32", AcceleratorTarget("cuda", "sm86")),
+        ("linux", AcceleratorTarget("cuda", "sm90")),
+        ("win32", AcceleratorTarget("cuda", "sm90")),
         ("linux", AcceleratorTarget("cpu")),
         ("win32", AcceleratorTarget("hip", "gfx1100")),
         ("win32", AcceleratorTarget("cpu")),
@@ -672,12 +675,12 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
     is_amd = target.is_amd_hip
     implementation = amd if is_amd else nvidia
     _, kernel = _capture_projection(monkeypatch, operation, implementation, head_dim, target=target)
-    # These operands' 272 input features fall outside SM89's Gluon kernels, so SM89 runs
-    # its Triton schedule: 64 rows by one head for Q, K, and V.
-    is_sm89 = target.is_cuda_capability(8, 9)
-    heads_per_program = 1 if is_sm89 or (is_amd and operation != "value") else 2
-    block_m = 64 if is_sm89 or operation == "query" or (is_amd and operation == "key") else 128
-    warps = 4 if is_sm89 or (is_amd and operation != "value") else 8
+    # These operands' 272 input features fall outside the Gluon kernels, so each target runs
+    # its Triton schedule. SM8x's is 64 rows by one head for Q, K, and V.
+    is_sm8x = target.is_cuda_capability(8)
+    heads_per_program = 1 if is_sm8x or (is_amd and operation != "value") else 2
+    block_m = 64 if is_sm8x or operation == "query" or (is_amd and operation == "key") else 128
+    warps = 4 if is_sm8x or (is_amd and operation != "value") else 8
     rows = 129 if operation == "query" else 193
     grid_heads = triton.cdiv(3, heads_per_program)
     grids = [call.args[0] for call in kernel.__getitem__.call_args_list]
@@ -689,7 +692,7 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
         assert call.kwargs["block_n"] == head_dim * heads_per_program
         assert call.kwargs["block_k"] == (64 if is_amd else 128)
         assert call.kwargs["heads_per_program"] == heads_per_program
-        assert call.kwargs["group_m"] == (8 if is_sm89 or is_amd else 0)
+        assert call.kwargs["group_m"] == (8 if is_sm8x or is_amd else 0)
         assert call.kwargs["num_warps"] == warps
         assert call.kwargs["num_stages"] == (2 if is_amd else 3)
         assert call.kwargs["aligned_projection"] is False

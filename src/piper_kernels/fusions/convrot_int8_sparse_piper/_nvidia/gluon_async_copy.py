@@ -1,12 +1,10 @@
-"""SM89 Gluon kernels for the fused ConvRot INT8 sparse-Piper Q/K/V projections.
+"""SM8x and SM120 Gluon kernels for the fused ConvRot INT8 sparse-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
 fragments. Q and K permute the weight rows so RoPE and the signed Hadamard stay
 in registers; Q emits Q32 INT8 rows with routing summaries, and K stores BF16
 rows and FP32 tile sums for the shared encoder, which centers K by its global mean.
-Q/K programs run at the 255-register limit. Masked Q/K tiles keep row clamps live
-through the K loop, so they multiply K32 operand slices; full Q/K tiles fit with
-K64 slices, which run them 1-2% faster. V projects its tiles through the shared
+Q/K programs run at the 255-register limit. V projects its tiles through the shared
 value-tile fragment, then centers them by the projected V mean and scales each K64 tile.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
@@ -177,7 +175,6 @@ def _query_kernel(
         rotary_dim,
         norm_epsilon,
         mask_rows,
-        fragments.K32_SLICE if mask_rows else fragments.K64_SLICE,
     )
 
     values, maximum, minimum = _summarize_blocks(
@@ -297,7 +294,6 @@ def _key_kernel(
         rotary_dim,
         norm_epsilon,
         mask_rows,
-        fragments.K32_SLICE if mask_rows else fragments.K64_SLICE,
     )
 
     values, key_summary, key_aux = _summarize_blocks(

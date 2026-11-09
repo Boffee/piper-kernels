@@ -205,7 +205,7 @@ def test_route_and_coarse_builder_places_out_of_order_query_chunks_by_offset() -
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
-    reason="requires native NVIDIA SM89 or SM120 routing",
+    reason="requires native NVIDIA SM8x or SM120 routing",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_nvidia_padded_summaries_match_portable_valid_prefix_means(dtype: torch.dtype) -> None:

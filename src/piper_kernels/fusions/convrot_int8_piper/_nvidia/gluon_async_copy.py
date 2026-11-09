@@ -1,8 +1,7 @@
 """SM89 Gluon kernels for the fused ConvRot INT8 dense-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
-fragments. Programs run at the 255-register limit, so every kernel multiplies K32
-operand slices: K64 slices spill inside the K loop at production widths.
+fragments. Programs run at the 255-register limit.
 
 Q quantizes its RMSNorm/RoPE tile after the signed Hadamard, with per-thread or
 Q32 scales. Per-thread groups (rows 32b + 8i + t) lie in one thread's registers,
@@ -109,7 +108,6 @@ def _query_kernel(
         rotary_dim,
         norm_epsilon,
         mask_rows,
-        fragments.K32_SLICE,
     )
     if mask_rows:
         rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
@@ -211,7 +209,6 @@ def _key_kernel(
         rotary_dim,
         norm_epsilon,
         mask_rows,
-        fragments.K32_SLICE,
     )
     if mask_rows:
         rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))

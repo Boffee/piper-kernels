@@ -15,7 +15,7 @@ def projection_available(head_dim: int = 128) -> bool:
 
 
 def dense_projection_available(head_dim: int = 128) -> bool:
-    """Dense Piper projections cover fewer targets than the sparse fusion (not SM89)."""
+    """Dense Piper projections cover fewer targets than the sparse fusion (not SM8x)."""
     return (
         torch.cuda.is_available()
         and dense_backend.select_projection_backend(

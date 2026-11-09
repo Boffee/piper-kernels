@@ -1,7 +1,7 @@
 """Paired-K128 recurrence arithmetic shared by the NVIDIA sparse Piper kernels.
 
 Every function here consumes register tensors or shared-memory descriptors that
-the calling kernel has already filled, so the SM120 TMA kernel and the SM89
+the calling kernel has already filled, so the SM120 TMA kernel and the SM8x
 ``cp.async`` kernel differ only in how operands reach shared memory. Keeping the
 arithmetic in one place preserves one numerical contract across targets:
 grouped INT8 Q/K, centered tile-scaled INT8 V, UINT8 probabilities, paired K128

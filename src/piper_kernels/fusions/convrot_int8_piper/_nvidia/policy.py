@@ -1,12 +1,10 @@
 """NVIDIA target support and resolved dense Q/K/V projection choices."""
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.fusions.convrot_int8_projection._nvidia import policy as projection_policy
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import (
     NvidiaExecutionPlan,
     ProjectionOperation,
-)
-from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import (
-    select_sm89_execution_plan,
 )
 
 _SM120_EXECUTION_PLAN = NvidiaExecutionPlan(
@@ -43,10 +41,11 @@ def select_execution_plan(
         raise ValueError("projection operation must be query, key, or value")
     if target.is_cuda_capability(12, 0):
         return _SM120_EXECUTION_PLAN
-    return select_sm89_execution_plan(
+    return projection_policy.select_execution_plan(
         operation=operation,
         input_features=input_features,
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         operands_aligned=operands_aligned,
+        triton_execution_plan=projection_policy.SM8X_TRITON_EXECUTION_PLAN,
     )

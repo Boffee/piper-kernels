@@ -1,7 +1,8 @@
-"""NVIDIA SM89 and SM120 support and execution policy for sparse Piper attention.
+"""NVIDIA SM8x and SM120 support and execution policy for sparse Piper attention.
 
 Both targets run the same paired-K128 recurrence with mixed-sign MMAv2. SM120
-loads operands with TMA; SM89 has no TMA and uses Ampere-style ``cp.async``.
+loads operands with TMA; SM8x has no TMA and uses Ampere-style ``cp.async``.
+SM8x launches follow choices measured on SM89, which represents the family.
 """
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -15,12 +16,12 @@ def uses_tensor_descriptors(target: AcceleratorTarget) -> bool:
 
 
 def uses_async_copies(target: AcceleratorTarget) -> bool:
-    """Select the ``cp.async`` kernel on exact NVIDIA SM89 (Ada), which lacks TMA."""
-    return target.is_cuda_capability(8, 9)
+    """Select the ``cp.async`` kernel on NVIDIA SM8x (Ampere and Ada), which lacks TMA."""
+    return target.is_cuda_capability(8)
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
-    """Enable exact NVIDIA SM89 and SM120 sparse attention and its routing kernels."""
+    """Enable NVIDIA SM8x and exact SM120 sparse attention and its routing kernels."""
     return uses_tensor_descriptors(target) or uses_async_copies(target)
 
 
@@ -65,15 +66,16 @@ def use_sm120_fused_preparation(head_dim: int, sequence_length: int) -> bool:
     return sequence_length >= (2048 if head_dim == 64 else 1024)
 
 
-# One 128-thread CTA per 21,504 registers lets three share an Ada SM.
-_SM89_D64_MAX_REGISTERS = 168
+# One 128-thread CTA per 21,504 registers lets three share an SM8x SM's 64K registers.
+_SM8X_D64_MAX_REGISTERS = 168
 
 
-def sm89_max_registers(head_dim: int) -> int | None:
-    """Return the per-thread register cap for SM89's Q64 four-warp launch, if any.
+def select_sm8x_max_registers(head_dim: int) -> int | None:
+    """Return the per-thread register cap for SM8x's Q64 four-warp launch, if any.
 
-    SM89's ``cp.async`` addressing lifts its D64 kernel to 179-183 registers,
-    which fits two CTAs per Ada SM; capping it at 168, where SM120's kernel
-    already sits, fits three. D128 is held to two CTAs by shared memory anyway.
+    Uncapped, ``cp.async`` addressing lifts the D64 kernel to 181-187 registers on
+    sm_86 and sm_89 with Triton 3.9, which fits two CTAs per SM. Capping it at 168
+    fits three, at the cost of 36-44 bytes of spill stores. Shared memory holds D128
+    to two CTAs on SM86 and SM89 anyway.
     """
-    return _SM89_D64_MAX_REGISTERS if head_dim == 64 else None
+    return _SM8X_D64_MAX_REGISTERS if head_dim == 64 else None
