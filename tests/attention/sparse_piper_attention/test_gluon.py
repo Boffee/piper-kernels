@@ -1,4 +1,4 @@
-"""Integer accumulation checks for the paired PV step shared by SM89 and SM120."""
+"""Integer accumulation checks for the paired PV step shared by SM8x and SM120."""
 
 import pytest
 import torch
@@ -15,9 +15,9 @@ pytestmark = [
         not torch.cuda.is_available()
         or not (
             AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
-            or AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(8, 9)
+            or AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(8)
         ),
-        reason="requires exact NVIDIA SM89 or SM120",
+        reason="requires NVIDIA SM8x or exact SM120",
     ),
 ]
 

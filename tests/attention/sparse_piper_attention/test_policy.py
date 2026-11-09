@@ -49,10 +49,10 @@ def test_very_sparse_long_sequences_keep_four_warps():
     ("target", "tma", "async_copy"),
     [
         (AcceleratorTarget("cuda", "sm120"), True, False),
-        (AcceleratorTarget("cuda", "sm89"), False, True),
+        *[(AcceleratorTarget("cuda", f"sm{arch}"), False, True) for arch in (80, 86, 87, 89)],
         (AcceleratorTarget("cuda", "sm121"), False, False),
-        (AcceleratorTarget("cuda", "sm88"), False, False),
         (AcceleratorTarget("cuda", "sm90"), False, False),
+        (AcceleratorTarget("cuda", "sm100"), False, False),
         (AcceleratorTarget("hip", "gfx1201"), False, False),
         (AcceleratorTarget("cpu"), False, False),
     ],
@@ -64,5 +64,5 @@ def test_each_target_selects_at_most_one_load_path(target, tma, async_copy):
 
 
 @pytest.mark.parametrize(("head_dim", "max_registers"), [(64, 168), (128, None)])
-def test_sm89_caps_only_d64_registers(head_dim, max_registers):
-    assert policy.sm89_max_registers(head_dim) == max_registers
+def test_sm8x_caps_only_d64_registers(head_dim, max_registers):
+    assert policy.select_sm8x_max_registers(head_dim) == max_registers

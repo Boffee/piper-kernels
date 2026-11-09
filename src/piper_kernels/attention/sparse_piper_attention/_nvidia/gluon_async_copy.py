@@ -2,8 +2,8 @@
 
 Q and each pair's K/V tiles reach shared memory through ``cp.async`` copies
 tracked by commit groups. The TMA implementation shares the routed traversal,
-paired-K128 recurrence, and epilogue. Dispatch currently selects this load
-pipeline on SM89 and retains its measured launch policy.
+paired-K128 recurrence, and epilogue. Dispatch selects this load pipeline on
+SM8x, with the launch policy measured on SM89.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -464,7 +464,7 @@ class _ContextLauncher:
             coarse_gate,
         )
         _validate_copy_storage(query_state.data)
-        max_registers = policy.sm89_max_registers(launch.head_dim)
+        max_registers = policy.select_sm8x_max_registers(launch.head_dim)
         compile_options = {} if max_registers is None else {"maxnreg": max_registers}
         with device_context(output.device):
             install_uint8_int8_dot_hook()

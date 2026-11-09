@@ -1,4 +1,4 @@
-"""SM89 projects D128 heads with Gluon kernels and other shapes with the Triton launchers."""
+"""NVIDIA projects D128 heads with Gluon kernels and other shapes with the Triton launchers."""
 
 from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock
@@ -26,6 +26,9 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
 )
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
+_NVIDIA_TARGETS = [
+    AcceleratorTarget("cuda", architecture) for architecture in ("sm80", "sm86", "sm89", "sm120")
+]
 _MMA_V2_AVAILABLE = torch.cuda.is_available() and AcceleratorTarget.from_device(
     torch.device("cuda")
 ).cuda_capability_at_least(8)
@@ -99,6 +102,7 @@ def _launch(
     bias=None,
     window=(64, 129),
     emit_block_mean=True,
+    target=_SM89_TARGET,
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
@@ -109,12 +113,10 @@ def _launch(
             "rotary_dim": 0 if operation == "value" else operands[5].shape[1],
         }
         options["execution_plan"] = (
-            dispatch.default_execution_plan(
-                input_qdata, weight_qdata, target=_SM89_TARGET, **metadata
-            )
+            dispatch.default_execution_plan(input_qdata, weight_qdata, target=target, **metadata)
             if module is dispatch
             else policy.select_execution_plan(
-                _SM89_TARGET, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
+                target, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
             )
         )
     if operation == "query":
@@ -167,8 +169,9 @@ def _launch(
     ],
 )
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-def test_sm89_uses_gluon_only_for_supported_projections(
-    monkeypatch, operation, head_dim, input_features, rotary_dim, supported
+@pytest.mark.parametrize("target", _NVIDIA_TARGETS, ids=str)
+def test_every_target_uses_gluon_only_for_supported_projections(
+    monkeypatch, target, operation, head_dim, input_features, rotary_dim, supported
 ):
     monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
@@ -179,7 +182,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
             "cuda:1", input_features=input_features, head_dim=head_dim, rotary_dim=rotary_dim
         )
         out = _outputs(operation, "cuda:1", storage=256, head_dim=head_dim)
-        _launch(dispatch, operation, operands, out)
+        _launch(dispatch, operation, operands, out, target=target)
     # V has no RoPE, so only its head and input widths matter.
     uses_gluon = supported or (
         operation == "value" and head_dim == 128 and input_features % 64 == 0
@@ -190,7 +193,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
     assert launched.call_args.kwargs["out"] is out
     if not uses_gluon:
         assert launched.call_args.kwargs["execution_plan"] is policy.select_execution_plan(
-            _SM89_TARGET,
+            target,
             operation=operation,
             input_features=272,
             head_dim=128,
@@ -200,9 +203,7 @@ def test_sm89_uses_gluon_only_for_supported_projections(
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize("with_block_lengths", [False, True])
-def test_sm89_gluon_launches_full_tiles_then_one_masked_tail(
-    monkeypatch, operation, with_block_lengths
-):
+def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, with_block_lengths):
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     kernel = MagicMock()
     monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
@@ -287,11 +288,32 @@ _POINTER_TYPES = {
 }
 
 
+# Spill stores measured past the budget and accepted, keyed by architecture, operation,
+# and variant. SM80's instruction order spills masked Q's K loop when a bias replaces the
+# norm weight, a rare configuration that every tile reaches only with block lengths. K32
+# slices spill SM89's full-tile K mean-routing epilogue after the K loop; K64 slices
+# avoided it but spilled SM120's full tiles, and one slice width serves every target.
+_ACCEPTED_SPILL_STORES = {
+    (80, "query", "bias_without_norm"): 176,
+    (89, "key", "full_tiles_mean_routing"): 48,
+}
+
+
+# SM86 and SM87 build the same PTX as SM89; SM80's differs in instruction order.
+@pytest.mark.parametrize("architecture", [80, 89, 120])
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize(
-    "variant", ["full_tiles", "masked_tail", "mean_routing", "block_lengths", "bias_without_norm"]
+    "variant",
+    [
+        "full_tiles",
+        "full_tiles_mean_routing",
+        "masked_tail",
+        "mean_routing",
+        "block_lengths",
+        "bias_without_norm",
+    ],
 )
-def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
+def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, variant):
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     constants = {
         "input_features": _INPUT_FEATURES,
@@ -299,9 +321,9 @@ def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
         "rotary_dim": 96,
         "norm_epsilon": 1e-5,
         "softmax_scale": 128**-0.5,
-        "mean_pool_summary": variant == "mean_routing",
+        "mean_pool_summary": variant in ("full_tiles_mean_routing", "mean_routing"),
         "mask_block_lengths": variant == "block_lengths",
-        "mask_rows": variant != "full_tiles",
+        "mask_rows": variant not in ("full_tiles", "full_tiles_mean_routing"),
         "emit_block_mean": True,
     }
     constants = {name: value for name, value in constants.items() if name in function.arg_names}
@@ -321,13 +343,15 @@ def test_sm89_gluon_kernels_compile_for_two_programs_per_sm(operation, variant):
             signature[name] = "i32"
     compiled, spill_stores = compile_with_spill_stores(
         GluonASTSource(function, signature, constexprs=constants, attrs=attributes),
-        GPUTarget("cuda", 89, 32),
+        GPUTarget("cuda", architecture, 32),
         {"num_warps": 4},
     )
     assert compiled.asm["cubin"]
     # Two programs share each SM's 99 KiB of shared memory.
     assert compiled.metadata.shared <= 99 * 1024 // 2
-    assert spill_stores <= PROJECTION_SPILL_STORE_BUDGET_BYTES
+    assert spill_stores <= _ACCEPTED_SPILL_STORES.get(
+        (architecture, operation, variant), PROJECTION_SPILL_STORE_BUDGET_BYTES
+    )
     truncations = [line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line]
     # Only K rounds its transformed rows to BF16, for the shared centered encoder.
     assert bool(truncations) is (operation == "key")
@@ -374,7 +398,7 @@ def _assert_matches(actual, expected, *, scale_rtol=1e-5):
         },
     ],
 )
-def test_sm89_gluon_projections_match_the_triton_launchers(operation, case):
+def test_gluon_projections_match_the_triton_launchers(operation, case):
     torch.manual_seed(1109)
     batch, sequence = case["batch"], case["sequence"]
     operands = _operands(

@@ -1,4 +1,4 @@
-"""Numerical, schedule, range, and addressing checks for the SM89 ``cp.async`` kernel."""
+"""Numerical, schedule, range, and addressing checks for the SM8x ``cp.async`` kernel."""
 
 import math
 from dataclasses import replace
@@ -31,7 +31,7 @@ pytestmark = [
     pytest.mark.skipif(
         not torch.cuda.is_available()
         or not policy.uses_async_copies(AcceleratorTarget.from_device(torch.device("cuda"))),
-        reason="requires exact NVIDIA SM89",
+        reason="requires NVIDIA SM8x",
     ),
 ]
 
@@ -95,16 +95,16 @@ def _prepare(
 
 
 def _launch(prepared, output, uncapped=False, **kwargs):
-    """Launch the SM89 kernel, optionally without its D64 register cap."""
+    """Launch the SM8x kernel, optionally without its D64 register cap."""
     if not uncapped:
         prepared.launch(prepared.query, output, **kwargs)
         return
-    original = policy.sm89_max_registers
-    policy.sm89_max_registers = lambda head_dim: None
+    original = policy.select_sm8x_max_registers
+    policy.select_sm8x_max_registers = lambda head_dim: None
     try:
         prepared.launch(prepared.query, output, **kwargs)
     finally:
-        policy.sm89_max_registers = original
+        policy.select_sm8x_max_registers = original
 
 
 def _fp64_query_block(prepared, head, query_block):
@@ -397,10 +397,10 @@ def _jit_arguments(module, prepared, output, **kwargs):
 def test_launch_specializes_no_more_finely_than_sm120(
     head_dim, sequence, heads, ratio, query_block_offset, coarse
 ):
-    """Two calls that share an SM120 specialization must share an SM89 one.
+    """Two calls that share an SM120 specialization must share an SM8x one.
 
-    SM120 passes TMA descriptors and SM89 passes 16-byte-aligned pointers, one
-    specialization each. SM89 has no query-tile or warp-count arguments because it
+    SM120 passes TMA descriptors and SM8x passes 16-byte-aligned pointers, one
+    specialization each. SM8x has no query-tile or warp-count arguments because it
     always runs Q64 with four warps and caps D64 registers; it masks its output
     tail exactly when the final Q64 tile is ragged. Every other argument it shares
     with SM120 must be SM120's.
@@ -417,27 +417,27 @@ def test_launch_specializes_no_more_finely_than_sm120(
         kwargs["coarse_gate"] = torch.randn(
             1, rows, heads, head_dim, device="cuda", dtype=torch.bfloat16
         )
-    sm89 = _jit_arguments(native, prepared, output, **kwargs)
+    sm8x = _jit_arguments(native, prepared, output, **kwargs)
     reference = _jit_arguments(sm120, prepared, output, **kwargs)
-    sm89_names = native._sparse_piper_attention_kernel.arg_names
+    sm8x_names = native._sparse_piper_attention_kernel.arg_names
     sm120_arguments = dict(
         zip(sm120._sparse_piper_attention_kernel.arg_names, reference["args"], strict=True)
     )
-    assert set(sm120_arguments) - set(sm89_names) == {
+    assert set(sm120_arguments) - set(sm8x_names) == {
         "query_desc",
         "key_desc",
         "value_desc",
         "block_m",
         "mma_warps",
     }
-    assert sm89["grid"] == ((rows + 63) // 64, *reference["grid"][1:])
+    assert sm8x["grid"] == ((rows + 63) // 64, *reference["grid"][1:])
     options = {**reference["options"], "num_warps": 4}
     if head_dim == 64:
         options["maxnreg"] = 168
-    assert sm89["options"] == options
-    sm89_arguments = dict(zip(sm89_names, sm89["args"], strict=True))
-    assert sm89_arguments["mask_output_tail"] is (rows % 64 != 0)
-    for name, actual in sm89_arguments.items():
+    assert sm8x["options"] == options
+    sm8x_arguments = dict(zip(sm8x_names, sm8x["args"], strict=True))
+    assert sm8x_arguments["mask_output_tail"] is (rows % 64 != 0)
+    for name, actual in sm8x_arguments.items():
         if name in ("query_ptr", "key_ptr", "value_ptr", "mask_output_tail"):
             continue
         expected = sm120_arguments[name]

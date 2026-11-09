@@ -42,11 +42,11 @@ from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiper
     [
         (AcceleratorTarget("cuda", "sm120"), "tma"),
         (AcceleratorTarget("cuda", "sm89"), "async_copy"),
+        (AcceleratorTarget("cuda", "sm86"), "async_copy"),
+        (AcceleratorTarget("cuda", "sm80"), "async_copy"),
         (AcceleratorTarget("cuda", "sm121"), None),
         (AcceleratorTarget("cuda", "sm100"), None),
         (AcceleratorTarget("cuda", "sm90"), None),
-        (AcceleratorTarget("cuda", "sm86"), None),
-        (AcceleratorTarget("cuda", "sm80"), None),
         (AcceleratorTarget("hip", "gfx1201"), None),
         (AcceleratorTarget("hip", "gfx942"), None),
         (AcceleratorTarget("cpu"), None),
@@ -75,14 +75,14 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, kernel, he
 
 
 @pytest.mark.skipif(_backend.nvidia_async_copy_gluon is None, reason="requires Triton import")
-def test_sm89_attention_uses_its_own_launcher_and_shared_preparation():
-    sm89 = _backend._nvidia_async_copy_attention
+def test_sm8x_attention_uses_its_own_launcher_and_shared_preparation():
+    sm8x = _backend._nvidia_async_copy_attention
     sm120 = _backend._nvidia_tma_attention
-    assert sm89 is not None
+    assert sm8x is not None
     assert sm120 is not None
-    assert sm89.bind is _backend.nvidia_async_copy_gluon.bind_context
-    assert sm89.bind is not sm120.bind
-    assert sm89.prepare is sm120.prepare
+    assert sm8x.bind is _backend.nvidia_async_copy_gluon.bind_context
+    assert sm8x.bind is not sm120.bind
+    assert sm8x.prepare is sm120.prepare
 
 
 def test_missing_attention_implementation_does_not_probe_device(monkeypatch):
@@ -308,11 +308,11 @@ def test_score_fallback_keeps_autograd(monkeypatch, query_blocks):
     [
         (AcceleratorTarget("cuda", "sm120"), True, True),
         (AcceleratorTarget("cuda", "sm89"), True, True),
+        (AcceleratorTarget("cuda", "sm86"), True, True),
         (AcceleratorTarget("hip", "gfx1200"), True, False),
         (AcceleratorTarget("hip", "gfx1201"), True, False),
         (AcceleratorTarget("cuda", "sm121"), False, False),
         (AcceleratorTarget("cuda", "sm90"), False, False),
-        (AcceleratorTarget("cuda", "sm86"), False, False),
         (AcceleratorTarget("hip", "gfx1100"), False, False),
         (AcceleratorTarget("hip", "gfx942"), False, False),
         (AcceleratorTarget("cpu"), False, False),

@@ -114,7 +114,7 @@ def _random_operands(
 )
 @pytest.mark.parametrize("affine", [True, False])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
-# SM89 projects 256 input features with Gluon and 272 with the shared Triton launchers.
+# NVIDIA projects 256 input features with Gluon and 272 with the shared Triton launchers.
 @pytest.mark.parametrize("input_features", [256, 272])
 def test_fused_query_projection_matches_the_fp32_composed_contract(
     input_features: int,

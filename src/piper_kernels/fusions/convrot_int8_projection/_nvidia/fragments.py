@@ -1,8 +1,8 @@
-"""Gluon fragments shared by the SM89 fused ConvRot INT8 dense and sparse Piper projections.
+"""Gluon fragments shared by the fused ConvRot INT8 dense and sparse Piper projections.
 
 Each program projects 128 rows onto one D128 head through the SM8x ConvRot INT8
 GEMM's pipeline: ``cp.async`` copies stage K64 slices of the INT8 operands in shared
-memory, and ``mma_v2`` accumulates exact INT32 products.
+memory, and ``mma_v2`` accumulates exact INT32 products from K32 operand slices.
 
 Q and K split warps only across rows and permute the weight rows, so each thread
 holds 4 consecutive features of every row it owns, with the other feature bits in
@@ -62,9 +62,8 @@ COPY_ROWS = gl.constexpr(gl.SliceLayout(1, _GL_COPY_LAYOUT.value))
 # Each thread stores 16 consecutive features of a Q/K row; each warp writes 4 whole rows.
 _GL_STORE_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 16], [4, 8], [NUM_WARPS, 1], [1, 0]))
 _GL_SUMMARY_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 4], [1, 32], [1, NUM_WARPS], [1, 0]))
-# Operand-slice widths for the projection: whole K64 tiles, or one m16n8k32 INT8 MMA step.
-K64_SLICE = gl.constexpr(_BLOCK_K)
-K32_SLICE = gl.constexpr(32)
+# Operands load and multiply one m16n8k32 INT8 MMA step at a time.
+_GL_MMA_K = gl.constexpr(32)
 
 
 @gluon.jit
@@ -75,13 +74,15 @@ def project_int8(
     weight_rows,
     accumulator,
     input_features: gl.constexpr,
-    mma_k: gl.constexpr,
 ):
     """Accumulate ``input[rows] @ weight[weight_rows].T`` in the SM8x GEMM's copy pipeline.
 
-    Operands load and multiply in ``mma_k``-wide slices of each K64 tile. The 128x128
-    accumulator already takes 128 of the 255 registers per thread, so K32 slices leave
-    the K loop room where K64 slices spill.
+    Operands load and multiply in K32 slices of each K64 tile. The 128x128 accumulator
+    already takes 128 of the 255 registers per thread, and K32 slices halve the operand
+    registers live in the K loop. K64 slices spill there at production widths for dense
+    Q, masked sparse Q/K tiles, and SM120's full sparse Q/K tiles. K64 slices run full
+    sparse Q/K tiles up to 2.3% faster on SM89, an estimated 0.1-0.6% of the attention
+    block; one slice width keeps a single K loop for every target.
     """
     mma_layout: gl.constexpr = accumulator.type.layout
     features = gl.arange(0, _GL_BLOCK_K, gl.SliceLayout(0, _GL_COPY_LAYOUT))
@@ -106,7 +107,7 @@ def project_int8(
         gl.DotOperandLayout(0, mma_layout, k_width=4),
         gl.DotOperandLayout(1, mma_layout, k_width=4),
         False,
-        mma_k,
+        _GL_MMA_K,
     )
 
 
@@ -258,14 +259,11 @@ def project_rmsnorm_rope(
     rotary_dim: gl.constexpr,
     norm_epsilon: gl.constexpr,
     mask_rows: gl.constexpr,
-    mma_k: gl.constexpr,
 ):
     """Project 128 rows onto a D128 head, then apply FP32 RMSNorm and RoPE by feature.
 
     Returns the tile, its sequence positions, and its features. With ``mask_rows``,
     rows past the sequence end repeat its last row; callers mask their outputs.
-    Each Q/K warp multiplies all 128 weight rows, so a K64 slice of them takes 64
-    registers; callers pick ``mma_k`` for their epilogue's register needs.
     """
     positions = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, FEATURE_LAYOUT))
     copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, COPY_ROWS)
@@ -284,7 +282,6 @@ def project_rmsnorm_rope(
         head * _GL_HEAD_DIM + _column_features(columns),
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
         input_features,
-        mma_k,
     )
     accumulator = _by_feature(accumulator)
 
@@ -403,11 +400,11 @@ def project_value_tiles(
 ):
     """Project 128 V rows onto a D128 head as FP32 ``[tiles, tile_rows, D128]`` values.
 
-    V keeps a 2x2 warp grid and multiplies K32 operand slices, which keep every V tile
-    below the register limit and run full tiles 1-2% faster than K64 slices. Each thread
-    then holds 8 consecutive rows of 16 features in one K64 tile: per-feature scales,
-    biases, and means take 16 registers each, row reductions run mostly in registers,
-    and the transposed stores write 8 contiguous bytes.
+    V keeps a 2x2 warp grid; its K32 operand slices also run full tiles 1-2% faster
+    than K64 slices on SM89. Each thread holds 8 consecutive rows of 16 features in one
+    K64 tile: per-feature scales, biases, and means take 16 registers each, row
+    reductions run mostly in registers, and the transposed stores write 8 contiguous
+    bytes.
 
     Returns the values with their sequence positions ``[tiles, tile_rows]``, their tile
     indices ``[tiles]``, rows within each tile ``[tile_rows]``, and features ``[D128]``.
@@ -433,7 +430,6 @@ def project_value_tiles(
         head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, COPY_ROWS),
         gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
         input_features,
-        K32_SLICE,
     )
 
     tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)

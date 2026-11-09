@@ -393,7 +393,7 @@ def test_route_and_coarse_path_reuses_chunked_minmax_pool_scores() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
-    reason="requires native NVIDIA SM89 or SM120 routing",
+    reason="requires native NVIDIA SM8x or SM120 routing",
 )
 def test_nvidia_packed_routes_match_the_portable_exact_policy() -> None:
     generator = torch.Generator().manual_seed(54)
@@ -417,7 +417,7 @@ def test_nvidia_packed_routes_match_the_portable_exact_policy() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
-    reason="requires native NVIDIA SM89 or SM120 routing",
+    reason="requires native NVIDIA SM8x or SM120 routing",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_nvidia_padded_summaries_match_portable_valid_prefix_extrema(dtype: torch.dtype) -> None:
@@ -452,7 +452,7 @@ def test_nvidia_padded_summaries_match_portable_valid_prefix_extrema(dtype: torc
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
-    reason="requires native NVIDIA SM89 or SM120 routing",
+    reason="requires native NVIDIA SM8x or SM120 routing",
 )
 def test_nvidia_ragged_key_summaries_match_portable_extrema() -> None:
     generator = torch.Generator().manual_seed(546)
@@ -470,7 +470,7 @@ def test_nvidia_ragged_key_summaries_match_portable_extrema() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not nvidia_policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
-    reason="requires native NVIDIA SM89 or SM120 routing",
+    reason="requires native NVIDIA SM8x or SM120 routing",
 )
 def test_nvidia_ragged_routes_ignore_invalid_query_storage() -> None:
     generator = torch.Generator(device="cuda").manual_seed(65)
