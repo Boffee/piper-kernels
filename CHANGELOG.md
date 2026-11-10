@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.8.0rc5] - 2026-11-09
+
 ### Added
 
 - The ConvRot INT8 dense-Piper fusion (`convrot_int8_piper_compile_options`) now applies
@@ -1060,7 +1062,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc4...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc5...HEAD
+[0.8.0rc5]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc4...v0.8.0rc5
 [0.8.0rc4]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc3...v0.8.0rc4
 [0.8.0rc3]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc2...v0.8.0rc3
 [0.8.0rc2]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc1...v0.8.0rc2
