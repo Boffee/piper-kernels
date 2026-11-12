@@ -8,7 +8,7 @@ calibration, and model quality.
 
 | Format | Stored representation | Execution |
 |---|---|---|
-| `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback. |
+| `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback; embedding lookups. |
 | `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Piper's native linear path targets exact NVIDIA SM120. |
 | `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same native NVFP4 target. |
 
@@ -146,6 +146,30 @@ For packed checkpoint constructors and all stored fields, see the
 Piper's [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py) supports
 independent correctness comparisons. ConvRot NVFP4 linear requires the supported
 native path and raises when its execution requirements are not met.
+
+## Look up embedding rows
+
+A 2-D ConvRot INT8 weight also serves as an `nn.Embedding` or `F.embedding` table of
+shape `[num_embeddings, embedding_dim]`. A lookup selects the requested rows' INT8
+values and scales, then dequantizes only those rows into the logical dtype and original
+basis; the table is never decoded whole. The rotation stays within each row, so rows
+decode independently.
+
+```python
+import torch
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+table = ConvRotInt8Tensor.from_hp(torch.randn(1000, 256, dtype=torch.bfloat16), group_size=256)
+embedding = torch.nn.Embedding(1000, 256, device="meta")
+embedding.weight = torch.nn.Parameter(table, requires_grad=False)
+
+with torch.inference_mode():
+    vectors = embedding(torch.tensor([[3, 7, 3]]))
+assert vectors.shape == (1, 3, 256)
+```
+
+`padding_idx` affects only gradients, so it does not change a lookup. `max_norm`
+renormalization and transposed weights raise `NotImplementedError`.
 
 ## Run a Conv3D
 

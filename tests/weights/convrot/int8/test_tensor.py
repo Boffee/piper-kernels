@@ -2,9 +2,11 @@
 
 import pytest
 import torch
+from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.int8 import tensor as tensor_module
 
 
 def test_dequantize_unrotates_the_stored_weight() -> None:
@@ -278,3 +280,68 @@ def test_static_linear_scale_survives_transpose_and_weight_updates():
     torch.testing.assert_close(weight.scale, expected.scale)
     assert weight.act_per_tensor_scale is input_scale
     assert input_scale.item() == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available"
+                ),
+            ],
+        ),
+    ],
+)
+def test_embedding_dequantizes_only_the_looked_up_rows(monkeypatch, device: str) -> None:
+    table = ConvRotInt8Tensor.from_hp(
+        torch.randn(20, 32, dtype=torch.float16, device=device), group_size=16
+    )
+    embedding = torch.nn.Embedding(20, 32, padding_idx=0, device="meta")
+    embedding.weight = torch.nn.Parameter(table, requires_grad=False)
+    ids = torch.tensor([[2, 1, 2, 0], [6, 9, 4, 5]], device=device)
+    expected = table.dequantize()[ids]
+    decoded_rows: list[int] = []
+
+    def dequantize_weight(qdata: torch.Tensor, *args: object) -> torch.Tensor:
+        decoded_rows.append(qdata.shape[0])
+        return original(qdata, *args)
+
+    original = tensor_module.dequantize_weight
+    monkeypatch.setattr(tensor_module, "dequantize_weight", dequantize_weight)
+    with torch.inference_mode():
+        actual = embedding(ids)
+
+    assert decoded_rows == [ids.numel()]
+    assert actual.dtype is torch.float16
+    assert torch.equal(actual, expected)
+
+
+def test_compiled_embedding_matches_eager() -> None:
+    torch.compiler.reset()
+    table = ConvRotInt8Tensor.from_hp(torch.randn(20, 32, dtype=torch.bfloat16), group_size=16)
+    ids = torch.tensor([[3, 7, 3]])
+
+    def look_up(indices: torch.Tensor) -> torch.Tensor:
+        return F.embedding(indices, table)
+
+    compiled = torch.compile(look_up, backend="aot_eager", fullgraph=True)
+    with torch.no_grad():
+        assert torch.equal(compiled(ids), table.dequantize()[ids])
+
+
+def test_embedding_rejects_unsupported_weights_and_renormalization() -> None:
+    table = ConvRotInt8Tensor.from_hp(torch.randn(16, 16), group_size=16)
+    kernel = ConvRotInt8Tensor.from_hp(torch.randn(16, 64, 3, 3, 3), group_size=64)
+    ids = torch.tensor([1, 2])
+
+    with pytest.raises(NotImplementedError, match="transposed"):
+        F.embedding(ids, table.t())
+    with pytest.raises(NotImplementedError, match="2-D"):
+        F.embedding(ids, kernel)
+    with pytest.raises(NotImplementedError, match="embedding_renorm"):
+        F.embedding(ids, table, max_norm=1.0)
