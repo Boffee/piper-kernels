@@ -5,6 +5,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- A 2-D `ConvRotInt8Tensor` works as an `nn.Embedding` or `F.embedding` table. A lookup
+  selects the requested rows' INT8 values and scales and dequantizes only those rows, so
+  a ConvRot INT8 token embedding no longer needs a wrapper module, whether it comes from
+  a ConvRot checkpoint or is decoded from GGUF or trellis storage. Lookups previously
+  raised `NotImplementedError`. `max_norm` renormalization and transposed weights remain
+  unsupported.
+
 ## [0.8.0rc5] - 2026-11-09
 
 ### Added

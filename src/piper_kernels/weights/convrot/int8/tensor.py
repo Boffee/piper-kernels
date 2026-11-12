@@ -483,6 +483,32 @@ def _convrot_add_dispatch(
     return weight.add_(update, alpha=kwargs.get("alpha", 1))
 
 
+@ConvRotInt8Tensor.implements(torch.ops.aten.embedding.default)
+def _embedding_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    _kwargs: dict[str, Any],
+) -> torch.Tensor:
+    """Dequantize only the looked-up rows, never the whole table.
+
+    The remaining arguments (``padding_idx``, ``scale_grad_by_freq``, ``sparse``) affect
+    only gradients, which frozen quantized weights do not have.
+    """
+    weight, indices = args[0], args[1]
+    assert isinstance(weight, ConvRotInt8Tensor)
+    weight._require_matrix("embedding")
+    require_untransposed(weight, "embedding")
+    rows = indices.reshape(-1)
+    values = dequantize_weight(
+        weight.qdata.index_select(0, rows),
+        weight.scale.index_select(0, rows),
+        weight.group_size,
+        weight.dtype,
+    )
+    return values.view(*indices.shape, weight.shape[1])
+
+
 @ConvRotInt8Tensor.implements(torch.ops.aten.linear.default)
 @ConvRotInt8Tensor.implements_torch_function(torch.nn.functional.linear)
 def _linear_dispatch(
