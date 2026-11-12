@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.8.0rc6] - 2026-11-12
+
 ### Added
 
 - A 2-D `ConvRotInt8Tensor` works as an `nn.Embedding` or `F.embedding` table. A lookup
@@ -1071,7 +1073,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc5...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc6...HEAD
+[0.8.0rc6]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc5...v0.8.0rc6
 [0.8.0rc5]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc4...v0.8.0rc5
 [0.8.0rc4]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc3...v0.8.0rc4
 [0.8.0rc3]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc2...v0.8.0rc3
