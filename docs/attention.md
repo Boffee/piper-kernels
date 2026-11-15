@@ -62,9 +62,10 @@ for arithmetic, architecture differences, and scheduling.
 
 ## Sparse attention
 
-Sparse Piper is non-causal self-attention. Q/K/V must have the same sequence length,
-at least 64 rows. It supports the same GQA head relationship as dense Piper, but
-uses sequence-major tensors and one keep ratio per **query** head.
+Sparse Piper is non-causal self-attention. K and V must have the same shape, with at
+least 64 sequence rows, and Q has their sequence length unless the call computes a
+[query slice](#query-slices). It supports the same GQA head relationship as dense
+Piper, but uses sequence-major tensors and one keep ratio per **query** head.
 
 ```python
 import torch
@@ -117,6 +118,38 @@ Native sparse backends cover NVIDIA SM8x/SM120 and AMD RDNA4. Other devices run 
 portable quantized reference. There is a separate exact sparse reference for
 quality comparisons; it is not the fallback used by this API.
 
+### Query slices
+
+Each K64 block of query rows depends only on its own queries and every key, so a
+call can compute just a slice of the query blocks, such as one device's share under
+context parallelism. Pass the slice of Q, the whole sequence's K and V, and the
+global index of the slice's first row as `global_row_offset`:
+
+```python
+start, end = 128, 193  # this caller's rows; start is a multiple of 64
+with torch.inference_mode():
+    part = attention(
+        q[:, start:end],
+        k,
+        v,
+        sparse_key_blocks=2,
+        sparse_query_blocks=2,
+        global_row_offset=start,
+    )
+assert torch.equal(part, output[:, start:end])
+```
+
+The slice must start on a K64 block and cover whole blocks of the sequence; only a
+compact slice that ends the sequence may end in a partial block, so with
+`block_lengths` every slice holds a multiple of 64 physical rows. Other placements
+raise `ValueError`. Everything else still describes the whole sequence:
+`block_lengths`, `sparse_query_blocks`, and forced tiles index global blocks, so every
+slice's call receives the same tensors. The output holds the slice's rows, each
+equal to that row of the whole-sequence call, so concatenating the slices' outputs
+reproduces it. The operators see only local tensors; gathering K/V and outputs
+across devices belongs to the caller. The projection fusions need Q and K/V
+projected from the same rows, so a sliced call compiles without them.
+
 ### Caller-forced tiles (experimental)
 
 This path additionally accepts contiguous device INT32 `force_tile_ids`
@@ -164,8 +197,9 @@ mean/minmax block scores, mean-pools `V`, expands to token rows, and multiplies
 the supplied gate directly without applying an activation. Q/K/V and the gate
 must match in shape (equal head counts) with matching query dtype/device on the
 gate. Pass `routing="mean"` or `"minmax"` and a finite positive `coarse_scale`;
-`coarse_key_blocks` defaults to all available blocks and supports compact tails and
-`block_lengths`. See [residual.py](../src/piper_kernels/attention/sparse_piper_attention/residual.py)
+`coarse_key_blocks` defaults to all available blocks and supports compact tails,
+`block_lengths`, and `global_row_offset` for a [query slice](#query-slices), whose Q and
+gate then hold only the slice's rows. See [residual.py](../src/piper_kernels/attention/sparse_piper_attention/residual.py)
 and [coarse.py](../src/piper_kernels/attention/sparse_piper_attention/coarse.py).
 Compatible compiler fusions accumulate fine and coarse outputs in FP32 before
 casting, so outputs can differ slightly from standalone addition.

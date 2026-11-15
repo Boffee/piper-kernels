@@ -157,7 +157,12 @@ def reshaped_quantized_attention_pattern(
     """Match one materialized quantized attention result before projection."""
     # PyTorch 2.15+ rejects nodes with undeclared non-default keywords, such as
     # FP16 outputs; output fusions validate this dtype against the attention result.
-    output_dtype = KeywordArg("output_attention_dtype")
+    # Earlier versions ignore them, so a query offset must be declared to survive.
+    # Declared keywords match their defaults too, so neither doubles the patterns.
+    keywords = {
+        "output_dtype": KeywordArg("output_attention_dtype"),
+        "global_row_offset": KeywordArg("output_global_row_offset"),
+    }
     operands = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_OPERAND_NAMES)
     policy = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_POLICY_NAMES)
     force_arguments = (
@@ -181,7 +186,7 @@ def reshaped_quantized_attention_pattern(
             ),
             *force_arguments,
             _users=1,
-            output_dtype=output_dtype,
+            **keywords,
         )
     else:
         block_lengths = KeywordArg("output_block_lengths") if with_block_lengths else None
@@ -199,7 +204,7 @@ def reshaped_quantized_attention_pattern(
             *policy,
             *optional_arguments,
             _users=1,
-            output_dtype=output_dtype,
+            **keywords,
         )
     return CallFunction(
         torch.ops.aten.reshape.default,
@@ -217,6 +222,16 @@ def build_forced_attention_keywords(match: Match) -> dict[str, Argument]:
         "force_tile_ids": cast(Argument, match.kwargs["output_force_tile_ids"]),
         "force_tile_counts": cast(Argument, match.kwargs["output_force_tile_counts"]),
     }
+
+
+def build_query_slice_keywords(match: Match) -> dict[str, Argument]:
+    """Preserve where a quantized attention's Q rows start across output fusion."""
+    global_row_offset = match.kwargs["output_global_row_offset"]
+    return (
+        {}
+        if global_row_offset is None
+        else {"global_row_offset": cast(Argument, global_row_offset)}
+    )
 
 
 def quantized_attention_arguments(match: Match) -> tuple[Argument, ...]:
@@ -244,6 +259,7 @@ def bounded_attention_arguments(match: Match) -> tuple[Argument, ...]:
 __all__ = [
     "bounded_attention_arguments",
     "build_forced_attention_keywords",
+    "build_query_slice_keywords",
     "optional_attention_layout_arguments",
     "quantized_attention_arguments",
     "reshaped_quantized_attention_pattern",

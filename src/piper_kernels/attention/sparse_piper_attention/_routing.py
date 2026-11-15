@@ -43,6 +43,7 @@ def _coarse_residual_from_mode(
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     """Return one policy-selected coarse branch while preserving its graph boundary."""
     validate_routing_mode(routing_mode)
@@ -51,7 +52,7 @@ def _coarse_residual_from_mode(
             (
                 block_lengths.numel()
                 if block_lengths is not None
-                else (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+                else (key.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
             )
             if coarse_key_blocks is None
             else coarse_key_blocks
@@ -65,6 +66,7 @@ def _coarse_residual_from_mode(
             coarse_scale,
             routing_mode,
             block_lengths,
+            global_row_offset,
         )
     return coarse_residual_impl(
         query,
@@ -75,6 +77,7 @@ def _coarse_residual_from_mode(
         coarse_scale=coarse_scale,
         routing_mode=routing_mode,
         block_lengths=block_lengths,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -88,6 +91,7 @@ def coarse_residual_impl(
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     """Apply the common Q/K/V-derived coarse residual implementation."""
     validate_routing_mode(routing_mode)
@@ -100,6 +104,7 @@ def coarse_residual_impl(
         coarse_scale,
         block_lengths,
         routing_label=_ROUTING_NAME_BY_MODE[routing_mode],
+        global_row_offset=global_row_offset,
     )
     query_head_major = query.transpose(1, 2)
     coarse_key = key.transpose(1, 2)[:, :, : coarse_key_blocks * _BLOCK_ROWS]
@@ -108,6 +113,7 @@ def coarse_residual_impl(
         coarse_key,
         routing_mode,
         block_lengths,
+        global_block_offset=global_row_offset // _BLOCK_ROWS,
     )
     pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :coarse_key_blocks]
     return _apply_chunked_coarse_residual(
@@ -130,15 +136,20 @@ def packed_routes_from_sequences(
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
     *,
+    global_block_offset: int = 0,
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
 ) -> PackedRoutes:
-    """Select routes for compact or valid-front padded Q and K64 sequences."""
+    """Select routes for compact or valid-front padded Q and K64 sequences.
+
+    ``block_lengths`` describes the global layout; Q holds the blocks that start
+    at global block ``global_block_offset``, and ``force_tile_mask`` has Q's rows.
+    """
     if key.ndim == 4 and (key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS):
         raise ValueError("sparse routing requires complete sparse-prefix K64 blocks")
     if key.ndim == 4 and layout.keeps_all_blocks(key.shape[2] // _BLOCK_ROWS):
         validate_routing_mode(routing_mode)
-        _validate_sequences(query, key, block_lengths)
+        _validate_sequences(query, key, block_lengths, global_block_offset=global_block_offset)
         return PackedRouteBuilder(
             layout,
             batch=query.shape[0],
@@ -154,6 +165,7 @@ def packed_routes_from_sequences(
         key,
         routing_mode,
         block_lengths,
+        global_block_offset=global_block_offset,
     )
     return packed_routes_from_summaries(
         query_summary,

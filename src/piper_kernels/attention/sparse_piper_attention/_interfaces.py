@@ -15,6 +15,12 @@ from ._prepared import (
 
 
 class PrepareOperands(Protocol):
+    """Quantize local Q against global K/V.
+
+    Q holds whole K64 blocks starting at global block ``global_block_offset``,
+    except compact rows that end the sequence; every other operand is global.
+    """
+
     def __call__(
         self,
         query: torch.Tensor,
@@ -25,6 +31,7 @@ class PrepareOperands(Protocol):
         combined_value: torch.Tensor,
         block_lengths: torch.Tensor | None = None,
         sparse_query_blocks: int | None = None,
+        global_block_offset: int = 0,
         emit_summaries: bool = False,
     ) -> _PreparedSparsePiperOperands: ...
 
@@ -103,10 +110,13 @@ class MinmaxScores(Protocol):
 
 
 class SequenceSummaries(Protocol):
+    """Summarize Q and K blocks; each length vector describes its own operand's blocks."""
+
     def __call__(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         routing_mode: int,
-        block_lengths: torch.Tensor | None = None,
+        query_block_lengths: torch.Tensor | None = None,
+        key_block_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...

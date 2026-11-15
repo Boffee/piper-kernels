@@ -124,6 +124,7 @@ def test_fused_preparation_matches_separate_passes(
         masked_key[:, :, : sparse_key_blocks * 64],
         _routing_modes._MINMAX_ROUTING,
         lengths,
+        None if lengths is None else lengths[:sparse_key_blocks],
     )
     options = {
         "sparse_key_blocks": sparse_key_blocks,
@@ -276,7 +277,8 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
                 head_dim**-0.5,
                 storage_sequence_length=rows,
                 sparse_key_blocks=sparse_key_blocks,
-                block_lengths=None,
+                query_block_lengths=None,
+                key_block_lengths=None,
             )
         )
         # The new producer must retain the all-zero quantization guards.

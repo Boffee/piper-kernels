@@ -957,3 +957,101 @@ def test_tile_centered_kv_token_sharding_invariance() -> None:
         0,
     )
     assert torch.equal(sharded_output, full_output)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
+)
+@pytest.mark.parametrize("coarse", [False, True])
+def test_quantized_query_storage_slices_reproduce_whole_sequence_rows(coarse: bool) -> None:
+    sequence_length = 449
+    generator = torch.Generator(device="cuda").manual_seed(1517)
+    shape = (1, sequence_length, 2, 128)
+    query, key, value, coarse_gate = (
+        torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+        for _ in range(4)
+    )
+    query_head_major = query.transpose(1, 2)
+    key_head_major = key.transpose(1, 2)
+    sparse_key_blocks = sequence_length // TILE_ROWS
+    query_blocks = (sequence_length + TILE_ROWS - 1) // TILE_ROWS
+    ratio_units = _normalize_head_keep_ratios((0.5, 0.75))
+    layout = _resolve_route_layout(ratio_units, sparse_key_blocks, query.device)
+    sparse_key = key_head_major[:, :, : sparse_key_blocks * TILE_ROWS]
+    routes = packed_minmax_pool_routes_from_sequences(query_head_major, sparse_key, layout)
+    query_summary, key_max, key_min = _minmax_pool_block_summaries(query_head_major, sparse_key)
+    backend = require_attention_backend(query_head_major)
+    prepared = backend.prepare(
+        query_head_major,
+        128**-0.5,
+        sparse_key_blocks=sparse_key_blocks,
+        combined_key=key_head_major,
+        combined_value=value.transpose(1, 2),
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
+    context = prepared.context
+    key_value = (
+        context.key,
+        context.key_scale,
+        context.key_center,
+        context.key_center_scale,
+        key_max,
+        key_min,
+        context.value,
+        context.value_scale_multiplier,
+        context.value_mean,
+    )
+    policy = (
+        _SparsePiperRatioProfile(ratio_units),
+        sparse_key_blocks,
+        sequence_length,
+        _MINMAX_ROUTING,
+    )
+    blocks = torch.arange(query_blocks, device="cuda", dtype=torch.int32)
+    # Forced tiles and the routed scope stay indexed by global query block.
+    options = {
+        "force_tile_ids": blocks.remainder(sparse_key_blocks)[:, None].contiguous(),
+        "force_tile_counts": torch.ones(query_blocks, device="cuda", dtype=torch.int32),
+    }
+
+    def run(start: int | None, end: int) -> torch.Tensor:
+        first = 0 if start is None else start
+        query_operands = (
+            prepared.query.data[:, :, first:end].contiguous(),
+            prepared.query.scale[
+                :, :, first // QUERY_SCALE_ROWS : end // QUERY_SCALE_ROWS
+            ].contiguous(),
+            query_summary[:, :, first // TILE_ROWS : end // TILE_ROWS].contiguous(),
+        )
+        offset = {} if start is None else {"global_row_offset": start}
+        if not coarse:
+            return _sparse_piper_attention_from_quantized_op(
+                *query_operands, *key_value, *policy, None, 4, **options, **offset
+            )
+        gate = coarse_gate[:, first : min(end, sequence_length)].contiguous()
+        return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+            *query_operands,
+            *key_value,
+            gate,
+            *policy,
+            0.125,
+            sparse_key_blocks,
+            None,
+            4,
+            **options,
+            **offset,
+        )
+
+    with torch.no_grad():
+        expected = run(None, query_blocks * TILE_ROWS)
+        slices = [run(0, 192), run(192, 384), run(384, query_blocks * TILE_ROWS)]
+
+    assert [part.shape[1] for part in slices] == [192, 192, sequence_length - 384]
+    assert torch.equal(torch.cat(slices, dim=1), expected)

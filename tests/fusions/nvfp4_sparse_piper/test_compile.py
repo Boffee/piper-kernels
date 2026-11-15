@@ -642,6 +642,29 @@ def test_output_fold_supports_every_bounded_attention_variant(
     graph.lint()
 
 
+def test_output_fold_leaves_query_slices_unfused(monkeypatch: pytest.MonkeyPatch) -> None:
+    graph = build_quantized_attention_output_graph(
+        with_block_lengths=False,
+        with_coarse=False,
+        with_sparse_query_blocks=False,
+    )
+    attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
+    node = next(node for node in graph.nodes if node.target is attention)
+    node.kwargs = {**node.kwargs, "global_row_offset": 64}
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    )
+
+    # NVFP4 output fusions compute every query row, so they must not drop the offset.
+    assert not _fold_attention_output(graph)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(attention) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
+
+
 def test_high_first_output_fold_preserves_order_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

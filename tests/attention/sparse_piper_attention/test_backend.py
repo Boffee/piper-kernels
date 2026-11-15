@@ -518,10 +518,23 @@ def test_summaries_use_selected_operation_after_validation(monkeypatch):
         is expected
     )
     select.assert_called_once_with(query, query)
-    summarize.assert_called_once_with(query, query, _routing_modes._MINMAX_ROUTING, None)
+    summarize.assert_called_once_with(query, query, _routing_modes._MINMAX_ROUTING, None, None)
     with pytest.raises(ValueError, match="rank-four"):
         _summaries.sequence_block_summaries(query[0], query, _routing_modes._MINMAX_ROUTING)
     select.assert_called_once()
+
+    # Q holds global blocks 2-3 of a padded layout; K is its one-block sparse prefix.
+    block_lengths = torch.tensor([64, 17, 51, 3], dtype=torch.int32)
+    _summaries.sequence_block_summaries(
+        query,
+        query[:, :, :64],
+        _routing_modes._MINMAX_ROUTING,
+        block_lengths,
+        global_block_offset=2,
+    )
+    *_, query_lengths, key_lengths = summarize.call_args.args
+    assert query_lengths.tolist() == [51, 3]
+    assert key_lengths.tolist() == [64]
 
 
 def _bind_mock(context, launch):

@@ -30,6 +30,7 @@ def _sparse_piper_coarse_residual_op(
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     """Preserve a Q/K/V-derived coarse residual as one semantic operation."""
     return coarse_residual_impl(
@@ -41,6 +42,7 @@ def _sparse_piper_coarse_residual_op(
         coarse_scale=coarse_scale,
         routing_mode=routing_mode,
         block_lengths=block_lengths,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -54,6 +56,7 @@ def _sparse_piper_coarse_residual_op_fake(
     coarse_scale: float,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     validate_coarse_residual_inputs(
         query,
@@ -64,5 +67,6 @@ def _sparse_piper_coarse_residual_op_fake(
         coarse_scale,
         block_lengths,
         routing_label=_routing_label(routing_mode),
+        global_row_offset=global_row_offset,
     )
     return torch.empty_like(query, memory_format=torch.contiguous_format)

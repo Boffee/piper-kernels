@@ -9,7 +9,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
-from ._block_layout import valid_block_rows, validate_block_lengths
+from ._block_layout import valid_block_rows, validate_block_lengths, validate_query_slice
 
 
 def _preserve_coarse_residual_in_graph(*tensors: torch.Tensor) -> bool:
@@ -48,17 +48,28 @@ def validate_coarse_residual_inputs(
     block_lengths: torch.Tensor | None,
     *,
     routing_label: str,
+    global_row_offset: int = 0,
 ) -> int:
-    """Validate the shared contract and resolve the coarse K64 prefix length."""
+    """Validate the shared contract and resolve the coarse K64 prefix length.
+
+    Q and the gate hold the global rows from ``global_row_offset``; K/V are global.
+    """
     tensors = (query, key, value, coarse_gate)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError(
             f"{routing_label} coarse attention tensors must use [batch,sequence,heads,features]"
         )
-    if query.shape != key.shape or query.shape != value.shape:
-        raise ValueError(f"{routing_label} coarse attention requires equal Q/K/V shapes")
+    if (
+        key.shape != value.shape
+        or query.shape[0] != key.shape[0]
+        or query.shape[2:] != key.shape[2:]
+    ):
+        raise ValueError(
+            f"{routing_label} coarse attention requires equal K/V shapes and matching Q "
+            "batch, heads, and features"
+        )
     if coarse_gate.shape != query.shape:
-        raise ValueError(f"{routing_label} coarse attention gate must match Q/K/V")
+        raise ValueError(f"{routing_label} coarse attention gate must match Q")
     if any(tensor.device != query.device for tensor in (key, value, coarse_gate)):
         raise ValueError(f"{routing_label} coarse attention tensors must share a device")
     if any(not tensor.is_floating_point() for tensor in (query, key, value)):
@@ -68,14 +79,21 @@ def validate_coarse_residual_inputs(
 
     validate_coarse_scale(coarse_scale)
     if block_lengths is None:
-        available_coarse_key_blocks = (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+        available_coarse_key_blocks = (key.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     else:
         available_coarse_key_blocks = validate_block_lengths(
             block_lengths,
-            sequence_length=query.shape[1],
+            sequence_length=key.shape[1],
             device=query.device,
             context=f"{routing_label} coarse attention",
         )
+    validate_query_slice(
+        global_row_offset,
+        query.shape[1],
+        sequence_length=key.shape[1],
+        has_block_lengths=block_lengths is not None,
+        context=f"{routing_label} coarse attention",
+    )
     resolved_coarse_key_blocks = (
         available_coarse_key_blocks if coarse_key_blocks is None else coarse_key_blocks
     )

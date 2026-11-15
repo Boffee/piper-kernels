@@ -9,7 +9,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
-from ._block_layout import valid_block_rows
+from ._block_layout import slice_query_block_lengths, valid_block_rows
 from ._routes import PackedRoutes
 
 _RECURRENCE_ROWS = 128
@@ -130,6 +130,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     scale: float,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     """Evaluate the selected quantized Sparse Piper algorithm in PyTorch.
 
@@ -137,18 +138,25 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     K64 tile with 2-term INT8 rotated midpoints, V64 tile-centered and tile-scaled
     INT8 V with BF16 tile means, paired K128 recurrence, UINT8 probabilities,
     and a pre-rounding FP32 denominator. It is a correctness reference, not a
-    fast fallback.
+    fast fallback. Q and ``routes`` hold the global rows from ``global_row_offset``,
+    as in ``SparsePiperAttention.forward``; the other operands are global.
     """
-    batch, sequence, heads, head_dim = query.shape
-    query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    batch, num_query_rows, heads, head_dim = query.shape
+    sequence = key.shape[1]
+    query_blocks = (num_query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    global_block_offset = global_row_offset // _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     value_head_major = value.transpose(1, 2)
 
+    query_block_lengths = slice_query_block_lengths(
+        block_lengths, global_block_offset, num_query_rows
+    )
     if block_lengths is not None:
-        valid_rows = valid_block_rows(block_lengths).reshape(-1)
-        valid_rows = valid_rows[None, None, :, None]
-        query_head_major = torch.where(valid_rows, query_head_major, 0)
+        assert query_block_lengths is not None
+        valid_query_rows = valid_block_rows(query_block_lengths).reshape(-1)[:, None]
+        valid_rows = valid_block_rows(block_lengths).reshape(-1)[:, None]
+        query_head_major = torch.where(valid_query_rows, query_head_major, 0)
         key_head_major = torch.where(valid_rows, key_head_major, 0)
         value_head_major = torch.where(valid_rows, value_head_major, 0)
 
@@ -196,7 +204,8 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
                     use_sparse_routes=(
-                        sparse_query_blocks is None or query_block < sparse_query_blocks
+                        sparse_query_blocks is None
+                        or global_block_offset + query_block < sparse_query_blocks
                     ),
                 )
                 selected_key = key_int8[batch_index, kv_head].index_select(0, key_indices)
@@ -211,17 +220,17 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     0, tile_indices
                 )
                 selected_value_mean = value_mean[batch_index, kv_head].index_select(0, tile_indices)
-                query_start = query_block * _BLOCK_ROWS
-                query_stop = min(query_start + _BLOCK_ROWS, sequence)
-                block_query = query_int8[batch_index, head, query_start:query_stop]
-                block_query_scale = query_scale[batch_index, head, query_start:query_stop]
+                start_row = query_block * _BLOCK_ROWS
+                end_row = min(start_row + _BLOCK_ROWS, num_query_rows)
+                block_query = query_int8[batch_index, head, start_row:end_row]
+                block_query_scale = query_scale[batch_index, head, start_row:end_row]
                 numerator = torch.zeros(
-                    (query_stop - query_start, head_dim),
+                    (end_row - start_row, head_dim),
                     device=query.device,
                     dtype=torch.float32,
                 )
                 denominator = torch.zeros(
-                    (query_stop - query_start,),
+                    (end_row - start_row,),
                     device=query.device,
                     dtype=torch.float32,
                 )
@@ -293,7 +302,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     running_max = next_max
 
                 block_output = numerator / (denominator.clamp_min(1e-30)[:, None] * _P_UINT8_RANGE)
-                output[batch_index, head, query_start:query_stop] = block_output.to(query.dtype)
+                output[batch_index, head, start_row:end_row] = block_output.to(query.dtype)
 
     return output.transpose(1, 2).contiguous()
 
@@ -308,10 +317,16 @@ def reference_exact_sparse_attention(
     scale: float,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
-    """Apply the same routes with exact BF16 inputs and FP32 attention math."""
-    batch, sequence, heads, _head_dim = query.shape
-    query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    """Apply the same routes with exact BF16 inputs and FP32 attention math.
+
+    Q and ``routes`` hold the global rows from ``global_row_offset``.
+    """
+    batch, num_query_rows, heads, _head_dim = query.shape
+    sequence = key.shape[1]
+    query_blocks = (num_query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    global_block_offset = global_row_offset // _BLOCK_ROWS
     output = torch.empty_like(query)
     route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 
@@ -329,19 +344,19 @@ def reference_exact_sparse_attention(
                     route_head_offsets=route_head_offsets,
                     block_lengths=block_lengths,
                     use_sparse_routes=(
-                        sparse_query_blocks is None or query_block < sparse_query_blocks
+                        sparse_query_blocks is None
+                        or global_block_offset + query_block < sparse_query_blocks
                     ),
                 )
-                query_start = query_block * _BLOCK_ROWS
-                query_stop = min(query_start + _BLOCK_ROWS, sequence)
-                block_query = query[batch_index, query_start:query_stop, head].float()
+                start_row = query_block * _BLOCK_ROWS
+                end_row = min(start_row + _BLOCK_ROWS, num_query_rows)
+                block_query = query[batch_index, start_row:end_row, head].float()
                 selected_key = key[batch_index, key_indices, kv_head].float()
                 selected_value = value[batch_index, key_indices, kv_head].float()
                 scores = block_query @ selected_key.mT * scale
                 if valid_keys is not None:
                     scores = scores.masked_fill(~valid_keys[None, :], -float("inf"))
                 probability = torch.softmax(scores, dim=-1)
-                output[batch_index, query_start:query_stop, head] = (
-                    probability @ selected_value
-                ).to(value.dtype)
+                block_output = probability @ selected_value
+                output[batch_index, start_row:end_row, head] = block_output.to(value.dtype)
     return output

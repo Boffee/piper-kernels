@@ -366,6 +366,7 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
         "output_dtype": original.meta["val"].dtype,
         "output_input_scale": output_input_scale,
         **sparse_piper_pattern.build_forced_attention_keywords(match),
+        **sparse_piper_pattern.build_query_slice_keywords(match),
     }
     reusable_input = None
     with graph.inserting_before(original):

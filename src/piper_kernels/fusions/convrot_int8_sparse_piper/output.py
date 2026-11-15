@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._residual import ResidualAdd, validate_residual_add
+from piper_kernels.attention.sparse_piper_attention._block_layout import (
+    slice_query_block_lengths,
+)
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
@@ -62,8 +65,7 @@ class _GateProjection:
 
 def _prepare_gate_projection(
     attention_storage: torch.Tensor,
-    logical_sequence_length: int,
-    block_lengths: torch.Tensor | None,
+    sequence_length: int,
     input_data: torch.Tensor,
     input_scale: torch.Tensor | None,
     weight_qdata: torch.Tensor,
@@ -71,12 +73,7 @@ def _prepare_gate_projection(
     bias: torch.Tensor | None,
     input_group_size: int | None = None,
 ) -> _GateProjection:
-    """Validate the input and one D64/D128-per-head gate weight."""
-    sequence_length = output_common.output_sequence_length(
-        attention_storage,
-        logical_sequence_length,
-        block_lengths,
-    )
+    """Validate the input for ``sequence_length`` output rows and one D64/D128-per-head weight."""
     batch, heads, _storage_sequence_length, head_dim = attention_storage.shape
     if (
         input_data.ndim != 3
@@ -143,8 +140,7 @@ def _prepare_gate_projection(
 
 def _prepare_optional_gate_projection(
     attention_storage: torch.Tensor,
-    logical_sequence_length: int,
-    block_lengths: torch.Tensor | None,
+    sequence_length: int,
     input_data: torch.Tensor | None,
     input_scale: torch.Tensor | None,
     weight_qdata: torch.Tensor | None,
@@ -163,8 +159,7 @@ def _prepare_optional_gate_projection(
     assert weight_scale is not None
     return _prepare_gate_projection(
         attention_storage,
-        logical_sequence_length,
-        block_lengths,
+        sequence_length,
         input_data,
         input_scale,
         weight_qdata,
@@ -186,6 +181,25 @@ def _resolve_projected_gate_input(
     if gate_input is not None:
         raise ValueError("chunk-prepared ConvRot INT8 Q and gate must share one input")
     return query_input if gate_weight_qdata is not None else None
+
+
+def _projected_output_rows(
+    query_input: torch.Tensor,
+    key: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    global_row_offset: int | None,
+) -> int:
+    """Return the output rows of Q projected from ``query_input``'s sequence rows."""
+    if query_input.ndim != 3:
+        raise ValueError("fused ConvRot INT8 Q input must be [batch, sequence, features]")
+    return output_common.projected_query_output_rows(
+        key,
+        logical_sequence_length,
+        block_lengths,
+        global_row_offset=global_row_offset,
+        num_query_rows=query_input.shape[1],
+    )
 
 
 def _validate_output_projection(
@@ -297,8 +311,12 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     output_input_scale: torch.Tensor | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
-    """Pipeline bounded attention chunks into the final ConvRot INT8 output."""
+    """Pipeline bounded attention chunks into the final ConvRot INT8 output.
+
+    Q storage covers the global sequence, or starts at global row ``global_row_offset``.
+    """
     backend = fusion_backend.require_output_backend(query)
     prepared = output_common.prepare_attention(
         query,
@@ -325,6 +343,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
         has_projected_coarse_gate=gate_projection is not None,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
     output_features, project_chunk, projector_tensors = _prepare_output_chunk_projector(
         query,
@@ -396,6 +415,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     residual_add: ResidualAdd | None = None,
     start_head: int = 0,
     end_head: int | None = None,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
     """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output.
 
@@ -406,11 +426,20 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     With a validated ``residual_add`` instead, each window's projection is added
     into its base rows, which hold live data, so attention uses separate buffers.
     The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``.
+    Q's input, RoPE tables, and output cover the global sequence, or with
+    ``global_row_offset`` the input's global rows from there.
     """
     projection_backend = fusion_backend.require_projection_backend(
         query_input, head_dim=key.shape[-1]
     )
     backend = fusion_backend.require_output_backend(key)
+    if (
+        query_input.ndim != 3
+        or query_input.shape[0] != key.shape[0]
+        or query_input.shape[-1] != query_weight_qdata.shape[-1]
+        or query_input.device != key.device
+    ):
+        raise ValueError("fused ConvRot INT8 Q input must match the attention batch and width")
     prepared = output_common.prepare_attention_context(
         key,
         key_scale,
@@ -435,16 +464,11 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         force_tile_counts=force_tile_counts,
         start_head=start_head,
         end_head=end_head,
+        global_row_offset=global_row_offset,
+        num_query_rows=query_input.shape[1],
     )
-    if (
-        query_input.ndim != 3
-        or query_input.shape[:2] != (key.shape[0], prepared.sequence_length)
-        or query_input.shape[-1] != query_weight_qdata.shape[-1]
-        or query_input.device != key.device
-    ):
-        raise ValueError(
-            "fused ConvRot INT8 Q input must match the global attention rows and width"
-        )
+    if query_input.shape[1] != prepared.sequence_length:
+        raise ValueError("fused ConvRot INT8 Q input must have one row per attention output row")
     if input_group_size is not None:
         validate_storage(
             query_weight_qdata, query_weight_scale, input_group_size, query_input.dtype
@@ -466,6 +490,14 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         output_input_scale=output_input_scale,
         residual_add=residual_add,
     )
+    # Q's projection masks its own input rows, which start at global row ``global_row_offset``.
+    query_block_lengths = (
+        block_lengths
+        if global_row_offset is None
+        else slice_query_block_lengths(
+            block_lengths, prepared.global_block_offset, prepared.sequence_length
+        )
+    )
 
     def project_query_chunk(
         start: int,
@@ -475,7 +507,7 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             assert query_input_scale is not None
             chunk_input, chunk_scale = query_input, query_input_scale
             chunk_cos, chunk_sin = cos, sin
-            chunk_lengths = block_lengths
+            chunk_lengths = query_block_lengths
             chunk_start = start
         else:
             chunk_input, chunk_scale = backend.prepare_input(
@@ -486,8 +518,10 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             chunk_cos, chunk_sin = cos[start : start + rows], sin[start : start + rows]
             chunk_lengths = (
                 None
-                if block_lengths is None
-                else block_lengths[start // TILE_ROWS : (start + rows + TILE_ROWS - 1) // TILE_ROWS]
+                if query_block_lengths is None
+                else query_block_lengths[
+                    start // TILE_ROWS : (start + rows + TILE_ROWS - 1) // TILE_ROWS
+                ]
             )
             chunk_start = 0
         return query_projection._launch_query_projection_range(
@@ -573,11 +607,20 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     *,
     input_group_size: int | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
+    """Project Q in bounded windows, attend, and apply the ConvRot INT8 output projection.
+
+    Without ``global_row_offset``, Q's input and RoPE tables cover the global sequence. With
+    it, they hold the global rows that start there, as in ``SparsePiperAttention.forward``,
+    and so do the coarse gate and the output; K/V, ``block_lengths``,
+    ``sparse_query_blocks``, and forced tiles describe the whole sequence.
+    """
     gate_projection = _prepare_optional_gate_projection(
         key,
-        logical_sequence_length,
-        block_lengths,
+        _projected_output_rows(
+            query_input, key, logical_sequence_length, block_lengths, global_row_offset
+        ),
         _resolve_projected_gate_input(
             query_input,
             gate_input,
@@ -630,6 +673,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         input_group_size=input_group_size,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -683,18 +727,22 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
     *,
     input_group_size: int | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> None:
     """Overwrite an exclusive floating-point input after each window is consumed.
 
     Compiler ownership checks exclude caller inputs, aliases, and escaping values.
     Q and gate finish reading a window before its output projection can overwrite it.
+    ``global_row_offset`` places Q's rows as in
+    ``convrot_int8_sparse_piper_projected_query_attention_output``.
     """
     if input_group_size is None:
         raise ValueError("input reuse requires chunked floating-point input preparation")
     gate_projection = _prepare_optional_gate_projection(
         key,
-        logical_sequence_length,
-        block_lengths,
+        _projected_output_rows(
+            query_input, key, logical_sequence_length, block_lengths, global_row_offset
+        ),
         _resolve_projected_gate_input(
             query_input,
             gate_input,
@@ -748,12 +796,13 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
         out=query_input,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
 
 
 @_projected_query_attention_output_inplace_op.register_fake
 def _projected_query_attention_output_inplace_op_fake(
-    _query_input: torch.Tensor,
+    query_input: torch.Tensor,
     _query_input_scale: torch.Tensor | None,
     _query_weight_qdata: torch.Tensor,
     _query_weight_scale: torch.Tensor,
@@ -797,6 +846,7 @@ def _projected_query_attention_output_inplace_op_fake(
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> None:
     output_common.validate_output_metadata(
         key,
@@ -806,11 +856,14 @@ def _projected_query_attention_output_inplace_op_fake(
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
+    _projected_output_rows(
+        query_input, key, logical_sequence_length, block_lengths, global_row_offset
+    )
 
 
 @_projected_query_attention_output_op.register_fake
 def _projected_query_attention_output_op_fake(
-    _query_input: torch.Tensor,
+    query_input: torch.Tensor,
     _query_input_scale: torch.Tensor | None,
     _query_weight_qdata: torch.Tensor,
     _query_weight_scale: torch.Tensor,
@@ -854,8 +907,9 @@ def _projected_query_attention_output_op_fake(
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
-    sequence_length = output_common.validate_output_metadata(
+    output_common.validate_output_metadata(
         key,
         logical_sequence_length,
         block_lengths,
@@ -863,31 +917,39 @@ def _projected_query_attention_output_op_fake(
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
+    sequence_length = _projected_output_rows(
+        query_input, key, logical_sequence_length, block_lengths, global_row_offset
+    )
     return output_common.new_projected_output(
         key, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
     )
 
 
-def _validate_residual_add(
+def _validate_residual_add(  # noqa: PLR0913, PLR0917
     base: torch.Tensor,
     gate: torch.Tensor,
     gate_indices: torch.Tensor,
     python_indexing: bool,
+    query_input: torch.Tensor,
     key: torch.Tensor,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None,
     weight_qdata: torch.Tensor,
     force_tile_ids: torch.Tensor | None,
     force_tile_counts: torch.Tensor | None,
+    global_row_offset: int | None,
 ) -> ResidualAdd:
     """Check from metadata that ``base`` has the projected output's rows and dtype."""
-    sequence_length = output_common.validate_output_metadata(
+    output_common.validate_output_metadata(
         key,
         logical_sequence_length,
         block_lengths,
         output_dtype=base.dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+    )
+    sequence_length = _projected_output_rows(
+        query_input, key, logical_sequence_length, block_lengths, global_row_offset
     )
     if base.ndim != 3 or base.shape[:2] != (key.shape[0], sequence_length):
         raise ValueError("sparse Piper residual base must have one row per output row")
@@ -971,6 +1033,7 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,
+    global_row_offset: int | None = None,
     head_slice_index: int = 0,
     num_head_slices: int = 1,
 ) -> None:
@@ -986,6 +1049,10 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     the Q, K, V, and coarse-gate operands hold slice ``head_slice_index``'s heads, the
     output projection takes their share of its input columns, and ``ratio_profile``
     covers every slice's heads. Each head then keeps the blocks it keeps unsliced.
+
+    ``global_row_offset`` places Q's rows as in
+    ``convrot_int8_sparse_piper_projected_query_attention_output``; ``base`` and
+    ``gate_indices`` then cover those rows, and every head slice uses the same start.
     """
     start_head, end_head = _resolve_head_slice(
         ratio_profile, query_weight_qdata, key, head_slice_index, num_head_slices
@@ -995,17 +1062,18 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         gate,
         gate_indices,
         python_indexing,
+        query_input,
         key,
         logical_sequence_length,
         block_lengths,
         weight_qdata,
         force_tile_ids,
         force_tile_counts,
+        global_row_offset,
     )
     gate_projection = _prepare_optional_gate_projection(
         key,
-        logical_sequence_length,
-        block_lengths,
+        residual_add.base.shape[1],
         _resolve_projected_gate_input(
             query_input,
             gate_input,
@@ -1061,6 +1129,7 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         residual_add=residual_add,
         start_head=start_head,
         end_head=end_head,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -1070,7 +1139,7 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
     gate: torch.Tensor,
     gate_indices: torch.Tensor,
     python_indexing: bool,
-    _query_input: torch.Tensor,
+    query_input: torch.Tensor,
     _query_input_scale: torch.Tensor | None,
     query_weight_qdata: torch.Tensor,
     _query_weight_scale: torch.Tensor,
@@ -1113,6 +1182,7 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
+    global_row_offset: int | None = None,
     head_slice_index: int = 0,
     num_head_slices: int = 1,
 ) -> None:
@@ -1122,12 +1192,14 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
         gate,
         gate_indices,
         python_indexing,
+        query_input,
         key,
         logical_sequence_length,
         block_lengths,
         weight_qdata,
         force_tile_ids,
         force_tile_counts,
+        global_row_offset,
     )
 
 
@@ -1173,11 +1245,19 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
+    """Attend from quantized Q and apply the ConvRot INT8 output projection in bounded windows.
+
+    Without ``global_row_offset``, Q storage covers the global sequence. With it, Q storage
+    starts at that global row, as in ``sparse_piper_attention_from_quantized``, and the
+    coarse gate and output have Q's rows; the other operands describe the whole sequence.
+    """
     gate_projection = _prepare_optional_gate_projection(
         query,
-        logical_sequence_length,
-        block_lengths,
+        output_common.output_sequence_length(
+            query, logical_sequence_length, block_lengths, global_row_offset
+        ),
         gate_input_qdata,
         gate_input_scale,
         gate_weight_qdata,
@@ -1216,6 +1296,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -1257,6 +1338,7 @@ def _attention_output_op_fake(
     force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
     sequence_length = output_common.validate_output_metadata(
         query,
@@ -1265,6 +1347,7 @@ def _attention_output_op_fake(
         output_dtype=output_dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
     return output_common.new_projected_output(
         query, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype

@@ -93,9 +93,13 @@ def sequence_block_summaries(
     query: torch.Tensor,
     key: torch.Tensor,
     routing_mode: int,
-    block_lengths: torch.Tensor | None = None,
+    query_block_lengths: torch.Tensor | None = None,
+    key_block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Summarize compact or valid-front padded Q/K blocks on CUDA."""
+    """Summarize compact or valid-front padded Q/K blocks on CUDA.
+
+    Each length vector holds one value per K64 block of its own operand.
+    """
     validate_routing_mode(routing_mode)
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError("optimized sequence summaries require rank-four Q/K tensors")
@@ -119,17 +123,19 @@ def sequence_block_summaries(
 
     batch, heads, query_rows, head_dim = query.shape
     key_rows = key.shape[2]
-    if block_lengths is not None and (
-        query_rows % _BLOCK_ROWS
-        or block_lengths.shape != (query_rows // _BLOCK_ROWS,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != query.device
-        or not block_lengths.is_contiguous()
-        or key_rows % _BLOCK_ROWS
-        or key_rows // _BLOCK_ROWS > block_lengths.numel()
+    if (query_block_lengths is None) != (key_block_lengths is None) or any(
+        lengths is not None
+        and (
+            rows % _BLOCK_ROWS
+            or lengths.shape != (rows // _BLOCK_ROWS,)
+            or lengths.dtype is not torch.int32
+            or lengths.device != query.device
+            or not lengths.is_contiguous()
+        )
+        for rows, lengths in ((query_rows, query_block_lengths), (key_rows, key_block_lengths))
     ):
         raise ValueError(
-            "optimized padded summaries require one contiguous device INT32 length per query K64"
+            "optimized padded summaries require one contiguous device INT32 length per Q/K K64"
         )
     query_blocks = (query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     key_blocks = (key_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
@@ -156,6 +162,7 @@ def sequence_block_summaries(
             sequence: torch.Tensor,
             primary: torch.Tensor,
             aux: torch.Tensor,
+            block_lengths: torch.Tensor | None,
             *,
             query: bool,
         ) -> None:
@@ -183,8 +190,8 @@ def sequence_block_summaries(
                 num_stages=1,
             )
 
-        launch(query, query_summary, query_summary, query=True)
-        launch(key, key_primary, key_aux, query=False)
+        launch(query, query_summary, query_summary, query_block_lengths, query=True)
+        launch(key, key_primary, key_aux, key_block_lengths, query=False)
         return query_summary, key_primary, key_aux
 
 
