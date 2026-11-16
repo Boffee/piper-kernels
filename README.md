@@ -40,7 +40,7 @@ the Visual C++ Redistributable for Visual Studio 2015–2022. For NVIDIA,
 or Visual Studio installation is needed. For AMD, use
 [TheRock's ROCm PyTorch build](https://github.com/ROCm/TheRock/blob/main/RELEASES.md)
 and its matching GPU device packages; see
-[AMD validation coverage](docs/development.md#accelerator-environments).
+[AMD validation coverage](docs/environments.md#rocm).
 
 ## Quick start
 
@@ -75,6 +75,7 @@ see [attention](docs/attention.md) for input and backend support.
 | Choose and use dense, sparse, or SageAttention2++ attention | [Attention](docs/attention.md) |
 | Construct, load, run, update, or shard quantized weights; enable compiler fusions | [Weights and quantized operators](docs/weights.md) |
 | Understand implementation boundaries, extend kernels, or run checks | [Development](docs/development.md) |
+| Set up CUDA/ROCm environments, caches, and regressions | [Environments](docs/environments.md) |
 | Measure performance and quality, tune, or inspect generated kernels | [Benchmarks](benchmarks/README.md) |
 
 These docs describe the checked-out revision. Use the matching Git tag for an
