@@ -7,11 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- `SparsePiperAttention` / `sparse_piper_attention` now center keys and values
-  per independent `64`-token tile (`K64 + V64`) instead of using sequence-wide
-  global mean reductions. Numerical outputs differ from prior releases
-  (including full-keep configurations), so callers upgrading should revalidate
-  end-to-end quality.
+- `SparsePiperAttention` / `sparse_piper_attention` and the sparse-Piper
+  compiler fusions (`convrot_int8_sparse_piper_compile_options`,
+  `nvfp4_sparse_piper_compile_options`, `convrot_nvfp4_sparse_piper_compile_options`)
+  now center keys and values per independent `64`-token tile (`K64 + V64`)
+  instead of using sequence-wide global mean reductions. Numerical outputs
+  differ from prior releases (including full-keep configurations), so callers
+  upgrading should revalidate end-to-end quality.
 
 ## [0.8.0rc6] - 2026-11-12
 

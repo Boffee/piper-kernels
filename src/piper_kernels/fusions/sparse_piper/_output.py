@@ -90,6 +90,8 @@ def validate_attention_output(
 def prepare_attention_context(  # noqa: PLR0913, PLR0917
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     key_summary: torch.Tensor,
     key_aux: torch.Tensor,
     value: torch.Tensor,
@@ -100,7 +102,6 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     logical_sequence_length: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
-    block_mean: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
@@ -119,11 +120,15 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     if coarse_gate is not None and has_projected_coarse_gate:
         raise ValueError("coarse gate cannot be both materialized and projected")
     has_coarse_gate = coarse_gate is not None or has_projected_coarse_gate
-    if (block_mean is not None) != has_coarse_gate:
-        raise ValueError("block means and coarse gate must be supplied together")
+    if (coarse_scale is not None) != has_coarse_gate or (
+        coarse_key_blocks is not None
+    ) != has_coarse_gate:
+        raise ValueError("coarse output requires a coarse gate, scale, and key block scope")
     quantized_context = _quantized_dispatch._prepare_quantized_sparse_piper_context(
         key,
         key_scale,
+        key_center,
+        key_center_scale,
         key_summary,
         key_aux,
         value,
@@ -134,7 +139,6 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         routing_mode,
         block_lengths,
-        block_mean,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
@@ -160,6 +164,8 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     query_summary: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     key_summary: torch.Tensor,
     key_aux: torch.Tensor,
     value: torch.Tensor,
@@ -170,7 +176,6 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     logical_sequence_length: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
-    block_mean: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
@@ -184,6 +189,8 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     context = prepare_attention_context(
         key,
         key_scale,
+        key_center,
+        key_center_scale,
         key_summary,
         key_aux,
         value,
@@ -194,7 +201,6 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         routing_mode,
         block_lengths,
-        block_mean,
         coarse_gate,
         coarse_scale,
         coarse_key_blocks,

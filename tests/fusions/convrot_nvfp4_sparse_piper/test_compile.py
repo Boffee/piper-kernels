@@ -37,7 +37,6 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
 )
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
-from piper_kernels.linear.nvfp4.triton import linear_mean
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
@@ -108,7 +107,7 @@ def test_convrot_preparation_reuses_nvfp4_sparse_projection_kernels(
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
-    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_mean.default) == 1
+    assert torch.ops.piper_kernels.nvfp4_linear_mean.default not in targets
     assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
@@ -132,7 +131,7 @@ def test_static_convrot_output_fuses_after_sparse_projection(
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     output_node = next(node for node in call_nodes if node.target is fused)
-    assert output_node.args[28:30] == (_GROUP_SIZE, 8_192)
+    assert output_node.args[30:32] == (_GROUP_SIZE, 8_192)
     graph.lint()
 
 
@@ -158,12 +157,7 @@ def test_complete_convrot_fold_supports_every_bounded_attention_variant(
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in targets
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
-    expected_value = (
-        torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
-        if with_coarse
-        else torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default
-    )
-    assert targets.count(expected_value) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     assert (
         targets.count(
             torch.ops.piper_kernels.convrot_nvfp4_sparse_piper_projected_query_attention_output.default
@@ -251,8 +245,8 @@ def test_dynamic_convrot_output_fuses(monkeypatch: pytest.MonkeyPatch) -> None:
     assert targets.count(fused) == 1
     node = next(node for node in graph.nodes if node.target is fused)
     assert node.kwargs["dynamic_activation_scale"] is True
-    assert node.args[26] is None
-    assert node.args[29] == 32_768
+    assert node.args[28] is None
+    assert node.args[31] == 32_768
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
@@ -378,29 +372,19 @@ def _run_explicit_attention_output(
         model.sparse_attention._routing_mode,
         head_dim=model.head_dim,
     )
-    value_mean = linear_mean(
-        *v_input,
-        v_weight.qdata,
-        v_weight.scale,
-        v_weight.per_tensor_scale,
-        model.value.bias,
-        model.batch,
-        model.sequence_length,
-    ).view(model.batch, model.heads, model.head_dim)
     value = fused_value.project_value(
         *v_input,
         v_weight.qdata,
         v_weight.scale,
         v_weight.per_tensor_scale,
         model.value.bias,
-        value_mean,
         4_096,
+        head_dim=model.head_dim,
     )
     attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
         *query,
         *key,
         *value,
-        value_mean,
         model.sparse_attention._ratio_profile,
         model.sparse_key_blocks,
         model.sequence_length,
@@ -461,25 +445,15 @@ def _run_explicit_projected_gate_output(
         block_lengths,
         head_dim=model.head_dim,
     )
-    value_mean = linear_mean(
+    value = fused_value.project_value(
         *v_input,
         v_weight.qdata,
         v_weight.scale,
         v_weight.per_tensor_scale,
         model.value.bias,
-        model.batch,
-        model.sequence_length,
-        block_lengths,
-    ).view(model.batch, model.heads, model.head_dim)
-    value = fused_value.project_value_with_block_means(
-        *v_input,
-        v_weight.qdata,
-        v_weight.scale,
-        v_weight.per_tensor_scale,
-        model.value.bias,
-        value_mean,
         4_096,
         block_lengths,
+        head_dim=model.head_dim,
     )
     coarse_gate = nvfp4_ops.linear_prepared(
         *gate_input,
@@ -494,9 +468,7 @@ def _run_explicit_projected_gate_output(
     )(
         *query,
         *key,
-        *value[:2],
-        value_mean,
-        value[2],
+        *value,
         coarse_gate,
         model.sparse_attention._ratio_profile,
         model.sparse_key_blocks,

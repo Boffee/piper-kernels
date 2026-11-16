@@ -19,6 +19,8 @@ _QUANTIZED_ATTENTION_OPERAND_NAMES = (
     "output_query_summary",
     "output_key",
     "output_key_scale",
+    "output_key_center",
+    "output_key_center_scale",
     "output_key_summary",
     "output_key_aux",
     "output_value",
@@ -167,7 +169,6 @@ def reshaped_quantized_attention_pattern(
         attention = CallFunction(
             torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
             *operands,
-            KeywordArg("output_block_mean"),
             KeywordArg("output_coarse_gate"),
             *policy,
             KeywordArg("output_coarse_scale"),
@@ -232,7 +233,6 @@ def bounded_attention_arguments(match: Match) -> tuple[Argument, ...]:
         tuple[Argument, ...],
         (
             match.kwargs.get("output_block_lengths"),
-            match.kwargs.get("output_block_mean"),
             match.kwargs.get("output_coarse_gate"),
             match.kwargs.get("output_coarse_scale"),
             match.kwargs.get("output_coarse_key_blocks"),

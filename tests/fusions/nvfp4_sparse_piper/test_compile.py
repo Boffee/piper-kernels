@@ -37,7 +37,6 @@ from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
 )
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
-from piper_kernels.linear.nvfp4.triton import linear_mean
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
@@ -400,27 +399,15 @@ def _run_explicit_attention_output(
         block_lengths,
         head_dim=model.head_dim,
     )
-    value_mean = linear_mean(
+    value = fused_value.project_value(
         *v_input,
         *_nvfp4_storage(model.value.weight),
         model.value.bias,
-        model.batch,
-        model.sequence_length,
-        block_lengths,
-    ).view(model.batch, model.heads, model.head_dim)
-    value = (
-        fused_value.project_value_with_block_means
-        if coarse_gate is not None
-        else fused_value.project_value
-    )(
-        *v_input,
-        *_nvfp4_storage(model.value.weight),
-        model.value.bias,
-        value_mean,
         4_096,
         block_lengths,
+        head_dim=model.head_dim,
     )
-    attention_arguments = (*query, *key, *value[:2], value_mean)
+    attention_arguments = (*query, *key, *value)
     if coarse_gate is None:
         optional_arguments = (
             (block_lengths, sparse_query_blocks)
@@ -445,7 +432,6 @@ def _run_explicit_attention_output(
         ).default
         attention = coarse_attention(
             *attention_arguments,
-            value[2],
             coarse_gate,
             model.sparse_attention._ratio_profile,
             model.sparse_key_blocks,
@@ -536,7 +522,7 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
-    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_mean.default) == 1
+    assert torch.ops.piper_kernels.nvfp4_linear_mean.default not in targets
     assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
@@ -571,12 +557,7 @@ def test_projection_fold_supports_every_bounded_attention_variant(
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
-    expected_value = (
-        torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
-        if with_coarse
-        else torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default
-    )
-    assert targets.count(expected_value) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     expected_attention = (
         torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
         if with_coarse
@@ -623,7 +604,7 @@ def test_static_output_fuses_after_prepared_sparse_projection(
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
     output_node = next(node for node in call_nodes if node.target is projected_output)
-    assert output_node.args[28] == 8_192
+    assert output_node.args[30] == 8_192
     assert output_node.args[-1] == (2 if with_sparse_query_blocks else None)
     graph.lint()
 
@@ -706,8 +687,8 @@ def test_dynamic_output_fuses(
     assert targets.count(fused) == 1
     node = next(node for node in graph.nodes if node.target is fused)
     assert node.kwargs["dynamic_activation_scale"] is True
-    assert node.args[26] is None
-    assert node.args[28] == 32_768
+    assert node.args[28] is None
+    assert node.args[30] == 32_768
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     graph.lint()
@@ -786,7 +767,7 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     )
-    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_linear_mean.default) == 1
+    assert torch.ops.piper_kernels.nvfp4_linear_mean.default not in capture.targets
     assert (
         capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
@@ -934,10 +915,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     )
     assert (
-        capture.targets.count(
-            torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
-        )
-        == 1
+        capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     )
     assert (
         capture.targets.count(

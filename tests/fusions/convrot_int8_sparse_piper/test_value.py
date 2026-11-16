@@ -106,23 +106,15 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
         if bias_dtype is not None
         else None
     )
-    input_mean = int8_ops.dequantized_input_mean(
-        operands.input_qdata,
-        operands.input_scale,
-    )
 
     actual_value, actual_scale, actual_mean = value_fusion._project_value_op(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
+        *operands.as_tuple(),
         head_dim=head_dim,
         bias=bias,
         value_format=int(value_format),
     )
     expected = composed_value_projection(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
+        *operands.as_tuple(),
         head_dim=head_dim,
         bias=bias,
     )
@@ -132,8 +124,8 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
     assert actual_value.dtype is torch.int8
     assert actual_scale.shape == (1, 2, storage_length // 64, 1)
     assert actual_scale.dtype is torch.float32
-    assert actual_mean.shape == (1, 2, head_dim)
-    assert actual_mean.dtype is torch.float32
+    assert actual_mean.shape == (1, 2, storage_length // 64, head_dim)
+    assert actual_mean.dtype is torch.bfloat16
     assert (
         int(
             (actual_value.to(torch.int16) - reference_value_storage(expected.value, value_format))
@@ -148,54 +140,38 @@ def test_fused_value_projection_matches_the_fp32_composed_contract(
         atol=2e-4,
         rtol=2e-5,
     )
-    torch.testing.assert_close(actual_mean, expected.value_mean, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(
+        actual_mean.float(), expected.value_mean.float(), atol=2e-4, rtol=1.6e-2
+    )
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("sequence_length", [64, 65, 192])
-def test_fused_value_projection_optionally_emits_valid_prefix_block_means(
+def test_fused_value_projection_emits_valid_prefix_tile_means(
     sequence_length: int,
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length)
-    input_mean = int8_ops.dequantized_input_mean(
-        operands.input_qdata,
-        operands.input_scale,
-    )
 
-    actual = value_fusion._project_value_with_block_means_op(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
-    )
-    expected = composed_value_projection(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
-    )
+    actual = value_fusion._project_value_op(*operands.as_tuple())
+    expected = composed_value_projection(*operands.as_tuple())
 
     assert int((actual[0].to(torch.int16) - expected.value).abs().max()) <= 1
     torch.testing.assert_close(actual[1], expected.value_scale_multiplier, atol=2e-4, rtol=2e-5)
-    torch.testing.assert_close(actual[2], expected.value_mean, atol=2e-6, rtol=2e-6)
-    assert actual[3].shape == expected.block_mean.shape
-    torch.testing.assert_close(actual[3], expected.block_mean, atol=0.015625, rtol=0.01)
+    assert actual[2].shape == expected.value_mean.shape
+    torch.testing.assert_close(
+        actual[2].float(), expected.value_mean.float(), atol=2e-4, rtol=1.6e-2
+    )
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("input_features", [256, 272])
-def test_fused_value_block_means_respect_internal_block_lengths(input_features: int) -> None:
+def test_fused_value_tile_means_respect_internal_block_lengths(input_features: int) -> None:
     operands = _random_operands(sequence_length=128, input_features=input_features)
     block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
-    dequantized = operands.input_qdata.float() * operands.input_scale[..., None]
-    input_mean = torch.cat((dequantized[:, :64], dequantized[:, 64:81]), dim=1).mean(dim=1)
 
-    actual = value_fusion._project_value_with_block_means_op(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
-        block_lengths,
-    )
+    actual = value_fusion._project_value_op(*operands.as_tuple(), block_lengths)
     projected = int8_ops.linear_prepared(
         *operands.as_tuple(),
         None,
@@ -206,7 +182,7 @@ def test_fused_value_block_means_respect_internal_block_lengths(input_features: 
         dim=2,
     )
 
-    torch.testing.assert_close(actual[3], expected, atol=0.015625, rtol=0.01)
+    torch.testing.assert_close(actual[2].float(), expected, atol=2e-4, rtol=1.6e-2)
     assert not bool(actual[0][..., 81:].any())
 
 
@@ -219,43 +195,30 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
         input_features=256,
         heads=3,
     )
-    input_mean = int8_ops.dequantized_input_mean(
-        operands.input_qdata,
-        operands.input_scale,
-    )
-    value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
-    )
+    value, value_scale_multiplier, value_mean = value_fusion._project_value_op(*operands.as_tuple())
 
     assert value.shape == (2, 3, 128, 192)
     assert value_scale_multiplier.shape == (2, 3, 3, 1)
-    assert value_mean.shape == (2, 3, 128)
+    assert value_mean.shape == (2, 3, 3, 128)
+    assert value_mean.dtype is torch.bfloat16
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
     operands = _random_operands(sequence_length=192, input_features=256, heads=3)
-    input_mean = int8_ops.dequantized_input_mean(
-        operands.input_qdata,
-        operands.input_scale,
-    )
     _value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
-        *operands.as_tuple()[:2],
-        input_mean,
-        *operands.as_tuple()[2:],
+        *operands.as_tuple()
     )
     materialized = int8_ops.linear_prepared(
         *operands.as_tuple(),
         None,
         torch.bfloat16,
     ).view(1, 192, 3, 128)
-    exact_mean = materialized.float().mean(dim=1)
-    smallest_tile_scale = value_scale_multiplier[..., 0].amin(dim=-1) / 255.0
+    exact_mean = materialized.float().unflatten(1, (3, 64)).mean(dim=2).permute(0, 2, 1, 3)
+    tile_scale = value_scale_multiplier[..., 0] / 255.0
 
-    assert bool(((value_mean - exact_mean).abs() <= smallest_tile_scale[:, :, None] * 0.05).all())
+    assert bool(((value_mean.float() - exact_mean).abs() <= tile_scale[..., None] * 0.05).all())
 
 
 @pytest.mark.gpu
@@ -264,37 +227,20 @@ def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
 def test_value_projection_custom_ops_pass_opcheck(with_bias: bool) -> None:
     operands = _random_operands()
     bias = torch.randn(256, device="cuda") if with_bias else None
-    input_mean = int8_ops.dequantized_input_mean(
-        operands.input_qdata,
-        operands.input_scale,
-    )
 
     value_result = torch.library.opcheck(
         value_fusion._project_value_op,
-        (
-            operands.input_qdata,
-            operands.input_scale,
-            input_mean,
-            operands.weight_qdata,
-            operands.weight_scale,
-        ),
+        operands.as_tuple(),
         kwargs={"bias": bias},
     )
-    summarized_value_result = torch.library.opcheck(
-        value_fusion._project_value_with_block_means_op,
-        (
-            operands.input_qdata,
-            operands.input_scale,
-            input_mean,
-            operands.weight_qdata,
-            operands.weight_scale,
-            torch.tensor([64], device="cuda", dtype=torch.int32),
-        ),
+    masked_value_result = torch.library.opcheck(
+        value_fusion._project_value_op,
+        (*operands.as_tuple(), torch.tensor([64], device="cuda", dtype=torch.int32)),
         kwargs={"bias": bias},
     )
 
     assert set(value_result.values()) == {"SUCCESS"}
-    assert set(summarized_value_result.values()) == {"SUCCESS"}
+    assert set(masked_value_result.values()) == {"SUCCESS"}
 
 
 @pytest.mark.gpu
@@ -303,14 +249,7 @@ def test_value_projection_runs_under_fullgraph_compile() -> None:
     operands = _random_operands()
 
     def prepare(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        input_mean = int8_ops.dequantized_input_mean(args[0], args[1])
-        return value_fusion._project_value_op(
-            args[0],
-            args[1],
-            input_mean,
-            args[2],
-            args[3],
-        )
+        return value_fusion._project_value_op(*args)
 
     expected = prepare(*operands.as_tuple())
     compiled = torch.compile(prepare, backend="eager", fullgraph=True)
@@ -327,38 +266,47 @@ def test_value_projection_fake_kernels_propagate_shapes(value_format, head_dim) 
     weight_qdata = torch.empty((3 * head_dim, 272), device="meta", dtype=torch.int8)
     weight_scale = torch.empty((3 * head_dim, 1), device="meta", dtype=torch.float32)
 
-    input_mean = int8_ops.dequantized_input_mean(input_qdata, input_scale)
     value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
         input_qdata,
         input_scale,
-        input_mean,
-        weight_qdata,
-        weight_scale,
-        head_dim=head_dim,
-        value_format=int(value_format),
-    )
-    summarized = value_fusion._project_value_with_block_means_op(
-        input_qdata,
-        input_scale,
-        input_mean,
         weight_qdata,
         weight_scale,
         head_dim=head_dim,
         value_format=int(value_format),
     )
 
-    assert input_mean.shape == (2, 272)
-    assert input_mean.dtype is torch.float32
     assert value.shape == value_format.shape(2, 3, 128, head_dim)
     assert value.dtype is torch.int8
     assert value_scale_multiplier.shape == (2, 3, 2, 1)
     assert value_scale_multiplier.dtype is torch.float32
-    assert value_mean.shape == (2, 3, head_dim)
-    assert value_mean.dtype is torch.float32
-    assert [tensor.shape for tensor in summarized[:3]] == [
-        value.shape,
-        value_scale_multiplier.shape,
-        value_mean.shape,
-    ]
-    assert summarized[3].shape == (2, 3, 2, head_dim)
-    assert summarized[3].dtype is torch.float32
+    assert value_mean.shape == (2, 3, 2, head_dim)
+    assert value_mean.dtype is torch.bfloat16
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
+@pytest.mark.parametrize("input_features", [256, 272])
+@pytest.mark.parametrize("constant_value", [2.0**100, -(2.0**100)])
+def test_fused_value_projection_bounds_large_constant_tile_scale(
+    input_features: int,
+    constant_value: float,
+) -> None:
+    input_qdata = torch.zeros((1, 128, input_features), device="cuda", dtype=torch.int8)
+    input_scale = torch.ones((1, 128), device="cuda", dtype=torch.float32)
+    weight_qdata = torch.zeros((2 * 128, input_features), device="cuda", dtype=torch.int8)
+    weight_scale = torch.ones((2 * 128, 1), device="cuda", dtype=torch.float32)
+    bias = torch.full((2 * 128,), constant_value, device="cuda", dtype=torch.bfloat16)
+
+    value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias=bias,
+    )
+
+    assert not bool(value.any())
+    torch.testing.assert_close(
+        value_mean, torch.full_like(value_mean, constant_value), atol=0, rtol=0
+    )
+    assert bool((value_scale_multiplier >= abs(constant_value) * (2.0**-80) * 255.0).all())

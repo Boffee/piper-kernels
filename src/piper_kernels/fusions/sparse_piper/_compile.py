@@ -84,7 +84,6 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     routing_mode: Argument,
     block_lengths: Argument | None = None,
     sparse_query_blocks: Argument | None = None,
-    block_mean: Argument | None = None,
     coarse_gate: Argument | None = None,
     coarse_scale: Argument | None = None,
     coarse_key_blocks: Argument | None = None,
@@ -94,7 +93,7 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
 ) -> torch.fx.Node:
     """Emit the shared fine or coarse quantized sparse-attention call."""
     force_arguments = (force_tile_ids, force_tile_counts) if force_tile_ids is not None else ()
-    coarse_arguments = block_mean, coarse_gate, coarse_scale, coarse_key_blocks
+    coarse_arguments = coarse_gate, coarse_scale, coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
     if with_coarse:
         if any(argument is None for argument in coarse_arguments):
@@ -103,7 +102,6 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
             torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
             args=(
                 *attention_arguments,
-                block_mean,
                 coarse_gate,
                 ratio_profile,
                 sparse_key_blocks,

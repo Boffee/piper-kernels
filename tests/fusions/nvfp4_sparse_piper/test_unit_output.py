@@ -45,9 +45,9 @@ def test_unit_output_matches_explicit_scale_and_replays(rotated: bool) -> None:
         op = output._attention_output_op
     # Four chunks, including a partial final chunk, exercise the consumer stream.
     unit = torch.ones((), device="cuda", dtype=torch.float32)
-    explicit = (*arguments[:17], unit, *arguments[18:], 128)
-    implicit = (*arguments[:17], None, *arguments[18:], 128)
-    value_mean = arguments[9]
+    explicit = (*arguments[:19], unit, *arguments[20:], 128)
+    implicit = (*arguments[:19], None, *arguments[20:], 128)
+    value_mean = arguments[11]
     assert isinstance(value_mean, torch.Tensor)
 
     with torch.no_grad():

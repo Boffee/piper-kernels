@@ -135,10 +135,9 @@ def test_materialized_releases_preparation_and_projections_before_next_stage(mon
     monkeypatch.setattr(
         _ops, "prepare_input", lambda *args: (temporary(prepared), temporary(prepared))
     )
-    monkeypatch.setattr(_ops, "dequantized_input_mean", lambda *args: temporary(prepared))
     for module, name, count in [
         (query, "_project_query_op", 3),
-        (key, "_project_key_op", 4),
+        (key, "_project_key_op", 6),
         (value, "_project_value_op", 3),
     ]:
         monkeypatch.setattr(
@@ -151,9 +150,9 @@ def test_materialized_releases_preparation_and_projections_before_next_stage(mon
 
     def attention(*args, **kwargs):
         assert all(reference() is None for reference in prepared)
-        assert len(projections) == 10
+        assert len(projections) == 12
         assert all(reference() is not None for reference in projections)
-        assert args[10].units == (500_000, 500_000)
+        assert args[12].units == (500_000, 500_000)
         assert kwargs["output_dtype"] == torch.float16
         return torch.empty(1, 64, 2, 64)
 

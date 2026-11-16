@@ -31,7 +31,9 @@ _ROTARY_DIM = 96
 _SPARSE_KEY_BLOCKS = 2
 
 type _QuantizedQueryOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-type _QuantizedKeyOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+type _QuantizedKeyOperands = tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
 type _QuantizedValueOperands = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
@@ -137,14 +139,9 @@ def _prepare(
         1e-5,
         _MINMAX_ROUTING,
     )
-    input_mean = int8_ops.dequantized_input_mean(
-        operands.input_qdata,
-        operands.input_scale,
-    )
     prepared_value = value._project_value_op(
         operands.input_qdata,
         operands.input_scale,
-        input_mean,
         operands.value_weight,
         operands.value_weight_scale,
         value_format=int(require_attention_backend(operands.input_qdata).value_format),

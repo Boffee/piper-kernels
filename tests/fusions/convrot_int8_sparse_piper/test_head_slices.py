@@ -18,7 +18,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 from ._helpers import output_available
 from .test_attention import _HEAD_DIM, _INPUT_FEATURES, _operands
@@ -32,7 +31,6 @@ _kernels = torch.ops.piper_kernels
 _RESIDUAL_ADD = _kernels.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
 _KEY = _kernels.convrot_int8_sparse_piper_project_key.default
 _VALUE = _kernels.convrot_int8_sparse_piper_project_value.default
-_VALUE_WITH_BLOCK_MEANS = _kernels.convrot_int8_sparse_piper_project_value_with_block_means.default
 
 _HEADS = 4
 _SEQUENCE = 512
@@ -131,7 +129,7 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 @pytest.mark.skipif(not output_available(), reason="requires fused sparse output support")
 @pytest.mark.parametrize(
     ("attention", "value_producer"),
-    [(_Attention, _VALUE), (_CoarseAttention, _VALUE_WITH_BLOCK_MEANS)],
+    [(_Attention, _VALUE), (_CoarseAttention, _VALUE)],
     ids=["fine", "coarse"],
 )
 def test_each_head_slice_projects_its_context_before_its_add(attention, value_producer):
@@ -205,7 +203,6 @@ def test_head_slices_add_what_one_add_does():
     output_scale = torch.rand((_WIDTH, 1), device="cuda").mul_(0.01).add_(0.001)
     gate = torch.ones((1, _WIDTH), device="cuda", dtype=torch.bfloat16)
     gate_indices = torch.zeros(_SEQUENCE, device="cuda", dtype=torch.int64)
-    input_mean = int8_ops.dequantized_input_mean(operands.input_qdata, operands.input_scale)
     value_format = int(require_attention_backend(operands.input_qdata).value_format)
     attention = SparsePiperAttention(_RATIOS)
 
@@ -224,7 +221,6 @@ def test_head_slices_add_what_one_add_does():
             *value._project_value_op(
                 operands.input_qdata,
                 operands.input_scale,
-                input_mean,
                 operands.value_weight[rows],
                 operands.value_weight_scale[rows],
                 value_format=value_format,

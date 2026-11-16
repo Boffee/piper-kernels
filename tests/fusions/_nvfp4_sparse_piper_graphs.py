@@ -343,11 +343,13 @@ def build_quantized_attention_output_graph(
             "query_summary": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
             "key": torch.empty((1, 2, 192, 128), device="cuda", dtype=torch.int8),
             "key_scale": torch.empty((1, 2, 3), device="cuda", dtype=torch.float32),
+            "key_center": torch.empty((1, 2, 3, 2, 128), device="cuda", dtype=torch.int8),
+            "key_center_scale": torch.empty((1, 2, 3, 2), device="cuda", dtype=torch.float32),
             "key_summary": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
             "key_aux": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
             "value": torch.empty((1, 2, 128, 192), device="cuda", dtype=torch.int8),
             "value_scale": torch.empty((1, 2, 3, 1), device="cuda", dtype=torch.float32),
-            "value_mean": torch.empty((1, 2, 128), device="cuda", dtype=torch.float32),
+            "value_mean": torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.bfloat16),
         }
         operands = tuple(_placeholder(graph, name, value) for name, value in tensors.items())
         block_lengths = (
@@ -360,11 +362,6 @@ def build_quantized_attention_output_graph(
             else None
         )
         if with_coarse:
-            block_mean = _placeholder(
-                graph,
-                "block_mean",
-                torch.empty((1, 2, 3, 128), device="cuda", dtype=torch.float32),
-            )
             coarse_gate = _placeholder(
                 graph,
                 "coarse_gate",
@@ -374,7 +371,6 @@ def build_quantized_attention_output_graph(
                 torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
                 args=(
                     *operands,
-                    block_mean,
                     coarse_gate,
                     [5_000, 10_000],
                     2,

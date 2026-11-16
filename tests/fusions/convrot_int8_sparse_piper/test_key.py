@@ -11,12 +11,15 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.fusions.convrot_int8_piper import key as dense_key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as key_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
-from ._helpers import dense_projection_available, projection_available
-from ._reference import composed_key_projection, composed_mean_pool_summary
+from ._helpers import projection_available
+from ._reference import (
+    composed_key_projection,
+    composed_mean_pool_summary,
+    reconstruct_key_center,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +121,7 @@ def _random_operands(
 @pytest.mark.parametrize("bias_dtype", [None, torch.float16, torch.bfloat16, torch.float32])
 # NVIDIA projects 256 input features with Gluon and 272 with the shared Triton launchers.
 @pytest.mark.parametrize("input_features", [256, 272])
-def test_fused_key_projection_matches_the_centered_bf16_storage_contract(
+def test_fused_key_projection_matches_the_tile_centered_contract(
     input_features: int,
     bias_dtype: torch.dtype | None,
     affine: bool,
@@ -139,7 +142,14 @@ def test_fused_key_projection_matches_the_centered_bf16_storage_contract(
         "norm_epsilon": 1e-5,
     }
 
-    actual_key, actual_scale, actual_max, actual_min = key_fusion._project_key_op(
+    (
+        actual_key,
+        actual_scale,
+        actual_center,
+        actual_center_scale,
+        actual_max,
+        actual_min,
+    ) = key_fusion._project_key_op(
         *operands.as_tuple()[:4],
         operands.norm_weight if affine else None,
         *operands.as_tuple()[5:],
@@ -150,15 +160,35 @@ def test_fused_key_projection_matches_the_centered_bf16_storage_contract(
     )
     expected = composed_key_projection(*operands.as_tuple(), bias=bias, **options)
     storage_length = padded_sequence_length(sequence_length)
+    storage_tiles = storage_length // 64
 
     assert actual_key.shape == (1, 2, storage_length, head_dim)
     assert actual_key.dtype is torch.int8
-    assert actual_scale.shape == (1, 2, storage_length // 64)
+    assert actual_scale.shape == (1, 2, storage_tiles)
     assert actual_scale.dtype is torch.float32
-    assert actual_max.shape == (1, 2, storage_length // 64, head_dim)
+    assert actual_center.shape == (1, 2, storage_tiles, 2, head_dim)
+    assert actual_center.dtype is torch.int8
+    assert actual_center_scale.shape == (1, 2, storage_tiles, 2)
+    assert actual_center_scale.dtype is torch.float32
+    assert actual_max.shape == (1, 2, storage_tiles, head_dim)
     assert actual_min.shape == actual_max.shape
-    assert int((actual_key.to(torch.int16) - expected.key).abs().max()) <= 1
-    torch.testing.assert_close(actual_scale, expected.key_scale, atol=1e-4, rtol=3e-3)
+    non_trivial = (expected.key_scale > 1e-6).repeat_interleave(64, dim=2)[..., None]
+    assert (
+        int((actual_key.to(torch.int16) - expected.key).abs().masked_fill(~non_trivial, 0).max())
+        <= 1
+    )
+    dequant_actual = actual_key.float() * actual_scale.repeat_interleave(64, dim=2)[..., None]
+    dequant_expected = (
+        expected.key.float() * expected.key_scale.repeat_interleave(64, dim=2)[..., None]
+    )
+    torch.testing.assert_close(dequant_actual, dequant_expected, rtol=1e-2, atol=1e-5)
+    torch.testing.assert_close(actual_scale, expected.key_scale, atol=1e-6, rtol=1e-4)
+    torch.testing.assert_close(
+        reconstruct_key_center(actual_center, actual_center_scale),
+        reconstruct_key_center(expected.key_center, expected.key_center_scale),
+        atol=1e-4,
+        rtol=2e-4,
+    )
     torch.testing.assert_close(actual_max, expected.key_max, atol=0.125, rtol=0.01)
     torch.testing.assert_close(actual_min, expected.key_min, atol=0.125, rtol=0.01)
 
@@ -171,10 +201,12 @@ def test_mean_pool_key_projection_emits_exact_valid_prefix_means(
 ) -> None:
     operands = _random_operands(sequence_length=sequence_length)
 
-    actual_key, actual_scale, actual_mean, actual_aux = key_fusion._project_key_op(
-        *operands.as_tuple(),
-        1e-5,
-        _MEAN_ROUTING,
+    actual_key, actual_scale, actual_center, actual_center_scale, actual_mean, actual_aux = (
+        key_fusion._project_key_op(
+            *operands.as_tuple(),
+            1e-5,
+            _MEAN_ROUTING,
+        )
     )
     expected = composed_mean_pool_summary(
         *operands.as_tuple(),
@@ -183,6 +215,8 @@ def test_mean_pool_key_projection_emits_exact_valid_prefix_means(
 
     assert actual_key.dtype is torch.int8
     assert actual_scale.dtype is torch.float32
+    assert actual_center.dtype is torch.int8
+    assert actual_center_scale.dtype is torch.float32
     assert actual_aux.numel() == 0
     torch.testing.assert_close(actual_mean, expected, atol=0.015625, rtol=0.01)
 
@@ -199,7 +233,7 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
         heads=3,
     )
 
-    key, key_scale, key_max, key_min = key_fusion._project_key_op(
+    key, key_scale, key_center, key_center_scale, key_max, key_min = key_fusion._project_key_op(
         *operands.as_tuple(),
         1e-5,
         _MINMAX_ROUTING,
@@ -207,6 +241,8 @@ def test_fused_key_projection_supports_k64_tail_batches_and_odd_heads() -> None:
 
     assert key.shape == (2, 3, 192, 128)
     assert key_scale.shape == (2, 3, 3)
+    assert key_center.shape == (2, 3, 3, 2, 128)
+    assert key_center_scale.shape == (2, 3, 3, 2)
     assert key_max.shape == (2, 3, 3, 128)
     assert key_min.shape == key_max.shape
 
@@ -243,7 +279,11 @@ def test_fused_key_projection_ignores_internal_padding(
     reference = composed_key_projection(
         *operands.as_tuple(), norm_epsilon=1e-5, block_lengths=block_lengths
     )
-    assert (actual[0].short() - reference.key.short()).abs().max() <= 1
+    non_trivial = (reference.key_scale > 1e-6).repeat_interleave(64, dim=2)[..., None]
+    assert (
+        int((actual[0].short() - reference.key.short()).abs().masked_fill(~non_trivial, 0).max())
+        <= 1
+    )
     torch.testing.assert_close(actual[1], reference.key_scale, atol=1e-6, rtol=3e-4)
 
 
@@ -257,9 +297,11 @@ def test_constant_transformed_keys_are_centered_to_fp32_roundoff(routing_mode, s
     operands.input_scale[:, 1:] = operands.input_scale[:, :1].clone()
     operands.cos.fill_(1)
     operands.sin.zero_()
-    key, scale, summary, _ = key_fusion._project_key_op(*operands.as_tuple(), 1e-5, routing_mode)
-    # Dividing the global sum by a non-power-of-two sequence length can leave
-    # FP32 roundoff. With epsilon-sized scales even that can produce nonzero codes.
+    key, scale, _center, _center_scale, summary, _ = key_fusion._project_key_op(
+        *operands.as_tuple(), 1e-5, routing_mode
+    )
+    # Dividing the tile sum by a non-power-of-two valid count can leave FP32
+    # roundoff. With epsilon-sized scales even that can produce nonzero codes.
     decoded = key.float() * scale.repeat_interleave(64, dim=2)[..., None]
     error_bound = 4 * torch.finfo(torch.float32).eps * key.shape[-1] ** 0.5 * summary.abs().max()
     assert decoded.abs().max() <= error_bound
@@ -272,26 +314,42 @@ def test_constant_transformed_keys_are_centered_to_fp32_roundoff(routing_mode, s
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("sequence_length", [65, 192, 1025])
-def test_dense_and_sparse_keys_share_centering_and_cuda_graph_results(head_dim, sequence_length):
-    if not projection_available(head_dim) or not dense_projection_available(head_dim):
-        pytest.skip("requires dense and sparse fused projections at this width")
+def test_sparse_keys_are_token_shard_invariant_and_cuda_graph_compatible(head_dim, sequence_length):
+    if not projection_available(head_dim):
+        pytest.skip("requires sparse fused projections at this width")
     operands = _random_operands(
         batch=2, sequence_length=sequence_length, heads=3, head_dim=head_dim
     )
     bias = torch.randn(3 * head_dim, device="cuda")
     arguments = operands.as_tuple()
-    # Sparse K always scales K64 groups.
-    dense = dense_key_fusion._project_key_op(
-        *arguments, 1e-5, bias, head_dim=head_dim, qk_quantization="per_warp"
+    sparse = key_fusion._project_key_op(
+        *arguments, 1e-5, _MINMAX_ROUTING, bias=bias, head_dim=head_dim
     )
-    sparse = key_fusion._project_key_op(*arguments, 1e-5, _MINMAX_ROUTING, bias=bias)
-    # Different projection tile layouts can straddle BF16/INT8 rounding boundaries.
-    assert (sparse[0].short() - dense[0].short()).abs().max() <= 1
-    torch.testing.assert_close(sparse[1], dense[1], atol=1e-7, rtol=3e-3)
+    # Leading K64-aligned token shards must produce identical outputs without global reductions.
+    prefix_rows = (sequence_length // 64) * 64
+    prefix_operands = (
+        operands.input_qdata[:, :prefix_rows].contiguous(),
+        operands.input_scale[:, :prefix_rows].contiguous(),
+        operands.weight_qdata,
+        operands.weight_scale,
+        operands.norm_weight,
+        operands.cos[:prefix_rows].contiguous(),
+        operands.sin[:prefix_rows].contiguous(),
+    )
+    sharded = key_fusion._project_key_op(
+        *prefix_operands, 1e-5, _MINMAX_ROUTING, bias=bias, head_dim=head_dim
+    )
+    prefix_tiles = prefix_rows // 64
+    assert torch.equal(sharded[0], sparse[0][:, :, :prefix_rows])
+    assert torch.equal(sharded[1], sparse[1][:, :, :prefix_tiles])
+    assert torch.equal(sharded[2], sparse[2][:, :, :prefix_tiles])
+    assert torch.equal(sharded[3], sparse[3][:, :, :prefix_tiles])
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        replayed = key_fusion._project_key_op(*arguments, 1e-5, _MINMAX_ROUTING, bias=bias)
+        replayed = key_fusion._project_key_op(
+            *arguments, 1e-5, _MINMAX_ROUTING, bias=bias, head_dim=head_dim
+        )
     graph.replay()
     for actual, expected in zip(replayed, sparse, strict=True):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -335,7 +393,7 @@ def test_key_projection_runs_under_fullgraph_compile() -> None:
 
 
 def test_key_projection_fake_kernels_propagate_shapes() -> None:
-    key, key_scale, key_max, key_min = key_fusion._project_key_op(
+    key, key_scale, key_center, key_center_scale, key_max, key_min = key_fusion._project_key_op(
         torch.empty((2, 128, 272), device="meta", dtype=torch.int8),
         torch.empty((2, 128), device="meta", dtype=torch.float32),
         torch.empty((3 * 128, 272), device="meta", dtype=torch.int8),
@@ -348,6 +406,11 @@ def test_key_projection_fake_kernels_propagate_shapes() -> None:
     )
 
     assert key.shape == (2, 3, 128, 128)
+    assert key_scale.shape == (2, 3, 2)
+    assert key_center.shape == (2, 3, 2, 2, 128)
+    assert key_center_scale.shape == (2, 3, 2, 2)
+    assert key_max.shape == (2, 3, 2, 128)
+    assert key_min.shape == (2, 3, 2, 128)
     assert key.dtype is torch.int8
     assert key_scale.shape == (2, 3, 2)
     assert key_scale.dtype is torch.float32

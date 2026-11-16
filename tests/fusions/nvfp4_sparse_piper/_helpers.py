@@ -218,14 +218,12 @@ def query_reference(
 
 def key_reference(
     key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     head_dim = key.shape[-1]
     sequence_length = key.shape[2]
     storage_length = padded_sequence_length(sequence_length)
-    quantized, scale = qk_quantization.prepare_key(
+    quantized, scale, center, center_scale = qk_quantization.prepare_tile_centered_key(
         key,
-        torch.zeros((*key.shape[:2], head_dim), device=key.device, dtype=torch.float32),
-        grouped=True,
         storage_key_length=storage_length,
     )
     padded = key.new_zeros((*key.shape[:2], storage_length, head_dim))
@@ -235,22 +233,29 @@ def key_reference(
     valid = valid.unflatten(0, (storage_length // _TILE_ROWS, _TILE_ROWS))
     maximum = blocks.masked_fill(~valid[None, None, :, :, None], -torch.inf).amax(dim=3)
     minimum = blocks.masked_fill(~valid[None, None, :, :, None], torch.inf).amin(dim=3)
-    return quantized, scale, maximum, minimum
+    return quantized, scale, center, center_scale, maximum, minimum
 
 
 def value_reference(
     projected: torch.Tensor,
-    value_mean: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length, heads, head_dim = projected.shape
     storage_length = padded_sequence_length(sequence_length)
-    centered = projected.new_zeros((1, heads, storage_length, head_dim), dtype=torch.float32)
-    centered[:, :, :sequence_length] = (
-        projected.transpose(0, 1)[None].float() - value_mean[:, :, None, :]
+    padded = projected.new_zeros((1, heads, storage_length, head_dim), dtype=torch.float32)
+    padded[:, :, :sequence_length] = projected.transpose(0, 1)[None].float()
+    blocks = padded.unflatten(2, (storage_length // _TILE_ROWS, _TILE_ROWS))
+    valid = torch.arange(storage_length, device=projected.device) < sequence_length
+    valid = valid.unflatten(0, (storage_length // _TILE_ROWS, _TILE_ROWS))
+    lengths = valid.sum(dim=1).clamp(min=1)
+    value_mean = (
+        (blocks * valid[None, None, :, :, None]).sum(dim=3) / lengths[None, None, :, None]
+    ).bfloat16()
+    centered = (blocks - value_mean.float()[:, :, :, None, :]) * valid[None, None, :, :, None]
+    scale = torch.maximum(
+        centered.abs().amax(dim=(-1, -2)) / 127.0 + 1e-7,
+        value_mean.float().abs().amax(dim=-1) * (2.0**-80),
     )
-    blocks = centered.unflatten(2, (storage_length // _TILE_ROWS, _TILE_ROWS))
-    scale = blocks.abs().amax(dim=(-1, -2)) / 127.0 + 1e-7
-    normalized = blocks / scale[..., None, None]
+    normalized = centered / scale[..., None, None]
     quantized = (
         torch.trunc(normalized + 0.5 * torch.where(normalized >= 0, 1.0, -1.0))
         .clamp(-127, 127)
@@ -259,4 +264,5 @@ def value_reference(
     return (
         quantized.flatten(2, 3).permute(0, 1, 3, 2).contiguous(),
         (scale * 255.0).unsqueeze(-1),
+        value_mean,
     )

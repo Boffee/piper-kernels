@@ -11,7 +11,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key, query, value
-from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from ._helpers import (
     key_reference,
@@ -60,9 +59,8 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract(
             norm_epsilon=1e-5,
         )
     )
-    value_mean = linear_mean(*v_projection.as_tuple(), biases[2], 1, 193).view(1, heads, head_dim)
     materialized_value = materialize_projection(v_projection, biases[2]).view(193, heads, head_dim)
-    expected_value = value_reference(materialized_value, value_mean)
+    expected_value = value_reference(materialized_value)
 
     actual_query = query.project_query(
         *q_projection.as_tuple(),
@@ -85,11 +83,11 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract(
         128,
         head_dim=head_dim,
     )
-    actual_value = value.project_value_with_block_means(
+    actual_value = value.project_value(
         *v_projection.as_tuple(),
         biases[2],
-        value_mean,
         128,
+        head_dim=head_dim,
     )
 
     assert int((actual_query[0].to(torch.int16) - expected_query[0]).abs().max()) <= 1
@@ -97,22 +95,19 @@ def test_chunked_qkv_epilogues_match_materialized_fp32_contract(
     torch.testing.assert_close(actual_query[2], expected_query[2], atol=0.125, rtol=0.01)
     assert int((actual_key[0].to(torch.int16) - expected_key[0]).abs().max()) <= 1
     torch.testing.assert_close(actual_key[1], expected_key[1], atol=1e-4, rtol=3e-3)
-    torch.testing.assert_close(actual_key[2], expected_key[2], atol=0.125, rtol=0.01)
-    torch.testing.assert_close(actual_key[3], expected_key[3], atol=0.125, rtol=0.01)
+    actual_center, expected_center = (
+        key_tensors[2][:, :, :, 0].float() * key_tensors[3][:, :, :, 0:1]
+        + key_tensors[2][:, :, :, 1].float() * key_tensors[3][:, :, :, 1:2]
+        for key_tensors in (actual_key, expected_key)
+    )
+    torch.testing.assert_close(actual_center, expected_center, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(actual_key[4], expected_key[4], atol=0.125, rtol=0.01)
+    torch.testing.assert_close(actual_key[5], expected_key[5], atol=0.125, rtol=0.01)
     assert int((actual_value[0].to(torch.int16) - expected_value[0]).abs().max()) <= 1
     torch.testing.assert_close(actual_value[1], expected_value[1], atol=2e-5, rtol=2e-3)
-    expected_block_mean = torch.stack(
-        [
-            materialized_value[start : start + 64].float().mean(dim=0)
-            for start in range(0, materialized_value.shape[0], 64)
-        ],
-        dim=1,
-    )[None]
-    torch.testing.assert_close(actual_value[2], expected_block_mean, atol=0.015625, rtol=0.01)
-
-    exact_mean = materialized_value.float().mean(dim=0)[None]
-    smallest_tile_step = (expected_value[1] / 255.0).amin(dim=2)
-    assert bool(((value_mean - exact_mean).abs() <= smallest_tile_step * 0.05).all())
+    torch.testing.assert_close(
+        actual_value[2].float(), expected_value[2].float(), atol=2e-4, rtol=1.6e-2
+    )
 
 
 @pytest.mark.gpu
@@ -158,7 +153,7 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
         _MEAN_ROUTING,
     )
 
-    def block_means(sequence: torch.Tensor) -> torch.Tensor:
+    def tile_means(sequence: torch.Tensor) -> torch.Tensor:
         return torch.stack(
             [
                 sequence[:, :, start : start + 64].mean(dim=2)
@@ -169,17 +164,17 @@ def test_mean_pool_summaries_match_materialized_fp32_contract() -> None:
 
     torch.testing.assert_close(
         actual_query[2],
-        block_means(transformed_query),
+        tile_means(transformed_query),
         atol=0.125,
         rtol=0.01,
     )
     torch.testing.assert_close(
-        actual_key[2],
-        block_means(transformed_key),
+        actual_key[4],
+        tile_means(transformed_key),
         atol=0.125,
         rtol=0.01,
     )
-    assert actual_key[3].numel() == 0
+    assert actual_key[5].numel() == 0
 
 
 @pytest.mark.gpu
@@ -226,16 +221,14 @@ def test_query_projection_range_uses_compact_storage_and_global_rows(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_value_block_means_respect_internal_block_lengths() -> None:
+def test_value_tile_means_respect_internal_block_lengths() -> None:
     operands = make_operands(sequence_length=128)
     projection = operands.projection(2)
     block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
-    value_mean = torch.zeros((1, 2, 128), device="cuda", dtype=torch.float32)
 
-    actual = value.project_value_with_block_means(
+    actual = value.project_value(
         *projection.as_tuple(),
         None,
-        value_mean,
         128,
         block_lengths,
     )
@@ -245,7 +238,7 @@ def test_value_block_means_respect_internal_block_lengths() -> None:
         dim=1,
     )[None]
 
-    torch.testing.assert_close(actual[2], expected, atol=0.015625, rtol=0.01)
+    torch.testing.assert_close(actual[2].float(), expected, atol=2e-4, rtol=1.6e-2)
     assert not bool(actual[0][..., 81:].any())
 
 
@@ -273,13 +266,6 @@ def test_qkv_projection_respects_internal_block_lengths(routing_mode: int) -> No
         operands.sin,
         norm_epsilon=1e-5,
     )
-    value_mean = linear_mean(
-        *v_projection.as_tuple(),
-        None,
-        1,
-        128,
-        block_lengths,
-    ).view(1, 2, 128)
 
     actual_query = query.project_query(
         *q_projection.as_tuple(),
@@ -307,7 +293,6 @@ def test_qkv_projection_respects_internal_block_lengths(routing_mode: int) -> No
     actual_value = value.project_value(
         *v_projection.as_tuple(),
         None,
-        value_mean,
         128,
         block_lengths,
     )
@@ -324,16 +309,16 @@ def test_qkv_projection_respects_internal_block_lengths(routing_mode: int) -> No
         denominator = block_lengths[None, None, :, None]
         expected_query_summary = query_blocks.masked_fill(~mask, 0).sum(dim=3) / denominator
         expected_key_summary = key_blocks.masked_fill(~mask, 0).sum(dim=3) / denominator
-        assert actual_key[3].numel() == 0
+        assert actual_key[5].numel() == 0
     else:
         expected_query_summary = query_blocks.masked_fill(~mask, -torch.inf).amax(
             dim=3
         ) + query_blocks.masked_fill(~mask, torch.inf).amin(dim=3)
         expected_key_summary = key_blocks.masked_fill(~mask, -torch.inf).amax(dim=3)
         expected_key_aux = key_blocks.masked_fill(~mask, torch.inf).amin(dim=3)
-        torch.testing.assert_close(actual_key[3], expected_key_aux, atol=0.125, rtol=0.01)
+        torch.testing.assert_close(actual_key[5], expected_key_aux, atol=0.125, rtol=0.01)
     torch.testing.assert_close(actual_query[2], expected_query_summary, atol=0.125, rtol=0.01)
-    torch.testing.assert_close(actual_key[2], expected_key_summary, atol=0.125, rtol=0.01)
+    torch.testing.assert_close(actual_key[4], expected_key_summary, atol=0.125, rtol=0.01)
 
 
 @pytest.mark.gpu
@@ -344,13 +329,6 @@ def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
     k_projection = operands.projection(1)
     v_projection = operands.projection(2)
     block_lengths = torch.tensor([64, 31], device="cuda", dtype=torch.int32)
-    value_mean = linear_mean(
-        *v_projection.as_tuple(),
-        None,
-        1,
-        128,
-        block_lengths,
-    ).view(1, 2, 128)
     cases = (
         (
             query.project_query,
@@ -383,17 +361,7 @@ def test_nvfp4_projection_custom_ops_pass_opcheck() -> None:
         ),
         (
             value.project_value,
-            (*v_projection.as_tuple(), None, value_mean, 128, block_lengths),
-        ),
-        (
-            value.project_value_with_block_means,
-            (
-                *v_projection.as_tuple(),
-                None,
-                value_mean,
-                128,
-                block_lengths,
-            ),
+            (*v_projection.as_tuple(), None, 128, block_lengths),
         ),
     )
 
@@ -436,12 +404,6 @@ def test_projection_fake_kernels_propagate_padded_shapes() -> None:
     projected_key = key.project_key(*prepared, norm, cos, sin, 1e-5, 128)
     projected_value = value.project_value(
         *prepared,
-        torch.empty((1, 3, 128), device="meta", dtype=torch.float32),
-        128,
-    )
-    summarized_value = value.project_value_with_block_means(
-        *prepared,
-        torch.empty((1, 3, 128), device="meta", dtype=torch.float32),
         128,
     )
 
@@ -453,15 +415,14 @@ def test_projection_fake_kernels_propagate_padded_shapes() -> None:
     assert [output.shape for output in projected_key] == [
         (1, 3, 256, 128),
         (1, 3, 4),
+        (1, 3, 4, 2, 128),
+        (1, 3, 4, 2),
         (1, 3, 4, 128),
         (1, 3, 4, 128),
     ]
     assert [output.shape for output in projected_value] == [
         (1, 3, 128, 256),
         (1, 3, 4, 1),
-    ]
-    assert [output.shape for output in summarized_value] == [
-        (1, 3, 128, 256),
-        (1, 3, 4, 1),
         (1, 3, 4, 128),
     ]
+    assert projected_value[2].dtype is torch.bfloat16
