@@ -1,6 +1,7 @@
 """Dense Piper boundaries for quantized Q and optional quantized K/V producers."""
 
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from piper_kernels._triton import (
     mixed_int8,
@@ -141,8 +142,8 @@ def _piper_attention_from_quantized_query_op(
     already include the attention scale and log2(e); padded rows and scale
     groups must be initialized by the producer. The scale layout must match
     ``select_qk_quantization`` for the target. Numerical codes/scales are
-    caller preconditions. K is centered using its global post-transform mean; V
-    retains per-token scaling and causal centering rules.
+    caller preconditions. K and V are centered per 1024-token chunk for both
+    non-causal and causal attention.
     """
     shape = _validate_quantized_query(query, query_scale, key, value, query_length, is_causal)
     if shape[0] == 0:
@@ -203,6 +204,7 @@ def _validate_quantized(  # noqa: PLR0913, PLR0917
     query_scale: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
     value: torch.Tensor,
     multiplier: torch.Tensor,
     log_scale: torch.Tensor,
@@ -220,6 +222,7 @@ def _validate_quantized(  # noqa: PLR0913, PLR0917
     validate_quantized_context(
         key,
         key_scale,
+        key_center,
         value,
         multiplier,
         log_scale,
@@ -237,9 +240,22 @@ def _validate_quantized(  # noqa: PLR0913, PLR0917
     return shape
 
 
+def _is_contiguous_strided(tensor: torch.Tensor) -> bool:
+    """Check contiguous strides without forcing 0/1 symbolic size guards on unit-hint dims."""
+    if tensor.layout is not torch.strided:
+        return False
+    expected = 1
+    for size, stride in zip(reversed(tensor.shape), reversed(tensor.stride()), strict=True):
+        if stride != expected and not statically_known_true(size == 1):
+            return False
+        expected *= size
+    return True
+
+
 def validate_quantized_context(  # noqa: PLR0913
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
     value: torch.Tensor,
     multiplier: torch.Tensor,
     log_scale: torch.Tensor,
@@ -253,7 +269,8 @@ def validate_quantized_context(  # noqa: PLR0913
 ) -> None:
     """Check native K/V metadata without allocating a query tensor.
 
-    K scales are per K64 group or, for per-thread quantization, per stored key.
+    K scales are per K64 group or, for per-thread quantization, per stored key;
+    ``key_center`` and ``value_mean`` store per-1024-token chunk FP32 means.
     """
     batch, heads, query_length, head_dim = query_shape
     if not isinstance(is_causal, bool):
@@ -265,6 +282,7 @@ def validate_quantized_context(  # noqa: PLR0913
     if output_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("quantized Piper output must use FP16/BF16")
     storage = (key_length + 63) // 64 * 64
+    key_chunks = (key_length + 1023) // 1024
     if key.ndim != 4 or key.shape[1] < 1 or heads % key.shape[1]:
         raise ValueError("quantized Piper key must have compatible GQA heads")
     kv_heads = key.shape[1]
@@ -272,18 +290,19 @@ def validate_quantized_context(  # noqa: PLR0913
     expected = (
         (key, (batch, kv_heads, storage, head_dim), torch.int8),
         (key_scale, (batch, kv_heads, num_key_scales), torch.float32),
+        (key_center, (batch, kv_heads, key_chunks, head_dim), torch.float32),
         (value, (batch, kv_heads, head_dim, storage), torch.int8),
         (multiplier, (batch, kv_heads, storage), torch.float32),
         (log_scale, (batch, kv_heads, storage), torch.float32),
-        (value_mean, (batch, kv_heads, head_dim), torch.float32),
+        (value_mean, (batch, kv_heads, key_chunks, head_dim), torch.float32),
     )
     for tensor, expected_shape, dtype in expected:
         if tensor.shape != expected_shape or tensor.dtype is not dtype:
             raise ValueError("quantized Piper K/V metadata must match the padded native contract")
-    for tensor in (key, key_scale, value, multiplier, log_scale, value_mean):
+    for tensor in (key, key_scale, key_center, value, multiplier, log_scale, value_mean):
         if tensor.device != query_device:
             raise ValueError("quantized Piper operands must share a device")
-        if tensor.layout is not torch.strided or not tensor.is_contiguous():
+        if not _is_contiguous_strided(tensor):
             raise ValueError("quantized Piper operands must be contiguous strided tensors")
         if torch.is_grad_enabled() and tensor.requires_grad:
             raise RuntimeError("quantized Piper Attention is an inference-only operator")
@@ -295,6 +314,7 @@ def _piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     query_scale: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
     value: torch.Tensor,
     multiplier: torch.Tensor,
     log_scale: torch.Tensor,
@@ -306,16 +326,17 @@ def _piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
 ) -> torch.Tensor:
     """Consume native Q/K and dense per-token V without repeating preparation.
 
-    K/V use K64-padded storage, including V metadata. Q/K scales follow
-    ``select_qk_quantization`` for the target, and V codes the producer's
-    target-native layout. Numerical codes, scales, and centering are caller
-    preconditions; all checks here inspect host metadata only.
+    K/V use K64-padded storage, including V metadata, with per-1024-token chunk
+    centers/means. Q/K scales follow ``select_qk_quantization`` for the target,
+    and V codes the producer's target-native layout. Numerical codes, scales,
+    and centering are caller preconditions; all checks here inspect host metadata only.
     """
     shape = _validate_quantized(
         query,
         query_scale,
         key,
         key_scale,
+        key_center,
         value,
         multiplier,
         log_scale,
@@ -330,6 +351,7 @@ def _piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     context = prepare_quantized_context(
         key,
         key_scale,
+        key_center,
         value,
         multiplier,
         log_scale,
@@ -349,6 +371,7 @@ type QuantizedContext = nvidia_backend._PreparedPiperContext | amd_backend.Prepa
 def prepare_quantized_context(
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
     value: torch.Tensor,
     multiplier: torch.Tensor,
     log_scale: torch.Tensor,
@@ -385,6 +408,7 @@ def prepare_quantized_context(
             key=key_argument,
             value=value_argument,
             key_scale=key_scale,
+            key_center=key_center,
             value_scale_multiplier=multiplier,
             value_log_scale=log_scale,
             value_mean=value_mean,
@@ -397,6 +421,7 @@ def prepare_quantized_context(
         key=key,
         value=value,
         key_scale=key_scale,
+        key_center=key_center,
         multiplier=multiplier,
         log_scale=log_scale,
         value_mean=value_mean,
@@ -448,6 +473,7 @@ def _piper_attention_from_quantized_fake(  # noqa: PLR0913, PLR0917
     query_scale: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
     value: torch.Tensor,
     multiplier: torch.Tensor,
     log_scale: torch.Tensor,
@@ -462,6 +488,7 @@ def _piper_attention_from_quantized_fake(  # noqa: PLR0913, PLR0917
         query_scale,
         key,
         key_scale,
+        key_center,
         value,
         multiplier,
         log_scale,

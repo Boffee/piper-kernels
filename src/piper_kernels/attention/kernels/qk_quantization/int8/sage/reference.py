@@ -133,6 +133,24 @@ def _quantize_rotated_query_key(
     return query_int8, key_int8, query_scale, key_scale
 
 
+def quantize_centered_query_key(
+    query: torch.Tensor,
+    key_centered: torch.Tensor,
+    *,
+    granularity: QKQuantizationGranularity,
+    quantization_range: int = 127,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rotate and quantize Q and already-centered K without global mean subtraction."""
+    return _quantize_rotated_query_key(
+        rotate_signed_hadamard_heads(query.float()),
+        rotate_signed_hadamard_heads(key_centered.float()),
+        granularity=granularity,
+        query_length=query.shape[2],
+        key_length=key_centered.shape[2],
+        quantization_range=quantization_range,
+    )
+
+
 def quantize_query_key(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -143,12 +161,10 @@ def quantize_query_key(
     """Center and smooth K, then quantize signed-Hadamard Q/K."""
     key_float = key.float()
     key_centered = key_float - key_float.mean(dim=2, keepdim=True)
-    return _quantize_rotated_query_key(
-        rotate_signed_hadamard_heads(query.float()),
-        rotate_signed_hadamard_heads(key_centered),
+    return quantize_centered_query_key(
+        query,
+        key_centered,
         granularity=granularity,
-        query_length=query.shape[2],
-        key_length=key.shape[2],
         quantization_range=quantization_range,
     )
 

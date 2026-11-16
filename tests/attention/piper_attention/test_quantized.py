@@ -419,7 +419,7 @@ def test_quantized_boundary_reuses_one_dynamic_fullgraph(causal):
         attention, fullgraph=True, dynamic=True, options={"post_grad_custom_pre_pass": capture}
     )
     with torch.inference_mode():
-        for query_length in (65, 129, 193):
+        for query_length in (65, 129, 1025):
             query = torch.randn(2, 6, query_length, 64, device="cuda", dtype=torch.bfloat16)
             key = torch.randn(
                 2,
@@ -480,7 +480,7 @@ def _pad_keys(metadata, storage):
     or not AcceleratorTarget.from_device(torch.device("cuda")).cuda_capability_at_least(8),
     reason="requires NVIDIA SM80 or newer",
 )
-@pytest.mark.parametrize("query_length", [65, 257, 320])
+@pytest.mark.parametrize("query_length", [65, 320, 1089])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_sm89_native_contract_matches_regular_gluon_attention(query_length, head_dim, causal):

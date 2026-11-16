@@ -130,10 +130,8 @@ def test_sm89_piper_provider_registers_separate_quantization_kernels() -> None:
     )
 
     assert set(providers[PIPER_ATTENTION].triton_jit_functions) == {
-        "kv-mean-partial",
-        "kv-mean-finish",
         "quantize-query-per-thread",
-        "quantize-key-per-thread",
+        "prepare-key-k1024",
         "quantize-value-per-key",
         "attention",
     }
@@ -158,10 +156,8 @@ def test_rdna4_provider_uses_dense_preparation_and_shared_benchmark_phases(archi
     assert provider.configuration["value_scale"] == "per_key"
     assert provider.configuration["block_n"] == 64
     assert set(provider.triton_jit_functions) == {
-        "kv-mean-partial",
-        "kv-mean-finish",
         "quantize-query-per-warp",
-        "quantize-key-per-block",
+        "prepare-key-k1024",
         "quantize-pack-value-per-key",
         "attention",
     }

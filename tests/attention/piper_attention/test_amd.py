@@ -84,8 +84,57 @@ def test_value_semantics_and_strides(head_dim, causal, kind):
     assert error < 0.005, error.item()
     if kind == "zero":
         assert torch.count_nonzero(actual) == 0
-    if kind == "constant" and not causal:
+    if kind == "constant":
         torch.testing.assert_close(actual, value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("constant_value", [2.0**100, -(2.0**100)])
+def test_restores_large_constant_value(head_dim, causal, constant_value):
+    query = torch.zeros(1, 2, 1089, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.zeros_like(query)
+    value = torch.full_like(query, constant_value)
+    actual = piper_attention(query, key, value, is_causal=causal)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_intra_chunk_weights_survive_large_k_bias(causal):
+    query = torch.zeros(1, 1, 128, 64, device="cuda", dtype=torch.bfloat16)
+    query[:, :, :, :2] = 1.0
+    key = torch.zeros_like(query)
+    key[:, :, :, 0] = 1.0e9
+    key[:, :, :64, 1] = 8.0
+    key[:, :, 64:, 1] = -8.0
+    value = torch.zeros_like(query)
+    value[:, :, :64, 0] = 1.0
+    actual = piper_attention(query, key, value, scale=1.0, is_causal=causal)
+    assert torch.isfinite(actual).all()
+    assert actual[0, 0, -1, 0].item() > 0.9
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_multi_chunk_shifted_key_means_match_reference(causal):
+    torch.manual_seed(993)
+    query = torch.randn(1, 2, 1089, 64, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    key[:, :, :1024, 0] -= 1.0
+    key[:, :, 1024:, 0] += 3.0
+    value = torch.randn_like(query)
+    value[:, :, 1024:] += 2.0
+    actual = piper_attention(query, key, value, scale=0.125, is_causal=causal)
+    expected = reference_piper_attention(
+        query,
+        key,
+        value,
+        0.125,
+        causal,
+        qk_quantization="per_warp",
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])

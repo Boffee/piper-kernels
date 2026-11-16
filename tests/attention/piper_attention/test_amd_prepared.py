@@ -19,14 +19,16 @@ def _prepared(
 ):
     query_storage = (query_length + 63) // 64 * 64
     key_storage = (key_length + 63) // 64 * 64
+    key_chunks = (key_length + 1023) // 1024
     with torch.device("meta"):
         context = backend.PreparedContext(
             key=torch.empty((batch, 2, key_storage, 64), dtype=torch.int8),
             value=torch.empty((batch, 2, key_storage // 64, 64, 64), dtype=torch.int8),
             key_scale=torch.empty((batch, 2, key_storage // 64)),
+            key_center=torch.empty((batch, 2, key_chunks, 64)),
             multiplier=torch.empty((batch, 2, key_storage)),
             log_scale=torch.empty((batch, 2, key_storage)),
-            value_mean=torch.empty((batch, 2, 64)),
+            value_mean=torch.empty((batch, 2, key_chunks, 64)),
             key_length=key_length,
             is_causal=causal,
         )
@@ -68,15 +70,18 @@ def test_launch_reuses_operands_and_logical_metadata_with_independent_outputs(mo
             context.value,
             query.scale,
             context.key_scale,
+            context.key_center,
             context.multiplier,
             context.log_scale,
             context.value_mean,
             output,
         )
         assert all(
-            actual is expected for actual, expected in zip(args[:9], expected_operands, strict=True)
+            actual is expected
+            for actual, expected in zip(args[:10], expected_operands, strict=True)
         )
-        assert args[9:21] == (0, 65, 0, 97, 128, 128, 6, *output.stride()[:3], 3, 64)
+        assert args[10:21] == (0, 65, 0, 97, 128, 128, 6, 1, *output.stride()[:3])
+        assert args[21:23] == (3, 64)
 
 
 @pytest.mark.parametrize(
@@ -127,19 +132,19 @@ def test_independent_preparation_keeps_quantization_policy_without_allocating_ou
         query = torch.empty(expected_query.shape, dtype=expected_query.dtype)
         key = torch.empty((2, 2, 97, 64), dtype=query.dtype)
         value = torch.empty_like(key)
-        key_mean = torch.empty((2, 2, 64))
-    means = Mock(return_value=(key_mean, expected_context.value_mean))
-    key_quantization = Mock(return_value=(expected_context.key, expected_context.key_scale))
+    key_quantization = Mock(
+        return_value=(expected_context.key, expected_context.key_scale, expected_context.key_center)
+    )
     query_quantization = Mock(return_value=(expected_query.data, expected_query.scale))
     value_quantization = Mock(
         return_value=(
             expected_context.value,
             expected_context.multiplier,
             expected_context.log_scale,
+            expected_context.value_mean,
         )
     )
-    monkeypatch.setattr(backend, "compute_kv_means", means)
-    monkeypatch.setattr(backend.qk_quantization, "prepare_key", key_quantization)
+    monkeypatch.setattr(backend._quantization, "prepare_chunk_centered_key", key_quantization)
     monkeypatch.setattr(backend.qk_quantization, "prepare_query", query_quantization)
     monkeypatch.setattr(backend, "prepare_value", value_quantization)
     monkeypatch.setattr(backend, "device_context", lambda _device: nullcontext())
@@ -148,20 +153,15 @@ def test_independent_preparation_keeps_quantization_policy_without_allocating_ou
     prepared_query = backend.prepare_query(query, 0.125, global_row_offset=global_row_offset)
     assert context.key is expected_context.key
     assert context.value is expected_context.value
+    assert context.key_center is expected_context.key_center
     assert context.key_length == 97
     assert prepared_query.data is expected_query.data
     assert prepared_query.scale is expected_query.scale
     assert prepared_query.shape == expected_query.shape
     assert prepared_query.dtype is expected_query.dtype
     assert prepared_query.global_row_offset == global_row_offset
-    means.assert_called_once_with(key, value, is_causal=False)
-    key_quantization.assert_called_once_with(key, key_mean, grouped=True, storage_key_length=128)
-    value_quantization.assert_called_once_with(
-        value,
-        expected_context.value_mean,
-        is_causal=False,
-        storage_length=128,
-    )
+    key_quantization.assert_called_once_with(key, grouped=True, storage_key_length=128)
+    value_quantization.assert_called_once_with(value, storage_length=128)
     query_quantization.assert_called_once_with(query, 0.125, grouped=True, storage_query_length=128)
 
 
@@ -178,7 +178,7 @@ def test_benchmark_wrapper_allocates_output_during_preparation_and_reuses_it(mon
     monkeypatch.setattr(backend, "launch_attention_into", launch_into)
     prepared = backend.prepare_attention(input_query, key, key, 0.125, False)
     assert prepared.context is context
-    assert prepared.query is query
+    assert prepared.query.data is query.data
     assert prepared.output.shape == query.shape
     assert prepared.output.dtype is query.dtype
     monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated during launch")))
@@ -222,9 +222,9 @@ def test_query_windows_pass_local_and_global_offsets_and_output_strides(
     )
     ((grid, args, _kwargs),) = kernel.calls
     assert grid == ((resolved_rows + 63) // 64, 6, 2)
-    assert args[8] is output
-    assert args[9:12] == (start, resolved_rows, origin + start)
-    assert args[16:19] == output.stride()[:3]
+    assert args[9] is output
+    assert args[10:13] == (start, resolved_rows, origin + start)
+    assert args[18:21] == output.stride()[:3]
 
 
 @pytest.mark.parametrize(

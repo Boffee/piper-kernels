@@ -47,7 +47,7 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
     )
     monkeypatch.setattr(
         piper_quantization,
-        "compute_kv_means",
+        "prepare_chunk_centered_key",
         stop_at_preprocessing,
     )
     query, key, value = _inputs()

@@ -1,4 +1,4 @@
-"""RDNA4 dense Piper: per-token V scaling and a Q64/K64 recurrence."""
+"""RDNA4 dense Piper: per-token V scaling, K1024+V1024 centering, and Q64/K64 recurrence."""
 
 # Gluon device types and layouts are not Python runtime values.
 # ruff: noqa: ANN001, ANN202, PLR0913, PLR0917
@@ -20,6 +20,7 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     four_fragments,
     pack_probabilities,
     pv_tiles,
+    qk_fp32_center_bias,
     qk_tiles,
     query_fragments,
     rescale_numerator,
@@ -27,8 +28,12 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
 )
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 
-from .._quantization import compute_kv_means
-from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
+from .. import _quantization
+from .._validation import (
+    resolve_query_window,
+    validate_output_buffer,
+    validate_query_offset,
+)
 from .triton import prepare_value
 
 # Launch attributes shared by every dense RDNA4 kernel compile.
@@ -36,6 +41,7 @@ _LLVM_FN_ATTRS = (
     ("target-features", "+cumode"),
     *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
 )
+_GL_TILES_PER_CHUNK = gl.constexpr(_quantization._TILES_PER_CHUNK)
 
 
 @gluon.jit
@@ -53,21 +59,23 @@ def _softmax_fragment(scores, maximum, scale, multiplier):
 @gluon.jit
 def _softmax_tile(scores, block_max, scale, multiplier):
     """Keep K64 normalization, but consume FP32 probabilities in 16-column fragments."""
-    chunks = four_fragments(scores)
+    fragments = four_fragments(scores)
     multiplier_0, multiplier_1 = gl.split(multiplier.reshape([1, 2, 32]).permute([0, 2, 1]))
     multiplier_00, multiplier_01 = gl.split(multiplier_0.reshape([1, 2, 16]).permute([0, 2, 1]))
     multiplier_10, multiplier_11 = gl.split(multiplier_1.reshape([1, 2, 16]).permute([0, 2, 1]))
     multipliers = (multiplier_00, multiplier_01, multiplier_10, multiplier_11)
-    packed_chunks, sums = (), ()
-    for chunk in gl.static_range(4):
-        words, total = _softmax_fragment(chunks[chunk], block_max, scale, multipliers[chunk])
-        packed_chunks += (words,)
+    packed_fragments, sums = (), ()
+    for fragment in gl.static_range(4):
+        words, total = _softmax_fragment(
+            fragments[fragment], block_max, scale, multipliers[fragment]
+        )
+        packed_fragments += (words,)
         sums += (total,)
         with gl.amd.warp_pipeline_stage("softmax"):
             pass
     packed = concat_columns(
-        concat_columns(packed_chunks[0], packed_chunks[1]),
-        concat_columns(packed_chunks[2], packed_chunks[3]),
+        concat_columns(packed_fragments[0], packed_fragments[1]),
+        concat_columns(packed_fragments[2], packed_fragments[3]),
     )
     return packed, (sums[0] + sums[1]) + (sums[2] + sums[3])
 
@@ -81,6 +89,7 @@ def _softmax_tile(scores, block_max, scale, multiplier):
         "query_storage",
         "key_storage",
         "heads",
+        "key_chunks",
         "stride_ob",
         "stride_oh",
         "stride_om",
@@ -92,6 +101,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
     value_ptr,
     query_scale_ptr,
     key_scale_ptr,
+    key_center_ptr,
     multiplier_ptr,
     log_scale_ptr,
     value_mean_ptr,
@@ -103,6 +113,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
     query_storage,
     key_storage,
     heads,
+    key_chunks,
     stride_ob,
     stride_oh,
     stride_om,
@@ -125,6 +136,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
     blocks = gl.full([1], stored_query_block, gl.int32, block_layout)
     rows = gl.arange(0, 64, gl.SliceLayout(0, row_layout))
     columns = gl.arange(0, 64, gl.SliceLayout(0, column_layout))
+    features = gl.arange(0, head_dim, gl.SliceLayout(0, column_layout))
     output_rows = query_block.to(gl.int64) * 64 + rows
     global_query_rows = global_query_start.to(gl.int64) + output_rows
     query = query_fragments(
@@ -142,57 +154,91 @@ def _dense_piper_kernel(  # noqa: PLR0915
     numerator = gl.zeros([1, 64, head_dim], gl.float32, MMA_LAYOUT)
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
+    running_bias = gl.zeros([1, 64], gl.float32, row_layout)
     tile_count = gl.cdiv(key_length, 64)
     if is_causal:
         tile_count = gl.minimum(tile_count, global_query_block + 1)
-    for tile in range(tile_count):
-        key_blocks = gl.full([1], tile, gl.int32, block_layout)
-        scores = qk_tiles(
-            query,
-            key_ptr + kv_batch_head * key_storage * head_dim,
-            key_blocks,
-            key_blocks,
-            wide_context_offsets,
+    chunk_count = gl.cdiv(tile_count, _GL_TILES_PER_CHUNK)
+    for chunk in range(chunk_count):
+        k_bias = qk_fp32_center_bias(
+            query_ptr + batch_head * query_storage * head_dim,
+            stored_query_block,
+            key_center_ptr + (kv_batch_head * key_chunks + chunk) * head_dim,
+            query_scale,
+            rows,
+            wide_query_offsets,
             head_dim,
-            two_tiles=False,
-            scalar_score_recovery=True,
+            row_layout,
         )
-        scale = query_scale * gl.load(key_scale_ptr + kv_batch_head * (key_storage // 64) + tile)
-        key_rows = tile.to(gl.int64) * 64 + columns
-        boundary = (tile + 1) * 64 > key_length
-        if is_causal:
-            boundary = boundary | (tile == global_query_block)
-        if boundary:
-            valid = key_rows[None, None, :] < key_length
+        if chunk > 0:
+            # Shift running_max into this chunk's unbiased coordinate frame once so large
+            # shared chunk offsets cancel before entering intra-chunk tile weights.
+            running_max = gl.where(
+                running_max == -float("inf"),
+                running_max,
+                running_max + (running_bias - k_bias),
+            )
+        chunk_denom = gl.zeros([1, 64], gl.float32, row_layout)
+        tile_start = chunk * _GL_TILES_PER_CHUNK
+        tile_stop = gl.minimum(tile_start + _GL_TILES_PER_CHUNK, tile_count)
+        for tile in range(tile_start, tile_stop):
+            key_blocks = gl.full([1], tile, gl.int32, block_layout)
+            scores = qk_tiles(
+                query,
+                key_ptr + kv_batch_head * key_storage * head_dim,
+                key_blocks,
+                key_blocks,
+                wide_context_offsets,
+                head_dim,
+                two_tiles=False,
+                scalar_score_recovery=True,
+            )
+            scale = query_scale * gl.load(
+                key_scale_ptr + kv_batch_head * (key_storage // 64) + tile
+            )
+            key_rows = tile.to(gl.int64) * 64 + columns
+            boundary = (tile + 1) * 64 > key_length
             if is_causal:
-                valid = valid & (key_rows[None, None, :] <= global_query_rows[None, :, None])
-            # Fused scaling must not turn a masked zero-scale score into 0 * -inf.
-            scores = gl.where(valid, gl.where(scale[:, :, None] == 0, 0.0, scores), -float("inf"))
-            scale = gl.where(scale == 0, 1.0, scale)
-        multiplier = gl.load(multiplier_ptr + kv_batch_head * key_storage + key_rows[None, :])
-        log_scale = gl.load(log_scale_ptr + kv_batch_head * key_storage + key_rows[None, :])
-        block_max = gl.max(scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]), 2)
-        next_max = gl.maximum(running_max, block_max)
-        old_weight = gl.exp2(running_max - next_max)
-        current_weight = gl.exp2(block_max - next_max)
-        packed, total = _softmax_tile(scores, block_max, scale, multiplier)
-        denominator = denominator * old_weight + total * current_weight
-        numerator = pv_tiles(
-            packed,
-            value_ptr + kv_batch_head * key_storage * head_dim,
-            key_blocks,
-            key_blocks,
-            rescale_numerator(numerator, old_weight),
-            current_weight,
-            wide_context_offsets,
-            two_tiles=False,
+                boundary = boundary | (tile == global_query_block)
+            if boundary:
+                valid = key_rows[None, None, :] < key_length
+                if is_causal:
+                    valid = valid & (key_rows[None, None, :] <= global_query_rows[None, :, None])
+                # Fused scaling must not turn a masked zero-scale score into 0 * -inf.
+                scores = gl.where(
+                    valid, gl.where(scale[:, :, None] == 0, 0.0, scores), -float("inf")
+                )
+                scale = gl.where(scale == 0, 1.0, scale)
+            multiplier = gl.load(multiplier_ptr + kv_batch_head * key_storage + key_rows[None, :])
+            log_scale = gl.load(log_scale_ptr + kv_batch_head * key_storage + key_rows[None, :])
+            block_max = gl.max(
+                scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]),
+                2,
+            )
+            next_max = gl.maximum(running_max, block_max)
+            old_weight = gl.exp2(running_max - next_max)
+            current_weight = gl.exp2(block_max - next_max)
+            packed, total = _softmax_tile(scores, block_max, scale, multiplier)
+            row_sum = total * current_weight
+            denominator = denominator * old_weight + row_sum
+            chunk_denom = chunk_denom * old_weight + row_sum
+            numerator = pv_tiles(
+                packed,
+                value_ptr + kv_batch_head * key_storage * head_dim,
+                key_blocks,
+                key_blocks,
+                rescale_numerator(numerator, old_weight),
+                current_weight,
+                wide_context_offsets,
+                two_tiles=False,
+            )
+            running_max = next_max
+        value_mean = gl.load(
+            value_mean_ptr + (kv_batch_head * key_chunks + chunk) * head_dim + features[None, :]
         )
-        running_max = next_max
+        numerator += (chunk_denom * 255.0)[:, :, None] * value_mean[:, None, :]
+        running_bias = k_bias
     output = numerator / (gl.maximum(denominator, 1e-30)[:, :, None] * 255.0)
-    features = gl.arange(0, head_dim, gl.SliceLayout(0, column_layout))
-    if not is_causal:
-        mean = gl.load(value_mean_ptr + kv_batch_head * head_dim + features[None, :])
-        output += mean[:, None, :]
     offsets = batch * stride_ob + head * stride_oh + output_rows[None, :, None] * stride_om
     gl.store(
         output_ptr + offsets + features[None, None, :],
@@ -208,6 +254,7 @@ class PreparedContext:
     key: torch.Tensor
     value: torch.Tensor
     key_scale: torch.Tensor
+    key_center: torch.Tensor
     multiplier: torch.Tensor
     log_scale: torch.Tensor
     value_mean: torch.Tensor
@@ -244,23 +291,20 @@ def prepare_context(
     """Prepare validated K/V once, independently of Q and output storage."""
     key_storage = triton.cdiv(key.shape[2], 64) * 64
     with device_context(key.device):
-        key_mean, value_mean = compute_kv_means(key, value, is_causal=is_causal)
-        key_int8, key_scale = qk_quantization.prepare_key(
+        key_int8, key_scale, key_center = _quantization.prepare_chunk_centered_key(
             key,
-            key_mean,
             grouped=True,
             storage_key_length=key_storage,
         )
-        packed_value, multiplier, log_scale = prepare_value(
+        packed_value, multiplier, log_scale, value_mean = prepare_value(
             value,
-            value_mean,
-            is_causal=is_causal,
             storage_length=key_storage,
         )
     return PreparedContext(
         key=key_int8,
         value=packed_value,
         key_scale=key_scale,
+        key_center=key_center,
         multiplier=multiplier,
         log_scale=log_scale,
         value_mean=value_mean,
@@ -275,12 +319,7 @@ def prepare_query(
     *,
     global_row_offset: int = 0,
 ) -> PreparedQuery:
-    """Prepare Q storage at an aligned global origin for full or ranged launches.
-
-    Matching a full-sequence preparation requires complete Q32 scale groups,
-    except for the actual sequence tail. Windows of existing prepared storage
-    may end at any row.
-    """
+    """Prepare Q storage at an aligned global origin for full or ranged launches."""
     validate_query_offset(global_row_offset, block_rows=64, name="global_row_offset")
     batch, heads, query_length, head_dim = query.shape
     query_storage = triton.cdiv(query_length, 64) * 64
@@ -314,6 +353,53 @@ def prepare_attention(
     return PreparedAttention(context=context, query=prepared_query, output=output)
 
 
+def _launch_window_into(
+    context: PreparedContext,
+    query: PreparedQuery,
+    output: torch.Tensor,
+    *,
+    query_start: int,
+    rows: int,
+) -> torch.Tensor:
+    batch, heads, _, head_dim = query.shape
+    query_storage = query.data.shape[2]
+    key_storage = context.key.shape[2]
+    key_chunks = context.key_center.shape[2]
+    with device_context(query.data.device):
+        _dense_piper_kernel[(triton.cdiv(rows, 64), heads, batch)](
+            query.data,
+            context.key,
+            context.value,
+            query.scale,
+            context.key_scale,
+            context.key_center,
+            context.multiplier,
+            context.log_scale,
+            context.value_mean,
+            output,
+            query_start,
+            rows,
+            query.global_row_offset + query_start,
+            context.key_length,
+            query_storage,
+            key_storage,
+            heads,
+            key_chunks,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            heads // context.key.shape[1],
+            head_dim,
+            context.is_causal,
+            query_storage * (head_dim // 8) > (1 << 31),
+            key_storage * head_dim > (1 << 32),
+            num_warps=4,
+            num_stages=1,
+            llvm_fn_attrs=_LLVM_FN_ATTRS,
+        )
+    return output
+
+
 def launch_attention_into(
     context: PreparedContext,
     query: PreparedQuery,
@@ -322,14 +408,7 @@ def launch_attention_into(
     query_start: int = 0,
     query_rows: int | None = None,
 ) -> torch.Tensor:
-    """Fill a caller-owned output for an aligned window of prepared Q.
-
-    Q and K/V must match in batch, head dimension, and device; Q heads must be
-    divisible by K/V heads. Causal masking uses Q's global origin plus the local
-    window start. query_start is local to prepared Q; query_rows=None selects
-    its remaining logical rows. Output rows begin at zero and may use
-    noncontiguous outer strides with contiguous features.
-    """
+    """Fill a caller-owned output for an aligned window of prepared Q."""
     batch, heads, query_length, head_dim = query.shape
     rows = resolve_query_window(
         query_length,
@@ -346,41 +425,15 @@ def launch_attention_into(
         dtype=query.dtype,
         device=query.data.device,
     )
-    query_storage = query.data.shape[2]
-    key_storage = context.key.shape[2]
     if batch == 0:
         return output
-    with device_context(query.data.device):
-        _dense_piper_kernel[(triton.cdiv(rows, 64), heads, batch)](
-            query.data,
-            context.key,
-            context.value,
-            query.scale,
-            context.key_scale,
-            context.multiplier,
-            context.log_scale,
-            context.value_mean,
-            output,
-            query_start,
-            rows,
-            query.global_row_offset + query_start,
-            context.key_length,
-            query_storage,
-            key_storage,
-            heads,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            heads // context.key.shape[1],
-            head_dim,
-            context.is_causal,
-            query_storage * (head_dim // 8) > (1 << 31),
-            key_storage * head_dim > (1 << 32),
-            num_warps=4,
-            num_stages=1,
-            llvm_fn_attrs=_LLVM_FN_ATTRS,
-        )
-    return output
+    return _launch_window_into(
+        context,
+        query,
+        output,
+        query_start=query_start,
+        rows=rows,
+    )
 
 
 def launch_attention(prepared: PreparedAttention) -> torch.Tensor:
