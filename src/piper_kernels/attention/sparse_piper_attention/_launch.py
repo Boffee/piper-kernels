@@ -155,7 +155,7 @@ def validate_attention_launch(
         else context.sparse_query_blocks
     )
     mask_ragged_tail = not has_block_lengths and logical_sequence_length != storage_sequence_length
-    resolved_coarse_output = context.value_mean if coarse_output is None else coarse_output
+    resolved_coarse_output = context.key_scale if coarse_output is None else coarse_output
     resolved_coarse_gate = output if coarse_gate is None else coarse_gate
     block_lengths_operand = (
         context.head_keep_blocks if context.block_lengths is None else context.block_lengths

@@ -23,7 +23,15 @@ from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
 from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
 from . import policy
-from ._recurrence import piper_probability_pair, piper_pv_pair, store_attention_output
+from ._recurrence import (
+    K_BIAS_GROUP_TILES,
+    accumulate_value_mean_pair,
+    build_k_bias_cache,
+    compute_pair_k_bias,
+    piper_probability_pair,
+    piper_pv_pair,
+    store_attention_output,
+)
 
 _BLOCK_N = TILE_ROWS
 
@@ -58,6 +66,8 @@ def _sparse_piper_attention_kernel(
     value_desc,
     query_scale_ptr,
     key_scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
     value_scale_multiplier_ptr,
     value_mean_ptr,
     coarse_output_ptr,
@@ -145,6 +155,11 @@ def _sparse_piper_attention_kernel(
     )
     value_shared_0 = value_shared_pair.index(0)
     value_shared_1 = value_shared_pair.index(1)
+    key_center_shared = gl.allocate_shared_memory(
+        gl.int8,
+        [K_BIAS_GROUP_TILES, head_dim],
+        gl.NVMMASharedLayout.get_default_for([K_BIAS_GROUP_TILES, head_dim], gl.int8),
+    )
     query_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     key_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     value_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
@@ -230,10 +245,36 @@ def _sparse_piper_attention_kernel(
     accumulator = gl.zeros([block_m, head_dim], gl.float32, mma_layout)
     denominator = gl.zeros([block_m], gl.float32, row_layout)
     running_max = gl.full([block_m], -float("inf"), gl.float32, row_layout)
+    bias_cache_0, bias_cache_1 = build_k_bias_cache(block_m, mma_layout)
     start_n_0 = initial_n_0
     start_n_1 = initial_n_1
 
     for pair_index in range(pair_count - 1):
+        k_bias_0, k_bias_1, bias_cache_0, bias_cache_1 = compute_pair_k_bias(
+            pair_index,
+            bias_cache_0,
+            bias_cache_1,
+            query,
+            query_scale,
+            key_center_ptr,
+            key_center_scale_ptr,
+            key_center_shared,
+            route_base,
+            tile_count,
+            routed_sparse_tile_count,
+            selected_sparse_tile_count,
+            sparse_key_blocks,
+            stride_rr,
+            use_sparse_routes,
+            skip_dense_routing,
+            kv_batch_head,
+            sequence_tiles,
+            head_dim,
+            mma_warps,
+            mma_layout,
+            key_layout,
+            row_layout,
+        )
         phase = pair_index & 1
         mbarrier.wait(key_barrier, phase=phase)
         (
@@ -242,6 +283,8 @@ def _sparse_piper_attention_kernel(
             running_max,
             old_weight,
             current_weight,
+            mass_0,
+            mass_1,
         ) = piper_probability_pair(
             query,
             key_shared_pair,
@@ -249,6 +292,8 @@ def _sparse_piper_attention_kernel(
             key_scale_ptr,
             value_scale_multiplier_ptr,
             block_lengths_ptr,
+            k_bias_0,
+            k_bias_1,
             denominator,
             running_max,
             kv_batch_head,
@@ -305,10 +350,47 @@ def _sparse_piper_attention_kernel(
             value_shared_1,
             value_barrier,
         )
+        accumulator = accumulate_value_mean_pair(
+            accumulator,
+            value_mean_ptr,
+            mass_0,
+            mass_1,
+            current_weight,
+            kv_batch_head,
+            start_n_0,
+            start_n_1,
+            sequence_tiles,
+            mma_layout,
+        )
         start_n_0 = next_n_0
         start_n_1 = next_n_1
 
     final_pair = pair_count - 1
+    k_bias_0, k_bias_1, _bias_cache_0, _bias_cache_1 = compute_pair_k_bias(
+        final_pair,
+        bias_cache_0,
+        bias_cache_1,
+        query,
+        query_scale,
+        key_center_ptr,
+        key_center_scale_ptr,
+        key_center_shared,
+        route_base,
+        tile_count,
+        routed_sparse_tile_count,
+        selected_sparse_tile_count,
+        sparse_key_blocks,
+        stride_rr,
+        use_sparse_routes,
+        skip_dense_routing,
+        kv_batch_head,
+        sequence_tiles,
+        head_dim,
+        mma_warps,
+        mma_layout,
+        key_layout,
+        row_layout,
+    )
     final_phase = final_pair & 1
     final_position_0 = final_pair * 2
     has_second = final_position_0 + 1 < tile_count
@@ -319,6 +401,8 @@ def _sparse_piper_attention_kernel(
         running_max,
         old_weight,
         current_weight,
+        mass_0,
+        mass_1,
     ) = piper_probability_pair(
         query,
         key_shared_pair,
@@ -326,6 +410,8 @@ def _sparse_piper_attention_kernel(
         key_scale_ptr,
         value_scale_multiplier_ptr,
         block_lengths_ptr,
+        k_bias_0,
+        k_bias_1,
         denominator,
         running_max,
         kv_batch_head,
@@ -351,17 +437,27 @@ def _sparse_piper_attention_kernel(
         mma_layout,
         value_layout,
     )
+    accumulator = accumulate_value_mean_pair(
+        accumulator,
+        value_mean_ptr,
+        mass_0,
+        mass_1,
+        current_weight,
+        kv_batch_head,
+        start_n_0,
+        start_n_1,
+        sequence_tiles,
+        mma_layout,
+    )
 
     store_attention_output(
         accumulator,
         denominator,
-        value_mean_ptr,
         coarse_output_ptr,
         coarse_gate_ptr,
         output_ptr,
         batch,
         head,
-        kv_batch_head,
         query_block,
         global_query_block,
         output_start_m,
@@ -471,6 +567,8 @@ class _ContextLauncher:
                 self.value_descriptor,
                 query_state.scale,
                 context.key_scale,
+                context.key_center,
+                context.key_center_scale,
                 context.value_scale_multiplier,
                 context.value_mean,
                 launch.coarse_output,

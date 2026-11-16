@@ -8,6 +8,7 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.kernels.sparse_piper.layout import (
     QUERY_SCALE_ROWS,
     TILE_ROWS,
+    ValueFormat,
 )
 from piper_kernels.attention.sparse_piper_attention._backend import (
     require_attention_backend,
@@ -41,7 +42,6 @@ from piper_kernels.attention.sparse_piper_attention.coarse import (
     _mean_pool_head_major_blocks,
     apply_coarse_attention_residual,
     coarse_attention,
-    mean_pool_block_values,
 )
 
 
@@ -179,6 +179,8 @@ def test_ragged_quantized_path_matches_materialized_dispatch(
         query_summary,
         prepared.context.key,
         prepared.context.key_scale,
+        prepared.context.key_center,
+        prepared.context.key_center_scale,
         key_max,
         key_min,
         prepared.context.value,
@@ -313,6 +315,8 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         query_summary,
         prepared.context.key,
         prepared.context.key_scale,
+        prepared.context.key_center,
+        prepared.context.key_center_scale,
         key_summary,
         key_aux,
         prepared.context.value,
@@ -323,13 +327,11 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         shape[1],
         routing_mode,
     )
-    block_mean = mean_pool_block_values(value)
     coarse_scale = 128**-0.5
     coarse_arguments = (
-        *fine_arguments[:10],
-        block_mean,
+        *fine_arguments[:12],
         coarse_gate,
-        *fine_arguments[10:],
+        *fine_arguments[12:],
         coarse_scale,
         coarse_key_blocks,
     )
@@ -338,13 +340,13 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         fine_output = _sparse_piper_attention_from_quantized_op(*fine_arguments)
         expected_coarse = coarse_attention(
             scores * coarse_scale,
-            block_mean[:, :, :coarse_key_blocks],
+            prepared.context.value_mean[:, :, :coarse_key_blocks].float(),
         )
         actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *coarse_arguments,
         )
         zero_gate_arguments = list(coarse_arguments)
-        zero_gate_arguments[11] = torch.zeros_like(coarse_gate)
+        zero_gate_arguments[12] = torch.zeros_like(coarse_gate)
         zero_gate_output = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *zero_gate_arguments,
         )
@@ -531,6 +533,8 @@ def _block_length_case(routing_mode: int, head_dim: int):
         query_summary,
         prepared.context.key,
         prepared.context.key_scale,
+        prepared.context.key_center,
+        prepared.context.key_center_scale,
         key_summary,
         key_aux,
         prepared.context.value,
@@ -576,7 +580,7 @@ def test_block_lengths_mask_internal_key_padding(routing_mode: int, head_dim: in
     corrupted_value[reference_value_storage(padding, prepared.context.value_format)] = -127
     corrupted_arguments = list(arguments)
     corrupted_arguments[3] = corrupted_key
-    corrupted_arguments[7] = corrupted_value
+    corrupted_arguments[9] = corrupted_value
     partial_arguments = list(arguments)
     partial_arguments[-2] = 64 + 17 + 51
     corrupted_arguments[-2] = partial_arguments[-2]
@@ -649,7 +653,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
     routing_mode: int,
     head_dim: int,
 ) -> None:
-    _shape, _query, value, _prepared, arguments, block_lengths = _block_length_case(
+    _shape, _query, value, prepared, arguments, block_lengths = _block_length_case(
         routing_mode,
         head_dim,
     )
@@ -663,24 +667,22 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         device=value.device,
         generator=generator,
     )
-    block_mean = mean_pool_block_values(value, block_lengths)
     coarse_key_blocks = block_lengths.numel()
     routing_query_summary = fine_arguments[2]
-    routing_key_summary = fine_arguments[5][:, :, :coarse_key_blocks]
+    routing_key_summary = fine_arguments[7][:, :, :coarse_key_blocks]
     if routing_mode == _MEAN_ROUTING:
         scores = routing_query_summary @ routing_key_summary.mT
     else:
         scores = _minmax_pool_scores(
             routing_query_summary,
             routing_key_summary,
-            fine_arguments[6][:, :, :coarse_key_blocks],
+            fine_arguments[8][:, :, :coarse_key_blocks],
         )
     coarse_scale = head_dim**-0.5
     coarse_arguments = (
-        *fine_arguments[:10],
-        block_mean,
+        *fine_arguments[:12],
         coarse_gate,
-        *fine_arguments[10:],
+        *fine_arguments[12:],
         coarse_scale,
         coarse_key_blocks,
         block_lengths,
@@ -695,7 +697,7 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
         )
         expected_coarse = coarse_attention(
             scores * coarse_scale,
-            block_mean[:, :, :coarse_key_blocks],
+            prepared.context.value_mean[:, :, :coarse_key_blocks].float(),
         )
         actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
             *coarse_arguments,
@@ -754,6 +756,8 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
         query_mean,
         prepared.context.key,
         prepared.context.key_scale,
+        prepared.context.key_center,
+        prepared.context.key_center_scale,
         key_mean,
         key_mean[:, :, :0],
         prepared.context.value,
@@ -780,3 +784,176 @@ def test_mean_pool_summaries_feed_the_common_quantized_attention() -> None:
 
     assert torch.equal(actual, expected)
     assert set(opcheck.values()) == {"SUCCESS"}
+
+
+def _assert_sparse_kv_shards_match(actual, expected) -> None:
+    for attr in (
+        "key",
+        "key_scale",
+        "key_center",
+        "key_center_scale",
+        "key_summary",
+        "key_aux",
+        "value",
+        "value_scale_multiplier",
+        "value_mean",
+    ):
+        left = getattr(actual, attr)
+        right = getattr(expected, attr)
+        assert left is not None
+        assert right is not None
+        assert torch.equal(left, right)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
+)
+def test_tile_centered_kv_token_sharding_invariance() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(709)
+    batch, heads, kv_heads, head_dim = 2, 6, 2, 128
+    shard_split = 128
+    shard1_length = 193
+    total_length = shard_split + shard1_length
+    shard0_sparse_blocks = shard_split // 64
+    shard1_sparse_blocks = shard1_length // 64
+    sparse_key_blocks = shard0_sparse_blocks + shard1_sparse_blocks
+
+    query = torch.randn(
+        (batch, heads, total_length, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    key = torch.randn(
+        (batch, kv_heads, total_length, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    value = torch.randn(
+        (batch, kv_heads, total_length, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+
+    scale = head_dim**-0.5
+    backend = require_attention_backend(query)
+    value_concat_dim = 2 if backend.value_format is ValueFormat.AMD_WMMA else 3
+    full = backend.prepare(
+        query,
+        scale,
+        sparse_key_blocks=sparse_key_blocks,
+        combined_key=key,
+        combined_value=value,
+        emit_summaries=True,
+    )
+    shard0 = backend.prepare(
+        query[:, :, :shard_split],
+        scale,
+        sparse_key_blocks=shard0_sparse_blocks,
+        combined_key=key[:, :, :shard_split],
+        combined_value=value[:, :, :shard_split],
+        emit_summaries=True,
+    )
+    shard1 = backend.prepare(
+        query[:, :, shard_split:],
+        scale,
+        sparse_key_blocks=shard1_sparse_blocks,
+        combined_key=key[:, :, shard_split:],
+        combined_value=value[:, :, shard_split:],
+        emit_summaries=True,
+    )
+    for operand in (full, shard0, shard1):
+        assert operand.query_summary is not None
+        assert operand.key_summary is not None
+        assert operand.key_aux is not None
+
+    cat_kv = {
+        "key": torch.cat((shard0.key, shard1.key), dim=2),
+        "key_scale": torch.cat((shard0.key_scale, shard1.key_scale), dim=2),
+        "key_center": torch.cat((shard0.key_center, shard1.key_center), dim=2),
+        "key_center_scale": torch.cat((shard0.key_center_scale, shard1.key_center_scale), dim=2),
+        "key_summary": torch.cat((shard0.key_summary, shard1.key_summary), dim=2),
+        "key_aux": torch.cat((shard0.key_aux, shard1.key_aux), dim=2),
+        "value": torch.cat((shard0.value, shard1.value), dim=value_concat_dim),
+        "value_scale_multiplier": torch.cat(
+            (shard0.value_scale_multiplier, shard1.value_scale_multiplier), dim=2
+        ),
+        "value_mean": torch.cat((shard0.value_mean, shard1.value_mean), dim=2),
+    }
+    for attr, cat_tensor in cat_kv.items():
+        assert torch.equal(cat_tensor, getattr(full, attr))
+
+    # Mutating the opposite shard must leave every K64/V64 tensor (including tail) unchanged.
+    mutated_key_prefix, mutated_value_prefix = key.clone(), value.clone()
+    mutated_key_prefix[:, :, :shard_split].mul_(-7.0).add_(13.0)
+    mutated_value_prefix[:, :, :shard_split].mul_(-5.0).sub_(9.0)
+    _assert_sparse_kv_shards_match(
+        backend.prepare(
+            query[:, :, shard_split:],
+            scale,
+            sparse_key_blocks=shard1_sparse_blocks,
+            combined_key=mutated_key_prefix[:, :, shard_split:],
+            combined_value=mutated_value_prefix[:, :, shard_split:],
+            emit_summaries=True,
+        ),
+        shard1,
+    )
+
+    mutated_key_suffix, mutated_value_suffix = key.clone(), value.clone()
+    mutated_key_suffix[:, :, shard_split:].mul_(9.0).sub_(11.0)
+    mutated_value_suffix[:, :, shard_split:].mul_(6.0).add_(4.0)
+    _assert_sparse_kv_shards_match(
+        backend.prepare(
+            query[:, :, :shard_split],
+            scale,
+            sparse_key_blocks=shard0_sparse_blocks,
+            combined_key=mutated_key_suffix[:, :, :shard_split],
+            combined_value=mutated_value_suffix[:, :, :shard_split],
+            emit_summaries=True,
+        ),
+        shard0,
+    )
+
+    profile = _SparsePiperRatioProfile((1,) * heads)
+    full_output = _sparse_piper_attention_from_quantized_op(
+        full.query,
+        full.query_scale,
+        full.query_summary,
+        full.key,
+        full.key_scale,
+        full.key_center,
+        full.key_center_scale,
+        full.key_summary,
+        full.key_aux,
+        full.value,
+        full.value_scale_multiplier,
+        full.value_mean,
+        profile,
+        sparse_key_blocks,
+        total_length,
+        0,
+    )
+    sharded_output = _sparse_piper_attention_from_quantized_op(
+        torch.cat((shard0.query, shard1.query), dim=2),
+        torch.cat((shard0.query_scale, shard1.query_scale), dim=2),
+        torch.cat((shard0.query_summary, shard1.query_summary), dim=2),
+        cat_kv["key"],
+        cat_kv["key_scale"],
+        cat_kv["key_center"],
+        cat_kv["key_center_scale"],
+        cat_kv["key_summary"],
+        cat_kv["key_aux"],
+        cat_kv["value"],
+        cat_kv["value_scale_multiplier"],
+        cat_kv["value_mean"],
+        profile,
+        sparse_key_blocks,
+        total_length,
+        0,
+    )
+    assert torch.equal(sharded_output, full_output)

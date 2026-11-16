@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
-    quantize_query_key,
+    quantize_tile_centered_query_key,
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
@@ -16,6 +16,7 @@ _RECURRENCE_ROWS = 128
 _P_UINT8_RANGE = 255.0
 _V_INT8_RANGE = 127.0
 _SCALE_EPSILON = 1e-7
+_VALUE_MEAN_SCALE_FLOOR = 2.0**-80
 
 
 def _active_indices(
@@ -64,21 +65,37 @@ def _active_indices(
     return key_indices, tile_indices, valid_keys
 
 
+def _resolve_valid_tile_rows(
+    sequence_length: int,
+    tile_count: int,
+    block_lengths: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if block_lengths is not None:
+        return valid_block_rows(block_lengths)
+    storage_length = tile_count * _BLOCK_ROWS
+    return (torch.arange(storage_length, device=device) < sequence_length).reshape(
+        tile_count, _BLOCK_ROWS
+    )
+
+
 def _quantize_value_per_tile(
     value_centered: torch.Tensor,
-    block_lengths: torch.Tensor | None = None,
+    value_mean: torch.Tensor,
+    valid_rows: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize centered V with one scalar scale per logical K64 tile."""
     batch, heads, key_length, head_dim = value_centered.shape
-    tile_count = (key_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    tile_count, _ = valid_rows.shape
     storage_length = tile_count * _BLOCK_ROWS
     padded = value_centered.new_zeros((batch, heads, storage_length, head_dim))
     padded[:, :, :key_length] = value_centered
     grouped = padded.reshape(batch, heads, tile_count, _BLOCK_ROWS, head_dim)
-    if block_lengths is not None:
-        valid_rows = valid_block_rows(block_lengths)
-        grouped = torch.where(valid_rows[None, None, :, :, None], grouped, 0)
-    scale = grouped.abs().amax(dim=(3, 4)) / _V_INT8_RANGE + _SCALE_EPSILON
+    grouped = torch.where(valid_rows[None, None, :, :, None], grouped, 0)
+    scale = torch.maximum(
+        grouped.abs().amax(dim=(3, 4)) / _V_INT8_RANGE + _SCALE_EPSILON,
+        value_mean.float().abs().amax(dim=-1) * _VALUE_MEAN_SCALE_FLOOR,
+    )
     quantized = (
         (grouped / scale[..., None, None])
         .round()
@@ -91,12 +108,15 @@ def _quantize_value_per_tile(
 def _quantize_query_key(
     query: torch.Tensor,
     key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Match the native per-Q32 and per-K64 grouped quantization."""
-    return quantize_query_key(
+    valid_key_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Match the native per-Q32 and per-K64 tile-centered grouped quantization."""
+    return quantize_tile_centered_query_key(
         query,
         key,
+        tile_rows=_BLOCK_ROWS,
         granularity="per_warp",
+        valid_key_rows=valid_key_rows,
     )
 
 
@@ -113,10 +133,11 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
 ) -> torch.Tensor:
     """Evaluate the selected quantized Sparse Piper algorithm in PyTorch.
 
-    This matches the native algorithmic contract: grouped INT8 Q/K, centered
-    tile-scaled INT8 V, paired K128 recurrence, UINT8 probabilities, and a
-    pre-rounding FP32 denominator. It is a correctness reference, not a fast
-    fallback.
+    This matches the native algorithmic contract: grouped INT8 Q/K centered per
+    K64 tile with 2-term H(K_mean) centers, V64 tile-centered and tile-scaled
+    INT8 V with BF16 tile means, paired K128 recurrence, UINT8 probabilities,
+    and a pre-rounding FP32 denominator. It is a correctness reference, not a
+    fast fallback.
     """
     batch, sequence, heads, head_dim = query.shape
     query_blocks = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
@@ -132,13 +153,32 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
         value_head_major = torch.where(valid_rows, value_head_major, 0)
 
     value_float = value_head_major.float()
-    value_mean = value_float.mean(dim=2, keepdim=True)
-    value_centered = value_float - value_mean
-    query_int8, key_int8, query_scale, key_scale = _quantize_query_key(
-        query_head_major,
-        key_head_major,
+    tile_count = (sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+    storage_length = tile_count * _BLOCK_ROWS
+    padded_value = value_float.new_zeros((batch, key.shape[2], storage_length, head_dim))
+    padded_value[:, :, :sequence] = value_float
+    grouped_value = padded_value.reshape(batch, key.shape[2], tile_count, _BLOCK_ROWS, head_dim)
+    valid_tile_rows = _resolve_valid_tile_rows(sequence, tile_count, block_lengths, query.device)
+    masked_value = torch.where(valid_tile_rows[None, None, :, :, None], grouped_value, 0.0)
+    valid_count = valid_tile_rows.sum(dim=1, keepdim=True).clamp_min(1.0)
+    value_mean = (masked_value.sum(dim=3) / valid_count[None, None, :, :]).bfloat16()
+    value_centered = torch.where(
+        valid_tile_rows[None, None, :, :, None],
+        masked_value - value_mean.float().unsqueeze(3),
+        0.0,
+    ).flatten(2, 3)[:, :, :sequence]
+    query_int8, key_int8, query_scale, key_scale, key_center, key_center_scale = (
+        _quantize_query_key(
+            query_head_major,
+            key_head_major,
+            valid_tile_rows,
+        )
     )
-    value_int8, value_scale = _quantize_value_per_tile(value_centered, block_lengths)
+    value_int8, value_scale = _quantize_value_per_tile(
+        value_centered,
+        value_mean,
+        valid_tile_rows,
+    )
     output = torch.empty_like(query_head_major)
     route_head_offsets = routes.route_head_offsets.detach().cpu().tolist()
 
@@ -166,6 +206,11 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     0,
                     tile_indices,
                 )
+                selected_key_center = key_center[batch_index, kv_head].index_select(0, tile_indices)
+                selected_key_center_scale = key_center_scale[batch_index, kv_head].index_select(
+                    0, tile_indices
+                )
+                selected_value_mean = value_mean[batch_index, kv_head].index_select(0, tile_indices)
                 query_start = query_block * _BLOCK_ROWS
                 query_stop = min(query_start + _BLOCK_ROWS, sequence)
                 block_query = query_int8[batch_index, head, query_start:query_stop]
@@ -184,6 +229,19 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
 
                 for pair_start in range(0, key_indices.numel(), _RECURRENCE_ROWS):
                     pair_stop = min(pair_start + _RECURRENCE_ROWS, key_indices.numel())
+                    pair_tile_start = pair_start // _BLOCK_ROWS
+                    pair_tile_stop = (pair_stop + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+                    pair_centers = selected_key_center[pair_tile_start:pair_tile_stop]
+                    pair_center_scales = selected_key_center_scale[pair_tile_start:pair_tile_stop]
+                    pair_rotated_means = (
+                        pair_centers[:, 0].float() * pair_center_scales[:, 0, None]
+                        + pair_centers[:, 1].float() * pair_center_scales[:, 1, None]
+                    )
+                    k_bias = (
+                        (block_query.float() @ pair_rotated_means.mT)
+                        * block_query_scale[:, None]
+                        * scale
+                    ).repeat_interleave(_BLOCK_ROWS, dim=-1)[:, : pair_stop - pair_start]
                     integer_scores = (
                         block_query.float() @ selected_key[pair_start:pair_stop].float().mT
                     )
@@ -192,14 +250,13 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                         * block_query_scale[:, None]
                         * selected_key_scale[None, pair_start:pair_stop]
                         * scale
+                        + k_bias
                     )
                     if valid_keys is not None:
                         scores = scores.masked_fill(
                             ~valid_keys[pair_start:pair_stop][None, :],
                             -float("inf"),
                         )
-                    pair_tile_start = pair_start // _BLOCK_ROWS
-                    pair_tile_stop = (pair_stop + _BLOCK_ROWS - 1) // _BLOCK_ROWS
                     pair_value_scales = selected_value_scale[pair_tile_start:pair_tile_stop]
                     row_value_scales = pair_value_scales.repeat_interleave(
                         _BLOCK_ROWS,
@@ -220,21 +277,22 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                         probability_start = tile_start - pair_start
                         probability_stop = tile_stop - pair_start
                         tile_ordinal = tile_start // _BLOCK_ROWS
+                        probability_tile = probabilities[:, probability_start:probability_stop]
                         probability_codes = (
-                            (
-                                probabilities[:, probability_start:probability_stop]
-                                * selected_value_scale[tile_ordinal]
-                                * _P_UINT8_RANGE
-                            )
+                            (probability_tile * selected_value_scale[tile_ordinal] * _P_UINT8_RANGE)
                             .round()
                             .clamp(0, _P_UINT8_RANGE)
                         )
                         partial = probability_codes @ selected_value[tile_start:tile_stop].float()
-                        numerator += partial * current_weight[:, None]
+                        tile_mass = probability_tile.sum(dim=-1)
+                        numerator += (
+                            partial * current_weight[:, None]
+                            + (tile_mass * current_weight * _P_UINT8_RANGE)[:, None]
+                            * selected_value_mean[tile_ordinal].float()[None, :]
+                        )
                     running_max = next_max
 
                 block_output = numerator / (denominator.clamp_min(1e-30)[:, None] * _P_UINT8_RANGE)
-                block_output += value_mean[batch_index, kv_head]
                 output[batch_index, head, query_start:query_stop] = block_output.to(query.dtype)
 
     return output.transpose(1, 2).contiguous()

@@ -533,11 +533,13 @@ def _quantized_context_arguments(head_dim=128):
     return {
         "key": torch.zeros(1, 1, 128, head_dim, dtype=torch.int8),
         "key_scale": torch.ones(1, 1, 2),
+        "key_center": torch.zeros(1, 1, 2, 2, head_dim, dtype=torch.int8),
+        "key_center_scale": torch.ones(1, 1, 2, 2),
         "key_summary": torch.zeros(1, 1, 2, head_dim),
         "key_aux": torch.zeros(1, 1, 2, head_dim),
         "value": torch.zeros(1, 1, head_dim, 128, dtype=torch.int8),
         "value_scale_multiplier": torch.ones(1, 1, 2, 1),
-        "value_mean": torch.zeros(1, 1, head_dim),
+        "value_mean": torch.zeros(1, 1, 2, head_dim, dtype=torch.bfloat16),
         "ratio_profile": _SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
         "sparse_key_blocks": 2,
         "logical_sequence_length": 128,
@@ -549,7 +551,7 @@ def _quantized_context_arguments(head_dim=128):
 def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeypatch, coarse):
     arguments = _quantized_context_arguments()
     if coarse:
-        arguments.update(block_mean=torch.ones(1, 1, 2, 128), coarse_scale=0.1, coarse_key_blocks=2)
+        arguments.update(coarse_scale=0.1, coarse_key_blocks=2)
     launch = Mock()
     select = Mock(
         return_value=AttentionBackend(
@@ -627,6 +629,8 @@ def test_shared_quantized_validation_rejects_cross_device_query():
     context = _prepare_sparse_piper_context_from_quantized(
         arguments["key"],
         arguments["key_scale"],
+        arguments["key_center"],
+        arguments["key_center_scale"],
         arguments["value"],
         arguments["value_scale_multiplier"],
         arguments["value_mean"],
@@ -651,6 +655,8 @@ def test_prepared_query_must_match_context_head_width():
     context = _prepare_sparse_piper_context_from_quantized(
         arguments["key"],
         arguments["key_scale"],
+        arguments["key_center"],
+        arguments["key_center_scale"],
         arguments["value"],
         arguments["value_scale_multiplier"],
         arguments["value_mean"],
@@ -767,6 +773,8 @@ def _prepared_attention(head_dim, routes_per_query):
     context = _prepare_sparse_piper_context_from_quantized(
         arguments["key"],
         arguments["key_scale"],
+        arguments["key_center"],
+        arguments["key_center_scale"],
         arguments["value"],
         arguments["value_scale_multiplier"],
         arguments["value_mean"],

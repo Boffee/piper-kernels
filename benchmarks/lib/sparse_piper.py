@@ -38,23 +38,14 @@ def assert_equal_finite(actual: torch.Tensor, expected: torch.Tensor) -> None:
         torch.testing.assert_close(left, right, rtol=0, atol=0)
 
 
-def reference_prepared_query(
+def _selected_tiles_and_validity(
     prepared: _PreparedSparsePiperAttention,
     batch: int,
     head: int,
     query_block: int,
-    *,
-    output_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Independent FP64 paired attention for one query block and one head.
-
-    Quantized operands are shared with the kernel, but matrix products and
-    probability quantization use PyTorch FP64. Pair results are combined with
-    a single global normalization, not the kernel's online FP32 recurrence.
-    Memory scales with one selected sequence, never the full attention matrix.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Resolve one query block's paired block indices and valid-token mask."""
     query, context = prepared.query, prepared.context
-    kv_head = head // (query.data.shape[1] // context.key.shape[1])
     device = query.data.device
     global_block = query.global_block_offset + query_block
     stored_blocks = context.key.shape[2] // 64
@@ -79,15 +70,47 @@ def reference_prepared_query(
         valid = (offsets < context.block_lengths[tiles, None]).flatten()
         rows = 64
     valid &= torch.arange(indices.numel(), device=device) < tile_count * 64
+    return tiles, indices, valid, rows
+
+
+def reference_prepared_query(
+    prepared: _PreparedSparsePiperAttention,
+    batch: int,
+    head: int,
+    query_block: int,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Independent FP64 paired attention for one query block and one head.
+
+    Quantized operands are shared with the kernel, but matrix products and
+    probability quantization use PyTorch FP64. Pair results are combined with
+    a single global normalization, not the kernel's online FP32 recurrence.
+    Memory scales with one selected sequence, never the full attention matrix.
+    """
+    query, context = prepared.query, prepared.context
+    kv_head = head // (query.data.shape[1] // context.key.shape[1])
+    tiles, indices, valid, rows = _selected_tiles_and_validity(prepared, batch, head, query_block)
     pairs = tiles.numel() // 2
     q = query.data[batch, head, query_block * 64 : query_block * 64 + rows].double()
-    q_scale = query.scale[batch, head, query_block * 2 : query_block * 2 + 2].repeat_interleave(32)
+    q_scale = (
+        query.scale[batch, head, query_block * 2 : query_block * 2 + 2]
+        .repeat_interleave(32)
+        .double()
+    )
     k = context.key[batch, kv_head].index_select(0, indices).double()
-    k_scale = context.key_scale[batch, kv_head, tiles].repeat_interleave(64)
+    k_scale = context.key_scale[batch, kv_head, tiles].repeat_interleave(64).double()
+    key_center = context.key_center[batch, kv_head, tiles]
+    key_center_scale = context.key_center_scale[batch, kv_head, tiles]
+    rotated_mean = (
+        key_center[:, 0].double() * key_center_scale[:, 0, None].double()
+        + key_center[:, 1].double() * key_center_scale[:, 1, None].double()
+    )
+    k_bias = ((q @ rotated_mean.T) * q_scale[:rows, None]).repeat_interleave(64, dim=-1)
     multiplier = (
         context.value_scale_multiplier[batch, kv_head, tiles, 0].repeat_interleave(64).double()
     )
-    scores = (q @ k.T) * q_scale[:rows, None].double() * k_scale[None, :].double()
+    scores = (q @ k.T) * q_scale[:rows, None] * k_scale[None, :] + k_bias
     scores = (
         scores.masked_fill(~valid[None, :], -torch.inf).reshape(rows, pairs, 128).transpose(0, 1)
     )
@@ -107,10 +130,16 @@ def reference_prepared_query(
     values = values.reshape(pairs, 128, query.data.shape[-1]).double()
     products = torch.bmm(codes, values)
     weights = torch.exp2(pair_max - pair_max.amax(dim=0))
-    numerator = (products * weights[:, :, None]).sum(dim=0)
+    tile_masses = (
+        probabilities.reshape(pairs, rows, 2, 64).sum(dim=-1) * weights[:, :, None] * 255.0
+    )
+    tile_means = context.value_mean[batch, kv_head, tiles].reshape(pairs, 2, -1).double()
+    numerator = (products * weights[:, :, None]).sum(dim=0) + (
+        tile_masses.transpose(0, 1).reshape(rows, pairs * 2) @ tile_means.reshape(pairs * 2, -1)
+    )
     denominator = (probabilities.sum(dim=-1) * weights).sum(dim=0)
     output = numerator / (denominator.clamp_min(1e-30)[:, None] * 255)
-    return (output + context.value_mean[batch, kv_head].double()).to(output_dtype)
+    return output.to(output_dtype)
 
 
 def check_query_samples(

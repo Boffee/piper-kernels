@@ -9,7 +9,16 @@ from piper_kernels.attention.kernels.sparse_piper import triton as primitives
 
 
 @triton.jit
-def _store_last_head(data, scales, summary, means, length: tl.constexpr, kind: tl.constexpr):
+def _store_last_head(
+    data,
+    scales,
+    centers,
+    center_scales,
+    summary,
+    means,
+    length: tl.constexpr,
+    kind: tl.constexpr,
+):
     head = tl.full((1,), 55, tl.int32)
     rows = tl.arange(0, 64)
     values = tl.full((64, 1, 128), 1.0, tl.float32)
@@ -18,6 +27,8 @@ def _store_last_head(data, scales, summary, means, length: tl.constexpr, kind: t
             values,
             data,
             scales,
+            centers,
+            center_scales,
             summary,
             summary,
             scales,
@@ -38,10 +49,9 @@ def _store_last_head(data, scales, summary, means, length: tl.constexpr, kind: t
     elif kind == "value":
         primitives.store_value_tile(
             values,
-            means,
             data,
             scales,
-            summary,
+            means,
             scales,
             0,
             56,
@@ -51,7 +61,6 @@ def _store_last_head(data, scales, summary, means, length: tl.constexpr, kind: t
             length,
             0,
             False,
-            True,
             1,
             128,
             64,
@@ -95,9 +104,11 @@ def test_store_last_head_uses_full_address(kind):
         pytest.skip("Not enough free device memory for the large-address regression")
     data = torch.full((56, length * 128), -7, device="cuda", dtype=torch.int8)
     scales = torch.empty((56, length // 16), device="cuda", dtype=torch.float32)
+    centers = torch.empty((56, length // 64, 2, 128), device="cuda", dtype=torch.int8)
+    center_scales = torch.empty((56, length // 64, 2), device="cuda", dtype=torch.float32)
     summary = torch.empty((56, length // 64, 128), device="cuda")
-    means = torch.zeros((56, 128), device="cuda")
-    _store_last_head[(1,)](data, scales, summary, means, length, kind)
+    means = torch.empty((56, length // 64, 128), device="cuda", dtype=torch.bfloat16)
+    _store_last_head[(1,)](data, scales, centers, center_scales, summary, means, length, kind)
     torch.cuda.synchronize()
     if kind == "value":
         written = data[55].view(128, length)[:, :64]
@@ -106,7 +117,7 @@ def test_store_last_head_uses_full_address(kind):
         written = data[55, : 64 * 128]
         untouched = data[55, 64 * 128 : 128 * 128]
     reference = torch.full((56, 128 * 128), -7, device="cuda", dtype=torch.int8)
-    _store_last_head[(1,)](reference, scales, summary, means, 128, kind)
+    _store_last_head[(1,)](reference, scales, centers, center_scales, summary, means, 128, kind)
     expected = (
         reference[55].view(128, 128)[:, :64] if kind == "value" else reference[55, : 64 * 128]
     )

@@ -24,7 +24,7 @@ def tile_offset(
     if skip_dense_routing:
         return position * tile_stride
     else:
-        safe_position = gl.minimum(position, routed_count - 1)
+        safe_position = gl.minimum(position, gl.maximum(routed_count - 1, 0))
         route = gl.load(routes + safe_position * route_stride).to(gl.int32)
         sparse_tile = gl.where(use_routes, route, position)
         sparse_start = sparse_tile * tile_stride

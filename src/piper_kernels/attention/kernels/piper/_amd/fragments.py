@@ -186,6 +186,9 @@ def query_fragments(
     return fragments
 
 
+_INTEGER_SUM_BIAS = gl.constexpr(0x3E22F983)
+
+
 @gluon.jit
 def qk_tiles(
     query,
@@ -218,7 +221,7 @@ def qk_tiles(
             # All D64/D128 INT8 dot products are bounded by 2^21. This integer
             # bias keeps the result bits in one FP32 binade; the FMA below
             # recovers the exact integer sum without integer-to-float conversion.
-            bias = gl.full([1, 128], 0x3E22F983, gl.int32, VECTOR_LAYOUT)
+            bias = gl.full([1, 128], _INTEGER_SUM_BIAS, gl.int32, VECTOR_LAYOUT)
             acc = (bias, bias, bias, bias, bias, bias, bias, bias)
             for k in gl.static_range(head_dim // 16):
                 offset = (
@@ -235,7 +238,58 @@ def qk_tiles(
 
 
 @gluon.jit
-def softmax_fragment(scores, maximum, scale, inverse_multiplier, log_multiplier):
+def qk_center_bias_pair(
+    query,
+    key_center_ptr,
+    key_center_scale_ptr,
+    tile_0,
+    tile_1,
+    query_scale,
+    use_64bit_context_offsets: gl.constexpr,
+    head_dim: gl.constexpr,
+):
+    """Compute Q64 @ H(K_mean)^T * Q_scale score biases for two K64 tiles."""
+    offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
+    lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
+    tile_0_index = gl.sum(tile_0, 0).to(offset_type)
+    tile_1_index = gl.sum(tile_1, 0).to(offset_type)
+    col = lane % 16
+    base_0 = tile_0_index * (2 * head_dim)
+    base_1 = tile_1_index * (2 * head_dim)
+    # Output columns 0..1 hold tile_0's 2-term H(K_mean) rows; 2..3 hold tile_1's.
+    row_offset = gl.where(
+        col < 2,
+        base_0 + col * head_dim,
+        gl.where(col < 4, base_1 + (col - 2) * head_dim, base_0),
+    ).to(offset_type)
+    bias = gl.full([1, 128], _INTEGER_SUM_BIAS, gl.int32, VECTOR_LAYOUT)
+    acc = (bias, bias, bias, bias, bias, bias, bias, bias)
+    for k in gl.static_range(head_dim // 16):
+        offset = (
+            row_offset[None, :] + (k // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8
+        ).to(offset_type)
+        key = gl.load((key_center_ptr + offset).to(gl.pointer_type(gl.uint64)))
+        acc = int8_wmma(query[k], key, acc, 0)
+    recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
+    col_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT))
+    col_idx = gl.arange(0, 16, col_layout)[None, None, :]
+    row_layout: gl.constexpr = query_scale.type.layout
+    dot_0 = gl.convert_layout(gl.sum(gl.where(col_idx == 0, recovered, 0.0), axis=2), row_layout)
+    dot_1 = gl.convert_layout(gl.sum(gl.where(col_idx == 1, recovered, 0.0), axis=2), row_layout)
+    dot_2 = gl.convert_layout(gl.sum(gl.where(col_idx == 2, recovered, 0.0), axis=2), row_layout)
+    dot_3 = gl.convert_layout(gl.sum(gl.where(col_idx == 3, recovered, 0.0), axis=2), row_layout)
+    scale_00 = gl.load(key_center_scale_ptr + tile_0_index * 2)
+    scale_01 = gl.load(key_center_scale_ptr + tile_0_index * 2 + 1)
+    scale_10 = gl.load(key_center_scale_ptr + tile_1_index * 2)
+    scale_11 = gl.load(key_center_scale_ptr + tile_1_index * 2 + 1)
+    return (
+        gl.fma(dot_0, scale_00, dot_1 * scale_01) * query_scale,
+        gl.fma(dot_2, scale_10, dot_3 * scale_11) * query_scale,
+    )
+
+
+@gluon.jit
+def softmax_fragment(scores, maximum, scale, inverse_multiplier, log_multiplier, k_bias=None):
     """Pack a sparse fragment with a tile-wide V scale and unrounded denominator."""
     row_layout: gl.constexpr = maximum.type.layout
     maximum = gl.convert_layout(maximum, gl.SliceLayout(2, scores.type.layout))
@@ -243,7 +297,11 @@ def softmax_fragment(scores, maximum, scale, inverse_multiplier, log_multiplier)
     scalar_layout: gl.constexpr = gl.SliceLayout(1, maximum.type.layout)
     log_multiplier = gl.convert_layout(log_multiplier, scalar_layout)
     inverse_multiplier = gl.convert_layout(inverse_multiplier, scalar_layout)
-    offset = log_multiplier[:, None] - maximum
+    if k_bias is None:
+        offset = log_multiplier[:, None] - maximum
+    else:
+        k_bias_local = gl.convert_layout(k_bias, maximum.type.layout)
+        offset = log_multiplier[:, None] + k_bias_local - maximum
     probability = gl.exp2(gl.fma(scores, scale[:, :, None], offset[:, :, None]))
     total = gl.convert_layout(gl.sum(probability, 2) * inverse_multiplier[:, None], row_layout)
     return pack_probabilities(probability), total

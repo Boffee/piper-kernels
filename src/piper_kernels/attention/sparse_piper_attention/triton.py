@@ -17,7 +17,6 @@ from piper_kernels.attention.kernels.sparse_piper import (
     triton as sparse_piper_kernels,
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, ValueFormat
-from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 
 from ._block_layout import valid_block_rows, validate_sparse_query_blocks
 from ._prepared import _PreparedSparsePiperOperands
@@ -59,29 +58,27 @@ def _quantize_value_per_tile_kernel(
     block_n: tl.constexpr,
     mask_block_lengths: tl.constexpr,
 ):
-    """Quantize one K64 storage tile while masking the logical V tail."""
-    key_block = tl.program_id(0)
-    batch_head = tl.program_id(1)
+    """Per-K64 tile-center and quantize one storage tile while masking the tail."""
+    key_block = tl.program_id(0).to(tl.int64)
+    batch_head = tl.program_id(1).to(tl.int64)
     batch = batch_head // heads
     head = batch_head % heads
-    offsets_n = key_block * block_n + tl.arange(0, block_n)
-    offsets_d = tl.arange(0, head_dim)
-    valid_rows = offsets_n < key_length
-    if mask_block_lengths:
-        valid_rows &= offsets_n - key_block * block_n < tl.load(block_lengths_ptr + key_block)
-    value = tl.load(
-        value_ptr
-        + batch * stride_vb
-        + head * stride_vh
-        + offsets_n[:, None] * stride_vn
-        + offsets_d[None, :],
-        mask=valid_rows[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    value_mean = tl.load(value_mean_ptr + batch_head * head_dim + offsets_d)
-    quantized, value_scale_multiplier = sparse_piper_kernels.quantize_value_tile(  # pyright: ignore[reportGeneralTypeIssues]
+    value, valid_rows, offsets_n, offsets_d = _load_row_tile(
+        value_ptr,
+        key_block,
+        head,
+        batch,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        block_lengths_ptr,
+        key_length,
+        mask_block_lengths,
+        head_dim,
+        block_n,
+    )
+    quantized, value_scale_multiplier, value_mean = sparse_piper_kernels.quantize_value_tile(  # pyright: ignore[reportGeneralTypeIssues]
         tl.reshape(value, (block_n, 1, head_dim)),
-        tl.reshape(value_mean, (1, head_dim)),
         valid_rows,
         tl.constexpr(1),
         head_dim,
@@ -90,7 +87,12 @@ def _quantize_value_per_tile_kernel(
     )
     quantized = tl.reshape(quantized, (block_n, head_dim))
     value_scale_multiplier = tl.reshape(value_scale_multiplier, ())
+    value_mean = tl.reshape(value_mean, (head_dim,))
     tile_count = tl.cdiv(key_length, block_n)
+    tl.store(
+        value_mean_ptr + (batch_head * tile_count + key_block) * head_dim + offsets_d,
+        value_mean,
+    )
     tl.store(
         value_scale_ptr + batch_head * tile_count + key_block,
         value_scale_multiplier,
@@ -227,9 +229,10 @@ def _quantize_query_with_summary_kernel(
 @triton.jit(do_not_specialize=_FUSED_DO_NOT_SPECIALIZE)
 def _quantize_key_with_summary_kernel(
     key_ptr,
-    key_mean_ptr,
     key_int8_ptr,
     key_scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
     key_summary_ptr,
     key_aux_ptr,
     block_lengths_ptr,
@@ -244,8 +247,8 @@ def _quantize_key_with_summary_kernel(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    """Quantize one centered K64 tile and emit min/max routing summaries of the raw tile."""
-    key_block = tl.program_id(0)
+    """Quantize one K64-centered tile and emit min/max routing summaries of the raw tile."""
+    key_block = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     batch = tl.program_id(2)
     values, valid_rows, sequence_offsets, features = _load_row_tile(
@@ -277,17 +280,15 @@ def _quantize_key_with_summary_kernel(
         tl.store(key_summary_ptr + summary_offsets, tl.reshape(summary, (head_dim,)))
         tl.store(key_aux_ptr + summary_offsets, tl.reshape(auxiliary, (head_dim,)))
 
-    # Centering sees only the logical length, as the separate quantizer did, so a
-    # zeroed padded row still centers to -mean and shares its tile's scale.
-    mean = tl.load(key_mean_ptr + head_block * head_dim + features)
-    logical_rows = sequence_offsets < logical_sequence_length
-    centered = tl.where(logical_rows[:, None], values - mean[None, :], 0.0)
-    quantized, key_scale = qk_quantization.quantize_key_tile(
-        tl.reshape(centered, (block_n, 1, head_dim)),
-        tl.constexpr(1),
-        head_dim,
-        block_n,
-        block_n,
+    quantized, key_scale, center_0, center_1, center_scale_0, center_scale_1 = (
+        qk_quantization.quantize_tile_centered_key_tile(
+            tl.reshape(values, (block_n, 1, head_dim)),
+            tl.reshape(valid_rows, (1, block_n)),
+            tl.constexpr(1),
+            head_dim,
+            block_n,
+            block_n,
+        )
     )
     tl.store(
         key_int8_ptr
@@ -296,28 +297,42 @@ def _quantize_key_with_summary_kernel(
         + features[None, :],
         tl.reshape(quantized, (block_n, head_dim)),
     )
+    tile_count = storage_sequence_length // block_n
+    tile_offset = head_block * tile_count + key_block
     tl.store(
-        key_scale_ptr + head_block * (storage_sequence_length // block_n) + key_block,
+        key_scale_ptr + tile_offset,
         tl.reshape(key_scale, ()),
+    )
+    qk_quantization.store_key_center_tile(
+        key_center_ptr,
+        key_center_scale_ptr,
+        tile_offset,
+        center_0,
+        center_1,
+        center_scale_0,
+        center_scale_1,
+        features,
+        head_dim,
     )
 
 
 def _prepare_query_key_with_summaries(
     query: torch.Tensor,
     key: torch.Tensor,
-    key_mean: torch.Tensor,
     scale: float,
     *,
     storage_sequence_length: int,
     sparse_key_blocks: int,
     block_lengths: torch.Tensor | None,
-) -> tuple[qk_quantization.PreparedInt8QueryKey, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize Q/K and emit their min/max K64 summaries in one pass over each operand.
-
-    The separate summary pass reads Q and K a second time. Emitting both from
-    one load halves those reads and removes two launches; the quantization and
-    summary arithmetic are the shared primitives, so results are unchanged.
-    """
+) -> tuple[
+    qk_quantization.PreparedInt8QueryKey,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Quantize Q/K (K64 tile-centered) and emit min/max K64 summaries in one pass."""
     batch, heads, sequence_length, head_dim = query.shape
     kv_heads = key.shape[1]
     blocks = storage_sequence_length // _BLOCK_N
@@ -333,6 +348,12 @@ def _prepare_query_key_with_summaries(
         (batch, kv_heads, storage_sequence_length, head_dim), device=key.device, dtype=torch.int8
     )
     key_scale = torch.empty((batch, kv_heads, blocks), device=key.device, dtype=torch.float32)
+    key_center = torch.empty(
+        (batch, kv_heads, blocks, 2, head_dim), device=key.device, dtype=torch.int8
+    )
+    key_center_scale = torch.empty(
+        (batch, kv_heads, blocks, 2), device=key.device, dtype=torch.float32
+    )
     query_summary = torch.empty(
         (batch, heads, blocks, head_dim), device=query.device, dtype=torch.float32
     )
@@ -340,7 +361,7 @@ def _prepare_query_key_with_summaries(
         (batch, kv_heads, sparse_key_blocks, head_dim), device=key.device, dtype=torch.float32
     )
     key_aux = torch.empty_like(key_primary)
-    lengths_or_placeholder = block_lengths if block_lengths is not None else key_mean
+    lengths_or_placeholder = block_lengths if block_lengths is not None else key_scale
     with device_context(query.device):
         _quantize_query_with_summary_kernel[(blocks, heads, batch)](
             query,
@@ -363,9 +384,10 @@ def _prepare_query_key_with_summaries(
         )
         _quantize_key_with_summary_kernel[(blocks, kv_heads, batch)](
             key,
-            key_mean,
             key_int8,
             key_scale,
+            key_center,
+            key_center_scale,
             key_primary,
             key_aux,
             lengths_or_placeholder,
@@ -387,7 +409,7 @@ def _prepare_query_key_with_summaries(
         query_scale=query_scale,
         key_scale=key_scale,
     )
-    return prepared, query_summary, key_primary, key_aux
+    return prepared, key_center, key_center_scale, query_summary, key_primary, key_aux
 
 
 def _prepare_sparse_piper_operands(
@@ -432,7 +454,6 @@ def _prepare_sparse_piper_operands(
         valid_rows = valid_block_rows(block_lengths).reshape(-1)
         valid_rows = valid_rows[None, None, :, None]
         query = torch.where(valid_rows, query, 0)
-        combined_key = torch.where(valid_rows, combined_key, 0)
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
     storage_sequence_length = tile_count * _BLOCK_N
     validate_sparse_query_blocks(
@@ -441,32 +462,38 @@ def _prepare_sparse_piper_operands(
         context="sparse Piper",
     )
 
-    key_mean, value_mean = piper_quantization.compute_kv_means(
-        combined_key,
-        combined_value,
-        is_causal=False,
-        block_lengths=block_lengths,
-    )
     query_summary = key_summary = key_aux = None
     if emit_summaries:
-        prepared_qk, query_summary, key_summary, key_aux = _prepare_query_key_with_summaries(
+        (
+            prepared_qk,
+            key_center,
+            key_center_scale,
+            query_summary,
+            key_summary,
+            key_aux,
+        ) = _prepare_query_key_with_summaries(
             query,
             combined_key,
-            key_mean,
             scale,
             storage_sequence_length=storage_sequence_length,
             sparse_key_blocks=sparse_key_blocks,
             block_lengths=block_lengths,
         )
+        query_int8, query_scale = prepared_qk.query, prepared_qk.query_scale
+        key_int8, key_scale = prepared_qk.key, prepared_qk.key_scale
     else:
-        prepared_qk = qk_quantization.prepare_query_key(
+        query_int8, query_scale = qk_quantization.prepare_query(
             query,
-            combined_key,
-            key_mean,
             scale,
             grouped=True,
-            storage_key_length=storage_sequence_length,
             storage_query_length=storage_sequence_length,
+        )
+        key_int8, key_scale, key_center, key_center_scale = (
+            qk_quantization.prepare_tile_centered_key(
+                combined_key,
+                storage_key_length=storage_sequence_length,
+                block_lengths=block_lengths,
+            )
         )
     value_int8 = torch.empty(
         value_format.shape(batch, kv_heads, storage_sequence_length, head_dim),
@@ -478,6 +505,11 @@ def _prepare_sparse_piper_operands(
         device=combined_value.device,
         dtype=torch.float32,
     )
+    value_mean = torch.empty(
+        (batch, kv_heads, tile_count, head_dim),
+        device=combined_value.device,
+        dtype=torch.bfloat16,
+    )
 
     with device_context(query.device):
         _quantize_value_per_tile_kernel[(tile_count, batch * kv_heads)](
@@ -485,7 +517,7 @@ def _prepare_sparse_piper_operands(
             value_mean,
             value_scale_multiplier,
             value_int8,
-            block_lengths if block_lengths is not None else value_mean,
+            block_lengths if block_lengths is not None else value_scale_multiplier,
             logical_sequence_length,
             combined_value.stride(0),
             combined_value.stride(1),
@@ -498,14 +530,16 @@ def _prepare_sparse_piper_operands(
             num_warps=4,
         )
     return _PreparedSparsePiperOperands(
-        key=prepared_qk.key,
+        key=key_int8,
         value=value_int8,
         value_format=value_format,
-        key_scale=prepared_qk.key_scale,
+        key_scale=key_scale,
+        key_center=key_center,
+        key_center_scale=key_center_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,
-        query=prepared_qk.query,
-        query_scale=prepared_qk.query_scale,
+        query=query_int8,
+        query_scale=query_scale,
         block_lengths=block_lengths,
         sparse_key_blocks=sparse_key_blocks,
         sparse_query_blocks=sparse_query_blocks,

@@ -11,7 +11,9 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import 
     rotate_signed_hadamard_heads,
 )
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    encode_residual_int8,
     quantize_query_key,
+    quantize_tile_centered_query_key,
 )
 
 
@@ -167,3 +169,66 @@ def test_query_key_quantization_preserves_offsets_above_int32(
     )
     torch.testing.assert_close(key, expected_key, atol=0, rtol=0)
     torch.testing.assert_close(key_scale, expected_key_scale, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("granularity", ["per_thread", "per_warp"])
+def test_quantize_tile_centered_query_key_masks_block_lengths(granularity: str) -> None:
+    torch.manual_seed(79)
+    query = torch.randn(2, 2, 128, 64, dtype=torch.bfloat16)
+    key = torch.randn(2, 2, 128, 64, dtype=torch.bfloat16)
+    valid_key_rows = torch.zeros((2, 64), dtype=torch.bool)
+    valid_key_rows[0, :17] = True
+    valid_key_rows[1, :51] = True
+
+    (
+        query_int8,
+        key_int8,
+        query_scale,
+        key_scale,
+        key_center,
+        key_center_scale,
+    ) = quantize_tile_centered_query_key(
+        query,
+        key,
+        tile_rows=64,
+        granularity=granularity,  # type: ignore[arg-type]
+        valid_key_rows=valid_key_rows,
+    )
+
+    masked_tiles = key.float().reshape(2, 2, 2, 64, 64) * valid_key_rows[None, None, :, :, None]
+    counts = valid_key_rows.sum(dim=1).clamp_min(1.0)[None, None, :, None, None]
+    expected_mean = masked_tiles.sum(dim=3, keepdim=True) / counts
+    expected_center, expected_center_scale = encode_residual_int8(
+        rotate_signed_hadamard_heads(expected_mean.squeeze(3))
+    )
+    torch.testing.assert_close(key_center, expected_center, atol=0, rtol=0)
+    torch.testing.assert_close(key_center_scale, expected_center_scale, atol=1e-6, rtol=1e-6)
+    assert query_int8.shape == query.shape
+    assert key_int8.shape == key.shape
+    assert query_scale.shape == query.shape[:3]
+    assert key_scale.shape == key.shape[:3]
+    invalid = ~valid_key_rows.reshape(128)
+    assert bool((key_int8[:, :, invalid] == 0).all())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("large_device_memory")
+@pytest.mark.parametrize("strided_axis", [0, 1, 2], ids=["batch", "head", "sequence"])
+def test_tile_centered_key_quantization_preserves_offsets_above_int32(strided_axis: int) -> None:
+    """Small logical tensors exercise addresses beyond 2**31 elements."""
+    if torch.cuda.mem_get_info()[0] < 7 * 2**30:
+        pytest.skip("requires 7 GiB free for strided input and output storage")
+    shape = [1, 1, 1, 128]
+    shape[strided_axis] = 3
+    torch.manual_seed(84)
+    compact = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    strides = list(compact.stride())
+    strides[strided_axis] = 2**30
+    strided = torch.empty_strided(shape, strides, device="cuda", dtype=torch.bfloat16)
+    strided.copy_(compact)
+
+    expected = triton_qk_quantization.prepare_tile_centered_key(compact, storage_key_length=64)
+    actual = triton_qk_quantization.prepare_tile_centered_key(strided, storage_key_length=64)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)

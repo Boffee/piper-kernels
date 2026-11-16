@@ -30,8 +30,8 @@ class PreparedInt8QueryKey:
 
     ``query_scale`` includes the attention softmax scale and the conversion
     from natural exponentials to the base-2 recurrence used by the attention
-    kernels. ``key`` is centered by ``key_mean`` before the signed Hadamard
-    transform and quantization.
+    kernels. ``key`` is centered globally (by ``key_mean``) or per tile/chunk
+    before the signed Hadamard transform and quantization.
     """
 
     query: torch.Tensor
@@ -169,35 +169,89 @@ def quantize_query_per_thread_tile(
 
 
 @triton.jit
-def quantize_key_tile(
+def encode_residual_int8_tile(values):
+    """Encode an FP32 [heads, tiles, D] tile as two residual INT8 terms + scales."""
+    max_0 = tl.max(tl.abs(values), axis=2)
+    scale_0 = max_0 / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
+    quantized_0 = round_to_int8(values / scale_0[:, :, None])
+    residual = values - quantized_0.to(tl.float32) * scale_0[:, :, None]
+    max_1 = tl.max(tl.abs(residual), axis=2)
+    scale_1 = max_1 / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
+    quantized_1 = round_to_int8(residual / scale_1[:, :, None])
+    return quantized_0, quantized_1, scale_0, scale_1
+
+
+@triton.jit
+def store_key_center_tile(
+    key_center_ptr,
+    key_center_scale_ptr,
+    tile_offset,
+    center_0,
+    center_1,
+    center_scale_0,
+    center_scale_1,
+    feature_offsets,
+    head_dim: tl.constexpr,
+):
+    """Store one tile's 2-term INT8 H(K_mean) center and FP32 residual scales."""
+    center_base = tile_offset * 2
+    tl.store(
+        key_center_ptr + center_base * head_dim + feature_offsets,
+        tl.reshape(center_0, (head_dim,)),
+    )
+    tl.store(
+        key_center_ptr + (center_base + 1) * head_dim + feature_offsets,
+        tl.reshape(center_1, (head_dim,)),
+    )
+    tl.store(key_center_scale_ptr + center_base, tl.reshape(center_scale_0, ()))
+    tl.store(key_center_scale_ptr + center_base + 1, tl.reshape(center_scale_1, ()))
+
+
+@triton.jit
+def quantize_tile_centered_key_tile(
     values,
+    valid,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Encode one tile of values after any caller-required K centering."""
+    """Tile-center and INT8-encode K in one Hadamard pass plus 2-term H(K_mean).
+
+    ``values`` must already be zeroed outside ``valid`` so the Hadamard
+    butterfly never mixes uninitialized/padded elements into valid features.
+    """
     smoothed = rotate_signed_hadamard_heads(
         tl.reshape(values, (block_m * heads_per_program, head_dim)),
         head_dim,
     )
-    smoothed = tl.permute(
-        tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
-        (1, 0, 2),
-    )
+    num_tiles: tl.constexpr = block_m // scale_rows
     grouped = tl.reshape(
-        smoothed,
-        (
-            heads_per_program,
-            block_m // scale_rows,
-            scale_rows,
-            head_dim,
+        tl.permute(
+            tl.reshape(smoothed, (block_m, heads_per_program, head_dim)),
+            (1, 0, 2),
         ),
+        (heads_per_program, num_tiles, scale_rows, head_dim),
     )
-    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
+    grouped_valid = tl.reshape(valid, (num_tiles, scale_rows))
+    valid_count = tl.maximum(tl.sum(grouped_valid.to(tl.float32), axis=1), 1.0)
+    rotated_mean = (
+        tl.sum(tl.where(grouped_valid[None, :, :, None], grouped, 0.0), axis=2)
+        / valid_count[None, :, None]
+    )
+    centered = tl.where(grouped_valid[None, :, :, None], grouped - rotated_mean[:, :, None, :], 0.0)
+    maximum = tl.max(tl.max(tl.abs(centered), axis=3), axis=2)
     key_scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
-    quantized = round_to_int8(grouped / key_scale[:, :, None, None])
-    return tl.reshape(quantized, (heads_per_program, block_m, head_dim)), key_scale
+    quantized = round_to_int8(centered / key_scale[:, :, None, None])
+    center_0, center_1, center_scale_0, center_scale_1 = encode_residual_int8_tile(rotated_mean)
+    return (
+        tl.reshape(quantized, (heads_per_program, block_m, head_dim)),
+        key_scale,
+        center_0,
+        center_1,
+        center_scale_0,
+        center_scale_1,
+    )
 
 
 @triton.jit
@@ -507,6 +561,143 @@ def quantize_key_per_block_kernel(
         scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
         scale,
     )
+
+
+@triton.jit(do_not_specialize=["key_length", "heads", "tile_count", "storage_key_length"])
+def quantize_key_tile_centered_per_block_kernel(
+    key_ptr,
+    output_ptr,
+    scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
+    block_lengths_ptr,
+    key_length,
+    storage_key_length,
+    tile_count,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    heads,
+    mask_block_lengths: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """Quantize K with per-block (K64) tile centering and 2-term H(K_mean)."""
+    scale_group = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
+    rows = tl.arange(0, block_n)
+    offsets_n = scale_group * block_n + rows
+    offsets_d = tl.arange(0, head_dim)
+    if mask_block_lengths:
+        block_length = tl.load(block_lengths_ptr + scale_group)
+        valid_rows = (rows < block_length) & (offsets_n < key_length)
+    else:
+        valid_rows = offsets_n < key_length
+    values = tl.load(
+        key_ptr
+        + batch * stride_kb
+        + head * stride_kh
+        + offsets_n[:, None] * stride_kn
+        + offsets_d[None, :],
+        mask=valid_rows[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    quantized, key_scale, center_0, center_1, center_scale_0, center_scale_1 = (
+        quantize_tile_centered_key_tile(
+            tl.reshape(values, (block_n, 1, head_dim)),
+            tl.reshape(valid_rows, (1, block_n)),
+            tl.constexpr(1),
+            head_dim,
+            block_n,
+            block_n,
+        )
+    )
+    tl.store(
+        output_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + offsets_n[:, None] * stride_on
+        + offsets_d[None, :],
+        tl.reshape(quantized, (block_n, head_dim)),
+        mask=offsets_n[:, None] < storage_key_length,
+    )
+    tl.store(
+        scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
+        tl.reshape(key_scale, ()),
+    )
+    store_key_center_tile(
+        key_center_ptr,
+        key_center_scale_ptr,
+        (batch * heads + head) * tile_count + scale_group,
+        center_0,
+        center_1,
+        center_scale_0,
+        center_scale_1,
+        offsets_d,
+        head_dim,
+    )
+
+
+def prepare_tile_centered_key(
+    key: torch.Tensor,
+    *,
+    storage_key_length: int,
+    block_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize K with per-K64 tile centering and emit 2-term H(K_mean) centers."""
+    batch, heads, key_length, head_dim = key.shape
+    if storage_key_length < key_length:
+        raise ValueError("K storage length cannot be smaller than the logical key length")
+    tile_count = int(triton.cdiv(storage_key_length, _KEY_BLOCK))
+    key_int8 = torch.empty(
+        (batch, heads, storage_key_length, head_dim),
+        device=key.device,
+        dtype=torch.int8,
+    )
+    key_scale = torch.empty((batch, heads, tile_count), device=key.device, dtype=torch.float32)
+    key_center = torch.empty(
+        (batch, heads, tile_count, 2, head_dim),
+        device=key.device,
+        dtype=torch.int8,
+    )
+    key_center_scale = torch.empty(
+        (batch, heads, tile_count, 2),
+        device=key.device,
+        dtype=torch.float32,
+    )
+    lengths_or_placeholder = block_lengths if block_lengths is not None else key_scale
+    with device_context(key.device):
+        quantize_key_tile_centered_per_block_kernel[(tile_count, heads, batch)](
+            key,
+            key_int8,
+            key_scale,
+            key_center,
+            key_center_scale,
+            lengths_or_placeholder,
+            key_length,
+            storage_key_length,
+            tile_count,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key_int8.stride(0),
+            key_int8.stride(1),
+            key_int8.stride(2),
+            key_scale.stride(0),
+            key_scale.stride(1),
+            heads,
+            mask_block_lengths=block_lengths is not None,
+            head_dim=head_dim,
+            block_n=_KEY_BLOCK,
+            num_warps=2 if head_dim == 128 else 1,
+        )
+    return key_int8, key_scale, key_center, key_center_scale
 
 
 def prepare_query(
