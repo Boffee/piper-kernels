@@ -22,24 +22,24 @@ original operations. RMSNorm can be affine or non-affine; RoPE can cover part or
 all of a head; projections may have bias. Output preparation supports dynamic
 per-token or supplied static scales.
 
-Projection, RMSNorm, and RoPE use FP32 arithmetic. K then uses BF16 temporary
-storage and FP32 tile sums of those represented values. Global mean reduction
-and centering precede K quantization with K64 group or per-key scales. Dense
-and sparse Piper share this K producer; sparse routing summaries retain the
-uncentered FP32 transform values.
+Projection, RMSNorm, and RoPE use FP32 arithmetic. K uses BF16 temporary
+storage, then invokes the shared `K1024` encoder (`prepare_chunk_centered_key`)
+to compute rotated per-chunk K centers `[B, H, C, D]` and quantize INT8 K with
+K64 group or per-key scales.
 Q/V keep FP32 intermediates until quantization. These rounding boundaries differ
 from materializing every operation in FP16/BF16 or retaining full FP32 K storage.
 Transformed K must remain finite in BF16; execution does not scan for violations.
 
-Non-causal V projects the represented input mean before per-token quantization;
-causal V remains uncentered. Prepared storage has these contracts:
+Both non-causal and causal V project per-1024-token-chunk represented input
+means (`project_value_chunk_means`) before per-token quantization, with zero
+sequence-wide reductions. Prepared storage has these contracts:
 
 - Q: contiguous Q64-padded INT8 storage and FP32 scales incorporating the
   softmax scale and `log2(e)`.
-- K: K64-padded storage and FP32 scales.
-- V: K64-padded storage with FP32 per-token multipliers/log scales; codes are
-  transposed on NVIDIA and packed WMMA tiles on RDNA4. NVIDIA log scales retain
-  their FP16 rounding.
+- K: K64-padded INT8 storage, FP32 scales, and FP32 K1024 rotated chunk centers.
+- V: K64-padded storage with FP32 per-token multipliers/log scales and FP32 V1024
+  chunk means; codes are transposed on NVIDIA and packed WMMA tiles on RDNA4.
+  NVIDIA log scales retain their FP16 rounding.
 
 Q/K scales use the granularity the target's attention kernels read: Q32 and K64
 group scales on SM120 and RDNA4, and on SM89, as in its native dense attention,
@@ -58,12 +58,13 @@ outputs without hardware selection or tensor-content checks; see the
 
 ## Shared ownership and bounded storage
 
-Dense and sparse paths share projection storage validation, RMSNorm/RoPE tiles,
-projected-mean reduction, compiler tuple matching, output projection, and the
-attention-to-output pipeline. `convrot_int8_centered_projection` owns BF16
-projection storage and FP32 statistics. `convrot_int8_sage_qk.key` owns K
-transforms and centered K encoding, with optional sparse routing summaries.
-Dense V's per-token quantization remains distinct from sparse V's tile scales.
+Dense and sparse paths share projection storage validation, RMSNorm/RoPE tiles, and
+chunk-mean projection helpers (`convrot_int8_projection`), compiler tuple matching,
+output projection, and the attention-to-output pipeline; bounded dense output windows
+live in [`_schedule.py`](_schedule.py).
+Dense K shares `piper_attention._quantization.prepare_chunk_centered_key` directly.
+Dense V's per-token quantization and `V1024` chunk means remain distinct from
+sparse V's `K64` tile scales and `K64` means.
 Typed backend methods operate on caller-owned buffers; target launch choices
 live in separate NVIDIA/RDNA4 modules. D128 projections run Gluon kernels built
 from the shared [fragments](../convrot_int8_projection/_nvidia/fragments.py): dense

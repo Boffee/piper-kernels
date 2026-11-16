@@ -10,17 +10,14 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     resolve_qk_quantization,
 )
+from piper_kernels.attention.piper_attention import _quantization
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 from piper_kernels.fusions.convrot_int8_projection.triton import (
-    project_prepared_input_mean_kernel,
+    project_value_chunk_means as project_prepared_chunk_means,
 )
-from piper_kernels.fusions.convrot_int8_sage_qk.key import (
-    project_key,  # noqa: F401 - shared launcher export
-)
-from piper_kernels.linear.convrot.int8 import _ops
 
 from . import _kernels
-from ._interfaces import QueryOutput, ValueOutput
+from ._interfaces import KeyOutput, QueryOutput, ValueOutput
 
 
 def project_query(
@@ -101,7 +98,82 @@ def project_query(
             launch(1, full_blocks, mask_ragged_tail=True)
 
 
-def project_value_mean(
+def project_key(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    bias: torch.Tensor | None = None,
+    *,
+    execution_plan: ProjectionExecutionPlan,
+    out: KeyOutput,
+) -> None:
+    """Project K once into BF16 storage, then quantize per 1024-token chunk."""
+    batch, sequence_length, input_features = input_qdata.shape
+    if batch == 0:
+        return
+    key_int8, key_scale, key_center = out
+    _, heads, storage_length, head_dim = key_int8.shape
+    stored = input_qdata.new_empty((batch, heads, sequence_length, head_dim), dtype=torch.bfloat16)
+    with device_context(input_qdata.device):
+        for count, offset, aligned_rows in (
+            (sequence_length // execution_plan.block_m, 0, True),
+            (
+                int(sequence_length % execution_plan.block_m != 0),
+                sequence_length // execution_plan.block_m,
+                False,
+            ),
+        ):
+            if not count:
+                continue
+            _kernels._project_key_kernel[
+                (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
+            ](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                norm_weight,
+                cos,
+                sin,
+                stored,
+                batch * sequence_length,
+                sequence_length,
+                offset,
+                input_features=input_features,
+                heads=heads,
+                heads_per_program=execution_plan.heads_per_program,
+                head_dim=head_dim,
+                rotary_dim=cos.shape[1],
+                norm_epsilon=norm_epsilon,
+                aligned_projection=(
+                    aligned_rows
+                    and input_features % execution_plan.block_k == 0
+                    and heads % execution_plan.heads_per_program == 0
+                ),
+                mask_ragged_tail=not aligned_rows,
+                block_m=execution_plan.block_m,
+                block_n=head_dim * execution_plan.heads_per_program,
+                block_k=execution_plan.block_k,
+                round_rsqrt_to_nearest=execution_plan.round_rsqrt_to_nearest,
+                group_m=execution_plan.group_m,
+                bias_ptr=bias,
+                num_warps=execution_plan.num_warps,
+                num_stages=execution_plan.num_stages,
+            )
+        _quantization.prepare_chunk_centered_key(
+            stored,
+            grouped=resolve_qk_quantization(key_scale, storage_length) == "per_warp",
+            storage_key_length=storage_length,
+            out=(key_int8, key_scale, key_center),
+        )
+
+
+def project_value_chunk_means(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -112,21 +184,17 @@ def project_value_mean(
     block_k: int,
     out: torch.Tensor,
 ) -> None:
-    """Project the dequantized input mean into ``out``, the mean non-causal V subtracts."""
-    output_features = weight_qdata.shape[0]
-    with device_context(input_qdata.device):
-        project_prepared_input_mean_kernel[(triton.cdiv(output_features, block_n), out.shape[0])](
-            _ops.dequantized_input_mean(input_qdata, input_scale),
-            weight_qdata,
-            weight_scale,
-            out,
-            input_features=input_qdata.shape[2],
-            output_features=output_features,
-            block_n=block_n,
-            block_k=block_k,
-            bias_ptr=bias,
-            num_warps=4,
-        )
+    """Project each 1024-token dequantized input mean into ``out[B, H, C, D]``."""
+    project_prepared_chunk_means(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        block_n=block_n,
+        block_k=block_k,
+        out=out,
+    )
 
 
 def project_value(
@@ -138,29 +206,25 @@ def project_value(
     *,
     is_causal: bool,
     packed_amd: bool,
-    mean_block_n: int | None,
     execution_plan: ProjectionExecutionPlan,
     out: ValueOutput,
 ) -> None:
-    """Project directly into dense per-token V, with an optional global mean."""
+    """Project directly into dense V1024-centered per-token V for causal and non-causal paths."""
+    del is_causal  # Both causal and non-causal dense Piper center each 1024-token chunk.
     value, multiplier, log_scale, mean = out
     batch, heads, head_dim, storage = value.shape
     sequence = input_qdata.shape[1]
-    mean_block_n = (
-        head_dim * execution_plan.heads_per_program if mean_block_n is None else mean_block_n
-    )
     with device_context(input_qdata.device):
-        if not is_causal:
-            project_value_mean(
-                input_qdata,
-                input_scale,
-                weight_qdata,
-                weight_scale,
-                bias,
-                block_n=mean_block_n,
-                block_k=execution_plan.block_k,
-                out=mean,
-            )
+        project_value_chunk_means(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            bias,
+            block_n=execution_plan.resolve_value_mean_block_n(head_dim),
+            block_k=execution_plan.block_k,
+            out=mean,
+        )
         for count, offset, aligned in (
             (sequence // 64, 0, True),
             (int(sequence % 64 != 0), sequence // 64, False),
@@ -180,6 +244,7 @@ def project_value(
                     bias,
                     sequence,
                     storage,
+                    mean.shape[2],
                     batch,
                     offset,
                     input_features=input_qdata.shape[2],
@@ -188,7 +253,6 @@ def project_value(
                     heads_per_program=execution_plan.heads_per_program,
                     block_k=execution_plan.block_k,
                     group_m=execution_plan.group_m,
-                    is_causal=is_causal,
                     packed_amd=packed_amd,
                     aligned_projection=(
                         aligned

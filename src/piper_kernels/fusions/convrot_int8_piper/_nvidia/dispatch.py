@@ -160,7 +160,6 @@ def project_value(
             weight_scale,
             bias,
             is_causal=is_causal,
-            mean_block_n=policy.VALUE_MEAN_BLOCK_N,
             out=out,
             execution_plan=plan,
         )
@@ -173,7 +172,6 @@ def project_value(
         bias,
         is_causal=is_causal,
         packed_amd=policy.PACKED_VALUE,
-        mean_block_n=policy.VALUE_MEAN_BLOCK_N,
         out=out,
         execution_plan=plan,
     )

@@ -25,7 +25,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.attention import _output as attention_output
-from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
+from piper_kernels.fusions.convrot_int8_projection import _validation as qk_validation
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
     _compile,

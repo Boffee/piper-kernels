@@ -5,14 +5,12 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 
-_ALIGNMENT = 128
 
-
-def _balanced_query_chunk_rows(sequence: int, maximum: int) -> int:
+def _balanced_query_chunk_rows(sequence: int, maximum: int, alignment: int = 128) -> int:
     """Choose the smallest aligned uniform window with the minimum chunk count."""
     chunks = (sequence + maximum - 1) // maximum
     rows = (sequence + chunks - 1) // chunks
-    return (rows + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
+    return (rows + alignment - 1) // alignment * alignment
 
 
 def _wave_query_chunk_rows(
@@ -22,22 +20,16 @@ def _wave_query_chunk_rows(
     block_rows: int,
     parallel_heads: int,
     concurrent_blocks: int,
+    alignment: int = 128,
 ) -> int:
-    """Avoid extra partially occupied waves without exceeding the validated cap.
-
-    A noncausal CTA traverses all K tiles, so a few CTAs spilling into an extra
-    scheduling wave can cost nearly another full traversal. Compare balanced
-    windows with the largest aligned window below a whole-wave boundary. Use
-    the latter only when it reduces total waves, including the final window;
-    ties retain balanced storage and its minimum launch count.
-    """
-    balanced = _balanced_query_chunk_rows(sequence, maximum)
-    if sequence <= maximum:
+    """Avoid extra partially occupied waves without exceeding the validated cap."""
+    balanced = _balanced_query_chunk_rows(sequence, maximum, alignment)
+    if sequence <= maximum or concurrent_blocks < 1:
         return balanced
     waves = (maximum // block_rows * parallel_heads) // concurrent_blocks
     wave_rows = waves * concurrent_blocks // parallel_heads * block_rows
-    wave_rows = wave_rows // _ALIGNMENT * _ALIGNMENT
-    if wave_rows == 0:
+    wave_rows = wave_rows // alignment * alignment
+    if wave_rows < alignment:
         return balanced
 
     def total_waves(rows: int) -> int:

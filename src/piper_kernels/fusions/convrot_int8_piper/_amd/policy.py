@@ -7,4 +7,3 @@ EXECUTION_PLAN = ProjectionExecutionPlan(
 )
 
 PACKED_VALUE = True
-VALUE_MEAN_BLOCK_N = None

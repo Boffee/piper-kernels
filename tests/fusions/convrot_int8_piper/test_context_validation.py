@@ -33,13 +33,14 @@ def _native_inputs(*, batch=2):
     qs = torch.empty(batch, 4, 4)
     k = torch.empty(batch, 2, 128, 64, dtype=torch.int8)
     ks = torch.empty(batch, 2, 2)
+    kc = torch.empty(batch, 2, 1, 64)
     v = torch.empty(batch, 2, 64, 128, dtype=torch.int8)
     mult, logs, mean = (
         torch.empty(batch, 2, 128),
         torch.empty(batch, 2, 128),
-        torch.empty(batch, 2, 64),
+        torch.empty(batch, 2, 1, 64),
     )
-    return [q, qs, k, ks, v, mult, logs, mean, 65, 97, False, torch.bfloat16]
+    return [q, qs, k, ks, kc, v, mult, logs, mean, 65, 97, False, torch.bfloat16]
 
 
 @pytest.mark.parametrize(
@@ -93,6 +94,7 @@ def test_value_rejects_bad_metadata_without_tensor_operations(invalid):
         "key_dtype",
         "key_shape",
         "scale_shape",
+        "key_center_shape",
         "value_shape",
         "mult_dtype",
         "log_shape",
@@ -113,26 +115,28 @@ def test_quantized_context_rejects_bad_metadata_without_tensor_operations(invali
         operands[2] = torch.empty(2, 3, 128, 64, dtype=torch.int8)
     elif invalid == "scale_shape":
         operands[3] = torch.empty(2, 2, 3)
+    elif invalid == "key_center_shape":
+        operands[4] = torch.empty(2, 2, 2, 64)
     elif invalid == "value_shape":
-        operands[4] = operands[4].transpose(2, 3).contiguous()
+        operands[5] = operands[5].transpose(2, 3).contiguous()
     elif invalid == "mult_dtype":
-        operands[5] = operands[5].half()
+        operands[6] = operands[6].half()
     elif invalid == "log_shape":
-        operands[6] = torch.empty(1)
-    elif invalid == "mean_shape":
         operands[7] = torch.empty(1)
+    elif invalid == "mean_shape":
+        operands[8] = torch.empty(1)
     elif invalid == "stride":
-        operands[5] = torch.empty(2, 2, 256)[..., ::2]
+        operands[6] = torch.empty(2, 2, 256)[..., ::2]
     elif invalid == "device":
         operands[3] = operands[3].to("meta")
     elif invalid == "length":
-        operands[9] = 0
+        operands[10] = 0
     elif invalid == "causal":
-        operands[10] = True
+        operands[11] = True
     elif invalid == "output_dtype":
-        operands[11] = torch.float32
+        operands[12] = torch.float32
     elif invalid == "grad":
-        operands[5].requires_grad_()
+        operands[6].requires_grad_()
     with _MetadataOnly(), pytest.raises((ValueError, TypeError, RuntimeError)):
         dispatch._validate_quantized(*operands)
 
@@ -148,7 +152,7 @@ def test_quantized_context_rejects_mixed_qk_granularities():
 @pytest.mark.parametrize("number", [0.0, -1.0, float("nan"), float("inf")])
 def test_tensor_contents_remain_caller_preconditions(number):
     operands = _native_inputs()
-    for index in (1, 3, 5, 6, 7):
+    for index in (1, 3, 4, 6, 7, 8):
         operands[index].fill_(number)
     with _MetadataOnly():
         assert dispatch._validate_quantized(*operands) == (2, 4, 65, 64)
@@ -175,7 +179,9 @@ def test_fake_outputs_only_and_empty_execution_skips_target(monkeypatch, batch):
         )
         prepared_value = value._project_value_op_fake(*operands, head_dim=64, is_causal=False)
         assert prepared_key[0].shape == (batch, 2, 128, 64)
+        assert prepared_key[2].shape == (batch, 2, 1, 64)
         assert prepared_value[0].shape == (batch, 2, 64, 128)
+        assert prepared_value[3].shape == (batch, 2, 1, 64)
     native = _native_inputs(batch=batch)
     with _OutputOnly():
         assert dispatch._piper_attention_from_quantized_fake(*native).shape == (batch, 4, 65, 64)

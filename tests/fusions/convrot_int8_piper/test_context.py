@@ -1,4 +1,4 @@
-"""Global K centering and dense per-token V remain intact under projection fusion."""
+"""K1024 and V1024 centering and dense per-token V remain intact under projection fusion."""
 
 from dataclasses import replace
 
@@ -10,11 +10,12 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as quantization
+from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
 from piper_kernels.attention.piper_attention._nvidia import policy
 from piper_kernels.attention.piper_attention._nvidia import triton as nvidia
 from piper_kernels.fusions.convrot_int8_piper import _backend, key, value
-from piper_kernels.fusions.convrot_int8_piper import triton as projection
+from piper_kernels.linear.convrot.int8 import _ops as linear_ops
 
 from .test_query import _NATIVE, _operands
 
@@ -47,25 +48,18 @@ def _key_reference(operands, bias, head_dim):
 @pytest.mark.parametrize("sequence", [1, 65, 193, 1025])
 @pytest.mark.parametrize("affine", [False, True])
 @pytest.mark.parametrize("granularity", ["per_warp", "per_thread"])
-def test_key_uses_global_post_transform_mean(head_dim, sequence, affine, granularity):
+def test_key_uses_chunked_post_transform_mean(head_dim, sequence, affine, granularity):
     operands = _operands("cuda", sequence=sequence, head_dim=head_dim, affine=affine)
     bias = torch.randn(3 * head_dim, device="cuda")
-    actual, scales = key._project_key_op(
+    actual, scales, centers = key._project_key_op(
         *operands, 1e-6, bias, head_dim=head_dim, qk_quantization=granularity
     )
     reference = _key_reference(operands, bias, head_dim).bfloat16()
-    expected, expected_scale = quantization.prepare_key(
+    expected, expected_scale, expected_center = piper_quantization.prepare_chunk_centered_key(
         reference,
-        reference.float().mean(2),
         grouped=granularity == "per_warp",
         storage_key_length=actual.shape[2],
     )
-    # Projection ordering can round a K value to the other BF16 neighbor, a step of
-    # at most 2**-7 of it. That moves a per-warp scale only at its group's maximum,
-    # and no rounded value here is one. Per-thread K applies a normalized Hadamard
-    # transform to each key, which spreads the step over every channel of the key, so
-    # a value in the key holding its group's maximum moves the scale by up to
-    # 2**-7 / sqrt(64), under 1e-3 for values no larger than the maximum.
     assert (actual.int() - expected.int()).abs().max() <= 1
     torch.testing.assert_close(
         scales[:, :, : expected_scale.shape[2]],
@@ -73,6 +67,7 @@ def test_key_uses_global_post_transform_mean(head_dim, sequence, affine, granula
         atol=2e-7,
         rtol=1e-3 if granularity == "per_thread" else 3e-5,
     )
+    torch.testing.assert_close(centers, expected_center, atol=2e-4, rtol=1e-3)
     assert torch.count_nonzero(actual[:, :, sequence:]) == 0
 
 
@@ -83,19 +78,23 @@ def test_key_storage_preserves_values_above_fp16_range():
     operands[4].fill_(131072)
     reference = _key_reference(operands, None, 64).bfloat16()
     assert reference.abs().max() > torch.finfo(torch.float16).max
-    actual, scales = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
-    expected, expected_scales = quantization.prepare_key(
-        reference, reference.float().mean(2), grouped=True, storage_key_length=actual.shape[2]
+    actual, scales, centers = key._project_key_op(
+        *operands, 1e-6, head_dim=64, qk_quantization="per_warp"
+    )
+    expected, expected_scales, expected_centers = piper_quantization.prepare_chunk_centered_key(
+        reference, grouped=True, storage_key_length=actual.shape[2]
     )
     assert torch.isfinite(scales).all()
+    assert torch.isfinite(centers).all()
     assert (actual.short() - expected.short()).abs().max() <= 1
     torch.testing.assert_close(scales, expected_scales, atol=2e-7, rtol=3e-5)
+    torch.testing.assert_close(centers, expected_centers, atol=1e-2, rtol=1e-3)
 
 
 @pytest.mark.gpu
 @_NATIVE
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("sequence", [1, 65, 193])
+@pytest.mark.parametrize("sequence", [1, 65, 193, 1025])
 @pytest.mark.parametrize("causal", [False, True])
 def test_value_uses_per_token_scales_and_correct_centering(head_dim, sequence, causal):
     operands = _operands("cuda", sequence=sequence, head_dim=head_dim)
@@ -107,10 +106,13 @@ def test_value_uses_per_token_scales_and_correct_centering(head_dim, sequence, c
         is_causal=causal,
     )
     reference = _projected(operands, bias, head_dim).transpose(1, 2).float()
-    if not causal:
-        expected_mean = reference.mean(2)
-        torch.testing.assert_close(mean, expected_mean, atol=3e-5, rtol=3e-5)
-        reference -= expected_mean[:, :, None]
+    chunk_count = (sequence + 1023) // 1024
+    for chunk in range(chunk_count):
+        start = chunk * 1024
+        end = min(start + 1024, sequence)
+        expected_mean = reference[:, :, start:end].mean(2)
+        torch.testing.assert_close(mean[:, :, chunk], expected_mean, atol=3e-5, rtol=3e-5)
+        reference[:, :, start:end] -= expected_mean[:, :, None]
     scales = reference.abs().amax(-1) / 127 + 1e-7
     normalized = reference / scales[..., None]
     expected_codes = (
@@ -132,7 +134,7 @@ def test_value_uses_per_token_scales_and_correct_centering(head_dim, sequence, c
         * (multipliers[:, :, :sequence] / 255)[..., None]
     )
     assert ((decoded - reference).abs() <= scales[..., None] * 0.51 + 2e-5).all()
-    if sequence > 1 or causal:
+    if sequence > 1 and sequence % 1024 != 1:
         assert (
             codes[:, :, :, :sequence].transpose(2, 3).int() - expected_codes.int()
         ).abs().max() <= 1
@@ -147,20 +149,20 @@ def test_value_uses_per_token_scales_and_correct_centering(head_dim, sequence, c
 @pytest.mark.gpu
 @_NATIVE
 def test_causal_value_does_not_reduce_or_depend_on_future_rows(monkeypatch):
-
-    operands = _operands("cuda", sequence=193)
+    operands = _operands("cuda", sequence=1057)
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("causal V must not compute a global mean")
+        raise AssertionError("V1024 must not compute a global mean")
 
-    monkeypatch.setattr(projection._ops, "dequantized_input_mean", forbidden)
+    monkeypatch.setattr(linear_ops, "dequantized_input_mean", forbidden)
     first = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
-    operands[0][:, 65:].zero_()
+    operands[0][:, 1024:].zero_()
     second = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
     for index in (1, 2):
         torch.testing.assert_close(
-            first[index][:, :, :65], second[index][:, :, :65], atol=0, rtol=0
+            first[index][:, :, :1024], second[index][:, :, :1024], atol=0, rtol=0
         )
+    torch.testing.assert_close(first[3][:, :, :1], second[3][:, :, :1], atol=0, rtol=0)
 
 
 @pytest.mark.gpu
@@ -208,10 +210,11 @@ def test_padded_quantized_boundary_matches_native_dense(head_dim, causal, dtype,
         qs,
         F.pad(context.key, (0, 0, 0, storage - context.key.shape[2])),
         context.key_scale if grouped else F.pad(context.key_scale, (0, padding)),
+        context.key_center,
         F.pad(context.value, (0, storage - context.value.shape[3])),
         F.pad(context.value_scale_multiplier, (0, padding)),
         logs,
-        torch.empty((2, 2, head_dim), device="cuda") if causal else context.value_mean,
+        context.value_mean,
         sequence,
         k.shape[2],
         causal,
@@ -233,12 +236,12 @@ def test_context_fake_paths_do_not_probe_hardware(monkeypatch, batch):
         operands = list(_operands("cpu"))
         operands[0] = torch.empty((batch, 65, 272), dtype=torch.int8)
         operands[1] = torch.empty((batch, 65))
-        k, ks = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
+        k, ks, kc = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
         v, mult, logs, mean = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
         q = torch.empty((batch, 6, 128, 64), dtype=torch.int8)
         qs = torch.empty((batch, 6, 4))
         out = dispatch._piper_attention_from_quantized_op(
-            q, qs, k, ks, v, mult, logs, mean, 65, 65, True, torch.bfloat16
+            q, qs, k, ks, kc, v, mult, logs, mean, 65, 65, True, torch.bfloat16
         )
         assert out.shape == (batch, 6, 65, 64)
         assert out.dtype is torch.bfloat16
@@ -250,9 +253,10 @@ def test_context_fake_paths_do_not_probe_hardware(monkeypatch, batch):
 def test_zero_projection_retains_usable_scales_and_opcheck(causal):
     operands = _operands("cuda", sequence=65)
     operands[0].zero_()
-    k, ks = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
+    k, ks, kc = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
     v, mult, logs, mean = value._project_value_op(*operands[:4], head_dim=64, is_causal=causal)
     assert torch.count_nonzero(k) == 0
+    assert torch.count_nonzero(kc) == 0
     assert torch.count_nonzero(v) == 0
     assert torch.count_nonzero(mean) == 0
     assert (ks > 0).all()

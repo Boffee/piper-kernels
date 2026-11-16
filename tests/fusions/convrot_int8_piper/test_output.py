@@ -60,10 +60,10 @@ def _reference(args, head_dim):
         *args[:10], head_dim=head_dim, qk_quantization=_qk_quantization(args[0].device)
     )
     attended = attention._piper_attention_from_quantized_op(
-        q, qs, *args[10:16], args[0].shape[1], *args[16:19]
+        q, qs, *args[10:17], args[0].shape[1], *args[17:20]
     )
     rows = attended.transpose(1, 2).reshape(args[0].shape[0], args[0].shape[1], -1)
-    return _ops.linear(rows, *args[19:23], None, args[23])
+    return _ops.linear(rows, *args[20:24], None, args[24])
 
 
 def _assert_output_close(actual: torch.Tensor, expected: torch.Tensor) -> None:

@@ -98,7 +98,7 @@ assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert generic_dispatch._triton_backend is None
 assert select_addmm_plan(AcceleratorTarget("cuda", "sm80"), 64) is not None
 assert AddmmExecutionPlan().block_n == 128
-from piper_kernels.fusions.convrot_int8_sage_qk._validation import validate_qk_projection_inputs
+from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_projection_inputs
 assert validate_qk_projection_inputs(
     torch.ones(1, 64, 32, dtype=torch.int8),
     torch.ones(1, 64),
@@ -110,7 +110,7 @@ assert validate_qk_projection_inputs(
     norm_epsilon=1e-6,
     name="Q",
 ) == (1, 64, 1)
-assert "piper_kernels.fusions.convrot_int8_sage_qk.triton" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_projection.triton" not in sys.modules
 assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)
@@ -120,7 +120,7 @@ assert torch.isfinite(weight.dequantize()).all()
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-@pytest.mark.parametrize("family", ["swiglu_ffn", "sparse_piper", "sage_qk"])
+@pytest.mark.parametrize("family", ["swiglu_ffn", "sparse_piper", "projection"])
 def test_convrot_int8_fusion_packages_have_explicit_names(family: str) -> None:
     current = f"piper_kernels.fusions.convrot_int8_{family}"
     assert importlib.import_module(current).__name__ == current
@@ -172,10 +172,10 @@ assert "piper_kernels.linear.convrot" not in sys.modules
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-def test_convrot_int8_sage_qk_does_not_load_sparse_piper_fusion() -> None:
+def test_convrot_int8_projection_does_not_load_sparse_piper_fusion() -> None:
     script = """
 import sys
-import piper_kernels.fusions.convrot_int8_sage_qk.triton
+import piper_kernels.fusions.convrot_int8_projection.triton
 
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper.query" not in sys.modules

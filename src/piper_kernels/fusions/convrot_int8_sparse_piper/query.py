@@ -9,7 +9,7 @@ import torch
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     validate_routing_mode,
 )
-from piper_kernels.fusions.convrot_int8_sage_qk._validation import (
+from piper_kernels.fusions.convrot_int8_projection._validation import (
     validate_qk_projection_inputs,
 )
 from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
