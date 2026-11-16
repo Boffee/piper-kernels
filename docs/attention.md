@@ -113,41 +113,34 @@ quality comparisons; it is not the fallback used by this API.
 
 ### Caller-forced tiles (experimental)
 
-The experimental fixed-budget forced-routing path additionally accepts
-`force_tile_ids` (contiguous device INT32 `[query_blocks, capacity]`) and
-`force_tile_counts` (contiguous device INT32 `[query_blocks]`). Active IDs in each
-row's counted prefix are shared across batches and heads. Every forced tile is
-included, and the remaining per-head budget is filled by ordinary score selection.
-Counts must lie in `[0, capacity]`; active IDs must be unique and lie in
-`[0, sparse_key_blocks)`, and each count must fit every affected head's resolved
-physical keep budget. These are caller preconditions, with metadata-only validation.
-Supply rows for every physical query block; dense query suffixes already include
-every key and ignore route selection. Unused ID slots are ignored.
+This path additionally accepts contiguous device INT32 `force_tile_ids`
+(`[query_blocks, capacity]`) and `force_tile_counts` (`[query_blocks]`). Every
+active ID in a row's counted prefix is shared across batches and heads and stays
+in the kept set, with remaining per-head slots filled by score selection. Dense
+query suffixes already attend every key and ignore routes.
 
-Query the budgets outside the compiled forward call when preparing forced lists:
+As caller preconditions with metadata-only validation: supply one row per
+physical query block, keep counts in `[0, capacity]` and within every head's
+physical keep budget, and keep active IDs unique in `[0, sparse_key_blocks)`.
+Unused slots are ignored. Query budgets outside `torch.compile`:
 
 ```python
 attention = SparsePiperAttention((0.5, 0.5))
 budgets = attention.resolve_head_keep_blocks(sparse_key_blocks=3)  # (2, 1)
-capacity = 2  # padded ID slots per query block
-max_force_count = min(capacity, min(budgets))  # 1
+capacity = 2
+max_force_count = min(capacity, min(budgets))  # 1 across heads
 ```
 
-Rounding is shared across heads, so independently rounding each ratio can
-overestimate a head's budget. Here, each row may force at most one tile even
-though the first head keeps two. The query allocates no tensors and accesses no
-device state; recompute the limit when the ratio profile or sparse prefix size changes.
+Because rounding is coupled across heads, independently rounding ratios can
+overestimate a head's budget; recompute whenever the profile or `sparse_key_blocks`
+changes. ID and count values can update in place at fixed shapes without
+recompiling (zeros disable forcing), and explicit CUDA graphs replay updated
+buffers. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 fusions preserve forced
+routing; the coarse residual is unaffected.
 
-ID and count contents can change at fixed tensor shapes without recompiling; zero
-counts disable forcing without changing the compiled call. Explicit graph replay
-with a fixed ratio profile uses updated contents in the captured input buffers.
-Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 projection/output fusions
-preserve forced routing. The coarse residual is unaffected.
-
-Changing sequence length or force capacity can also reuse a Torch graph when
-the caller marks the corresponding input dimensions dynamic before the compiled
-call. Mark the model input's sequence dimension and the query-row dimension of
-both force tensors; mark the IDs' capacity dimension if it varies. For example:
+To share one dynamic Torch graph across sequence lengths or force capacities,
+mark those dimensions dynamic on the model inputs and force tensors (and derive
+Python ints like `sparse_key_blocks` from tensor shapes when they vary):
 
 ```python
 torch._dynamo.mark_dynamic(hidden_states, 1)  # [batch, sequence, features]
@@ -155,49 +148,32 @@ torch._dynamo.mark_dynamic(force_tile_ids, (0, 1))
 torch._dynamo.mark_dynamic(force_tile_counts, 0)
 ```
 
-Other sequence-shaped model inputs, such as rotary tables, need matching dynamic
-dimensions. Changing a Python integer argument such as `sparse_key_blocks` can
-still recompile; derive it from dynamic tensor shapes inside the compiled
-function when applicable. Keep model head count and head dimension fixed.
-Shape guards and GPU kernel policies still apply: one Torch graph does not
-promise one kernel variant across every layout, alignment, or backend. Zero and
-singleton dimensions may also receive separate compiler specializations.
+Keep head counts and head dimensions fixed; shape guards, backend policies, and
+zero/singleton compiler specializations still apply.
 
 ### Coarse residual
 
-For models with a coarse branch, `sparse_piper_coarse_residual` returns a separate
-residual to add to the fine output. It derives mean/minmax block scores, mean-pools
-V, expands the coarse result to token rows, and multiplies the supplied gate
-directly; it does not apply a sigmoid or another activation. Q/K/V and the gate
-must have the same shape, including equal head counts; the gate shares the query
-dtype and device. Supply `routing="mean"` or `"minmax"` and a finite positive
-`coarse_scale`. `coarse_key_blocks` defaults to all available blocks and may include
-a compact partial tail. It also supports `block_lengths`.
-
-See the [coarse API](../src/piper_kernels/attention/sparse_piper_attention/residual.py)
-and [score-based coarse operations](../src/piper_kernels/attention/sparse_piper_attention/coarse.py)
-for composing this branch or supplying learned block scores. Compatible compiler
-fusions accumulate fine output and gated coarse contribution in FP32 before the
-final output cast, so fused and separately materialized results can differ.
+`sparse_piper_coarse_residual` returns a separate branch residual: it derives
+mean/minmax block scores, mean-pools `V`, expands to token rows, and multiplies
+the supplied gate directly without applying an activation. Q/K/V and the gate
+must match in shape (equal head counts) with matching query dtype/device on the
+gate. Pass `routing="mean"` or `"minmax"` and a finite positive `coarse_scale`;
+`coarse_key_blocks` defaults to all available blocks and supports compact tails and
+`block_lengths`. See [residual.py](../src/piper_kernels/attention/sparse_piper_attention/residual.py)
+and [coarse.py](../src/piper_kernels/attention/sparse_piper_attention/coarse.py).
+Compatible compiler fusions accumulate fine and coarse outputs in FP32 before
+casting, so outputs can differ slightly from standalone addition.
 
 ## Compile and fuse projections
 
-The public attention operators support `torch.compile`; no special options are
-needed for standalone attention. For example, the dense setup above can use
-`compiled = torch.compile(piper_attention, fullgraph=True)` and then
-`compiled(q, k, v)` with its dense-layout inputs.
+Standalone attention works with `torch.compile(piper_attention, fullgraph=True)`.
+Replacing `SparsePiperAttention` with another profile of the same head count and
+routing policy reuses compiled graphs (including compatible fusions). Because
+runtime profiles disable automatic CUDA graph capture around those ops, use
+explicit CUDA graphs when a profile is fixed and recapture if it changes.
 
-To change sparse keep ratios, replace the `SparsePiperAttention` module with one
-containing the new profile. Profiles with the same head count and routing policy
-reuse a compiled graph, including compatible sparse projection and output fusions.
-Ratio values are runtime operator inputs; other model and shape changes can still
-require compilation. Operations that consume runtime profiles are excluded from
-automatic CUDA graph capture, since replay would retain the captured ratios.
-Without graph partitioning, this disables capture for the containing compiled
-graph. Explicit CUDA graphs remain supported for a fixed profile; capture a new
-graph when it changes.
-
-For quantized projections around attention, opt into the matching compiler helper:
+For quantized projection/output fusion, pass the matching helper to
+`torch.compile(..., options=...)` following [compiler options](weights.md#compile-a-model):
 
 | Projection format and attention | Helper package under `piper_kernels.fusions` |
 |---|---|
@@ -206,29 +182,20 @@ For quantized projections around attention, opt into the matching compiler helpe
 | NVFP4 + sparse Piper | `nvfp4_sparse_piper` |
 | ConvRot NVFP4 + sparse Piper | `convrot_nvfp4_sparse_piper` |
 
-Each package exports `<package_name>_compile_options()` and includes the necessary
-linear passes. Follow the shared [compiler-helper usage](weights.md#compile-a-model)
-for passing options to `torch.compile` and handling unmatched patterns.
-
-Dense ConvRot INT8 fusion supports MHA/GQA. Its optional `fuse_output=True` also
-enables bounded attention-to-output-projection execution; output fusion defaults
-to off. Supported patterns and numerical/storage contracts live in the
-[fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md).
-Dense ConvRot INT8 fusion supports NVIDIA SM89/SM120, sparse fusion supports
-NVIDIA SM8x/SM120, and both support AMD RDNA4. NVIDIA's D128 Gluon projection
-kernels preserve the shared FP32 stages but can differ from the Triton kernels by
-one INT8 code at rounding boundaries.
-Sparse integrations additionally recognize compatible coarse branches and padded
-layouts; their exact matchers live beside the helper in each package. Do not infer
-fusion eligibility from the standalone attention API alone.
+Each exports `<package_name>_compile_options()`. ConvRot INT8 dense fusion
+supports MHA/GQA and optional `fuse_output=True` (bounded attention-to-output
+execution, off by default); dense targets NVIDIA SM89/SM120 and AMD RDNA4, sparse
+targets SM8x/SM120 and RDNA4. On NVIDIA D128, Gluon projections keep the shared
+FP32 arithmetic but can differ from Triton by one INT8 code at rounding ties. See
+the [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md) for
+matchers, storage contracts, and bounded-window internals.
 
 ### Update a residual stream in place
 
-Transformer blocks often add gated attention and FFN outputs to a residual stream.
-When a compiled block may overwrite that input, `residual_updates_compile_options`
-from `piper_kernels.fusions.residual_updates` makes those additions write into it
-directly instead of allocating new full-size outputs. Its rewrite runs ahead of the
-fusion passes, so apply it before or after the attention and FFN helpers:
+When a compiled block writes gated attention and FFN outputs back into its
+residual input via `hidden.copy_(...)`, `residual_updates_compile_options`
+computes eligible additions in place without allocating intermediate full-size
+output buffers:
 
 ```python
 from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
@@ -247,39 +214,24 @@ def update_block(hidden, *block_inputs):
 compiled = torch.compile(update_block, fullgraph=True, options=options)
 ```
 
-The copy back declares that the caller no longer needs the original input; do not
-read it, or any view of its storage, after the call. Without it the block is
-unchanged.
+Returning `hidden.copy_(...)` declares that the caller will not read `hidden` (or
+any view of it) after the call; if the block reads the original input afterward,
+Inductor inserts a copy instead. Per-token indexed gates
+(`base + gate[indices] * update`) and eligible ConvRot/NVFP4 FFN and
+Q-projected ConvRot INT8 attention outputs fold into the add; row-broadcast gates
+stay unchanged. In-place adds round separately per update (`_nvidia` ConvRot INT8
+uses its [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues)).
 
-Each gated sum `base + gate[indices] * update` that builds the copied-back result
-from the input becomes an add into the input, whatever produced its update, which
-removes the block's new output buffers. The helper's docstring states which gates,
-updates, and devices qualify; per-token gates selected by index do, while blocks whose
-gates broadcast across rows are left unchanged. When an FFN fusion,
-`{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn`, or a fused ConvRot INT8 Piper
-attention output, dense or sparse with fused Q projection, produced the update, that
-fusion computes its output inside the add, which also removes that full-size output.
-The rewritten graph stays functional, and Inductor adds an update in place only when
-the block reads none of the input's original values afterward, through any view;
-otherwise it copies the input first, which keeps the result correct but forgoes that
-update's saving.
-Updates round the residual separately, so results can differ slightly. Eligible
-ConvRot INT8 projections perform the addition in the GEMM epilogue; see
-[backend support and rounding](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues).
-The helper also disables Inductor buffer reuse, which could otherwise hold a dead full-size
-buffer across attention. See the
-[fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
-for numerical and storage details.
+When query and K/V head counts are even, half the output projection's input
+width is a multiple of the ConvRot group size, and a sparse coarse gate (if
+any) is a ConvRot INT8 projection of the attention's input, folded attention
+also runs in two sequential head halves; otherwise the whole attention runs as
+one slice. Slicing halves active K/V memory while keeping per-head sparse block
+selection intact, leaves dense attention speed unchanged (sparse runs slightly
+slower), and slightly alters numerics because each slice quantizes its own
+share of the output projection input. See
+[in-place residual adds](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
+for matcher and buffer-allocation details.
 
-A fused attention computed inside its add, dense or sparse, also runs in two head
-slices, one after another, so only half its K and V exist at a time. That applies when
-its query and K/V head counts are even, half the output projection's input is a whole
-number of ConvRot groups, and a sparse coarse gate, if any, is a ConvRot INT8 projection
-of the attention's input; otherwise it runs as one slice. Each sparse head keeps the
-blocks it keeps unsliced. Slicing changes results slightly, because each slice quantizes
-its own share of the output projection's input. Dense attention keeps its speed; sparse
-attention runs slightly slower.
-
-For installation and next steps, return to the [README](../README.md). See
-[weights](weights.md) for constructing projection weights and
-[benchmarks](../benchmarks/README.md) for reproducible quality and performance checks.
+Return to [README](../README.md), [weights](weights.md), or
+[benchmarks](../benchmarks/README.md).

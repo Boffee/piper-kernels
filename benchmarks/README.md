@@ -6,7 +6,7 @@ Hardware chooses the implementation, never a smaller workload. Synthetic
 operator measurements do not establish full-model speed or checkpoint quality.
 
 Run from the repository root using the environment for the accelerator under
-test; see [CUDA and ROCm setup](../docs/development.md#accelerator-environments).
+test; see [CUDA and ROCm setup](../docs/environments.md).
 For an external environment, replace `uv run python` with
 `PYTHONPATH=src /path/to/env/bin/python`.
 

@@ -1,14 +1,13 @@
 # Developing Piper Kernels
 
-[README](../README.md) · [Attention](attention.md) · [Weights](weights.md) ·
+[README](../README.md) · [Environments](environments.md) ·
+[Attention](attention.md) · [Weights](weights.md) ·
 [Benchmarks](../benchmarks/README.md)
 
-Use this guide when changing the library: it explains ownership, implementation
-contracts, and how to validate a change.
-
-Piper Kernels owns operator semantics, quantized representations, portable
-references, and optimized implementations. Applications and Piper Offload depend
-on it; it does not depend on either or own model loading and offloading policy.
+Use this guide when changing the library: it explains package ownership,
+conventions, validation, and testing. Piper Kernels owns operator semantics,
+quantized formats, portable references, and optimized kernels; applications and
+Piper Offload depend on it, not vice versa.
 
 ## Architecture
 
@@ -17,192 +16,138 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels).
 | Area | Responsibility |
 |---|---|
 | `attention/` | Dense, sparse, and SageAttention2++ APIs, references, and backends |
-| `weights/` | Weight formats and their quantization arithmetic, packed storage, tensor subclasses, updates, and sharding |
-| `linear/`, `conv3d/` | Operators that consume weight formats, references, and backend dispatch |
-| `fusions/` | Composed operations and compiler rewrites that share preparation or intermediates |
-| `specializations/` | Explicitly enabled model/workload integrations built from reusable kernels |
-| `_residual/`, `_input_activations/`, `_inductor_options.py` | Private contracts and compiler options that several areas share |
-| `_triton/`, `attention/kernels/` | Triton runtime and target facts, compiler extensions, and shared GPU primitives |
-| `gguf/`, `trellis/`, `stochastic_quantization/` | Packed GGUF decoding, trellis-coded encoding and decoding, and reusable rounding arithmetic |
+| `weights/` | Weight formats, quantization arithmetic, packed storage, tensor subclasses, updates, and sharding |
+| `linear/`, `conv3d/` | Operators consuming weight formats, references, and backend dispatch |
+| `fusions/` | Composed operations and compiler rewrites sharing preparation or intermediates |
+| `specializations/` | Explicitly enabled model integrations built from reusable kernels |
+| `_residual/`, `_input_activations/`, `_inductor_options.py` | Private contracts and compiler options shared across areas |
+| `_triton/`, `attention/kernels/` | Triton runtime/target facts, compiler workarounds, and shared GPU primitives |
+| `gguf/`, `trellis/`, `stochastic_quantization/` | Packed GGUF decoding, trellis encoding/decoding, and rounding arithmetic |
 
-Code lives in the area that owns its concept. A concept that several areas share
-and none owns, such as residual adds, is a private package at the package root:
-its `__init__.py` holds the contract and imports without Triton, and its
-`triton.py` holds the Triton code, as in operator packages and
-`stochastic_quantization/`. `_triton/` holds code about Triton itself (device
-probing, compiler targets, and compiler extensions) and format-independent
-primitives such as reductions. It imports nothing else from the package.
+Code lives where its concept belongs. Concepts shared by several areas without
+a single owner (such as residual adds) live in private root packages whose
+`__init__.py` imports without Triton and whose `triton.py` holds Triton code.
+`_triton/` depends on nothing else in the package.
 
-`weights/` owns each weight format and the lifecycle of its storage. A format
-package keeps its Triton-free contract in private modules such as `_layout.py`,
-`_rotation.py`, and `_quantization.py`, and all of its Triton code in `triton.py`:
-the encoding, decoding, and rotation arithmetic, and the weight conversion and
-update kernels built on it. Linear and convolution operators own execution and
-use that arithmetic to prepare activations in the format of their weights.
-`gguf/` decodes packed blocks without depending on the formats it feeds.
-The package consumes supplied GGUF blocks, trellis streams, and their metadata
-rather than parsing model repositories. Backend-specific modules own launch
-policy; public operators and compiler rewrites use those choices rather than
-duplicating them.
-
-The source-local READMEs explain implementation details for
+`weights/` owns each format and its storage lifecycle, separating Triton-free
+modules (`_layout.py`, `_rotation.py`, `_quantization.py`) from `triton.py`.
+`linear/`, `conv3d/`, and `fusions/` reuse that arithmetic and defer target
+launch policy to backend modules. Source-local READMEs own internals for
 [dense attention](../src/piper_kernels/attention/piper_attention/README.md),
 [dense projection fusion](../src/piper_kernels/fusions/convrot_int8_piper/README.md),
 [NVIDIA INT8 linear](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md),
 [Conv3D](../src/piper_kernels/conv3d/convrot/int8/README.md),
-[trellis-coded weights](../src/piper_kernels/trellis/README.md), and the
-[MiniMax-H3 encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
-Tests follow the operator and format structure in [`tests/`](../tests).
+[trellis-coded weights](../src/piper_kernels/trellis/README.md), and
+[MiniMax-H3 encoder Conv3D](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
+Tests mirror [`tests/`](../tests) structure.
 
 ## Code conventions
 
 Target Python 3.13 and the Ruff and Pyright settings in
-[`pyproject.toml`](../pyproject.toml). Use typed interfaces between modules;
-structured values shared across stages should have types that express their
-fields and invariants. Contain `Any` at external or dynamic boundaries and
-explain why it is needed there.
+[`pyproject.toml`](../pyproject.toml). Use typed module boundaries that express
+invariants; contain `Any` at external/dynamic boundaries and document why.
 
-Keep one name for a concept in code and prose. Preserve documented public names,
-serialized fields, and external names required for compatibility; translate
-external terminology at its integration boundary. For new interfaces:
+Keep one name for each concept across prose, Python orchestration, Triton/Gluon
+kernels, PyTorch references, benchmarks, and tests. Preserve public names and
+serialized fields, translating external terminology at integration boundaries:
 
-- Functions start with a verb describing their operation. Use `build_` to
-  assemble a value, `resolve_` to settle a specification, `compute_` to derive a
-  value from data, and `validate_` to check a contract. `select_` chooses an
-  implementation or plan; `require_` raises when the requested support is
-  unavailable. Keep framework callbacks and alternate constructors consistent
-  with their established conventions.
-- Variables name the values they hold. Use plural nouns for collections and
-  predicates such as `has_padding` for booleans. Scalar counts use `num_<things>`,
-  individual indices use `<thing>_index`, and slice boundaries use `start_<unit>`
-  and exclusive `end_<unit>`.
-- Mathematical and kernel notation such as `q`, `k`, `v`, `M`, `N`, `K`, and
-  `BLOCK_M` is appropriate in numerical code. Make units explicit when a value
-  could mean bytes, elements, tokens, or blocks; ordinary orchestration uses
-  descriptive names.
-- Put shared internal helpers in the private module that owns them, with names
-  that callers can import without extending a public module's API. Prefer a
-  leading underscore on symbols used only within their module or class. A
-  module's `__all__`, when present, lists the names it intends callers to use.
-  Package compatibility follows [VERSIONING.md](../VERSIONING.md), including
-  its distinction between public APIs and private modules.
+- Start functions with a verb: `build_` assembles a value, `resolve_` settles a
+  specification, `compute_` derives from data, `validate_` checks a contract,
+  `select_` chooses a plan/implementation, and `require_` raises when support is
+  absent. Match framework callbacks and alternate constructors to their conventions.
+- Use plural nouns for collections, boolean predicates such as `has_padding`,
+  `num_<things>` for scalar counts, `<thing>_index` for indices, and
+  `start_<unit>` / exclusive `end_<unit>` for slice bounds.
+- Restrict compact notation (`q`, `k`, `v`, `M`, `N`, `K`, `BLOCK_M`) to standard
+  matrix roles. Name tensor pointers, derived intermediates, and layouts after
+  their canonical concept (for example `key_center`, `key_center_shared`,
+  `rotated_mean`, `feature_offsets`), not prototype shorthand (`kc`, `mu_h`, `q0`,
+  `d_offsets`). Always make units explicit when ambiguous (bytes, elements,
+  tokens, or blocks).
+- Keep shared helpers in their owning private module, hide helper-internal
+  batching/caching state behind clear function boundaries rather than duplicating
+  loop/modulo logic at callers, and collapse repeated multi-line device/reference
+  blocks or variant `*_with_*` adapters into parameterized helpers. Prefix
+  module/class-private names with `_` and export public surfaces via `__all__`.
+  See [VERSIONING.md](../VERSIONING.md) for compatibility boundaries.
 
 ## Documentation ownership
 
-Write for the reader's task. Lead with the behavior or decision they need and its
-constraints. Use plain language, short paragraphs, and small examples. Preserve
-contracts and numerical distinctions; remove repetition and irrelevant detail.
+Write for the reader's task: lead with behavior and constraints, keep paragraphs
+short, and keep one authoritative owner per explanation while linking from other
+places:
 
-Each explanation has one owner, and other places link to it rather than restate it:
+- **Topic guides (`docs/`)**: Caller contracts, invariants, and end-to-end usage.
+  Note caller-visible behavior differences concisely (such as causal vs
+  non-causal semantics), and link source-local READMEs for backend internals,
+  threshold numbers, or compiler/tiling mechanics.
+- **Public API docstrings**: Brief summary followed by signature-ordered inputs,
+  options, result shapes/dtypes, mutation, numerical behavior, and backend
+  support, distinguishing caller preconditions under the [validation contract](#validation-contract).
+- **Module docstrings & source-local READMEs**: Algorithms, packed layouts,
+  internal invariants, and schedule rationale.
+- **Benchmark & environment guides**: Methodology/diagnostics in [benchmarks](../benchmarks/README.md);
+  CUDA, ROCm, and cache setup in [environments](environments.md).
+- **This guide & CHANGELOG.md**: Cross-subsystem conventions live here; release
+  history belongs in `CHANGELOG.md`.
 
-- **Topic guides** in `docs/` are written for callers. They explain subsystem
-  concepts, invariants, and how APIs work together, with examples for common
-  tasks. Model and backend examples link to their owners for specific requirements.
-- **Public API docstrings** lead with a short summary of what the caller can do.
-  They describe inputs and options in signature order and the result, including
-  relevant tensor layouts, shapes, dtypes, numerical behavior, mutation, and backend
-  support. Distinguish numerical caller preconditions from runtime checks using the
-  [validation contract](#validation-contract), and reuse an existing contract when
-  it covers the requirement.
-- **Module and internal API docstrings and source-local READMEs** own algorithms,
-  packed layouts, internal assumptions, and execution-plan rationale. Caller
-  guides and public docstrings include implementation details only when they
-  affect valid usage or observable behavior. Model-specific assumptions stay
-  with their `specializations/` code.
-- **Benchmark tools and command help** own specialized experiments and measurement
-  controls; the [benchmark guide](../benchmarks/README.md) owns shared methodology.
-- **This guide** owns conventions and invariants that span subsystems.
-  **CHANGELOG.md** owns release history; see
-  [commits and pull requests](#commits-and-pull-requests).
+To stop guides from growing unwieldy over successive PRs:
+
+- **Edit in place instead of appending**: rework or tighten existing prose when
+  behavior changes, and delete obsolete qualifiers rather than stacking trailing
+  caveats.
+- **State library-wide caveats once**: do not repeat generic reminders (quantized
+  rounding differences, metadata-only validation, compile coverage vs on-device
+  speed) in every section or README; link the owning contract only when a section
+  breaks an assumption.
+- **Keep one guide per audience**: split out standalone operational setups (as in
+  [environments](environments.md)) before mixed concerns clutter a guide.
 
 ## Validation contract
 
-This is a library-wide API contract, including inference, dispatch, compiler
-rewrites, fake/meta implementations, and weight wrappers constructed or
-reconstructed from supplied storage, including views and device moves.
+Applies across inference, dispatch, compiler/fake paths, and weight wrapping
+(including views and device moves):
 
-Assign each metadata or configuration check to the boundary that owns the
-contract. Internal stages can rely on guarantees already established along
-their call path; independent entry points still need their required checks.
-Share validation when several entry points own the same contract. Do not repeat
-checks throughout a pipeline solely because values pass through another helper.
-
-Validation may inspect host metadata: shapes, dtypes, devices, layouts/strides,
-gradient flags, and Python configuration. Keep checks for supported storage and
-operations. Numerical tensor contents are caller preconditions on every device.
-For example, a ConvRot INT8 static input scale must be finite and positive;
-the API does not promise runtime rejection of zero, negative, NaN, or infinite
-scales.
-
-These paths must not inspect tensor contents solely for validation. That rules
-out host readbacks (`.item()`, `bool(tensor)`, `.cpu()`), synchronization,
-tensor scans/reductions, device assertions, validation kernel launches, and
-temporary device allocations for that purpose. Validation must work without
-tensor contents during tracing and fake/meta execution and must not introduce
-barriers to CUDA graph capture.
-
-Exporters, checkpoint loaders, and other callers own required numerical
-validation at ingestion. A dedicated tensor-content validation API must be
-explicitly invoked outside inference, compilation, and weight wrapping, never
-run implicitly in those paths.
-
-Offline quantization/conversion is distinct from wrapping supplied storage.
-Content checks are allowed as documented parts of those conversions: for
-example, NVFP4 `from_hp(..., compute_per_tensor_scale=True)` derives a global
-scale from the weight values and rejects a non-finite maximum. This does not
-permit implicit content validation in inference, compiler, or wrapper paths.
-
-This boundary avoids synchronization and extra inference work. It does not
-remove algorithmic guards: deriving a usable dynamic scale for an all-zero
-input is required handling of valid input.
+- Validate metadata (`shape`, `dtype`, `device`, strides, flags, Python config)
+  once at the boundary that owns it. Internal stages rely on upstream checks;
+  independent entry points still check their own contract, sharing helpers.
+- Numerical tensor contents are caller preconditions on all devices (for instance,
+  finite positive static scales). Do not add host readbacks (`.item()`, `.cpu()`,
+  `bool(tensor)`), synchronizations, scans, validation kernels, or extra
+  allocations to check contents in inference, compilation, or weight wrapping;
+  validation must remain traceable and CUDA-graph-safe.
+- Exporters/loaders run explicit content validation outside these paths. Offline
+  quantizers/converters (such as `from_hp(..., compute_per_tensor_scale=True)`)
+  may validate derived scales as documented. Algorithmic guards for valid inputs
+  (such as all-zero dynamic scaling) are still required.
 
 ## Execution plans and schedules
 
-An **execution plan** contains the resolved choices for one invocation:
-implementation, preparation and fusion, memory access, and launch settings.
-It can execute one kernel or several. A **schedule** describes how work is
-organized, such as tiles, warps, pipeline stages, or chunk sizes. Give a stage
-its own schedule when it is independently selected, reused, or tuned; a flat
-plan is otherwise sufficient.
+An **execution plan** resolves one invocation (implementation, preparation,
+memory access, launch settings) and may launch multiple kernels. A **schedule**
+covers one stage's tiling, warps, pipeline depth, or chunks when tuned or reused
+independently. Keep immutable `<Operation>ExecutionPlan` / `<Stage>Schedule`
+types and config validation in `_plan.py`, and target/shape selection in
+`policy.py` or `_policy.py`.
 
-Immutable `<Operation>ExecutionPlan` and `<Stage>Schedule` values live in
-`_plan.py`, with their configuration validation and reporting. Target/shape
-selection belongs in `policy.py` or `_policy.py`. Vendor-specific plans may
-extend a shared plan. The [INT8 plans](../src/piper_kernels/linear/convrot/int8/_plan.py)
-and [NVIDIA policy](../src/piper_kernels/linear/convrot/int8/_nvidia/policy.py)
-show this division.
-
-`select_execution_plan(...)` selects from host metadata;
-`default_execution_plan(...)` resolves operand metadata before selection.
-Runtime parameters and stored fields use `execution_plan` (a local variable may
-be `plan`); independently selected stages use `schedule` or `<stage>_schedule`.
-Benchmark metadata uses the same distinction. Document changes to serialized
-fields so saved measurements remain interpretable.
-
-Type and policy modules must import without Triton. Every compiler pass's
-`uuid()` returns `compute_compile_pass_uuid(self)` from
-[`_inductor_options.py`](../src/piper_kernels/_inductor_options.py), which hashes
-the whole package source, so moving or adding modules needs no cache-key
-bookkeeping. A pass keeps its configuration out of instance state, because the
-key identifies a pass by its class.
+`select_execution_plan(...)` picks from host metadata; `default_execution_plan(...)`
+resolves operand metadata beforehand. Use `execution_plan` (`plan` locally) and
+`schedule` / `<stage>_schedule` in runtime args, fields, and benchmark metadata.
+Type and policy modules must import without Triton. Every compiler pass's `uuid()`
+returns `compute_compile_pass_uuid(self)` from [`_inductor_options.py`](../src/piper_kernels/_inductor_options.py)
+and avoids storing configuration on instance state.
 
 ## Performance tuning
 
-Real model shapes are useful benchmark anchors. General dispatch decisions
-need a hardware or workload explanation, such as useful tile count, alignment,
-or available parallelism, rather than matching a model's exact dimensions or
-the endpoints of a benchmark sweep. Check representative nearby shapes before
-generalizing a measured improvement. Explicit model assumptions belong in
-opt-in `specializations/`, where their scope is visible to callers.
-
-Distinguish compiler coverage from on-device correctness and performance
-evidence. Successful dispatch or compilation on an architecture is not evidence
-that its schedule was measured there. Use the [benchmark guide](../benchmarks/README.md)
-for reproducible runs and backend notes for the rationale behind current policy.
+Use real model shapes as anchors, but base general dispatch decisions on hardware
+or workload properties (alignment, useful tiles, parallelism) verified across
+nearby shapes. Put model-specific assumptions in opt-in `specializations/`.
+Compile or dispatch coverage alone does not prove on-device correctness or
+speedup; measure with the [benchmark guide](../benchmarks/README.md).
 
 ## Checks
 
-For the repository's default CUDA development environment:
+In the default CUDA environment:
 
 ```shell
 uv sync --dev
@@ -213,165 +158,52 @@ uv run pyright
 uv build
 ```
 
-Tests use `pytest-xdist` with work stealing: larger initial batches reuse compiled
-kernels within each worker, and idle workers take pending tests from busier workers.
-CPU runs use at most 16 workers and runs with a visible accelerator use at most 8.
-Set `PYTEST_XDIST_AUTO_NUM_WORKERS` to adjust for device memory, or pass `-n0`
-to debug serially (`--pdb` does so automatically).
-Tests that allocate gigabytes of device memory or spawn extra GPU processes
-use `@pytest.mark.usefixtures("large_device_memory")` to serialize that work.
-CPU operations default to one thread per process to avoid competing thread pools
-across workers. Set `OMP_NUM_THREADS` or `MKL_NUM_THREADS` before pytest to override;
-child processes inherit these settings.
-
-GPU tests use the `gpu` marker and require a compatible accelerator. The
-pre-commit hook hides CUDA and runs portable tests; pytest exercises
-installed GPU backends when CUDA is visible. [CI](../.github/workflows/ci.yml) checks the
-portable suite, tooling, and distributions on Linux, plus portable attention and
-Triton selection on Windows. A passing portable run does not validate GPU code.
-
-Triton and PyTorch Inductor manage their own persistent compiler caches. Pytest
-uses their default locations or honors `TRITON_CACHE_DIR` and
-`TORCHINDUCTOR_CACHE_DIR` from the environment. The suite does not create a
-separate cache or clear compiled artifacts on exit, so later runs can reuse them.
-
-Linux CI persists both compiler caches between runs. It restores caches for the
-same platform and dependency lockfile, and the compilers invalidate entries when
-their inputs change. Every test still runs on a cache hit; `--durations=20` in
-the CI log reports the remaining slow cases.
-
-Configure cache directories on a local filesystem that supports executable
-mappings (DLL loading on Windows), with enough free space and access restricted
-to the current user. These caches contain native code that the test process
-loads. Concurrent compilation on network/distributed filesystems can fail even
-when executable mappings work; see [the upstream Triton report](https://github.com/triton-lang/triton/issues/11512).
-
-For a cold compilation run, point both cache variables at new, empty directories.
-To reset existing caches or reclaim space, remove the selected directories only
-when no processes are using them. The next run rebuilds missing artifacts.
-Temporary-directory cleanup and reboot retention depend on the chosen filesystem
-and operating-system configuration.
+GPU tests carry the `gpu` marker; pre-commit hides CUDA and runs portable tests,
+and [CI](../.github/workflows/ci.yml) checks portable behavior without validating
+GPU kernels. See [environments](environments.md) for worker/thread variables,
+compiler caches, and [ROCm regressions](environments.md#rocm-regressions).
 
 ### Writing tests
 
-Build only what a test exercises. Put tests beside the operator or subsystem they
-cover, prefer fixtures in local `conftest.py` files, and isolate filesystem state
-with temporary paths. Load optional backends and fixture dependencies when the
-test needs them. Test shared validation at its owning layer, with representative
-integration cases for each caller.
+Build only what the test exercises, beside the subsystem it covers, using local
+`conftest.py` fixtures, temporary directories for filesystem state, and lazy
+backend imports. Test shared validation at its owning layer plus representative
+caller integration cases.
 
-Gate hardware-specific tests through `AcceleratorTarget`, as the library does.
-ROCm devices also report a CUDA capability, and RX 9070 XT reports `(12, 0)`, so
-`torch.cuda.get_device_capability()` alone selects AMD devices for NVIDIA tests.
-Use `exact_sm120_available()` from [`tests/_accelerators.py`](../tests/_accelerators.py)
-for tests that require exact NVIDIA SM120.
+Always select backends through `AcceleratorTarget` (ROCm RX 9070 XT reports CUDA
+capability `(12, 0)`); use `exact_sm120_available()` from [`tests/_accelerators.py`](../tests/_accelerators.py)
+when targeting NVIDIA SM120 specifically.
 
-Extend existing cases while preserving numerical oracles, storage invariants, and
-distinct failure checks. Keep helpers focused on shared mechanics. Parametrize
-meaningful format, layout, and device boundaries without multiplying cases that
-execute the same path. Related checks may share a process when their isolation
-requirements still hold. Fresh-process import checks must preserve their cold
-import order and keep forbidden imports blocked throughout the check.
-When reducing a matrix, name the retained numerical or failure tests that cover
-the omitted combinations. Use `--durations=20` to distinguish fixture cost from
-test execution. Compare repeated pytest runs with matching workers, threads,
-hardware, and caches; fewer cases alone do not establish a speedup.
-
-## Accelerator environments
-
-Package installation and platform prerequisites are in the
-[README](../README.md#installation). The repository's `uv` sources select CUDA.
-For ROCm development, use a separate environment with matching ROCm PyTorch and
-Triton, the relevant package extras, and the `test` group dependencies from
-[pyproject.toml](../pyproject.toml). Do not use the checkout's `uv sync` to
-provision that environment.
-
-The following setup was validated on Linux with RX 9070 XT: stable ROCm 10.1.0,
-PyTorch 2.14, and the matching Triton selected by its wheel. From this checkout,
-create a fresh environment and install the stack before the test dependencies:
-
-```shell
-uv --no-config venv --python 3.13 .venv-rocm
-uv --no-config pip install --python .venv-rocm/bin/python \
-  --index-url https://stable.repo.amd.com/rocm/whl-next/ \
-  "torch[device-gfx1201]==2.14.0+rocm10.1.0"
-uv --no-config pip install --python .venv-rocm/bin/python --group test \
-  "torchao==0.18.0" "numpy>=2"
-```
-
-The device extra installs the matching ROCm libraries; torchvision and torchaudio
-are not required. Use separate environments when comparing stable and nightly
-builds. Run the regressions below and representative benchmarks before promoting
-a new stack to the development or CI default.
-
-PyTorch 2.15 for ROCm 10.0 (`torch==2.15.0+rocm10.0` from PyTorch's `rocm10.0`
-index) with its Triton 3.9 also passes the regressions. Piper attention relies on
-RDNA4 code-generation workarounds there; see the
-[dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior).
-ConvRot INT8 linear and FFN kernels remain 2–5% slower with Triton 3.9 than 3.8.
-
-AMD dispatch accepts Linux and Windows with the same architecture limits;
-existing on-device validation is Linux-only. The documented INT8 hardware
-validation is RX 9070 XT (`gfx1201`); compiler coverage for other accepted targets
-does not establish hardware correctness or performance. Run the regressions
-below before relying on Windows execution. Consult the relevant operator guide
-and backend policy for supported targets.
-
-### ROCm regressions
-
-From the checkout, run the focused RDNA4 suite using that environment's Python:
-
-```shell
-/path/to/rocm-env/bin/python scripts/run_rocm_regressions.py --junitxml=artifacts/rocm-results.xml
-```
-
-On Windows, use its `Scripts/python.exe` instead. The runner imports this
-checkout, reports environment and device versions, and requires native RDNA4
-attention, INT8 linear/Conv3D, and sparse projection/output backends. Missing
-hardware or backends fail the run instead of silently skipping it.
-
-The [runner](../scripts/run_rocm_regressions.py) defines the regression selection,
-covering numerical behavior, GQA, static/dynamic scales, fusions, dynamic
-compilation, and graph capture. It runs serially to bound VRAM and isolate
-kernel-cache assertions. Additional pytest arguments select subsets, for
-example `-k sparse_gqa`.
-
-The opt-in [ROCm workflow](../.github/workflows/rocm.yml) runs this script on a
-provisioned RDNA4 runner, nightly or by manual dispatch.
+Parametrize meaningful format/layout/device boundaries without duplicating
+identical paths. Preserve oracles, failure checks, and cold-import isolation in
+subprocess import checks. When trimming a matrix, state which retained tests cover
+the dropped cases, and compare performance using `--durations=20` across matched
+runs.
 
 ## Commits and pull requests
 
-Commit messages use the standard Git format: an imperative subject of at most 72
-characters, such as "Preserve static scales when sharding weights", then a blank
-line and a body wrapped at 72 columns that explains why. Subjects take no type
-prefix such as `feat:`; the changelog classifies changes. Pull request titles
-follow the same subject rule. Keep commits focused and include the checks and
-fixes needed for the change. Do not commit generated outputs, benchmark artifacts,
-compiler caches, model checkpoints, or local secrets.
+Use standard Git commits: an imperative subject `<= 72` chars with no type
+prefix (`feat:` etc.), a blank line, and a 72-column body explaining why. Never
+commit generated outputs, benchmark artifacts, caches, checkpoints, or secrets.
 
-A pull request description leads with the problem: what goes wrong, for whom,
-and how often. Then it covers:
+Split large cross-cutting refactors cleanly along contract or subsystem boundaries
+(for example, updating an operator's contract before downstream fusions or
+sibling operators) into a reviewable stack, removing superseded code in its
+owning change instead of adding throwaway intermediate states. Skip hooks on an
+intermediate stacked commit only when downstream updates intentionally follow in
+the next commit, and verify full repo checks at the stack tip.
 
-- **Change:** what the PR does, why this design, and what it removes or supersedes.
-- **Compatibility:** whether public APIs, accepted tensor metadata, numerical
-  results, mutation, backend support, or packed storage and checkpoints change.
-  Call out changes to rounding or accumulation even when signatures stay the same;
-  use [VERSIONING.md](../VERSIONING.md) for the public compatibility boundary.
-- **Validation:** the commands run and their results, and what remains unvalidated.
-  Identify the hardware and workload behind numerical or performance claims;
-  distinguish portable tests and compiler coverage from on-device validation.
+Lead PR descriptions with the problem, then cover **Change** (design and what is
+removed), **Compatibility** (API, metadata, rounding/accumulation, storage changes),
+and **Validation** (commands, hardware/workloads, portable/compile vs on-device
+coverage). Link related issues and PRs.
 
-Link related issues and PRs.
-
-Add a `CHANGELOG.md` entry under **Unreleased** when a caller can observe the change:
-in APIs, supported inputs or backends, numerical results, performance, mutation,
-or stored data. Documentation-only changes, tests, and internal refactors need
-none. Use the existing Added, Changed, or Fixed heading, and prefix a breaking
-change with "Breaking:". State what changes for the caller and what they must do;
-implementation and test details belong in the PR. Keep any qualification needed
-to avoid overstating hardware support or measured improvements.
+Add a **`CHANGELOG.md`** entry under `## [Unreleased]` (`Added`/`Changed`/`Fixed`,
+with `Breaking:` prefix when breaking) whenever callers can observe API, behavior,
+numerical, performance, mutation, or storage changes. Keep entries to 1–2 short
+sentences on caller impact and hardware/measurement scope; leave kernel
+mechanics and benchmark sweeps in PRs or READMEs.
 
 ## Releases
 
-[VERSIONING.md](../VERSIONING.md) defines public compatibility and the release
-process.
+See [VERSIONING.md](../VERSIONING.md) for compatibility policy and the release checklist.

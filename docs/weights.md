@@ -115,46 +115,37 @@ with torch.inference_mode():
 assert output.shape == rotated_output.shape == (2, 128)
 ```
 
-`compute_per_tensor_scale=True` derives the weight's global scale; for ConvRot it
-does so after rotation. Do not also supply `per_tensor_scale`. Dynamic activation
-scaling derives a global input scale. For calibrated static activation scaling,
-set `use_dynamic_per_tensor_scale=False` and supply `act_per_tensor_scale` to the
-weight constructor: a finite positive FP32 scalar on the weight device, calibrated
-in the stored basis.
-With dynamic scaling disabled, omitting `act_per_tensor_scale` declares a unit
-global activation scale. The same contract applies to ordinary and ConvRot FFN
-and sparse-attention output fusions. See [compilation](#compile-a-model) for
-sharing input preparation across projections.
+`compute_per_tensor_scale=True` computes the weight global scale (after rotation
+for ConvRot; mutually exclusive with `per_tensor_scale`). For static activation
+scaling, set `use_dynamic_per_tensor_scale=False` and pass a finite positive FP32
+scalar `act_per_tensor_scale` on the weight device calibrated in the stored basis;
+omitting it fixes unit global scaling (`1.0`, still computing 16-value block
+scales). The same scale contract applies to NVFP4/ConvRot FFN and sparse output
+fusions; see [compilation](#compile-a-model) for preparation sharing.
 
-Piper's portable NVFP4 weight builder, activation preparation, and weight updates
-round block scales directly to E4M3, including subnormals down to `1/512`, following
-FlashInfer's scale handling. They do not impose TorchAO's `1/64` smallest-normal
-floor. A scale that rounds to zero reconstructs its whole block as zero; zero
-inputs are handled without NaNs. A static activation global scale of `1.0` still
-computes a scale for every 16-value block. Selecting `use_triton_kernel=True` in
-`from_hp` delegates weight quantization to TorchAO's optional backend and retains
-its encoding behavior.
-Independent reciprocal and fused activation rounding can still differ between
-backends; matching scale semantics does not promise bitwise-identical model outputs.
+Piper's portable weight builder, activation preparation, and updates round block
+scales directly to E4M3 down to `1/512` (FlashInfer semantics; passing
+`use_triton_kernel=True` to `from_hp` keeps TorchAO's `1/64` normal floor). Zero
+scales decode a block as zero without NaNs, and independent/fused rounding need
+not agree bitwise across backends.
 
-`PiperNVFP4Tensor.from_torchao(existing)` wraps existing TorchAO NVFP4 storage
-without copying. `ConvRotNVFP4Tensor.from_torchao(existing, group_size=...)` only
-attaches rotation metadata: the stored values must already be in that basis.
-For packed checkpoint constructors and all stored fields, see the
+`PiperNVFP4Tensor.from_torchao(existing)` wraps TorchAO storage without copying;
+`ConvRotNVFP4Tensor.from_torchao(existing, group_size=...)` attaches rotation
+metadata to values already in that basis (see
 [ordinary NVFP4](../src/piper_kernels/weights/nvfp4/tensor.py) and
-[ConvRot NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) classes.
-Piper's [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py) supports
-independent correctness comparisons. ConvRot NVFP4 linear requires the supported
-native path and raises when its execution requirements are not met.
+[ConvRot NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) for packed
+constructors and fields, and [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py)
+for numerical checks). ConvRot NVFP4 linear requires the native SM120 path and
+raises when unsupported.
 
 ## Run a Conv3D
 
-ConvRot INT8 represents logical `[out, in, 3, 3, 3]` weights usable with ordinary
-`F.conv3d` and `nn.Conv3d`. Execution is inference-only, requires a static input
-scale, and accepts FP16 or FP32 NCTHW activations and optional FP16/FP32 bias;
-output is FP16. Input channels must be a power of two from 64 to 4096 and divisible
-by the rotation group size. Groups must be 1 and dilation must be 1.
-Noncontiguous activations and bias are supported.
+ConvRot INT8 represents logical `[out, in, 3, 3, 3]` weights usable with `F.conv3d`
+and `nn.Conv3d` for inference. Execution requires a static activation scale, FP16
+or FP32 NCTHW inputs with matching optional bias, power-of-two input channels in
+`[64, 4096]` divisible by `group_size`, `groups=1`, and `dilation=1`; output is
+always FP16. Noncontiguous inputs and bias are supported; channels-last weight
+memory formats are not.
 
 ```python
 import torch
@@ -175,45 +166,33 @@ conv_layer = torch.nn.Conv3d(64, 16, 3, padding=1, bias=False, device="meta")
 conv_layer.weight = torch.nn.Parameter(conv_weight, requires_grad=False)
 ```
 
-For checkpoint storage, use the same `from_quantized` constructor as linear
-weights, with INT8 `qdata` shaped `[out, 3, 3, 3, in]` and the static activation
-scale. Weight conversion and dequantization can omit that activation scale;
-execution requires it. Channels-last weight memory-format requests are unsupported.
+For checkpoint loading, `from_quantized` takes `[out, 3, 3, 3, in]` INT8 `qdata`
+and `[out]`/`[out, 1]` FP32 `scale`; `act_per_tensor_scale` can be omitted for
+conversion/dequantization only. Stride accepts one or three positive integers, and
+padding accepts nonnegative symmetric counts, `"valid"`, or `"same"` (stride `1`)
+matching PyTorch output shapes (`padding=0` adds no hidden temporal frames).
+Unbatched inputs, transposed convolutions, other kernel sizes, and BF16 autocast
+are unsupported (FP16 autocast casts eligible FP32 inputs/bias while keeping FP16
+output). Results approximate floating-point convolution.
 
-Stride accepts a positive integer or three integers. Padding accepts nonnegative
-symmetric zero-padding amounts (an integer or three integers), `"valid"`, or
-`"same"` (stride 1). These follow PyTorch output-shape semantics: `padding=0`
-adds nothing, including no hidden temporal padding. Already padded inputs can
-be passed directly. Unbatched inputs, transposed convolution, and other kernel
-sizes are unsupported. FP16 autocast casts eligible FP32 input/bias while retaining
-packed weight storage and FP32 scales; BF16 autocast is unsupported. The logical
-weight dtype does not change the fixed FP16 output contract. Numerical results
-approximate floating-point convolution through weight and activation quantization.
+For causal video convolution, pad two preceding zero frames with `F.pad` and call
+`F.conv3d(..., padding=0)` (applying any spatial reflection separately). The
+`ConvRotInt8Conv3d` / `conv3d` convenience APIs in `piper_kernels.conv3d.convrot.int8` add two
+causal zero frames automatically, accept `padding="none"|"reflect"|"reflect_right"`
+(`height, width > 1`), retain FP32 input precision under autocast, and accept an
+optional FP16 residual.
 
-For causal video convolution, pad two zero frames before the input, then use
-`F.conv3d(..., padding=0)`. Spatial reflection, if needed, is a separate caller
-operation. The existing `ConvRotInt8Conv3d` layer and `conv3d` function in
-`piper_kernels.conv3d.convrot.int8` remain causal convenience APIs: they always
-request two preceding zero frames, with `padding="none"`, `"reflect"`, or
-`"reflect_right"` selecting spatial padding only. Reflection requires height and
-width greater than one; `"reflect_right"` pads only bottom/right borders. These
-convenience APIs retain FP32 input precision under autocast and accept an optional
-FP16 residual with the output shape.
-
-Both standard and causal calls support `torch.compile` without extra options.
-For optional fusion of explicit zero/spatial-reflection padding, use
-`convrot_int8_conv3d_compile_options` from that package. The
+Both APIs work under `torch.compile`; `convrot_int8_conv3d_compile_options`
+additionally fuses explicit zero/spatial-reflection padding chains. See
 [Conv3D implementation notes](../src/piper_kernels/conv3d/convrot/int8/README.md)
-cover storage, offload integration, and fusion limits. H3-specific calibration and
-normalization fusion belong to the
-[encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
-Matrix updates, GGUF conversion, trellis coding, transpose, and sharding below apply to 2-D
-weights only.
+and the [MiniMax-H3 encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
+The sections below (updates, GGUF, trellis, sharding) cover 2-D weights only.
 
 ## Compile a model
 
-The operators support ordinary `torch.compile`. Optional compiler helpers enable
-preparation sharing and fusion of compatible operations. For `linear_layer` above:
+Operators work with `torch.compile` directly; pass a format/fusion helper through
+`torch.compile(options=...)` (without `mode`) to share input preparation or fuse
+blocks while leaving unmatched ops unchanged:
 
 ```python
 from piper_kernels.linear.convrot import convrot_int8_compile_options
@@ -221,40 +200,36 @@ from piper_kernels.linear.convrot import convrot_int8_compile_options
 compiled_layer = torch.compile(linear_layer, options=convrot_int8_compile_options())
 ```
 
-Use `nvfp4_compile_options` from `piper_kernels.linear.nvfp4` for ordinary NVFP4,
-or `convrot_nvfp4_compile_options` from `piper_kernels.linear.convrot.nvfp4` for
-ConvRot NVFP4. These passes share compatible input preparation across linears.
-The INT8 helper also absorbs supported exclusive GELU inputs. Static preparation
-can be shared only when projections use the same scale graph value, not merely
-equal-valued scale tensors. NVFP4 unit-scale metadata survives independent weight
-transfers, so compatible projections of the same input can still share preparation.
+- **Linears**: `convrot_int8_compile_options` (`piper_kernels.linear.convrot`),
+  `nvfp4_compile_options` (`piper_kernels.linear.nvfp4`), and
+  `convrot_nvfp4_compile_options` (`piper_kernels.linear.convrot.nvfp4`) share
+  preparation across compatible linears (INT8 also fuses exclusive tanh-GELU
+  inputs). Static INT8 shares preparation only across the same scale graph node;
+  NVFP4 unit-scale metadata shares across transfers.
+- **FFNs**: `{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn_compile_options`
+  under `piper_kernels.fusions` fuse FP16/BF16 SwiGLU and exclusive `tanh`-GELU
+  FFNs while preserving static/dynamic scales. When updating a residual stream, see
+  [in-place residual updates](attention.md#update-a-residual-stream-in-place) and
+  [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues).
+- **Attention & specializations**: see [attention](attention.md#compile-and-fuse-projections)
+  and [`specializations/`](../src/piper_kernels/specializations).
 
-For FFNs, use the matching package under `piper_kernels.fusions`:
-`{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn`. Each exports
-`<package_name>_compile_options()`, installs FFN fusion before ordinary linear
-rewriting, and preserves each projection's static/dynamic scale. SwiGLU matches
-separate gate/value/down projections; GELU matches an exclusive
-`down(gelu(up(x), approximate="tanh"))`. FFN fusions support FP16/BF16 activations.
-When a block adds a gated update and then the gated FFN output to its residual
-stream, the FFN fusion stores that sum over the update's buffer, so neither sum
-allocates; to add both into a block input the block overwrites instead, see
-[residual updates](attention.md#update-a-residual-stream-in-place). Eligible ConvRot INT8
-down projections perform either sum in the GEMM epilogue; see
-[backend support and rounding](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues).
-See [attention](attention.md#compile-and-fuse-projections) for attention-region
-helpers, and the [specializations](../src/piper_kernels/specializations) for
-model-specific compile options.
-
-Pass the result through `torch.compile(options=...)`; do not also pass `mode`.
-Helpers preserve existing options, and unmatched patterns retain their original
-operations. Static INT8 weights bypass AOTAutograd's persistent disk cache;
-Inductor caching and reuse of the compiled graph still work. There is no hidden
-prepared-weight cache.
+Static INT8 weights bypass AOTAutograd's persistent disk cache (Inductor caching
+and graph reuse remain enabled). There is no hidden prepared-weight cache.
 
 ## Merge an adapter
 
-All three matrix wrappers support logical in-place updates. Continuing with the
-INT8 weight:
+All three 2-D formats support untransposed inference-only in-place updates
+(`addmm_` for `beta * weight + alpha * (mat1 @ mat2)`; `add_` for
+`beta * weight + alpha * update` where Piper adds optional `beta`). Updates
+preserve the wrapper and activation calibration while overwriting existing
+`qdata` and `scale` storage in place, so clone a weight first if other
+wrappers share those checkpoint tensors and must stay unchanged. Finite real
+`alpha` and `beta` default to `1.0` (supporting integers and zero coefficients,
+with `alpha=0, beta=1` a no-op); inputs must share the weight's logical dtype and
+device, and INT8 `addmm_` factors (`mat1`/`mat2`) aliasing `qdata` or `scale`
+storage are preserved across the in-place write (copied before merging on
+Triton):
 
 ```python
 lora_a = torch.randn(4, int8_weight.shape[1], device=int8_weight.device, dtype=int8_weight.dtype)
@@ -263,62 +238,40 @@ with torch.no_grad():
     int8_weight.addmm_(lora_b, lora_a, alpha=0.1, rounding_seed=42)
 ```
 
-`addmm_` computes `beta * weight + alpha * (mat1 @ mat2)`; `add_` computes
-`beta * weight + alpha * update` from an exact-shape dense update. Both default
-`alpha` and `beta` to `1.0` and require finite real values; integers are accepted.
-The `beta` keyword on `add_` is a Piper extension to PyTorch; standard ATen
-addition keeps `beta=1`. A zero coefficient ignores the
-corresponding values, and `alpha=0, beta=1` preserves storage without requantizing.
-Inputs must match the weight's logical dtype and device. Updates are
-inference-only, require an untransposed matrix, and requantize into the existing
-storage. They preserve the wrapper, packed-data/scales storage, and activation
-calibration.
+On NVIDIA SM80+/HIP with `in_features <= 16,384` (else `32 MiB` scratch cap on
+Triton; optimized NVFP4 also avoids dense buffers), Triton `addmm_` avoids a full
+dense update allocation, falling back to dense PyTorch elsewhere. Lower scratch
+does not guarantee higher speed, and HIP merge currently has compile-only
+coverage.
 
-With Triton and at most 16,384 input features, ConvRot INT8 `addmm_` on NVIDIA
-SM80+ and HIP avoids a dense update buffer. Other supported Triton GPUs cap the
-product buffer at 32 MiB; the PyTorch fallback still materializes full
-floating-point weights. INT8 factors sharing packed-data or scale storage are
-copied before merging to preserve their original values. Optimized NVFP4 updates
-also avoid a dense update buffer. Lower scratch usage does not guarantee a faster
-merge, especially for small weights, larger adapter ranks, or FP32 factors.
-
-Fused merge validation currently covers NVIDIA hardware and CUDA/HIP compiler
-targets; HIP on-device correctness and latency have not yet been measured.
-
-An optional unsigned 64-bit `rounding_seed` enables stochastic code selection
-without changing scale selection or consuming PyTorch's global RNG. Omitting it
-uses nearest rounding. Reproduction is specific to the backend/device; Torch and
-Triton need not choose identical codes. Standard update signatures support
-`torch.compile`, but the `add_` `beta` and `rounding_seed` extensions are for
-eager updates because of Dynamo's built-in signature. Repeated updates are lossy:
-restore pristine weights before replacing or removing a merged adapter. Callers
-must also respect ownership of the storage they update, including read-only
-checkpoint mappings.
-
-For custom quantizers, the [stochastic quantization package](../src/piper_kernels/stochastic_quantization/__init__.py)
-exposes integer and codebook rounding; its `triton` module supplies kernel primitives.
+Pass an unsigned 64-bit `rounding_seed` for stochastic code rounding without
+touching global RNG (reproducible per backend/device only; Dynamo compiles
+standard signatures without `beta`/`rounding_seed`). Repeated updates are lossy, so
+restore pristine weights before unmerging and respect read-only checkpoint
+buffers. Custom quantizers can reuse
+[`piper_kernels.stochastic_quantization`](../src/piper_kernels/stochastic_quantization/__init__.py)
+and its `.triton` module.
 
 ## Convert packed GGUF storage
 
 Both ConvRot formats expose `from_gguf(packed_bytes, quant_type=..., group_size=...)`
-and `weight.copy_from_gguf_(packed_bytes, quant_type=...)`. Pass a 2-D packed byte
-tensor and its GGML quantization type; the type may be omitted if the tensor carries
-a `quant_type` attribute. The package does not parse GGUF files or map tensor names.
+and `weight.copy_from_gguf_(packed_bytes, quant_type=...)` on 2-D packed byte
+tensors (omitting `quant_type` if the tensor carries that attribute). The package
+does not parse GGUF files.
 
-Conversion decodes, rotates, and quantizes without allocating a dense weight;
-`copy_from_gguf_` refills compatible existing storage. INT8 requires a compatible
-Triton accelerator; NVFP4 conversion requires exact SM120. Unsupported devices
-raise rather than allocate a dense fallback. ConvRot NVFP4 accepts the same scale
-and activation configuration as `from_hp`, including
-`compute_per_tensor_scale=True`. See the [INT8](../src/piper_kernels/weights/convrot/int8/tensor.py)
-and [NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) constructors for signatures.
+Conversion decodes, rotates, and quantizes without a dense temporary weight, and
+`copy_from_gguf_` refills existing storage; INT8 requires Triton GPU support and
+NVFP4 requires exact SM120 (unsupported devices raise). ConvRot NVFP4 accepts the
+same scale and activation options as `from_hp`, including
+`compute_per_tensor_scale=True`. See
+[INT8](../src/piper_kernels/weights/convrot/int8/tensor.py) and
+[NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) constructors.
 
 ## Encode and decode trellis-coded storage
 
-Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It is a
-storage format: an exporter encodes each weight once, and loading decodes it into
-ordinary ConvRot INT8 storage, so execution is unchanged. See the
-[format](../src/piper_kernels/trellis/README.md).
+Trellis coding packs a rotated ConvRot INT8 weight to 3–6 bits per weight for
+offline export and decodes it back into ordinary ConvRot INT8 storage at load
+time (`block_size <= 256` independent of ConvRot `group_size`):
 
 ```python
 from piper_kernels.trellis import TrellisStorage
@@ -335,28 +288,16 @@ int8_weight = ConvRotInt8Tensor.from_trellis(
 int8_weight.copy_from_trellis_(storage.bitstreams, storage.block_scales, storage.scale)
 ```
 
-`from_hp` rotates a 2-D weight for `group_size` and encodes it in blocks of up to
-256 weights, each with an FP8 scale. `bits_per_weight` counts that scale, so 4.5
-stores a 256-weight block in 143 bytes of codes and a 1-byte scale; tensors in one
-model can use different rates. A checkpoint stores the three tensors, the block size and the ConvRot group
-size. Encoding reads the weight's values: it rejects a non-finite weight and
-requires an NVIDIA CUDA GPU. The format README covers the encoder and its
-throughput.
-
-A block is the run of weights that share one scale, as in GGUF and NVFP4; it is
-independent of the ConvRot rotation `group_size`. The streams already hold the
-weight rotated for `group_size`, so decoding does not rotate; contiguous `scale`
-storage is reused. `copy_from_trellis_` refills compatible existing storage at any
-rate, taking the block size from the weight's width. Decoding is exact by
-construction, so every backend produces the same INT8 values; this is validated
-on NVIDIA, and AMD decoding has compile coverage only. It requires a supported
-Triton accelerator and raises on other devices.
+A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
+`TrellisStorage.from_hp` requires an NVIDIA GPU and validates finite input
+weights. Decoding requires a supported Triton GPU (validated on NVIDIA, compile
+coverage only on AMD), reuses contiguous `scale` storage, and supports in-place
+refills via `copy_from_trellis_`; see [trellis format details](../src/piper_kernels/trellis/README.md).
 
 ## Shard a quantized weight
 
-Use `shard_quantized_weight` to partition an already quantized full weight without
-requantizing. Unlike a view, each shard owns its storage; NVFP4 block scales are
-repacked with fresh padding.
+`shard_quantized_weight` copies a contiguous untransposed 2-D shard with its own
+packed storage (repacking NVFP4 padding):
 
 ```python
 from piper_kernels.weights.sharding import shard_quantized_weight
@@ -364,16 +305,12 @@ from piper_kernels.weights.sharding import shard_quantized_weight
 row_shard = shard_quantized_weight(int8_weight, dim=0, start=0, length=64)
 ```
 
-`dim=0` partitions output rows at any nonempty contiguous interval. `dim=1`
-partitions input channels and must align both start and length to ConvRot groups
-and, for NVFP4, 16-value quantization blocks. Inputs must be contiguous,
-untransposed matrices. NVFP4 accepts flat/canonical and ordinary/swizzled scales,
-but execution still requires its supported layout. Ordinary slice/narrow views
-and DTensor redistribution of quantized weights are unsupported.
-
-For DTensor, install the local quantized shard **before** `parallelize_module`.
-This example assumes an initialized 1-D `mesh` and the same `full_weight` loaded on
-each rank:
+`dim=0` splits output rows at any nonempty interval; `dim=1` aligns both `start`
+and `length` to ConvRot groups and 16-value NVFP4 blocks. NVFP4 accepts
+flat/canonical and ordinary/swizzled scales, though execution requires its
+supported layout. Direct narrow/slice
+views and DTensor redistribution are unsupported. For DTensor, install the local
+shard **before** `parallelize_module`:
 
 ```python
 from torch.distributed.tensor import DTensor, Shard
@@ -400,32 +337,22 @@ plan = ColwiseParallel() if dim == 0 else RowwiseParallel()
 distributed_layer = parallelize_module(distributed_layer, mesh, plan)
 ```
 
-Bias must also be a DTensor: `Shard(0)` for output-row sharding, `Replicate()` for
-input-channel sharding. Output-row shards concatenate; input-channel shards sum
-partial outputs and add bias once. Input partitioning may change dynamic scales
-and accumulation order, so compare with tolerances against the corresponding local
-quantized computation. For fused sharded attention/FFNs, keep complete heads or
-intermediate-feature shards local, unwrap activations around the fused region,
-and place collectives outside it; compare against the local **fused** computation.
+Use `Shard(0)` bias for `dim=0` and `Replicate()` for `dim=1`. Compare sharded
+results against local quantized execution; for fused sharded blocks, keep full
+heads or FFN intermediate shards local, unwrap activations around fusions, keep
+collectives outside, and compare against the local **fused** output.
 
 ## Storage and checkpoint compatibility
 
-Same-shape `view`/`view_as` and matrix transposes share storage and retain format
-metadata. `as_strided` supports the existing layout or its transpose with unchanged
-storage offset. Other shape/layout changes are unsupported. A transposed weight
-can participate in activation matrix products, but cannot be made contiguous,
-updated in place, or passed as another `F.linear` weight. The DTensor `mm`/`addmm`
-path supports the linear case: `alpha=beta=1` and a vector bias.
+Same-shape `view`/`view_as`, transposes, and matching `as_strided` views share
+storage; other shape/layout ops are unsupported. Transposed weights only support
+activation GEMMs (no `.contiguous()`, in-place updates, or `F.linear` reuse).
+DTensor `mm`/`addmm` supports linear `alpha=beta=1` with vector bias.
 
-Floating-point conversions change the logical dtype while reusing packed
-storage; converting to the current dtype and device returns the same weight.
-Views and conversions have the same contracts under `torch.no_grad()` and
-`torch.inference_mode()`, including weights created outside inference mode.
-
-Use `load_state_dict(..., assign=True)` when preserving supplied checkpoint storage
-matters. Loading a pickled `ConvRotInt8Tensor` with `weights_only=True` requires
-that class in `torch.serialization.safe_globals`. Tensor subclass checkpoints
-carry Python class paths: the current classes live under `piper_kernels.weights`,
-and checkpoints pickled with former `linear` class paths must be re-exported;
-legacy import aliases are not provided. Packed tensor/scale layouts are unchanged.
-See the [changelog](../CHANGELOG.md) when upgrading a pinned consumer.
+Floating conversions reuse packed storage while updating the logical dtype (same
+contracts under `torch.no_grad()` and `torch.inference_mode()`). Use
+`load_state_dict(..., assign=True)` to keep caller-supplied storage, add
+`ConvRotInt8Tensor` to `torch.serialization.safe_globals` for `weights_only=True`,
+and export checkpoints with current `piper_kernels.weights` class paths (former
+`piper_kernels.linear` aliases are removed; packed layouts are unchanged). See
+[CHANGELOG.md](../CHANGELOG.md) when upgrading.
